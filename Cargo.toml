@@ -1,0 +1,55 @@
+[package]
+name = "xsd-schema"
+version = "0.1.0"
+edition = "2021"
+authors = ["XmlPad Project"]
+description = "XSD 1.0 schema parser and validator"
+license = "MIT"
+
+[dependencies]
+# XML parsing
+quick-xml = "0.31"           # Streaming XML parser with byte position tracking
+roxmltree = "0.19"           # Read-only tree for W3C test suite parsing
+
+# Data structures
+slotmap = "1.0"              # Arena storage with typed keys
+bitflags = "2.4"             # DerivationSet flags
+
+# Error handling
+thiserror = "1.0"            # Error derive macros
+
+# Pattern matching and validation
+regex = "1.10"               # Pattern facet validation
+
+# Date/time types (for Phase 2 - type system)
+chrono = "0.4"               # Date/time types
+
+# Precision decimals (for Phase 2 - type system)
+rust_decimal = "1.33"        # xs:decimal precision
+
+# XSD atomic value parsing/formatting
+num-bigint = "0.4"           # Unbounded integers for xs:integer
+base64 = "0.22"              # Base64 encoding/decoding
+hex = "0.4"                  # Hex encoding/decoding
+
+# Async support
+futures = "0.3"              # For async schema resolution
+
+# XPath parser (LALRPOP runtime)
+lalrpop-util = "0.22.2"      # LALRPOP runtime utilities
+
+[build-dependencies]
+lalrpop = "0.22.2"           # LALRPOP parser generator
+
+[dev-dependencies]
+pretty_assertions = "1.4"    # Better assertion output in tests
+criterion = "0.5"            # Benchmarking (optional)
+
+[lib]
+name = "xsd_schema"
+path = "src/lib.rs"
+
+[[test]]
+name = "conformance"
+path = "tests/conformance/driver.rs"
+harness = false

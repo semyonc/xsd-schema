@@ -1,0 +1,571 @@
+//! Schema model - SchemaSet, SchemaDocument, NamespaceTable
+//!
+//! This module contains the core schema organization structures:
+//! - `SchemaSet` - Complete schema collection with all documents and components
+//! - `SchemaDocument` - Individual schema document (root or included/imported)
+//! - `NamespaceTable` - Per-namespace component lookup
+
+use std::collections::HashMap;
+use bitflags::bitflags;
+
+use crate::ids::*;
+use crate::namespace::NameTable;
+use crate::namespace::table::well_known;
+use crate::parser::location::{SourceMapStorage, SourceRef};
+use crate::namespace::QualifiedName;
+use crate::schema::annotation::Annotation;
+use crate::schema::wildcard::ElementWildcard;
+use crate::arenas::SchemaArenas;
+use crate::types::{BuiltinTypes, XmlTypeCode};
+
+/// XSD version mode
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XsdVersion {
+    #[default]
+    V1_0,
+    V1_1,
+}
+
+bitflags! {
+    /// Derivation control flags (for final, block attributes)
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct DerivationSet: u8 {
+        const EXTENSION = 0x01;
+        const RESTRICTION = 0x02;
+        const LIST = 0x04;
+        const UNION = 0x08;
+        const SUBSTITUTION = 0x10;
+
+        /// All derivation methods blocked
+        const ALL = Self::EXTENSION.bits() | Self::RESTRICTION.bits() |
+                   Self::LIST.bits() | Self::UNION.bits() | Self::SUBSTITUTION.bits();
+    }
+}
+
+impl DerivationSet {
+    /// Create a DerivationSet with only EXTENSION
+    pub fn extension() -> Self {
+        Self::EXTENSION
+    }
+
+    /// Create a DerivationSet with only RESTRICTION
+    pub fn restriction() -> Self {
+        Self::RESTRICTION
+    }
+
+    /// Check if extension is blocked/final
+    pub fn contains_extension(&self) -> bool {
+        self.contains(Self::EXTENSION)
+    }
+
+    /// Check if restriction is blocked/final
+    pub fn contains_restriction(&self) -> bool {
+        self.contains(Self::RESTRICTION)
+    }
+
+    /// Check if list derivation is blocked/final
+    pub fn contains_list(&self) -> bool {
+        self.contains(Self::LIST)
+    }
+
+    /// Check if union derivation is blocked/final
+    pub fn contains_union(&self) -> bool {
+        self.contains(Self::UNION)
+    }
+
+    /// Check if substitution is blocked
+    pub fn contains_substitution(&self) -> bool {
+        self.contains(Self::SUBSTITUTION)
+    }
+}
+
+/// Form choice for element/attribute form defaults
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FormChoice {
+    #[default]
+    Unqualified,
+    Qualified,
+}
+
+/// Complete schema set (possibly from multiple documents)
+///
+/// This is the main entry point for working with XSD schemas.
+/// It owns all schema components and provides namespace-based lookup.
+#[derive(Debug)]
+pub struct SchemaSet {
+    /// String interning table for names and namespace URIs
+    pub name_table: NameTable,
+
+    /// Centralized source map storage for all documents
+    pub source_maps: SourceMapStorage,
+
+    /// All parsed schema documents
+    pub documents: Vec<SchemaDocument>,
+
+    /// Per-namespace component tables (keyed by NameId; None = no namespace)
+    pub namespaces: HashMap<Option<NameId>, NamespaceTable>,
+
+    /// XSD version mode (1.0 or 1.1)
+    pub xsd_version: XsdVersion,
+
+    /// Arena storage for all components
+    pub arenas: SchemaArenas,
+
+    /// Loaded schema locations (for cycle detection)
+    pub loaded_locations: HashMap<String, DocumentId>,
+
+    /// Built-in type registry with well-known type IDs
+    builtin_types: Option<BuiltinTypes>,
+}
+
+impl SchemaSet {
+    /// Create a new empty schema set
+    pub fn new() -> Self {
+        Self::with_version(XsdVersion::V1_0)
+    }
+
+    /// Create a new schema set with specified version
+    pub fn with_version(version: XsdVersion) -> Self {
+        let mut set = Self {
+            name_table: NameTable::new(),
+            source_maps: SourceMapStorage::new(),
+            documents: Vec::new(),
+            namespaces: HashMap::new(),
+            xsd_version: version,
+            arenas: SchemaArenas::new(),
+            loaded_locations: HashMap::new(),
+            builtin_types: None,
+        };
+
+        // Initialize built-in types
+        let builtin_types = BuiltinTypes::new(&mut set);
+        set.builtin_types = Some(builtin_types);
+
+        set
+    }
+
+    /// Check if a schema location has already been loaded
+    pub fn is_loaded(&self, location: &str) -> bool {
+        self.loaded_locations.contains_key(location)
+    }
+
+    /// Mark a schema location as loaded
+    pub fn mark_loaded(&mut self, location: String, doc_id: DocumentId) {
+        self.loaded_locations.insert(location, doc_id);
+    }
+
+    /// Get or create namespace table for a namespace
+    pub fn get_or_create_namespace(&mut self, ns: Option<NameId>) -> &mut NamespaceTable {
+        self.namespaces.entry(ns).or_insert_with(NamespaceTable::new)
+    }
+
+    /// Look up a type by namespace and name
+    pub fn lookup_type(&self, ns: Option<NameId>, name: NameId) -> Option<TypeKey> {
+        self.namespaces.get(&ns)?.types.get(&name).copied()
+    }
+
+    /// Look up an element by namespace and name
+    pub fn lookup_element(&self, ns: Option<NameId>, name: NameId) -> Option<ElementKey> {
+        self.namespaces.get(&ns)?.elements.get(&name).copied()
+    }
+
+    /// Look up an attribute by namespace and name
+    pub fn lookup_attribute(&self, ns: Option<NameId>, name: NameId) -> Option<AttributeKey> {
+        self.namespaces.get(&ns)?.attributes.get(&name).copied()
+    }
+
+    /// Look up a model group by namespace and name
+    pub fn lookup_model_group(&self, ns: Option<NameId>, name: NameId) -> Option<ModelGroupKey> {
+        self.namespaces.get(&ns)?.model_groups.get(&name).copied()
+    }
+
+    /// Look up an attribute group by namespace and name
+    pub fn lookup_attribute_group(&self, ns: Option<NameId>, name: NameId) -> Option<AttributeGroupKey> {
+        self.namespaces.get(&ns)?.attribute_groups.get(&name).copied()
+    }
+
+    /// Look up a notation by namespace and name
+    pub fn lookup_notation(&self, ns: Option<NameId>, name: NameId) -> Option<NotationKey> {
+        self.namespaces.get(&ns)?.notations.get(&name).copied()
+    }
+
+    // ========================================================================
+    // Built-in type access
+    // ========================================================================
+
+    /// Get the built-in types registry.
+    ///
+    /// This provides access to well-known type IDs for all 47+ built-in XSD types.
+    pub fn builtin_types(&self) -> &BuiltinTypes {
+        self.builtin_types
+            .as_ref()
+            .expect("BuiltinTypes should always be initialized")
+    }
+
+    /// Get a built-in simple type by QName (namespace + local name).
+    ///
+    /// This only looks up built-in types in the XS namespace.
+    /// For user-defined types, use `lookup_type` instead.
+    ///
+    /// # Arguments
+    /// * `namespace` - The namespace URI (should be XS namespace for built-in types)
+    /// * `local_name` - The local name of the type
+    ///
+    /// # Returns
+    /// The `SimpleTypeKey` for the built-in type, or `None` if not found.
+    pub fn get_built_in_simple_type_by_qname(
+        &self,
+        namespace: Option<NameId>,
+        local_name: NameId,
+    ) -> Option<SimpleTypeKey> {
+        // Built-in types are only in the XS namespace
+        if namespace != Some(well_known::XS_NAMESPACE) {
+            return None;
+        }
+        self.builtin_types().get_by_local_name(local_name)
+    }
+
+    /// Get a built-in simple type by its XmlTypeCode.
+    ///
+    /// # Returns
+    /// The `SimpleTypeKey` for the built-in type, or `None` if not a simple type code.
+    pub fn get_built_in_simple_type_by_code(&self, code: XmlTypeCode) -> Option<SimpleTypeKey> {
+        self.builtin_types().get_by_type_code(code)
+    }
+
+    /// Get the XmlTypeCode for a simple type.
+    ///
+    /// Returns `None` if the type is not a built-in type.
+    pub fn get_type_code(&self, type_id: SimpleTypeKey) -> Option<XmlTypeCode> {
+        self.builtin_types().get_type_code(type_id)
+    }
+
+    /// Check if `derived` derives from `base` (transitively).
+    ///
+    /// For built-in types, this uses the standard XSD derivation hierarchy.
+    /// For user-defined types, this walks the base type chain using resolved references.
+    ///
+    /// # Returns
+    /// - `true` if `derived == base`
+    /// - `true` if `derived` has `base` somewhere in its derivation chain
+    /// - `false` otherwise
+    pub fn derives_from(&self, derived: SimpleTypeKey, base: SimpleTypeKey) -> bool {
+        // Same type derives from itself
+        if derived == base {
+            return true;
+        }
+
+        // First, check if both are built-in types and use the built-in derivation
+        let builtin = self.builtin_types();
+        if builtin.is_builtin(derived) && builtin.is_builtin(base) {
+            return builtin.derives_from(derived, base);
+        }
+
+        // For user-defined types (or mixed), walk the resolved base type chain
+        let mut current = derived;
+        let mut visited = std::collections::HashSet::new();
+
+        while visited.insert(current) {
+            // Get the simple type data
+            if let Some(type_def) = self.arenas.simple_types.get(current) {
+                // Check the resolved base type
+                if let Some(base_type_key) = type_def.resolved_base_type {
+                    // Extract SimpleTypeKey from TypeKey
+                    if let crate::ids::TypeKey::Simple(simple_base) = base_type_key {
+                        if simple_base == base {
+                            return true;
+                        }
+                        current = simple_base;
+                        continue;
+                    }
+                }
+            }
+
+            // If no resolved base type, try built-in derivation as fallback
+            if builtin.is_builtin(current) {
+                if let Some(parent) = builtin.get_base_type(current) {
+                    if parent == base {
+                        return true;
+                    }
+                    current = parent;
+                    continue;
+                }
+            }
+
+            // No more base types to traverse
+            break;
+        }
+
+        false
+    }
+}
+
+impl Default for SchemaSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A single schema document (root or included/imported)
+///
+/// Represents one XSD file with its components and directives.
+#[derive(Debug)]
+pub struct SchemaDocument {
+    /// Document ID for source map reference
+    pub id: DocumentId,
+
+    /// Base URI (location) of this document
+    pub base_uri: String,
+
+    /// Target namespace (None = chameleon or no namespace)
+    pub target_namespace: Option<NameId>,
+
+    /// Schema-level attributes
+    pub version: Option<String>,
+    pub element_form_default: FormChoice,
+    pub attribute_form_default: FormChoice,
+    pub block_default: DerivationSet,
+    pub final_default: DerivationSet,
+    pub schema_id: Option<String>,
+    pub xml_lang: Option<String>,
+
+    /// XSD 1.1: Default attributes group reference
+    pub default_attributes: Option<QualifiedName>,
+
+    /// XSD 1.1: Default namespace for XPath
+    pub xpath_default_namespace: Option<NameId>,
+
+    /// Composition directives (in document order)
+    pub includes: Vec<IncludeDirective>,
+    pub imports: Vec<ImportDirective>,
+    pub redefines: Vec<RedefineDirective>,
+    pub overrides: Vec<OverrideDirective>, // XSD 1.1
+
+    /// XSD 1.1: Default open content
+    pub default_open_content: Option<DefaultOpenContent>,
+
+    /// Schema-level annotations
+    pub annotations: Vec<Annotation>,
+
+    /// Source reference for error reporting
+    pub source: Option<SourceRef>,
+}
+
+impl SchemaDocument {
+    /// Create a new schema document
+    pub fn new(id: DocumentId, base_uri: String) -> Self {
+        Self {
+            id,
+            base_uri,
+            target_namespace: None,
+            version: None,
+            element_form_default: FormChoice::default(),
+            attribute_form_default: FormChoice::default(),
+            block_default: DerivationSet::empty(),
+            final_default: DerivationSet::empty(),
+            schema_id: None,
+            xml_lang: None,
+            default_attributes: None,
+            xpath_default_namespace: None,
+            includes: Vec::new(),
+            imports: Vec::new(),
+            redefines: Vec::new(),
+            overrides: Vec::new(),
+            default_open_content: None,
+            annotations: Vec::new(),
+            source: None,
+        }
+    }
+}
+
+/// Per-namespace component lookup tables
+///
+/// Each namespace has its own table mapping local names to component keys.
+/// Uses NameId as keys for fast equality checks.
+#[derive(Debug, Default)]
+pub struct NamespaceTable {
+    /// Type definitions (simple and complex)
+    pub types: HashMap<NameId, TypeKey>,
+    /// Element declarations
+    pub elements: HashMap<NameId, ElementKey>,
+    /// Attribute declarations
+    pub attributes: HashMap<NameId, AttributeKey>,
+    /// Attribute groups
+    pub attribute_groups: HashMap<NameId, AttributeGroupKey>,
+    /// Named model groups
+    pub model_groups: HashMap<NameId, ModelGroupKey>,
+    /// Notations
+    pub notations: HashMap<NameId, NotationKey>,
+    /// Identity constraints (global, for XSD 1.1 refs)
+    pub identity_constraints: HashMap<NameId, IdentityConstraintKey>,
+}
+
+impl NamespaceTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a type in this namespace
+    pub fn register_type(&mut self, name: NameId, key: TypeKey) -> Option<TypeKey> {
+        self.types.insert(name, key)
+    }
+
+    /// Register an element in this namespace
+    pub fn register_element(&mut self, name: NameId, key: ElementKey) -> Option<ElementKey> {
+        self.elements.insert(name, key)
+    }
+
+    /// Register an attribute in this namespace
+    pub fn register_attribute(&mut self, name: NameId, key: AttributeKey) -> Option<AttributeKey> {
+        self.attributes.insert(name, key)
+    }
+
+    /// Register a model group in this namespace
+    pub fn register_model_group(&mut self, name: NameId, key: ModelGroupKey) -> Option<ModelGroupKey> {
+        self.model_groups.insert(name, key)
+    }
+
+    /// Register an attribute group in this namespace
+    pub fn register_attribute_group(&mut self, name: NameId, key: AttributeGroupKey) -> Option<AttributeGroupKey> {
+        self.attribute_groups.insert(name, key)
+    }
+
+    /// Register a notation in this namespace
+    pub fn register_notation(&mut self, name: NameId, key: NotationKey) -> Option<NotationKey> {
+        self.notations.insert(name, key)
+    }
+}
+
+// Schema composition directives
+
+/// xs:include directive
+#[derive(Debug, Clone)]
+pub struct IncludeDirective {
+    pub source: Option<SourceRef>,
+    pub schema_location: String,
+    pub resolved_doc_id: Option<DocumentId>,
+}
+
+/// xs:import directive
+#[derive(Debug, Clone)]
+pub struct ImportDirective {
+    pub source: Option<SourceRef>,
+    pub namespace: Option<String>,
+    pub schema_location: Option<String>,
+    pub resolved_doc_id: Option<DocumentId>,
+}
+
+/// xs:redefine directive (deprecated in XSD 1.1)
+#[derive(Debug, Clone)]
+pub struct RedefineDirective {
+    pub source: Option<SourceRef>,
+    pub schema_location: String,
+    pub simple_types: Vec<SimpleTypeKey>,
+    pub complex_types: Vec<ComplexTypeKey>,
+    pub groups: Vec<ModelGroupKey>,
+    pub attribute_groups: Vec<AttributeGroupKey>,
+}
+
+/// xs:override directive (XSD 1.1)
+#[derive(Debug, Clone)]
+pub struct OverrideDirective {
+    pub source: Option<SourceRef>,
+    pub schema_location: String,
+    pub components: Vec<OverrideComponent>,
+}
+
+/// Component that can appear in xs:override
+#[derive(Debug, Clone)]
+pub enum OverrideComponent {
+    SimpleType(SimpleTypeKey),
+    ComplexType(ComplexTypeKey),
+    Group(ModelGroupKey),
+    AttributeGroup(AttributeGroupKey),
+    Element(ElementKey),
+    Attribute(AttributeKey),
+    Notation(NotationKey),
+}
+
+/// Default open content at schema level (XSD 1.1)
+#[derive(Debug, Clone)]
+pub struct DefaultOpenContent {
+    pub source: Option<SourceRef>,
+    pub applies_to_empty: bool,
+    pub mode: OpenContentMode,
+    pub wildcard: Option<ElementWildcard>,
+}
+
+/// Open content mode (XSD 1.1)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenContentMode {
+    None,
+    #[default]
+    Interleave,
+    Suffix,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_set_creation() {
+        let set = SchemaSet::new();
+        assert_eq!(set.xsd_version, XsdVersion::V1_0);
+        assert!(set.documents.is_empty());
+        assert!(set.namespaces.is_empty());
+    }
+
+    #[test]
+    fn test_schema_set_with_version() {
+        let set = SchemaSet::with_version(XsdVersion::V1_1);
+        assert_eq!(set.xsd_version, XsdVersion::V1_1);
+    }
+
+    #[test]
+    fn test_namespace_table_registration() {
+        use slotmap::SlotMap;
+        let mut table = NamespaceTable::new();
+
+        // Create a dummy key for testing
+        let mut dummy_map: SlotMap<SimpleTypeKey, ()> = SlotMap::with_key();
+        let key1 = dummy_map.insert(());
+        let key2 = dummy_map.insert(());
+
+        // Register a type
+        let old = table.register_type(NameId(1), TypeKey::Simple(key1));
+        assert!(old.is_none());
+
+        // Re-registering returns old value
+        let old = table.register_type(NameId(1), TypeKey::Simple(key2));
+        assert!(old.is_some());
+    }
+
+    #[test]
+    fn test_schema_set_load_tracking() {
+        let mut set = SchemaSet::new();
+
+        assert!(!set.is_loaded("test.xsd"));
+        set.mark_loaded("test.xsd".to_string(), 0);
+        assert!(set.is_loaded("test.xsd"));
+    }
+
+    #[test]
+    fn test_derivation_set_flags() {
+        let mut flags = DerivationSet::empty();
+        assert!(flags.is_empty());
+
+        flags |= DerivationSet::EXTENSION;
+        assert!(flags.contains(DerivationSet::EXTENSION));
+        assert!(!flags.contains(DerivationSet::RESTRICTION));
+
+        let all = DerivationSet::ALL;
+        assert!(all.contains(DerivationSet::EXTENSION));
+        assert!(all.contains(DerivationSet::RESTRICTION));
+    }
+
+    #[test]
+    fn test_form_choice_default() {
+        assert_eq!(FormChoice::default(), FormChoice::Unqualified);
+    }
+}
