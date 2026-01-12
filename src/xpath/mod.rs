@@ -24,8 +24,10 @@
 // Parser modules
 pub mod arena;
 pub mod ast;
+pub mod error;
 pub mod lexer;
 pub mod parser;
+pub mod operators;
 
 // Navigator modules
 pub mod roxmltree;
@@ -35,6 +37,7 @@ pub use self::roxmltree::RoXmlNavigator;
 // Re-export key parser types
 pub use self::arena::{AstArena, AstNodeId, SourceSpan};
 pub use self::ast::AstNode;
+pub use self::error::XPathError;
 pub use self::lexer::{Lexer, Token};
 pub use self::parser::{parse, ParseError, ParsedXPath};
 
