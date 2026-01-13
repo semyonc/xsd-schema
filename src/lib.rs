@@ -4,6 +4,60 @@
 //! namespace management, and W3C conformance testing. It follows the design specifications
 //! in the XSD_*.md documentation files.
 //!
+//! # Entry Points
+//!
+//! ## Single Schema (Recommended)
+//!
+//! Use [`load_and_process_schema`] for complete processing of a single schema:
+//!
+//! ```
+//! use xsd_schema::{SchemaSet, load_and_process_schema};
+//!
+//! let mut schema_set = SchemaSet::new();
+//! let xml = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+//!     <xs:element name="root" type="xs:string"/>
+//! </xs:schema>"#;
+//!
+//! let stats = load_and_process_schema(xml.as_bytes(), "schema.xsd", &mut schema_set, None)
+//!     .expect("failed to load schema");
+//! assert_eq!(stats.doc_id, 0);
+//! ```
+//!
+//! ## Multiple Related Schemas
+//!
+//! For loading multiple schema files, use the two-phase approach:
+//!
+//! ```
+//! use xsd_schema::{SchemaSet, parse_schema_only, process_loaded_schemas};
+//!
+//! let mut schema_set = SchemaSet::new();
+//!
+//! let schemas = [
+//!     (r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+//!                   targetNamespace="urn:schema1">
+//!         <xs:element name="item1" type="xs:string"/>
+//!     </xs:schema>"#, "schema1.xsd"),
+//!     (r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+//!                   targetNamespace="urn:schema2">
+//!         <xs:element name="item2" type="xs:int"/>
+//!     </xs:schema>"#, "schema2.xsd"),
+//! ];
+//!
+//! // Phase 1: Parse all schemas
+//! for (xml, uri) in schemas {
+//!     parse_schema_only(xml.as_bytes(), uri, &mut schema_set).expect("parse failed");
+//! }
+//!
+//! // Phase 2: Process all schemas together (inline assembly + reference resolution)
+//! let (inline_stats, resolution_stats) = process_loaded_schemas(&mut schema_set)
+//!     .expect("processing failed");
+//! ```
+//!
+//! ## Advanced: Low-Level Parser
+//!
+//! For custom pipelines, the low-level parser is available at [`parser::parse_schema`].
+//! This only performs Phase 1 (parsing + assembly) - subsequent phases must be run manually.
+//!
 //! # Architecture
 //!
 //! The parser uses a state machine approach with typed parser frames for each XSD element type.
@@ -49,6 +103,12 @@ pub mod xpath;
 // Pipeline orchestration
 pub mod pipeline;
 
+// Embedded assets
+pub mod embedded;
+
+// Builder pattern API
+pub mod builder;
+
 // Re-export primary types
 pub use error::{SchemaError, SchemaResult, FacetError, FacetResult};
 pub use ids::*;
@@ -80,3 +140,15 @@ pub use pipeline::{
     load_and_process_schema, load_schema, parse_schema_only, process_loaded_schemas,
     PipelineConfig, PipelineStats, DirectiveStats,
 };
+
+// Re-export builder types
+pub use builder::{SchemaSetBuilder, CompiledSchemaSet, CompilationStats};
+
+// Re-export resolver types
+pub use parser::resolver::{
+    SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
+    SchemaResolver, ResolverConfig, SchemaCatalog,
+};
+
+// Re-export embedded assets
+pub use embedded::{XML_XSD, XML_NAMESPACE, get_embedded_schema, has_embedded_schema};

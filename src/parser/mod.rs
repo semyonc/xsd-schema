@@ -36,6 +36,11 @@ pub use attrs::{
 };
 
 // Re-exports from parse
+//
+// Note: `parse_schema` and `parse_schema_with_config` are low-level APIs that only perform
+// Phase 1 (parsing + assembly). For typical use cases, prefer:
+// - `crate::load_and_process_schema` for single schemas with full processing
+// - `crate::parse_schema_only` + `crate::process_loaded_schemas` for multiple schemas
 pub use parse::{parse_schema, parse_schema_with_config, ParserConfig};
 
 // Re-exports from assemble
@@ -59,4 +64,6 @@ pub use structure::{
 pub use resolver::{
     SchemaResolver, ResolverConfig, SchemaCatalog, CatalogEntry,
     ResolutionResult, resolve_all_directives,
+    // Loader trait and implementations
+    SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
 };

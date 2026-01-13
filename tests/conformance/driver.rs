@@ -458,11 +458,12 @@ impl TestRunner {
         let mut schema_set = xsd_schema::SchemaSet::new();
         let mut parse_error: Option<String> = None;
 
+        // Phase 1: Parse all schemas
         for schema_file in &test.schema_files {
             match fs::read(schema_file) {
                 Ok(content) => {
                     let uri = schema_file.to_string_lossy();
-                    match xsd_schema::parser::parse_schema(&content, &uri, &mut schema_set) {
+                    match xsd_schema::parse_schema_only(&content, &uri, &mut schema_set) {
                         Ok(_) => {}
                         Err(e) => {
                             parse_error = Some(e.to_string());
@@ -474,6 +475,13 @@ impl TestRunner {
                     parse_error = Some(format!("Failed to read file: {}", e));
                     break;
                 }
+            }
+        }
+
+        // Phase 2: Process all loaded schemas (inline assembly + reference resolution)
+        if parse_error.is_none() {
+            if let Err(e) = xsd_schema::process_loaded_schemas(&mut schema_set) {
+                parse_error = Some(e.to_string());
             }
         }
 

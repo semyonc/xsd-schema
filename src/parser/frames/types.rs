@@ -1,0 +1,1281 @@
+// ============================================================================
+// Simple Type Frame
+// ============================================================================
+
+/// Parsing phase for simpleType
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleTypePhase {
+    /// Expecting annotation
+    Annotation,
+    /// Expecting restriction, list, or union
+    Derivation,
+    /// Done
+    Done,
+}
+
+/// Frame for xs:simpleType element
+pub struct SimpleTypeFrame {
+    phase: SimpleTypePhase,
+    name: Option<NameId>,
+    final_derivation: DerivationSet,
+    id: Option<String>,
+    derivation_id: Option<String>,
+    variety: Option<SimpleTypeVariety>,
+    base_type: Option<TypeRefResult>,
+    item_type: Option<TypeRefResult>,
+    member_types: Vec<TypeRefResult>,
+    facets: FacetSet,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl SimpleTypeFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+    ) -> SchemaResult<Self> {
+        let name = attrs
+            .get_value_by_name(name_table, "name")
+            .and_then(|s| name_table.get(s));
+
+        let final_derivation = parse_derivation_set(
+            attrs.get_value_by_name(name_table, "final"),
+        )?;
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            phase: SimpleTypePhase::Annotation,
+            name,
+            final_derivation,
+            id,
+            derivation_id: None,
+            variety: None,
+            base_type: None,
+            item_type: None,
+            member_types: Vec::new(),
+            facets: FacetSet::new(),
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for SimpleTypeFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        match self.phase {
+            SimpleTypePhase::Annotation => matches!(
+                local_name,
+                xsd_names::ANNOTATION | xsd_names::RESTRICTION | xsd_names::LIST | xsd_names::UNION
+            ),
+            SimpleTypePhase::Derivation => matches!(
+                local_name,
+                xsd_names::RESTRICTION | xsd_names::LIST | xsd_names::UNION
+            ),
+            SimpleTypePhase::Done => false,
+        }
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "name" | "final" | "id")
+    }
+
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        match local_name {
+            xsd_names::ANNOTATION => {
+                self.phase = SimpleTypePhase::Derivation;
+            }
+            xsd_names::RESTRICTION | xsd_names::LIST | xsd_names::UNION => {
+                self.phase = SimpleTypePhase::Done;
+            }
+            _ => {}
+        }
+    }
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Type(TypeFrameResult::Simple(st)) => {
+                // Inline type from restriction/list/union
+                self.variety = Some(st.variety);
+                self.base_type = st.base_type;
+                self.item_type = st.item_type;
+                self.member_types = st.member_types;
+                self.facets = st.facets;
+                self.derivation_id = st.derivation_id;
+            }
+            FrameResult::Restriction(res) => {
+                let base = if let Some(inline) = res.inline_type {
+                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+                } else {
+                    res.base_type
+                };
+                self.variety = Some(SimpleTypeVariety::Atomic);
+                self.base_type = base;
+                self.facets = res.facets;
+                self.derivation_id = res.id;
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+            name: self.name,
+            variety: self.variety.unwrap_or(SimpleTypeVariety::Atomic),
+            base_type: self.base_type,
+            item_type: self.item_type,
+            member_types: self.member_types,
+            facets: self.facets,
+            final_derivation: self.final_derivation,
+            id: self.id,
+            derivation_id: self.derivation_id,
+            annotation,
+            source: self.source,
+        })))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// Restriction Frame
+// ============================================================================
+
+/// Frame for xs:restriction
+pub struct RestrictionFrame {
+    base_type: Option<TypeRefResult>,
+    facets: FacetSet,
+    particle: Option<ParticleResult>,
+    open_content: Option<OpenContentResult>,
+    attributes: Vec<AttributeUseResult>,
+    attribute_groups: Vec<QNameRef>,
+    attribute_wildcard: Option<WildcardResult>,
+    assertions: Vec<AssertResult>,
+    id: Option<String>,
+    annotation: Option<Annotation>,
+    inline_type: Option<SimpleTypeResult>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl RestrictionFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+        ns_snapshot: &NamespaceContextSnapshot,
+    ) -> SchemaResult<Self> {
+        let base_type = attrs
+            .get_value_by_name(name_table, "base")
+            .map(|s| parse_qname_ref(s, name_table, ns_snapshot))
+            .transpose()?
+            .map(TypeRefResult::QName);
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            base_type,
+            facets: FacetSet::new(),
+            particle: None,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            assertions: Vec::new(),
+            id,
+            annotation: None,
+            inline_type: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for RestrictionFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(
+            local_name,
+            xsd_names::ANNOTATION
+                | xsd_names::SIMPLE_TYPE
+                | xsd_names::ENUMERATION
+                | xsd_names::PATTERN
+                | xsd_names::MIN_INCLUSIVE
+                | xsd_names::MAX_INCLUSIVE
+                | xsd_names::MIN_EXCLUSIVE
+                | xsd_names::MAX_EXCLUSIVE
+                | xsd_names::MIN_LENGTH
+                | xsd_names::MAX_LENGTH
+                | xsd_names::LENGTH
+                | xsd_names::TOTAL_DIGITS
+                | xsd_names::FRACTION_DIGITS
+                | xsd_names::WHITE_SPACE
+                | xsd_names::SEQUENCE
+                | xsd_names::CHOICE
+                | xsd_names::ALL
+                | xsd_names::GROUP
+                | xsd_names::ATTRIBUTE
+                | xsd_names::ATTRIBUTE_GROUP
+                | xsd_names::ANY_ATTRIBUTE
+                | xsd_names::OPEN_CONTENT
+                | xsd_names::ASSERT
+        )
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "base" | "id")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Type(TypeFrameResult::Simple(st)) => {
+                self.inline_type = Some(st);
+            }
+            FrameResult::Facet(facet) => {
+                apply_facet(&mut self.facets, facet)?;
+            }
+            FrameResult::Particle(particle) => {
+                self.particle = Some(particle);
+            }
+            FrameResult::OpenContent(open_content) => {
+                self.open_content = Some(open_content);
+            }
+            FrameResult::Attribute(attr) => {
+                self.attributes.push(AttributeUseResult {
+                    attribute: attr,
+                    use_kind: AttributeUseKind::Optional,
+                });
+            }
+            FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
+                if let Some(ref_name) = ag.ref_name {
+                    self.attribute_groups.push(ref_name);
+                }
+            }
+            FrameResult::Group(GroupFrameResult::Model(mg)) => {
+                let min_occurs = mg.min_occurs;
+                let max_occurs = mg.max_occurs;
+                self.particle = Some(ParticleResult {
+                    term: ParticleTerm::Group(mg),
+                    min_occurs,
+                    max_occurs,
+                    source: None,
+                });
+            }
+            FrameResult::Wildcard(wc) => {
+                self.attribute_wildcard = Some(wc);
+            }
+            FrameResult::Assert(assertion) => {
+                self.assertions.push(assertion);
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // Validate restriction structure: base XOR inline type (can't have both)
+        if self.base_type.is_some() && self.inline_type.is_some() {
+            return Err(SchemaError::structural(
+                "sch-restriction-base-type",
+                "Restriction cannot have both 'base' attribute and inline type",
+                None,
+            ));
+        }
+
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Restriction(RestrictionResult {
+            base_type: self.base_type,
+            inline_type: self.inline_type,
+            facets: self.facets,
+            particle: self.particle,
+            open_content: self.open_content,
+            attributes: self.attributes,
+            attribute_groups: self.attribute_groups,
+            attribute_wildcard: self.attribute_wildcard,
+            assertions: self.assertions,
+            id: self.id,
+            annotation,
+            source: self.source,
+        }))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// Extension Frame
+// ============================================================================
+
+/// Frame for xs:extension
+pub struct ExtensionFrame {
+    base_type: Option<TypeRefResult>,
+    particle: Option<ParticleResult>,
+    open_content: Option<OpenContentResult>,
+    attributes: Vec<AttributeUseResult>,
+    attribute_groups: Vec<QNameRef>,
+    attribute_wildcard: Option<WildcardResult>,
+    assertions: Vec<AssertResult>,
+    id: Option<String>,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl ExtensionFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+        ns_snapshot: &NamespaceContextSnapshot,
+    ) -> SchemaResult<Self> {
+        let base_type = attrs
+            .get_value_by_name(name_table, "base")
+            .map(|s| parse_qname_ref(s, name_table, ns_snapshot))
+            .transpose()?
+            .map(TypeRefResult::QName);
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            base_type,
+            particle: None,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            assertions: Vec::new(),
+            id,
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for ExtensionFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(
+            local_name,
+            xsd_names::ANNOTATION
+                | xsd_names::OPEN_CONTENT
+                | xsd_names::SEQUENCE
+                | xsd_names::CHOICE
+                | xsd_names::ALL
+                | xsd_names::GROUP
+                | xsd_names::ATTRIBUTE
+                | xsd_names::ATTRIBUTE_GROUP
+                | xsd_names::ANY_ATTRIBUTE
+                | xsd_names::ASSERT
+        )
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "base" | "id")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Particle(particle) => {
+                self.particle = Some(particle);
+            }
+            FrameResult::OpenContent(open_content) => {
+                self.open_content = Some(open_content);
+            }
+            FrameResult::Attribute(attr) => {
+                self.attributes.push(AttributeUseResult {
+                    attribute: attr,
+                    use_kind: AttributeUseKind::Optional,
+                });
+            }
+            FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
+                if let Some(ref_name) = ag.ref_name {
+                    self.attribute_groups.push(ref_name);
+                }
+            }
+            FrameResult::Group(GroupFrameResult::Model(mg)) => {
+                let min_occurs = mg.min_occurs;
+                let max_occurs = mg.max_occurs;
+                self.particle = Some(ParticleResult {
+                    term: ParticleTerm::Group(mg),
+                    min_occurs,
+                    max_occurs,
+                    source: None,
+                });
+            }
+            FrameResult::Wildcard(wc) => {
+                self.attribute_wildcard = Some(wc);
+            }
+            FrameResult::Assert(assertion) => {
+                self.assertions.push(assertion);
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Extension(ExtensionResult {
+            base_type: self.base_type,
+            particle: self.particle,
+            open_content: self.open_content,
+            attributes: self.attributes,
+            attribute_groups: self.attribute_groups,
+            attribute_wildcard: self.attribute_wildcard,
+            assertions: self.assertions,
+            id: self.id,
+            annotation,
+            source: self.source,
+        }))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// List Frame
+// ============================================================================
+
+/// Frame for xs:list within simpleType
+pub struct ListFrame {
+    item_type: Option<TypeRefResult>,
+    id: Option<String>,
+    annotation: Option<Annotation>,
+    inline_type: Option<SimpleTypeResult>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl ListFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+        ns_snapshot: &NamespaceContextSnapshot,
+    ) -> SchemaResult<Self> {
+        let item_type = attrs
+            .get_value_by_name(name_table, "itemType")
+            .map(|s| parse_qname_ref(s, name_table, ns_snapshot))
+            .transpose()?
+            .map(TypeRefResult::QName);
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            item_type,
+            id,
+            annotation: None,
+            inline_type: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for ListFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, xsd_names::ANNOTATION | xsd_names::SIMPLE_TYPE)
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "itemType" | "id")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Type(TypeFrameResult::Simple(st)) => {
+                self.inline_type = Some(st);
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // Validate list structure: itemType XOR inline simpleType
+        let has_item_type_attr = self.item_type.is_some();
+        let has_inline_type = self.inline_type.is_some();
+
+        if has_item_type_attr && has_inline_type {
+            return Err(SchemaError::structural(
+                "sch-list-itemtype-type",
+                "List cannot have both 'itemType' attribute and inline simpleType",
+                None,
+            ));
+        }
+
+        if !has_item_type_attr && !has_inline_type {
+            return Err(SchemaError::structural(
+                "sch-list-itemtype-required",
+                "List must have either 'itemType' attribute or inline simpleType",
+                None,
+            ));
+        }
+
+        let item = if let Some(inline) = self.inline_type {
+            Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+        } else {
+            self.item_type
+        };
+
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+            name: None,
+            variety: SimpleTypeVariety::List,
+            base_type: None,
+            item_type: item,
+            member_types: Vec::new(),
+            facets: FacetSet::new(),
+            final_derivation: DerivationSet::empty(),
+            id: None,
+            derivation_id: self.id,
+            annotation,
+            source: self.source,
+        })))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// Union Frame
+// ============================================================================
+
+/// Frame for xs:union within simpleType
+pub struct UnionFrame {
+    member_types: Vec<TypeRefResult>,
+    id: Option<String>,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl UnionFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+        ns_snapshot: &NamespaceContextSnapshot,
+    ) -> SchemaResult<Self> {
+        let member_types = if let Some(s) = attrs.get_value_by_name(name_table, "memberTypes") {
+            parse_qname_list(s, name_table, ns_snapshot)?
+                .into_iter()
+                .map(TypeRefResult::QName)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            member_types,
+            id,
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for UnionFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, xsd_names::ANNOTATION | xsd_names::SIMPLE_TYPE)
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "memberTypes" | "id")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Type(TypeFrameResult::Simple(st)) => {
+                self.member_types.push(TypeRefResult::Inline(Box::new(
+                    TypeFrameResult::Simple(st),
+                )));
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // Validate union structure: must have memberTypes and/or inline simpleTypes
+        if self.member_types.is_empty() {
+            return Err(SchemaError::structural(
+                "sch-union-members-required",
+                "Union must have 'memberTypes' attribute or inline simpleType children",
+                None,
+            ));
+        }
+
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+            name: None,
+            variety: SimpleTypeVariety::Union,
+            base_type: None,
+            item_type: None,
+            member_types: self.member_types,
+            facets: FacetSet::new(),
+            final_derivation: DerivationSet::empty(),
+            id: None,
+            derivation_id: self.id,
+            annotation,
+            source: self.source,
+        })))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// Simple/Complex Content Frames
+// ============================================================================
+
+/// Frame for xs:simpleContent
+pub struct SimpleContentFrame {
+    id: Option<String>,
+    base_type: Option<TypeRefResult>,
+    derivation: Option<DerivationMethod>,
+    facets: FacetSet,
+    attributes: Vec<AttributeUseResult>,
+    attribute_groups: Vec<QNameRef>,
+    attribute_wildcard: Option<WildcardResult>,
+    assertions: Vec<AssertResult>,
+    derivation_id: Option<String>,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl SimpleContentFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+    ) -> SchemaResult<Self> {
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            id,
+            base_type: None,
+            derivation: None,
+            facets: FacetSet::new(),
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            assertions: Vec::new(),
+            derivation_id: None,
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for SimpleContentFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(
+            local_name,
+            xsd_names::ANNOTATION | xsd_names::RESTRICTION | xsd_names::EXTENSION
+        )
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "id")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Restriction(res) => {
+                let base = if let Some(inline) = res.inline_type {
+                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+                } else {
+                    res.base_type
+                };
+                self.base_type = base;
+                self.derivation = Some(DerivationMethod::Restriction);
+                self.facets = res.facets;
+                self.attributes = res.attributes;
+                self.attribute_groups = res.attribute_groups;
+                self.attribute_wildcard = res.attribute_wildcard;
+                self.assertions = res.assertions;
+                self.derivation_id = res.id;
+            }
+            FrameResult::Extension(res) => {
+                self.base_type = res.base_type;
+                self.derivation = Some(DerivationMethod::Extension);
+                self.attributes = res.attributes;
+                self.attribute_groups = res.attribute_groups;
+                self.attribute_wildcard = res.attribute_wildcard;
+                self.assertions = res.assertions;
+                self.derivation_id = res.id;
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        let base_type = self.base_type.ok_or_else(|| SchemaError::structural(
+            "sch-simple-content",
+            "xs:simpleContent requires a base type",
+            None,
+        ))?;
+
+        Ok(FrameResult::SimpleContent(SimpleContentDefResult {
+            base_type: Some(base_type),
+            derivation: self.derivation.unwrap_or(DerivationMethod::Restriction),
+            facets: self.facets,
+            attributes: self.attributes,
+            attribute_groups: self.attribute_groups,
+            attribute_wildcard: self.attribute_wildcard,
+            assertions: self.assertions,
+            id: self.id,
+            derivation_id: self.derivation_id,
+            source: self.source,
+        }))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+/// Frame for xs:complexContent
+pub struct ComplexContentFrame {
+    id: Option<String>,
+    mixed: bool,
+    base_type: Option<TypeRefResult>,
+    derivation: Option<DerivationMethod>,
+    particle: Option<ParticleResult>,
+    open_content: Option<OpenContentResult>,
+    attributes: Vec<AttributeUseResult>,
+    attribute_groups: Vec<QNameRef>,
+    attribute_wildcard: Option<WildcardResult>,
+    assertions: Vec<AssertResult>,
+    derivation_id: Option<String>,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl ComplexContentFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+    ) -> SchemaResult<Self> {
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        let mixed = parse_bool_attr_default(attrs, name_table, "mixed", false)?;
+
+        Ok(Self {
+            id,
+            mixed,
+            base_type: None,
+            derivation: None,
+            particle: None,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            assertions: Vec::new(),
+            derivation_id: None,
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for ComplexContentFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(
+            local_name,
+            xsd_names::ANNOTATION | xsd_names::RESTRICTION | xsd_names::EXTENSION
+        )
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(local_name, "id" | "mixed")
+    }
+
+    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::Restriction(res) => {
+                self.base_type = res.base_type;
+                self.derivation = Some(DerivationMethod::Restriction);
+                self.particle = res.particle;
+                self.open_content = res.open_content;
+                self.attributes = res.attributes;
+                self.attribute_groups = res.attribute_groups;
+                self.attribute_wildcard = res.attribute_wildcard;
+                self.assertions = res.assertions;
+                self.derivation_id = res.id;
+            }
+            FrameResult::Extension(res) => {
+                self.base_type = res.base_type;
+                self.derivation = Some(DerivationMethod::Extension);
+                self.particle = res.particle;
+                self.open_content = res.open_content;
+                self.attributes = res.attributes;
+                self.attribute_groups = res.attribute_groups;
+                self.attribute_wildcard = res.attribute_wildcard;
+                self.assertions = res.assertions;
+                self.derivation_id = res.id;
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        Ok(FrameResult::ComplexContent(ComplexContentDefResult {
+            particle: self.particle,
+            derivation: self.derivation.unwrap_or(DerivationMethod::Restriction),
+            mixed: self.mixed,
+            base_type: self.base_type,
+            open_content: self.open_content,
+            attributes: self.attributes,
+            attribute_groups: self.attribute_groups,
+            attribute_wildcard: self.attribute_wildcard,
+            assertions: self.assertions,
+            id: self.id,
+            derivation_id: self.derivation_id,
+            source: self.source,
+        }))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+
+// ============================================================================
+// Complex Type Frame
+// ============================================================================
+
+/// Parsing phase for complexType
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComplexTypePhase {
+    Annotation,
+    Content,
+    Attributes,
+    Done,
+}
+
+/// Frame for xs:complexType element
+pub struct ComplexTypeFrame {
+    phase: ComplexTypePhase,
+    name: Option<NameId>,
+    base_type: Option<TypeRefResult>,
+    derivation_method: Option<DerivationMethod>,
+    mixed: bool,
+    is_abstract: bool,
+    final_derivation: DerivationSet,
+    block: DerivationSet,
+    default_attributes_apply: bool,
+    id: Option<String>,
+    content: ComplexContentResult,
+    open_content: Option<OpenContentResult>,
+    attributes: Vec<AttributeUseResult>,
+    attribute_groups: Vec<QNameRef>,
+    attribute_wildcard: Option<WildcardResult>,
+    assertions: Vec<AssertResult>,
+    annotation: Option<Annotation>,
+    source: Option<SourceRef>,
+    foreign_attributes: Vec<ForeignAttribute>,
+}
+
+impl ComplexTypeFrame {
+    pub fn new(
+        attrs: &AttributeMap,
+        name_table: &NameTable,
+        source: Option<SourceRef>,
+    ) -> SchemaResult<Self> {
+        let name = attrs
+            .get_value_by_name(name_table, "name")
+            .and_then(|s| name_table.get(s));
+
+        let mixed = parse_bool_attr_default(attrs, name_table, "mixed", false)?;
+
+        let is_abstract = parse_bool_attr_default(attrs, name_table, "abstract", false)?;
+
+        let final_derivation = parse_derivation_set(
+            attrs.get_value_by_name(name_table, "final"),
+        )?;
+
+        let block = parse_derivation_set(
+            attrs.get_value_by_name(name_table, "block"),
+        )?;
+
+        let default_attributes_apply =
+            parse_bool_attr_default(attrs, name_table, "defaultAttributesApply", true)?;
+
+        let id = attrs
+            .get_value_by_name(name_table, "id")
+            .map(String::from);
+
+        Ok(Self {
+            phase: ComplexTypePhase::Annotation,
+            name,
+            base_type: None,
+            derivation_method: None,
+            mixed,
+            is_abstract,
+            final_derivation,
+            block,
+            default_attributes_apply,
+            id,
+            content: ComplexContentResult::Empty,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            assertions: Vec::new(),
+            annotation: None,
+            source,
+            foreign_attributes: Vec::new(),
+        })
+    }
+}
+
+impl Frame for ComplexTypeFrame {
+    fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        match self.phase {
+            ComplexTypePhase::Annotation => matches!(
+                local_name,
+                xsd_names::ANNOTATION
+                    | xsd_names::SIMPLE_CONTENT
+                    | xsd_names::COMPLEX_CONTENT
+                    | xsd_names::OPEN_CONTENT
+                    | xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+                    | xsd_names::ASSERT
+            ),
+            ComplexTypePhase::Content => matches!(
+                local_name,
+                xsd_names::SIMPLE_CONTENT
+                    | xsd_names::COMPLEX_CONTENT
+                    | xsd_names::OPEN_CONTENT
+                    | xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+                    | xsd_names::ASSERT
+            ),
+            ComplexTypePhase::Attributes => matches!(
+                local_name,
+                xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+                    | xsd_names::ASSERT
+            ),
+            ComplexTypePhase::Done => false,
+        }
+    }
+
+    fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        matches!(
+            local_name,
+            "name"
+                | "mixed"
+                | "abstract"
+                | "final"
+                | "block"
+                | "defaultAttributesApply"
+                | "id"
+        )
+    }
+
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        match local_name {
+            xsd_names::ANNOTATION => {
+                self.phase = ComplexTypePhase::Content;
+            }
+            xsd_names::SIMPLE_CONTENT | xsd_names::COMPLEX_CONTENT => {
+                self.phase = ComplexTypePhase::Done;
+            }
+            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
+                self.phase = ComplexTypePhase::Attributes;
+            }
+            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
+                self.phase = ComplexTypePhase::Attributes;
+            }
+            xsd_names::ANY_ATTRIBUTE => {
+                self.phase = ComplexTypePhase::Done;
+            }
+            _ => {}
+        }
+    }
+
+    fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
+        match child {
+            FrameResult::Annotation(ann) => {
+                self.annotation = Some(ann);
+            }
+            FrameResult::OpenContent(open_content) => {
+                self.open_content = Some(open_content);
+            }
+            FrameResult::SimpleContent(mut sc) => {
+                self.base_type = sc
+                    .base_type
+                    .as_ref()
+                    .and_then(|bt| match bt {
+                        TypeRefResult::QName(qname) => {
+                            Some(TypeRefResult::QName(qname.clone()))
+                        }
+                        _ => None,
+                    });
+                self.derivation_method = Some(sc.derivation);
+                self.attributes = std::mem::take(&mut sc.attributes);
+                self.attribute_groups = std::mem::take(&mut sc.attribute_groups);
+                self.attribute_wildcard = sc.attribute_wildcard.take();
+                self.content = ComplexContentResult::Simple(sc);
+            }
+            FrameResult::ComplexContent(mut cc) => {
+                self.base_type = cc
+                    .base_type
+                    .as_ref()
+                    .and_then(|bt| match bt {
+                        TypeRefResult::QName(qname) => {
+                            Some(TypeRefResult::QName(qname.clone()))
+                        }
+                        _ => None,
+                    });
+                self.derivation_method = Some(cc.derivation);
+                self.attributes = std::mem::take(&mut cc.attributes);
+                self.attribute_groups = std::mem::take(&mut cc.attribute_groups);
+                self.attribute_wildcard = cc.attribute_wildcard.take();
+                self.mixed = cc.mixed;
+                self.content = ComplexContentResult::Complex(cc);
+            }
+            FrameResult::Particle(particle) => {
+                self.content = ComplexContentResult::Complex(ComplexContentDefResult {
+                    particle: Some(particle),
+                    derivation: DerivationMethod::Restriction,
+                    mixed: self.mixed,
+                    base_type: None,
+                    open_content: None,
+                    attributes: Vec::new(),
+                    attribute_groups: Vec::new(),
+                    attribute_wildcard: None,
+                    assertions: Vec::new(),
+                    id: None,
+                    derivation_id: None,
+                    source: None,
+                });
+            }
+            FrameResult::Attribute(attr) => {
+                self.attributes.push(AttributeUseResult {
+                    attribute: attr,
+                    use_kind: AttributeUseKind::Optional,
+                });
+            }
+            FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
+                if let Some(ref_name) = ag.ref_name {
+                    self.attribute_groups.push(ref_name);
+                }
+            }
+            FrameResult::Wildcard(wc) => {
+                self.attribute_wildcard = Some(wc);
+            }
+            FrameResult::Assert(assertion) => {
+                self.assertions.push(assertion);
+            }
+            FrameResult::Skip => {}
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        let mut content = self.content;
+        match &mut content {
+            ComplexContentResult::Empty => {
+                if self.open_content.is_some() || !self.assertions.is_empty() {
+                    content = ComplexContentResult::Complex(ComplexContentDefResult {
+                        particle: None,
+                        derivation: DerivationMethod::Restriction,
+                        mixed: self.mixed,
+                        base_type: None,
+                        open_content: self.open_content,
+                        attributes: Vec::new(),
+                        attribute_groups: Vec::new(),
+                        attribute_wildcard: None,
+                        assertions: self.assertions,
+                        id: None,
+                        derivation_id: None,
+                        source: None,
+                    });
+                }
+            }
+            ComplexContentResult::Complex(cc) => {
+                if cc.open_content.is_none() {
+                    cc.open_content = self.open_content;
+                }
+                if !self.assertions.is_empty() {
+                    cc.assertions.extend(self.assertions);
+                }
+            }
+            ComplexContentResult::Simple(_) => {}
+        }
+
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+        Ok(FrameResult::Type(TypeFrameResult::Complex(ComplexTypeResult {
+            name: self.name,
+            base_type: self.base_type,
+            derivation_method: self.derivation_method,
+            content,
+            attributes: self.attributes,
+            attribute_groups: self.attribute_groups,
+            attribute_wildcard: self.attribute_wildcard,
+            mixed: self.mixed,
+            is_abstract: self.is_abstract,
+            final_derivation: self.final_derivation,
+            block: self.block,
+            default_attributes_apply: self.default_attributes_apply,
+            id: self.id,
+            annotation,
+            source: self.source,
+        })))
+    }
+
+    fn source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
+
+    fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
+        self.foreign_attributes = attrs;
+    }
+}
+

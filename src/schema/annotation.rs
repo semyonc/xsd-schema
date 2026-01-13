@@ -249,6 +249,28 @@ pub fn create_implicit_annotation(attrs: Vec<ForeignAttribute>, source: Option<S
     }
 }
 
+/// Merge foreign attributes into an existing annotation or create an implicit one
+///
+/// This is used by frame finish() methods to ensure foreign attributes on schema
+/// elements are preserved. If no explicit annotation exists, an implicit one is
+/// created to hold the foreign attributes.
+pub fn merge_foreign_attributes(
+    annotation: Option<Annotation>,
+    foreign_attrs: Vec<ForeignAttribute>,
+    source: Option<SourceRef>,
+) -> Option<Annotation> {
+    if foreign_attrs.is_empty() {
+        return annotation;
+    }
+    match annotation {
+        Some(mut ann) => {
+            ann.attributes.extend(foreign_attrs);
+            Some(ann)
+        }
+        None => Some(create_implicit_annotation(foreign_attrs, source))
+    }
+}
+
 /// Helper to check if an attribute is a foreign attribute
 ///
 /// Foreign attributes are those not in:

@@ -200,13 +200,37 @@ pub enum NamespaceScope {
 
 /// Snapshot of namespace bindings at a point in time
 ///
-/// Used to capture context for annotation processing.
+/// Used to capture context for annotation processing and QName resolution.
 #[derive(Debug, Clone, Default)]
 pub struct NamespaceContextSnapshot {
     /// Default namespace at snapshot time
     pub default_ns: Option<NameId>,
     /// All prefix bindings (excluding xml/xmlns)
     pub bindings: Vec<(NameId, NameId)>,
+}
+
+impl NamespaceContextSnapshot {
+    /// Look up namespace URI for a prefix NameId
+    ///
+    /// Searches through the captured bindings to find the namespace
+    /// associated with the given prefix.
+    pub fn resolve_prefix(&self, prefix_id: NameId) -> Option<NameId> {
+        for &(p, ns) in &self.bindings {
+            if p == prefix_id {
+                return Some(ns);
+            }
+        }
+        // Check well-known xml prefix (always in scope per XML spec)
+        if prefix_id == well_known::XML_PREFIX {
+            return Some(well_known::XML_NAMESPACE);
+        }
+        None
+    }
+
+    /// Get the default namespace (for unprefixed elements)
+    pub fn default_namespace(&self) -> Option<NameId> {
+        self.default_ns
+    }
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@
 //!
 //! # Usage
 //!
-//! ```ignore
+//! ```
 //! use xsd_schema::{SchemaSet, load_and_process_schema, PipelineConfig};
 //!
 //! let mut schema_set = SchemaSet::new();
@@ -18,9 +18,10 @@
 //!     <xs:element name="root" type="xs:string"/>
 //! </xs:schema>"#;
 //!
-//! let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)?;
-//! println!("Processed {} inline types", result.inline_stats.total_inline_types);
-//! println!("Resolved {} type references", result.resolution_stats.types_resolved);
+//! let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+//!     .expect("failed to process schema");
+//! println!("Processed {} inline types", result.inline_stats.unwrap().total_inline_types);
+//! println!("Resolved {} type references", result.resolution_stats.unwrap().types_resolved);
 //! ```
 
 use crate::error::SchemaResult;
@@ -137,7 +138,7 @@ impl From<&ResolutionResult> for DirectiveStats {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use xsd_schema::{SchemaSet, load_and_process_schema};
 ///
 /// let mut schema_set = SchemaSet::new();
@@ -152,7 +153,8 @@ impl From<&ResolutionResult> for DirectiveStats {
 ///     </xs:element>
 /// </xs:schema>"#;
 ///
-/// let stats = load_and_process_schema(xsd.as_bytes(), "schema.xsd", &mut schema_set, None)?;
+/// let stats = load_and_process_schema(xsd.as_bytes(), "schema.xsd", &mut schema_set, None)
+///     .expect("failed to process schema");
 /// assert!(stats.inline_stats.unwrap().total_inline_types > 0);
 /// ```
 pub fn load_and_process_schema(
@@ -541,11 +543,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "List itemType XOR inline validation not yet wired into parsing pipeline (XSD_TODO.md item C)"]
     fn test_list_itemtype_xor_inline() {
         // List with both itemType and inline simpleType should be rejected
-        // NOTE: validate_list_structure() exists in structure.rs but is not called
-        // during parsing. This test is ignored until the wiring is complete.
         let mut schema_set = SchemaSet::new();
         let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
@@ -674,5 +673,91 @@ mod tests {
         let valid_name = schema_set.name_table.get("valid").unwrap();
         let elem_key = schema_set.lookup_element(None, valid_name);
         assert!(elem_key.is_some(), "Valid element should be parsed after unknown subtree");
+    }
+
+    // ========================================================================
+    // Foreign Attribute / Implicit Annotation Tests (from XSD_EXTENSIBILITY.md)
+    // ========================================================================
+
+    #[test]
+    fn test_element_foreign_attribute_creates_implicit_annotation() {
+        // Element with foreign attribute but no explicit annotation should get implicit one
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                       xmlns:custom="http://example.com/custom">
+                <xs:element name="test" custom:attr="value"/>
+            </xs:schema>"#;
+
+        let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+        assert!(result.is_ok(), "Should parse schema with foreign attribute: {:?}", result);
+
+        // Verify element has annotation with foreign attribute
+        let test_name = schema_set.name_table.get("test").unwrap();
+        let elem_key = schema_set.lookup_element(None, test_name).unwrap();
+        let elem = schema_set.arenas.elements.get(elem_key).unwrap();
+
+        assert!(elem.annotation.is_some(), "Element with foreign attribute should have annotation");
+        let ann = elem.annotation.as_ref().unwrap();
+        assert!(!ann.attributes.is_empty(), "Annotation should have foreign attributes");
+        assert_eq!(ann.attributes[0].value, "value");
+    }
+
+    #[test]
+    fn test_foreign_attribute_merged_with_explicit_annotation() {
+        // Element with both explicit annotation and foreign attribute
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                       xmlns:custom="http://example.com/custom">
+                <xs:element name="test" custom:attr="value">
+                    <xs:annotation>
+                        <xs:documentation>Test documentation</xs:documentation>
+                    </xs:annotation>
+                </xs:element>
+            </xs:schema>"#;
+
+        let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+        assert!(result.is_ok(), "Should parse schema: {:?}", result);
+
+        // Verify element has annotation with both documentation and foreign attribute
+        let test_name = schema_set.name_table.get("test").unwrap();
+        let elem_key = schema_set.lookup_element(None, test_name).unwrap();
+        let elem = schema_set.arenas.elements.get(elem_key).unwrap();
+
+        assert!(elem.annotation.is_some(), "Element should have annotation");
+        let ann = elem.annotation.as_ref().unwrap();
+        assert!(!ann.items.is_empty(), "Annotation should have documentation item");
+        assert!(!ann.attributes.is_empty(), "Annotation should have merged foreign attributes");
+    }
+
+    #[test]
+    fn test_complex_type_foreign_attribute() {
+        // ComplexType with foreign attribute
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                       xmlns:jaxb="http://java.sun.com/xml/ns/jaxb">
+                <xs:complexType name="PersonType" jaxb:class="Person">
+                    <xs:sequence>
+                        <xs:element name="name" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:schema>"#;
+
+        let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+        assert!(result.is_ok(), "Should parse schema: {:?}", result);
+
+        // Verify complex type has annotation with foreign attribute
+        let type_name = schema_set.name_table.get("PersonType").unwrap();
+        let type_key = schema_set.lookup_type(None, type_name).unwrap();
+        if let TypeKey::Complex(ct_key) = type_key {
+            let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
+            assert!(ct.annotation.is_some(), "ComplexType with foreign attribute should have annotation");
+            let ann = ct.annotation.as_ref().unwrap();
+            assert!(!ann.attributes.is_empty(), "Annotation should have foreign attributes");
+        } else {
+            panic!("Expected complex type");
+        }
     }
 }

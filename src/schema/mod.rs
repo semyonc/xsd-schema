@@ -13,6 +13,8 @@
 //! - `inline` - Inline type assembly (TypeRefResult::Inline → TypeKey)
 //! - `dependencies` - Dependency graph for type compilation order
 //! - `derivation` - Type derivation validation
+//! - `redefine` - xs:redefine processing
+//! - `override_dir` - xs:override processing (XSD 1.1)
 
 pub mod model;
 pub mod decl;
@@ -23,6 +25,8 @@ pub mod resolver;
 pub mod inline;
 pub mod dependencies;
 pub mod derivation;
+pub mod redefine;
+pub mod override_dir;
 
 // Re-exports from model
 pub use model::{
@@ -76,3 +80,9 @@ pub use dependencies::{
 pub use derivation::{
     validate_all_derivations, DerivationStats as DerivationValidationStats,
 };
+
+// Re-exports from redefine
+pub use redefine::apply_redefine;
+
+// Re-exports from override_dir
+pub use override_dir::apply_override;

@@ -21,7 +21,6 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
-use crate::namespace::table::well_known;
 use crate::parser::frames::{QNameRef, TypeRefResult};
 use crate::parser::location::SourceRef;
 use crate::schema::SchemaSet;
@@ -43,20 +42,19 @@ impl<'a> ReferenceResolver<'a> {
     /// Resolve a type reference (QName → TypeKey)
     ///
     /// Checks built-in types first, then user-defined types.
-    /// If the namespace is not resolved but a prefix is present, attempts to
-    /// resolve the prefix to a known XSD namespace for built-in type lookup.
+    /// The namespace should already be resolved during parsing via NamespaceContextSnapshot.
     pub fn resolve_type_ref(
         &self,
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<TypeKey> {
-        // Determine the effective namespace for lookup
-        let effective_namespace = self.resolve_effective_namespace(qname);
+        // Use the namespace resolved during parsing
+        let namespace = qname.namespace;
 
         // 1. Check built-in types first (XS namespace)
         if let Some(type_key) = self
             .schema_set
-            .get_built_in_simple_type_by_qname(effective_namespace, qname.local_name)
+            .get_built_in_simple_type_by_qname(namespace, qname.local_name)
         {
             return Ok(TypeKey::Simple(type_key));
         }
@@ -64,7 +62,7 @@ impl<'a> ReferenceResolver<'a> {
         // 2. Look up in namespace table
         if let Some(type_key) = self
             .schema_set
-            .lookup_type(effective_namespace, qname.local_name)
+            .lookup_type(namespace, qname.local_name)
         {
             return Ok(type_key);
         }
@@ -77,38 +75,6 @@ impl<'a> ReferenceResolver<'a> {
             format!("Type '{}' not found", name_str),
             location,
         ))
-    }
-
-    /// Resolve the effective namespace for a QName reference.
-    ///
-    /// If the namespace is already set, returns it directly.
-    /// If not set but a prefix is present, attempts to resolve the prefix
-    /// to a known XSD namespace based on common conventions.
-    fn resolve_effective_namespace(&self, qname: &QNameRef) -> Option<NameId> {
-        // If namespace is already resolved, use it
-        if qname.namespace.is_some() {
-            return qname.namespace;
-        }
-
-        // If we have a prefix, try to resolve it to a known namespace
-        if let Some(prefix_id) = qname.prefix {
-            let prefix = self.schema_set.name_table.resolve(prefix_id);
-            // Check for common XSD prefixes
-            if matches!(prefix, "xs" | "xsd" | "xmlschema") {
-                return Some(well_known::XS_NAMESPACE);
-            }
-            // Check for common XSI prefixes
-            if matches!(prefix, "xsi") {
-                return Some(well_known::XSI_NAMESPACE);
-            }
-            // Check for XML namespace prefix
-            if prefix == "xml" {
-                return Some(well_known::XML_NAMESPACE);
-            }
-        }
-
-        // No namespace resolution possible
-        None
     }
 
     /// Resolve a TypeRefResult to a TypeKey

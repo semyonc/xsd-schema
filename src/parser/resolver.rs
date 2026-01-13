@@ -33,8 +33,16 @@
 //! - Relative paths (resolved against base URI)
 //! - HTTP/HTTPS URLs (via async trait)
 //! - Catalog-based resolution
+//!
+//! # Customizable Loading
+//!
+//! The [`SchemaLoader`] trait allows custom loading strategies:
+//! - [`FileSystemLoader`] - Loads from local file system
+//! - [`EmbeddedLoader`] - Loads from embedded static assets
+//! - [`LoaderChain`] - Combines multiple loaders with priority
 
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
 use crate::error::{SchemaError, SchemaResult};
@@ -42,7 +50,197 @@ use crate::ids::{DocumentId, NameId};
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
 use crate::SchemaSet;
 
-/// Schema resolver for loading external schema documents
+// ============================================================================
+// SchemaLoader Trait and Implementations
+// ============================================================================
+
+/// Trait for loading schema content from various sources.
+///
+/// Implementations can support file systems, HTTP, embedded resources, etc.
+/// The loader chain uses priority to determine which loader handles a request.
+pub trait SchemaLoader: Send + Sync + Debug {
+    /// Load schema content from the given location.
+    ///
+    /// Returns the schema content as a string, or an error if loading fails.
+    fn load(&self, location: &str) -> SchemaResult<String>;
+
+    /// Check if this loader can handle the given location.
+    ///
+    /// Used by [`LoaderChain`] to find an appropriate loader.
+    fn can_load(&self, location: &str) -> bool;
+
+    /// Priority for loader chain (higher = checked first).
+    ///
+    /// Default is 0. Embedded loader uses 100 to be checked before file system.
+    fn priority(&self) -> i32 {
+        0
+    }
+}
+
+/// File system schema loader (default).
+///
+/// Loads schemas from local file system paths.
+#[derive(Debug, Clone, Default)]
+pub struct FileSystemLoader {
+    /// Base directory for resolving relative paths (not currently used directly)
+    pub base_dir: Option<PathBuf>,
+}
+
+impl FileSystemLoader {
+    /// Create a new file system loader.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Create a file system loader with a base directory.
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        Self {
+            base_dir: Some(base_dir),
+        }
+    }
+}
+
+impl SchemaLoader for FileSystemLoader {
+    fn load(&self, location: &str) -> SchemaResult<String> {
+        let path = Path::new(location);
+        std::fs::read_to_string(path).map_err(|e| {
+            SchemaError::resolution(format!("Failed to read file '{}': {}", location, e))
+        })
+    }
+
+    fn can_load(&self, location: &str) -> bool {
+        !location.starts_with("http://")
+            && !location.starts_with("https://")
+            && !location.starts_with("embedded://")
+    }
+
+    fn priority(&self) -> i32 {
+        0
+    }
+}
+
+/// Embedded resource loader for built-in schemas.
+///
+/// Loads schemas from static assets embedded in the binary using the
+/// `embedded://` URI scheme.
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddedLoader;
+
+impl EmbeddedLoader {
+    /// Create a new embedded loader.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl SchemaLoader for EmbeddedLoader {
+    fn load(&self, location: &str) -> SchemaResult<String> {
+        if let Some(rest) = location.strip_prefix("embedded://") {
+            match rest {
+                "xml.xsd" => {
+                    let bytes = crate::embedded::XML_XSD;
+                    String::from_utf8(bytes.to_vec()).map_err(|e| {
+                        SchemaError::resolution(format!("Invalid UTF-8 in embedded schema: {}", e))
+                    })
+                }
+                _ => Err(SchemaError::resolution(format!(
+                    "Unknown embedded schema: {}",
+                    rest
+                ))),
+            }
+        } else {
+            Err(SchemaError::resolution(format!(
+                "Not an embedded location: {}",
+                location
+            )))
+        }
+    }
+
+    fn can_load(&self, location: &str) -> bool {
+        location.starts_with("embedded://")
+    }
+
+    fn priority(&self) -> i32 {
+        100 // High priority - checked before file system
+    }
+}
+
+/// Composite loader that chains multiple loaders.
+///
+/// Loaders are tried in priority order (highest first) until one can handle
+/// the requested location.
+#[derive(Debug, Default)]
+pub struct LoaderChain {
+    loaders: Vec<Box<dyn SchemaLoader>>,
+}
+
+impl LoaderChain {
+    /// Create a new empty loader chain.
+    pub fn new() -> Self {
+        Self {
+            loaders: Vec::new(),
+        }
+    }
+
+    /// Create a loader chain with default loaders (embedded + filesystem).
+    pub fn with_defaults() -> Self {
+        let mut chain = Self::new();
+        chain.add(Box::new(EmbeddedLoader::new()));
+        chain.add(Box::new(FileSystemLoader::new()));
+        chain
+    }
+
+    /// Add a loader to the chain.
+    ///
+    /// Loaders are automatically sorted by priority (highest first).
+    pub fn add(&mut self, loader: Box<dyn SchemaLoader>) {
+        self.loaders.push(loader);
+        self.loaders
+            .sort_by(|a, b| b.priority().cmp(&a.priority()));
+    }
+
+    /// Get the number of loaders in the chain.
+    pub fn len(&self) -> usize {
+        self.loaders.len()
+    }
+
+    /// Check if the chain is empty.
+    pub fn is_empty(&self) -> bool {
+        self.loaders.is_empty()
+    }
+}
+
+impl SchemaLoader for LoaderChain {
+    fn load(&self, location: &str) -> SchemaResult<String> {
+        for loader in &self.loaders {
+            if loader.can_load(location) {
+                return loader.load(location);
+            }
+        }
+        Err(SchemaError::resolution(format!(
+            "No loader available for: {}",
+            location
+        )))
+    }
+
+    fn can_load(&self, location: &str) -> bool {
+        self.loaders.iter().any(|l| l.can_load(location))
+    }
+
+    fn priority(&self) -> i32 {
+        // Chain priority is max of all loaders
+        self.loaders.iter().map(|l| l.priority()).max().unwrap_or(0)
+    }
+}
+
+// ============================================================================
+// Schema Resolver
+// ============================================================================
+
+/// Schema resolver for loading external schema documents.
+///
+/// Uses a [`SchemaLoader`] chain to support multiple loading strategies
+/// (file system, embedded assets, HTTP, etc.).
 pub struct SchemaResolver {
     /// Configuration for resolution
     pub config: ResolverConfig,
@@ -50,6 +248,8 @@ pub struct SchemaResolver {
     resolving: HashSet<String>,
     /// Catalog for namespace-to-location mapping
     catalog: SchemaCatalog,
+    /// Schema loader chain
+    loader: Box<dyn SchemaLoader>,
 }
 
 /// Configuration for schema resolution
@@ -114,15 +314,19 @@ impl SchemaCatalog {
             .map(|e| e.location.as_str())
     }
 
-    /// Add well-known XML namespaces
+    /// Add well-known XML namespaces with embedded schema locations.
+    ///
+    /// Maps standard XML namespaces to `embedded://` URIs that are resolved
+    /// by the [`EmbeddedLoader`].
     pub fn add_xml_catalog(&mut self) {
-        // XML namespace (always implicitly available)
+        // XML namespace (xml:lang, xml:space, xml:base) - uses embedded schema
         self.add(
             "http://www.w3.org/XML/1998/namespace",
-            "http://www.w3.org/2001/xml.xsd",
+            "embedded://xml.xsd",
         );
 
-        // XML Schema instance namespace
+        // XML Schema instance namespace (xsi:type, xsi:nil, etc.)
+        // Note: This could be embedded in the future
         self.add(
             "http://www.w3.org/2001/XMLSchema-instance",
             "http://www.w3.org/2001/XMLSchema-instance.xsd",
@@ -131,21 +335,57 @@ impl SchemaCatalog {
 }
 
 impl SchemaResolver {
-    /// Create a new resolver with default configuration
+    /// Create a new resolver with default configuration and loader chain.
+    ///
+    /// Uses [`LoaderChain::with_defaults()`] which includes:
+    /// - [`EmbeddedLoader`] for `embedded://` URIs
+    /// - [`FileSystemLoader`] for file paths
     pub fn new() -> Self {
         Self {
             config: ResolverConfig::default(),
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
+            loader: Box::new(LoaderChain::with_defaults()),
         }
     }
 
-    /// Create a resolver with the specified configuration
+    /// Create a resolver with the specified configuration.
+    ///
+    /// Uses the default loader chain.
     pub fn with_config(config: ResolverConfig) -> Self {
         Self {
             config,
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
+            loader: Box::new(LoaderChain::with_defaults()),
+        }
+    }
+
+    /// Create a resolver with a custom loader.
+    ///
+    /// # Example
+    /// ```
+    /// use xsd_schema::{SchemaResolver, LoaderChain};
+    ///
+    /// let loader = LoaderChain::with_defaults();
+    /// let resolver = SchemaResolver::with_loader(Box::new(loader));
+    /// ```
+    pub fn with_loader(loader: Box<dyn SchemaLoader>) -> Self {
+        Self {
+            config: ResolverConfig::default(),
+            resolving: HashSet::new(),
+            catalog: SchemaCatalog::new(),
+            loader,
+        }
+    }
+
+    /// Create a resolver with custom configuration and loader.
+    pub fn with_config_and_loader(config: ResolverConfig, loader: Box<dyn SchemaLoader>) -> Self {
+        Self {
+            config,
+            resolving: HashSet::new(),
+            catalog: SchemaCatalog::new(),
+            loader,
         }
     }
 
@@ -217,27 +457,22 @@ impl SchemaResolver {
         Ok(Some(doc_id))
     }
 
-    /// Load content from a location
-    fn load_content(&self, location: &str) -> SchemaResult<String> {
-        if location.starts_with("http://") || location.starts_with("https://") {
-            if !self.config.allow_network {
-                return Err(SchemaError::resolution(format!(
-                    "Network access not allowed for: {}",
-                    location
-                )));
-            }
-            // TODO: Implement HTTP loading (requires async or blocking HTTP client)
-            Err(SchemaError::resolution(format!(
-                "HTTP loading not yet implemented: {}",
+    /// Load content from a location using the configured loader chain.
+    ///
+    /// Supports embedded://, file paths, and potentially HTTP (if configured).
+    pub fn load_content(&self, location: &str) -> SchemaResult<String> {
+        // Check network access for HTTP URLs
+        if (location.starts_with("http://") || location.starts_with("https://"))
+            && !self.config.allow_network
+        {
+            return Err(SchemaError::resolution(format!(
+                "Network access not allowed for: {}",
                 location
-            )))
-        } else {
-            // File path
-            let path = Path::new(location);
-            std::fs::read_to_string(path).map_err(|e| {
-                SchemaError::resolution(format!("Failed to read file '{}': {}", location, e))
-            })
+            )));
         }
+
+        // Use the loader chain
+        self.loader.load(location)
     }
 
     /// Process an include directive
@@ -548,11 +783,76 @@ mod tests {
         let mut catalog = SchemaCatalog::new();
         catalog.add_xml_catalog();
 
-        assert!(catalog
-            .lookup("http://www.w3.org/XML/1998/namespace")
-            .is_some());
+        assert_eq!(
+            catalog.lookup("http://www.w3.org/XML/1998/namespace"),
+            Some("embedded://xml.xsd")
+        );
         assert!(catalog
             .lookup("http://www.w3.org/2001/XMLSchema-instance")
             .is_some());
+    }
+
+    #[test]
+    fn test_embedded_loader() {
+        let loader = EmbeddedLoader::new();
+
+        // Can load embedded URIs
+        assert!(loader.can_load("embedded://xml.xsd"));
+        assert!(!loader.can_load("/path/to/file.xsd"));
+        assert!(!loader.can_load("http://example.com/schema.xsd"));
+
+        // Load xml.xsd
+        let content = loader.load("embedded://xml.xsd").unwrap();
+        assert!(content.contains("targetNamespace=\"http://www.w3.org/XML/1998/namespace\""));
+
+        // Unknown embedded schema
+        assert!(loader.load("embedded://unknown.xsd").is_err());
+    }
+
+    #[test]
+    fn test_file_system_loader() {
+        let loader = FileSystemLoader::new();
+
+        // Can load file paths, not embedded or HTTP
+        assert!(loader.can_load("/path/to/file.xsd"));
+        assert!(loader.can_load("relative/path.xsd"));
+        assert!(!loader.can_load("embedded://xml.xsd"));
+        assert!(!loader.can_load("http://example.com/schema.xsd"));
+        assert!(!loader.can_load("https://example.com/schema.xsd"));
+    }
+
+    #[test]
+    fn test_loader_chain() {
+        let chain = LoaderChain::with_defaults();
+
+        // Can load both embedded and file paths
+        assert!(chain.can_load("embedded://xml.xsd"));
+        assert!(chain.can_load("/path/to/file.xsd"));
+
+        // Load embedded schema through chain
+        let content = chain.load("embedded://xml.xsd").unwrap();
+        assert!(content.contains("http://www.w3.org/XML/1998/namespace"));
+
+        // Chain has expected number of loaders
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[test]
+    fn test_loader_chain_priority() {
+        let mut chain = LoaderChain::new();
+        chain.add(Box::new(FileSystemLoader::new())); // priority 0
+        chain.add(Box::new(EmbeddedLoader::new())); // priority 100
+
+        // EmbeddedLoader should be first due to higher priority
+        assert_eq!(chain.priority(), 100);
+    }
+
+    #[test]
+    fn test_resolver_with_embedded_loader() {
+        let resolver = SchemaResolver::new();
+
+        // Load embedded xml.xsd
+        let content = resolver.load_content("embedded://xml.xsd").unwrap();
+        assert!(content.contains("http://www.w3.org/XML/1998/namespace"));
     }
 }

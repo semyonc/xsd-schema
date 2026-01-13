@@ -14,7 +14,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```
 //! use xsd_schema::parser::parse::parse_schema;
 //! use xsd_schema::SchemaSet;
 //!
@@ -23,7 +23,9 @@
 //!     <xs:element name="root" type="xs:string"/>
 //! </xs:schema>"#;
 //!
-//! let doc_id = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set)?;
+//! let doc_id = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set)
+//!     .expect("parse failed");
+//! assert_eq!(doc_id, 0);
 //! ```
 
 use quick_xml::events::Event;
@@ -517,6 +519,9 @@ fn handle_start_element(
         intern_attribute_values(local_name, &attr_map, state.ns_context.name_table_mut());
     }
 
+    // Create namespace snapshot for QName resolution during frame construction
+    let ns_snapshot = state.ns_context.snapshot();
+
     // Create the new frame
     let frame = if state.config.error_recovery {
         let mut frame = create_frame_recovering(
@@ -524,12 +529,13 @@ fn handle_start_element(
             &attr_map,
             state.ns_context.name_table(),
             source_ref.clone(),
+            &ns_snapshot,
             &mut state.errors,
         );
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
-            frame.set_namespaces(state.ns_context.snapshot());
+            frame.set_namespaces(ns_snapshot.clone());
         }
         frame
     } else {
@@ -538,11 +544,12 @@ fn handle_start_element(
             &attr_map,
             state.ns_context.name_table(),
             source_ref.clone(),
+            &ns_snapshot,
         )?;
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
-            frame.set_namespaces(state.ns_context.snapshot());
+            frame.set_namespaces(ns_snapshot.clone());
         }
         frame
     };
@@ -583,7 +590,21 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
         }
     };
 
-    let result = frame.finish()?;
+    // Save source ref before finish() consumes the frame
+    let source_ref = frame.source().cloned();
+
+    let result = match frame.finish() {
+        Ok(r) => r,
+        Err(e) => {
+            // Add source location to error if available
+            let e = if let Some(ref src) = source_ref {
+                e.with_location(state.source_map.locate(src.span.start))
+            } else {
+                e
+            };
+            return Err(e);
+        }
+    };
 
     // Pop namespace scope
     state.pop_scope();
