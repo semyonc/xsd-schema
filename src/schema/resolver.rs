@@ -54,9 +54,9 @@ impl<'a> ReferenceResolver<'a> {
         // 1. Check built-in types first (XS namespace)
         if let Some(type_key) = self
             .schema_set
-            .get_built_in_simple_type_by_qname(namespace, qname.local_name)
+            .get_built_in_type_by_qname(namespace, qname.local_name)
         {
-            return Ok(TypeKey::Simple(type_key));
+            return Ok(type_key);
         }
 
         // 2. Look up in namespace table
@@ -394,7 +394,7 @@ fn resolve_element_references(
     let resolver = ReferenceResolver::new(schema_set);
 
     // Resolve type reference (if not already resolved from inline type)
-    let resolved_type = if already_resolved_type.is_some() {
+    let mut resolved_type = if already_resolved_type.is_some() {
         // Type was already resolved during assembly (inline type)
         already_resolved_type
     } else if let Some(ref qname) = type_qname {
@@ -404,6 +404,9 @@ fn resolve_element_references(
     } else {
         None
     };
+    if resolved_type.is_none() && ref_name.is_none() {
+        resolved_type = Some(TypeKey::Complex(schema_set.any_type_key()));
+    }
 
     // Resolve element reference (for <xs:element ref="...">)
     let resolved_ref = if let Some(ref qname) = ref_name {
@@ -939,6 +942,28 @@ mod tests {
 
         let result = resolver.resolve_type_ref(&qname, None);
         assert!(result.is_ok(), "Should resolve xs:integer");
+    }
+
+    #[test]
+    fn test_resolve_builtin_any_type() {
+        let schema_set = SchemaSet::new();
+        let resolver = ReferenceResolver::new(&schema_set);
+
+        let any_type_name = schema_set.name_table.get("anyType").unwrap();
+        let qname = QNameRef {
+            prefix: None,
+            local_name: any_type_name,
+            namespace: Some(well_known::XS_NAMESPACE),
+        };
+
+        let result = resolver.resolve_type_ref(&qname, None);
+        assert!(result.is_ok(), "Should resolve xs:anyType");
+
+        if let Ok(TypeKey::Complex(key)) = result {
+            assert_eq!(key, schema_set.builtin_types().any_type);
+        } else {
+            panic!("Expected Complex type key");
+        }
     }
 
     #[test]

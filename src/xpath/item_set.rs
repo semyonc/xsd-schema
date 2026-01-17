@@ -13,6 +13,7 @@ use std::cmp::Ordering;
 use std::ops::{Index, IndexMut};
 use std::slice;
 
+use super::error::XPathError;
 use super::iterator::XmlItem;
 use super::timsort::{timsort_slice_with_comparer, IComparer};
 use super::{DomNavigator, XmlNodeOrder};
@@ -295,6 +296,30 @@ impl XPathComparer {
     pub fn new() -> Self {
         XPathComparer
     }
+
+    /// Fallible comparison of two XmlItems in document order.
+    ///
+    /// Returns an error if either item is not a node.
+    pub fn try_compare<N: DomNavigator>(
+        &self,
+        x: &XmlItem<N>,
+        y: &XmlItem<N>,
+    ) -> Result<Ordering, XPathError> {
+        match (x, y) {
+            (XmlItem::Node(nav1), XmlItem::Node(nav2)) => {
+                match nav1.compare_position(nav2) {
+                    XmlNodeOrder::Before => Ok(Ordering::Less),
+                    XmlNodeOrder::After => Ok(Ordering::Greater),
+                    XmlNodeOrder::Same => Ok(Ordering::Equal),
+                    XmlNodeOrder::Unknown => Ok(Ordering::Equal),
+                }
+            }
+            _ => Err(XPathError::XPTY0004 {
+                expected: "node".to_string(),
+                found: "atomic value".to_string(),
+            }),
+        }
+    }
 }
 
 impl<N: DomNavigator> IComparer<XmlItem<N>> for XPathComparer {
@@ -340,6 +365,23 @@ impl XPathEqualityComparer {
         match (x, y) {
             (XmlItem::Node(nav1), XmlItem::Node(nav2)) => nav1.is_same_position(nav2),
             _ => panic!("Cannot compare non-node items for position equality (XPTY0004)"),
+        }
+    }
+
+    /// Fallible equality check for two XmlItems.
+    ///
+    /// Returns an error if either item is not a node.
+    pub fn try_equals<N: DomNavigator>(
+        &self,
+        x: &XmlItem<N>,
+        y: &XmlItem<N>,
+    ) -> Result<bool, XPathError> {
+        match (x, y) {
+            (XmlItem::Node(nav1), XmlItem::Node(nav2)) => Ok(nav1.is_same_position(nav2)),
+            _ => Err(XPathError::XPTY0004 {
+                expected: "node".to_string(),
+                found: "atomic value".to_string(),
+            }),
         }
     }
 }

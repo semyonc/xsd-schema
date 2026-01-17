@@ -691,6 +691,7 @@ impl SourceRefExt for SourceRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::TypeKey;
     use crate::parser::frames::TypeFrameResult;
     use crate::schema::model::{FormChoice, OpenContentMode};
     use crate::schema::wildcard::{NamespaceConstraint, ProcessContents};
@@ -890,5 +891,66 @@ mod tests {
         assert!(config.error_recovery);
         assert!(config.collect_foreign_attributes);
         assert_eq!(config.max_depth, 0);
+    }
+
+    #[test]
+    fn test_apply_schema_defaults_to_elements_and_types() {
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                       blockDefault="extension"
+                       finalDefault="restriction">
+              <xs:element name="head" type="xs:string"/>
+              <xs:complexType name="Base"/>
+              <xs:simpleType name="Simple">
+                <xs:restriction base="xs:string"/>
+              </xs:simpleType>
+            </xs:schema>"#;
+
+        let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
+        assert!(result.is_ok());
+
+        let name_id = schema_set.name_table.get("head").expect("name id for head");
+        let ns_table = schema_set
+            .namespaces
+            .get(&None)
+            .expect("default namespace table");
+        let elem_key = ns_table.elements.get(&name_id).expect("element key");
+        let elem = schema_set
+            .arenas
+            .elements
+            .get(*elem_key)
+            .expect("element data");
+        assert!(elem.block.contains_extension());
+        assert!(elem.final_derivation.contains_restriction());
+
+        let base_id = schema_set.name_table.get("Base").expect("name id for Base");
+        let base_key = ns_table.types.get(&base_id).expect("type key for Base");
+        match base_key {
+            TypeKey::Complex(key) => {
+                let base = schema_set
+                    .arenas
+                    .complex_types
+                    .get(*key)
+                    .expect("complex type data");
+                assert!(base.block.contains_extension());
+                assert!(base.final_derivation.contains_restriction());
+            }
+            _ => panic!("expected complex type for Base"),
+        }
+
+        let simple_id = schema_set.name_table.get("Simple").expect("name id for Simple");
+        let simple_key = ns_table.types.get(&simple_id).expect("type key for Simple");
+        match simple_key {
+            TypeKey::Simple(key) => {
+                let simple = schema_set
+                    .arenas
+                    .simple_types
+                    .get(*key)
+                    .expect("simple type data");
+                assert!(simple.final_derivation.contains_restriction());
+            }
+            _ => panic!("expected simple type for Simple"),
+        }
     }
 }

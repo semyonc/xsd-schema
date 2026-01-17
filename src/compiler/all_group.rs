@@ -24,6 +24,7 @@ use crate::types::complex::{NamespaceConstraint, ProcessContents};
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::nfa::NfaTerm;
 use super::particle::MaxOccurs;
+use super::substitution::SubstitutionGroupMap;
 
 /// Compiled all-group content model
 ///
@@ -308,8 +309,39 @@ pub fn term_matches(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
 ) -> TermMatchResult {
+    term_matches_with_substitution(
+        term,
+        element_name,
+        element_namespace,
+        target_namespace,
+        None,
+    )
+}
+
+/// Match an element name against an NfaTerm with optional substitution groups.
+pub fn term_matches_with_substitution(
+    term: &NfaTerm,
+    element_name: NameId,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+    substitution_groups: Option<&SubstitutionGroupMap>,
+) -> TermMatchResult {
     match term {
-        NfaTerm::Element { name, namespace, .. } => {
+        NfaTerm::Element {
+            name,
+            namespace,
+            element_key,
+        } => {
+            if let (Some(map), Some(key)) = (substitution_groups, element_key) {
+                if let Some(names) = map.get(key) {
+                    return if names.contains(&(element_name, element_namespace)) {
+                        TermMatchResult::Match
+                    } else {
+                        TermMatchResult::NoMatch
+                    };
+                }
+            }
+
             if *name == element_name && *namespace == element_namespace {
                 TermMatchResult::Match
             } else {
@@ -352,6 +384,36 @@ fn wildcard_matches(
 mod tests {
     use super::*;
     use crate::ids::NameId;
+    use crate::schema::model::{DerivationSet, SchemaSet};
+    use crate::compiler::build_substitution_group_map;
+
+    fn element_data(name: NameId, target_namespace: Option<NameId>) -> crate::arenas::ElementDeclData {
+        crate::arenas::ElementDeclData {
+            name: Some(name),
+            target_namespace,
+            ref_name: None,
+            type_ref: None,
+            inline_type: None,
+            substitution_group: Vec::new(),
+            default_value: None,
+            fixed_value: None,
+            nillable: false,
+            is_abstract: false,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            block: DerivationSet::empty(),
+            final_derivation: DerivationSet::empty(),
+            form: None,
+            id: None,
+            alternatives: Vec::new(),
+            identity_constraints: Vec::new(),
+            annotation: None,
+            source: None,
+            resolved_type: None,
+            resolved_ref: None,
+            resolved_substitution_groups: Vec::new(),
+        }
+    }
 
     fn make_element_term(name: u32) -> NfaTerm {
         NfaTerm::element(NameId(name), None, None)
@@ -521,6 +583,69 @@ mod tests {
         assert_eq!(
             term_matches(&term, NameId(1), target_ns, target_ns),
             TermMatchResult::NoMatch
+        );
+    }
+
+    #[test]
+    fn test_term_matches_substitution_group_member() {
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let head_key = schema_set
+            .arenas
+            .alloc_element(element_data(head_name, None));
+        let member_key = schema_set
+            .arenas
+            .alloc_element(element_data(member_name, None));
+
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let map = build_substitution_group_map(&schema_set);
+        let term = NfaTerm::element(head_name, None, Some(head_key));
+
+        assert_eq!(
+            term_matches_with_substitution(&term, member_name, None, None, Some(&map)),
+            TermMatchResult::Match
+        );
+    }
+
+    #[test]
+    fn test_term_matches_substitution_group_abstract_head() {
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let mut head = element_data(head_name, None);
+        head.is_abstract = true;
+        let head_key = schema_set.arenas.alloc_element(head);
+        let member_key = schema_set
+            .arenas
+            .alloc_element(element_data(member_name, None));
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let map = build_substitution_group_map(&schema_set);
+        let term = NfaTerm::element(head_name, None, Some(head_key));
+
+        assert_eq!(
+            term_matches_with_substitution(&term, head_name, None, None, Some(&map)),
+            TermMatchResult::NoMatch
+        );
+        assert_eq!(
+            term_matches_with_substitution(&term, member_name, None, None, Some(&map)),
+            TermMatchResult::Match
         );
     }
 }

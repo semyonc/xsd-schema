@@ -3,9 +3,12 @@
 //! This module defines the core NFA (Nondeterministic Finite Automaton) structures
 //! used to represent compiled XSD content models.
 
+use std::collections::HashSet;
+
 use crate::ids::{ElementKey, NameId};
 use crate::parser::location::SourceRef;
 use crate::types::complex::{NamespaceConstraint, ProcessContents};
+use super::substitution::SubstitutionGroupMap;
 
 /// Unique identifier for NFA states within a table
 pub type StateId = u32;
@@ -226,9 +229,205 @@ pub enum TransitionKind {
     Consume,
 }
 
+/// Compute the epsilon closure for a set of start states.
+pub fn epsilon_closure(
+    nfa: &NfaTable,
+    start_states: impl IntoIterator<Item = StateId>,
+) -> HashSet<StateId> {
+    let mut closure = HashSet::new();
+    let mut stack: Vec<StateId> = start_states.into_iter().collect();
+
+    while let Some(state_id) = stack.pop() {
+        if !closure.insert(state_id) {
+            continue;
+        }
+        if let Some(state) = nfa.get_state(state_id) {
+            for target in state.epsilon_transitions() {
+                if !closure.contains(&target) {
+                    stack.push(target);
+                }
+            }
+        }
+    }
+
+    closure
+}
+
+/// Match an element name against an NfaTerm with optional substitution groups.
+pub fn term_matches(
+    term: &NfaTerm,
+    element_name: NameId,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+    substitution_groups: Option<&SubstitutionGroupMap>,
+) -> bool {
+    match term {
+        NfaTerm::Element {
+            name,
+            namespace,
+            element_key,
+        } => {
+            if let (Some(map), Some(key)) = (substitution_groups, element_key) {
+                if let Some(names) = map.get(key) {
+                    return names.contains(&(element_name, element_namespace));
+                }
+            }
+            *name == element_name && *namespace == element_namespace
+        }
+        NfaTerm::Wildcard {
+            namespace_constraint,
+            ..
+        } => wildcard_matches(namespace_constraint, element_namespace, target_namespace),
+    }
+}
+
+/// Advance NFA states by matching an element and applying epsilon closure.
+pub fn advance_states(
+    nfa: &NfaTable,
+    start_states: impl IntoIterator<Item = StateId>,
+    element_name: NameId,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+    substitution_groups: Option<&SubstitutionGroupMap>,
+) -> HashSet<StateId> {
+    let closure = epsilon_closure(nfa, start_states);
+    let mut next = HashSet::new();
+
+    for state_id in closure {
+        let state = match nfa.get_state(state_id) {
+            Some(state) => state,
+            None => continue,
+        };
+        let term = match state.term.as_ref() {
+            Some(term) => term,
+            None => continue,
+        };
+
+        if term_matches(
+            term,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+        ) {
+            for target in state.consuming_transitions() {
+                next.insert(target);
+            }
+        }
+    }
+
+    epsilon_closure(nfa, next)
+}
+
+/// Advance NFA states with element-over-wildcard priority (XSD 1.1).
+pub fn advance_with_priority(
+    nfa: &NfaTable,
+    start_states: impl IntoIterator<Item = StateId>,
+    element_name: NameId,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+    substitution_groups: Option<&SubstitutionGroupMap>,
+) -> HashSet<StateId> {
+    let closure = epsilon_closure(nfa, start_states);
+    let mut element_targets = HashSet::new();
+    let mut wildcard_targets = HashSet::new();
+
+    for state_id in closure {
+        let state = match nfa.get_state(state_id) {
+            Some(state) => state,
+            None => continue,
+        };
+        let term = match state.term.as_ref() {
+            Some(term) => term,
+            None => continue,
+        };
+
+        if !term_matches(
+            term,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+        ) {
+            continue;
+        }
+
+        match term {
+            NfaTerm::Element { .. } => {
+                for target in state.consuming_transitions() {
+                    element_targets.insert(target);
+                }
+            }
+            NfaTerm::Wildcard { .. } => {
+                for target in state.consuming_transitions() {
+                    wildcard_targets.insert(target);
+                }
+            }
+        }
+    }
+
+    let next = if !element_targets.is_empty() {
+        element_targets
+    } else {
+        wildcard_targets
+    };
+
+    epsilon_closure(nfa, next)
+}
+
+fn wildcard_matches(
+    constraint: &NamespaceConstraint,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+) -> bool {
+    match constraint {
+        NamespaceConstraint::Any => true,
+        NamespaceConstraint::Other => element_namespace != target_namespace,
+        NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
+        NamespaceConstraint::Local => element_namespace.is_none(),
+        NamespaceConstraint::List(list) => list.contains(&element_namespace),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    use crate::compiler::build_substitution_group_map;
+    use crate::schema::model::{DerivationSet, SchemaSet};
+
+    fn element_data(name: NameId) -> crate::arenas::ElementDeclData {
+        crate::arenas::ElementDeclData {
+            name: Some(name),
+            target_namespace: None,
+            ref_name: None,
+            type_ref: None,
+            inline_type: None,
+            substitution_group: Vec::new(),
+            default_value: None,
+            fixed_value: None,
+            nillable: false,
+            is_abstract: false,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            block: DerivationSet::empty(),
+            final_derivation: DerivationSet::empty(),
+            form: None,
+            id: None,
+            alternatives: Vec::new(),
+            identity_constraints: Vec::new(),
+            annotation: None,
+            source: None,
+            resolved_type: None,
+            resolved_ref: None,
+            resolved_substitution_groups: Vec::new(),
+        }
+    }
+
+    fn make_set(ids: &[StateId]) -> HashSet<StateId> {
+        ids.iter().copied().collect()
+    }
 
     #[test]
     fn test_nfa_state_creation() {
@@ -293,5 +492,93 @@ mod tests {
 
         let cons = NfaTransition::consume(2);
         assert_eq!(cons.kind, TransitionKind::Consume);
+    }
+
+    #[test]
+    fn test_epsilon_closure_basic() {
+        let mut s0 = NfaState::epsilon(0, None);
+        s0.add_epsilon(1);
+        let mut s1 = NfaState::epsilon(1, None);
+        s1.add_epsilon(2);
+        let s2 = NfaState::with_term(2, NfaTerm::element(NameId(1), None, None), None);
+
+        let nfa = NfaTable::new(vec![s0, s1, s2], 0, 2);
+        let closure = epsilon_closure(&nfa, [0]);
+
+        assert_eq!(closure, make_set(&[0, 1, 2]));
+    }
+
+    fn make_priority_nfa() -> NfaTable {
+        let mut start = NfaState::epsilon(0, None);
+        start.add_epsilon(1);
+        start.add_epsilon(2);
+
+        let mut elem_state = NfaState::with_term(1, NfaTerm::element(NameId(1), None, None), None);
+        let mut wild_state = NfaState::with_term(
+            2,
+            NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax),
+            None,
+        );
+
+        elem_state.add_consume(3);
+        wild_state.add_consume(4);
+
+        let exit_elem = NfaState::epsilon(3, None);
+        let exit_wild = NfaState::epsilon(4, None);
+
+        NfaTable::new(
+            vec![start, elem_state, wild_state, exit_elem, exit_wild],
+            0,
+            3,
+        )
+    }
+
+    #[test]
+    fn test_advance_states_matches_element_and_wildcard() {
+        let nfa = make_priority_nfa();
+        let next = advance_states(&nfa, [0], NameId(1), None, None, None);
+        assert_eq!(next, make_set(&[3, 4]));
+
+        let next = advance_states(&nfa, [0], NameId(2), None, None, None);
+        assert_eq!(next, make_set(&[4]));
+    }
+
+    #[test]
+    fn test_advance_with_priority_prefers_element() {
+        let nfa = make_priority_nfa();
+        let next = advance_with_priority(&nfa, [0], NameId(1), None, None, None);
+        assert_eq!(next, make_set(&[3]));
+
+        let next = advance_with_priority(&nfa, [0], NameId(2), None, None, None);
+        assert_eq!(next, make_set(&[4]));
+    }
+
+    #[test]
+    fn test_term_matches_substitution_groups() {
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let head_key = schema_set.arenas.alloc_element(element_data(head_name));
+        let member_key = schema_set.arenas.alloc_element(element_data(member_name));
+
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let map = build_substitution_group_map(&schema_set);
+        let term = NfaTerm::element(head_name, None, Some(head_key));
+
+        assert!(term_matches(
+            &term,
+            member_name,
+            None,
+            None,
+            Some(&map)
+        ));
     }
 }

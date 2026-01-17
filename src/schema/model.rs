@@ -225,6 +225,38 @@ impl SchemaSet {
         self.builtin_types().get_by_local_name(local_name)
     }
 
+    /// Get a built-in type by QName (namespace + local name).
+    ///
+    /// This includes the built-in complex type `xs:anyType` and all built-in simple types.
+    pub fn get_built_in_type_by_qname(
+        &self,
+        namespace: Option<NameId>,
+        local_name: NameId,
+    ) -> Option<TypeKey> {
+        if namespace != Some(well_known::XS_NAMESPACE) {
+            return None;
+        }
+
+        if let Some(any_type_name) = self.name_table.get("anyType") {
+            if local_name == any_type_name {
+                return Some(TypeKey::Complex(self.builtin_types().any_type));
+            }
+        }
+
+        self.get_built_in_simple_type_by_qname(namespace, local_name)
+            .map(TypeKey::Simple)
+    }
+
+    /// Get the built-in `xs:anyType` key.
+    pub fn any_type_key(&self) -> ComplexTypeKey {
+        self.builtin_types().any_type
+    }
+
+    /// Check if the given type key refers to `xs:anyType`.
+    pub fn is_any_type(&self, type_key: TypeKey) -> bool {
+        matches!(type_key, TypeKey::Complex(key) if key == self.builtin_types().any_type)
+    }
+
     /// Get a built-in simple type by its XmlTypeCode.
     ///
     /// # Returns
@@ -328,6 +360,10 @@ impl SchemaSet {
             return true;
         }
 
+        if self.is_any_type(base) {
+            return true;
+        }
+
         match (derived, base) {
             // Case 1: Both are simple types
             (TypeKey::Simple(d), TypeKey::Simple(b)) => {
@@ -340,10 +376,8 @@ impl SchemaSet {
             }
 
             // Case 3: Simple derives from Complex
-            // All simple types derive from anyType (via anySimpleType), but we don't
-            // track anyType as a ComplexTypeKey. This case is uncommon in practice.
+            // All simple types derive from anyType (via anySimpleType).
             (TypeKey::Simple(_), TypeKey::Complex(_)) => {
-                // Could check if base is anyType, but we don't have that key readily available
                 false
             }
 
@@ -713,6 +747,8 @@ pub enum OpenContentMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arenas::ComplexTypeDefData;
+    use crate::parser::frames::ComplexContentResult;
 
     #[test]
     fn test_schema_set_creation() {
@@ -887,6 +923,47 @@ mod tests {
         assert!(set.is_type_derived_from(
             TypeKey::Simple(builtin.byte),
             TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_any_type() {
+        let mut set = SchemaSet::new();
+        let any_type = set.builtin_types().any_type;
+        let string_type = set.builtin_types().string;
+
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(string_type),
+            TypeKey::Complex(any_type),
+            DerivationSet::empty()
+        ));
+
+        let ct_key = set.arenas.alloc_complex_type(ComplexTypeDefData {
+            name: None,
+            target_namespace: None,
+            base_type: None,
+            derivation_method: None,
+            content: ComplexContentResult::Empty,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            mixed: false,
+            is_abstract: false,
+            final_derivation: DerivationSet::empty(),
+            block: DerivationSet::empty(),
+            default_attributes_apply: true,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_base_type: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+        });
+
+        assert!(set.is_type_derived_from(
+            TypeKey::Complex(ct_key),
+            TypeKey::Complex(any_type),
             DerivationSet::empty()
         ));
     }

@@ -10,6 +10,8 @@ use num_bigint::BigInt;
 
 use crate::types::XmlValue;
 
+use super::error::XPathError;
+use super::item_set::{ItemSet, XPathComparer};
 use super::DomNavigator;
 
 /// XPath item (node or atomic value).
@@ -53,7 +55,7 @@ pub trait XmlNodeIterator: Clone {
     fn current_position(&self) -> Option<usize>;
 
     /// Advance to next item; returns false at end of sequence.
-    fn move_next(&mut self) -> bool;
+    fn move_next(&mut self) -> Result<bool, XPathError>;
 
     /// 1-based sequential position for axis iteration.
     fn sequential_position(&self) -> Option<usize> {
@@ -102,7 +104,7 @@ impl<N: DomNavigator> XmlNodeIterator for VecNodeIterator<N> {
         self.index
     }
 
-    fn move_next(&mut self) -> bool {
+    fn move_next(&mut self) -> Result<bool, XPathError> {
         let next = match self.index {
             None => 0,
             Some(i) => i + 1,
@@ -110,10 +112,10 @@ impl<N: DomNavigator> XmlNodeIterator for VecNodeIterator<N> {
 
         if next < self.items.len() {
             self.index = Some(next);
-            true
+            Ok(true)
         } else {
             self.index = None;
-            false
+            Ok(false)
         }
     }
 }
@@ -143,8 +145,8 @@ impl<N: DomNavigator> XmlNodeIterator for EmptyIterator<N> {
         None
     }
 
-    fn move_next(&mut self) -> bool {
-        false
+    fn move_next(&mut self) -> Result<bool, XPathError> {
+        Ok(false)
     }
 }
 
@@ -179,27 +181,28 @@ impl<I: XmlNodeIterator> BufferedNodeIterator<I> {
         Self::new(source.clone())
     }
 
-    pub fn preload(source: I) -> Self {
+    pub fn preload(source: I) -> Result<Self, XPathError> {
         let mut iter = Self::new(source);
-        iter.fill();
-        iter
+        iter.fill()?;
+        Ok(iter)
     }
 
-    pub fn fill(&mut self) {
+    pub fn fill(&mut self) -> Result<(), XPathError> {
         let mut state = self.state.borrow_mut();
         if state.exhausted {
-            return;
+            return Ok(());
         }
-        while state.source.move_next() {
+        while state.source.move_next()? {
             let next_item = state.source.current().map(clone_item_ref);
             if let Some(item) = next_item {
                 state.buffer.push(item);
             } else {
                 state.exhausted = true;
-                return;
+                return Ok(());
             }
         }
         state.exhausted = true;
+        Ok(())
     }
 }
 
@@ -214,7 +217,7 @@ impl<I: XmlNodeIterator> XmlNodeIterator for BufferedNodeIterator<I> {
         self.index
     }
 
-    fn move_next(&mut self) -> bool {
+    fn move_next(&mut self) -> Result<bool, XPathError> {
         let next_index = match self.index {
             None => 0,
             Some(i) => i + 1,
@@ -224,33 +227,33 @@ impl<I: XmlNodeIterator> XmlNodeIterator for BufferedNodeIterator<I> {
         if next_index < state.buffer.len() {
             self.index = Some(next_index);
             self.current = state.buffer.get(next_index).cloned();
-            return true;
+            return Ok(true);
         }
 
         if state.exhausted {
             self.index = None;
             self.current = None;
-            return false;
+            return Ok(false);
         }
 
-        if state.source.move_next() {
+        if state.source.move_next()? {
             let next_item = state.source.current().map(clone_item_ref);
             if let Some(item) = next_item {
                 state.buffer.push(item.clone());
                 self.index = Some(next_index);
                 self.current = Some(item);
-                return true;
+                return Ok(true);
             }
             state.exhausted = true;
             self.index = None;
             self.current = None;
-            return false;
+            return Ok(false);
         }
 
         state.exhausted = true;
         self.index = None;
         self.current = None;
-        false
+        Ok(false)
     }
 }
 
@@ -296,12 +299,12 @@ impl<N: DomNavigator> XmlNodeIterator for RangeIterator<N> {
         self.index
     }
 
-    fn move_next(&mut self) -> bool {
+    fn move_next(&mut self) -> Result<bool, XPathError> {
         if self.done {
             self.current_value = None;
             self.current_item = None;
             self.index = None;
-            return false;
+            return Ok(false);
         }
 
         let next_value = match &self.current_value {
@@ -314,7 +317,7 @@ impl<N: DomNavigator> XmlNodeIterator for RangeIterator<N> {
             self.current_value = None;
             self.current_item = None;
             self.index = None;
-            return false;
+            return Ok(false);
         }
 
         self.current_value = Some(next_value.clone());
@@ -323,7 +326,233 @@ impl<N: DomNavigator> XmlNodeIterator for RangeIterator<N> {
             None => 0,
             Some(i) => i + 1,
         });
-        true
+        Ok(true)
+    }
+}
+
+/// Iterator that enforces document order for node sequences.
+#[derive(Debug, Clone)]
+pub struct DocumentOrderNodeIterator<N: DomNavigator> {
+    items: ItemSet<XmlItem<N>>,
+    item_index: usize,
+    index: Option<usize>,
+    current: Option<XmlItem<N>>,
+    last_node: Option<N>,
+}
+
+impl<N: DomNavigator> DocumentOrderNodeIterator<N> {
+    pub fn new<I: XmlNodeIterator<Navigator = N>>(mut base: I) -> Result<Self, XPathError> {
+        let mut is_node: Option<bool> = None;
+        let mut items = ItemSet::new();
+
+        while base.move_next()? {
+            let item = match base.current() {
+                Some(item) => item,
+                None => break,
+            };
+            let item_is_node = matches!(item, XmlItemRef::Node(_));
+            if let Some(prev) = is_node {
+                if prev != item_is_node {
+                    return Err(XPathError::XPTY0018);
+                }
+            } else {
+                is_node = Some(item_is_node);
+            }
+            items.add(clone_item_ref(item));
+        }
+
+        if is_node == Some(true) {
+            let comparer = XPathComparer::new();
+            items.sort_with(&comparer);
+        }
+
+        Ok(Self {
+            items,
+            item_index: 0,
+            index: None,
+            current: None,
+            last_node: None,
+        })
+    }
+}
+
+impl<N: DomNavigator> XmlNodeIterator for DocumentOrderNodeIterator<N> {
+    type Navigator = N;
+
+    fn current(&self) -> Option<XmlItemRef<'_, Self::Navigator>> {
+        self.current.as_ref().map(XmlItemRef::from_item)
+    }
+
+    fn current_position(&self) -> Option<usize> {
+        self.index
+    }
+
+    fn move_next(&mut self) -> Result<bool, XPathError> {
+        while self.item_index < self.items.len() {
+            let item = self.items[self.item_index].clone();
+            self.item_index += 1;
+
+            if let XmlItem::Node(nav) = &item {
+                if let Some(last) = self.last_node.as_ref() {
+                    if last.is_same_position(nav) {
+                        continue;
+                    }
+                }
+                self.last_node = Some(nav.clone());
+            }
+
+            self.current = Some(item);
+            let next_index = match self.index {
+                None => 0,
+                Some(i) => i + 1,
+            };
+            self.index = Some(next_index);
+            return Ok(true);
+        }
+
+        self.index = None;
+        self.current = None;
+        Ok(false)
+    }
+}
+
+/// Iterator that returns the item at a specific sequential position.
+#[derive(Debug, Clone)]
+pub struct PositionFilterNodeIterator<I: XmlNodeIterator> {
+    position: usize,
+    iter: I,
+    index: Option<usize>,
+    current: Option<XmlItem<I::Navigator>>,
+    done: bool,
+}
+
+impl<I: XmlNodeIterator> PositionFilterNodeIterator<I> {
+    pub fn new(position: usize, iter: I) -> Self {
+        Self {
+            position,
+            iter,
+            index: None,
+            current: None,
+            done: false,
+        }
+    }
+}
+
+impl<I: XmlNodeIterator> XmlNodeIterator for PositionFilterNodeIterator<I> {
+    type Navigator = I::Navigator;
+
+    fn current(&self) -> Option<XmlItemRef<'_, Self::Navigator>> {
+        self.current.as_ref().map(XmlItemRef::from_item)
+    }
+
+    fn current_position(&self) -> Option<usize> {
+        self.index
+    }
+
+    fn move_next(&mut self) -> Result<bool, XPathError> {
+        if self.done {
+            self.index = None;
+            self.current = None;
+            return Ok(false);
+        }
+
+        while self.iter.move_next()? {
+            let seq_pos = match self.iter.sequential_position() {
+                Some(pos) => pos,
+                None => continue,
+            };
+            if seq_pos == self.position {
+                self.iter.reset_sequential_position();
+                self.current = self.iter.current().map(clone_item_ref);
+                self.index = Some(0);
+                self.done = true;
+                return Ok(self.current.is_some());
+            }
+        }
+
+        self.done = true;
+        self.index = None;
+        self.current = None;
+        Ok(false)
+    }
+}
+
+/// Iterator that returns atomic items and errors on nodes.
+#[derive(Debug, Clone)]
+pub struct ItemIterator<I: XmlNodeIterator> {
+    iter: I,
+    started: bool,
+    index: Option<usize>,
+    current: Option<XmlItem<I::Navigator>>,
+}
+
+impl<I: XmlNodeIterator> ItemIterator<I> {
+    pub fn new(iter: I) -> Self {
+        Self {
+            iter,
+            started: false,
+            index: None,
+            current: None,
+        }
+    }
+}
+
+impl<I: XmlNodeIterator> XmlNodeIterator for ItemIterator<I> {
+    type Navigator = I::Navigator;
+
+    fn current(&self) -> Option<XmlItemRef<'_, Self::Navigator>> {
+        self.current.as_ref().map(XmlItemRef::from_item)
+    }
+
+    fn current_position(&self) -> Option<usize> {
+        self.index
+    }
+
+    fn move_next(&mut self) -> Result<bool, XPathError> {
+        if !self.started {
+            self.started = true;
+            if self.iter.current_position().is_some() {
+                let item = match self.iter.current() {
+                    Some(item) => item,
+                    None => {
+                        self.index = None;
+                        self.current = None;
+                        return Ok(false);
+                    }
+                };
+                if matches!(item, XmlItemRef::Node(_)) {
+                    return Err(XPathError::XPTY0018);
+                }
+                self.current = Some(clone_item_ref(item));
+                self.index = Some(0);
+                return Ok(true);
+            }
+        }
+
+        if self.iter.move_next()? {
+            let item = match self.iter.current() {
+                Some(item) => item,
+                None => {
+                    self.index = None;
+                    self.current = None;
+                    return Ok(false);
+                }
+            };
+            if matches!(item, XmlItemRef::Node(_)) {
+                return Err(XPathError::XPTY0018);
+            }
+            self.current = Some(clone_item_ref(item));
+            let next_index = match self.index {
+                None => 0,
+                Some(i) => i + 1,
+            };
+            self.index = Some(next_index);
+            return Ok(true);
+        }
+
+        self.index = None;
+        self.current = None;
+        Ok(false)
     }
 }
 
@@ -332,6 +561,7 @@ mod tests {
     use super::*;
 
     use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::types::XmlValue;
 
     fn current_integer<N: DomNavigator>(iter: &impl XmlNodeIterator<Navigator = N>) -> BigInt {
         match iter.current() {
@@ -346,7 +576,7 @@ mod tests {
     #[test]
     fn test_empty_iterator() {
         let mut iter: EmptyIterator<RoXmlNavigator<'static>> = EmptyIterator::new();
-        assert!(!iter.move_next());
+        assert!(!iter.move_next().unwrap());
         assert!(iter.current().is_none());
         assert!(iter.current_position().is_none());
     }
@@ -354,29 +584,29 @@ mod tests {
     #[test]
     fn test_range_iterator_values() {
         let mut iter: RangeIterator<RoXmlNavigator<'static>> = RangeIterator::from_i64(1, 3);
-        assert!(iter.move_next());
+        assert!(iter.move_next().unwrap());
         assert_eq!(current_integer(&iter), BigInt::from(1));
         assert_eq!(iter.current_position(), Some(0));
         assert_eq!(iter.sequential_position(), Some(1));
 
-        assert!(iter.move_next());
+        assert!(iter.move_next().unwrap());
         assert_eq!(current_integer(&iter), BigInt::from(2));
         assert_eq!(iter.current_position(), Some(1));
         assert_eq!(iter.sequential_position(), Some(2));
 
-        assert!(iter.move_next());
+        assert!(iter.move_next().unwrap());
         assert_eq!(current_integer(&iter), BigInt::from(3));
         assert_eq!(iter.current_position(), Some(2));
         assert_eq!(iter.sequential_position(), Some(3));
 
-        assert!(!iter.move_next());
+        assert!(!iter.move_next().unwrap());
         assert!(iter.current().is_none());
     }
 
     #[test]
     fn test_range_iterator_empty() {
         let mut iter: RangeIterator<RoXmlNavigator<'static>> = RangeIterator::from_i64(5, 3);
-        assert!(!iter.move_next());
+        assert!(!iter.move_next().unwrap());
         assert!(iter.current().is_none());
     }
 
@@ -388,16 +618,100 @@ mod tests {
         ]);
 
         let mut buffered = BufferedNodeIterator::new(source);
-        assert!(buffered.move_next());
+        assert!(buffered.move_next().unwrap());
         assert_eq!(current_integer(&buffered), BigInt::from(1));
 
         let mut clone = buffered.clone();
         assert_eq!(current_integer(&clone), BigInt::from(1));
 
-        assert!(buffered.move_next());
+        assert!(buffered.move_next().unwrap());
         assert_eq!(current_integer(&buffered), BigInt::from(2));
 
-        assert!(clone.move_next());
+        assert!(clone.move_next().unwrap());
         assert_eq!(current_integer(&clone), BigInt::from(2));
+    }
+
+    #[test]
+    fn test_document_order_iterator_dedupes() {
+        let doc = roxmltree::Document::parse("<root><a/><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+        let first = nav.clone();
+        nav.move_to_next_sibling(); // a
+        let second = nav.clone();
+
+        let source: VecNodeIterator<RoXmlNavigator<'_>> = VecNodeIterator::new(vec![
+            XmlItem::Node(second),
+            XmlItem::Node(first.clone()),
+            XmlItem::Node(first),
+        ]);
+
+        let mut iter = DocumentOrderNodeIterator::new(source).unwrap();
+        let mut names = Vec::new();
+        while iter.move_next().unwrap() {
+            match iter.current() {
+                Some(XmlItemRef::Node(node)) => names.push(node.local_name().to_string()),
+                _ => panic!("expected node"),
+            }
+        }
+        assert_eq!(names, vec!["a".to_string(), "a".to_string()]);
+    }
+
+    #[test]
+    fn test_document_order_iterator_rejects_mixed_sequence() {
+        let doc = roxmltree::Document::parse("<root><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child();
+        nav.move_to_first_child();
+        let source: VecNodeIterator<RoXmlNavigator<'_>> = VecNodeIterator::new(vec![
+            XmlItem::Node(nav.clone()),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+        ]);
+
+        let result = DocumentOrderNodeIterator::new(source);
+        assert!(matches!(result, Err(XPathError::XPTY0018)));
+    }
+
+    #[test]
+    fn test_position_filter_iterator() {
+        let source: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ]);
+
+        let mut iter = PositionFilterNodeIterator::new(2, source);
+        assert!(iter.move_next().unwrap());
+        assert_eq!(current_integer(&iter), BigInt::from(2));
+        assert!(!iter.move_next().unwrap());
+    }
+
+    #[test]
+    fn test_item_iterator_returns_atomic() {
+        let source: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ]);
+
+        let mut iter = ItemIterator::new(source);
+        assert!(iter.move_next().unwrap());
+        assert_eq!(current_integer(&iter), BigInt::from(1));
+        assert!(iter.move_next().unwrap());
+        assert_eq!(current_integer(&iter), BigInt::from(2));
+        assert!(!iter.move_next().unwrap());
+    }
+
+    #[test]
+    fn test_item_iterator_rejects_nodes() {
+        let doc = roxmltree::Document::parse("<root><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child();
+        nav.move_to_first_child();
+
+        let source: VecNodeIterator<RoXmlNavigator<'_>> =
+            VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
+        let mut iter = ItemIterator::new(source);
+        let result = iter.move_next();
+        assert!(matches!(result, Err(XPathError::XPTY0018)));
     }
 }

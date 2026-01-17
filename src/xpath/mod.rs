@@ -34,6 +34,7 @@ pub mod node_test;
 pub mod context;
 pub mod timsort;
 pub mod item_set;
+pub mod axis_iterators;
 
 // Core function modules (ported from CoreFuncs.cs)
 pub mod boolean;
@@ -60,6 +61,14 @@ pub use self::parser::{parse, ParseError, ParsedXPath};
 pub use self::iterator::{
     XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
     EmptyIterator, BufferedNodeIterator, RangeIterator,
+    DocumentOrderNodeIterator, PositionFilterNodeIterator, ItemIterator,
+};
+pub use self::axis_iterators::{
+    AxisTraversal, SequentialAxisNodeIterator,
+    SelfAxis, ParentAxis, AncestorAxis, ChildAxis, AttributeAxis,
+    NamespaceAxis, FollowingSiblingAxis, PrecedingSiblingAxis,
+    DescendantNodeIterator, FollowingNodeIterator, PrecedingNodeIterator,
+    SpecialChildNodeIterator, SpecialDescendantNodeIterator, ChildOverDescendantsNodeIterator,
 };
 pub use self::tree_comparer::TreeComparer;
 pub use self::node_test::{NodeTest, matches_name_test, matches_sequence_type};

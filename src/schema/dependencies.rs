@@ -343,6 +343,10 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
     for key in complex_type_keys {
         let type_key = TypeKey::Complex(key);
 
+        if is_builtin_type(type_key, builtin_types) {
+            continue;
+        }
+
         // Add type to graph
         graph.add_type(type_key);
         stats.complex_types += 1;
@@ -436,7 +440,7 @@ fn is_builtin_simple_type(key: SimpleTypeKey, builtin: &crate::types::builtin::B
 fn is_builtin_type(key: TypeKey, builtin: &crate::types::builtin::BuiltinTypes) -> bool {
     match key {
         TypeKey::Simple(simple_key) => is_builtin_simple_type(simple_key, builtin),
-        TypeKey::Complex(_) => false, // No built-in complex types in the arena
+        TypeKey::Complex(complex_key) => complex_key == builtin.any_type,
     }
 }
 

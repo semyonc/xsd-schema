@@ -1,7 +1,8 @@
 //! Built-in type registry for XSD types
 //!
 //! This module provides the `BuiltinTypes` struct which contains pre-allocated
-//! `SimpleTypeKey` references for all 50 built-in XSD simple types.
+//! `SimpleTypeKey` references for all 50 built-in XSD simple types, plus
+//! the built-in complex `xs:anyType`.
 //!
 //! ## Usage
 //!
@@ -17,10 +18,14 @@
 
 use std::collections::HashMap;
 
-use crate::ids::{NameId, SimpleTypeKey};
+use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey};
 use crate::namespace::table::well_known;
 use crate::schema::model::{SchemaSet, XsdVersion};
-use crate::arenas::SimpleTypeDefData;
+use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
+use crate::parser::frames::{
+    ComplexContentDefResult, ComplexContentResult, DerivationMethod, ParticleResult, ParticleTerm,
+    ProcessContents, WildcardNamespace, WildcardResult,
+};
 use super::{XmlTypeCode, BuiltInType};
 
 /// Well-known built-in type IDs for fast access.
@@ -38,6 +43,10 @@ use super::{XmlTypeCode, BuiltInType};
 /// - List types (NMTOKENS, IDREFS, ENTITIES)
 #[derive(Debug, Clone)]
 pub struct BuiltinTypes {
+    // Complex types
+    /// xs:anyType - the ur-type
+    pub any_type: ComplexTypeKey,
+
     // Abstract types
     /// xs:anySimpleType - base of all simple types
     pub any_simple_type: SimpleTypeKey,
@@ -172,6 +181,64 @@ impl BuiltinTypes {
     pub fn new(schema_set: &mut SchemaSet) -> Self {
         let xsd_version = schema_set.xsd_version;
         let xs_ns = Some(well_known::XS_NAMESPACE);
+
+        let any_type_name = schema_set.name_table.add("anyType");
+        let any_type = schema_set.arenas.alloc_complex_type(ComplexTypeDefData {
+            name: Some(any_type_name),
+            target_namespace: xs_ns,
+            base_type: None,
+            derivation_method: None,
+            content: ComplexContentResult::Complex(ComplexContentDefResult {
+                particle: Some(ParticleResult {
+                    term: ParticleTerm::Any(WildcardResult {
+                        namespace: WildcardNamespace::Any,
+                        process_contents: ProcessContents::Lax,
+                        not_namespace: None,
+                        not_qname: None,
+                        id: None,
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 0,
+                    max_occurs: None,
+                    source: None,
+                }),
+                derivation: DerivationMethod::Restriction,
+                mixed: true,
+                base_type: None,
+                open_content: None,
+                attributes: Vec::new(),
+                attribute_groups: Vec::new(),
+                attribute_wildcard: Some(WildcardResult {
+                    namespace: WildcardNamespace::Any,
+                    process_contents: ProcessContents::Lax,
+                    not_namespace: None,
+                    not_qname: None,
+                    id: None,
+                    annotation: None,
+                    source: None,
+                }),
+                assertions: Vec::new(),
+                id: None,
+                derivation_id: None,
+                source: None,
+            }),
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            mixed: true,
+            is_abstract: false,
+            final_derivation: crate::schema::model::DerivationSet::empty(),
+            block: crate::schema::model::DerivationSet::empty(),
+            default_attributes_apply: true,
+            id: None,
+            annotation: None,
+            source: None,
+            // Resolved references (built-in types have no unresolved references)
+            resolved_base_type: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+        });
 
         // Helper to create and register a built-in type
         let mut create_type = |builtin: BuiltInType| -> SimpleTypeKey {
@@ -351,6 +418,7 @@ impl BuiltinTypes {
         }
 
         Self {
+            any_type,
             any_simple_type,
             any_atomic_type,
             string,

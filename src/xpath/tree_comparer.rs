@@ -7,6 +7,7 @@ use crate::types::{normalize_whitespace, WhitespaceMode, XmlAtomicValue, XmlValu
 use crate::types::XmlTypeCode;
 
 use super::ast::BinaryOpKind;
+use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
 use super::operators::eval_binary;
 use super::{DomNavigator, DomNodeType};
@@ -200,7 +201,7 @@ impl TreeComparer {
     }
 
     /// Deep equality for two XPath item iterators.
-    pub fn deep_equal_iter<I>(&self, left: &I, right: &I) -> bool
+    pub fn deep_equal_iter<I>(&self, left: &I, right: &I) -> Result<bool, XPathError>
     where
         I: XmlNodeIterator,
     {
@@ -208,13 +209,13 @@ impl TreeComparer {
         let mut right_iter = right.clone();
 
         loop {
-            let left_has = left_iter.move_next();
-            let right_has = right_iter.move_next();
+            let left_has = left_iter.move_next()?;
+            let right_has = right_iter.move_next()?;
             if left_has != right_has {
-                return false;
+                return Ok(false);
             }
             if !left_has {
-                return true;
+                return Ok(true);
             }
 
             let left_item = left_iter.current();
@@ -223,15 +224,15 @@ impl TreeComparer {
             match (left_item, right_item) {
                 (Some(XmlItemRef::Node(left_node)), Some(XmlItemRef::Node(right_node))) => {
                     if !self.node_equal(left_node, right_node) {
-                        return false;
+                        return Ok(false);
                     }
                 }
                 (Some(XmlItemRef::Atomic(left_value)), Some(XmlItemRef::Atomic(right_value))) => {
                     if !self.item_equal(left_value, right_value) {
-                        return false;
+                        return Ok(false);
                     }
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
         }
     }
@@ -362,7 +363,7 @@ mod tests {
         let right: VecNodeIterator<RoXmlNavigator<'static>> =
             VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::decimal(Decimal::new(1, 0)))]);
 
-        assert!(comparer.deep_equal_iter(&left, &right));
+        assert!(comparer.deep_equal_iter(&left, &right).unwrap());
     }
 
     #[test]
@@ -373,6 +374,6 @@ mod tests {
         let right: VecNodeIterator<RoXmlNavigator<'static>> =
             VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::float(f32::NAN))]);
 
-        assert!(comparer.deep_equal_iter(&left, &right));
+        assert!(comparer.deep_equal_iter(&left, &right).unwrap());
     }
 }

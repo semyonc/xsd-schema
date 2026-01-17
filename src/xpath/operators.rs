@@ -1944,17 +1944,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
@@ -1982,17 +1982,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
@@ -2020,17 +2020,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
@@ -2057,17 +2057,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
@@ -2101,17 +2101,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
@@ -2138,17 +2138,17 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
     let mut left_iter = left.clone();
 
-    while left_iter.move_next() {
+    while left_iter.move_next()? {
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
         let left_value = atomize_item(left_item)?;
         let mut right_iter = right_buf.clone();
 
-        while right_iter.move_next() {
+        while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;

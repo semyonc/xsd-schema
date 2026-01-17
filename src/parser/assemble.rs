@@ -31,6 +31,8 @@ use crate::SchemaSet;
 pub struct SchemaAssembler<'a> {
     schema_set: &'a mut SchemaSet,
     target_namespace: Option<NameId>,
+    block_default: crate::schema::model::DerivationSet,
+    final_default: crate::schema::model::DerivationSet,
     /// Identity constraint names seen in this document (for uniqueness checking)
     /// XSD constraint: Identity Constraint Name Uniqueness - names must be unique per schema document
     identity_constraint_names: HashSet<NameId>,
@@ -43,10 +45,17 @@ enum GroupKeyResult {
 }
 
 impl<'a> SchemaAssembler<'a> {
-    pub fn new(schema_set: &'a mut SchemaSet, target_namespace: Option<NameId>) -> Self {
+    pub fn new(
+        schema_set: &'a mut SchemaSet,
+        target_namespace: Option<NameId>,
+        block_default: crate::schema::model::DerivationSet,
+        final_default: crate::schema::model::DerivationSet,
+    ) -> Self {
         Self {
             schema_set,
             target_namespace,
+            block_default,
+            final_default,
             identity_constraint_names: HashSet::new(),
         }
     }
@@ -112,6 +121,10 @@ impl<'a> SchemaAssembler<'a> {
                     annotation,
                     source,
                 } = simple;
+                let mut final_derivation = final_derivation;
+                if final_derivation.is_empty() {
+                    final_derivation = self.final_default;
+                }
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("simpleType", source_ref.as_ref(), self.schema_set))?;
                 let data = SimpleTypeDefData {
@@ -157,6 +170,14 @@ impl<'a> SchemaAssembler<'a> {
                     annotation,
                     source,
                 } = complex;
+                let mut final_derivation = final_derivation;
+                let mut block = block;
+                if final_derivation.is_empty() {
+                    final_derivation = self.final_default;
+                }
+                if block.is_empty() {
+                    block = self.block_default;
+                }
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("complexType", source_ref.as_ref(), self.schema_set))?;
                 let data = ComplexTypeDefData {
@@ -217,6 +238,16 @@ impl<'a> SchemaAssembler<'a> {
         let source_ref = source.clone();
         let name = name.ok_or_else(|| missing_name("element", source_ref.as_ref(), self.schema_set))?;
         let target_namespace = local_namespace.or(self.target_namespace);
+        let mut block = block;
+        let mut final_derivation = final_derivation;
+        if ref_name.is_none() {
+            if block.is_empty() {
+                block = self.block_default;
+            }
+            if final_derivation.is_empty() {
+                final_derivation = self.final_default;
+            }
+        }
 
         // Check identity constraint name uniqueness (per schema document)
         // XSD Constraint: Identity Constraint Name Uniqueness (§3.11.1)
@@ -537,7 +568,12 @@ pub fn assemble_schema(
     result: SchemaFrameResult,
 ) -> SchemaResult<SchemaDocument> {
     let target_namespace = result.target_namespace;
-    let mut assembler = SchemaAssembler::new(schema_set, target_namespace);
+    let mut assembler = SchemaAssembler::new(
+        schema_set,
+        target_namespace,
+        result.block_default,
+        result.final_default,
+    );
     assembler.assemble(result, doc_id, base_uri)
 }
 

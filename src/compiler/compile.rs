@@ -10,7 +10,7 @@ use crate::parser::frames::{
     ProcessContents, QNameRef, WildcardNamespace, WildcardResult,
 };
 use crate::parser::location::SourceRef;
-use crate::schema::SchemaSet;
+use crate::schema::{FormChoice, SchemaSet};
 use crate::types::complex::{NamespaceConstraint, ProcessContents as TypesProcessContents};
 
 use super::error::{NfaCompileError, NfaCompileResult};
@@ -134,7 +134,9 @@ impl<'a> CompileContext<'a> {
             (ref_name.local_name, ref_name.namespace, key)
         } else if let Some(name) = elem.name {
             // Local element declaration
-            (name, elem.target_namespace, None)
+            let source_ref = source.or(elem.source.as_ref());
+            let namespace = self.effective_element_namespace(elem, source_ref);
+            (name, namespace, None)
         } else {
             return Err(NfaCompileError::unresolved_element(
                 "anonymous element without name or ref".to_string(),
@@ -366,6 +368,35 @@ impl<'a> CompileContext<'a> {
             ProcessContents::Skip => TypesProcessContents::Skip,
         }
     }
+
+    fn effective_element_namespace(
+        &self,
+        elem: &ElementFrameResult,
+        source: Option<&SourceRef>,
+    ) -> Option<NameId> {
+        if elem.target_namespace.is_some() {
+            return elem.target_namespace;
+        }
+
+        let doc = source.and_then(|s| self.schema_set.documents.get(s.doc_id as usize));
+        let default_form = doc
+            .map(|d| d.element_form_default)
+            .unwrap_or(FormChoice::Unqualified);
+        let target_namespace = doc
+            .map(|d| d.target_namespace)
+            .unwrap_or(self.target_namespace);
+
+        let form = match elem.form.as_deref() {
+            Some("qualified") => FormChoice::Qualified,
+            Some("unqualified") => FormChoice::Unqualified,
+            _ => default_form,
+        };
+
+        match form {
+            FormChoice::Qualified => target_namespace,
+            FormChoice::Unqualified => None,
+        }
+    }
 }
 
 /// Compile a particle to an NFA table (convenience function)
@@ -391,6 +422,8 @@ pub fn compile_model_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::location::{SourceRef, SourceSpan};
+    use crate::schema::SchemaDocument;
 
     fn make_element_particle(name: NameId, min: u32, max: Option<u32>) -> ParticleResult {
         ParticleResult {
@@ -543,5 +576,115 @@ mod tests {
 
         let result = compile_particle(&schema_set, &particle, None);
         assert!(matches!(result, Err(NfaCompileError::InvalidOccurrence { .. })));
+    }
+
+    #[test]
+    fn test_element_form_default_applies_to_local_element() {
+        let mut schema_set = SchemaSet::new();
+        let target_ns = schema_set.name_table.add("http://example.com");
+        let name = schema_set.name_table.add("local");
+
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.target_namespace = Some(target_ns);
+        doc.element_form_default = FormChoice::Qualified;
+        schema_set.documents.push(doc);
+
+        let source_ref = SourceRef::new(doc_id, SourceSpan::new(0, 0));
+        let particle = ParticleResult {
+            term: ParticleTerm::Element(ElementFrameResult {
+                name: Some(name),
+                ref_name: None,
+                target_namespace: None,
+                type_ref: None,
+                inline_type: None,
+                substitution_group: vec![],
+                default_value: None,
+                fixed_value: None,
+                nillable: false,
+                is_abstract: false,
+                min_occurs: 1,
+                max_occurs: Some(1),
+                block: Default::default(),
+                final_derivation: Default::default(),
+                form: None,
+                id: None,
+                alternatives: vec![],
+                identity_constraints: vec![],
+                annotation: None,
+                source: Some(source_ref.clone()),
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: Some(source_ref),
+        };
+
+        let table = compile_particle(&schema_set, &particle, Some(target_ns)).unwrap();
+        let term = table
+            .states
+            .iter()
+            .find_map(|state| state.term.as_ref())
+            .expect("expected element term");
+        match term {
+            NfaTerm::Element { namespace, .. } => {
+                assert_eq!(*namespace, Some(target_ns));
+            }
+            _ => panic!("expected element term"),
+        }
+    }
+
+    #[test]
+    fn test_element_form_override_unqualified() {
+        let mut schema_set = SchemaSet::new();
+        let target_ns = schema_set.name_table.add("http://example.com");
+        let name = schema_set.name_table.add("local");
+
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.target_namespace = Some(target_ns);
+        doc.element_form_default = FormChoice::Qualified;
+        schema_set.documents.push(doc);
+
+        let source_ref = SourceRef::new(doc_id, SourceSpan::new(0, 0));
+        let particle = ParticleResult {
+            term: ParticleTerm::Element(ElementFrameResult {
+                name: Some(name),
+                ref_name: None,
+                target_namespace: None,
+                type_ref: None,
+                inline_type: None,
+                substitution_group: vec![],
+                default_value: None,
+                fixed_value: None,
+                nillable: false,
+                is_abstract: false,
+                min_occurs: 1,
+                max_occurs: Some(1),
+                block: Default::default(),
+                final_derivation: Default::default(),
+                form: Some("unqualified".to_string()),
+                id: None,
+                alternatives: vec![],
+                identity_constraints: vec![],
+                annotation: None,
+                source: Some(source_ref.clone()),
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: Some(source_ref),
+        };
+
+        let table = compile_particle(&schema_set, &particle, Some(target_ns)).unwrap();
+        let term = table
+            .states
+            .iter()
+            .find_map(|state| state.term.as_ref())
+            .expect("expected element term");
+        match term {
+            NfaTerm::Element { namespace, .. } => {
+                assert_eq!(*namespace, None);
+            }
+            _ => panic!("expected element term"),
+        }
     }
 }

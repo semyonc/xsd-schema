@@ -32,13 +32,28 @@ mod compile;
 mod error;
 mod particle;
 mod all_group;
+mod upa;
+mod substitution;
 
-pub use nfa::{NfaTable, NfaState, NfaTerm, NfaTransition, TransitionKind, StateId};
+pub use nfa::{
+    advance_states,
+    advance_with_priority,
+    epsilon_closure,
+    term_matches as nfa_term_matches,
+    NfaTable,
+    NfaState,
+    NfaTerm,
+    NfaTransition,
+    TransitionKind,
+    StateId,
+};
 pub use fragment::{NfaFragment, FragmentBuilder, fragment_to_table};
 pub use compile::{CompileContext, compile_particle, compile_model_group};
 pub use error::{NfaCompileError, NfaCompileResult};
 pub use particle::{MaxOccurs, CountedParticle, apply_occurs, MAX_OCCURS_LIMIT};
 pub use all_group::{
     AllGroupModel, AllParticle, AllGroupState, OpenContentWildcard, OpenContentMode,
-    validate_all_group_constraints, term_matches, TermMatchResult,
+    validate_all_group_constraints, term_matches, term_matches_with_substitution, TermMatchResult,
 };
+pub use upa::check_upa;
+pub use substitution::{build_substitution_group_map, SubstitutionGroupMap};

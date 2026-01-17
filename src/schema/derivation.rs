@@ -28,8 +28,10 @@
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{DerivationMethod, SimpleTypeVariety};
+use crate::parser::location::SourceRef;
 use crate::schema::dependencies::DependencyGraph;
 use crate::schema::SchemaSet;
+use crate::schema::model::DerivationSet;
 use crate::types::facets::FacetSet;
 
 /// Statistics from derivation validation
@@ -339,7 +341,9 @@ fn validate_complex_extension(
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
                 // Check that base type is not final for extension
-                if base_type.final_derivation.contains_extension() {
+                if effective_type_final(schema_set, base_type.final_derivation, base_type.source.as_ref())
+                    .contains_extension()
+                {
                     let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
                     let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
                     let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
@@ -380,7 +384,9 @@ fn validate_complex_restriction(
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
                 // Check that base type is not final for restriction
-                if base_type.final_derivation.contains_restriction() {
+                if effective_type_final(schema_set, base_type.final_derivation, base_type.source.as_ref())
+                    .contains_restriction()
+                {
                     let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
                     let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
                     let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
@@ -447,11 +453,33 @@ fn format_type_name(
     }
 }
 
+fn effective_type_final(
+    schema_set: &SchemaSet,
+    final_derivation: DerivationSet,
+    source: Option<&SourceRef>,
+) -> DerivationSet {
+    if !final_derivation.is_empty() {
+        return final_derivation;
+    }
+
+    let Some(source) = source else {
+        return final_derivation;
+    };
+
+    schema_set
+        .documents
+        .get(source.doc_id as usize)
+        .map(|doc| doc.final_default)
+        .unwrap_or(final_derivation)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
     use crate::parser::frames::ComplexContentResult;
+    use crate::parser::location::{SourceRef, SourceSpan};
+    use crate::schema::model::SchemaDocument;
     use crate::schema::model::DerivationSet;
 
     fn create_simple_type_data(name: Option<NameId>, variety: SimpleTypeVariety) -> SimpleTypeDefData {
@@ -690,6 +718,36 @@ mod tests {
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
         // Create derived type with extension (should fail)
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Extension);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+            assert_eq!(constraint, "cos-ct-extends");
+        } else {
+            panic!("Expected structural error with cos-ct-extends constraint");
+        }
+    }
+
+    #[test]
+    fn test_validate_extension_of_final_default_type_error() {
+        let mut schema_set = SchemaSet::new();
+        let doc_id = schema_set.documents.len() as crate::ids::DocumentId;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.final_default = DerivationSet::extension();
+        schema_set.documents.push(doc);
+
+        // Create base complex type with final from schema default.
+        let mut base_data = create_complex_type_data(None);
+        base_data.source = Some(SourceRef::new(doc_id, SourceSpan::new(0, 0)));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        // Create derived type with extension (should fail).
         let mut derived_data = create_complex_type_data(None);
         derived_data.derivation_method = Some(DerivationMethod::Extension);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
