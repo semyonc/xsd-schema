@@ -298,6 +298,212 @@ impl SchemaSet {
 
         false
     }
+
+    // ========================================================================
+    // Type derivation checking (analog of C# XmlSchemaType.IsDerivedFrom)
+    // ========================================================================
+
+    /// Check if `derived` is derived from `base`, optionally filtering by derivation method.
+    ///
+    /// This mirrors C#'s `XmlSchemaType.IsDerivedFrom(derivedType, baseType, method)`.
+    ///
+    /// # Arguments
+    /// * `derived` - The potentially derived type
+    /// * `base` - The potential base type
+    /// * `exclude_methods` - Derivation methods to exclude from the check.
+    ///                       Use `DerivationSet::empty()` to allow any method (like C#'s Empty).
+    ///
+    /// # Returns
+    /// - `true` if `derived == base`
+    /// - `true` if `derived` derives from `base` via a non-excluded derivation method
+    /// - `false` otherwise
+    pub fn is_type_derived_from(
+        &self,
+        derived: TypeKey,
+        base: TypeKey,
+        exclude_methods: DerivationSet,
+    ) -> bool {
+        // Same type derives from itself
+        if derived == base {
+            return true;
+        }
+
+        match (derived, base) {
+            // Case 1: Both are simple types
+            (TypeKey::Simple(d), TypeKey::Simple(b)) => {
+                self.is_simple_type_derived_from(d, b, exclude_methods)
+            }
+
+            // Case 2: Both are complex types
+            (TypeKey::Complex(d), TypeKey::Complex(b)) => {
+                self.is_complex_type_derived_from(d, b, exclude_methods)
+            }
+
+            // Case 3: Simple derives from Complex
+            // All simple types derive from anyType (via anySimpleType), but we don't
+            // track anyType as a ComplexTypeKey. This case is uncommon in practice.
+            (TypeKey::Simple(_), TypeKey::Complex(_)) => {
+                // Could check if base is anyType, but we don't have that key readily available
+                false
+            }
+
+            // Case 4: Complex derives from Simple
+            // Complex types with simpleContent can derive from simple types
+            (TypeKey::Complex(d), TypeKey::Simple(b)) => {
+                self.is_complex_derived_from_simple(d, b, exclude_methods)
+            }
+        }
+    }
+
+    /// Check if simple type `derived` is derived from simple type `base` with method filtering.
+    fn is_simple_type_derived_from(
+        &self,
+        derived: SimpleTypeKey,
+        base: SimpleTypeKey,
+        exclude_methods: DerivationSet,
+    ) -> bool {
+        use crate::parser::frames::SimpleTypeVariety;
+
+        // Same type
+        if derived == base {
+            return true;
+        }
+
+        let builtin = self.builtin_types();
+        let mut current = derived;
+        let mut visited = std::collections::HashSet::new();
+
+        while visited.insert(current) {
+            // Get type definition
+            if let Some(type_def) = self.arenas.simple_types.get(current) {
+                // Determine derivation method based on variety
+                let method_flag = match type_def.variety {
+                    SimpleTypeVariety::Atomic => DerivationSet::RESTRICTION,
+                    SimpleTypeVariety::List => DerivationSet::LIST,
+                    SimpleTypeVariety::Union => DerivationSet::UNION,
+                };
+
+                // If this derivation method is excluded, stop traversal
+                if exclude_methods.contains(method_flag) {
+                    return false;
+                }
+
+                // Check resolved base type
+                if let Some(base_type_key) = type_def.resolved_base_type {
+                    if let TypeKey::Simple(simple_base) = base_type_key {
+                        if simple_base == base {
+                            return true;
+                        }
+                        current = simple_base;
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback to built-in derivation
+            if builtin.is_builtin(current) {
+                // For built-in types, derivation is always by restriction
+                if exclude_methods.contains(DerivationSet::RESTRICTION) {
+                    return false;
+                }
+                if let Some(parent) = builtin.get_base_type(current) {
+                    if parent == base {
+                        return true;
+                    }
+                    current = parent;
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        false
+    }
+
+    /// Check if complex type `derived` is derived from complex type `base` with method filtering.
+    fn is_complex_type_derived_from(
+        &self,
+        derived: ComplexTypeKey,
+        base: ComplexTypeKey,
+        exclude_methods: DerivationSet,
+    ) -> bool {
+        use crate::parser::frames::DerivationMethod;
+
+        if derived == base {
+            return true;
+        }
+
+        let mut current = derived;
+        let mut visited = std::collections::HashSet::new();
+
+        while visited.insert(current) {
+            if let Some(type_def) = self.arenas.complex_types.get(current) {
+                // Determine derivation method flag
+                let method_flag = match type_def.derivation_method {
+                    Some(DerivationMethod::Extension) => DerivationSet::EXTENSION,
+                    Some(DerivationMethod::Restriction) => DerivationSet::RESTRICTION,
+                    None => DerivationSet::empty(), // Implicit restriction from anyType
+                };
+
+                // If this derivation method is excluded, stop traversal
+                if !method_flag.is_empty() && exclude_methods.contains(method_flag) {
+                    return false;
+                }
+
+                // Check resolved base type
+                if let Some(base_type_key) = type_def.resolved_base_type {
+                    if let TypeKey::Complex(complex_base) = base_type_key {
+                        if complex_base == base {
+                            return true;
+                        }
+                        current = complex_base;
+                        continue;
+                    }
+                }
+            }
+
+            break;
+        }
+
+        false
+    }
+
+    /// Check if complex type `derived` (with simpleContent) derives from simple type `base`.
+    fn is_complex_derived_from_simple(
+        &self,
+        derived: ComplexTypeKey,
+        base: SimpleTypeKey,
+        exclude_methods: DerivationSet,
+    ) -> bool {
+        use crate::parser::frames::DerivationMethod;
+
+        if let Some(type_def) = self.arenas.complex_types.get(derived) {
+            // Check derivation method
+            let method_flag = match type_def.derivation_method {
+                Some(DerivationMethod::Extension) => DerivationSet::EXTENSION,
+                Some(DerivationMethod::Restriction) => DerivationSet::RESTRICTION,
+                None => DerivationSet::empty(),
+            };
+
+            if !method_flag.is_empty() && exclude_methods.contains(method_flag) {
+                return false;
+            }
+
+            // Check if base type is the target simple type
+            if let Some(base_type_key) = type_def.resolved_base_type {
+                if let TypeKey::Simple(simple_base) = base_type_key {
+                    if simple_base == base {
+                        return true;
+                    }
+                    // Continue checking up the simple type chain
+                    return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
+                }
+            }
+        }
+
+        false
+    }
 }
 
 impl Default for SchemaSet {
@@ -567,5 +773,161 @@ mod tests {
     #[test]
     fn test_form_choice_default() {
         assert_eq!(FormChoice::default(), FormChoice::Unqualified);
+    }
+
+    // ========================================================================
+    // Tests for is_type_derived_from (analog of C# XmlSchemaType.IsDerivedFrom)
+    // ========================================================================
+
+    #[test]
+    fn test_is_type_derived_from_same_type() {
+        let set = SchemaSet::new();
+        let string_key = set.builtin_types().string;
+
+        // Same type derives from itself
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(string_key),
+            TypeKey::Simple(string_key),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_direct_derivation() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // xs:normalizedString derives from xs:string
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.normalized_string),
+            TypeKey::Simple(builtin.string),
+            DerivationSet::empty()
+        ));
+
+        // xs:integer derives from xs:decimal
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.integer),
+            TypeKey::Simple(builtin.decimal),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_transitive() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // xs:NCName derives from xs:string (NCName < Name < token < normalizedString < string)
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.ncname),
+            TypeKey::Simple(builtin.string),
+            DerivationSet::empty()
+        ));
+
+        // xs:byte derives from xs:decimal (byte < short < int < long < integer < decimal)
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.byte),
+            TypeKey::Simple(builtin.decimal),
+            DerivationSet::empty()
+        ));
+
+        // xs:ID derives from xs:string (ID < NCName < Name < token < normalizedString < string)
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.id),
+            TypeKey::Simple(builtin.string),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_not_derived() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // xs:string does NOT derive from xs:integer
+        assert!(!set.is_type_derived_from(
+            TypeKey::Simple(builtin.string),
+            TypeKey::Simple(builtin.integer),
+            DerivationSet::empty()
+        ));
+
+        // xs:decimal does NOT derive from xs:integer (reverse direction)
+        assert!(!set.is_type_derived_from(
+            TypeKey::Simple(builtin.decimal),
+            TypeKey::Simple(builtin.integer),
+            DerivationSet::empty()
+        ));
+
+        // xs:date does NOT derive from xs:duration
+        assert!(!set.is_type_derived_from(
+            TypeKey::Simple(builtin.date),
+            TypeKey::Simple(builtin.duration),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_any_simple_type() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // All simple types derive from xs:anySimpleType
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.string),
+            TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::empty()
+        ));
+
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.integer),
+            TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::empty()
+        ));
+
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.byte),
+            TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::empty()
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_exclude_restriction() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // With RESTRICTION excluded, xs:normalizedString does NOT derive from xs:string
+        assert!(!set.is_type_derived_from(
+            TypeKey::Simple(builtin.normalized_string),
+            TypeKey::Simple(builtin.string),
+            DerivationSet::RESTRICTION
+        ));
+
+        // Same type still derives from itself even with exclusions
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.string),
+            TypeKey::Simple(builtin.string),
+            DerivationSet::RESTRICTION
+        ));
+    }
+
+    #[test]
+    fn test_is_type_derived_from_list_types() {
+        let set = SchemaSet::new();
+        let builtin = set.builtin_types();
+
+        // xs:NMTOKENS is a list type that derives from xs:anySimpleType
+        assert!(set.is_type_derived_from(
+            TypeKey::Simple(builtin.nmtokens),
+            TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::empty()
+        ));
+
+        // With LIST excluded, xs:NMTOKENS should not derive from xs:anySimpleType
+        assert!(!set.is_type_derived_from(
+            TypeKey::Simple(builtin.nmtokens),
+            TypeKey::Simple(builtin.any_simple_type),
+            DerivationSet::LIST
+        ));
     }
 }

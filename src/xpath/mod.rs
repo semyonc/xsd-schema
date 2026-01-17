@@ -28,6 +28,23 @@ pub mod error;
 pub mod lexer;
 pub mod parser;
 pub mod operators;
+pub mod iterator;
+pub mod tree_comparer;
+pub mod node_test;
+pub mod context;
+pub mod timsort;
+pub mod item_set;
+
+// Core function modules (ported from CoreFuncs.cs)
+pub mod boolean;
+pub mod atomize;
+pub mod cast;
+pub mod sequence_ops;
+pub mod node_ops;
+pub mod quantified;
+pub mod string_ops;
+pub mod type_info;
+pub mod iter_adapters;
 
 // Navigator modules
 pub mod roxmltree;
@@ -40,6 +57,19 @@ pub use self::ast::AstNode;
 pub use self::error::XPathError;
 pub use self::lexer::{Lexer, Token};
 pub use self::parser::{parse, ParseError, ParsedXPath};
+pub use self::iterator::{
+    XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
+    EmptyIterator, BufferedNodeIterator, RangeIterator,
+};
+pub use self::tree_comparer::TreeComparer;
+pub use self::node_test::{NodeTest, matches_name_test, matches_sequence_type};
+pub use self::context::XPathContext;
+pub use self::timsort::{
+    timsort, timsort_by, timsort_slice, timsort_slice_by,
+    timsort_with_comparer, timsort_slice_with_comparer,
+    IComparer, OrdComparer, ReverseComparer, FnComparer,
+};
+pub use self::item_set::{ItemSet, ItemSetIter, ItemSetIterMut, XPathComparer, XPathEqualityComparer};
 
 use crate::ids::SimpleTypeKey;
 use crate::types::value::XmlValue;

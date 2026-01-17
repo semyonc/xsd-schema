@@ -109,6 +109,9 @@ pub mod embedded;
 // Builder pattern API
 pub mod builder;
 
+// NFA compiler for content models
+pub mod compiler;
+
 // Re-export primary types
 pub use error::{SchemaError, SchemaResult, FacetError, FacetResult};
 pub use ids::*;
@@ -133,7 +136,11 @@ pub use types::{
 };
 
 // Re-export XPath navigation types
-pub use xpath::{DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope, RoXmlNavigator};
+pub use xpath::{
+    DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope, RoXmlNavigator,
+    XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
+    EmptyIterator, BufferedNodeIterator, RangeIterator, TreeComparer, XPathContext,
+};
 
 // Re-export pipeline functions
 pub use pipeline::{
@@ -152,3 +159,11 @@ pub use parser::resolver::{
 
 // Re-export embedded assets
 pub use embedded::{XML_XSD, XML_NAMESPACE, get_embedded_schema, has_embedded_schema};
+
+// Re-export compiler types
+pub use compiler::{
+    NfaTable, NfaState, NfaTerm, NfaTransition, TransitionKind, StateId,
+    NfaFragment, FragmentBuilder, fragment_to_table,
+    CompileContext, compile_particle, compile_model_group,
+    NfaCompileError, NfaCompileResult,
+};

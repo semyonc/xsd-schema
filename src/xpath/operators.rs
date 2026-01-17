@@ -11,7 +11,12 @@ use num_bigint::BigInt;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
+use crate::xpath::cast::cast_to;
+use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
+use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
+use crate::xpath::type_info::type_code_to_name;
+use crate::xpath::DomNavigator;
 use crate::types::value::{
     DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue,
     TimezoneOffset, YearMonthDurationValue, XmlAtomicValue, XmlValue, XmlValueKind,
@@ -160,8 +165,18 @@ fn eval_boolean_logic(
 }
 
 fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let left = unwrap_union_value(left);
+    let right = unwrap_union_value(right);
+
     if let Some(result) = compare_temporal_eq(left, right)? {
         return Ok(result);
+    }
+
+    if left.type_code.is_list() || right.type_code.is_list() {
+        if left.type_code != right.type_code {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
+        return Ok(list_values_equal(left, right));
     }
 
     if left.type_code.is_numeric() && right.type_code.is_numeric() {
@@ -176,10 +191,17 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
         return Ok(left.to_string_value() == right.to_string_value());
     }
 
-    Err(XPathError::internal("Equality operator not defined for types"))
+    if left.type_code == right.type_code {
+        return Ok(left.value == right.value);
+    }
+
+    Err(operator_not_defined("op:eq", left, right))
 }
 
 fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let left = unwrap_union_value(left);
+    let right = unwrap_union_value(right);
+
     if let Some(result) = compare_temporal_gt(left, right)? {
         return Ok(result);
     }
@@ -189,14 +211,21 @@ fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     }
 
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
-        return Ok(left.to_string_value() > right.to_string_value());
+        let left_value = left.to_string_value();
+        let right_value = right.to_string_value();
+        return Ok(compare_string_values(&left_value, &right_value) == Ordering::Greater);
     }
 
-    Err(XPathError::internal("Comparison operator not defined for types"))
+    Err(operator_not_defined("op:gt", left, right))
 }
 
 fn compare_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    Ok(compare_gt(left, right)? || compare_eq(left, right)?)
+    match compare_eq(left, right) {
+        Ok(true) => Ok(true),
+        Ok(false) => compare_gt(left, right),
+        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right),
+        Err(err) => Err(err),
+    }
 }
 
 fn compare_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
@@ -204,7 +233,12 @@ fn compare_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 }
 
 fn compare_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    Ok(compare_lt(left, right)? || compare_eq(left, right)?)
+    match compare_eq(left, right) {
+        Ok(true) => Ok(true),
+        Ok(false) => compare_lt(left, right),
+        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right),
+        Err(err) => Err(err),
+    }
 }
 
 fn eval_temporal_binary(
@@ -236,6 +270,9 @@ fn compare_temporal_eq(
     }
 
     if is_date_time_code(left.type_code) || is_date_time_code(right.type_code) {
+        if !(is_date_time_code(left.type_code) && is_date_time_code(right.type_code)) {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
         let left_dt = as_datetime(left)
             .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         let right_dt = as_datetime(right)
@@ -244,6 +281,9 @@ fn compare_temporal_eq(
     }
 
     if left.type_code == XmlTypeCode::Date || right.type_code == XmlTypeCode::Date {
+        if left.type_code != XmlTypeCode::Date || right.type_code != XmlTypeCode::Date {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
         let left_date = as_date(left)
             .ok_or_else(|| XPathError::internal("Expected date value"))?;
         let right_date = as_date(right)
@@ -252,6 +292,9 @@ fn compare_temporal_eq(
     }
 
     if left.type_code == XmlTypeCode::Time || right.type_code == XmlTypeCode::Time {
+        if left.type_code != XmlTypeCode::Time || right.type_code != XmlTypeCode::Time {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
         let left_time = as_time(left)
             .ok_or_else(|| XPathError::internal("Expected time value"))?;
         let right_time = as_time(right)
@@ -260,6 +303,9 @@ fn compare_temporal_eq(
     }
 
     if is_duration_code(left.type_code) || is_duration_code(right.type_code) {
+        if !(is_duration_code(left.type_code) && is_duration_code(right.type_code)) {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
         let left_parts = duration_parts(left)?
             .ok_or_else(|| XPathError::internal("Expected duration value"))?;
         let right_parts = duration_parts(right)?
@@ -267,9 +313,7 @@ fn compare_temporal_eq(
         return Ok(Some(left_parts == right_parts));
     }
 
-    Err(XPathError::internal(
-        "Equality operator not defined for types",
-    ))
+    Err(operator_not_defined("op:eq", left, right))
 }
 
 fn compare_temporal_gt(
@@ -281,6 +325,9 @@ fn compare_temporal_gt(
     }
 
     if is_date_time_code(left.type_code) || is_date_time_code(right.type_code) {
+        if !(is_date_time_code(left.type_code) && is_date_time_code(right.type_code)) {
+            return Err(operator_not_defined("op:gt", left, right));
+        }
         let left_dt = as_datetime(left)
             .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         let right_dt = as_datetime(right)
@@ -289,6 +336,9 @@ fn compare_temporal_gt(
     }
 
     if left.type_code == XmlTypeCode::Date || right.type_code == XmlTypeCode::Date {
+        if left.type_code != XmlTypeCode::Date || right.type_code != XmlTypeCode::Date {
+            return Err(operator_not_defined("op:gt", left, right));
+        }
         let left_date = as_date(left)
             .ok_or_else(|| XPathError::internal("Expected date value"))?;
         let right_date = as_date(right)
@@ -297,6 +347,9 @@ fn compare_temporal_gt(
     }
 
     if left.type_code == XmlTypeCode::Time || right.type_code == XmlTypeCode::Time {
+        if left.type_code != XmlTypeCode::Time || right.type_code != XmlTypeCode::Time {
+            return Err(operator_not_defined("op:gt", left, right));
+        }
         let left_time = as_time(left)
             .ok_or_else(|| XPathError::internal("Expected time value"))?;
         let right_time = as_time(right)
@@ -307,6 +360,11 @@ fn compare_temporal_gt(
     if left.type_code == XmlTypeCode::YearMonthDuration
         || right.type_code == XmlTypeCode::YearMonthDuration
     {
+        if left.type_code != XmlTypeCode::YearMonthDuration
+            || right.type_code != XmlTypeCode::YearMonthDuration
+        {
+            return Err(operator_not_defined("op:gt", left, right));
+        }
         let left_duration = as_year_month_duration(left)
             .ok_or_else(|| XPathError::internal("Expected yearMonthDuration value"))?;
         let right_duration = as_year_month_duration(right)
@@ -319,6 +377,11 @@ fn compare_temporal_gt(
     if left.type_code == XmlTypeCode::DayTimeDuration
         || right.type_code == XmlTypeCode::DayTimeDuration
     {
+        if left.type_code != XmlTypeCode::DayTimeDuration
+            || right.type_code != XmlTypeCode::DayTimeDuration
+        {
+            return Err(operator_not_defined("op:gt", left, right));
+        }
         let left_duration = as_day_time_duration(left)
             .ok_or_else(|| XPathError::internal("Expected dayTimeDuration value"))?;
         let right_duration = as_day_time_duration(right)
@@ -329,9 +392,49 @@ fn compare_temporal_gt(
         ));
     }
 
-    Err(XPathError::internal(
-        "Comparison operator not defined for types",
-    ))
+    Err(operator_not_defined("op:gt", left, right))
+}
+
+fn operator_not_defined(op: &str, left: &XmlValue, right: &XmlValue) -> XPathError {
+    XPathError::BinaryOperatorNotDefined {
+        operator: op.to_string(),
+        left_type: type_code_to_name(left.type_code).to_string(),
+        right_type: type_code_to_name(right.type_code).to_string(),
+    }
+}
+
+fn is_operator_not_defined(err: &XPathError) -> bool {
+    matches!(err, XPathError::BinaryOperatorNotDefined { .. })
+}
+
+fn unwrap_union_value<'a>(value: &'a XmlValue) -> &'a XmlValue {
+    let mut current = value;
+    loop {
+        match &current.value {
+            XmlValueKind::Union(inner) => current = inner,
+            _ => return current,
+        }
+    }
+}
+
+fn list_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
+    match (&left.value, &right.value) {
+        (
+            XmlValueKind::List {
+                item_type: left_item_type,
+                items: left_items,
+            },
+            XmlValueKind::List {
+                item_type: right_item_type,
+                items: right_items,
+            },
+        ) => left_item_type == right_item_type && left_items == right_items,
+        _ => false,
+    }
+}
+
+fn compare_string_values(left: &str, right: &str) -> Ordering {
+    left.cmp(right)
 }
 
 fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
@@ -1646,6 +1749,580 @@ fn is_string_like(code: XmlTypeCode) -> bool {
     code.is_string_derived() || matches!(code, XmlTypeCode::AnyUri | XmlTypeCode::UntypedAtomic)
 }
 
+// ============================================================================
+// General Comparison Support (for sequence comparisons)
+// ============================================================================
+
+/// Perform magnitude relationship promotion for general comparisons.
+///
+/// When comparing values in a general comparison, UntypedAtomic values are
+/// promoted to match the type of the other operand according to XPath 2.0 rules:
+///
+/// - If the other operand is numeric, UntypedAtomic is promoted to xs:double
+/// - If the other operand is string, UntypedAtomic is kept as string
+/// - If the other operand is a typed value, UntypedAtomic is cast to that type
+///
+/// # Arguments
+///
+/// * `left` - The left operand
+/// * `right` - The right operand
+///
+/// # Returns
+///
+/// A tuple of (promoted_left, promoted_right) suitable for comparison
+pub fn magnitude_relationship(
+    left: &XmlValue,
+    right: &XmlValue,
+) -> Result<(XmlValue, XmlValue), XPathError> {
+    let mut left_result = left.clone();
+    let mut right_result = right.clone();
+
+    // Promote left if it's UntypedAtomic
+    if left.type_code == XmlTypeCode::UntypedAtomic {
+        if right.type_code.is_numeric() {
+            // Promote to double
+            let s = left.to_string_value();
+            let d: f64 = s.trim().parse().map_err(|_| {
+                XPathError::invalid_cast_value(&s, "xs:double")
+            })?;
+            left_result = XmlValue::double(d);
+        } else if is_string_like(right.type_code) {
+            // Keep as string
+            left_result = XmlValue::string(left.to_string_value());
+        }
+        // For other types, we'd need full cast support - for now, keep as string
+    }
+
+    // Promote right if it's UntypedAtomic
+    if right.type_code == XmlTypeCode::UntypedAtomic {
+        if left_result.type_code.is_numeric() {
+            // Promote to double
+            let s = right.to_string_value();
+            let d: f64 = s.trim().parse().map_err(|_| {
+                XPathError::invalid_cast_value(&s, "xs:double")
+            })?;
+            right_result = XmlValue::double(d);
+        } else if is_string_like(left_result.type_code) {
+            // Keep as string
+            right_result = XmlValue::string(right.to_string_value());
+        }
+        // For other types, we'd need full cast support - for now, keep as string
+    }
+
+    Ok((left_result, right_result))
+}
+
+/// Perform magnitude relationship promotion with context-aware casting.
+///
+/// This mirrors `MagnitudeRelationship` in C# with support for schema-aware casts.
+pub fn magnitude_relationship_ctx(
+    _context: &XPathContext,
+    left: &XmlValue,
+    right: &XmlValue,
+) -> Result<(XmlValue, XmlValue), XPathError> {
+    let mut left_result = left.clone();
+    let mut right_result = right.clone();
+
+    if left_result.type_code == XmlTypeCode::UntypedAtomic {
+        if right.type_code.is_numeric() {
+            let s = left_result.to_string_value();
+            let d: f64 = s.trim().parse().map_err(|_| {
+                XPathError::invalid_cast_value(&s, "xs:double")
+            })?;
+            left_result = XmlValue::double(d);
+        } else if is_string_like(right.type_code) {
+            left_result = XmlValue::string(left_result.to_string_value());
+        } else if right.type_code != XmlTypeCode::UntypedAtomic {
+            left_result = cast_to(&left_result, right.type_code)?;
+        }
+    }
+
+    if right_result.type_code == XmlTypeCode::UntypedAtomic {
+        if left_result.type_code.is_numeric() {
+            let s = right_result.to_string_value();
+            let d: f64 = s.trim().parse().map_err(|_| {
+                XPathError::invalid_cast_value(&s, "xs:double")
+            })?;
+            right_result = XmlValue::double(d);
+        } else if is_string_like(left_result.type_code) {
+            right_result = XmlValue::string(right_result.to_string_value());
+        } else if left_result.type_code != XmlTypeCode::UntypedAtomic {
+            right_result = cast_to(&right_result, left_result.type_code)?;
+        }
+    }
+
+    Ok((left_result, right_result))
+}
+
+fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<XmlValue, XPathError> {
+    Ok(match item {
+        XmlItemRef::Atomic(value) => value.clone(),
+        XmlItemRef::Node(node) => node.atomized_value(),
+    })
+}
+
+/// Compare two values for equality (value comparison).
+///
+/// This is the core equality comparison used by both value and general comparisons.
+/// For general comparisons, use `magnitude_relationship` first to promote UntypedAtomic values.
+pub fn value_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    compare_eq(left, right)
+}
+
+/// Compare two values for greater-than (value comparison).
+pub fn value_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    compare_gt(left, right)
+}
+
+/// Compare two values for greater-than-or-equal (value comparison).
+pub fn value_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    compare_ge(left, right)
+}
+
+/// Compare two values for less-than (value comparison).
+pub fn value_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    compare_lt(left, right)
+}
+
+/// Compare two values for less-than-or-equal (value comparison).
+pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    compare_le(left, right)
+}
+
+// ============================================================================
+// General comparisons for single atomized values
+// ============================================================================
+
+/// General equality comparison with magnitude relationship promotion (single values).
+///
+/// Promotes UntypedAtomic values before comparison.
+/// For sequence comparisons, use `general_eq_seq`.
+pub fn general_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let (l, r) = magnitude_relationship(left, right)?;
+    compare_eq(&l, &r)
+}
+
+/// General greater-than comparison with magnitude relationship promotion (single values).
+pub fn general_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let (l, r) = magnitude_relationship(left, right)?;
+    compare_gt(&l, &r)
+}
+
+/// General not-equal comparison with magnitude relationship promotion (single values).
+pub fn general_ne(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    general_eq(left, right).map(|eq| !eq)
+}
+
+/// General greater-than-or-equal comparison with magnitude relationship promotion (single values).
+pub fn general_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let (l, r) = magnitude_relationship(left, right)?;
+    compare_ge(&l, &r)
+}
+
+/// General less-than comparison with magnitude relationship promotion (single values).
+pub fn general_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let (l, r) = magnitude_relationship(left, right)?;
+    compare_lt(&l, &r)
+}
+
+/// General less-than-or-equal comparison with magnitude relationship promotion (single values).
+pub fn general_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+    let (l, r) = magnitude_relationship(left, right)?;
+    compare_le(&l, &r)
+}
+
+// ============================================================================
+// Iterator-based general comparisons (Cartesian product semantics)
+// ============================================================================
+
+pub fn general_eq_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_eq(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(err) if is_operator_not_defined(&err) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn general_ne_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_eq(&l, &r) {
+                Ok(true) => continue,
+                Ok(false) => return Ok(true),
+                Err(err) if is_operator_not_defined(&err) => return Ok(true),
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn general_lt_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_lt(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn general_le_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_eq(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(err) if is_operator_not_defined(&err) => {}
+                Err(err) => return Err(err),
+            }
+
+            match value_lt(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn general_gt_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_gt(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+pub fn general_ge_iter<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone());
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next() {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next() {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
+
+            match value_eq(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(err) if is_operator_not_defined(&err) => {}
+                Err(err) => return Err(err),
+            }
+
+            match value_gt(&l, &r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+// ============================================================================
+// General comparisons for sequences (Cartesian product semantics)
+// ============================================================================
+
+/// General equality comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) from the Cartesian product
+/// of the two sequences satisfies the equality condition.
+///
+/// # XPath 2.0 Semantics
+///
+/// The general comparison operators (`=`, `!=`, `<`, `<=`, `>`, `>=`) are
+/// existentially quantified over their operand sequences:
+/// - `A = B` is true if there exist atomized values `a` in `A` and `b` in `B`
+///   such that `a eq b` is true (after type promotion).
+///
+/// # Arguments
+///
+/// * `left` - Left sequence of atomized values
+/// * `right` - Right sequence of atomized values
+///
+/// # Returns
+///
+/// `true` if any pair satisfies equality, `false` if no pairs satisfy or
+/// either sequence is empty.
+pub fn general_eq_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    // Empty sequences: result is false (no pairs exist)
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    // Cartesian product: check if ANY pair satisfies the condition
+    for l in left {
+        for r in right {
+            match general_eq(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue, // Type errors mean this pair doesn't match
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// General not-equal comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) satisfies inequality.
+pub fn general_ne_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    for l in left {
+        for r in right {
+            match general_ne(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// General less-than comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) satisfies left < right.
+pub fn general_lt_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    for l in left {
+        for r in right {
+            match general_lt(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// General less-than-or-equal comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) satisfies left <= right.
+pub fn general_le_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    for l in left {
+        for r in right {
+            match general_le(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// General greater-than comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) satisfies left > right.
+pub fn general_gt_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    for l in left {
+        for r in right {
+            match general_gt(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// General greater-than-or-equal comparison for sequences (Cartesian product).
+///
+/// Returns true if ANY pair (left_item, right_item) satisfies left >= right.
+pub fn general_ge_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPathError> {
+    if left.is_empty() || right.is_empty() {
+        return Ok(false);
+    }
+
+    for l in left {
+        for r in right {
+            match general_ge(l, r) {
+                Ok(true) => return Ok(true),
+                Ok(false) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 fn unsupported_operator(op: BinaryOpKind, left: &XmlValue, right: &XmlValue) -> XPathError {
     XPathError::internal(format!(
         "Operator {:?} not defined for types {:?} and {:?}",
@@ -1656,6 +2333,11 @@ fn unsupported_operator(op: BinaryOpKind, left: &XmlValue, right: &XmlValue) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::NameTable;
+    use crate::namespace::qname::QualifiedName;
+    use crate::xpath::context::XPathContext;
+    use crate::xpath::iterator::{VecNodeIterator, XmlItem};
+    use crate::xpath::roxmltree::RoXmlNavigator;
 
     fn int_value(type_code: XmlTypeCode, value: i64) -> XmlValue {
         XmlValue {
@@ -2001,5 +2683,361 @@ mod tests {
             }
             _ => panic!("Expected dayTimeDuration result"),
         }
+    }
+
+    // ========================================================================
+    // General Comparison Tests
+    // ========================================================================
+
+    #[test]
+    fn test_magnitude_relationship_untyped_to_numeric() {
+        // UntypedAtomic compared with integer should promote to double
+        let left = XmlValue::untyped("42");
+        let right = int_value(XmlTypeCode::Integer, 42);
+        let (promoted_left, promoted_right) = magnitude_relationship(&left, &right).unwrap();
+        assert_eq!(promoted_left.type_code, XmlTypeCode::Double);
+        assert_eq!(promoted_right.type_code, XmlTypeCode::Integer);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_untyped_to_string() {
+        // UntypedAtomic compared with string should become string
+        let left = XmlValue::untyped("hello");
+        let right = XmlValue::string("world");
+        let (promoted_left, promoted_right) = magnitude_relationship(&left, &right).unwrap();
+        assert_eq!(promoted_left.type_code, XmlTypeCode::String);
+        assert_eq!(promoted_right.type_code, XmlTypeCode::String);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_both_untyped() {
+        // Both UntypedAtomic should both become string
+        let left = XmlValue::untyped("abc");
+        let right = XmlValue::untyped("def");
+        let (promoted_left, promoted_right) = magnitude_relationship(&left, &right).unwrap();
+        // When both are untyped, they stay as string-like
+        assert!(is_string_like(promoted_left.type_code));
+        assert!(is_string_like(promoted_right.type_code));
+    }
+
+    #[test]
+    fn test_general_eq_with_untyped() {
+        // "42" = 42 should be true (UntypedAtomic promoted to double)
+        let left = XmlValue::untyped("42");
+        let right = int_value(XmlTypeCode::Integer, 42);
+        assert!(general_eq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_eq_strings() {
+        let left = XmlValue::string("hello");
+        let right = XmlValue::string("hello");
+        assert!(general_eq(&left, &right).unwrap());
+
+        let right2 = XmlValue::string("world");
+        assert!(!general_eq(&left, &right2).unwrap());
+    }
+
+    #[test]
+    fn test_general_gt_with_untyped() {
+        // "50" > 42 should be true
+        let left = XmlValue::untyped("50");
+        let right = int_value(XmlTypeCode::Integer, 42);
+        assert!(general_gt(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_ne() {
+        let left = XmlValue::string("a");
+        let right = XmlValue::string("b");
+        assert!(general_ne(&left, &right).unwrap());
+
+        let same = XmlValue::string("a");
+        assert!(!general_ne(&left, &same).unwrap());
+    }
+
+    #[test]
+    fn test_general_comparisons_numeric() {
+        let five = int_value(XmlTypeCode::Integer, 5);
+        let ten = int_value(XmlTypeCode::Integer, 10);
+
+        assert!(general_lt(&five, &ten).unwrap());
+        assert!(general_le(&five, &ten).unwrap());
+        assert!(!general_gt(&five, &ten).unwrap());
+        assert!(!general_ge(&five, &ten).unwrap());
+
+        assert!(general_ge(&five, &five).unwrap());
+        assert!(general_le(&five, &five).unwrap());
+    }
+
+    #[test]
+    fn test_value_comparisons() {
+        let a = XmlValue::string("abc");
+        let b = XmlValue::string("xyz");
+
+        assert!(value_lt(&a, &b).unwrap());
+        assert!(value_le(&a, &b).unwrap());
+        assert!(!value_gt(&a, &b).unwrap());
+        assert!(!value_ge(&a, &b).unwrap());
+        assert!(!value_eq(&a, &b).unwrap());
+    }
+
+    // ========================================================================
+    // Sequence General Comparison Tests (Cartesian product)
+    // ========================================================================
+
+    #[test]
+    fn test_general_eq_seq_finds_match() {
+        // (1, 2, 3) = (3, 4, 5) should be true because 3 appears in both
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+            int_value(XmlTypeCode::Integer, 3),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 3),
+            int_value(XmlTypeCode::Integer, 4),
+            int_value(XmlTypeCode::Integer, 5),
+        ];
+        assert!(general_eq_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_eq_seq_no_match() {
+        // (1, 2) = (3, 4) should be false because no common values
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 3),
+            int_value(XmlTypeCode::Integer, 4),
+        ];
+        assert!(!general_eq_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_eq_seq_empty_is_false() {
+        // Empty sequences always return false for general comparisons
+        let left: Vec<XmlValue> = vec![];
+        let right = vec![int_value(XmlTypeCode::Integer, 1)];
+        assert!(!general_eq_seq(&left, &right).unwrap());
+        assert!(!general_eq_seq(&right, &left).unwrap());
+        assert!(!general_eq_seq(&left, &left).unwrap());
+    }
+
+    #[test]
+    fn test_general_ne_seq() {
+        // (1, 2) != (2, 3) should be true because 1 != 2, 1 != 3, 2 != 3 all true
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 2),
+            int_value(XmlTypeCode::Integer, 3),
+        ];
+        assert!(general_ne_seq(&left, &right).unwrap());
+
+        // (1) != (1) should be false because no pair is not-equal
+        let same = vec![int_value(XmlTypeCode::Integer, 1)];
+        assert!(!general_ne_seq(&same, &same).unwrap());
+    }
+
+    #[test]
+    fn test_general_lt_seq() {
+        // (1, 2) < (3, 4) should be true because 1 < 3, 1 < 4, 2 < 3, 2 < 4
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 3),
+            int_value(XmlTypeCode::Integer, 4),
+        ];
+        assert!(general_lt_seq(&left, &right).unwrap());
+
+        // (3, 4) < (1, 2) should be false
+        assert!(!general_lt_seq(&right, &left).unwrap());
+
+        // (1, 5) < (3, 4) should be true because 1 < 3, 1 < 4
+        let mixed = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 5),
+        ];
+        assert!(general_lt_seq(&mixed, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_gt_seq() {
+        // (3, 4) > (1, 2) should be true
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 3),
+            int_value(XmlTypeCode::Integer, 4),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        assert!(general_gt_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_le_seq() {
+        // (1, 2) <= (2, 3) should be true because 1 <= 2, 1 <= 3, 2 <= 2, 2 <= 3
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 2),
+            int_value(XmlTypeCode::Integer, 3),
+        ];
+        assert!(general_le_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_ge_seq() {
+        // (2, 3) >= (1, 2) should be true
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 2),
+            int_value(XmlTypeCode::Integer, 3),
+        ];
+        let right = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        assert!(general_ge_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_seq_with_type_promotion() {
+        // UntypedAtomic should be promoted: ("42") = (42) should be true
+        let left = vec![XmlValue::untyped("42")];
+        let right = vec![int_value(XmlTypeCode::Integer, 42)];
+        assert!(general_eq_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_seq_mixed_types() {
+        // Mixed types that can't compare just skip those pairs
+        // (1, "hello") = ("hello", 2) should be true because "hello" = "hello"
+        let left = vec![
+            int_value(XmlTypeCode::Integer, 1),
+            XmlValue::string("hello"),
+        ];
+        let right = vec![
+            XmlValue::string("hello"),
+            int_value(XmlTypeCode::Integer, 2),
+        ];
+        assert!(general_eq_seq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_compare_ge_prefers_eq_over_ordering() {
+        // QName ordering isn't defined, but equality is.
+        let mut names = NameTable::new();
+        let local = names.add("a");
+        let qname = QualifiedName::local(local);
+        let left = XmlValue::new(
+            XmlTypeCode::QName,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+        );
+        let right = left.clone();
+
+        assert!(compare_ge(&left, &right).unwrap());
+        assert!(compare_le(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_list_equality() {
+        let left = XmlValue::new(
+            XmlTypeCode::NmTokens,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::NmToken,
+                items: vec![
+                    XmlAtomicValue::String("a".to_string()),
+                    XmlAtomicValue::String("b".to_string()),
+                ],
+            },
+        );
+        let right = left.clone();
+        let different = XmlValue::new(
+            XmlTypeCode::NmTokens,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::NmToken,
+                items: vec![XmlAtomicValue::String("a".to_string())],
+            },
+        );
+
+        assert!(compare_eq(&left, &right).unwrap());
+        assert!(!compare_eq(&left, &different).unwrap());
+    }
+
+    #[test]
+    fn test_union_unwrap_equality() {
+        let inner = XmlValue::string("hello");
+        let left = XmlValue::new(XmlTypeCode::String, XmlValueKind::Union(Box::new(inner)));
+        let right = XmlValue::string("hello");
+        assert!(compare_eq(&left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_eq_iter_finds_match() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ]);
+
+        assert!(general_eq_iter(&context, &left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_eq_iter_invalid_cast_errors() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::untyped("not-a-number")),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+        ]);
+
+        let result = general_eq_iter(&context, &left, &right);
+        assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
+    }
+
+    #[test]
+    fn test_general_eq_iter_type_mismatch_is_false() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::boolean(true)),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(date_value(2024, 1, 1)),
+        ]);
+
+        assert!(!general_eq_iter(&context, &left, &right).unwrap());
+    }
+
+    #[test]
+    fn test_general_gt_iter_type_mismatch_errors() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::boolean(true)),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::string("false")),
+        ]);
+
+        let result = general_gt_iter(&context, &left, &right);
+        assert!(matches!(result, Err(XPathError::BinaryOperatorNotDefined { .. })));
     }
 }
