@@ -2,6 +2,8 @@
 // Expression Nodes
 // ============================================================================
 
+use super::{AstNodeId, SourceSpan};
+
 /// Comma-separated sequence of expressions.
 ///
 /// In XPath, `(a, b, c)` creates a sequence containing results of a, b, and c.
@@ -89,4 +91,5 @@ impl VarRefNode {
         }
     }
 }
+
 

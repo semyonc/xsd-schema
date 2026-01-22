@@ -2,6 +2,8 @@
 // Operators
 // ============================================================================
 
+use super::{AstNodeId, SourceSpan};
+
 /// Operator flags for optimization hints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OpFlags {
@@ -167,4 +169,5 @@ impl BinaryOpNode {
         }
     }
 }
+
 

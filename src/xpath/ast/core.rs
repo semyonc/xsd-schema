@@ -2,6 +2,8 @@
 // Core AST Node Enum
 // ============================================================================
 
+use super::{BinaryOpNode, ContextItemNode, ExprNode, FilterExprNode, ForNode, FunctionCallNode, IfNode, PathExprNode, PathStepNode, QuantifiedNode, RangeNode, TypeExprNode, UnaryOpNode, VarRefNode, ValueNode};
+
 /// The main AST node type, encompassing all possible expression types.
 #[derive(Debug, Clone)]
 pub enum AstNode {
@@ -36,4 +38,5 @@ pub enum AstNode {
     /// Type expression (instance of, treat as, cast as, castable as).
     TypeExpr(TypeExprNode),
 }
+
 

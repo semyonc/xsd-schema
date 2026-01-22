@@ -2,6 +2,8 @@
 // Control Flow Nodes
 // ============================================================================
 
+use super::{AstNodeId, SourceSpan};
+
 /// Conditional expression (`if (test) then expr else expr`).
 #[derive(Debug, Clone)]
 pub struct IfNode {
@@ -118,4 +120,5 @@ impl QuantifiedNode {
         }
     }
 }
+
 

@@ -2,6 +2,8 @@
 // Path Expressions
 // ============================================================================
 
+use super::{AstNodeId, SourceSpan};
+
 /// XPath axis specifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
@@ -282,4 +284,5 @@ impl FilterExprNode {
         }
     }
 }
+
 

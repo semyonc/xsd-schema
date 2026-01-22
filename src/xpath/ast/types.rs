@@ -2,6 +2,8 @@
 // Type Expressions
 // ============================================================================
 
+use super::{AstNodeId, KindTest, QName, SourceSpan};
+
 /// Kind of type expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeExprKind {
@@ -99,4 +101,5 @@ pub enum ItemTypeNode {
     /// Kind test (`node()`, `element()`, etc.).
     Kind(KindTest),
 }
+
 
