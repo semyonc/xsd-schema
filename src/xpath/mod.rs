@@ -47,6 +47,9 @@ pub mod string_ops;
 pub mod type_info;
 pub mod iter_adapters;
 
+// XPath 2.0 function registry and dispatch
+pub mod functions;
+
 // Navigator modules
 pub mod roxmltree;
 
@@ -72,7 +75,8 @@ pub use self::axis_iterators::{
 };
 pub use self::tree_comparer::TreeComparer;
 pub use self::node_test::{NodeTest, matches_name_test, matches_sequence_type};
-pub use self::context::XPathContext;
+pub use self::context::{XPathContext, DynamicContext, VarStore, VarSlotId, VarRef, NameBinder};
+pub use self::functions::{FunctionId, FunctionArity, FunctionSignature, XPathValue, FUNCTION_REGISTRY};
 pub use self::timsort::{
     timsort, timsort_by, timsort_slice, timsort_slice_by,
     timsort_with_comparer, timsort_slice_with_comparer,

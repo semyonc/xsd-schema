@@ -102,7 +102,15 @@ pub enum XPathError {
 
     /// FORG0006: Invalid argument type for function.
     #[error("[FORG0006] Function '{function}' called with invalid argument type '{arg_type}'")]
-    FORG0006 { function: String, arg_type: String },
+    FORG0006Named { function: String, arg_type: String },
+
+    /// FORG0006: General effective boolean value error.
+    #[error("[FORG0006] {message}")]
+    FORG0006 { message: String },
+
+    /// FORG0008: Both arguments to fn:dateTime have a timezone
+    #[error("[FORG0008] Both arguments to fn:dateTime have a timezone")]
+    FORG0008,
 
     // ========================================================================
     // Arithmetic Errors (FOAR)
@@ -250,10 +258,23 @@ impl XPathError {
 
     /// Create FORG0006 invalid argument type error.
     pub fn invalid_argument_type(function: impl Into<String>, arg_type: impl Into<String>) -> Self {
-        XPathError::FORG0006 {
+        XPathError::FORG0006Named {
             function: function.into(),
             arg_type: arg_type.into(),
         }
+    }
+
+    /// Create a not implemented error.
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        XPathError::Internal(format!("Not implemented: {}", message.into()))
+    }
+
+    /// Create a wrong number of arguments error.
+    pub fn wrong_number_of_arguments(function: &str, expected: usize, actual: usize) -> Self {
+        XPathError::Internal(format!(
+            "Function '{}' expects {} arguments, but got {}",
+            function, expected, actual
+        ))
     }
 
     /// Create binary operator not defined error.
@@ -299,7 +320,9 @@ impl XPathError {
             XPathError::FORG0003 => Some("FORG0003"),
             XPathError::FORG0004 => Some("FORG0004"),
             XPathError::FORG0005 => Some("FORG0005"),
+            XPathError::FORG0006Named { .. } => Some("FORG0006"),
             XPathError::FORG0006 { .. } => Some("FORG0006"),
+            XPathError::FORG0008 => Some("FORG0008"),
             XPathError::FOAR0001 => Some("FOAR0001"),
             XPathError::FOAR0002 => Some("FOAR0002"),
             XPathError::FOCA0002 { .. } => Some("FOCA0002"),

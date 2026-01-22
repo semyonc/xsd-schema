@@ -312,10 +312,10 @@ mod tests {
         );
         let result = effective_boolean_value(&dt);
         assert!(result.is_err());
-        if let Err(XPathError::FORG0006 { function, .. }) = result {
+        if let Err(XPathError::FORG0006Named { function, .. }) = result {
             assert_eq!(function, "fn:boolean");
         } else {
-            panic!("Expected FORG0006 error");
+            panic!("Expected FORG0006Named error");
         }
     }
 
