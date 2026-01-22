@@ -112,6 +112,9 @@ pub mod builder;
 // NFA compiler for content models
 pub mod compiler;
 
+// Instance validation
+pub mod validation;
+
 // Re-export primary types
 pub use error::{SchemaError, SchemaResult, FacetError, FacetResult};
 pub use ids::*;
@@ -166,4 +169,15 @@ pub use compiler::{
     NfaFragment, FragmentBuilder, fragment_to_table,
     CompileContext, compile_particle, compile_model_group,
     NfaCompileError, NfaCompileResult,
+};
+
+// Re-export instance validation types
+// Note: ValidationError here is distinct from types::validators::ValidationError
+pub use validation::{
+    ValidationError as InstanceValidationError,
+    ValidationResult as InstanceValidationResult,
+    error as validation_error,
+    error_with_path as validation_error_with_path,
+    from_value_error, from_facet_error,
+    facet_constraint_code,
 };

@@ -64,7 +64,7 @@ fn override_simple_type(schema_set: &mut SchemaSet, new_key: SimpleTypeKey) -> S
 
     let name = new_type.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding simple type must have a name",
             None,
         )
@@ -91,7 +91,7 @@ fn override_complex_type(
 
     let name = new_type.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding complex type must have a name",
             None,
         )
@@ -114,7 +114,7 @@ fn override_model_group(schema_set: &mut SchemaSet, new_key: ModelGroupKey) -> S
 
     let name = new_group.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding model group must have a name",
             None,
         )
@@ -140,7 +140,7 @@ fn override_attribute_group(
 
     let name = new_group.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding attribute group must have a name",
             None,
         )
@@ -163,7 +163,7 @@ fn override_element(schema_set: &mut SchemaSet, new_key: ElementKey) -> SchemaRe
 
     let name = new_elem.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding element must have a name",
             None,
         )
@@ -186,7 +186,7 @@ fn override_attribute(schema_set: &mut SchemaSet, new_key: AttributeKey) -> Sche
 
     let name = new_attr.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-override",
+            "src-override",
             "Overriding attribute must have a name",
             None,
         )

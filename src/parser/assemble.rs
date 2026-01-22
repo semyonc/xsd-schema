@@ -462,7 +462,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_type(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-type",
+                "sch-props-correct",
                 format!("Duplicate type declaration '{}'", name_str),
                 location,
             ));
@@ -481,7 +481,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_element(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-element",
+                "sch-props-correct",
                 format!("Duplicate element declaration '{}'", name_str),
                 location,
             ));
@@ -500,7 +500,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_attribute(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-attribute",
+                "sch-props-correct",
                 format!("Duplicate attribute declaration '{}'", name_str),
                 location,
             ));
@@ -519,7 +519,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_model_group(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-group",
+                "sch-props-correct",
                 format!("Duplicate group declaration '{}'", name_str),
                 location,
             ));
@@ -538,7 +538,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_attribute_group(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-attribute-group",
+                "sch-props-correct",
                 format!("Duplicate attribute group declaration '{}'", name_str),
                 location,
             ));
@@ -557,7 +557,7 @@ impl<'a> SchemaAssembler<'a> {
         let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
         if ns_table.register_notation(name, key).is_some() {
             return Err(SchemaError::structural(
-                "sch-duplicate-notation",
+                "sch-props-correct",
                 format!("Duplicate notation declaration '{}'", name_str),
                 location,
             ));
@@ -840,7 +840,7 @@ fn missing_name(
 ) -> SchemaError {
     let location = source.and_then(|s| schema_set.source_maps.locate(s));
     SchemaError::structural(
-        "sch-missing-name",
+        "src-resolve",
         format!("Missing required name for {}", kind),
         location,
     )

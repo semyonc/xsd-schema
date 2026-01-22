@@ -259,7 +259,7 @@ impl Frame for IdentityFrame {
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let name = self.name.ok_or_else(|| {
             SchemaError::structural(
-                "sch-identity-constraint",
+                "src-identity-constraint",
                 "Identity constraint requires 'name' attribute",
                 None,
             )
@@ -267,7 +267,7 @@ impl Frame for IdentityFrame {
 
         let selector = self.selector.ok_or_else(|| {
             SchemaError::structural(
-                "sch-identity-selector",
+                "src-identity-constraint",
                 "Identity constraint requires a selector",
                 None,
             )
@@ -275,7 +275,7 @@ impl Frame for IdentityFrame {
 
         if self.fields.is_empty() {
             return Err(SchemaError::structural(
-                "sch-identity-field",
+                "src-identity-constraint",
                 "Identity constraint requires at least one field",
                 None,
             ));

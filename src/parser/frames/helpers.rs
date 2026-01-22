@@ -15,7 +15,7 @@ where
         Some(value) => {
             let parsed = parse(value).map_err(|err| {
                 SchemaError::structural(
-                    "sch-attributes",
+                    "ct-props-correct",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -64,7 +64,7 @@ fn parse_occurs_attr_raw(
         Some(value) => {
             let parsed = parse_occurs(value).map_err(|err| {
                 SchemaError::structural(
-                    "sch-attributes",
+                    "ct-props-correct",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -84,7 +84,7 @@ fn parse_min_occurs_attr(
         None => Ok(1),
         Some(Some(value)) => Ok(value),
         Some(None) => Err(SchemaError::structural(
-            "sch-attributes",
+            "ct-props-correct",
             format!("Invalid value for attribute '{}': 'unbounded'", name),
             None,
         )),
@@ -163,7 +163,7 @@ fn parse_derivation_set(value: Option<&str>) -> SchemaResult<DerivationSet> {
             "substitution" => set |= DerivationSet::SUBSTITUTION,
             _ => {
                 return Err(SchemaError::structural(
-                    "sch-derivation-set",
+                    "sch-props-correct",
                     format!("Invalid derivation method: '{}'", token),
                     None,
                 ));
@@ -191,7 +191,7 @@ fn parse_qname_ref(
     };
 
     let local_name = name_table.get(local).ok_or_else(|| SchemaError::structural(
-        "sch-qname",
+        "src-resolve",
         format!("Unknown local name: '{}'", local),
         None,
     ))?;

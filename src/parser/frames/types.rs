@@ -304,7 +304,7 @@ impl Frame for RestrictionFrame {
         // Validate restriction structure: base XOR inline type (can't have both)
         if self.base_type.is_some() && self.inline_type.is_some() {
             return Err(SchemaError::structural(
-                "sch-restriction-base-type",
+                "src-restriction-base-or-simpleType",
                 "Restriction cannot have both 'base' attribute and inline type",
                 None,
             ));
@@ -562,7 +562,7 @@ impl Frame for ListFrame {
 
         if has_item_type_attr && has_inline_type {
             return Err(SchemaError::structural(
-                "sch-list-itemtype-type",
+                "src-list-itemType-or-simpleType",
                 "List cannot have both 'itemType' attribute and inline simpleType",
                 None,
             ));
@@ -570,7 +570,7 @@ impl Frame for ListFrame {
 
         if !has_item_type_attr && !has_inline_type {
             return Err(SchemaError::structural(
-                "sch-list-itemtype-required",
+                "src-list-itemType-or-simpleType",
                 "List must have either 'itemType' attribute or inline simpleType",
                 None,
             ));
@@ -685,7 +685,7 @@ impl Frame for UnionFrame {
         // Validate union structure: must have memberTypes and/or inline simpleTypes
         if self.member_types.is_empty() {
             return Err(SchemaError::structural(
-                "sch-union-members-required",
+                "src-union-memberTypes-or-simpleTypes",
                 "Union must have 'memberTypes' attribute or inline simpleType children",
                 None,
             ));
@@ -818,7 +818,7 @@ impl Frame for SimpleContentFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let base_type = self.base_type.ok_or_else(|| SchemaError::structural(
-            "sch-simple-content",
+            "ct-props-correct",
             "xs:simpleContent requires a base type",
             None,
         ))?;

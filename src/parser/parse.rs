@@ -265,7 +265,7 @@ pub fn parse_schema_with_config(
     // Check for incomplete parsing
     if !state.frame_stack.is_empty() {
         return Err(SchemaError::structural(
-            "sch-incomplete",
+            "src-resolve",
             "Schema document ended with unclosed elements",
             None,
         ));
@@ -411,7 +411,7 @@ fn handle_start_element(
         // Must be xs:schema
         if local_name != xsd_names::SCHEMA || !state.is_xsd_element(element_ns) {
             return Err(SchemaError::structural(
-                "sch-root",
+                "sch-props-correct",
                 format!(
                     "Root element must be xs:schema, found '{}'",
                     local_name
@@ -469,7 +469,7 @@ fn handle_start_element(
             if state.config.error_recovery {
                 // Push a skip frame for error recovery
                 state.add_error(SchemaError::structural(
-                    "sch-unexpected-child",
+                    "sch-props-correct",
                     format!("Unexpected element '{}' in current context", local_name),
                     None,
                 ));
@@ -477,7 +477,7 @@ fn handle_start_element(
                 return Ok(());
             } else {
                 return Err(SchemaError::structural(
-                    "sch-unexpected-child",
+                    "sch-props-correct",
                     format!("Unexpected element '{}' in current context", local_name),
                     None,
                 ));

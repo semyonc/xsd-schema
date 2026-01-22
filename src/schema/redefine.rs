@@ -65,7 +65,7 @@ fn apply_simple_type_redefine(
 
     let name = new_type.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined simple type must have a name",
             None,
         )
@@ -75,7 +75,7 @@ fn apply_simple_type_redefine(
     // Find the original type
     let original_key = schema_set.lookup_type(namespace, name).ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             format!(
                 "Original type '{}' not found for redefinition",
                 schema_set.name_table.resolve(name)
@@ -108,7 +108,7 @@ fn apply_complex_type_redefine(
 
     let name = new_type.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined complex type must have a name",
             None,
         )
@@ -118,7 +118,7 @@ fn apply_complex_type_redefine(
     // Find and validate original exists
     let _original_key = schema_set.lookup_type(namespace, name).ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             format!(
                 "Original type '{}' not found for redefinition",
                 schema_set.name_table.resolve(name)
@@ -150,7 +150,7 @@ fn apply_model_group_redefine(
 
     let name = new_group.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined model group must have a name",
             None,
         )
@@ -162,7 +162,7 @@ fn apply_model_group_redefine(
         .lookup_model_group(namespace, name)
         .ok_or_else(|| {
             SchemaError::structural(
-                "sch-redefine",
+                "src-redefine",
                 format!(
                     "Original group '{}' not found for redefinition",
                     schema_set.name_table.resolve(name)
@@ -194,7 +194,7 @@ fn apply_attribute_group_redefine(
 
     let name = new_group.name.ok_or_else(|| {
         SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined attribute group must have a name",
             None,
         )
@@ -206,7 +206,7 @@ fn apply_attribute_group_redefine(
         .lookup_attribute_group(namespace, name)
         .ok_or_else(|| {
             SchemaError::structural(
-                "sch-redefine",
+                "src-redefine",
                 format!(
                     "Original attribute group '{}' not found for redefinition",
                     schema_set.name_table.resolve(name)
@@ -243,7 +243,7 @@ fn validate_self_derivation_simple(
     if let Some(TypeRefResult::QName(ref qname)) = type_def.base_type {
         if qname.local_name != expected_name {
             return Err(SchemaError::structural(
-                "sch-redefine",
+                "src-redefine",
                 "Redefined simple type must derive from the original type (self-reference)",
                 type_def
                     .source
@@ -253,7 +253,7 @@ fn validate_self_derivation_simple(
         }
     } else {
         return Err(SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined simple type must have a base type reference",
             type_def
                 .source
@@ -283,7 +283,7 @@ fn validate_self_derivation_complex(
     if let Some(TypeRefResult::QName(ref qname)) = type_def.base_type {
         if qname.local_name != expected_name {
             return Err(SchemaError::structural(
-                "sch-redefine",
+                "src-redefine",
                 "Redefined complex type must derive from the original type (self-reference)",
                 type_def
                     .source
@@ -293,7 +293,7 @@ fn validate_self_derivation_complex(
         }
     } else {
         return Err(SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "Redefined complex type must have a base type reference",
             type_def
                 .source
@@ -330,7 +330,7 @@ fn validate_self_reference_group(
 
     if self_refs != 1 {
         return Err(SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             format!(
                 "Redefined group must contain exactly one self-reference (found {})",
                 self_refs
@@ -366,7 +366,7 @@ fn validate_self_reference_attribute_group(
 
     if self_refs != 1 {
         return Err(SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             format!(
                 "Redefined attribute group must contain exactly one self-reference (found {})",
                 self_refs

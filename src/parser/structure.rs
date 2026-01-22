@@ -96,7 +96,7 @@ pub fn validate_element_structure(
         // Top-level element validation
         if !has_name {
             return Err(SchemaError::structural(
-                "sch-element-name-required",
+                "src-element",
                 "Top-level element declaration must have 'name' attribute",
                 None,
             ));
@@ -104,7 +104,7 @@ pub fn validate_element_structure(
 
         if has_ref {
             return Err(SchemaError::structural(
-                "sch-element-top-ref",
+                "src-element",
                 "Top-level element declaration cannot have 'ref' attribute",
                 None,
             ));
@@ -114,7 +114,7 @@ pub fn validate_element_structure(
         for prohibited in &["minOccurs", "maxOccurs", "form"] {
             if attrs.get_value_by_name(name_table, prohibited).is_some() {
                 return Err(SchemaError::structural(
-                    "sch-element-top-prohibited",
+                    "src-element",
                     format!(
                         "Top-level element declaration cannot have '{}' attribute",
                         prohibited
@@ -127,7 +127,7 @@ pub fn validate_element_structure(
         // Local element validation
         if has_name && has_ref {
             return Err(SchemaError::structural(
-                "sch-element-name-ref",
+                "src-element",
                 "Local element cannot have both 'name' and 'ref' attributes",
                 None,
             ));
@@ -135,7 +135,7 @@ pub fn validate_element_structure(
 
         if !has_name && !has_ref {
             return Err(SchemaError::structural(
-                "sch-element-name-or-ref",
+                "src-element",
                 "Local element must have either 'name' or 'ref' attribute",
                 None,
             ));
@@ -149,7 +149,7 @@ pub fn validate_element_structure(
             for prohibited in &ref_prohibited {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
-                        "sch-element-ref-prohibited",
+                        "src-element",
                         format!(
                             "Element reference cannot have '{}' attribute",
                             prohibited
@@ -166,7 +166,7 @@ pub fn validate_element_structure(
     let has_fixed = attrs.get_value_by_name(name_table, "fixed").is_some();
     if has_default && has_fixed {
         return Err(SchemaError::structural(
-            "sch-element-default-fixed",
+            "cos-valid-default",
             "Element cannot have both 'default' and 'fixed' attributes",
             None,
         ));
@@ -200,7 +200,7 @@ pub fn validate_attribute_structure(
         // Top-level attribute validation
         if !has_name {
             return Err(SchemaError::structural(
-                "sch-attribute-name-required",
+                "src-attribute",
                 "Top-level attribute declaration must have 'name' attribute",
                 None,
             ));
@@ -208,7 +208,7 @@ pub fn validate_attribute_structure(
 
         if has_ref {
             return Err(SchemaError::structural(
-                "sch-attribute-top-ref",
+                "src-attribute",
                 "Top-level attribute declaration cannot have 'ref' attribute",
                 None,
             ));
@@ -218,7 +218,7 @@ pub fn validate_attribute_structure(
         for prohibited in &["use", "form"] {
             if attrs.get_value_by_name(name_table, prohibited).is_some() {
                 return Err(SchemaError::structural(
-                    "sch-attribute-top-prohibited",
+                    "src-attribute",
                     format!(
                         "Top-level attribute declaration cannot have '{}' attribute",
                         prohibited
@@ -231,7 +231,7 @@ pub fn validate_attribute_structure(
         // Local attribute validation
         if has_name && has_ref {
             return Err(SchemaError::structural(
-                "sch-attribute-name-ref",
+                "src-attribute",
                 "Local attribute cannot have both 'name' and 'ref' attributes",
                 None,
             ));
@@ -239,7 +239,7 @@ pub fn validate_attribute_structure(
 
         if !has_name && !has_ref {
             return Err(SchemaError::structural(
-                "sch-attribute-name-or-ref",
+                "src-attribute",
                 "Local attribute must have either 'name' or 'ref' attribute",
                 None,
             ));
@@ -251,7 +251,7 @@ pub fn validate_attribute_structure(
             for prohibited in &ref_prohibited {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
-                        "sch-attribute-ref-prohibited",
+                        "src-attribute",
                         format!(
                             "Attribute reference cannot have '{}' attribute",
                             prohibited
@@ -268,7 +268,7 @@ pub fn validate_attribute_structure(
     let has_fixed = attrs.get_value_by_name(name_table, "fixed").is_some();
     if has_default && has_fixed {
         return Err(SchemaError::structural(
-            "sch-attribute-default-fixed",
+            "cos-valid-default",
             "Attribute cannot have both 'default' and 'fixed' attributes",
             None,
         ));
@@ -279,14 +279,14 @@ pub fn validate_attribute_structure(
         if use_val == "prohibited" {
             if has_default {
                 return Err(SchemaError::structural(
-                    "sch-attribute-prohibited-default",
+                    "src-attribute",
                     "Prohibited attribute cannot have 'default' attribute",
                     None,
                 ));
             }
             if has_fixed {
                 return Err(SchemaError::structural(
-                    "sch-attribute-prohibited-fixed",
+                    "src-attribute",
                     "Prohibited attribute cannot have 'fixed' attribute",
                     None,
                 ));
@@ -315,7 +315,7 @@ pub fn validate_simple_type_structure(
 
     if ctx.is_top_level && !has_name {
         return Err(SchemaError::structural(
-            "sch-simpletype-name-required",
+            "src-simple-type",
             "Top-level simpleType must have 'name' attribute",
             None,
         ));
@@ -323,7 +323,7 @@ pub fn validate_simple_type_structure(
 
     if !ctx.is_top_level && has_name {
         return Err(SchemaError::structural(
-            "sch-simpletype-name-prohibited",
+            "src-simple-type",
             "Inline simpleType cannot have 'name' attribute",
             None,
         ));
@@ -345,7 +345,7 @@ pub fn validate_complex_type_structure(
 
     if ctx.is_top_level && !has_name {
         return Err(SchemaError::structural(
-            "sch-complextype-name-required",
+            "src-ct",
             "Top-level complexType must have 'name' attribute",
             None,
         ));
@@ -353,7 +353,7 @@ pub fn validate_complex_type_structure(
 
     if !ctx.is_top_level && has_name {
         return Err(SchemaError::structural(
-            "sch-complextype-name-prohibited",
+            "src-ct",
             "Inline complexType cannot have 'name' attribute",
             None,
         ));
@@ -378,7 +378,7 @@ pub fn validate_restriction_structure(
 
     if has_base && has_inline_type {
         return Err(SchemaError::structural(
-            "sch-restriction-base-type",
+            "src-restriction-base-or-simpleType",
             "Restriction cannot have both 'base' attribute and inline type",
             None,
         ));
@@ -401,7 +401,7 @@ pub fn validate_extension_structure(
 
     if !has_base {
         return Err(SchemaError::structural(
-            "sch-extension-base-required",
+            "src-ct",
             "Extension must have 'base' attribute",
             None,
         ));
@@ -426,7 +426,7 @@ pub fn validate_list_structure(
 
     if has_item_type && has_inline_type {
         return Err(SchemaError::structural(
-            "sch-list-itemtype-type",
+            "src-list-itemType-or-simpleType",
             "List cannot have both 'itemType' attribute and inline simpleType",
             None,
         ));
@@ -434,7 +434,7 @@ pub fn validate_list_structure(
 
     if !has_item_type && !has_inline_type {
         return Err(SchemaError::structural(
-            "sch-list-itemtype-required",
+            "src-list-itemType-or-simpleType",
             "List must have either 'itemType' attribute or inline simpleType",
             None,
         ));
@@ -455,7 +455,7 @@ pub fn validate_union_structure(
 
     if !has_member_types && !has_inline_types {
         return Err(SchemaError::structural(
-            "sch-union-members-required",
+            "src-union-memberTypes-or-simpleTypes",
             "Union must have 'memberTypes' attribute or inline simpleType children",
             None,
         ));
@@ -480,7 +480,7 @@ pub fn validate_key_unique_structure(
 
     if !has_name {
         return Err(SchemaError::structural(
-            "sch-identity-name-required",
+            "src-identity-constraint",
             "Identity constraint (key/unique) must have 'name' attribute",
             None,
         ));
@@ -503,7 +503,7 @@ pub fn validate_keyref_structure(
 
     if !has_name {
         return Err(SchemaError::structural(
-            "sch-keyref-name-required",
+            "src-identity-constraint",
             "Keyref must have 'name' attribute",
             None,
         ));
@@ -511,7 +511,7 @@ pub fn validate_keyref_structure(
 
     if !has_refer {
         return Err(SchemaError::structural(
-            "sch-keyref-refer-required",
+            "src-identity-constraint",
             "Keyref must have 'refer' attribute",
             None,
         ));
@@ -539,14 +539,14 @@ pub fn validate_group_structure(
     if ctx.is_top_level {
         if !has_name {
             return Err(SchemaError::structural(
-                "sch-group-name-required",
+                "mgd-props-correct",
                 "Top-level group must have 'name' attribute",
                 None,
             ));
         }
         if has_ref {
             return Err(SchemaError::structural(
-                "sch-group-top-ref",
+                "mgd-props-correct",
                 "Top-level group cannot have 'ref' attribute",
                 None,
             ));
@@ -554,14 +554,14 @@ pub fn validate_group_structure(
     } else {
         if has_name && has_ref {
             return Err(SchemaError::structural(
-                "sch-group-name-ref",
+                "mgd-props-correct",
                 "Group cannot have both 'name' and 'ref' attributes",
                 None,
             ));
         }
         if !has_name && !has_ref {
             return Err(SchemaError::structural(
-                "sch-group-name-or-ref",
+                "mgd-props-correct",
                 "Group must have either 'name' or 'ref' attribute",
                 None,
             ));
@@ -586,14 +586,14 @@ pub fn validate_attribute_group_structure(
     if ctx.is_top_level {
         if !has_name {
             return Err(SchemaError::structural(
-                "sch-attrgroup-name-required",
+                "src-attribute_group",
                 "Top-level attributeGroup must have 'name' attribute",
                 None,
             ));
         }
         if has_ref {
             return Err(SchemaError::structural(
-                "sch-attrgroup-top-ref",
+                "src-attribute_group",
                 "Top-level attributeGroup cannot have 'ref' attribute",
                 None,
             ));
@@ -601,14 +601,14 @@ pub fn validate_attribute_group_structure(
     } else {
         if has_name && has_ref {
             return Err(SchemaError::structural(
-                "sch-attrgroup-name-ref",
+                "src-attribute_group",
                 "AttributeGroup cannot have both 'name' and 'ref' attributes",
                 None,
             ));
         }
         if !has_name && !has_ref {
             return Err(SchemaError::structural(
-                "sch-attrgroup-name-or-ref",
+                "src-attribute_group",
                 "AttributeGroup must have either 'name' or 'ref' attribute",
                 None,
             ));
@@ -713,7 +713,7 @@ pub fn validate_notation_structure(
 
     if !has_name {
         return Err(SchemaError::structural(
-            "sch-notation-name-required",
+            "n-props-correct",
             "Notation must have 'name' attribute",
             None,
         ));
@@ -723,7 +723,7 @@ pub fn validate_notation_structure(
         XsdVersion::V1_0 => {
             if !has_public {
                 return Err(SchemaError::structural(
-                    "sch-notation-public-required",
+                    "n-props-correct",
                     "Notation must have 'public' attribute in XSD 1.0",
                     None,
                 ));
@@ -732,7 +732,7 @@ pub fn validate_notation_structure(
         XsdVersion::V1_1 => {
             if !has_public && !has_system {
                 return Err(SchemaError::structural(
-                    "sch-notation-id-required",
+                    "n-props-correct",
                     "Notation must have 'public' or 'system' attribute in XSD 1.1",
                     None,
                 ));
@@ -758,7 +758,7 @@ pub fn validate_include_structure(
 
     if !has_location {
         return Err(SchemaError::structural(
-            "sch-include-location-required",
+            "src-include",
             "Include must have 'schemaLocation' attribute",
             None,
         ));
@@ -790,7 +790,7 @@ pub fn validate_redefine_structure(
 
     if !has_location {
         return Err(SchemaError::structural(
-            "sch-redefine-location-required",
+            "src-redefine",
             "Redefine must have 'schemaLocation' attribute",
             None,
         ));

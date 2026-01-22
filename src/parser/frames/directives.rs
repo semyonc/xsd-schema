@@ -55,7 +55,7 @@ impl Frame for IncludeFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let schema_location = self.schema_location.ok_or_else(|| SchemaError::structural(
-            "sch-include",
+            "src-include",
             "xs:include requires 'schemaLocation' attribute",
             None,
         ))?;
@@ -266,7 +266,7 @@ impl Frame for OverrideFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let schema_location = self.schema_location.ok_or_else(|| SchemaError::structural(
-            "sch-override",
+            "src-override",
             "xs:override requires 'schemaLocation' attribute",
             None,
         ))?;
@@ -378,7 +378,7 @@ impl Frame for RedefineFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let schema_location = self.schema_location.ok_or_else(|| SchemaError::structural(
-            "sch-redefine",
+            "src-redefine",
             "xs:redefine requires 'schemaLocation' attribute",
             None,
         ))?;
