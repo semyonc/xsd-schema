@@ -10,8 +10,8 @@ use slotmap::SlotMap;
 use crate::ids::*;
 use crate::parser::frames::{
     AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor, DerivationMethod,
-    IdentityResult, ParticleResult, QNameRef, SimpleTypeResult, SimpleTypeVariety, TypeFrameResult,
-    TypeRefResult, WildcardResult,
+    IdentityResult, OpenContentResult, ParticleResult, QNameRef, SimpleTypeResult,
+    SimpleTypeVariety, TypeFrameResult, TypeRefResult, WildcardResult,
 };
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::Annotation;
@@ -63,6 +63,7 @@ pub struct ComplexTypeDefData {
     pub base_type: Option<TypeRefResult>,
     pub derivation_method: Option<DerivationMethod>,
     pub content: ComplexContentResult,
+    pub open_content: Option<OpenContentResult>,
     pub attributes: Vec<AttributeUseResult>,
     pub attribute_groups: Vec<QNameRef>,
     pub attribute_wildcard: Option<WildcardResult>,

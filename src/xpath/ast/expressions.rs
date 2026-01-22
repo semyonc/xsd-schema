@@ -49,6 +49,8 @@ pub enum ValueNode {
     Decimal(String),
     /// Double literal (stored as string to preserve exact representation).
     Double(String),
+    /// Typed value (for runtime computed values).
+    Typed(crate::types::value::XmlValue),
 }
 
 /// Context item reference (`.`).

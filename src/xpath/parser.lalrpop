@@ -530,7 +530,7 @@ UnaryExpr: AstNodeId = {
     <l:@L> "plus" <e:UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::UnaryOp(UnaryOpNode::new(
-            UnaryOpKind::Plus, e, span
+            UnaryOpKind::Identity, e, span
         )))
     },
 };

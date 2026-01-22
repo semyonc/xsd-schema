@@ -3,19 +3,26 @@
 //! This module implements the core compilation logic for transforming
 //! XSD content model particles into NFAs.
 
-use crate::arenas::ModelGroupData;
+use crate::arenas::{ComplexTypeDefData, ModelGroupData};
 use crate::ids::NameId;
 use crate::parser::frames::{
-    Compositor, ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm,
-    ProcessContents, QNameRef, WildcardNamespace, WildcardResult,
+    Compositor, ComplexContentResult, ElementFrameResult, ModelGroupDefResult, OpenContentMode,
+    OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef, WildcardNamespace,
+    WildcardResult,
 };
 use crate::parser::location::SourceRef;
+use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
+use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint as SchemaNamespaceConstraint};
 use crate::schema::{FormChoice, SchemaSet};
-use crate::types::complex::{NamespaceConstraint, ProcessContents as TypesProcessContents};
+use crate::types::complex::{
+    NamespaceConstraint, OpenContent, OpenContentMode as TypesOpenContentMode,
+    ProcessContents as TypesProcessContents, WildcardRef,
+};
 
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 use super::nfa::{NfaTable, NfaTerm};
+use super::open_content::ContentModelMatcher;
 use super::particle::{apply_occurs, MaxOccurs};
 
 /// Maximum recursion depth for compiling nested groups
@@ -419,10 +426,187 @@ pub fn compile_model_group(
     ctx.compile_model_group(group)
 }
 
+/// Compile a complex type's content model into a matcher, applying open content defaults.
+pub fn compile_content_model_matcher(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+) -> NfaCompileResult<ContentModelMatcher> {
+    let target_namespace = type_def.target_namespace;
+    let mut ctx = CompileContext::new(schema_set, target_namespace);
+    let base_matcher = match &type_def.content {
+        ComplexContentResult::Complex(def) => match &def.particle {
+            Some(particle) => ContentModelMatcher::Nfa(ctx.compile_particle(particle)?),
+            None => ContentModelMatcher::Nfa(empty_nfa()),
+        },
+        ComplexContentResult::Empty | ComplexContentResult::Simple(_) => {
+            ContentModelMatcher::Nfa(empty_nfa())
+        }
+    };
+
+    let open_content = resolve_open_content(
+        schema_set,
+        &type_def.content,
+        type_def.open_content.as_ref(),
+        type_def.source.as_ref(),
+    );
+
+    Ok(attach_open_content(base_matcher, open_content))
+}
+
+fn empty_nfa() -> NfaTable {
+    let mut builder = FragmentBuilder::new();
+    fragment_to_table(builder.epsilon_fragment())
+}
+
+fn attach_open_content(
+    matcher: ContentModelMatcher,
+    open_content: Option<OpenContent>,
+) -> ContentModelMatcher {
+    let open_content = match open_content {
+        Some(open_content) => open_content,
+        None => return matcher,
+    };
+
+    match matcher {
+        ContentModelMatcher::Nfa(nfa) => ContentModelMatcher::WithOpenContent {
+            nfa,
+            mode: open_content.mode,
+            wildcard: open_content.wildcard,
+        },
+        other => other,
+    }
+}
+
+fn resolve_open_content(
+    schema_set: &SchemaSet,
+    content: &ComplexContentResult,
+    explicit: Option<&OpenContentResult>,
+    source: Option<&SourceRef>,
+) -> Option<OpenContent> {
+    if schema_set.xsd_version != XsdVersion::V1_1 {
+        return None;
+    }
+
+    if let Some(explicit) = explicit {
+        return open_content_from_result(explicit);
+    }
+
+    if !matches!(content, ComplexContentResult::Complex(_) | ComplexContentResult::Empty) {
+        return None;
+    }
+
+    let doc = source.and_then(|s| schema_set.documents.get(s.doc_id as usize));
+    let default = doc.and_then(|d| d.default_open_content.as_ref())?;
+
+    if !default.applies_to_empty && content_is_empty(content) {
+        return None;
+    }
+
+    open_content_from_default(default)
+}
+
+fn content_is_empty(content: &ComplexContentResult) -> bool {
+    match content {
+        ComplexContentResult::Empty => true,
+        ComplexContentResult::Complex(def) => def.particle.is_none(),
+        ComplexContentResult::Simple(_) => false,
+    }
+}
+
+fn open_content_from_result(result: &OpenContentResult) -> Option<OpenContent> {
+    let mode = convert_open_content_mode(result.mode);
+    if matches!(mode, TypesOpenContentMode::None) {
+        return None;
+    }
+
+    Some(OpenContent {
+        mode,
+        wildcard: result.wildcard.as_ref().map(wildcard_ref_from_result),
+        source: result.source.clone(),
+    })
+}
+
+fn open_content_from_default(default: &DefaultOpenContent) -> Option<OpenContent> {
+    let mode = convert_schema_open_content_mode(default.mode);
+    if matches!(mode, TypesOpenContentMode::None) {
+        return None;
+    }
+
+    Some(OpenContent {
+        mode,
+        wildcard: default.wildcard.as_ref().map(wildcard_ref_from_default),
+        source: default.source.clone(),
+    })
+}
+
+fn convert_open_content_mode(mode: OpenContentMode) -> TypesOpenContentMode {
+    match mode {
+        OpenContentMode::None => TypesOpenContentMode::None,
+        OpenContentMode::Interleave => TypesOpenContentMode::Interleave,
+        OpenContentMode::Suffix => TypesOpenContentMode::Suffix,
+    }
+}
+
+fn convert_schema_open_content_mode(mode: SchemaOpenContentMode) -> TypesOpenContentMode {
+    match mode {
+        SchemaOpenContentMode::None => TypesOpenContentMode::None,
+        SchemaOpenContentMode::Interleave => TypesOpenContentMode::Interleave,
+        SchemaOpenContentMode::Suffix => TypesOpenContentMode::Suffix,
+    }
+}
+
+fn wildcard_ref_from_result(wildcard: &WildcardResult) -> WildcardRef {
+    let namespace_constraint = match &wildcard.namespace {
+        WildcardNamespace::Any => NamespaceConstraint::Any,
+        WildcardNamespace::Other => NamespaceConstraint::Other,
+        WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
+        WildcardNamespace::Local => NamespaceConstraint::Local,
+        WildcardNamespace::List(list) => NamespaceConstraint::List(list.clone()),
+    };
+
+    let process_contents = match wildcard.process_contents {
+        ProcessContents::Strict => TypesProcessContents::Strict,
+        ProcessContents::Lax => TypesProcessContents::Lax,
+        ProcessContents::Skip => TypesProcessContents::Skip,
+    };
+
+    WildcardRef {
+        namespace_constraint,
+        process_contents,
+        source: wildcard.source.clone(),
+    }
+}
+
+fn wildcard_ref_from_default(wildcard: &ElementWildcard) -> WildcardRef {
+    let namespace_constraint = match &wildcard.namespace_constraint {
+        SchemaNamespaceConstraint::Any => NamespaceConstraint::Any,
+        SchemaNamespaceConstraint::Other => NamespaceConstraint::Other,
+        SchemaNamespaceConstraint::Enumeration(list) => NamespaceConstraint::List(list.clone()),
+        SchemaNamespaceConstraint::Not(_) => {
+            // TODO: Preserve notNamespace constraints once supported in types::complex.
+            NamespaceConstraint::Any
+        }
+    };
+
+    let process_contents = match wildcard.process_contents {
+        crate::schema::wildcard::ProcessContents::Strict => TypesProcessContents::Strict,
+        crate::schema::wildcard::ProcessContents::Lax => TypesProcessContents::Lax,
+        crate::schema::wildcard::ProcessContents::Skip => TypesProcessContents::Skip,
+    };
+
+    WildcardRef {
+        namespace_constraint,
+        process_contents,
+        source: wildcard.source.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser::location::{SourceRef, SourceSpan};
+    use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
+    use crate::schema::wildcard::ElementWildcard;
     use crate::schema::SchemaDocument;
 
     fn make_element_particle(name: NameId, min: u32, max: Option<u32>) -> ParticleResult {
@@ -493,6 +677,34 @@ mod tests {
         }
     }
 
+    fn make_complex_type_data(
+        source: Option<SourceRef>,
+        content: ComplexContentResult,
+    ) -> ComplexTypeDefData {
+        ComplexTypeDefData {
+            name: None,
+            target_namespace: None,
+            base_type: None,
+            derivation_method: None,
+            content,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            mixed: false,
+            is_abstract: false,
+            final_derivation: Default::default(),
+            block: Default::default(),
+            default_attributes_apply: true,
+            id: None,
+            annotation: None,
+            source,
+            resolved_base_type: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+        }
+    }
+
     #[test]
     fn test_compile_single_element() {
         let schema_set = SchemaSet::new();
@@ -541,6 +753,60 @@ mod tests {
 
         // Choice should have branch states
         assert!(table.state_count() >= 4);
+    }
+
+    #[test]
+    fn test_default_open_content_applies_to_empty_complex_type() {
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.default_open_content = Some(DefaultOpenContent {
+            source: None,
+            applies_to_empty: true,
+            mode: SchemaOpenContentMode::Suffix,
+            wildcard: Some(ElementWildcard::any_lax()),
+        });
+        schema_set.documents.push(doc);
+
+        let source = SourceRef::new(doc_id, SourceSpan::new(0, 0));
+        let ct_key = schema_set.arenas.alloc_complex_type(make_complex_type_data(
+            Some(source),
+            ComplexContentResult::Empty,
+        ));
+        let type_def = schema_set.arenas.complex_types.get(ct_key).unwrap();
+
+        let matcher = compile_content_model_matcher(&schema_set, type_def).unwrap();
+        match matcher {
+            ContentModelMatcher::WithOpenContent { mode, wildcard, .. } => {
+                assert_eq!(mode, TypesOpenContentMode::Suffix);
+                assert!(wildcard.is_some());
+            }
+            _ => panic!("expected open content wrapper"),
+        }
+    }
+
+    #[test]
+    fn test_default_open_content_skipped_when_not_applies_to_empty() {
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.default_open_content = Some(DefaultOpenContent {
+            source: None,
+            applies_to_empty: false,
+            mode: SchemaOpenContentMode::Interleave,
+            wildcard: Some(ElementWildcard::any_lax()),
+        });
+        schema_set.documents.push(doc);
+
+        let source = SourceRef::new(doc_id, SourceSpan::new(0, 0));
+        let ct_key = schema_set.arenas.alloc_complex_type(make_complex_type_data(
+            Some(source),
+            ComplexContentResult::Empty,
+        ));
+        let type_def = schema_set.arenas.complex_types.get(ct_key).unwrap();
+
+        let matcher = compile_content_model_matcher(&schema_set, type_def).unwrap();
+        assert!(matches!(matcher, ContentModelMatcher::Nfa(_)));
     }
 
     #[test]

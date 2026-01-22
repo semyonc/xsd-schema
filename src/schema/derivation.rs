@@ -509,6 +509,7 @@ mod tests {
             base_type: None,
             derivation_method: None,
             content: ComplexContentResult::Empty,
+            open_content: None,
             attributes: Vec::new(),
             attribute_groups: Vec::new(),
             attribute_wildcard: None,

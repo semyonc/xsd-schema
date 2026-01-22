@@ -58,8 +58,16 @@ enum Promote {
 /// Evaluate a unary operator for a single atomic value.
 pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathError> {
     match op {
-        UnaryOpKind::Plus => Ok(value.clone()),
+        UnaryOpKind::Identity => Ok(value.clone()),
         UnaryOpKind::Negate => eval_numeric_unary(value),
+        UnaryOpKind::BooleanNot => {
+            // TODO: Implement boolean not when needed
+            Err(XPathError::internal("BooleanNot operator not yet implemented"))
+        }
+        UnaryOpKind::Atomize => {
+            // TODO: Implement atomization when needed
+            Err(XPathError::internal("Atomize operator not yet implemented"))
+        }
     }
 }
 

@@ -2,6 +2,26 @@
 // Operators
 // ============================================================================
 
+/// Operator flags for optimization hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpFlags {
+    pub atomize: bool,
+    pub singleton: bool,
+    pub ordered: bool,
+}
+
+impl OpFlags {
+    pub fn atomized() -> Self {
+        Self { atomize: true, ..Default::default() }
+    }
+    pub fn singleton() -> Self {
+        Self { singleton: true, ..Default::default() }
+    }
+    pub fn ordered() -> Self {
+        Self { ordered: true, ..Default::default() }
+    }
+}
+
 /// Range expression (`expr to expr`).
 #[derive(Debug, Clone)]
 pub struct RangeNode {
@@ -24,8 +44,12 @@ impl RangeNode {
 pub enum UnaryOpKind {
     /// Unary minus (`-expr`).
     Negate,
-    /// Unary plus (`+expr`).
-    Plus,
+    /// Unary plus / identity (`+expr`).
+    Identity,
+    /// Boolean not (fn:not).
+    BooleanNot,
+    /// Atomization operator.
+    Atomize,
 }
 
 /// Unary operator expression.
@@ -128,6 +152,8 @@ pub struct BinaryOpNode {
     pub right: AstNodeId,
     /// Source location.
     pub span: SourceSpan,
+    /// Operator flags for optimization hints.
+    pub flags: OpFlags,
 }
 
 impl BinaryOpNode {
@@ -137,6 +163,7 @@ impl BinaryOpNode {
             left,
             right,
             span,
+            flags: OpFlags::default(),
         }
     }
 }

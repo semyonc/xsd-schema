@@ -15,9 +15,9 @@ use crate::ids::{
     TypeKey,
 };
 use crate::parser::frames::{
-    AttributeFrameResult, AttributeGroupDefResult, ComplexTypeResult, DirectiveResult, FrameResult,
-    GroupFrameResult, ModelGroupDefResult, NotationResult, OverrideResult, RedefineComponent,
-    SchemaFrameResult, SimpleTypeResult, TypeFrameResult,
+    AttributeFrameResult, AttributeGroupDefResult, ComplexContentResult, ComplexTypeResult,
+    DirectiveResult, FrameResult, GroupFrameResult, ModelGroupDefResult, NotationResult,
+    OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult, TypeFrameResult,
 };
 use crate::parser::location::SourceRef;
 use crate::namespace::QualifiedName;
@@ -178,6 +178,10 @@ impl<'a> SchemaAssembler<'a> {
                 if block.is_empty() {
                     block = self.block_default;
                 }
+                let open_content = match &content {
+                    ComplexContentResult::Complex(def) => def.open_content.clone(),
+                    _ => None,
+                };
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("complexType", source_ref.as_ref(), self.schema_set))?;
                 let data = ComplexTypeDefData {
@@ -186,6 +190,7 @@ impl<'a> SchemaAssembler<'a> {
                     base_type,
                     derivation_method,
                     content,
+                    open_content,
                     attributes,
                     attribute_groups,
                     attribute_wildcard,

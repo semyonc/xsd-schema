@@ -34,6 +34,7 @@ mod particle;
 mod all_group;
 mod upa;
 mod substitution;
+mod open_content;
 
 pub use nfa::{
     advance_states,
@@ -48,7 +49,9 @@ pub use nfa::{
     StateId,
 };
 pub use fragment::{NfaFragment, FragmentBuilder, fragment_to_table};
-pub use compile::{CompileContext, compile_particle, compile_model_group};
+pub use compile::{
+    CompileContext, compile_content_model_matcher, compile_model_group, compile_particle,
+};
 pub use error::{NfaCompileError, NfaCompileResult};
 pub use particle::{MaxOccurs, CountedParticle, apply_occurs, MAX_OCCURS_LIMIT};
 pub use all_group::{
@@ -57,3 +60,7 @@ pub use all_group::{
 };
 pub use upa::check_upa;
 pub use substitution::{build_substitution_group_map, SubstitutionGroupMap};
+pub use open_content::{
+    ContentModelMatcher, OpenContent, OpenContentMode as CompilerOpenContentMode, validate_interleave,
+    validate_suffix,
+};

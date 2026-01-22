@@ -226,6 +226,8 @@ pub struct PathExprNode {
     pub steps: Vec<AstNodeId>,
     /// Source location.
     pub span: SourceSpan,
+    /// Hint that result order doesn't matter (optimization).
+    pub unordered_hint: bool,
 }
 
 impl PathExprNode {
@@ -235,6 +237,7 @@ impl PathExprNode {
             is_absolute: true,
             steps: Vec::new(),
             span,
+            unordered_hint: false,
         }
     }
 
@@ -244,6 +247,7 @@ impl PathExprNode {
             is_absolute: true,
             steps,
             span,
+            unordered_hint: false,
         }
     }
 
@@ -253,6 +257,7 @@ impl PathExprNode {
             is_absolute: false,
             steps,
             span,
+            unordered_hint: false,
         }
     }
 }

@@ -223,6 +223,7 @@ impl BuiltinTypes {
                 derivation_id: None,
                 source: None,
             }),
+            open_content: None,
             attributes: Vec::new(),
             attribute_groups: Vec::new(),
             attribute_wildcard: None,

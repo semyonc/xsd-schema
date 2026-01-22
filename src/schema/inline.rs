@@ -349,12 +349,17 @@ fn assemble_inline_type(
             Ok(TypeKey::Simple(key))
         }
         TypeFrameResult::Complex(complex) => {
+            let open_content = match &complex.content {
+                ComplexContentResult::Complex(def) => def.open_content.clone(),
+                _ => None,
+            };
             let data = ComplexTypeDefData {
                 name: complex.name, // May be None for anonymous types
                 target_namespace,
                 base_type: complex.base_type.clone(),
                 derivation_method: complex.derivation_method,
                 content: complex.content.clone(),
+                open_content,
                 attributes: complex.attributes.clone(),
                 attribute_groups: complex.attribute_groups.clone(),
                 attribute_wildcard: complex.attribute_wildcard.clone(),
