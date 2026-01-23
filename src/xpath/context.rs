@@ -388,7 +388,9 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
 
     /// Get the context item, returning an error if undefined.
     pub fn require_context_item(&self) -> Result<&XmlItem<N>, super::error::XPathError> {
-        self.context_item.as_ref().ok_or(super::error::XPathError::XPDY0002)
+        self.context_item.as_ref().ok_or_else(|| super::error::XPathError::XPDY0002 {
+            message: "Context item is undefined".to_string(),
+        })
     }
 
     /// Get the context node, returning an error if undefined or not a node.
@@ -399,7 +401,9 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
                 expected: "node()".to_string(),
                 found: "atomic value".to_string(),
             }),
-            None => Err(super::error::XPathError::XPDY0002),
+            None => Err(super::error::XPathError::XPDY0002 {
+                message: "Context item is undefined".to_string(),
+            }),
         }
     }
 

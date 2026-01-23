@@ -47,9 +47,9 @@ pub enum XPathError {
     // ========================================================================
     // Dynamic Errors (XPDY)
     // ========================================================================
-    /// XPDY0002: Context item is undefined.
-    #[error("[XPDY0002] The context item is undefined")]
-    XPDY0002,
+    /// XPDY0002: Context item is undefined (with message).
+    #[error("[XPDY0002] {message}")]
+    XPDY0002 { message: String },
 
     /// XPDY0050: More than one item where singleton expected.
     #[error("[XPDY0050] More than one item in sequence where single item expected")]
@@ -111,6 +111,17 @@ pub enum XPathError {
     /// FORG0008: Both arguments to fn:dateTime have a timezone
     #[error("[FORG0008] Both arguments to fn:dateTime have a timezone")]
     FORG0008,
+
+    // ========================================================================
+    // Character/Codepoint Errors (FOCH)
+    // ========================================================================
+    /// FOCH0001: Invalid codepoint.
+    #[error("[FOCH0001] Invalid codepoint '{codepoint}' in codepoints-to-string")]
+    FOCH0001 { codepoint: String },
+
+    /// FOCH0003: Unsupported normalization form.
+    #[error("[FOCH0003] Unsupported normalization form '{normalization_form}'")]
+    FOCH0003 { normalization_form: String },
 
     // ========================================================================
     // Arithmetic Errors (FOAR)
@@ -225,7 +236,9 @@ impl XPathError {
 
     /// Create XPDY0002 context undefined error.
     pub fn context_undefined() -> Self {
-        XPathError::XPDY0002
+        XPathError::XPDY0002 {
+            message: "The context item is undefined".to_string(),
+        }
     }
 
     /// Create XPDY0050 more than one item error.
@@ -309,7 +322,7 @@ impl XPathError {
             XPathError::XPST0051 { .. } => Some("XPST0051"),
             XPathError::XPST0017 { .. } => Some("XPST0017"),
             XPathError::XPST0081 { .. } => Some("XPST0081"),
-            XPathError::XPDY0002 => Some("XPDY0002"),
+            XPathError::XPDY0002 { .. } => Some("XPDY0002"),
             XPathError::XPDY0050 => Some("XPDY0050"),
             XPathError::XPTY0004 { .. } => Some("XPTY0004"),
             XPathError::XPTY0004Cast { .. } => Some("XPTY0004"),
@@ -323,6 +336,8 @@ impl XPathError {
             XPathError::FORG0006Named { .. } => Some("FORG0006"),
             XPathError::FORG0006 { .. } => Some("FORG0006"),
             XPathError::FORG0008 => Some("FORG0008"),
+            XPathError::FOCH0001 { .. } => Some("FOCH0001"),
+            XPathError::FOCH0003 { .. } => Some("FOCH0003"),
             XPathError::FOAR0001 => Some("FOAR0001"),
             XPathError::FOAR0002 => Some("FOAR0002"),
             XPathError::FOCA0002 { .. } => Some("FOCA0002"),

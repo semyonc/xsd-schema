@@ -317,6 +317,155 @@ pub fn compare(a: &str, b: &str) -> i32 {
     }
 }
 
+/// Join strings with a separator.
+///
+/// Implements XPath `fn:string-join($strings, $separator)`.
+pub fn string_join(values: &[&str], separator: &str) -> String {
+    values.join(separator)
+}
+
+/// Unicode normalization forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnicodeNormalizationForm {
+    /// NFC (Canonical Decomposition, followed by Canonical Composition)
+    NFC,
+    /// NFD (Canonical Decomposition)
+    NFD,
+    /// NFKC (Compatibility Decomposition, followed by Canonical Composition)
+    NFKC,
+    /// NFKD (Compatibility Decomposition)
+    NFKD,
+}
+
+impl UnicodeNormalizationForm {
+    /// Parse normalization form from string (case-insensitive).
+    pub fn parse(s: &str) -> Option<Self> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("NFC") {
+            Some(Self::NFC)
+        } else if trimmed.eq_ignore_ascii_case("NFD") {
+            Some(Self::NFD)
+        } else if trimmed.eq_ignore_ascii_case("NFKC") {
+            Some(Self::NFKC)
+        } else if trimmed.eq_ignore_ascii_case("NFKD") {
+            Some(Self::NFKD)
+        } else if trimmed.is_empty() {
+            // Empty string means no normalization
+            None
+        } else {
+            None
+        }
+    }
+}
+
+/// Normalize a string using Unicode normalization.
+///
+/// Uses the `unicode-normalization` crate for actual normalization.
+/// If form is None (empty string input), returns the input unchanged.
+#[cfg(feature = "unicode-normalization")]
+pub fn normalize_unicode(value: &str, form: Option<UnicodeNormalizationForm>) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    match form {
+        Some(UnicodeNormalizationForm::NFC) => value.nfc().collect(),
+        Some(UnicodeNormalizationForm::NFD) => value.nfd().collect(),
+        Some(UnicodeNormalizationForm::NFKC) => value.nfkc().collect(),
+        Some(UnicodeNormalizationForm::NFKD) => value.nfkd().collect(),
+        None => value.to_string(),
+    }
+}
+
+/// Normalize a string using Unicode normalization (fallback without feature).
+///
+/// Without the unicode-normalization feature, this only handles the no-op case.
+#[cfg(not(feature = "unicode-normalization"))]
+pub fn normalize_unicode(value: &str, form: Option<UnicodeNormalizationForm>) -> Result<String, super::error::XPathError> {
+    match form {
+        None => Ok(value.to_string()),
+        Some(f) => Err(super::error::XPathError::not_implemented(format!(
+            "Unicode normalization form {:?} requires unicode-normalization feature",
+            f
+        ))),
+    }
+}
+
+/// Encode a string for use in a URI per RFC 3986.
+///
+/// Only alphanumeric characters and `-`, `_`, `.`, `~` are left unescaped.
+/// All other characters are percent-encoded using UTF-8.
+pub fn encode_for_uri(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() * 3);
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' || byte == b'~' {
+            result.push(byte as char);
+        } else {
+            result.push('%');
+            result.push(to_hex_digit(byte >> 4));
+            result.push(to_hex_digit(byte & 0x0F));
+        }
+    }
+    result
+}
+
+/// Escape an IRI to produce a valid URI.
+///
+/// Less restrictive than encode-for-uri: allows most ASCII printable characters
+/// except space, `<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, and `` ` ``.
+pub fn iri_to_uri(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() * 3);
+    for byte in value.bytes() {
+        // Space is always encoded
+        if byte == b' ' {
+            result.push_str("%20");
+        } else if byte >= 0x20 && byte < 0x7F
+            && byte != b'<' && byte != b'>'
+            && byte != b'"' && byte != b'{' && byte != b'}'
+            && byte != b'|' && byte != b'\\' && byte != b'^' && byte != b'`'
+        {
+            result.push(byte as char);
+        } else {
+            result.push('%');
+            result.push(to_hex_digit(byte >> 4));
+            result.push(to_hex_digit(byte & 0x0F));
+        }
+    }
+    result
+}
+
+/// Escape a URI for use in HTML.
+///
+/// Escapes characters outside the ASCII printable range (0x20-0x7E).
+pub fn escape_html_uri(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() * 3);
+    for byte in value.bytes() {
+        if byte >= 0x20 && byte < 0x7F {
+            result.push(byte as char);
+        } else {
+            result.push('%');
+            result.push(to_hex_digit(byte >> 4));
+            result.push(to_hex_digit(byte & 0x0F));
+        }
+    }
+    result
+}
+
+/// Convert a nibble (0-15) to a hex digit character.
+#[inline]
+fn to_hex_digit(nibble: u8) -> char {
+    if nibble < 10 {
+        (b'0' + nibble) as char
+    } else {
+        (b'A' + nibble - 10) as char
+    }
+}
+
+/// Compare two strings by codepoint (ordinal comparison).
+///
+/// Returns true if the strings are equal by codepoint comparison.
+pub fn codepoint_equal(a: &str, b: &str) -> bool {
+    a == b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

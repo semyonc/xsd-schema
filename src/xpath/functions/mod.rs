@@ -14,6 +14,8 @@
 
 pub mod signature;
 pub mod registry;
+pub mod string;
+pub mod numeric;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
@@ -537,24 +539,60 @@ pub fn eval_function<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
-    // For Phase 1, we just define the dispatch structure.
-    // Actual implementations will be added in later phases.
     match id {
-        // Boolean functions (simple implementations)
+        // ====================================================================
+        // Boolean functions
+        // ====================================================================
         FunctionId::True => Ok(XPathValue::boolean(true)),
         FunctionId::False => Ok(XPathValue::boolean(false)),
         FunctionId::Not => eval_not(args),
 
-        // Context functions (simple implementations)
+        // ====================================================================
+        // Context functions
+        // ====================================================================
         FunctionId::Position => Ok(XPathValue::integer(context.context_position as i64)),
         FunctionId::Last => Ok(XPathValue::integer(context.context_size as i64)),
 
-        // Empty/Exists (simple implementations)
+        // ====================================================================
+        // Sequence functions (basic)
+        // ====================================================================
         FunctionId::Empty => eval_empty(args),
         FunctionId::Exists => eval_exists(args),
-
-        // Count (simple implementation)
         FunctionId::Count => eval_count(args),
+
+        // ====================================================================
+        // String functions (Phase 2)
+        // ====================================================================
+        FunctionId::Concat => string::concat(context, args),
+        FunctionId::StringJoin => string::string_join(context, args),
+        FunctionId::Substring => string::substring(context, args),
+        FunctionId::StringLength => string::string_length(context, args),
+        FunctionId::NormalizeSpace => string::normalize_space(context, args),
+        FunctionId::NormalizeUnicode => string::normalize_unicode(context, args),
+        FunctionId::UpperCase => string::upper_case(context, args),
+        FunctionId::LowerCase => string::lower_case(context, args),
+        FunctionId::Translate => string::translate(context, args),
+        FunctionId::EncodeForUri => string::encode_for_uri(context, args),
+        FunctionId::IriToUri => string::iri_to_uri(context, args),
+        FunctionId::EscapeHtmlUri => string::escape_html_uri(context, args),
+        FunctionId::Contains => string::contains(context, args),
+        FunctionId::StartsWith => string::starts_with(context, args),
+        FunctionId::EndsWith => string::ends_with(context, args),
+        FunctionId::SubstringBefore => string::substring_before(context, args),
+        FunctionId::SubstringAfter => string::substring_after(context, args),
+        FunctionId::StringToCodepoints => string::string_to_codepoints(context, args),
+        FunctionId::CodepointsToString => string::codepoints_to_string(context, args),
+        FunctionId::Compare => string::compare(context, args),
+        FunctionId::CodepointEqual => string::codepoint_equal(context, args),
+
+        // ====================================================================
+        // Numeric functions (Phase 3)
+        // ====================================================================
+        FunctionId::Abs => numeric::abs(context, args),
+        FunctionId::Ceiling => numeric::ceiling(context, args),
+        FunctionId::Floor => numeric::floor(context, args),
+        FunctionId::Round => numeric::round(context, args),
+        FunctionId::RoundHalfToEven => numeric::round_half_to_even(context, args),
 
         // All other functions will be implemented in later phases
         _ => Err(XPathError::not_implemented(format!(

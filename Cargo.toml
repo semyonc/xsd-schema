@@ -41,12 +41,19 @@ lalrpop-util = "0.22.2"      # LALRPOP runtime utilities
 # Function registry
 once_cell = "1.19"           # For static function registry
 
+# Unicode normalization (for fn:normalize-unicode)
+unicode-normalization = { version = "0.1", optional = true }
+
 [build-dependencies]
 lalrpop = "0.22.2"           # LALRPOP parser generator
 
 [dev-dependencies]
 pretty_assertions = "1.4"    # Better assertion output in tests
 criterion = "0.5"            # Benchmarking (optional)
+
+[features]
+default = ["unicode-normalization"]
+unicode-normalization = ["dep:unicode-normalization"]
 
 [lib]
 name = "xsd_schema"
