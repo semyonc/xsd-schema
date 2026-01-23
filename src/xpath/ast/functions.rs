@@ -3,6 +3,7 @@
 // ============================================================================
 
 use super::{AstNodeId, SourceSpan};
+use crate::xpath::functions::FunctionId;
 
 /// Function call expression (`prefix:name(args...)`).
 #[derive(Debug, Clone)]
@@ -15,6 +16,8 @@ pub struct FunctionCallNode {
     pub args: Vec<AstNodeId>,
     /// Source location.
     pub span: SourceSpan,
+    /// Resolved function identifier (set during binding phase).
+    pub function_id: Option<FunctionId>,
 }
 
 impl FunctionCallNode {
@@ -24,6 +27,7 @@ impl FunctionCallNode {
             local_name,
             args,
             span,
+            function_id: None,
         }
     }
 }
