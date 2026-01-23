@@ -16,6 +16,7 @@ pub mod signature;
 pub mod registry;
 pub mod string;
 pub mod numeric;
+pub mod sequence;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
@@ -593,6 +594,16 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Floor => numeric::floor(context, args),
         FunctionId::Round => numeric::round(context, args),
         FunctionId::RoundHalfToEven => numeric::round_half_to_even(context, args),
+
+        // ====================================================================
+        // Sequence functions (Phase 3)
+        // ====================================================================
+        FunctionId::IndexOf => sequence::index_of(context, args),
+        FunctionId::Remove => sequence::remove(context, args),
+        FunctionId::InsertBefore => sequence::insert_before(context, args),
+        FunctionId::Subsequence => sequence::subsequence(context, args),
+        FunctionId::Unordered => sequence::unordered(context, args),
+        FunctionId::DeepEqual => sequence::deep_equal(context, args),
 
         // All other functions will be implemented in later phases
         _ => Err(XPathError::not_implemented(format!(
