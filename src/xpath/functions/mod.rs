@@ -19,6 +19,7 @@ pub mod numeric;
 pub mod sequence;
 pub mod aggregate;
 pub mod node;
+pub mod datetime;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
@@ -636,6 +637,44 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::DocumentUri => node::document_uri(context, args),
         FunctionId::Lang => node::lang(context, args),
         FunctionId::Root => node::root(context, args),
+
+        // ====================================================================
+        // DateTime functions (Phase 6)
+        // ====================================================================
+        FunctionId::DateTime => datetime::create_datetime(context, args),
+        FunctionId::CurrentDateTime => datetime::current_datetime(context, args),
+        FunctionId::CurrentDate => datetime::current_date(context, args),
+        FunctionId::CurrentTime => datetime::current_time(context, args),
+        FunctionId::ImplicitTimezone => datetime::implicit_timezone(context, args),
+        // Duration component extraction
+        FunctionId::YearsFromDuration => datetime::years_from_duration(context, args),
+        FunctionId::MonthsFromDuration => datetime::months_from_duration(context, args),
+        FunctionId::DaysFromDuration => datetime::days_from_duration(context, args),
+        FunctionId::HoursFromDuration => datetime::hours_from_duration(context, args),
+        FunctionId::MinutesFromDuration => datetime::minutes_from_duration(context, args),
+        FunctionId::SecondsFromDuration => datetime::seconds_from_duration(context, args),
+        // DateTime component extraction
+        FunctionId::YearFromDateTime => datetime::year_from_datetime(context, args),
+        FunctionId::MonthFromDateTime => datetime::month_from_datetime(context, args),
+        FunctionId::DayFromDateTime => datetime::day_from_datetime(context, args),
+        FunctionId::HoursFromDateTime => datetime::hours_from_datetime(context, args),
+        FunctionId::MinutesFromDateTime => datetime::minutes_from_datetime(context, args),
+        FunctionId::SecondsFromDateTime => datetime::seconds_from_datetime(context, args),
+        FunctionId::TimezoneFromDateTime => datetime::timezone_from_datetime(context, args),
+        // Date component extraction
+        FunctionId::YearFromDate => datetime::year_from_date(context, args),
+        FunctionId::MonthFromDate => datetime::month_from_date(context, args),
+        FunctionId::DayFromDate => datetime::day_from_date(context, args),
+        FunctionId::TimezoneFromDate => datetime::timezone_from_date(context, args),
+        // Time component extraction
+        FunctionId::HoursFromTime => datetime::hours_from_time(context, args),
+        FunctionId::MinutesFromTime => datetime::minutes_from_time(context, args),
+        FunctionId::SecondsFromTime => datetime::seconds_from_time(context, args),
+        FunctionId::TimezoneFromTime => datetime::timezone_from_time(context, args),
+        // Timezone adjustment
+        FunctionId::AdjustDateTimeToTimezone => datetime::adjust_datetime_to_timezone(context, args),
+        FunctionId::AdjustDateToTimezone => datetime::adjust_date_to_timezone(context, args),
+        FunctionId::AdjustTimeToTimezone => datetime::adjust_time_to_timezone(context, args),
 
         // All other functions will be implemented in later phases
         _ => Err(XPathError::not_implemented(format!(

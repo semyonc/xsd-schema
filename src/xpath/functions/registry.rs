@@ -452,7 +452,7 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::ImplicitTimezone,
-        FunctionSignature::new(FN_NAMESPACE, "implicit-timezone", vec![], day_time_duration_opt()),
+        FunctionSignature::new(FN_NAMESPACE, "implicit-timezone", vec![], day_time_duration()),
     ));
 
     // Duration component extraction

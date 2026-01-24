@@ -341,6 +341,11 @@ pub mod types {
         SequenceType::optional(ItemType::AtomicType(crate::types::XmlTypeCode::Duration))
     }
 
+    /// xs:dayTimeDuration
+    pub fn day_time_duration() -> SequenceType {
+        SequenceType::one(ItemType::AtomicType(crate::types::XmlTypeCode::DayTimeDuration))
+    }
+
     /// xs:dayTimeDuration?
     pub fn day_time_duration_opt() -> SequenceType {
         SequenceType::optional(ItemType::AtomicType(crate::types::XmlTypeCode::DayTimeDuration))
