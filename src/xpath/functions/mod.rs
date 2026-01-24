@@ -17,6 +17,8 @@ pub mod registry;
 pub mod string;
 pub mod numeric;
 pub mod sequence;
+pub mod aggregate;
+pub mod node;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
@@ -613,6 +615,27 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Subsequence => sequence::subsequence(context, args),
         FunctionId::Unordered => sequence::unordered(context, args),
         FunctionId::DeepEqual => sequence::deep_equal(context, args),
+
+        // ====================================================================
+        // Aggregate functions (Phase 5)
+        // ====================================================================
+        FunctionId::Sum => aggregate::sum(context, args),
+        FunctionId::Avg => aggregate::avg(context, args),
+        FunctionId::Min => aggregate::min(context, args),
+        FunctionId::Max => aggregate::max(context, args),
+
+        // ====================================================================
+        // Node functions (Phase 5)
+        // ====================================================================
+        FunctionId::Name => node::name(context, args),
+        FunctionId::LocalName => node::local_name(context, args),
+        FunctionId::NamespaceUri => node::namespace_uri(context, args),
+        FunctionId::NodeName => node::node_name(context, args),
+        FunctionId::Nilled => node::nilled(context, args),
+        FunctionId::BaseUri => node::base_uri(context, args),
+        FunctionId::DocumentUri => node::document_uri(context, args),
+        FunctionId::Lang => node::lang(context, args),
+        FunctionId::Root => node::root(context, args),
 
         // All other functions will be implemented in later phases
         _ => Err(XPathError::not_implemented(format!(

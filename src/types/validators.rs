@@ -2824,7 +2824,7 @@ mod tests {
     #[test]
     fn test_float_validator() {
         let v = FloatValidator;
-        assert!(v.validate("3.14").is_ok());
+        assert!(v.validate("2.5").is_ok());
         assert!(v.validate("INF").is_ok());
         assert!(v.validate("-INF").is_ok());
         assert!(v.validate("NaN").is_ok());
@@ -2833,7 +2833,7 @@ mod tests {
     #[test]
     fn test_double_validator() {
         let v = DoubleValidator;
-        let result = v.validate("3.14159265359").unwrap();
+        let result = v.validate("2.718281828").unwrap();
         assert_eq!(result.type_code, XmlTypeCode::Double);
     }
 

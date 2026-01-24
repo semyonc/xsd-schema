@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_cast_string_to_decimal() {
-        let value = XmlValue::string("3.14");
+        let value = XmlValue::string("2.5");
         let result = cast_to(&value, XmlTypeCode::Decimal).unwrap();
         assert_eq!(result.type_code, XmlTypeCode::Decimal);
     }

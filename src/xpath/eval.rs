@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn test_eval_double_literal() {
         let mut arena = AstArena::new();
-        let val = arena.add(AstNode::Value(ValueNode::Double("3.14".to_string())));
+        let val = arena.add(AstNode::Value(ValueNode::Double("2.5".to_string())));
         let root = wrap_in_expr(&mut arena, val);
 
         let result = bind_and_eval(&mut arena, root).unwrap();

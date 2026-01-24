@@ -819,9 +819,9 @@ mod tests {
 
     #[test]
     fn test_xml_value_double() {
-        let v = XmlValue::double(3.14);
+        let v = XmlValue::double(2.5);
         assert_eq!(v.type_code, XmlTypeCode::Double);
-        assert_eq!(v.as_double(), Some(3.14));
+        assert_eq!(v.as_double(), Some(2.5));
     }
 
     #[test]

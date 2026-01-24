@@ -1678,7 +1678,7 @@ mod tests {
     #[test]
     fn test_simple_number() {
         assert_eq!(tokenize("42"), vec![Token::IntegerLiteral("42".to_string())]);
-        assert_eq!(tokenize("3.14"), vec![Token::DecimalLiteral("3.14".to_string())]);
+        assert_eq!(tokenize("2.5"), vec![Token::DecimalLiteral("2.5".to_string())]);
         assert_eq!(tokenize("1e10"), vec![Token::DoubleLiteral("1e10".to_string())]);
     }
 

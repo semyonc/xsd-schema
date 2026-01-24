@@ -284,11 +284,11 @@ mod tests {
 
     #[test]
     fn test_to_number() {
-        assert_eq!(to_number(&XmlValue::double(3.14)), 3.14);
+        assert_eq!(to_number(&XmlValue::double(2.5)), 2.5);
         assert_eq!(to_number(&XmlValue::float(2.5)), 2.5);
         assert_eq!(to_number(&XmlValue::integer(BigInt::from(42))), 42.0);
         assert_eq!(to_number(&XmlValue::decimal(Decimal::new(125, 2))), 1.25);
-        assert_eq!(to_number(&XmlValue::string("3.14")), 3.14);
+        assert_eq!(to_number(&XmlValue::string("2.5")), 2.5);
         assert!(to_number(&XmlValue::string("not a number")).is_nan());
     }
 
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_to_number_untyped() {
         assert_eq!(to_number(&XmlValue::untyped("42.5")), 42.5);
-        assert_eq!(to_number(&XmlValue::untyped("  3.14  ")), 3.14); // Trimmed
+        assert_eq!(to_number(&XmlValue::untyped("  2.5  ")), 2.5); // Trimmed
     }
 
     #[test]

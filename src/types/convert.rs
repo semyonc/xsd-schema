@@ -669,7 +669,7 @@ mod tests {
     fn test_to_double() {
         let converter = TypeConverter::new();
 
-        assert_eq!(converter.to_double(&XmlValue::double(3.14)).unwrap(), 3.14);
+        assert_eq!(converter.to_double(&XmlValue::double(2.5)).unwrap(), 2.5);
         assert_eq!(converter.to_double(&XmlValue::float(2.5)).unwrap(), 2.5);
         assert_eq!(converter.to_double(&XmlValue::integer(BigInt::from(42))).unwrap(), 42.0);
         assert_eq!(converter.to_double(&XmlValue::decimal(Decimal::new(123, 1))).unwrap(), 12.3);
@@ -715,9 +715,9 @@ mod tests {
         assert_eq!(result.as_double(), Some(42.0));
 
         // Double to string
-        let dbl_val = XmlValue::double(3.14);
+        let dbl_val = XmlValue::double(2.5);
         let result = converter.cast(&dbl_val, XmlTypeCode::String).unwrap();
-        assert!(result.to_string_value().starts_with("3.14"));
+        assert!(result.to_string_value().starts_with("2.5"));
     }
 
     #[test]
@@ -804,7 +804,7 @@ mod tests {
     fn test_into_xml_value() {
         assert_eq!(true.into_xml_value().as_boolean(), Some(true));
         assert_eq!(42i32.into_xml_value().as_integer(), Some(&BigInt::from(42)));
-        assert_eq!(3.14f64.into_xml_value().as_double(), Some(3.14));
+        assert_eq!(2.5f64.into_xml_value().as_double(), Some(2.5));
         assert_eq!("hello".into_xml_value().as_string(), Some("hello"));
     }
 }
