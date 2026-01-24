@@ -10,7 +10,7 @@ use crate::xpath::string_ops;
 use crate::xpath::DomNavigator;
 
 use crate::xpath::context::DynamicContext;
-use super::{atomize_to_string, atomize_to_string_opt, atomize_to_double, XPathValue};
+use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, atomize_to_double, XPathValue};
 
 // ============================================================================
 // String Functions
@@ -47,7 +47,7 @@ pub fn string_join<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("string-join", 2, args.len()));
     }
 
-    let separator = atomize_to_string(args.pop().unwrap())?;
+    let separator = atomize_to_string_required(args.pop().unwrap())?;
     let sequence = args.pop().unwrap();
 
     // Collect all string values from the sequence
@@ -165,7 +165,7 @@ pub fn normalize_unicode<N: DomNavigator>(
     let source = atomize_to_string(args.remove(0))?;
 
     let form = if !args.is_empty() {
-        let form_str = atomize_to_string(args.remove(0))?;
+        let form_str = atomize_to_string_required(args.remove(0))?;
         let trimmed = form_str.trim();
         if trimmed.is_empty() {
             None
@@ -235,8 +235,8 @@ pub fn translate<N: DomNavigator>(
     }
 
     let source = atomize_to_string(args.remove(0))?;
-    let map_string = atomize_to_string(args.remove(0))?;
-    let trans_string = atomize_to_string(args.remove(0))?;
+    let map_string = atomize_to_string_required(args.remove(0))?;
+    let trans_string = atomize_to_string_required(args.remove(0))?;
 
     let result = string_ops::translate(&source, &map_string, &trans_string);
     Ok(XPathValue::string(result))
@@ -302,6 +302,9 @@ pub fn contains<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("contains", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let source = atomize_to_string(args.remove(0))?;
     let substring = atomize_to_string(args.remove(0))?;
     // Collation argument is ignored for now (uses default Unicode codepoint collation)
@@ -322,6 +325,9 @@ pub fn starts_with<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("starts-with", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let source = atomize_to_string(args.remove(0))?;
     let prefix = atomize_to_string(args.remove(0))?;
     // Collation argument is ignored for now
@@ -342,6 +348,9 @@ pub fn ends_with<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("ends-with", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let source = atomize_to_string(args.remove(0))?;
     let suffix = atomize_to_string(args.remove(0))?;
     // Collation argument is ignored for now
@@ -362,6 +371,9 @@ pub fn substring_before<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("substring-before", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let source = atomize_to_string(args.remove(0))?;
     let pattern = atomize_to_string(args.remove(0))?;
     // Collation argument is ignored for now
@@ -382,6 +394,9 @@ pub fn substring_after<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("substring-after", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let source = atomize_to_string(args.remove(0))?;
     let pattern = atomize_to_string(args.remove(0))?;
     // Collation argument is ignored for now
@@ -420,6 +435,7 @@ pub fn string_to_codepoints<N: DomNavigator>(
 /// fn:codepoints-to-string($arg as xs:integer*) as xs:string
 ///
 /// Converts a sequence of codepoints to a string.
+/// Accepts any numeric type that can be converted to an integer codepoint.
 pub fn codepoints_to_string<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -439,17 +455,8 @@ pub fn codepoints_to_string<N: DomNavigator>(
     for item in items {
         match item {
             XmlItem::Atomic(v) => {
-                if let Some(i) = v.as_integer() {
-                    let cp: u32 = i.try_into().map_err(|_| XPathError::FOCH0001 {
-                        codepoint: i.to_string(),
-                    })?;
-                    codepoints.push(cp);
-                } else {
-                    return Err(XPathError::XPTY0004 {
-                        expected: "xs:integer".to_string(),
-                        found: format!("{:?}", v.type_code),
-                    });
-                }
+                let cp = atomize_to_codepoint(&v)?;
+                codepoints.push(cp);
             }
             XmlItem::Node(_) => {
                 return Err(XPathError::XPTY0004 {
@@ -468,6 +475,42 @@ pub fn codepoints_to_string<N: DomNavigator>(
     }
 }
 
+/// Convert an atomic value to a codepoint (u32).
+/// Handles integer types directly and numeric types that are whole numbers.
+fn atomize_to_codepoint(value: &XmlValue) -> Result<u32, XPathError> {
+    // Try integer first (most common case)
+    if let Some(i) = value.as_integer() {
+        return i.try_into().map_err(|_| XPathError::FOCH0001 {
+            codepoint: i.to_string(),
+        });
+    }
+
+    // Handle other numeric types (double, float, decimal)
+    if value.type_code.is_numeric() {
+        if let Some(d) = value.as_double() {
+            // Check it's a whole number
+            if d.is_nan() || d.is_infinite() || d.fract() != 0.0 {
+                return Err(XPathError::FORG0001 {
+                    value: d.to_string(),
+                    target_type: "xs:integer".to_string(),
+                });
+            }
+            // Check it's in valid u32 range
+            if d < 0.0 || d > u32::MAX as f64 {
+                return Err(XPathError::FOCH0001 {
+                    codepoint: d.to_string(),
+                });
+            }
+            return Ok(d as u32);
+        }
+    }
+
+    Err(XPathError::XPTY0004 {
+        expected: "xs:integer".to_string(),
+        found: format!("{:?}", value.type_code),
+    })
+}
+
 /// fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?) as xs:integer?
 /// fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?, $collation as xs:string) as xs:integer?
 ///
@@ -480,6 +523,9 @@ pub fn compare<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("compare", 2, args.len()));
     }
 
+    if args.len() == 3 {
+        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+    }
     let s1 = atomize_to_string_opt(args.remove(0))?;
     let s2 = atomize_to_string_opt(args.remove(0))?;
     // Collation argument is ignored for now
@@ -695,6 +741,51 @@ mod tests {
                 assert_eq!(v.as_string().unwrap(), "ABC");
             }
             _ => panic!("Expected string"),
+        }
+    }
+
+    #[test]
+    fn test_codepoints_to_string_from_doubles() {
+        let (_, mut ctx) = make_context();
+        // Use doubles that are whole numbers
+        let seq = XPathValue::from_sequence(vec![
+            XmlItem::Atomic(XmlValue::double(65.0)),
+            XmlItem::Atomic(XmlValue::double(66.0)),
+            XmlItem::Atomic(XmlValue::double(67.0)),
+        ]);
+        let args = vec![seq];
+        let result = codepoints_to_string(&mut ctx, args).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_string().unwrap(), "ABC");
+            }
+            _ => panic!("Expected string"),
+        }
+    }
+
+    #[test]
+    fn test_codepoints_to_string_fractional_double_fails() {
+        let (_, mut ctx) = make_context();
+        // Use a double with a fractional part - should fail
+        let seq = XPathValue::from_sequence(vec![
+            XmlItem::Atomic(XmlValue::double(65.5)),
+        ]);
+        let args = vec![seq];
+        let result = codepoints_to_string(&mut ctx, args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_codepoints_to_string_empty() {
+        let (_, mut ctx) = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = codepoints_to_string(&mut ctx, args).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_string().unwrap(), "");
+            }
+            _ => panic!("Expected empty string"),
         }
     }
 

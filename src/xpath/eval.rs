@@ -558,3 +558,52 @@ mod tests {
         }
     }
 }
+
+// ============================================================================
+// Integration Tests (Parse -> Bind -> Eval)
+// ============================================================================
+
+#[cfg(test)]
+mod integration_tests {
+    //! Integration tests for the full parse -> bind -> eval pipeline.
+    //!
+    //! These tests are marked `#[ignore]` until the XPath parser is implemented.
+    //! They serve as a specification for the expected behavior of the full pipeline.
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_if_expression() {
+        // let result = eval_xpath("if (true()) then 'yes' else 'no'");
+        // assert_eq!(result.unwrap().as_string(), Some("yes".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_nested_functions() {
+        // let result = eval_xpath("upper-case(concat('a', 'b'))");
+        // assert_eq!(result.unwrap().as_string(), Some("AB".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_variable_reference() {
+        // let result = eval_xpath_with_var("$x + 1", "x", 5);
+        // assert_eq!(result.unwrap().as_integer().map(|i| i.to_string()), Some("6".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_comparison() {
+        // assert_eq!(eval_xpath("1 = 1").unwrap().as_boolean(), Some(true));
+        // assert_eq!(eval_xpath("1 = 2").unwrap().as_boolean(), Some(false));
+        // assert_eq!(eval_xpath("1 < 2").unwrap().as_boolean(), Some(true));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_arithmetic() {
+        // assert_eq!(eval_xpath("1 + 2").unwrap().as_integer().map(|i| i.to_string()), Some("3".to_string()));
+        // assert_eq!(eval_xpath("5 - 3").unwrap().as_integer().map(|i| i.to_string()), Some("2".to_string()));
+        // assert_eq!(eval_xpath("2 * 3").unwrap().as_integer().map(|i| i.to_string()), Some("6".to_string()));
+    }
+}

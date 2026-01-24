@@ -15,19 +15,19 @@ use crate::types::sequence::SequenceType;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionKey {
     /// Namespace URI
-    pub namespace: &'static str,
+    pub namespace: String,
     /// Local name
-    pub local_name: &'static str,
+    pub local_name: String,
     /// Number of arguments
     pub arity: usize,
 }
 
 impl FunctionKey {
     /// Create a new function key
-    pub fn new(namespace: &'static str, local_name: &'static str, arity: usize) -> Self {
+    pub fn new(namespace: impl Into<String>, local_name: impl Into<String>, arity: usize) -> Self {
         Self {
-            namespace,
-            local_name,
+            namespace: namespace.into(),
+            local_name: local_name.into(),
             arity,
         }
     }
@@ -59,7 +59,7 @@ pub struct FunctionRegistry {
     lookup: HashMap<FunctionKey, usize>,
     /// Lookup map for variadic functions: (namespace, local_name) -> entry index
     /// Used when exact arity lookup fails
-    variadic_lookup: HashMap<(&'static str, &'static str), usize>,
+    variadic_lookup: HashMap<(String, String), usize>,
 }
 
 impl FunctionRegistry {
@@ -80,18 +80,18 @@ impl FunctionRegistry {
         // Register for each valid arity
         match sig.arity {
             FunctionArity::Exact(n) => {
-                let key = FunctionKey::new(sig.namespace, sig.local_name, n);
+                let key = FunctionKey::new(sig.namespace.to_string(), sig.local_name.to_string(), n);
                 self.lookup.insert(key, index);
             }
             FunctionArity::Range(min, max) => {
                 for arity in min..=max {
-                    let key = FunctionKey::new(sig.namespace, sig.local_name, arity);
+                    let key = FunctionKey::new(sig.namespace.to_string(), sig.local_name.to_string(), arity);
                     self.lookup.insert(key, index);
                 }
             }
             FunctionArity::Variadic(_) => {
                 // For variadic, register in the variadic lookup
-                self.variadic_lookup.insert((sig.namespace, sig.local_name), index);
+                self.variadic_lookup.insert((sig.namespace.to_string(), sig.local_name.to_string()), index);
             }
         }
 
@@ -103,19 +103,18 @@ impl FunctionRegistry {
     /// Also handles the XPath 2010 namespace alias.
     pub fn lookup(&self, namespace: &str, local_name: &str, arity: usize) -> Option<&FunctionEntry> {
         // Try exact lookup first
-        if let Some(&index) = self.lookup.get(&FunctionKey {
-            namespace: unsafe { std::mem::transmute::<&str, &'static str>(namespace) },
-            local_name: unsafe { std::mem::transmute::<&str, &'static str>(local_name) },
+        let key = FunctionKey {
+            namespace: namespace.to_string(),
+            local_name: local_name.to_string(),
             arity,
-        }) {
+        };
+        if let Some(&index) = self.lookup.get(&key) {
             return Some(&self.entries[index]);
         }
 
         // Try variadic lookup
-        if let Some(&index) = self.variadic_lookup.get(&(
-            unsafe { std::mem::transmute::<&str, &'static str>(namespace) },
-            unsafe { std::mem::transmute::<&str, &'static str>(local_name) },
-        )) {
+        let variadic_key = (namespace.to_string(), local_name.to_string());
+        if let Some(&index) = self.variadic_lookup.get(&variadic_key) {
             let entry = &self.entries[index];
             if entry.signature.arity.matches(arity) {
                 return Some(entry);

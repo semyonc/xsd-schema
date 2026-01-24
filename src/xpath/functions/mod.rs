@@ -406,12 +406,22 @@ pub fn atomize_to_string<N: DomNavigator>(value: XPathValue<N>) -> Result<String
             if items.len() == 1 {
                 item_to_string(items.into_iter().next().unwrap())
             } else {
-                Err(XPathError::XPTY0004 {
-                    expected: "xs:string".to_string(),
-                    found: format!("sequence of {} items", items.len()),
-                })
+                Err(XPathError::more_than_one_item())
             }
         }
+    }
+}
+
+/// Atomize a value and convert to required string.
+///
+/// Returns error if the value is empty or contains more than one item.
+pub fn atomize_to_string_required<N: DomNavigator>(value: XPathValue<N>) -> Result<String, XPathError> {
+    match value {
+        XPathValue::Empty => Err(XPathError::XPTY0004 {
+            expected: "xs:string".to_string(),
+            found: "empty-sequence()".to_string(),
+        }),
+        other => atomize_to_string(other),
     }
 }
 
@@ -447,10 +457,7 @@ pub fn atomize_to_double<N: DomNavigator>(value: XPathValue<N>) -> Result<f64, X
             if items.len() == 1 {
                 item_to_double(items.into_iter().next().unwrap())
             } else {
-                Err(XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("sequence of {} items", items.len()),
-                })
+                Err(XPathError::more_than_one_item())
             }
         }
     }
@@ -481,10 +488,7 @@ pub fn atomize_to_single<N: DomNavigator>(value: XPathValue<N>) -> Result<XmlVal
             if items.len() == 1 {
                 item_to_atomic(items.into_iter().next().unwrap())
             } else {
-                Err(XPathError::XPTY0004 {
-                    expected: "item()".to_string(),
-                    found: format!("sequence of {} items", items.len()),
-                })
+                Err(XPathError::more_than_one_item())
             }
         }
     }
@@ -598,6 +602,11 @@ pub fn eval_function<N: DomNavigator>(
         // ====================================================================
         // Sequence functions (Phase 3)
         // ====================================================================
+        FunctionId::Reverse => sequence::reverse(context, args),
+        FunctionId::ZeroOrOne => sequence::zero_or_one(context, args),
+        FunctionId::OneOrMore => sequence::one_or_more(context, args),
+        FunctionId::ExactlyOne => sequence::exactly_one(context, args),
+        FunctionId::DistinctValues => sequence::distinct_values(context, args),
         FunctionId::IndexOf => sequence::index_of(context, args),
         FunctionId::Remove => sequence::remove(context, args),
         FunctionId::InsertBefore => sequence::insert_before(context, args),

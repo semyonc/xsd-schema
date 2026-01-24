@@ -434,3 +434,68 @@ mod tests {
         bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
     }
 }
+
+// ============================================================================
+// Integration Tests (Parse -> Bind -> Eval)
+// ============================================================================
+
+#[cfg(test)]
+mod integration_tests {
+    //! Integration tests for the full parse -> bind -> eval pipeline.
+    //!
+    //! These tests are marked `#[ignore]` until the XPath parser is implemented.
+    //! They serve as a specification for the expected behavior of the full pipeline.
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_concat() {
+        // let result = eval_xpath("concat('a', 'b')");
+        // assert_eq!(result.unwrap().as_string(), Some("ab".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_string_length() {
+        // let result = eval_xpath("string-length('hello')");
+        // assert_eq!(result.unwrap().as_integer().map(|i| i.to_string()), Some("5".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_substring() {
+        // let result = eval_xpath("substring('hello', 2, 3)");
+        // assert_eq!(result.unwrap().as_string(), Some("ell".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_upper_case() {
+        // let result = eval_xpath("upper-case('hello')");
+        // assert_eq!(result.unwrap().as_string(), Some("HELLO".to_string()));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_boolean_functions() {
+        // assert_eq!(eval_xpath("true()").unwrap().as_boolean(), Some(true));
+        // assert_eq!(eval_xpath("false()").unwrap().as_boolean(), Some(false));
+        // assert_eq!(eval_xpath("not(true())").unwrap().as_boolean(), Some(false));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_numeric_functions() {
+        // assert_eq!(eval_xpath("abs(-5)").unwrap().as_double(), Some(5.0));
+        // assert_eq!(eval_xpath("ceiling(1.5)").unwrap().as_double(), Some(2.0));
+        // assert_eq!(eval_xpath("floor(1.5)").unwrap().as_double(), Some(1.0));
+        // assert_eq!(eval_xpath("round(1.5)").unwrap().as_double(), Some(2.0));
+    }
+
+    #[test]
+    #[ignore = "Requires parser implementation"]
+    fn test_parse_bind_eval_sequence_functions() {
+        // assert_eq!(eval_xpath("empty(())").unwrap().as_boolean(), Some(true));
+        // assert_eq!(eval_xpath("exists(1)").unwrap().as_boolean(), Some(true));
+        // assert_eq!(eval_xpath("count((1, 2, 3))").unwrap().as_integer().map(|i| i.to_string()), Some("3".to_string()));
+    }
+}

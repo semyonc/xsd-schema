@@ -19,7 +19,7 @@ use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::tree_comparer::TreeComparer;
 use crate::xpath::DomNavigator;
 
-use super::{atomize_sequence, atomize_to_double, atomize_to_single, materialize, XPathValue};
+use super::{atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt, materialize, XPathValue};
 
 // ============================================================================
 // fn:index-of($seq as xs:anyAtomicType*, $search as xs:anyAtomicType,
@@ -45,7 +45,10 @@ pub fn index_of<N: DomNavigator>(
 
     // Atomize both
     let seq_values = atomize_sequence(seq)?;
-    let search_value = atomize_to_single(search_arg)?;
+    let search_value = match atomize_to_single_opt(search_arg)? {
+        None => return Ok(XPathValue::Empty),
+        Some(value) => value,
+    };
 
     // Find matching positions (1-based)
     let mut positions = Vec::new();
@@ -58,14 +61,36 @@ pub fn index_of<N: DomNavigator>(
     Ok(XPathValue::from_sequence(positions))
 }
 
-/// Compare two atomic values for equality (used by index-of).
+/// Compare two atomic values for equality (used by index-of and distinct-values).
 /// Normalizes UntypedAtomic and AnyUri to string for comparison.
+/// Applies numeric type promotion for comparing different numeric types.
 fn values_equal(left: &XmlValue, right: &XmlValue) -> bool {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
 
-    // Use value equality
+    // Numeric type promotion: compare numerics as doubles
+    if left_norm.type_code.is_numeric() && right_norm.type_code.is_numeric() {
+        return numeric_values_equal(&left_norm, &right_norm);
+    }
+
+    // Use value equality for non-numeric types
     left_norm == right_norm
+}
+
+/// Compare two numeric values for equality using double promotion.
+/// NaN is not equal to NaN for value comparison per XPath spec.
+fn numeric_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
+    match (left.as_double(), right.as_double()) {
+        (Some(l), Some(r)) => {
+            // NaN != NaN for value comparison
+            if l.is_nan() || r.is_nan() {
+                return false;
+            }
+            // Compare with epsilon for floating point tolerance
+            (l - r).abs() < f64::EPSILON || l == r
+        }
+        _ => false,
+    }
 }
 
 /// Normalize a value for comparison (UntypedAtomic and AnyUri become string).
@@ -76,6 +101,134 @@ fn normalize_for_comparison(value: &XmlValue) -> XmlValue {
         }
         _ => value.clone(),
     }
+}
+
+// ============================================================================
+// fn:reverse($arg as item()*) as item()*
+// ============================================================================
+
+/// Implements fn:reverse - reverses the order of items in a sequence.
+pub fn reverse<N: DomNavigator>(
+    _context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.len() != 1 {
+        return Err(XPathError::wrong_number_of_arguments("reverse", 1, args.len()));
+    }
+
+    let mut items = materialize(args.remove(0));
+    items.reverse();
+    Ok(XPathValue::from_sequence(items))
+}
+
+// ============================================================================
+// fn:zero-or-one($arg as item()*) as item()?
+// ============================================================================
+
+/// Implements fn:zero-or-one - returns the argument if it contains zero or one items.
+///
+/// Raises FORG0003 if the argument contains more than one item.
+pub fn zero_or_one<N: DomNavigator>(
+    _context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.len() != 1 {
+        return Err(XPathError::wrong_number_of_arguments("zero-or-one", 1, args.len()));
+    }
+
+    let arg = args.remove(0);
+    if arg.len() > 1 {
+        return Err(XPathError::FORG0003);
+    }
+    Ok(arg)
+}
+
+// ============================================================================
+// fn:one-or-more($arg as item()*) as item()+
+// ============================================================================
+
+/// Implements fn:one-or-more - returns the argument if it contains one or more items.
+///
+/// Raises FORG0004 if the argument is an empty sequence.
+pub fn one_or_more<N: DomNavigator>(
+    _context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.len() != 1 {
+        return Err(XPathError::wrong_number_of_arguments("one-or-more", 1, args.len()));
+    }
+
+    let arg = args.remove(0);
+    if arg.is_empty() {
+        return Err(XPathError::FORG0004);
+    }
+    Ok(arg)
+}
+
+// ============================================================================
+// fn:exactly-one($arg as item()*) as item()
+// ============================================================================
+
+/// Implements fn:exactly-one - returns the argument if it contains exactly one item.
+///
+/// Raises FORG0005 if the argument does not contain exactly one item.
+pub fn exactly_one<N: DomNavigator>(
+    _context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.len() != 1 {
+        return Err(XPathError::wrong_number_of_arguments("exactly-one", 1, args.len()));
+    }
+
+    let arg = args.remove(0);
+    if arg.len() != 1 {
+        return Err(XPathError::FORG0005);
+    }
+    Ok(arg)
+}
+
+// ============================================================================
+// fn:distinct-values($arg as xs:anyAtomicType*, $collation as xs:string?) as xs:anyAtomicType*
+// ============================================================================
+
+/// Implements fn:distinct-values - returns unique values from a sequence.
+///
+/// Returns the values that appear in the argument with duplicates removed.
+/// Uses value equality with numeric type promotion.
+pub fn distinct_values<N: DomNavigator>(
+    _context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(XPathError::wrong_number_of_arguments("distinct-values", 1, args.len()));
+    }
+
+    let seq = args.remove(0);
+    // Collation (arg 1) is ignored for now
+
+    // Atomize the sequence
+    let values = atomize_sequence(seq)?;
+
+    if values.is_empty() {
+        return Ok(XPathValue::Empty);
+    }
+
+    // Remove duplicates using values_equal for comparison
+    let mut distinct: Vec<XmlValue> = Vec::new();
+    for value in values {
+        let is_duplicate = distinct.iter().any(|existing| values_equal(existing, &value));
+        if !is_duplicate {
+            distinct.push(value);
+        }
+    }
+
+    // Convert back to XPathValue
+    let items: Vec<XmlItem<N>> = distinct
+        .into_iter()
+        .map(XmlItem::Atomic)
+        .collect();
+
+    Ok(XPathValue::from_sequence(items))
 }
 
 // ============================================================================
@@ -598,6 +751,236 @@ mod tests {
         let args = vec![seq];
         let result = unordered(&mut ctx, args).unwrap();
         assert_eq!(extract_integers(result), vec![1, 2, 3]);
+    }
+
+    // ========== index-of with numeric type promotion tests ==========
+
+    #[test]
+    fn test_index_of_integer_matches_double() {
+        let mut ctx = make_context();
+        // Sequence of integers
+        let seq = integer_seq::<RoXmlNavigator>(&[10, 20, 30]);
+        // Search for 20.0 (double)
+        let search = XPathValue::double(20.0);
+        let args = vec![seq, search];
+        let result = index_of(&mut ctx, args).unwrap();
+        // Should find 20 at position 2
+        assert_eq!(extract_integers(result), vec![2]);
+    }
+
+    #[test]
+    fn test_index_of_double_matches_integer() {
+        let mut ctx = make_context();
+        // Sequence with a double
+        let items: Vec<XmlItem<RoXmlNavigator>> = vec![
+            XmlItem::Atomic(XmlValue::double(10.0)),
+            XmlItem::Atomic(XmlValue::double(20.0)),
+            XmlItem::Atomic(XmlValue::double(30.0)),
+        ];
+        let seq = XPathValue::from_sequence(items);
+        // Search for 20 (integer)
+        let search = XPathValue::integer(20);
+        let args = vec![seq, search];
+        let result = index_of(&mut ctx, args).unwrap();
+        // Should find 20.0 at position 2
+        assert_eq!(extract_integers(result), vec![2]);
+    }
+
+    #[test]
+    fn test_index_of_nan_not_equal() {
+        let mut ctx = make_context();
+        // Sequence with NaN
+        let items: Vec<XmlItem<RoXmlNavigator>> = vec![
+            XmlItem::Atomic(XmlValue::double(f64::NAN)),
+            XmlItem::Atomic(XmlValue::double(1.0)),
+        ];
+        let seq = XPathValue::from_sequence(items);
+        // Search for NaN
+        let search = XPathValue::double(f64::NAN);
+        let args = vec![seq, search];
+        let result = index_of(&mut ctx, args).unwrap();
+        // NaN should not match NaN for value comparison
+        assert!(result.is_empty());
+    }
+
+    // ========== reverse tests ==========
+
+    #[test]
+    fn test_reverse_sequence() {
+        let mut ctx = make_context();
+        let seq = integer_seq::<RoXmlNavigator>(&[1, 2, 3, 4, 5]);
+        let args = vec![seq];
+        let result = reverse(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_reverse_empty() {
+        let mut ctx = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = reverse(&mut ctx, args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_reverse_single() {
+        let mut ctx = make_context();
+        let seq = XPathValue::integer(42);
+        let args = vec![seq];
+        let result = reverse(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![42]);
+    }
+
+    // ========== zero-or-one tests ==========
+
+    #[test]
+    fn test_zero_or_one_empty() {
+        let mut ctx = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = zero_or_one(&mut ctx, args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_zero_or_one_single() {
+        let mut ctx = make_context();
+        let seq = XPathValue::integer(42);
+        let args = vec![seq];
+        let result = zero_or_one(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![42]);
+    }
+
+    #[test]
+    fn test_zero_or_one_multiple_fails() {
+        let mut ctx = make_context();
+        let seq = integer_seq::<RoXmlNavigator>(&[1, 2]);
+        let args = vec![seq];
+        let result = zero_or_one(&mut ctx, args);
+        match result {
+            Err(e) => assert_eq!(e.error_code(), Some("FORG0003")),
+            Ok(_) => panic!("Expected FORG0003 error"),
+        }
+    }
+
+    // ========== one-or-more tests ==========
+
+    #[test]
+    fn test_one_or_more_single() {
+        let mut ctx = make_context();
+        let seq = XPathValue::integer(42);
+        let args = vec![seq];
+        let result = one_or_more(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![42]);
+    }
+
+    #[test]
+    fn test_one_or_more_multiple() {
+        let mut ctx = make_context();
+        let seq = integer_seq::<RoXmlNavigator>(&[1, 2, 3]);
+        let args = vec![seq];
+        let result = one_or_more(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_one_or_more_empty_fails() {
+        let mut ctx = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = one_or_more(&mut ctx, args);
+        match result {
+            Err(e) => assert_eq!(e.error_code(), Some("FORG0004")),
+            Ok(_) => panic!("Expected FORG0004 error"),
+        }
+    }
+
+    // ========== exactly-one tests ==========
+
+    #[test]
+    fn test_exactly_one_single() {
+        let mut ctx = make_context();
+        let seq = XPathValue::integer(42);
+        let args = vec![seq];
+        let result = exactly_one(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![42]);
+    }
+
+    #[test]
+    fn test_exactly_one_empty_fails() {
+        let mut ctx = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = exactly_one(&mut ctx, args);
+        match result {
+            Err(e) => assert_eq!(e.error_code(), Some("FORG0005")),
+            Ok(_) => panic!("Expected FORG0005 error"),
+        }
+    }
+
+    #[test]
+    fn test_exactly_one_multiple_fails() {
+        let mut ctx = make_context();
+        let seq = integer_seq::<RoXmlNavigator>(&[1, 2]);
+        let args = vec![seq];
+        let result = exactly_one(&mut ctx, args);
+        match result {
+            Err(e) => assert_eq!(e.error_code(), Some("FORG0005")),
+            Ok(_) => panic!("Expected FORG0005 error"),
+        }
+    }
+
+    // ========== distinct-values tests ==========
+
+    #[test]
+    fn test_distinct_values_integers() {
+        let mut ctx = make_context();
+        let seq = integer_seq::<RoXmlNavigator>(&[1, 2, 1, 3, 2, 1]);
+        let args = vec![seq];
+        let result = distinct_values(&mut ctx, args).unwrap();
+        assert_eq!(extract_integers(result), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_distinct_values_empty() {
+        let mut ctx = make_context();
+        let seq = XPathValue::<RoXmlNavigator>::Empty;
+        let args = vec![seq];
+        let result = distinct_values(&mut ctx, args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_distinct_values_mixed_numeric() {
+        let mut ctx = make_context();
+        // Mix of integers and doubles that are equal
+        let items: Vec<XmlItem<RoXmlNavigator>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::double(2.0)),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))), // duplicate of 1
+            XmlItem::Atomic(XmlValue::double(2.0)), // duplicate of 2.0
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(3))),
+        ];
+        let seq = XPathValue::from_sequence(items);
+        let args = vec![seq];
+        let result = distinct_values(&mut ctx, args).unwrap();
+        // Should have 3 distinct values: 1, 2.0, 3
+        assert_eq!(result.len(), 3);
+    }
+
+    #[test]
+    fn test_distinct_values_strings() {
+        let mut ctx = make_context();
+        let items: Vec<XmlItem<RoXmlNavigator>> = vec!["a", "b", "a", "c", "b"]
+            .into_iter()
+            .map(|s| XmlItem::Atomic(XmlValue::string(s)))
+            .collect();
+        let seq = XPathValue::from_sequence(items);
+        let args = vec![seq];
+        let result = distinct_values(&mut ctx, args).unwrap();
+        // Should have 3 distinct values: a, b, c
+        assert_eq!(result.len(), 3);
     }
 
     // ========== deep-equal tests ==========
