@@ -20,6 +20,10 @@ pub mod sequence;
 pub mod aggregate;
 pub mod node;
 pub mod datetime;
+pub mod qname;
+pub mod uri;
+pub mod regex;
+pub mod special;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
@@ -556,10 +560,13 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Not => eval_not(args),
 
         // ====================================================================
-        // Context functions
+        // Context/Special functions
         // ====================================================================
-        FunctionId::Position => Ok(XPathValue::integer(context.context_position as i64)),
-        FunctionId::Last => Ok(XPathValue::integer(context.context_size as i64)),
+        FunctionId::Position => special::position(context, args),
+        FunctionId::Last => special::last(context, args),
+        FunctionId::Trace => special::trace(context, args),
+        FunctionId::Data => special::data(context, args),
+        FunctionId::DefaultCollation => special::default_collation(context, args),
 
         // ====================================================================
         // Sequence functions (basic)
@@ -675,6 +682,30 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::AdjustDateTimeToTimezone => datetime::adjust_datetime_to_timezone(context, args),
         FunctionId::AdjustDateToTimezone => datetime::adjust_date_to_timezone(context, args),
         FunctionId::AdjustTimeToTimezone => datetime::adjust_time_to_timezone(context, args),
+
+        // ====================================================================
+        // QName functions (Phase 7)
+        // ====================================================================
+        FunctionId::ResolveQName => qname::resolve_qname(context, args),
+        FunctionId::QName => qname::qname_constructor(context, args),
+        FunctionId::PrefixFromQName => qname::prefix_from_qname(context, args),
+        FunctionId::LocalNameFromQName => qname::local_name_from_qname(context, args),
+        FunctionId::NamespaceUriFromQName => qname::namespace_uri_from_qname(context, args),
+        FunctionId::NamespaceUriForPrefix => qname::namespace_uri_for_prefix(context, args),
+        FunctionId::InScopePrefixes => qname::in_scope_prefixes(context, args),
+
+        // ====================================================================
+        // URI functions (Phase 7)
+        // ====================================================================
+        FunctionId::ResolveUri => uri::resolve_uri(context, args),
+        FunctionId::StaticBaseUri => uri::static_base_uri(context, args),
+
+        // ====================================================================
+        // Regex functions (Phase 7)
+        // ====================================================================
+        FunctionId::Matches => regex::matches(context, args),
+        FunctionId::Replace => regex::replace(context, args),
+        FunctionId::Tokenize => regex::tokenize(context, args),
 
         // All other functions will be implemented in later phases
         _ => Err(XPathError::not_implemented(format!(

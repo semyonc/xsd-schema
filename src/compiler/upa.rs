@@ -348,13 +348,11 @@ fn check_element_element_conflicts(
                     let first_name = schema_set
                         .name_table
                         .try_resolve(*name1)
-                        .unwrap_or("<unknown>")
-                        .to_string();
+                        .unwrap_or_else(|| "<unknown>".to_string());
                     let second_name = schema_set
                         .name_table
                         .try_resolve(*name2)
-                        .unwrap_or("<unknown>")
-                        .to_string();
+                        .unwrap_or_else(|| "<unknown>".to_string());
 
                     return Err(UpaError::ElementElementConflict {
                         first_name,
@@ -405,8 +403,7 @@ fn check_element_wildcard_conflicts(
                         let element_name = schema_set
                             .name_table
                             .try_resolve(*name)
-                            .unwrap_or("<unknown>")
-                            .to_string();
+                            .unwrap_or_else(|| "<unknown>".to_string());
 
                         return Err(UpaError::ElementWildcardConflict {
                             element_name,

@@ -591,7 +591,7 @@ pub trait Frame {
                 None => continue,
             };
 
-            if !self.allows_attribute(local_name, name_table) {
+            if !self.allows_attribute(&local_name, name_table) {
                 return Err(SchemaError::structural(
                     "ct-props-correct",
                     format!("Attribute '{}' is not allowed here", local_name),

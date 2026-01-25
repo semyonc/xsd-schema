@@ -82,6 +82,13 @@ pub enum XPathError {
     XQTY0030,
 
     // ========================================================================
+    // XQuery Static Errors (XQST)
+    // ========================================================================
+    /// XQST0076: Invalid collation URI.
+    #[error("[XQST0076] Collation '{collation}' is not supported")]
+    XQST0076 { collation: String },
+
+    // ========================================================================
     // Function Errors - General (FORG)
     // ========================================================================
     /// FORG0001: Invalid value for cast/constructor.
@@ -118,6 +125,10 @@ pub enum XPathError {
     /// FOCH0001: Invalid codepoint.
     #[error("[FOCH0001] Invalid codepoint '{codepoint}' in codepoints-to-string")]
     FOCH0001 { codepoint: String },
+
+    /// FOCH0002: Unsupported collation.
+    #[error("[FOCH0002] Unsupported collation: '{collation}'")]
+    FOCH0002 { collation: String },
 
     /// FOCH0003: Unsupported normalization form.
     #[error("[FOCH0003] Unsupported normalization form '{normalization_form}'")]
@@ -159,6 +170,39 @@ pub enum XPathError {
     /// FODT0003: Invalid timezone value.
     #[error("[FODT0003] Invalid timezone value: {value}")]
     FODT0003 { value: String },
+
+    // ========================================================================
+    // Namespace Errors (FONS)
+    // ========================================================================
+    /// FONS0005: Base-uri not defined in static context.
+    #[error("[FONS0005] Base-uri not defined in the static context")]
+    FONS0005,
+
+    // ========================================================================
+    // URI Errors (FORG)
+    // ========================================================================
+    /// FORG0009: Error in resolving a relative URI.
+    #[error("[FORG0009] Error in resolving a relative URI against a base URI: '{uri}'")]
+    FORG0009 { uri: String },
+
+    // ========================================================================
+    // Regex Errors (FORX)
+    // ========================================================================
+    /// FORX0001: Invalid regular expression flags.
+    #[error("[FORX0001] Invalid regular expression flags: '{flags}'")]
+    FORX0001 { flags: String },
+
+    /// FORX0002: Invalid regular expression.
+    #[error("[FORX0002] Invalid regular expression: '{pattern}'")]
+    FORX0002 { pattern: String },
+
+    /// FORX0003: Regular expression matches zero-length string.
+    #[error("[FORX0003] Regular expression matches zero-length string: '{pattern}'")]
+    FORX0003 { pattern: String },
+
+    /// FORX0004: Invalid replacement string.
+    #[error("[FORX0004] Invalid replacement string: '{replacement}'")]
+    FORX0004 { replacement: String },
 
     // ========================================================================
     // Operator Errors
@@ -282,12 +326,13 @@ impl XPathError {
         XPathError::Internal(format!("Not implemented: {}", message.into()))
     }
 
-    /// Create a wrong number of arguments error.
+    /// Create XPST0017 wrong number of arguments error.
     pub fn wrong_number_of_arguments(function: &str, expected: usize, actual: usize) -> Self {
-        XPathError::Internal(format!(
-            "Function '{}' expects {} arguments, but got {}",
-            function, expected, actual
-        ))
+        XPathError::XPST0017 {
+            name: function.to_string(),
+            arity: actual,
+            namespace: format!("(expected {} argument{})", expected, if expected == 1 { "" } else { "s" }),
+        }
     }
 
     /// Create binary operator not defined error.
@@ -314,6 +359,58 @@ impl XPathError {
         }
     }
 
+    /// Create FONS0005 base-uri not defined error.
+    pub fn base_uri_not_defined() -> Self {
+        XPathError::FONS0005
+    }
+
+    /// Create FORG0009 URI resolution error.
+    pub fn uri_resolution_error(uri: impl Into<String>) -> Self {
+        XPathError::FORG0009 { uri: uri.into() }
+    }
+
+    /// Create FORX0001 invalid regex flags error.
+    pub fn invalid_regex_flags(flags: impl Into<String>) -> Self {
+        XPathError::FORX0001 {
+            flags: flags.into(),
+        }
+    }
+
+    /// Create FORX0002 invalid regex pattern error.
+    pub fn invalid_regex_pattern(pattern: impl Into<String>) -> Self {
+        XPathError::FORX0002 {
+            pattern: pattern.into(),
+        }
+    }
+
+    /// Create FORX0003 regex matches zero-length string error.
+    pub fn regex_matches_zero_length(pattern: impl Into<String>) -> Self {
+        XPathError::FORX0003 {
+            pattern: pattern.into(),
+        }
+    }
+
+    /// Create FORX0004 invalid replacement string error.
+    pub fn invalid_replacement_string(replacement: impl Into<String>) -> Self {
+        XPathError::FORX0004 {
+            replacement: replacement.into(),
+        }
+    }
+
+    /// Create XQST0076 unsupported collation error.
+    pub fn unsupported_collation(collation: impl Into<String>) -> Self {
+        XPathError::XQST0076 {
+            collation: collation.into(),
+        }
+    }
+
+    /// Create FOCH0002 unsupported collation error.
+    pub fn unknown_collation(collation: impl Into<String>) -> Self {
+        XPathError::FOCH0002 {
+            collation: collation.into(),
+        }
+    }
+
     /// Get the error code (e.g., "XPTY0004") if this is a spec-defined error.
     pub fn error_code(&self) -> Option<&'static str> {
         match self {
@@ -329,6 +426,7 @@ impl XPathError {
             XPathError::XPTY0018 => Some("XPTY0018"),
             XPathError::XPTY0019 => Some("XPTY0019"),
             XPathError::XQTY0030 => Some("XQTY0030"),
+            XPathError::XQST0076 { .. } => Some("XQST0076"),
             XPathError::FORG0001 { .. } => Some("FORG0001"),
             XPathError::FORG0003 => Some("FORG0003"),
             XPathError::FORG0004 => Some("FORG0004"),
@@ -337,6 +435,7 @@ impl XPathError {
             XPathError::FORG0006 { .. } => Some("FORG0006"),
             XPathError::FORG0008 => Some("FORG0008"),
             XPathError::FOCH0001 { .. } => Some("FOCH0001"),
+            XPathError::FOCH0002 { .. } => Some("FOCH0002"),
             XPathError::FOCH0003 { .. } => Some("FOCH0003"),
             XPathError::FOAR0001 => Some("FOAR0001"),
             XPathError::FOAR0002 => Some("FOAR0002"),
@@ -345,6 +444,12 @@ impl XPathError {
             XPathError::FODT0001 => Some("FODT0001"),
             XPathError::FODT0002 => Some("FODT0002"),
             XPathError::FODT0003 { .. } => Some("FODT0003"),
+            XPathError::FONS0005 => Some("FONS0005"),
+            XPathError::FORG0009 { .. } => Some("FORG0009"),
+            XPathError::FORX0001 { .. } => Some("FORX0001"),
+            XPathError::FORX0002 { .. } => Some("FORX0002"),
+            XPathError::FORX0003 { .. } => Some("FORX0003"),
+            XPathError::FORX0004 { .. } => Some("FORX0004"),
             XPathError::BinaryOperatorNotDefined { .. } => None,
             XPathError::UnaryOperatorNotDefined { .. } => None,
             XPathError::Internal(_) => None,

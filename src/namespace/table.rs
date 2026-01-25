@@ -9,8 +9,16 @@
 //! - NameId(0) reserved for empty string
 //! - Rehashing when entries.len() > buckets.len()
 //! - Pre-seed with standard namespaces
+//!
+//! ## Interior Mutability
+//!
+//! NameTable uses interior mutability (`RefCell`) to allow adding new strings
+//! through a shared reference (`&self`). This enables runtime string interning
+//! in contexts where only immutable access to the table is available (e.g.,
+//! during XPath function evaluation).
 
 use crate::ids::NameId;
+use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -30,12 +38,14 @@ struct Entry {
 /// Provides O(1) average-case lookup and insertion.
 /// All strings in the schema model should be interned through this table.
 ///
+/// Uses interior mutability to allow adding strings through shared references.
+///
 /// # Example
 ///
 /// ```
 /// use xsd_schema::namespace::NameTable;
 ///
-/// let mut table = NameTable::new();
+/// let table = NameTable::new();
 /// let id1 = table.add("hello");
 /// let id2 = table.add("hello");
 /// assert_eq!(id1, id2); // Same string -> same ID
@@ -43,10 +53,10 @@ struct Entry {
 /// ```
 #[derive(Debug)]
 pub struct NameTable {
-    /// All entries (indexed by NameId)
-    entries: Vec<Entry>,
+    /// All entries (indexed by NameId) - uses RefCell for interior mutability
+    entries: RefCell<Vec<Entry>>,
     /// Hash buckets (index into entries via first entry in chain)
-    buckets: Vec<i32>,
+    buckets: RefCell<Vec<i32>>,
 }
 
 impl NameTable {
@@ -55,9 +65,9 @@ impl NameTable {
 
     /// Create a new name table pre-seeded with standard namespaces
     pub fn new() -> Self {
-        let mut table = Self {
-            entries: Vec::with_capacity(Self::INITIAL_BUCKETS),
-            buckets: vec![-1; Self::INITIAL_BUCKETS],
+        let table = Self {
+            entries: RefCell::new(Vec::with_capacity(Self::INITIAL_BUCKETS)),
+            buckets: RefCell::new(vec![-1; Self::INITIAL_BUCKETS]),
         };
 
         // Pre-seed standard values
@@ -84,15 +94,17 @@ impl NameTable {
     ///
     /// If the string already exists, returns the existing NameId.
     /// Otherwise, creates a new entry and returns a new NameId.
-    pub fn add(&mut self, value: &str) -> NameId {
+    ///
+    /// Uses interior mutability, so this can be called through a shared reference.
+    pub fn add(&self, value: &str) -> NameId {
         let hash = Self::hash_str(value);
 
-        // Check if already present
+        // Check if already present (read-only borrow)
         if let Some(id) = self.find(value, hash) {
             return id;
         }
 
-        // Need to insert
+        // Need to insert (mutable borrow)
         self.insert(value, hash)
     }
 
@@ -104,26 +116,30 @@ impl NameTable {
 
     /// Resolve a NameId to its string value
     ///
+    /// Returns a copy of the string to avoid borrow issues.
+    ///
     /// # Panics
     ///
     /// Panics if the NameId is invalid (out of bounds).
-    pub fn resolve(&self, id: NameId) -> &str {
-        &self.entries[id.0 as usize].text
+    pub fn resolve(&self, id: NameId) -> String {
+        self.entries.borrow()[id.0 as usize].text.to_string()
     }
 
     /// Try to resolve a NameId to its string value
-    pub fn try_resolve(&self, id: NameId) -> Option<&str> {
-        self.entries.get(id.0 as usize).map(|e| e.text.as_ref())
+    ///
+    /// Returns a copy of the string to avoid borrow issues.
+    pub fn try_resolve(&self, id: NameId) -> Option<String> {
+        self.entries.borrow().get(id.0 as usize).map(|e| e.text.to_string())
     }
 
     /// Get the number of interned strings
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.borrow().len()
     }
 
     /// Check if the table is empty
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.entries.borrow().is_empty()
     }
 
     /// Hash a string
@@ -135,11 +151,14 @@ impl NameTable {
 
     /// Find an existing entry
     fn find(&self, value: &str, hash: u64) -> Option<NameId> {
-        let bucket_idx = (hash as usize) % self.buckets.len();
-        let mut entry_idx = self.buckets[bucket_idx];
+        let entries = self.entries.borrow();
+        let buckets = self.buckets.borrow();
+
+        let bucket_idx = (hash as usize) % buckets.len();
+        let mut entry_idx = buckets[bucket_idx];
 
         while entry_idx >= 0 {
-            let entry = &self.entries[entry_idx as usize];
+            let entry = &entries[entry_idx as usize];
             if entry.hash == hash && entry.text.as_ref() == value {
                 return Some(NameId(entry_idx as u32));
             }
@@ -150,37 +169,40 @@ impl NameTable {
     }
 
     /// Insert a new entry
-    fn insert(&mut self, value: &str, hash: u64) -> NameId {
+    fn insert(&self, value: &str, hash: u64) -> NameId {
+        let mut entries = self.entries.borrow_mut();
+        let mut buckets = self.buckets.borrow_mut();
+
         // Check if we need to rehash
-        if self.entries.len() >= self.buckets.len() {
-            self.rehash();
+        if entries.len() >= buckets.len() {
+            Self::rehash_internal(&mut entries, &mut buckets);
         }
 
-        let id = NameId(self.entries.len() as u32);
-        let bucket_idx = (hash as usize) % self.buckets.len();
+        let id = NameId(entries.len() as u32);
+        let bucket_idx = (hash as usize) % buckets.len();
 
         // Insert at head of chain
-        let next = self.buckets[bucket_idx];
-        self.entries.push(Entry {
+        let next = buckets[bucket_idx];
+        entries.push(Entry {
             hash,
             next,
             text: value.into(),
         });
-        self.buckets[bucket_idx] = id.0 as i32;
+        buckets[bucket_idx] = id.0 as i32;
 
         id
     }
 
-    /// Rehash the table (double bucket count)
-    fn rehash(&mut self) {
-        let new_size = self.buckets.len() * 2;
-        self.buckets = vec![-1; new_size];
+    /// Rehash the table (double bucket count) - internal version
+    fn rehash_internal(entries: &mut Vec<Entry>, buckets: &mut Vec<i32>) {
+        let new_size = buckets.len() * 2;
+        *buckets = vec![-1; new_size];
 
         // Re-insert all entries into new buckets
-        for (idx, entry) in self.entries.iter_mut().enumerate() {
+        for (idx, entry) in entries.iter_mut().enumerate() {
             let bucket_idx = (entry.hash as usize) % new_size;
-            entry.next = self.buckets[bucket_idx];
-            self.buckets[bucket_idx] = idx as i32;
+            entry.next = buckets[bucket_idx];
+            buckets[bucket_idx] = idx as i32;
         }
     }
 }
@@ -244,14 +266,14 @@ mod tests {
 
     #[test]
     fn test_add_and_resolve() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let id = table.add("hello");
         assert_eq!(table.resolve(id), "hello");
     }
 
     #[test]
     fn test_deduplication() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let id1 = table.add("hello");
         let id2 = table.add("hello");
         assert_eq!(id1, id2);
@@ -259,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_different_strings_different_ids() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let id1 = table.add("hello");
         let id2 = table.add("world");
         assert_ne!(id1, id2);
@@ -267,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_get_existing() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let id = table.add("test");
         assert_eq!(table.get("test"), Some(id));
     }
@@ -298,7 +320,7 @@ mod tests {
 
     #[test]
     fn test_rehashing() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         // Insert enough entries to trigger rehashing
         for i in 0..1000 {
             let s = format!("string_{}", i);
@@ -313,10 +335,21 @@ mod tests {
 
     #[test]
     fn test_unicode_strings() {
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let id1 = table.add("日本語");
         let id2 = table.add("日本語");
         assert_eq!(id1, id2);
         assert_eq!(table.resolve(id1), "日本語");
+    }
+
+    #[test]
+    fn test_interior_mutability() {
+        // Test that add works through shared reference
+        let table = NameTable::new();
+        let table_ref = &table;
+        let id1 = table_ref.add("through_ref");
+        let id2 = table_ref.add("through_ref");
+        assert_eq!(id1, id2);
+        assert_eq!(table.resolve(id1), "through_ref");
     }
 }

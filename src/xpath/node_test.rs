@@ -189,7 +189,7 @@ fn qname_matches<N: DomNavigator>(
             Some(ns) => ns,
             None => return false,
         },
-        None => "",
+        None => String::new(),
     };
 
     nav.local_name() == local && nav.namespace_uri() == ns

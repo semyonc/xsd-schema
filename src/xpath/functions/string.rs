@@ -12,6 +12,19 @@ use crate::xpath::DomNavigator;
 use crate::xpath::context::DynamicContext;
 use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, atomize_to_double, XPathValue};
 
+/// Default collation URI (codepoint collation).
+const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
+
+/// Validate collation URI - only default collation is supported.
+/// Returns Ok(()) if collation is valid (default or empty), FOCH0002 otherwise.
+fn validate_collation(collation: Option<&str>) -> Result<(), XPathError> {
+    match collation {
+        None => Ok(()),
+        Some(c) if c.is_empty() || c == DEFAULT_COLLATION => Ok(()),
+        Some(c) => Err(XPathError::unknown_collation(c)),
+    }
+}
+
 // ============================================================================
 // String Functions
 // ============================================================================
@@ -523,12 +536,13 @@ pub fn compare<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("compare", 2, args.len()));
     }
 
+    // Validate collation if provided (third argument)
     if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
+        let collation = atomize_to_string_required(args.pop().unwrap())?;
+        validate_collation(Some(&collation))?;
     }
     let s1 = atomize_to_string_opt(args.remove(0))?;
     let s2 = atomize_to_string_opt(args.remove(0))?;
-    // Collation argument is ignored for now
 
     match (s1, s2) {
         (Some(a), Some(b)) => {
@@ -822,5 +836,36 @@ mod tests {
             }
             _ => panic!("Expected boolean"),
         }
+    }
+
+    #[test]
+    fn test_compare_with_default_collation() {
+        let (_, mut ctx) = make_context();
+        // Should work with default collation
+        let args = vec![
+            XPathValue::string("abc"),
+            XPathValue::string("abd"),
+            XPathValue::string(DEFAULT_COLLATION),
+        ];
+        let result = compare(&mut ctx, args).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(*v.as_integer().unwrap(), (-1).into());
+            }
+            _ => panic!("Expected integer"),
+        }
+    }
+
+    #[test]
+    fn test_compare_with_invalid_collation() {
+        let (_, mut ctx) = make_context();
+        // Should fail with unsupported collation
+        let args = vec![
+            XPathValue::string("abc"),
+            XPathValue::string("abd"),
+            XPathValue::string("http://example.com/custom-collation"),
+        ];
+        let result = compare(&mut ctx, args);
+        assert!(matches!(result, Err(XPathError::FOCH0002 { .. })));
     }
 }

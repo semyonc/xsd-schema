@@ -19,7 +19,20 @@ use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::tree_comparer::TreeComparer;
 use crate::xpath::DomNavigator;
 
-use super::{atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt, materialize, XPathValue};
+use super::{atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt, atomize_to_string_opt, materialize, XPathValue};
+
+/// Default collation URI (codepoint collation).
+const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
+
+/// Validate collation URI - only default collation is supported.
+/// Returns Ok(()) if collation is valid (default or empty), FOCH0002 otherwise.
+fn validate_collation(collation: Option<&str>) -> Result<(), XPathError> {
+    match collation {
+        None => Ok(()),
+        Some(c) if c.is_empty() || c == DEFAULT_COLLATION => Ok(()),
+        Some(c) => Err(XPathError::unknown_collation(c)),
+    }
+}
 
 // ============================================================================
 // fn:index-of($seq as xs:anyAtomicType*, $search as xs:anyAtomicType,
@@ -500,9 +513,15 @@ pub fn deep_equal<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("deep-equal", 2, args.len()));
     }
 
+    // Validate collation if provided (third argument)
+    if args.len() == 3 {
+        let collation_arg = args.pop().unwrap();
+        let collation = atomize_to_string_opt(collation_arg)?;
+        validate_collation(collation.as_deref())?;
+    }
+
     let param1 = args.remove(0);
     let param2 = args.remove(0);
-    // Collation (arg 2) is ignored for now
 
     // Materialize both sequences
     let items1 = materialize(param1);

@@ -212,10 +212,10 @@ impl<'a> ReferenceResolver<'a> {
         let ns = qname
             .namespace
             .map(|id| self.schema_set.name_table.resolve(id))
-            .unwrap_or("");
+            .unwrap_or_default();
         let local = self.schema_set.name_table.resolve(qname.local_name);
         if ns.is_empty() {
-            local.to_string()
+            local
         } else {
             format!("{{{}}}{}", ns, local)
         }

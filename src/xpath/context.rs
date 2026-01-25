@@ -99,7 +99,7 @@ impl<'a> XPathContext<'a> {
     /// Resolve a prefix to a namespace URI.
     ///
     /// Returns the namespace URI for the given prefix, or None if not found.
-    pub fn resolve_prefix(&self, prefix: &str) -> Option<&str> {
+    pub fn resolve_prefix(&self, prefix: &str) -> Option<String> {
         if prefix.is_empty() {
             // Empty prefix: use default element namespace
             self.default_element_ns.and_then(|id| self.names.try_resolve(id))
@@ -122,7 +122,7 @@ impl<'a> XPathContext<'a> {
     }
 
     /// Resolve a name from the name table.
-    pub fn resolve_name(&self, id: NameId) -> Option<&str> {
+    pub fn resolve_name(&self, id: NameId) -> Option<String> {
         self.names.try_resolve(id)
     }
 }
@@ -228,9 +228,9 @@ impl NameBinder {
             }
         }
         // Format QName for error using NameTable
-        let local = names.try_resolve(name.local_name).unwrap_or("<unknown>");
+        let local = names.try_resolve(name.local_name).unwrap_or_else(|| "<unknown>".to_string());
         let qname_str = if let Some(prefix_id) = name.prefix {
-            let prefix = names.try_resolve(prefix_id).unwrap_or("<unknown>");
+            let prefix = names.try_resolve(prefix_id).unwrap_or_else(|| "<unknown>".to_string());
             format!("{}:{}", prefix, local)
         } else {
             local.to_string()
