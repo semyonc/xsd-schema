@@ -648,8 +648,8 @@ pub fn validate_xsd_version_element(
     element_name: &str,
     ctx: &ValidationContext,
 ) -> SchemaResult<()> {
-    if ctx.xsd_version == XsdVersion::V1_0 {
-        if XSD_1_1_ELEMENTS.contains(&element_name) {
+    if ctx.xsd_version == XsdVersion::V1_0
+        && XSD_1_1_ELEMENTS.contains(&element_name) {
             return Err(SchemaError::feature(
                 format!(
                     "Element '{}' requires XSD 1.1 but schema is in XSD 1.0 mode",
@@ -658,7 +658,6 @@ pub fn validate_xsd_version_element(
                 None,
             ));
         }
-    }
     Ok(())
 }
 

@@ -29,18 +29,15 @@ use super::XmlTypeCode;
 
 /// Fixed vs default facet values
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Default)]
 pub enum FacetFixed {
     /// Value can be further restricted
+    #[default]
     Default,
     /// Value cannot be changed by derived types
     Fixed,
 }
 
-impl Default for FacetFixed {
-    fn default() -> Self {
-        FacetFixed::Default
-    }
-}
 
 /// Whitespace handling mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -199,7 +196,7 @@ fn xsd_pattern_to_rust(xsd_pattern: &str) -> String {
                         chars.next();
                         // Copy the block name including braces
                         if chars.peek() == Some(&'{') {
-                            while let Some(c) = chars.next() {
+                            for c in chars.by_ref() {
                                 result.push(c);
                                 if c == '}' {
                                     break;

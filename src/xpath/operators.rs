@@ -415,7 +415,7 @@ fn is_operator_not_defined(err: &XPathError) -> bool {
     matches!(err, XPathError::BinaryOperatorNotDefined { .. })
 }
 
-fn unwrap_union_value<'a>(value: &'a XmlValue) -> &'a XmlValue {
+fn unwrap_union_value(value: &XmlValue) -> &XmlValue {
     let mut current = value;
     loop {
         match &current.value {
@@ -2944,7 +2944,7 @@ mod tests {
     #[test]
     fn test_compare_ge_prefers_eq_over_ordering() {
         // QName ordering isn't defined, but equality is.
-        let mut names = NameTable::new();
+        let names = NameTable::new();
         let local = names.add("a");
         let qname = QualifiedName::local(local);
         let left = XmlValue::new(

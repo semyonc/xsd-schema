@@ -43,7 +43,7 @@ impl SchemaFrame {
     ) -> SchemaResult<Self> {
         let target_namespace = attrs
             .get_value_by_name(name_table, "targetNamespace")
-            .map(|s| name_table.get(s).unwrap_or_else(|| {
+            .map(|s| name_table.get(s).unwrap_or({
                 // This shouldn't happen in normal parsing flow
                 NameId(0)
             }));

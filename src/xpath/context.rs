@@ -449,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_name_binder_push_pop() {
-        let mut names = NameTable::new();
+        let names = NameTable::new();
         let mut binder = NameBinder::new();
         assert!(binder.is_empty());
         assert_eq!(binder.len(), 0);
@@ -486,7 +486,7 @@ mod tests {
 
     #[test]
     fn test_name_binder_shadowing() {
-        let mut names = NameTable::new();
+        let names = NameTable::new();
         let mut binder = NameBinder::new();
 
         let x_id = names.add("x");
@@ -512,7 +512,7 @@ mod tests {
 
     #[test]
     fn test_name_binder_unbound_error() {
-        let mut names = NameTable::new();
+        let names = NameTable::new();
         let binder = NameBinder::new();
         let undefined_id = names.add("undefined");
         let name = QualifiedName::local(undefined_id);

@@ -9,8 +9,10 @@ use crate::parser::location::SourceRef;
 ///
 /// Specifies which namespaces are allowed by a wildcard.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum NamespaceConstraint {
     /// Any namespace allowed (##any)
+    #[default]
     Any,
 
     /// Other namespaces allowed (##other) - excludes target namespace
@@ -63,11 +65,6 @@ impl NamespaceConstraint {
     }
 }
 
-impl Default for NamespaceConstraint {
-    fn default() -> Self {
-        NamespaceConstraint::Any
-    }
-}
 
 /// Process contents directive
 ///
@@ -85,16 +82,20 @@ pub enum ProcessContents {
     Skip,
 }
 
-impl ProcessContents {
-    /// Parse from string attribute value
-    pub fn from_str(s: &str) -> Option<Self> {
+impl std::str::FromStr for ProcessContents {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "strict" => Some(ProcessContents::Strict),
-            "lax" => Some(ProcessContents::Lax),
-            "skip" => Some(ProcessContents::Skip),
-            _ => None,
+            "strict" => Ok(ProcessContents::Strict),
+            "lax" => Ok(ProcessContents::Lax),
+            "skip" => Ok(ProcessContents::Skip),
+            _ => Err(()),
         }
     }
+}
+
+impl ProcessContents {
 
     /// Convert to string
     pub fn as_str(&self) -> &'static str {
@@ -348,10 +349,10 @@ mod tests {
 
     #[test]
     fn test_process_contents_parsing() {
-        assert_eq!(ProcessContents::from_str("strict"), Some(ProcessContents::Strict));
-        assert_eq!(ProcessContents::from_str("lax"), Some(ProcessContents::Lax));
-        assert_eq!(ProcessContents::from_str("skip"), Some(ProcessContents::Skip));
-        assert_eq!(ProcessContents::from_str("invalid"), None);
+        assert_eq!("strict".parse(), Ok(ProcessContents::Strict));
+        assert_eq!("lax".parse(), Ok(ProcessContents::Lax));
+        assert_eq!("skip".parse(), Ok(ProcessContents::Skip));
+        assert_eq!("invalid".parse::<ProcessContents>(), Err(()));
     }
 
     #[test]

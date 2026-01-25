@@ -184,7 +184,7 @@ pub fn load_and_process_schema(
         // Recursively process directives in loaded documents
         let mut pending_docs = dir_result.loaded.clone();
         while !pending_docs.is_empty() {
-            let current_batch: Vec<_> = pending_docs.drain(..).collect();
+            let current_batch: Vec<_> = std::mem::take(&mut pending_docs);
             for loaded_doc_id in current_batch {
                 let nested_result = resolve_all_directives(loaded_doc_id, &mut resolver, schema_set);
                 stats.loaded_docs.extend(nested_result.loaded.iter().copied());
@@ -582,7 +582,7 @@ mod tests {
         // Note: This validation might happen during assembly or resolution, not parsing
         // If the schema parses but fails during resolution, we still consider it a success
         // as long as the error is eventually caught
-        assert!(result.is_err() || schema_set.arenas.simple_types.len() > 0,
+        assert!(result.is_err() || !schema_set.arenas.simple_types.is_empty(),
             "Should either reject empty union or parse it for later validation");
     }
 

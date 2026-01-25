@@ -625,9 +625,9 @@ impl<'input> Lexer<'input> {
         let start = self.pos;
         while let Some(c) = self.current() {
             // Allow : only if followed by NCName char
-            if c == ':' && self.peek(1).map(Self::is_ncname_char).unwrap_or(false) {
-                self.advance(1);
-            } else if Self::is_ncname_char(c) {
+            if (c == ':' && self.peek(1).map(Self::is_ncname_char).unwrap_or(false))
+                || Self::is_ncname_char(c)
+            {
                 self.advance(1);
             } else {
                 break;
@@ -1068,11 +1068,7 @@ impl<'input> Lexer<'input> {
             self.state = LexerState::Operator;
         }
 
-        if name.contains(':') {
-            self.enqueue(Token::QName(name), start, end);
-        } else {
-            self.enqueue(Token::QName(name), start, end);
-        }
+        self.enqueue(Token::QName(name), start, end);
 
         Ok(())
     }

@@ -194,6 +194,7 @@ impl NameTable {
     }
 
     /// Rehash the table (double bucket count) - internal version
+    #[allow(clippy::ptr_arg)]
     fn rehash_internal(entries: &mut Vec<Entry>, buckets: &mut Vec<i32>) {
         let new_size = buckets.len() * 2;
         *buckets = vec![-1; new_size];

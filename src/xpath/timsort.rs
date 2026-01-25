@@ -502,9 +502,7 @@ where
                 if len1 == 1 {
                     break 'outer;
                 }
-                if min_gallop > 0 {
-                    min_gallop -= 1;
-                }
+                min_gallop = min_gallop.saturating_sub(1);
                 if count1 < MIN_GALLOP && count2 < MIN_GALLOP {
                     break;
                 }
@@ -651,9 +649,7 @@ where
                 if len1 == 0 {
                     break 'outer;
                 }
-                if min_gallop > 0 {
-                    min_gallop -= 1;
-                }
+                min_gallop = min_gallop.saturating_sub(1);
                 if count1 < MIN_GALLOP && count2 < MIN_GALLOP {
                     break;
                 }
@@ -977,7 +973,7 @@ where
     T: Clone,
     F: FnMut(&T, &T) -> Ordering,
 {
-    let vec: Vec<T> = slice.iter().cloned().collect();
+    let vec: Vec<T> = slice.to_vec();
     let sorted = TimSort::sort(vec, compare);
     for (i, item) in sorted.into_iter().enumerate() {
         slice[i] = item;

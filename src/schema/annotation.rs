@@ -220,7 +220,7 @@ impl Annotation {
     /// Get documentation in a specific language
     pub fn documentation_for_lang(&self, lang: &str) -> Option<&DocumentationElement> {
         self.documentations().find(|d| {
-            d.lang.as_ref().map_or(false, |l| l == lang)
+            d.lang.as_ref().is_some_and(|l| l == lang)
         })
     }
 

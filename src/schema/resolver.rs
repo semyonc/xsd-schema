@@ -968,7 +968,7 @@ mod tests {
 
     #[test]
     fn test_resolve_unknown_type_error() {
-        let mut schema_set = SchemaSet::new();
+        let schema_set = SchemaSet::new();
 
         // Add the name before creating the resolver to avoid borrow conflicts
         let unknown_name = schema_set.name_table.add("nonExistentType");
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn test_format_qname_without_namespace() {
-        let mut schema_set = SchemaSet::new();
+        let schema_set = SchemaSet::new();
 
         // Add the name before creating the resolver to avoid borrow conflicts
         let local_name = schema_set.name_table.add("localType");

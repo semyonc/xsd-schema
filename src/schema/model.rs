@@ -156,7 +156,7 @@ impl SchemaSet {
 
     /// Get or create namespace table for a namespace
     pub fn get_or_create_namespace(&mut self, ns: Option<NameId>) -> &mut NamespaceTable {
-        self.namespaces.entry(ns).or_insert_with(NamespaceTable::new)
+        self.namespaces.entry(ns).or_default()
     }
 
     /// Look up a type by namespace and name
@@ -301,15 +301,12 @@ impl SchemaSet {
             // Get the simple type data
             if let Some(type_def) = self.arenas.simple_types.get(current) {
                 // Check the resolved base type
-                if let Some(base_type_key) = type_def.resolved_base_type {
-                    // Extract SimpleTypeKey from TypeKey
-                    if let crate::ids::TypeKey::Simple(simple_base) = base_type_key {
-                        if simple_base == base {
-                            return true;
-                        }
-                        current = simple_base;
-                        continue;
+                if let Some(crate::ids::TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
+                    if simple_base == base {
+                        return true;
                     }
+                    current = simple_base;
+                    continue;
                 }
             }
 
@@ -343,7 +340,7 @@ impl SchemaSet {
     /// * `derived` - The potentially derived type
     /// * `base` - The potential base type
     /// * `exclude_methods` - Derivation methods to exclude from the check.
-    ///                       Use `DerivationSet::empty()` to allow any method (like C#'s Empty).
+    ///   Use `DerivationSet::empty()` to allow any method (like C#'s Empty).
     ///
     /// # Returns
     /// - `true` if `derived == base`
@@ -423,14 +420,12 @@ impl SchemaSet {
                 }
 
                 // Check resolved base type
-                if let Some(base_type_key) = type_def.resolved_base_type {
-                    if let TypeKey::Simple(simple_base) = base_type_key {
-                        if simple_base == base {
-                            return true;
-                        }
-                        current = simple_base;
-                        continue;
+                if let Some(TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
+                    if simple_base == base {
+                        return true;
                     }
+                    current = simple_base;
+                    continue;
                 }
             }
 
@@ -486,14 +481,12 @@ impl SchemaSet {
                 }
 
                 // Check resolved base type
-                if let Some(base_type_key) = type_def.resolved_base_type {
-                    if let TypeKey::Complex(complex_base) = base_type_key {
-                        if complex_base == base {
-                            return true;
-                        }
-                        current = complex_base;
-                        continue;
+                if let Some(TypeKey::Complex(complex_base)) = type_def.resolved_base_type {
+                    if complex_base == base {
+                        return true;
                     }
+                    current = complex_base;
+                    continue;
                 }
             }
 
@@ -525,14 +518,12 @@ impl SchemaSet {
             }
 
             // Check if base type is the target simple type
-            if let Some(base_type_key) = type_def.resolved_base_type {
-                if let TypeKey::Simple(simple_base) = base_type_key {
-                    if simple_base == base {
-                        return true;
-                    }
-                    // Continue checking up the simple type chain
-                    return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
+            if let Some(TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
+                if simple_base == base {
+                    return true;
                 }
+                // Continue checking up the simple type chain
+                return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
             }
         }
 

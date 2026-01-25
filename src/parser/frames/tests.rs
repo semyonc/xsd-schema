@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn test_parse_process_contents_attr() {
-        let mut name_table = NameTable::new();
+        let name_table = NameTable::new();
         let name_id = name_table.add("processContents");
 
         let attrs = AttributeMap::new(vec![ParsedAttribute {

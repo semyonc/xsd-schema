@@ -239,10 +239,10 @@ impl Frame for OverrideFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Type(TypeFrameResult::Simple(st)) => {
-                self.simple_types.push(st);
+                self.simple_types.push(*st);
             }
             FrameResult::Type(TypeFrameResult::Complex(ct)) => {
-                self.complex_types.push(ct);
+                self.complex_types.push(*ct);
             }
             FrameResult::Element(el) => {
                 self.elements.push(el);
@@ -251,7 +251,7 @@ impl Frame for OverrideFrame {
                 self.attributes.push(attr);
             }
             FrameResult::Group(group) => {
-                match &group {
+                match group {
                     GroupFrameResult::Model(_) => self.groups.push(group),
                     GroupFrameResult::Attribute(_) => self.attribute_groups.push(group),
                 }

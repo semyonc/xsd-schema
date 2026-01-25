@@ -56,7 +56,7 @@ impl ElementFrame {
 
         let target_namespace = attrs
             .get_value_by_name(name_table, "targetNamespace")
-            .map(|s| name_table.get(s).unwrap_or_else(|| NameId(0)));
+            .map(|s| name_table.get(s).unwrap_or(NameId(0)));
 
         let type_ref = attrs
             .get_value_by_name(name_table, "type")
@@ -299,7 +299,7 @@ impl AttributeFrame {
 
         let target_namespace = attrs
             .get_value_by_name(name_table, "targetNamespace")
-            .map(|s| name_table.get(s).unwrap_or_else(|| NameId(0)));
+            .map(|s| name_table.get(s).unwrap_or(NameId(0)));
 
         let type_ref = attrs
             .get_value_by_name(name_table, "type")
@@ -379,7 +379,7 @@ impl Frame for AttributeFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Type(TypeFrameResult::Simple(st)) => {
-                self.inline_type = Some(Box::new(st));
+                self.inline_type = Some(st);
             }
             FrameResult::Skip => {}
             _ => {}

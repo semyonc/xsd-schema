@@ -654,15 +654,15 @@ mod tests {
     fn test_to_boolean() {
         let converter = TypeConverter::new();
 
-        assert_eq!(converter.to_boolean(&XmlValue::boolean(true)).unwrap(), true);
-        assert_eq!(converter.to_boolean(&XmlValue::boolean(false)).unwrap(), false);
-        assert_eq!(converter.to_boolean(&XmlValue::string("hello")).unwrap(), true);
-        assert_eq!(converter.to_boolean(&XmlValue::string("")).unwrap(), false);
-        assert_eq!(converter.to_boolean(&XmlValue::integer(BigInt::from(1))).unwrap(), true);
-        assert_eq!(converter.to_boolean(&XmlValue::integer(BigInt::from(0))).unwrap(), false);
-        assert_eq!(converter.to_boolean(&XmlValue::double(1.5)).unwrap(), true);
-        assert_eq!(converter.to_boolean(&XmlValue::double(0.0)).unwrap(), false);
-        assert_eq!(converter.to_boolean(&XmlValue::double(f64::NAN)).unwrap(), false);
+        assert!(converter.to_boolean(&XmlValue::boolean(true)).unwrap());
+        assert!(!converter.to_boolean(&XmlValue::boolean(false)).unwrap());
+        assert!(converter.to_boolean(&XmlValue::string("hello")).unwrap());
+        assert!(!converter.to_boolean(&XmlValue::string("")).unwrap());
+        assert!(converter.to_boolean(&XmlValue::integer(BigInt::from(1))).unwrap());
+        assert!(!converter.to_boolean(&XmlValue::integer(BigInt::from(0))).unwrap());
+        assert!(converter.to_boolean(&XmlValue::double(1.5)).unwrap());
+        assert!(!converter.to_boolean(&XmlValue::double(0.0)).unwrap());
+        assert!(!converter.to_boolean(&XmlValue::double(f64::NAN)).unwrap());
     }
 
     #[test]

@@ -112,15 +112,15 @@ impl Frame for SimpleTypeFrame {
                 self.derivation_id = st.derivation_id;
             }
             FrameResult::Restriction(res) => {
-                let base = if let Some(inline) = res.inline_type {
-                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+                let base = if let Some(inline) = res.inline_type.clone() {
+                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
                 } else {
-                    res.base_type
+                    res.base_type.clone()
                 };
                 self.variety = Some(SimpleTypeVariety::Atomic);
                 self.base_type = base;
-                self.facets = res.facets;
-                self.derivation_id = res.id;
+                self.facets = res.facets.clone();
+                self.derivation_id = res.id.clone();
             }
             FrameResult::Skip => {}
             _ => {}
@@ -134,7 +134,7 @@ impl Frame for SimpleTypeFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+        Ok(FrameResult::Type(TypeFrameResult::Simple(Box::new(SimpleTypeResult {
             name: self.name,
             variety: self.variety.unwrap_or(SimpleTypeVariety::Atomic),
             base_type: self.base_type,
@@ -146,7 +146,7 @@ impl Frame for SimpleTypeFrame {
             derivation_id: self.derivation_id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -256,7 +256,7 @@ impl Frame for RestrictionFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Type(TypeFrameResult::Simple(st)) => {
-                self.inline_type = Some(st);
+                self.inline_type = Some(*st);
             }
             FrameResult::Facet(facet) => {
                 apply_facet(&mut self.facets, facet)?;
@@ -282,7 +282,7 @@ impl Frame for RestrictionFrame {
                 let min_occurs = mg.min_occurs;
                 let max_occurs = mg.max_occurs;
                 self.particle = Some(ParticleResult {
-                    term: ParticleTerm::Group(mg),
+                    term: ParticleTerm::Group(*mg),
                     min_occurs,
                     max_occurs,
                     source: None,
@@ -315,7 +315,7 @@ impl Frame for RestrictionFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Restriction(RestrictionResult {
+        Ok(FrameResult::Restriction(Box::new(RestrictionResult {
             base_type: self.base_type,
             inline_type: self.inline_type,
             facets: self.facets,
@@ -328,7 +328,7 @@ impl Frame for RestrictionFrame {
             id: self.id,
             annotation,
             source: self.source,
-        }))
+        })))
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -441,7 +441,7 @@ impl Frame for ExtensionFrame {
                 let min_occurs = mg.min_occurs;
                 let max_occurs = mg.max_occurs;
                 self.particle = Some(ParticleResult {
-                    term: ParticleTerm::Group(mg),
+                    term: ParticleTerm::Group(*mg),
                     min_occurs,
                     max_occurs,
                     source: None,
@@ -547,7 +547,7 @@ impl Frame for ListFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Type(TypeFrameResult::Simple(st)) => {
-                self.inline_type = Some(st);
+                self.inline_type = Some(*st);
             }
             FrameResult::Skip => {}
             _ => {}
@@ -577,7 +577,7 @@ impl Frame for ListFrame {
         }
 
         let item = if let Some(inline) = self.inline_type {
-            Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+            Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
         } else {
             self.item_type
         };
@@ -587,7 +587,7 @@ impl Frame for ListFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+        Ok(FrameResult::Type(TypeFrameResult::Simple(Box::new(SimpleTypeResult {
             name: None,
             variety: SimpleTypeVariety::List,
             base_type: None,
@@ -599,7 +599,7 @@ impl Frame for ListFrame {
             derivation_id: self.id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -696,7 +696,7 @@ impl Frame for UnionFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Type(TypeFrameResult::Simple(SimpleTypeResult {
+        Ok(FrameResult::Type(TypeFrameResult::Simple(Box::new(SimpleTypeResult {
             name: None,
             variety: SimpleTypeVariety::Union,
             base_type: None,
@@ -708,7 +708,7 @@ impl Frame for UnionFrame {
             derivation_id: self.id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -787,19 +787,19 @@ impl Frame for SimpleContentFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Restriction(res) => {
-                let base = if let Some(inline) = res.inline_type {
-                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(inline))))
+                let base = if let Some(inline) = res.inline_type.clone() {
+                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
                 } else {
-                    res.base_type
+                    res.base_type.clone()
                 };
                 self.base_type = base;
                 self.derivation = Some(DerivationMethod::Restriction);
-                self.facets = res.facets;
-                self.attributes = res.attributes;
-                self.attribute_groups = res.attribute_groups;
-                self.attribute_wildcard = res.attribute_wildcard;
-                self.assertions = res.assertions;
-                self.derivation_id = res.id;
+                self.facets = res.facets.clone();
+                self.attributes = res.attributes.clone();
+                self.attribute_groups = res.attribute_groups.clone();
+                self.attribute_wildcard = res.attribute_wildcard.clone();
+                self.assertions = res.assertions.clone();
+                self.derivation_id = res.id.clone();
             }
             FrameResult::Extension(res) => {
                 self.base_type = res.base_type;
@@ -915,15 +915,15 @@ impl Frame for ComplexContentFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Restriction(res) => {
-                self.base_type = res.base_type;
+                self.base_type = res.base_type.clone();
                 self.derivation = Some(DerivationMethod::Restriction);
-                self.particle = res.particle;
-                self.open_content = res.open_content;
-                self.attributes = res.attributes;
-                self.attribute_groups = res.attribute_groups;
-                self.attribute_wildcard = res.attribute_wildcard;
-                self.assertions = res.assertions;
-                self.derivation_id = res.id;
+                self.particle = res.particle.clone();
+                self.open_content = res.open_content.clone();
+                self.attributes = res.attributes.clone();
+                self.attribute_groups = res.attribute_groups.clone();
+                self.attribute_wildcard = res.attribute_wildcard.clone();
+                self.assertions = res.assertions.clone();
+                self.derivation_id = res.id.clone();
             }
             FrameResult::Extension(res) => {
                 self.base_type = res.base_type;
@@ -1251,7 +1251,7 @@ impl Frame for ComplexTypeFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Type(TypeFrameResult::Complex(ComplexTypeResult {
+        Ok(FrameResult::Type(TypeFrameResult::Complex(Box::new(ComplexTypeResult {
             name: self.name,
             base_type: self.base_type,
             derivation_method: self.derivation_method,
@@ -1267,7 +1267,7 @@ impl Frame for ComplexTypeFrame {
             id: self.id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {

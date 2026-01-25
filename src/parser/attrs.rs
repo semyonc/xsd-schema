@@ -245,8 +245,8 @@ pub fn parse_use(value: &str) -> Result<crate::types::complex::AttributeUseKind,
 
 /// Parse a processContents attribute
 pub fn parse_process_contents(value: &str) -> Result<crate::schema::ProcessContents, String> {
-    crate::schema::ProcessContents::from_str(value)
-        .ok_or_else(|| format!("Invalid processContents value: '{}'", value))
+    value.parse()
+        .map_err(|_| format!("Invalid processContents value: '{}'", value))
 }
 
 /// Parse a form attribute (qualified/unqualified)

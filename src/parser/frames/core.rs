@@ -30,7 +30,7 @@ pub enum FrameResult {
     /// Facet completed
     Facet(FacetResult),
     /// Restriction completed
-    Restriction(RestrictionResult),
+    Restriction(Box<RestrictionResult>),
     /// Extension completed
     Extension(ExtensionResult),
     /// Simple content completed
@@ -78,8 +78,8 @@ pub struct SchemaFrameResult {
 /// Type definition result
 #[derive(Debug, Clone)]
 pub enum TypeFrameResult {
-    Simple(SimpleTypeResult),
-    Complex(ComplexTypeResult),
+    Simple(Box<SimpleTypeResult>),
+    Complex(Box<ComplexTypeResult>),
 }
 
 /// Simple type result
@@ -235,8 +235,8 @@ pub enum AttributeUseKind {
 /// Group definition result
 #[derive(Debug)]
 pub enum GroupFrameResult {
-    Model(ModelGroupDefResult),
-    Attribute(AttributeGroupDefResult),
+    Model(Box<ModelGroupDefResult>),
+    Attribute(Box<AttributeGroupDefResult>),
 }
 
 /// Model group definition result
@@ -544,10 +544,10 @@ pub struct RedefineResult {
 /// Redefine component
 #[derive(Debug)]
 pub enum RedefineComponent {
-    SimpleType(SimpleTypeResult),
-    ComplexType(ComplexTypeResult),
-    Group(ModelGroupDefResult),
-    AttributeGroup(AttributeGroupDefResult),
+    SimpleType(Box<SimpleTypeResult>),
+    ComplexType(Box<ComplexTypeResult>),
+    Group(Box<ModelGroupDefResult>),
+    AttributeGroup(Box<AttributeGroupDefResult>),
 }
 
 /// Override directive result (XSD 1.1)

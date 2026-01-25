@@ -12,8 +12,10 @@ use crate::schema::model::DerivationSet;
 
 /// Complex type content kind
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum ContentKind {
     /// Empty content (no child elements or text)
+    #[default]
     Empty,
     /// Simple content (text only, possibly with attributes)
     Simple,
@@ -23,11 +25,6 @@ pub enum ContentKind {
     Mixed,
 }
 
-impl Default for ContentKind {
-    fn default() -> Self {
-        ContentKind::Empty
-    }
-}
 
 /// Derivation method for complex types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,22 +71,19 @@ pub enum ComplexTypeRef {
 
 /// Content model for complex types
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum ComplexTypeContent {
     /// Empty content (no elements or text)
+    #[default]
     Empty,
 
     /// Simple content (text value with attributes)
     Simple(SimpleContentDef),
 
     /// Complex content (elements with optional mixed text)
-    Complex(ComplexContentDef),
+    Complex(Box<ComplexContentDef>),
 }
 
-impl Default for ComplexTypeContent {
-    fn default() -> Self {
-        ComplexTypeContent::Empty
-    }
-}
 
 /// Simple content definition (text value with attributes)
 #[derive(Debug, Clone)]
@@ -168,7 +162,7 @@ impl ContentParticle {
 
     /// Check if this particle allows multiple occurrences
     pub fn is_repeating(&self) -> bool {
-        self.max_occurs.map_or(true, |max| max > 1)
+        self.max_occurs.is_none_or(|max| max > 1)
     }
 
     /// Check if this particle is unbounded
@@ -245,8 +239,10 @@ pub struct WildcardRef {
 
 /// Namespace constraint for wildcards
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum NamespaceConstraint {
     /// Any namespace (##any)
+    #[default]
     Any,
     /// Other namespaces (##other)
     Other,
@@ -260,11 +256,6 @@ pub enum NamespaceConstraint {
     // TODO: XSD 1.1 - Implement notNamespace/notQName
 }
 
-impl Default for NamespaceConstraint {
-    fn default() -> Self {
-        NamespaceConstraint::Any
-    }
-}
 
 /// Process contents mode for wildcards
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

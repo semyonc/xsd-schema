@@ -28,6 +28,14 @@ use crate::schema::model::{
 use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint, ProcessContents as SchemaProcessContents};
 use crate::SchemaSet;
 
+/// Result type for convert_directives function
+type DirectivesResult = (
+    Vec<IncludeDirective>,
+    Vec<ImportDirective>,
+    Vec<RedefineDirective>,
+    Vec<OverrideDirective>,
+);
+
 pub struct SchemaAssembler<'a> {
     schema_set: &'a mut SchemaSet,
     target_namespace: Option<NameId>,
@@ -120,7 +128,7 @@ impl<'a> SchemaAssembler<'a> {
                     derivation_id,
                     annotation,
                     source,
-                } = simple;
+                } = *simple;
                 let mut final_derivation = final_derivation;
                 if final_derivation.is_empty() {
                     final_derivation = self.final_default;
@@ -169,7 +177,7 @@ impl<'a> SchemaAssembler<'a> {
                     id,
                     annotation,
                     source,
-                } = complex;
+                } = *complex;
                 let mut final_derivation = final_derivation;
                 let mut block = block;
                 if final_derivation.is_empty() {
@@ -363,7 +371,7 @@ impl<'a> SchemaAssembler<'a> {
                     id,
                     annotation,
                     source,
-                } = group;
+                } = *group;
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("group", source_ref.as_ref(), self.schema_set))?;
                 let data = ModelGroupData {
@@ -397,7 +405,7 @@ impl<'a> SchemaAssembler<'a> {
                     id,
                     annotation,
                     source,
-                } = group;
+                } = *group;
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("attributeGroup", source_ref.as_ref(), self.schema_set))?;
                 let data = AttributeGroupData {
@@ -631,12 +639,7 @@ pub fn build_schema_document(
 pub fn convert_directives(
     directives: Vec<DirectiveResult>,
     assembler: &mut SchemaAssembler<'_>,
-) -> SchemaResult<(
-    Vec<IncludeDirective>,
-    Vec<ImportDirective>,
-    Vec<RedefineDirective>,
-    Vec<OverrideDirective>,
-)> {
+) -> SchemaResult<DirectivesResult> {
     let mut includes = Vec::new();
     let mut imports = Vec::new();
     let mut redefines = Vec::new();
@@ -721,14 +724,14 @@ fn convert_override(
     let mut components = Vec::new();
 
     for st in override_result.simple_types {
-        let key = assembler.assemble_type(TypeFrameResult::Simple(st), false)?;
+        let key = assembler.assemble_type(TypeFrameResult::Simple(Box::new(st)), false)?;
         if let TypeKey::Simple(simple) = key {
             components.push(OverrideComponent::SimpleType(simple));
         }
     }
 
     for ct in override_result.complex_types {
-        let key = assembler.assemble_type(TypeFrameResult::Complex(ct), false)?;
+        let key = assembler.assemble_type(TypeFrameResult::Complex(Box::new(ct)), false)?;
         if let TypeKey::Complex(complex) = key {
             components.push(OverrideComponent::ComplexType(complex));
         }

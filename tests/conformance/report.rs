@@ -7,6 +7,8 @@
 //! - CSV export
 //! - HTML report
 
+#![allow(dead_code)] // Report infrastructure for future use
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Write};

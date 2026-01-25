@@ -850,11 +850,10 @@ impl<'a, I: XmlNodeIterator> FollowingNodeIterator<'a, I> {
 
     fn next_item(&mut self) -> Result<bool, XPathError> {
         loop {
-            if !self.base.accept {
-                if !self.base.move_next_iter()? {
+            if !self.base.accept
+                && !self.base.move_next_iter()? {
                     return Ok(false);
                 }
-            }
 
             let moved = match self.base.curr.as_mut() {
                 Some(nav) => nav.move_to_following(self.kind, None),

@@ -1372,7 +1372,7 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
         });
     };
 
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
@@ -1423,8 +1423,8 @@ fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8
 
 /// Split timezone from date/time string
 fn split_timezone(s: &str) -> (&str, Option<TimezoneOffset>) {
-    if s.ends_with('Z') {
-        (&s[..s.len() - 1], Some(TimezoneOffset::UTC))
+    if let Some(stripped) = s.strip_suffix('Z') {
+        (stripped, Some(TimezoneOffset::UTC))
     } else if let Some(pos) = s.rfind('+') {
         if pos > 0 && pos < s.len() - 1 {
             let tz_str = &s[pos + 1..];
@@ -1496,7 +1496,7 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
         });
     };
 
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gYearMonth",
@@ -1550,7 +1550,7 @@ fn parse_gmonthday(s: &str) -> ValidationResult<GMonthDayValue> {
         message: "Invalid day".to_string(),
     })?;
 
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gMonthDay",
@@ -1578,7 +1578,7 @@ fn parse_gday(s: &str) -> ValidationResult<GDayValue> {
         message: "Invalid day".to_string(),
     })?;
 
-    if day < 1 || day > 31 {
+    if !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gDay",
@@ -1606,7 +1606,7 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
         message: "Invalid month".to_string(),
     })?;
 
-    if month < 1 || month > 12 {
+    if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gMonth",

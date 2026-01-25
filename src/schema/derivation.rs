@@ -800,7 +800,7 @@ mod tests {
 
     #[test]
     fn test_format_type_name_with_namespace() {
-        let mut schema_set = SchemaSet::new();
+        let schema_set = SchemaSet::new();
         let name_id = schema_set.name_table.add("myType");
         let ns_id = schema_set.name_table.add("http://example.com");
         let name = format_type_name(&schema_set, Some(name_id), Some(ns_id));
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_format_type_name_no_namespace() {
-        let mut schema_set = SchemaSet::new();
+        let schema_set = SchemaSet::new();
         let name_id = schema_set.name_table.add("myType");
         let name = format_type_name(&schema_set, Some(name_id), None);
         assert_eq!(name, "myType");

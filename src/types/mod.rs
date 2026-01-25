@@ -69,9 +69,11 @@ pub use convert::{
 /// See XSD_TYPE_DESIGN.md §3.2 for full specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum XmlTypeCode {
     // Special types (0-9)
     /// No type information
+    #[default]
     None = 0,
     /// Any item (XPath2)
     Item = 1,
@@ -444,11 +446,6 @@ impl XmlTypeCode {
     }
 }
 
-impl Default for XmlTypeCode {
-    fn default() -> Self {
-        Self::None
-    }
-}
 
 // ============================================================================
 // PrimitiveTypeCode - The 19 primitive XSD types
@@ -660,8 +657,10 @@ impl PrimitiveTypeCode {
 /// enabling efficient dispatch in XPath2 operations.
 /// See XSD_TYPE_DESIGN.md §3.4 for specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Default)]
 pub enum ValueKind {
     /// Atomic value (single indivisible value)
+    #[default]
     Atomic,
     /// List value (sequence of atomic values)
     List,
@@ -669,11 +668,6 @@ pub enum ValueKind {
     Union,
 }
 
-impl Default for ValueKind {
-    fn default() -> Self {
-        Self::Atomic
-    }
-}
 
 // ============================================================================
 // Tests

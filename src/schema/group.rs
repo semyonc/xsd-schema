@@ -213,7 +213,7 @@ impl Occurrence {
 
     /// Check if this occurrence allows multiple
     pub fn allows_multiple(&self) -> bool {
-        self.max.map_or(true, |m| m > 1)
+        self.max.is_none_or(|m| m > 1)
     }
 
     /// Check if this occurrence is exactly once

@@ -62,11 +62,11 @@ pub fn every(values: &[XmlValue]) -> Result<bool, XPathError> {
 /// # Returns
 ///
 /// `true` if any value satisfies the predicate.
-pub fn some_with<F>(values: &[XmlValue], mut predicate: F) -> bool
+pub fn some_with<F>(values: &[XmlValue], predicate: F) -> bool
 where
     F: FnMut(&XmlValue) -> bool,
 {
-    values.iter().any(|v| predicate(v))
+    values.iter().any(predicate)
 }
 
 /// Check if every value in the sequence matches a predicate.
@@ -81,11 +81,11 @@ where
 /// # Returns
 ///
 /// `true` if all values satisfy the predicate.
-pub fn every_with<F>(values: &[XmlValue], mut predicate: F) -> bool
+pub fn every_with<F>(values: &[XmlValue], predicate: F) -> bool
 where
     F: FnMut(&XmlValue) -> bool,
 {
-    values.iter().all(|v| predicate(v))
+    values.iter().all(predicate)
 }
 
 /// Check if the sequence contains at least one true value.

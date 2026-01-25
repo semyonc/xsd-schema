@@ -358,7 +358,7 @@ fn atomize_to_qname<N: DomNavigator>(
             if let Some(qn) = value.as_qname() {
                 Ok(Some(qn.clone()))
             } else {
-                Err(XPathError::type_mismatch("xs:QName", &format!("{:?}", value.type_code)))
+                Err(XPathError::type_mismatch("xs:QName", format!("{:?}", value.type_code)))
             }
         }
     }

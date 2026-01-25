@@ -288,6 +288,7 @@ impl TestSuiteParser {
         Ok(tests)
     }
 
+    #[allow(clippy::only_used_in_recursion)]
     fn scan_directory(&self, dir: &Path, tests: &mut Vec<TestCase>) -> Result<(), String> {
         let entries = fs::read_dir(dir)
             .map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
@@ -296,7 +297,7 @@ impl TestSuiteParser {
             let path = entry.path();
             if path.is_dir() {
                 self.scan_directory(&path, tests)?;
-            } else if path.extension().map_or(false, |e| e == "xsd") {
+            } else if path.extension().is_some_and(|e| e == "xsd") {
                 // Create a test case for each .xsd file
                 let name = path
                     .file_stem()
@@ -411,7 +412,7 @@ impl TestRunner {
             // Update group stats
             let stats = stats_by_group
                 .entry(result.group.clone())
-                .or_insert_with(TestStats::default);
+                .or_default();
             stats.add_result(&result);
 
             if self.verbose {
@@ -673,7 +674,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
 
     #[test]
     fn test_stats_pass_rate() {

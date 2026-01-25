@@ -82,10 +82,10 @@ fn resolve_element_key(schema_set: &SchemaSet, key: ElementKey) -> ElementKey {
         .unwrap_or(key)
 }
 
-fn resolved_element<'a>(
-    schema_set: &'a SchemaSet,
+fn resolved_element(
+    schema_set: &SchemaSet,
     key: ElementKey,
-) -> Option<&'a crate::arenas::ElementDeclData> {
+) -> Option<&crate::arenas::ElementDeclData> {
     let key = resolve_element_key(schema_set, key);
     schema_set.arenas.elements.get(key)
 }

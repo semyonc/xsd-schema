@@ -142,7 +142,7 @@ fn matches_item_type<N: DomNavigator>(
         ItemType::Comment => nav.node_type() == DomNodeType::Comment,
         ItemType::ProcessingInstruction(target) => {
             nav.node_type() == DomNodeType::ProcessingInstruction
-                && target.as_ref().map_or(true, |name| nav.local_name() == name)
+                && target.as_ref().is_none_or(|name| nav.local_name() == name)
         }
         ItemType::NamespaceNode => nav.node_type() == DomNodeType::Namespace,
         ItemType::AtomicType(_) | ItemType::SchemaAtomicType(_) => false,
@@ -245,7 +245,7 @@ mod tests {
         let doc = roxmltree::Document::parse("<root xmlns=\"urn:test\"/>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child();
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let ns_id = table.add("urn:test");
         let local_id = table.add("root");
         let ctx = XPathContext::new(&table);
@@ -260,7 +260,7 @@ mod tests {
         let doc = roxmltree::Document::parse("<root xmlns=\"urn:test\"/>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child();
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let ns_id = table.add("urn:test");
         let local_id = table.add("root");
         let ctx = XPathContext::new(&table);
@@ -276,7 +276,7 @@ mod tests {
         let doc = roxmltree::Document::parse("<root xmlns=\"urn:test\"><child/></root>")
             .expect("parse xml");
         let nav = RoXmlNavigator::new(&doc);
-        let mut table = NameTable::new();
+        let table = NameTable::new();
         let ns_id = table.add("urn:test");
         let local_id = table.add("root");
         let ctx = XPathContext::new(&table);

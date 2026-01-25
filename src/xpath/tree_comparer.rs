@@ -14,17 +14,11 @@ use super::{DomNavigator, DomNodeType};
 
 /// Compares XPath nodes and sequences for deep equality.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct TreeComparer {
     pub ignore_whitespace: bool,
 }
 
-impl Default for TreeComparer {
-    fn default() -> Self {
-        Self {
-            ignore_whitespace: false,
-        }
-    }
-}
 
 impl TreeComparer {
     pub fn new() -> Self {

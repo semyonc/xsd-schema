@@ -146,8 +146,8 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
     }
 
     /// Get current frame
-    fn current_frame(&self) -> Option<&Box<dyn Frame>> {
-        self.frame_stack.last()
+    fn current_frame(&self) -> Option<&dyn Frame> {
+        self.frame_stack.last().map(|b| b.as_ref())
     }
 
     /// Get current frame mutably
@@ -370,7 +370,7 @@ fn handle_start_element(
     let local_name = std::str::from_utf8(local_name_bytes).map_err(|e| {
         SchemaError::xml(
             format!("Invalid UTF-8 in element name: {}", e),
-            Some(state.source_ref(span).into_location(state.source_map)),
+            Some(state.source_ref(span).to_location(state.source_map)),
         )
     })?;
 
@@ -679,11 +679,11 @@ fn push_skip_frame(
 
 /// Helper extension for SourceRef to convert to SourceLocation
 trait SourceRefExt {
-    fn into_location(&self, source_map: &SourceMap) -> SourceLocation;
+    fn to_location(&self, source_map: &SourceMap) -> SourceLocation;
 }
 
 impl SourceRefExt for SourceRef {
-    fn into_location(&self, source_map: &SourceMap) -> SourceLocation {
+    fn to_location(&self, source_map: &SourceMap) -> SourceLocation {
         source_map.locate(self.span.start)
     }
 }
@@ -795,8 +795,10 @@ mod tests {
                 </xs:element>
             </xs:schema>"###;
 
-        let mut config = ParserConfig::default();
-        config.xsd_version = XsdVersion::V1_1;
+        let config = ParserConfig {
+            xsd_version: XsdVersion::V1_1,
+            ..Default::default()
+        };
 
         let doc_id = parse_schema_with_config(
             xsd.as_bytes(),

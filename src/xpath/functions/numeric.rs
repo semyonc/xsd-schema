@@ -372,12 +372,10 @@ fn round_half_away_from_zero_decimal(d: Decimal) -> Decimal {
         } else {
             truncated
         }
+    } else if frac <= -half {
+        truncated - Decimal::ONE
     } else {
-        if frac <= -half {
-            truncated - Decimal::ONE
-        } else {
-            truncated
-        }
+        truncated
     }
 }
 
@@ -546,12 +544,10 @@ fn round_ties_even_f32(f: f32) -> f32 {
         floored
     } else if frac > 0.5 {
         floored + 1.0
+    } else if floored as i32 % 2 == 0 {
+        floored
     } else {
-        if floored as i32 % 2 == 0 {
-            floored
-        } else {
-            floored + 1.0
-        }
+        floored + 1.0
     }
 }
 

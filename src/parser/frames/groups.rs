@@ -94,7 +94,7 @@ impl Frame for ModelGroupFrame {
             }
             FrameResult::Group(GroupFrameResult::Model(mg)) => {
                 self.particles.push(ParticleResult {
-                    term: ParticleTerm::Group(mg),
+                    term: ParticleTerm::Group(*mg),
                     min_occurs: 1,
                     max_occurs: Some(1),
                     source: None,
@@ -237,7 +237,7 @@ impl Frame for GroupFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Group(GroupFrameResult::Model(ModelGroupDefResult {
+        Ok(FrameResult::Group(GroupFrameResult::Model(Box::new(ModelGroupDefResult {
             name: self.name,
             ref_name: self.ref_name,
             compositor: self.compositor,
@@ -247,7 +247,7 @@ impl Frame for GroupFrame {
             id: self.id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -358,7 +358,7 @@ impl Frame for AttributeGroupFrame {
             self.foreign_attributes,
             self.source.clone(),
         );
-        Ok(FrameResult::Group(GroupFrameResult::Attribute(AttributeGroupDefResult {
+        Ok(FrameResult::Group(GroupFrameResult::Attribute(Box::new(AttributeGroupDefResult {
             name: self.name,
             ref_name: self.ref_name,
             attributes: self.attributes,
@@ -367,7 +367,7 @@ impl Frame for AttributeGroupFrame {
             id: self.id,
             annotation,
             source: self.source,
-        })))
+        }))))
     }
 
     fn source(&self) -> Option<&SourceRef> {

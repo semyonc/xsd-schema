@@ -110,7 +110,7 @@ pub fn assemble_inline_types(schema_set: &mut SchemaSet) -> SchemaResult<InlineA
 
     // Process jobs iteratively (nested inline types may add more jobs)
     while !jobs.is_empty() {
-        let current_jobs: Vec<_> = jobs.drain(..).collect();
+        let current_jobs: Vec<_> = std::mem::take(&mut jobs);
 
         for job in current_jobs {
             let type_key = assemble_inline_type(schema_set, &job.type_frame, job.target_namespace)?;
@@ -148,7 +148,7 @@ fn collect_inline_type_jobs(schema_set: &SchemaSet) -> Vec<InlineTypeJob> {
             jobs.push(InlineTypeJob {
                 owner: InlineOwner::Attribute(key),
                 role: InlineRole::AttributeType,
-                type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                 target_namespace: target_ns,
             });
         }
@@ -211,7 +211,7 @@ fn collect_inline_type_jobs(schema_set: &SchemaSet) -> Vec<InlineTypeJob> {
                 jobs.push(InlineTypeJob {
                     owner: InlineOwner::ComplexType(key),
                     role: InlineRole::ComplexTypeAttribute(idx),
-                    type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                    type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                     target_namespace: target_ns,
                 });
             }
@@ -248,7 +248,7 @@ fn collect_inline_type_jobs(schema_set: &SchemaSet) -> Vec<InlineTypeJob> {
                 jobs.push(InlineTypeJob {
                     owner: InlineOwner::AttributeGroup(key),
                     role: InlineRole::AttributeGroupAttribute(idx),
-                    type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                    type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                     target_namespace: target_ns,
                 });
             }
@@ -283,7 +283,7 @@ fn collect_content_inline_types(
                     jobs.push(InlineTypeJob {
                         owner: InlineOwner::ComplexType(owner_key),
                         role: InlineRole::ComplexTypeAttribute(idx),
-                        type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                        type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                         target_namespace: target_ns,
                     });
                 }
@@ -306,7 +306,7 @@ fn collect_content_inline_types(
                     jobs.push(InlineTypeJob {
                         owner: InlineOwner::ComplexType(owner_key),
                         role: InlineRole::ComplexTypeAttribute(idx),
-                        type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                        type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                         target_namespace: target_ns,
                     });
                 }
@@ -545,7 +545,7 @@ fn collect_nested_inline_types(
                         jobs.push(InlineTypeJob {
                             owner: InlineOwner::ComplexType(key),
                             role: InlineRole::ComplexTypeAttribute(idx),
-                            type_frame: TypeFrameResult::Simple((**inline_type).clone()),
+                            type_frame: TypeFrameResult::Simple(Box::new((**inline_type).clone())),
                             target_namespace,
                         });
                     }
@@ -567,7 +567,7 @@ mod tests {
     use crate::types::facets::FacetSet;
 
     fn create_simple_type_frame(variety: SimpleTypeVariety) -> TypeFrameResult {
-        TypeFrameResult::Simple(SimpleTypeResult {
+        TypeFrameResult::Simple(Box::new(SimpleTypeResult {
             name: None,
             variety,
             base_type: None,
@@ -579,7 +579,7 @@ mod tests {
             derivation_id: None,
             annotation: None,
             source: None,
-        })
+        }))
     }
 
     #[test]

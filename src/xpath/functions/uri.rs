@@ -196,8 +196,11 @@ fn is_absolute_uri(uri: &str) -> bool {
     false
 }
 
+/// URI components tuple: (scheme, authority, path, query)
+type UriComponents<'a> = (Option<String>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+
 /// Parse URI into components (scheme, authority, path, query).
-fn parse_uri_components(uri: &str) -> Result<(Option<String>, Option<&str>, Option<&str>, Option<&str>), ()> {
+fn parse_uri_components(uri: &str) -> Result<UriComponents<'_>, ()> {
     let mut rest = uri;
     let mut scheme = None;
     let mut authority = None;

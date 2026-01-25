@@ -250,11 +250,10 @@ impl DependencyGraph {
         let mut path = Vec::new();
 
         for &start in &self.all_types {
-            if !visited.contains(&start) {
-                if self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path).is_some() {
+            if !visited.contains(&start)
+                && self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path).is_some() {
                     return true;
                 }
-            }
         }
 
         false
@@ -429,11 +428,11 @@ fn is_builtin_simple_type(key: SimpleTypeKey, builtin: &crate::types::builtin::B
         || key == builtin.unsigned_byte
         || key == builtin.positive_integer
         // Check optional XSD 1.1 types
-        || builtin.any_atomic_type.map_or(false, |t| key == t)
-        || builtin.year_month_duration.map_or(false, |t| key == t)
-        || builtin.day_time_duration.map_or(false, |t| key == t)
-        || builtin.datetime_stamp.map_or(false, |t| key == t)
-        || builtin.untyped_atomic.map_or(false, |t| key == t)
+        || (builtin.any_atomic_type == Some(key))
+        || (builtin.year_month_duration == Some(key))
+        || (builtin.day_time_duration == Some(key))
+        || (builtin.datetime_stamp == Some(key))
+        || (builtin.untyped_atomic == Some(key))
 }
 
 /// Check if a type key refers to a built-in type

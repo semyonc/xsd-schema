@@ -225,72 +225,67 @@ mod tests {
 
     #[test]
     fn test_boolean_ebv() {
-        assert_eq!(effective_boolean_value(&XmlValue::boolean(true)).unwrap(), true);
-        assert_eq!(effective_boolean_value(&XmlValue::boolean(false)).unwrap(), false);
+        assert!(effective_boolean_value(&XmlValue::boolean(true)).unwrap());
+        assert!(!effective_boolean_value(&XmlValue::boolean(false)).unwrap());
     }
 
     #[test]
     fn test_string_ebv() {
-        assert_eq!(effective_boolean_value(&XmlValue::string("")).unwrap(), false);
-        assert_eq!(effective_boolean_value(&XmlValue::string("hello")).unwrap(), true);
-        assert_eq!(effective_boolean_value(&XmlValue::string(" ")).unwrap(), true); // Whitespace is non-empty
+        assert!(!effective_boolean_value(&XmlValue::string("")).unwrap());
+        assert!(effective_boolean_value(&XmlValue::string("hello")).unwrap());
+        assert!(effective_boolean_value(&XmlValue::string(" ")).unwrap()); // Whitespace is non-empty
     }
 
     #[test]
     fn test_untyped_atomic_ebv() {
-        assert_eq!(effective_boolean_value(&XmlValue::untyped("")).unwrap(), false);
-        assert_eq!(effective_boolean_value(&XmlValue::untyped("value")).unwrap(), true);
+        assert!(!effective_boolean_value(&XmlValue::untyped("")).unwrap());
+        assert!(effective_boolean_value(&XmlValue::untyped("value")).unwrap());
     }
 
     #[test]
     fn test_numeric_ebv() {
         // Integer
-        assert_eq!(
-            effective_boolean_value(&XmlValue::integer(BigInt::from(0))).unwrap(),
-            false
+        assert!(
+            !effective_boolean_value(&XmlValue::integer(BigInt::from(0))).unwrap()
         );
-        assert_eq!(
-            effective_boolean_value(&XmlValue::integer(BigInt::from(42))).unwrap(),
-            true
+        assert!(
+            effective_boolean_value(&XmlValue::integer(BigInt::from(42))).unwrap()
         );
-        assert_eq!(
-            effective_boolean_value(&XmlValue::integer(BigInt::from(-1))).unwrap(),
-            true
+        assert!(
+            effective_boolean_value(&XmlValue::integer(BigInt::from(-1))).unwrap()
         );
 
         // Decimal
-        assert_eq!(
-            effective_boolean_value(&XmlValue::decimal(Decimal::ZERO)).unwrap(),
-            false
+        assert!(
+            !effective_boolean_value(&XmlValue::decimal(Decimal::ZERO)).unwrap()
         );
-        assert_eq!(
-            effective_boolean_value(&XmlValue::decimal(Decimal::new(123, 2))).unwrap(),
-            true
+        assert!(
+            effective_boolean_value(&XmlValue::decimal(Decimal::new(123, 2))).unwrap()
         );
 
         // Double
-        assert_eq!(effective_boolean_value(&XmlValue::double(0.0)).unwrap(), false);
-        assert_eq!(effective_boolean_value(&XmlValue::double(1.5)).unwrap(), true);
-        assert_eq!(effective_boolean_value(&XmlValue::double(f64::NAN)).unwrap(), false);
-        assert_eq!(effective_boolean_value(&XmlValue::double(f64::INFINITY)).unwrap(), true);
+        assert!(!effective_boolean_value(&XmlValue::double(0.0)).unwrap());
+        assert!(effective_boolean_value(&XmlValue::double(1.5)).unwrap());
+        assert!(!effective_boolean_value(&XmlValue::double(f64::NAN)).unwrap());
+        assert!(effective_boolean_value(&XmlValue::double(f64::INFINITY)).unwrap());
 
         // Float
-        assert_eq!(effective_boolean_value(&XmlValue::float(0.0)).unwrap(), false);
-        assert_eq!(effective_boolean_value(&XmlValue::float(1.5)).unwrap(), true);
-        assert_eq!(effective_boolean_value(&XmlValue::float(f32::NAN)).unwrap(), false);
+        assert!(!effective_boolean_value(&XmlValue::float(0.0)).unwrap());
+        assert!(effective_boolean_value(&XmlValue::float(1.5)).unwrap());
+        assert!(!effective_boolean_value(&XmlValue::float(f32::NAN)).unwrap());
     }
 
     #[test]
     fn test_empty_sequence_ebv() {
-        assert_eq!(effective_boolean_value_opt(None).unwrap(), false);
+        assert!(!effective_boolean_value_opt(None).unwrap());
     }
 
     #[test]
     fn test_not() {
-        assert_eq!(not(&XmlValue::boolean(true)).unwrap(), false);
-        assert_eq!(not(&XmlValue::boolean(false)).unwrap(), true);
-        assert_eq!(not(&XmlValue::string("")).unwrap(), true);
-        assert_eq!(not(&XmlValue::string("x")).unwrap(), false);
+        assert!(!not(&XmlValue::boolean(true)).unwrap());
+        assert!(not(&XmlValue::boolean(false)).unwrap());
+        assert!(not(&XmlValue::string("")).unwrap());
+        assert!(!not(&XmlValue::string("x")).unwrap());
     }
 
     #[test]

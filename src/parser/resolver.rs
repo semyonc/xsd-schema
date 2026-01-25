@@ -196,7 +196,7 @@ impl LoaderChain {
     pub fn add(&mut self, loader: Box<dyn SchemaLoader>) {
         self.loaders.push(loader);
         self.loaders
-            .sort_by(|a, b| b.priority().cmp(&a.priority()));
+            .sort_by_key(|b| std::cmp::Reverse(b.priority()));
     }
 
     /// Get the number of loaders in the chain.
@@ -655,9 +655,9 @@ pub fn resolve_all_directives(
     let target_namespace = doc.target_namespace;
 
     // Clone directives to avoid borrow issues
-    let includes: Vec<_> = doc.includes.iter().cloned().collect();
-    let imports: Vec<_> = doc.imports.iter().cloned().collect();
-    let redefines: Vec<_> = doc.redefines.iter().cloned().collect();
+    let includes: Vec<_> = doc.includes.to_vec();
+    let imports: Vec<_> = doc.imports.to_vec();
+    let redefines: Vec<_> = doc.redefines.to_vec();
 
     // Process includes
     for include in includes {

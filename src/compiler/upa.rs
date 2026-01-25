@@ -25,10 +25,11 @@ use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{build_substitution_group_map, SubstitutionGroupMap};
 
 /// Result type for internal UPA checking operations
-type UpaResult<T> = Result<T, UpaError>;
+type UpaResult<T> = Result<T, Box<UpaError>>;
 
 /// Errors that can occur during UPA checking
 #[derive(Error, Debug, Clone)]
+#[allow(clippy::enum_variant_names)]
 enum UpaError {
     /// Two element particles can match the same element
     #[error("UPA violation: elements '{first_name}' and '{second_name}' conflict at state {state_id}")]
@@ -88,7 +89,7 @@ impl UpaError {
 
 }
 
-fn upa_error_to_schema_error(schema_set: &SchemaSet, error: UpaError) -> SchemaError {
+fn upa_error_to_schema_error(schema_set: &SchemaSet, error: Box<UpaError>) -> SchemaError {
     let primary = error
         .first_location()
         .and_then(|source| schema_set.source_maps.locate(source));
@@ -354,7 +355,7 @@ fn check_element_element_conflicts(
                         .try_resolve(*name2)
                         .unwrap_or_else(|| "<unknown>".to_string());
 
-                    return Err(UpaError::ElementElementConflict {
+                    return Err(Box::new(UpaError::ElementElementConflict {
                         first_name,
                         second_name,
                         first_name_id: *name1,
@@ -364,7 +365,7 @@ fn check_element_element_conflicts(
                         state_id: from_state_id,
                         first_location: elem1.origin.clone(),
                         second_location: elem2.origin.clone(),
-                    });
+                    }));
                 }
             }
         }
@@ -405,7 +406,7 @@ fn check_element_wildcard_conflicts(
                             .try_resolve(*name)
                             .unwrap_or_else(|| "<unknown>".to_string());
 
-                        return Err(UpaError::ElementWildcardConflict {
+                        return Err(Box::new(UpaError::ElementWildcardConflict {
                             element_name,
                             element_name_id: *name,
                             element_namespace: *elem_ns,
@@ -413,7 +414,7 @@ fn check_element_wildcard_conflicts(
                             state_id: from_state_id,
                             element_location: elem.origin.clone(),
                             wildcard_location: wc.origin.clone(),
-                        });
+                        }));
                     }
                 }
             }
@@ -446,13 +447,13 @@ fn check_wildcard_wildcard_conflicts(
             ) = (&wc1.term, &wc2.term)
             {
                 if wildcards_overlap(constraint1, constraint2, target_namespace, xsd_version) {
-                    return Err(UpaError::WildcardWildcardConflict {
+                    return Err(Box::new(UpaError::WildcardWildcardConflict {
                         first_constraint: constraint1.clone(),
                         second_constraint: constraint2.clone(),
                         state_id: from_state_id,
                         first_location: wc1.origin.clone(),
                         second_location: wc2.origin.clone(),
-                    });
+                    }));
                 }
             }
         }
@@ -592,7 +593,7 @@ mod tests {
 
     #[test]
     fn test_element_element_same_name_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
 
         // Build a choice between two elements with the same name
@@ -611,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_element_element_different_namespace_no_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
         let ns1 = schema_set.name_table.add("http://ns1.example.com");
         let ns2 = schema_set.name_table.add("http://ns2.example.com");
@@ -631,7 +632,7 @@ mod tests {
 
     #[test]
     fn test_element_element_sequence_no_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
 
         // Build a sequence of two elements with the same name (no conflict in sequence)
@@ -649,7 +650,7 @@ mod tests {
 
     #[test]
     fn test_element_element_different_names_no_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
         let name_b = schema_set.name_table.add("b");
 
@@ -672,7 +673,7 @@ mod tests {
 
     #[test]
     fn test_element_wildcard_any_conflict_xsd10() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
 
         // Build a choice between an element and a ##any wildcard
@@ -691,7 +692,7 @@ mod tests {
 
     #[test]
     fn test_element_wildcard_any_allowed_xsd11() {
-        let mut schema_set = create_test_schema_set_v11();
+        let schema_set = create_test_schema_set_v11();
         let name_a = schema_set.name_table.add("a");
 
         // Build a choice between an element and a ##any wildcard
@@ -710,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_element_wildcard_other_with_target_no_overlap() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
         let target_ns = schema_set.name_table.add("http://target.example.com");
 
@@ -752,7 +753,7 @@ mod tests {
 
     #[test]
     fn test_wildcard_wildcard_target_vs_other_no_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let target_ns = schema_set.name_table.add("http://target.example.com");
 
         // Build a choice between ##targetNamespace and ##other wildcards
@@ -771,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_wildcard_wildcard_list_overlap() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let ns1 = schema_set.name_table.add("http://ns1.example.com");
         let ns2 = schema_set.name_table.add("http://ns2.example.com");
 
@@ -797,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_wildcard_wildcard_list_no_overlap() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let ns1 = schema_set.name_table.add("http://ns1.example.com");
         let ns2 = schema_set.name_table.add("http://ns2.example.com");
 
@@ -826,7 +827,7 @@ mod tests {
 
     #[test]
     fn test_nested_choice_with_conflict() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
         let name_b = schema_set.name_table.add("b");
 
@@ -850,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_optional_element_before_same_element() {
-        let mut schema_set = create_test_schema_set();
+        let schema_set = create_test_schema_set();
         let name_a = schema_set.name_table.add("a");
 
         // Build: a? a (optional a followed by required a)

@@ -37,7 +37,7 @@ fn get_implicit_timezone_offset() -> TimezoneOffset {
 
 /// Convert a TimezoneOffset to a DayTimeDurationValue.
 fn timezone_to_day_time_duration(tz: TimezoneOffset) -> DayTimeDurationValue {
-    let total_minutes = tz.0.abs() as u32;
+    let total_minutes = tz.0.unsigned_abs() as u32;
     let hours = total_minutes / 60;
     let minutes = total_minutes % 60;
     DayTimeDurationValue {
@@ -83,7 +83,7 @@ fn day_time_duration_to_timezone(
     };
 
     // Validate range: must be within +-14:00 (+-840 minutes)
-    if signed_minutes < -840 || signed_minutes > 840 {
+    if !(-840..=840).contains(&signed_minutes) {
         return Err(XPathError::FODT0003 {
             value: format_day_time_duration(dur),
         });
@@ -119,7 +119,7 @@ fn format_day_time_duration(dur: &DayTimeDurationValue) -> String {
 
 /// Validate that a timezone offset is in the valid range (+-14:00).
 fn validate_timezone_offset(minutes: i16) -> Result<(), XPathError> {
-    if minutes < -840 || minutes > 840 {
+    if !(-840..=840).contains(&minutes) {
         return Err(XPathError::FODT0003 {
             value: format!("{}:{:02}", minutes / 60, (minutes % 60).abs()),
         });

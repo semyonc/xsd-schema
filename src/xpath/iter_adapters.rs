@@ -231,9 +231,7 @@ impl<I: Iterator> Iterator for SkipIterator<I> {
     fn next(&mut self) -> Option<Self::Item> {
         while self.to_skip > 0 {
             self.to_skip -= 1;
-            if self.inner.next().is_none() {
-                return None;
-            }
+            self.inner.next()?;
         }
         self.inner.next()
     }

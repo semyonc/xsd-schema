@@ -410,12 +410,12 @@ pub fn cast_to_integer_subtype(
     let val_i128: i128 = bigint
         .to_string()
         .parse()
-        .map_err(|_| XPathError::invalid_cast_value(&bigint.to_string(), &format!("{:?}", target_type)))?;
+        .map_err(|_| XPathError::invalid_cast_value(bigint.to_string(), format!("{:?}", target_type)))?;
 
     if val_i128 < min || val_i128 > max {
         return Err(XPathError::invalid_cast_value(
-            &bigint.to_string(),
-            &format!("{:?}", target_type),
+            bigint.to_string(),
+            format!("{:?}", target_type),
         ));
     }
 

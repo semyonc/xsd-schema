@@ -417,7 +417,7 @@ pub fn iri_to_uri(value: &str) -> String {
         // Space is always encoded
         if byte == b' ' {
             result.push_str("%20");
-        } else if byte >= 0x20 && byte < 0x7F
+        } else if (0x20..0x7F).contains(&byte)
             && byte != b'<' && byte != b'>'
             && byte != b'"' && byte != b'{' && byte != b'}'
             && byte != b'|' && byte != b'\\' && byte != b'^' && byte != b'`'
@@ -438,7 +438,7 @@ pub fn iri_to_uri(value: &str) -> String {
 pub fn escape_html_uri(value: &str) -> String {
     let mut result = String::with_capacity(value.len() * 3);
     for byte in value.bytes() {
-        if byte >= 0x20 && byte < 0x7F {
+        if (0x20..0x7F).contains(&byte) {
             result.push(byte as char);
         } else {
             result.push('%');
