@@ -66,9 +66,7 @@ fn node_test_kind(node_test: &Option<NodeTest>) -> DomNodeType {
             ItemType::Text => DomNodeType::Text,
             ItemType::Comment => DomNodeType::Comment,
             ItemType::ProcessingInstruction(_) => DomNodeType::ProcessingInstruction,
-            ItemType::AtomicType(_) | ItemType::SchemaAtomicType(_) => {
-                panic!("node test does not map to a node kind")
-            }
+            ItemType::AtomicType(_) | ItemType::SchemaAtomicType(_) => DomNodeType::All,
         },
     }
 }
