@@ -9,6 +9,7 @@
 
 use regex::{Regex, RegexBuilder};
 
+use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
@@ -167,6 +168,9 @@ pub fn tokenize<N: DomNavigator>(
 // ============================================================================
 
 /// Build a Regex from an XPath pattern and flags.
+///
+/// Converts XSD/XPath regex pattern syntax to Rust regex, handling XSD-specific
+/// character class escapes like `\i` (initial XML name char) and `\c` (XML name char).
 fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
     // Validate flags
     for c in flags.chars() {
@@ -175,8 +179,11 @@ fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
         }
     }
 
+    // Convert XSD/XPath pattern to Rust regex (unanchored for XPath)
+    let rust_pattern = convert_xml_pattern(pattern, ConvertOptions::xpath());
+
     // Build regex with flags
-    let mut builder = RegexBuilder::new(pattern);
+    let mut builder = RegexBuilder::new(&rust_pattern);
 
     for c in flags.chars() {
         match c {
@@ -663,5 +670,101 @@ mod tests {
         // Trailing $ at end of string should be rejected
         assert!(validate_replacement_string("hello$").is_err());
         assert!(validate_replacement_string("a$1$").is_err());
+    }
+
+    // =========================================================================
+    // XSD/XPath character class escape tests (\i, \c)
+    // =========================================================================
+
+    #[test]
+    fn test_matches_initial_name_char() {
+        // Test \i matches initial XML name characters
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = matches(&mut ctx, vec![
+            XPathValue::string("_foo"),
+            XPathValue::string(r"\i"),
+        ]).unwrap();
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+    }
+
+    #[test]
+    fn test_matches_xml_name_pattern() {
+        // Test \i\c* matches XML names
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = matches(&mut ctx, vec![
+            XPathValue::string("foo:bar"),
+            XPathValue::string(r"\i\c*"),
+        ]).unwrap();
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+    }
+
+    #[test]
+    fn test_matches_digit_not_initial() {
+        // Test \i does NOT match digits
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = matches(&mut ctx, vec![
+            XPathValue::string("123"),
+            XPathValue::string(r"^\i"),
+        ]).unwrap();
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+    }
+
+    #[test]
+    fn test_matches_name_char_with_digits() {
+        // Test \c matches digits and other name characters
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = matches(&mut ctx, vec![
+            XPathValue::string("abc123"),
+            XPathValue::string(r"\c+"),
+        ]).unwrap();
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+    }
+
+    #[test]
+    fn test_replace_with_name_char_pattern() {
+        // Test replace with \c pattern
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = replace(&mut ctx, vec![
+            XPathValue::string("hello world"),
+            XPathValue::string(r"\c+"),
+            XPathValue::string("X"),
+        ]).unwrap();
+
+        if let XPathValue::Item(XmlItem::Atomic(v)) = result {
+            assert_eq!(v.as_string(), Some("X X"));
+        } else {
+            panic!("Expected string");
+        }
+    }
+
+    #[test]
+    fn test_tokenize_with_non_name_char() {
+        // Test tokenize using \C (non-name character) as delimiter
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = tokenize(&mut ctx, vec![
+            XPathValue::string("foo bar baz"),
+            XPathValue::string(r"\C+"),
+        ]).unwrap();
+
+        match result {
+            XPathValue::Sequence(items) => {
+                assert_eq!(items.len(), 3);
+                let strs: Vec<String> = items.iter().map(|item| {
+                    if let XmlItem::Atomic(v) = item {
+                        v.to_string_value()
+                    } else {
+                        panic!("Expected atomic")
+                    }
+                }).collect();
+                assert_eq!(strs, vec!["foo", "bar", "baz"]);
+            }
+            _ => panic!("Expected sequence"),
+        }
     }
 }

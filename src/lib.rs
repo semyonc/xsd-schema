@@ -109,6 +109,9 @@ pub mod embedded;
 // Builder pattern API
 pub mod builder;
 
+// Regex pattern conversion (shared between XSD and XPath)
+pub mod regex_convert;
+
 // NFA compiler for content models
 pub mod compiler;
 

@@ -22,6 +22,7 @@
 use crate::error::{FacetError, FacetResult};
 use crate::ids::NameId;
 use crate::parser::location::SourceRef;
+use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use regex::Regex;
 use std::collections::HashSet;
 
@@ -91,7 +92,7 @@ impl PatternFacet {
     /// The pattern is converted from XSD regex syntax to Rust regex syntax
     /// and compiled. Returns an error if the pattern is invalid.
     pub fn new(value: String, source: Option<SourceRef>) -> FacetResult<Self> {
-        let rust_pattern = xsd_pattern_to_rust(&value);
+        let rust_pattern = convert_xml_pattern(&value, ConvertOptions::xsd());
         let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
             pattern: value.clone(),
             message: e.to_string(),
@@ -115,7 +116,7 @@ impl PatternFacet {
     /// Compile the pattern if not already compiled
     pub fn compile(&mut self) -> FacetResult<()> {
         if self.compiled.is_none() {
-            let rust_pattern = xsd_pattern_to_rust(&self.value);
+            let rust_pattern = convert_xml_pattern(&self.value, ConvertOptions::xsd());
             let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: e.to_string(),
@@ -131,7 +132,7 @@ impl PatternFacet {
             Some(regex) => regex.is_match(value),
             None => {
                 // Try to compile on-the-fly (fallback)
-                if let Ok(rust_pattern) = std::panic::catch_unwind(|| xsd_pattern_to_rust(&self.value)) {
+                if let Ok(rust_pattern) = std::panic::catch_unwind(|| convert_xml_pattern(&self.value, ConvertOptions::xsd())) {
                     if let Ok(regex) = Regex::new(&rust_pattern) {
                         return regex.is_match(value);
                     }
@@ -140,88 +141,6 @@ impl PatternFacet {
             }
         }
     }
-}
-
-/// Convert XSD regex pattern to Rust regex pattern
-///
-/// XSD uses a subset of standard regex with some differences:
-/// - XSD patterns are implicitly anchored (match entire string)
-/// - Character class differences (\i, \c for XML name characters)
-/// - Block escapes (\p{IsBasicLatin}, etc.)
-///
-/// This function handles the common cases and anchors the pattern.
-fn xsd_pattern_to_rust(xsd_pattern: &str) -> String {
-    let mut result = String::with_capacity(xsd_pattern.len() + 4);
-
-    // XSD patterns are implicitly anchored - they must match the entire string
-    result.push('^');
-
-    let mut chars = xsd_pattern.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(&next) = chars.peek() {
-                match next {
-                    // XSD-specific character class escapes
-                    'i' => {
-                        // Initial name character: Letter | '_' | ':'
-                        chars.next();
-                        result.push_str(r"[A-Za-z_:]");
-                    }
-                    'I' => {
-                        // Not initial name character
-                        chars.next();
-                        result.push_str(r"[^A-Za-z_:]");
-                    }
-                    'c' => {
-                        // Name character: Letter | Digit | '.' | '-' | '_' | ':' | CombiningChar | Extender
-                        chars.next();
-                        result.push_str(r"[A-Za-z0-9._:\-]");
-                    }
-                    'C' => {
-                        // Not name character
-                        chars.next();
-                        result.push_str(r"[^A-Za-z0-9._:\-]");
-                    }
-                    // Standard escapes - pass through
-                    'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | '\\' | '|' | '.'
-                    | '?' | '*' | '+' | '{' | '}' | '(' | ')' | '[' | ']' | '^' | '$' | '-' => {
-                        result.push('\\');
-                        result.push(next);
-                        chars.next();
-                    }
-                    // Unicode category escapes \p{...} - pass through (Rust regex supports these)
-                    'p' | 'P' => {
-                        result.push('\\');
-                        result.push(next);
-                        chars.next();
-                        // Copy the block name including braces
-                        if chars.peek() == Some(&'{') {
-                            for c in chars.by_ref() {
-                                result.push(c);
-                                if c == '}' {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    // Other escapes - pass through
-                    _ => {
-                        result.push('\\');
-                        result.push(next);
-                        chars.next();
-                    }
-                }
-            } else {
-                // Trailing backslash
-                result.push('\\');
-            }
-        } else {
-            result.push(ch);
-        }
-    }
-
-    result.push('$');
-    result
 }
 
 /// Enumeration facet (allowed values)
@@ -2026,27 +1945,27 @@ mod tests {
 
     #[test]
     fn test_xsd_pattern_anchoring() {
-        let rust = xsd_pattern_to_rust("abc");
+        let rust = convert_xml_pattern("abc", ConvertOptions::xsd());
         assert!(rust.starts_with('^'));
         assert!(rust.ends_with('$'));
     }
 
     #[test]
     fn test_xsd_pattern_initial_name_char() {
-        let rust = xsd_pattern_to_rust(r"\i");
+        let rust = convert_xml_pattern(r"\i", ConvertOptions::xsd());
         assert!(rust.contains("[A-Za-z_:]"));
     }
 
     #[test]
     fn test_xsd_pattern_name_char() {
-        let rust = xsd_pattern_to_rust(r"\c");
+        let rust = convert_xml_pattern(r"\c", ConvertOptions::xsd());
         // The hyphen is escaped in the character class
         assert!(rust.contains(r"[A-Za-z0-9._:\-]"));
     }
 
     #[test]
     fn test_xsd_pattern_standard_escapes() {
-        let rust = xsd_pattern_to_rust(r"\d+\s*");
+        let rust = convert_xml_pattern(r"\d+\s*", ConvertOptions::xsd());
         assert!(rust.contains(r"\d"));
         assert!(rust.contains(r"\s"));
     }
