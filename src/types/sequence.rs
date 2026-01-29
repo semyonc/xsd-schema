@@ -135,16 +135,18 @@ impl ItemType {
     }
 }
 
-/// Name test for element/attribute tests
+/// Name test for element/attribute tests (resolved form with interned names)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NameTest {
     /// Wildcard (*) - matches any name
     Wildcard,
-    /// Namespace wildcard (*:local) - matches any namespace
-    NamespaceWildcard(String),
+    /// Namespace wildcard (*:local) - matches any namespace with specific local name
+    /// The NameId is the interned local name
+    NamespaceWildcard(crate::ids::NameId),
     /// Local name wildcard (prefix:*) - matches any local name in namespace
-    LocalWildcard(String),
-    /// Specific QName
+    /// The NameId is the resolved namespace URI
+    LocalWildcard(crate::ids::NameId),
+    /// Specific QName (fully resolved)
     QName(QualifiedName),
 }
 

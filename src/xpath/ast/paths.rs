@@ -176,12 +176,15 @@ impl QName {
 pub struct PathStepNode {
     /// Axis specifier.
     pub axis: Axis,
-    /// Node test.
+    /// Node test (AST form with raw strings).
     pub test: NodeTest,
     /// Predicates (expression IDs).
     pub predicates: Vec<AstNodeId>,
     /// Source location.
     pub span: SourceSpan,
+    /// Resolved name test (populated during binding).
+    /// Uses interned NameIds and resolved namespace URIs.
+    pub resolved_test: Option<crate::types::NameTest>,
 }
 
 impl PathStepNode {
@@ -191,6 +194,7 @@ impl PathStepNode {
             test,
             predicates: Vec::new(),
             span,
+            resolved_test: None,
         }
     }
 
@@ -205,6 +209,7 @@ impl PathStepNode {
             test,
             predicates,
             span,
+            resolved_test: None,
         }
     }
 
@@ -215,6 +220,7 @@ impl PathStepNode {
             test: NodeTest::Kind(KindTest::AnyKind),
             predicates: Vec::new(),
             span,
+            resolved_test: None,
         }
     }
 }

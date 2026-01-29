@@ -43,10 +43,7 @@ impl SchemaFrame {
     ) -> SchemaResult<Self> {
         let target_namespace = attrs
             .get_value_by_name(name_table, "targetNamespace")
-            .map(|s| name_table.get(s).unwrap_or({
-                // This shouldn't happen in normal parsing flow
-                NameId(0)
-            }));
+            .map(|s| name_table.add(s));
 
         validate_attr_value(attrs, name_table, "elementFormDefault", parse_form)?;
         let element_form_default = attrs

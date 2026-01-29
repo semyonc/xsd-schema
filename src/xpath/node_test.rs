@@ -40,8 +40,20 @@ pub fn matches_name_test<N: DomNavigator>(
 
     match test {
         NameTest::Wildcard => true,
-        NameTest::NamespaceWildcard(ns) => nav.namespace_uri() == ns,
-        NameTest::LocalWildcard(local) => nav.local_name() == local,
+        NameTest::NamespaceWildcard(local_id) => {
+            // *:local - match any namespace with specific local name
+            match ctx.resolve_name(*local_id) {
+                Some(local) => nav.local_name() == local,
+                None => false,
+            }
+        }
+        NameTest::LocalWildcard(ns_id) => {
+            // prefix:* - match any local name in specific namespace
+            match ctx.resolve_name(*ns_id) {
+                Some(ns) => nav.namespace_uri() == ns,
+                None => false,
+            }
+        }
         NameTest::QName(qname) => qname_matches(qname, nav, ctx),
     }
 }
@@ -222,8 +234,10 @@ mod tests {
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child();
         let table = NameTable::new();
+        let ns_id = table.add("urn:test");
         let ctx = XPathContext::new(&table);
-        let test = NameTest::LocalWildcard("root".to_string());
+        // LocalWildcard takes namespace URI - matches any local name in that namespace
+        let test = NameTest::LocalWildcard(ns_id);
 
         assert!(matches_name_test(&test, &nav, &ctx));
     }
@@ -234,8 +248,10 @@ mod tests {
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child();
         let table = NameTable::new();
+        let local_id = table.add("root");
         let ctx = XPathContext::new(&table);
-        let test = NameTest::NamespaceWildcard("urn:test".to_string());
+        // NamespaceWildcard takes local name - matches any namespace with that local name
+        let test = NameTest::NamespaceWildcard(local_id);
 
         assert!(matches_name_test(&test, &nav, &ctx));
     }

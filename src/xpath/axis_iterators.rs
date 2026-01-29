@@ -1398,11 +1398,16 @@ mod tests {
 
         let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
         let table = NameTable::new();
+        // Intern the local names for matching
+        let a_id = table.add("a");
+        let b_id = table.add("b");
+        let c_id = table.add("c");
         let ctx = XPathContext::new(&table);
+        // NamespaceWildcard matches any namespace with specific local name (*:local)
         let tests = vec![
-            NodeTest::Name(NameTest::LocalWildcard("a".to_string())),
-            NodeTest::Name(NameTest::LocalWildcard("b".to_string())),
-            NodeTest::Name(NameTest::LocalWildcard("c".to_string())),
+            NodeTest::Name(NameTest::NamespaceWildcard(a_id)),
+            NodeTest::Name(NameTest::NamespaceWildcard(b_id)),
+            NodeTest::Name(NameTest::NamespaceWildcard(c_id)),
         ];
         let mut iter = ChildOverDescendantsNodeIterator::new(ctx, tests, base);
 

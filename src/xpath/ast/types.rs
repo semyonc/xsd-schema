@@ -24,10 +24,13 @@ pub struct TypeExprNode {
     pub kind: TypeExprKind,
     /// Operand expression.
     pub operand: AstNodeId,
-    /// Target type.
+    /// Target type (AST form with raw strings).
     pub target_type: SequenceTypeNode,
     /// Source location.
     pub span: SourceSpan,
+    /// Resolved atomic type QName (populated during binding for Atomic item types).
+    /// Uses interned NameIds and resolved namespace URIs.
+    pub resolved_atomic_type: Option<crate::namespace::qname::QualifiedName>,
 }
 
 impl TypeExprNode {
@@ -42,6 +45,7 @@ impl TypeExprNode {
             operand,
             target_type,
             span,
+            resolved_atomic_type: None,
         }
     }
 }

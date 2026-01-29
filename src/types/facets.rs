@@ -668,62 +668,58 @@ impl FacetSet {
         // Note: Full numeric comparison would require parsing the values
         // For now, we check fixed constraints and inherit missing values
         if let Some(ref base_facet) = base.min_inclusive {
-            if result.min_inclusive.is_none() {
-                result.min_inclusive = Some(base_facet.clone());
-            } else if base_facet.fixed == FacetFixed::Fixed {
-                let derived = result.min_inclusive.as_ref().unwrap();
-                if derived.value != base_facet.value {
+            if let Some(ref derived) = result.min_inclusive {
+                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
                     return Err(FacetError::fixed_violation(
                         "minInclusive",
                         &base_facet.value,
                         &derived.value,
                     ));
                 }
+            } else {
+                result.min_inclusive = Some(base_facet.clone());
             }
         }
 
         if let Some(ref base_facet) = base.max_inclusive {
-            if result.max_inclusive.is_none() {
-                result.max_inclusive = Some(base_facet.clone());
-            } else if base_facet.fixed == FacetFixed::Fixed {
-                let derived = result.max_inclusive.as_ref().unwrap();
-                if derived.value != base_facet.value {
+            if let Some(ref derived) = result.max_inclusive {
+                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
                     return Err(FacetError::fixed_violation(
                         "maxInclusive",
                         &base_facet.value,
                         &derived.value,
                     ));
                 }
+            } else {
+                result.max_inclusive = Some(base_facet.clone());
             }
         }
 
         if let Some(ref base_facet) = base.min_exclusive {
-            if result.min_exclusive.is_none() {
-                result.min_exclusive = Some(base_facet.clone());
-            } else if base_facet.fixed == FacetFixed::Fixed {
-                let derived = result.min_exclusive.as_ref().unwrap();
-                if derived.value != base_facet.value {
+            if let Some(ref derived) = result.min_exclusive {
+                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
                     return Err(FacetError::fixed_violation(
                         "minExclusive",
                         &base_facet.value,
                         &derived.value,
                     ));
                 }
+            } else {
+                result.min_exclusive = Some(base_facet.clone());
             }
         }
 
         if let Some(ref base_facet) = base.max_exclusive {
-            if result.max_exclusive.is_none() {
-                result.max_exclusive = Some(base_facet.clone());
-            } else if base_facet.fixed == FacetFixed::Fixed {
-                let derived = result.max_exclusive.as_ref().unwrap();
-                if derived.value != base_facet.value {
+            if let Some(ref derived) = result.max_exclusive {
+                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
                     return Err(FacetError::fixed_violation(
                         "maxExclusive",
                         &base_facet.value,
                         &derived.value,
                     ));
                 }
+            } else {
+                result.max_exclusive = Some(base_facet.clone());
             }
         }
 
@@ -784,17 +780,16 @@ impl FacetSet {
 
         // ExplicitTimezone
         if let Some(ref base_etz) = base.explicit_timezone {
-            if result.explicit_timezone.is_none() {
-                result.explicit_timezone = Some(base_etz.clone());
-            } else if base_etz.fixed == FacetFixed::Fixed {
-                let derived = result.explicit_timezone.as_ref().unwrap();
-                if derived.value != base_etz.value {
+            if let Some(ref derived) = result.explicit_timezone {
+                if base_etz.fixed == FacetFixed::Fixed && derived.value != base_etz.value {
                     return Err(FacetError::fixed_violation(
                         "explicitTimezone",
                         format!("{:?}", base_etz.value),
                         format!("{:?}", derived.value),
                     ));
                 }
+            } else {
+                result.explicit_timezone = Some(base_etz.clone());
             }
         }
 

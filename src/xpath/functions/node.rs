@@ -381,23 +381,27 @@ fn any_uri(s: impl Into<String>) -> XmlValue {
     )
 }
 
-/// Get a NameId from a string, using NameId(0) (empty string) if not found.
+/// Get a NameId from a string, using NameId(0) (empty string) if string is empty.
 ///
 /// This is used for required names (like local-name) where we need a NameId.
-/// If the string isn't in the table, we use the empty string ID.
+/// The string is interned using `add()` which always succeeds.
 fn get_or_empty_id(names: &NameTable, s: &str) -> NameId {
-    names.get(s).unwrap_or(NameId(0))
+    if s.is_empty() {
+        NameId(0)
+    } else {
+        names.add(s)
+    }
 }
 
 /// Get an optional NameId from a string.
 ///
-/// Returns None if the string is empty, Some(NameId) if found in table,
-/// or Some(NameId(0)) as fallback if not found.
+/// Returns None if the string is empty, Some(NameId) otherwise.
+/// The string is interned using `add()` which always succeeds.
 fn get_opt_id(names: &NameTable, s: &str) -> Option<NameId> {
     if s.is_empty() {
         None
     } else {
-        Some(names.get(s).unwrap_or(NameId(0)))
+        Some(names.add(s))
     }
 }
 
