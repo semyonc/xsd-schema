@@ -17,7 +17,7 @@
 //! Other node types return `not_implemented` errors for now.
 
 use crate::xpath::arena::{AstArena, AstNodeId};
-use crate::xpath::ast::{AstNode, BinaryOpKind, ValueNode};
+use crate::xpath::ast::{AstNode, BinaryOpKind, ForNode, QuantifiedNode, QuantifierKind, ValueNode};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue};
@@ -133,12 +133,12 @@ pub fn eval_node<N: DomNavigator>(
             eval_function(function_id, ctx, args)
         }
 
-        AstNode::For(_) => {
-            Err(XPathError::not_implemented("for expression evaluation"))
+        AstNode::For(for_node) => {
+            eval_for_expression(arena, for_node, ctx)
         }
 
-        AstNode::Quantified(_) => {
-            Err(XPathError::not_implemented("quantified expression evaluation"))
+        AstNode::Quantified(quant_node) => {
+            eval_quantified_expression(arena, quant_node, ctx)
         }
 
         AstNode::PathExpr(_) => {
@@ -295,6 +295,221 @@ pub fn eval_node<N: DomNavigator>(
         AstNode::TypeExpr(_) => {
             Err(XPathError::not_implemented("type expression evaluation"))
         }
+    }
+}
+
+use std::ops::ControlFlow;
+
+// ============================================================================
+// For Expression Evaluation
+// ============================================================================
+
+/// Evaluate a for expression (`for $x in X, $y in Y return expr`).
+///
+/// Semantics per XPath 2.0 spec:
+/// - Evaluate each binding's `in_expr` to produce a sequence
+/// - Iterate through all combinations (Cartesian product for multiple bindings)
+/// - For each combination, bind variables and evaluate `return_expr`
+/// - Concatenate all results into a single sequence
+fn eval_for_expression<N: DomNavigator>(
+    arena: &AstArena,
+    for_node: &ForNode,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Validate all binding slots are assigned upfront
+    let slots: Vec<u32> = for_node
+        .bindings
+        .iter()
+        .map(|b| {
+            b.slot
+                .ok_or_else(|| XPathError::Internal("For binding slot not assigned".to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Collect all binding sequences upfront
+    let mut binding_values: Vec<Vec<XmlItem<N>>> = Vec::with_capacity(for_node.bindings.len());
+    for binding in &for_node.bindings {
+        let seq_value = eval_node(arena, binding.in_expr, ctx)?;
+        binding_values.push(seq_value.into_vec());
+    }
+
+    // If any binding sequence is empty, return empty sequence
+    if binding_values.iter().any(|v| v.is_empty()) {
+        return Ok(XPathValue::empty());
+    }
+
+    // Collect results from iterating over Cartesian product
+    let mut results: Vec<XmlItem<N>> = Vec::new();
+
+    // For the for expression, we use XPathError as the break type since we only
+    // break on errors (never short-circuit for other reasons)
+    match eval_for_bindings(
+        arena,
+        &slots,
+        &binding_values,
+        0,
+        for_node.return_expr,
+        ctx,
+        &mut |result| match result {
+            Ok(value) => {
+                results.extend(value.into_vec());
+                ControlFlow::Continue(())
+            }
+            Err(e) => ControlFlow::Break(e),
+        },
+    ) {
+        ControlFlow::Continue(()) => {}
+        ControlFlow::Break(e) => return Err(e),
+    }
+
+    Ok(XPathValue::from_sequence(results))
+}
+
+/// Recursively iterate over Cartesian product of bindings.
+///
+/// This helper handles the recursive iteration for for/quantified expressions.
+/// For each binding, it iterates over its sequence and recursively processes
+/// the remaining bindings. When all bindings are processed, it evaluates the body.
+///
+/// The function is generic over the break type `B`, allowing callers to use
+/// different types for different control flow needs:
+/// - For expressions use `B = XPathError` (only break on errors)
+/// - Quantified expressions use `B = QuantifiedExit` (break on short-circuit or error)
+fn eval_for_bindings<N: DomNavigator, B>(
+    arena: &AstArena,
+    slots: &[u32],
+    binding_values: &[Vec<XmlItem<N>>],
+    binding_index: usize,
+    body_id: AstNodeId,
+    ctx: &mut DynamicContext<'_, N>,
+    collector: &mut impl FnMut(Result<XPathValue<N>, XPathError>) -> ControlFlow<B>,
+) -> ControlFlow<B> {
+    if binding_index >= slots.len() {
+        // All bindings processed, evaluate the body
+        let result = eval_node(arena, body_id, ctx);
+        return collector(result);
+    }
+
+    let slot = slots[binding_index];
+
+    // Iterate over each item in the current binding's sequence
+    for item in &binding_values[binding_index] {
+        // Set the variable for this binding
+        ctx.set_variable(slot, XPathValue::from_item(item.clone()));
+
+        // Recursively process remaining bindings
+        if let cf @ ControlFlow::Break(_) = eval_for_bindings(
+            arena,
+            slots,
+            binding_values,
+            binding_index + 1,
+            body_id,
+            ctx,
+            collector,
+        ) {
+            return cf;
+        }
+    }
+
+    ControlFlow::Continue(())
+}
+
+// ============================================================================
+// Quantified Expression Evaluation
+// ============================================================================
+
+/// Exit type for quantified expression short-circuit evaluation.
+///
+/// This enum cleanly distinguishes between a legitimate short-circuit exit
+/// (when the quantified expression's answer is determined) and an actual error.
+enum QuantifiedExit {
+    /// Short-circuit: the quantified expression's answer is determined.
+    ShortCircuit,
+    /// A real error occurred during evaluation.
+    Error(XPathError),
+}
+
+/// Evaluate a quantified expression (`some/every $x in X satisfies expr`).
+///
+/// Semantics per XPath 2.0 spec:
+/// - `some`: Returns true if at least one combination satisfies the expression
+/// - `every`: Returns true if all combinations satisfy (including empty - vacuous truth)
+/// - Short-circuit evaluation when result is determined
+fn eval_quantified_expression<N: DomNavigator>(
+    arena: &AstArena,
+    quant_node: &QuantifiedNode,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Validate all binding slots are assigned upfront
+    let slots: Vec<u32> = quant_node
+        .bindings
+        .iter()
+        .map(|b| {
+            b.slot
+                .ok_or_else(|| XPathError::Internal("For binding slot not assigned".to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Collect all binding sequences upfront
+    let mut binding_values: Vec<Vec<XmlItem<N>>> = Vec::with_capacity(quant_node.bindings.len());
+    for binding in &quant_node.bindings {
+        let seq_value = eval_node(arena, binding.in_expr, ctx)?;
+        binding_values.push(seq_value.into_vec());
+    }
+
+    // Handle empty binding sequences
+    if binding_values.iter().any(|v| v.is_empty()) {
+        return match quant_node.kind {
+            QuantifierKind::Some => Ok(XPathValue::boolean(false)),
+            QuantifierKind::Every => Ok(XPathValue::boolean(true)), // Vacuous truth
+        };
+    }
+
+    // Iterate over Cartesian product with short-circuit evaluation
+    let mut found_some = false;
+    let mut all_satisfied = true;
+
+    // Use QuantifiedExit as the break type to cleanly distinguish between
+    // short-circuit (answer found) and real errors
+    match eval_for_bindings(
+        arena,
+        &slots,
+        &binding_values,
+        0,
+        quant_node.satisfies,
+        ctx,
+        &mut |result| match result {
+            Ok(value) => match effective_boolean_value(&value) {
+                Ok(satisfied) => {
+                    match quant_node.kind {
+                        QuantifierKind::Some => {
+                            if satisfied {
+                                found_some = true;
+                                return ControlFlow::Break(QuantifiedExit::ShortCircuit);
+                            }
+                        }
+                        QuantifierKind::Every => {
+                            if !satisfied {
+                                all_satisfied = false;
+                                return ControlFlow::Break(QuantifiedExit::ShortCircuit);
+                            }
+                        }
+                    }
+                    ControlFlow::Continue(())
+                }
+                Err(e) => ControlFlow::Break(QuantifiedExit::Error(e)),
+            },
+            Err(e) => ControlFlow::Break(QuantifiedExit::Error(e)),
+        },
+    ) {
+        ControlFlow::Continue(()) => {} // Completed all iterations
+        ControlFlow::Break(QuantifiedExit::ShortCircuit) => {} // Found answer early
+        ControlFlow::Break(QuantifiedExit::Error(e)) => return Err(e),
+    }
+
+    match quant_node.kind {
+        QuantifierKind::Some => Ok(XPathValue::boolean(found_some)),
+        QuantifierKind::Every => Ok(XPathValue::boolean(all_satisfied)),
     }
 }
 
@@ -1566,6 +1781,425 @@ mod tests {
 
         let result = bind_and_eval(&mut arena, root).unwrap();
         assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // For Expression Tests
+    // ========================================================================
+
+    /// Helper to create a for expression with bindings and return expr
+    fn make_for_expr(
+        arena: &mut AstArena,
+        names: &NameTable,
+        var_names: &[&str],
+        in_exprs: Vec<AstNodeId>,
+        return_expr: AstNodeId,
+    ) -> AstNodeId {
+        use crate::xpath::ast::ForBinding;
+
+        let span = SourceSpan::new(0, 50);
+        let bindings: Vec<ForBinding> = var_names
+            .iter()
+            .zip(in_exprs)
+            .map(|(name, in_expr)| {
+                let _ = names.add(name); // Ensure name is in table
+                ForBinding::new(String::new(), name.to_string(), in_expr, span)
+            })
+            .collect();
+
+        let for_node = crate::xpath::ast::ForNode::new(bindings, return_expr, span);
+        arena.add(AstNode::For(for_node))
+    }
+
+    /// Helper to create a sequence of integers
+    fn make_int_sequence(arena: &mut AstArena, values: &[i64]) -> AstNodeId {
+        let span = SourceSpan::new(0, 10);
+        let items: Vec<AstNodeId> = values
+            .iter()
+            .map(|v| arena.add(AstNode::Value(ValueNode::Integer(v.to_string()))))
+            .collect();
+        let expr = ExprNode::sequence(items, span);
+        arena.add(AstNode::Expr(expr))
+    }
+
+    /// Helper to create a variable reference
+    fn make_var_ref(arena: &mut AstArena, name: &str) -> AstNodeId {
+        use crate::xpath::ast::VarRefNode;
+        let span = SourceSpan::new(0, 5);
+        let var_ref = VarRefNode::new(String::new(), name.to_string(), span);
+        arena.add(AstNode::VarRef(var_ref))
+    }
+
+    #[test]
+    fn test_for_single_binding() {
+        // for $i in (1, 2, 3) return $i
+        // Expected: (1, 2, 3)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let var_ref = make_var_ref(&mut arena, "i");
+        let for_id = make_for_expr(&mut arena, &names, &["i"], vec![seq], var_ref);
+        let root = wrap_in_expr(&mut arena, for_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 3);
+
+        // Verify values are 1, 2, 3
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                XmlItem::Atomic(v) => {
+                    assert_eq!(
+                        v.as_integer().map(|x| x.to_string()),
+                        Some((i as i64 + 1).to_string())
+                    );
+                }
+                _ => panic!("Expected atomic integer"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_for_empty_sequence() {
+        // for $i in () return $i
+        // Expected: ()
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let var_ref = make_var_ref(&mut arena, "i");
+        let for_id = make_for_expr(&mut arena, &names, &["i"], vec![empty], var_ref);
+        let root = wrap_in_expr(&mut arena, for_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_for_multiple_bindings() {
+        // for $i in (1, 2), $j in (10, 20) return $i + $j
+        // Expected: (11, 21, 12, 22) - Cartesian product order
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq1 = make_int_sequence(&mut arena, &[1, 2]);
+        let seq2 = make_int_sequence(&mut arena, &[10, 20]);
+        let var_i = make_var_ref(&mut arena, "i");
+        let var_j = make_var_ref(&mut arena, "j");
+        let span = SourceSpan::new(0, 10);
+        let add = BinaryOpNode::new(BinaryOpKind::Add, var_i, var_j, span);
+        let add_id = arena.add(AstNode::BinaryOp(add));
+        let for_id = make_for_expr(&mut arena, &names, &["i", "j"], vec![seq1, seq2], add_id);
+        let root = wrap_in_expr(&mut arena, for_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 4);
+
+        // Verify values: 1+10=11, 1+20=21, 2+10=12, 2+20=22
+        let expected = [11i64, 21, 12, 22];
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                XmlItem::Atomic(v) => {
+                    assert_eq!(
+                        v.as_integer().map(|x| x.to_string()),
+                        Some(expected[i].to_string())
+                    );
+                }
+                _ => panic!("Expected atomic integer"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_for_return_empty() {
+        // for $i in (1, 2, 3) return ()
+        // Expected: ()
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let for_id = make_for_expr(&mut arena, &names, &["i"], vec![seq], empty);
+        let root = wrap_in_expr(&mut arena, for_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // Quantified Expression Tests
+    // ========================================================================
+
+    /// Helper to create a quantified expression
+    fn make_quantified_expr(
+        arena: &mut AstArena,
+        names: &NameTable,
+        kind: QuantifierKind,
+        var_names: &[&str],
+        in_exprs: Vec<AstNodeId>,
+        satisfies: AstNodeId,
+    ) -> AstNodeId {
+        use crate::xpath::ast::ForBinding;
+
+        let span = SourceSpan::new(0, 50);
+        let bindings: Vec<ForBinding> = var_names
+            .iter()
+            .zip(in_exprs)
+            .map(|(name, in_expr)| {
+                let _ = names.add(name); // Ensure name is in table
+                ForBinding::new(String::new(), name.to_string(), in_expr, span)
+            })
+            .collect();
+
+        let quant_node = crate::xpath::ast::QuantifiedNode::new(kind, bindings, satisfies, span);
+        arena.add(AstNode::Quantified(quant_node))
+    }
+
+    #[test]
+    fn test_some_true() {
+        // some $x in (1, 2, 3) satisfies $x > 2
+        // Expected: true (3 > 2)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let var_x = make_var_ref(&mut arena, "x");
+        let two = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, two, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![seq], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_some_false() {
+        // some $x in (1, 2, 3) satisfies $x > 5
+        // Expected: false
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let var_x = make_var_ref(&mut arena, "x");
+        let five = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, five, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![seq], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_some_empty_sequence() {
+        // some $x in () satisfies $x > 0
+        // Expected: false (no items to test)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let var_x = make_var_ref(&mut arena, "x");
+        let zero = arena.add(AstNode::Value(ValueNode::Integer("0".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![empty], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_every_true() {
+        // every $x in (1, 2, 3) satisfies $x > 0
+        // Expected: true
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let var_x = make_var_ref(&mut arena, "x");
+        let zero = arena.add(AstNode::Value(ValueNode::Integer("0".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![seq], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_every_false() {
+        // every $x in (1, 2, 3) satisfies $x > 2
+        // Expected: false (1 and 2 are not > 2)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+        let var_x = make_var_ref(&mut arena, "x");
+        let two = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, two, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![seq], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_every_empty_vacuous_truth() {
+        // every $x in () satisfies $x > 0
+        // Expected: true (vacuous truth)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let var_x = make_var_ref(&mut arena, "x");
+        let zero = arena.add(AstNode::Value(ValueNode::Integer("0".to_string())));
+        let span = SourceSpan::new(0, 10);
+        let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
+        let gt_id = arena.add(AstNode::BinaryOp(gt));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![empty], gt_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true (vacuous truth)"),
+        }
+    }
+
+    #[test]
+    fn test_some_multiple_bindings() {
+        // some $x in (1, 2), $y in (3, 4) satisfies $x + $y = 5
+        // Expected: true (1+4=5 or 2+3=5)
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let seq1 = make_int_sequence(&mut arena, &[1, 2]);
+        let seq2 = make_int_sequence(&mut arena, &[3, 4]);
+        let var_x = make_var_ref(&mut arena, "x");
+        let var_y = make_var_ref(&mut arena, "y");
+        let five = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let span = SourceSpan::new(0, 20);
+        let add = BinaryOpNode::new(BinaryOpKind::Add, var_x, var_y, span);
+        let add_id = arena.add(AstNode::BinaryOp(add));
+        let eq = BinaryOpNode::new(BinaryOpKind::GeneralEq, add_id, five, span);
+        let eq_id = arena.add(AstNode::BinaryOp(eq));
+        let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x", "y"], vec![seq1, seq2], eq_id);
+        let root = wrap_in_expr(&mut arena, quant_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
     }
 }
 
