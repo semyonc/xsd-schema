@@ -24,8 +24,8 @@ use crate::xpath::functions::{atomize_to_single_opt, eval_function, effective_bo
 use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::node_ops::{following_node, preceding_node, same_node};
 use crate::xpath::operators::{
-    eval_binary, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter, general_le_iter,
-    general_lt_iter, general_ne_iter,
+    eval_binary, eval_range, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter,
+    general_le_iter, general_lt_iter, general_ne_iter,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNavigator;
@@ -149,8 +149,21 @@ pub fn eval_node<N: DomNavigator>(
             Err(XPathError::not_implemented("filter expression evaluation"))
         }
 
-        AstNode::Range(_) => {
-            Err(XPathError::not_implemented("range expression evaluation"))
+        AstNode::Range(range) => {
+            let start_val = eval_node(arena, range.start, ctx)?;
+            let end_val = eval_node(arena, range.end, ctx)?;
+
+            let start_opt = atomize_to_single_opt(start_val)?;
+            let end_opt = atomize_to_single_opt(end_val)?;
+
+            match (start_opt, end_opt) {
+                (None, _) | (_, None) => Ok(XPathValue::empty()),
+                (Some(start), Some(end)) => {
+                    let values = eval_range(&start, &end)?;
+                    let items: Vec<XmlItem<N>> = values.into_iter().map(XmlItem::Atomic).collect();
+                    Ok(XPathValue::from_sequence(items))
+                }
+            }
         }
 
         AstNode::UnaryOp(unary_op) => {
@@ -356,7 +369,7 @@ mod tests {
     use super::*;
     use crate::namespace::table::NameTable;
     use crate::xpath::arena::SourceSpan;
-    use crate::xpath::ast::{BinaryOpNode, ExprNode, FunctionCallNode, IfNode, UnaryOpNode, UnaryOpKind, ValueNode};
+    use crate::xpath::ast::{BinaryOpNode, ExprNode, FunctionCallNode, IfNode, RangeNode, UnaryOpNode, UnaryOpKind, ValueNode};
     use crate::xpath::bind::bind_node;
     use crate::xpath::context::{NameBinder, XPathContext};
     use crate::xpath::RoXmlNavigator;
@@ -1453,6 +1466,105 @@ mod tests {
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         // Except of same node with itself should give empty sequence
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // Range Expression Tests
+    // ========================================================================
+
+    #[test]
+    fn test_range_basic() {
+        // 1 to 5 -> (1, 2, 3, 4, 5)
+        let mut arena = AstArena::new();
+        let start = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let end = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let span = SourceSpan::new(0, 6);
+        let range = RangeNode::new(start, end, span);
+        let range_id = arena.add(AstNode::Range(range));
+        let root = wrap_in_expr(&mut arena, range_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 5);
+        // Verify values are 1, 2, 3, 4, 5
+        for (i, item) in items.iter().enumerate() {
+            match item {
+                XmlItem::Atomic(v) => {
+                    assert_eq!(
+                        v.as_integer().map(|x| x.to_string()),
+                        Some((i + 1).to_string())
+                    );
+                }
+                _ => panic!("Expected atomic integer"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_range_empty() {
+        // 5 to 3 -> () (empty sequence when start > end)
+        let mut arena = AstArena::new();
+        let start = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let end = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 6);
+        let range = RangeNode::new(start, end, span);
+        let range_id = arena.add(AstNode::Range(range));
+        let root = wrap_in_expr(&mut arena, range_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_range_single() {
+        // 5 to 5 -> (5)
+        let mut arena = AstArena::new();
+        let start = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let end = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let span = SourceSpan::new(0, 6);
+        let range = RangeNode::new(start, end, span);
+        let range_id = arena.add(AstNode::Range(range));
+        let root = wrap_in_expr(&mut arena, range_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 1);
+        match &items[0] {
+            XmlItem::Atomic(v) => {
+                assert_eq!(v.as_integer().map(|x| x.to_string()), Some("5".to_string()));
+            }
+            _ => panic!("Expected atomic integer"),
+        }
+    }
+
+    #[test]
+    fn test_range_empty_start_operand() {
+        // () to 5 -> ()
+        let mut arena = AstArena::new();
+        let start = arena.add(AstNode::Value(ValueNode::Empty));
+        let end = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let span = SourceSpan::new(0, 7);
+        let range = RangeNode::new(start, end, span);
+        let range_id = arena.add(AstNode::Range(range));
+        let root = wrap_in_expr(&mut arena, range_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_range_empty_end_operand() {
+        // 1 to () -> ()
+        let mut arena = AstArena::new();
+        let start = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let end = arena.add(AstNode::Value(ValueNode::Empty));
+        let span = SourceSpan::new(0, 7);
+        let range = RangeNode::new(start, end, span);
+        let range_id = arena.add(AstNode::Range(range));
+        let root = wrap_in_expr(&mut arena, range_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
         assert!(result.is_empty());
     }
 }
