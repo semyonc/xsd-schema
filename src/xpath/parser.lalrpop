@@ -125,6 +125,9 @@ extern {
         ">" => Token::GreaterThan,
         "question" => Token::Question,
         "." => Token::Dot,
+
+        // End of input
+        "eof" => Token::Eof,
     }
 }
 
@@ -132,11 +135,16 @@ extern {
 // Top-level Expression
 // ============================================================================
 
+// Entry point: Expr followed by Eof for proper error recovery
 pub Expr: AstNodeId = {
+    <e:ExprInner> "eof" => e,
+};
+
+ExprInner: AstNodeId = {
     <l:@L> <e:ExprSingle> <r:@R> => {
         arena.add(AstNode::Expr(ExprNode::single(e, SourceSpan::new(l, r))))
     },
-    <l:@L> <seq:Expr> "," <e:ExprSingle> <r:@R> => {
+    <l:@L> <seq:ExprInner> "," <e:ExprSingle> <r:@R> => {
         // Append to existing sequence
         let span = SourceSpan::new(l, r);
         match arena.get_mut(seq) {

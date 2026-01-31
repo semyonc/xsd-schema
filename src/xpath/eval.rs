@@ -17,11 +17,12 @@
 //! Other node types return `not_implemented` errors for now.
 
 use crate::xpath::arena::{AstArena, AstNodeId};
-use crate::xpath::ast::{AstNode, ValueNode};
+use crate::xpath::ast::{AstNode, BinaryOpKind, ValueNode};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
-use crate::xpath::functions::{eval_function, effective_boolean_value, XPathValue};
+use crate::xpath::functions::{atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue};
 use crate::xpath::iterator::XmlItem;
+use crate::xpath::operators::eval_binary;
 use crate::xpath::DomNavigator;
 
 /// Evaluate an AST node and return the result.
@@ -151,8 +152,68 @@ pub fn eval_node<N: DomNavigator>(
             Err(XPathError::not_implemented("unary operator evaluation"))
         }
 
-        AstNode::BinaryOp(_) => {
-            Err(XPathError::not_implemented("binary operator evaluation"))
+        AstNode::BinaryOp(bin_op) => {
+            match bin_op.kind {
+                // Logical operators - short-circuit evaluation
+                BinaryOpKind::And => {
+                    let left_val = eval_node(arena, bin_op.left, ctx)?;
+                    let left_bool = effective_boolean_value(&left_val)?;
+                    if !left_bool {
+                        return Ok(XPathValue::boolean(false));
+                    }
+                    let right_val = eval_node(arena, bin_op.right, ctx)?;
+                    let right_bool = effective_boolean_value(&right_val)?;
+                    Ok(XPathValue::boolean(right_bool))
+                }
+                BinaryOpKind::Or => {
+                    let left_val = eval_node(arena, bin_op.left, ctx)?;
+                    let left_bool = effective_boolean_value(&left_val)?;
+                    if left_bool {
+                        return Ok(XPathValue::boolean(true));
+                    }
+                    let right_val = eval_node(arena, bin_op.right, ctx)?;
+                    let right_bool = effective_boolean_value(&right_val)?;
+                    Ok(XPathValue::boolean(right_bool))
+                }
+
+                // Arithmetic and value comparison operators - atomize to single values
+                BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul |
+                BinaryOpKind::Div | BinaryOpKind::IDiv | BinaryOpKind::Mod |
+                BinaryOpKind::ValueEq | BinaryOpKind::ValueNe |
+                BinaryOpKind::ValueLt | BinaryOpKind::ValueLe |
+                BinaryOpKind::ValueGt | BinaryOpKind::ValueGe => {
+                    let left_val = eval_node(arena, bin_op.left, ctx)?;
+                    let right_val = eval_node(arena, bin_op.right, ctx)?;
+
+                    let left_opt = atomize_to_single_opt(left_val)?;
+                    let right_opt = atomize_to_single_opt(right_val)?;
+
+                    match (left_opt, right_opt) {
+                        (None, _) | (_, None) => Ok(XPathValue::empty()),
+                        (Some(left), Some(right)) => {
+                            let result = eval_binary(bin_op.kind, &left, &right)?;
+                            Ok(XPathValue::from_atomic(result))
+                        }
+                    }
+                }
+
+                // General comparisons - require iterator infrastructure (deferred)
+                BinaryOpKind::GeneralEq | BinaryOpKind::GeneralNe |
+                BinaryOpKind::GeneralLt | BinaryOpKind::GeneralLe |
+                BinaryOpKind::GeneralGt | BinaryOpKind::GeneralGe => {
+                    Err(XPathError::not_implemented("general comparison operators"))
+                }
+
+                // Node comparisons - require node identity (deferred)
+                BinaryOpKind::Is | BinaryOpKind::Before | BinaryOpKind::After => {
+                    Err(XPathError::not_implemented("node comparison operators"))
+                }
+
+                // Sequence operators - require path evaluation (deferred)
+                BinaryOpKind::Union | BinaryOpKind::Intersect | BinaryOpKind::Except => {
+                    Err(XPathError::not_implemented("sequence operators"))
+                }
+            }
         }
 
         AstNode::PathStep(_) => {
@@ -207,7 +268,7 @@ mod tests {
     use super::*;
     use crate::namespace::table::NameTable;
     use crate::xpath::arena::SourceSpan;
-    use crate::xpath::ast::{ExprNode, FunctionCallNode, IfNode, ValueNode};
+    use crate::xpath::ast::{BinaryOpNode, ExprNode, FunctionCallNode, IfNode, ValueNode};
     use crate::xpath::bind::bind_node;
     use crate::xpath::context::{NameBinder, XPathContext};
     use crate::xpath::RoXmlNavigator;
@@ -555,6 +616,101 @@ mod tests {
                 assert_eq!(v.as_string(), Some("Hello, World!"));
             }
             _ => panic!("Expected string 'Hello, World!'"),
+        }
+    }
+
+    #[test]
+    fn test_eval_arithmetic_add() {
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let right = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Add, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("8".to_string()));
+            }
+            _ => panic!("Expected integer 8"),
+        }
+    }
+
+    #[test]
+    fn test_eval_arithmetic_sub() {
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let right = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Sub, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("2".to_string()));
+            }
+            _ => panic!("Expected integer 2"),
+        }
+    }
+
+    #[test]
+    fn test_eval_arithmetic_mul() {
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Integer("5".to_string())));
+        let right = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Mul, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("15".to_string()));
+            }
+            _ => panic!("Expected integer 15"),
+        }
+    }
+
+    #[test]
+    fn test_eval_logical_and_short_circuit() {
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Boolean(false)));
+        let right = arena.add(AstNode::Value(ValueNode::Boolean(true)));
+        let span = SourceSpan::new(0, 10);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::And, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_eval_logical_or_short_circuit() {
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Boolean(true)));
+        let right = arena.add(AstNode::Value(ValueNode::Boolean(false)));
+        let span = SourceSpan::new(0, 10);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Or, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
     }
 }

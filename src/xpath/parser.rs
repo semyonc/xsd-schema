@@ -5,7 +5,7 @@
 
 use crate::xpath::arena::{AstArena, AstNodeId, SourceSpan};
 use crate::xpath::ast::AstNode;
-use crate::xpath::lexer::{Lexer, LexerError, Token};
+use crate::xpath::lexer::{Lexer, LexerError};
 use std::fmt;
 
 // The LALRPOP-generated parser.
@@ -101,62 +101,39 @@ pub fn parse(input: &str) -> Result<ParsedXPath, ParseError> {
     let mut arena = AstArena::new();
     let lexer = Lexer::new(input);
 
-    // Note: The actual parser invocation will be uncommented once LALRPOP generates the code
-    // For now, we provide a stub that creates an empty expression
-
-    // TODO: Uncomment when LALRPOP is configured in build.rs
-    // let root = xpath_parser::ExprParser::new()
-    //     .parse(&mut arena, lexer)
-    //     .map_err(|e| match e {
-    //         lalrpop_util::ParseError::InvalidToken { location } => ParseError::Parser {
-    //             message: "Invalid token".to_string(),
-    //             location: Some(location),
-    //         },
-    //         lalrpop_util::ParseError::UnrecognizedEof { location, expected } => {
-    //             ParseError::Parser {
-    //                 message: format!("Unexpected end of input, expected one of: {:?}", expected),
-    //                 location: Some(location),
-    //             }
-    //         }
-    //         lalrpop_util::ParseError::UnrecognizedToken { token, expected } => {
-    //             ParseError::Parser {
-    //                 message: format!(
-    //                     "Unexpected token {:?}, expected one of: {:?}",
-    //                     token.1, expected
-    //                 ),
-    //                 location: Some(token.0),
-    //             }
-    //         }
-    //         lalrpop_util::ParseError::ExtraToken { token } => ParseError::Parser {
-    //             message: format!("Extra token: {:?}", token.1),
-    //             location: Some(token.0),
-    //         },
-    //         lalrpop_util::ParseError::User { error } => ParseError::Lexer(error),
-    //     })?;
-
-    // Temporary: consume lexer to verify it works
-    let mut last_pos = 0;
-    for result in lexer {
-        match result {
-            Ok((_, Token::Eof, end)) => {
-                last_pos = end;
-                break;
+    let root = xpath_grammar::ExprParser::new()
+        .parse(&mut arena, lexer)
+        .map_err(|e| match e {
+            lalrpop_util::ParseError::InvalidToken { location } => ParseError::Parser {
+                message: "Invalid token".to_string(),
+                location: Some(location),
+            },
+            lalrpop_util::ParseError::UnrecognizedEof { location, expected } => {
+                ParseError::Parser {
+                    message: format!("Unexpected end of input, expected one of: {:?}", expected),
+                    location: Some(location),
+                }
             }
-            Ok((_, _, end)) => {
-                last_pos = end;
+            lalrpop_util::ParseError::UnrecognizedToken { token, expected } => {
+                ParseError::Parser {
+                    message: format!(
+                        "Unexpected token {:?}, expected one of: {:?}",
+                        token.1, expected
+                    ),
+                    location: Some(token.0),
+                }
             }
-            Err(e) => return Err(ParseError::Lexer(e)),
-        }
-    }
-
-    // Create a placeholder empty expression
-    use crate::xpath::ast::ValueNode;
-    let root = arena.add(AstNode::Value(ValueNode::Empty));
+            lalrpop_util::ParseError::ExtraToken { token } => ParseError::Parser {
+                message: format!("Extra token: {:?}", token.1),
+                location: Some(token.0),
+            },
+            lalrpop_util::ParseError::User { error } => ParseError::Lexer(error),
+        })?;
 
     Ok(ParsedXPath {
         arena,
         root,
-        span: SourceSpan::new(0, last_pos),
+        span: SourceSpan::new(0, input.len()),
     })
 }
 
@@ -164,16 +141,36 @@ pub fn parse(input: &str) -> Result<ParsedXPath, ParseError> {
 ///
 /// This is a convenience function when you only need the arena and root.
 pub fn parse_expr(input: &str, arena: &mut AstArena) -> Result<AstNodeId, ParseError> {
-    let _lexer = Lexer::new(input);
+    let lexer = Lexer::new(input);
 
-    // TODO: Uncomment when LALRPOP is configured
-    // xpath_parser::ExprParser::new()
-    //     .parse(arena, lexer)
-    //     .map_err(|e| /* ... */)
-
-    // Temporary placeholder
-    use crate::xpath::ast::ValueNode;
-    Ok(arena.add(AstNode::Value(ValueNode::Empty)))
+    xpath_grammar::ExprParser::new()
+        .parse(arena, lexer)
+        .map_err(|e| match e {
+            lalrpop_util::ParseError::InvalidToken { location } => ParseError::Parser {
+                message: "Invalid token".to_string(),
+                location: Some(location),
+            },
+            lalrpop_util::ParseError::UnrecognizedEof { location, expected } => {
+                ParseError::Parser {
+                    message: format!("Unexpected end of input, expected one of: {:?}", expected),
+                    location: Some(location),
+                }
+            }
+            lalrpop_util::ParseError::UnrecognizedToken { token, expected } => {
+                ParseError::Parser {
+                    message: format!(
+                        "Unexpected token {:?}, expected one of: {:?}",
+                        token.1, expected
+                    ),
+                    location: Some(token.0),
+                }
+            }
+            lalrpop_util::ParseError::ExtraToken { token } => ParseError::Parser {
+                message: format!("Extra token: {:?}", token.1),
+                location: Some(token.0),
+            },
+            lalrpop_util::ParseError::User { error } => ParseError::Lexer(error),
+        })
 }
 
 #[cfg(test)]
@@ -181,28 +178,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_stub() {
-        // This tests the stub implementation
+    fn test_parse_arithmetic() {
         let result = parse("1 + 2");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
     }
 
     #[test]
     fn test_parse_path() {
         let result = parse("/a/b/c");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
     }
 
     #[test]
     fn test_parse_variable() {
         let result = parse("$x");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
     }
 
     #[test]
     fn test_parse_function() {
         let result = parse("fn:count(*)");
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "Parse failed: {:?}", result.err());
     }
 
     #[test]
