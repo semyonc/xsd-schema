@@ -48,10 +48,6 @@ pub enum UnaryOpKind {
     Negate,
     /// Unary plus / identity (`+expr`).
     Identity,
-    /// Boolean not (fn:not).
-    BooleanNot,
-    /// Atomization operator.
-    Atomize,
 }
 
 /// Unary operator expression.

@@ -18,7 +18,7 @@
 
 use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{
-    AstNode, BinaryOpKind, ForNode, ItemTypeNode, OccurrenceIndicator, QuantifiedNode,
+    AstNode, BinaryOpKind, ForBinding, ForNode, ItemTypeNode, OccurrenceIndicator, QuantifiedNode,
     QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
 };
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
@@ -635,28 +635,6 @@ fn eval_for_expression<N: DomNavigator>(
     for_node: &ForNode,
     ctx: &mut DynamicContext<'_, N>,
 ) -> Result<XPathValue<N>, XPathError> {
-    // Validate all binding slots are assigned upfront
-    let slots: Vec<u32> = for_node
-        .bindings
-        .iter()
-        .map(|b| {
-            b.slot
-                .ok_or_else(|| XPathError::Internal("For binding slot not assigned".to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Collect all binding sequences upfront
-    let mut binding_values: Vec<Vec<XmlItem<N>>> = Vec::with_capacity(for_node.bindings.len());
-    for binding in &for_node.bindings {
-        let seq_value = eval_node(arena, binding.in_expr, ctx)?;
-        binding_values.push(seq_value.into_vec());
-    }
-
-    // If any binding sequence is empty, return empty sequence
-    if binding_values.iter().any(|v| v.is_empty()) {
-        return Ok(XPathValue::empty());
-    }
-
     // Collect results from iterating over Cartesian product
     let mut results: Vec<XmlItem<N>> = Vec::new();
 
@@ -664,8 +642,7 @@ fn eval_for_expression<N: DomNavigator>(
     // break on errors (never short-circuit for other reasons)
     match eval_for_bindings(
         arena,
-        &slots,
-        &binding_values,
+        &for_node.bindings,
         0,
         for_node.return_expr,
         ctx,
@@ -684,11 +661,16 @@ fn eval_for_expression<N: DomNavigator>(
     Ok(XPathValue::from_sequence(results))
 }
 
-/// Recursively iterate over Cartesian product of bindings.
+/// Recursively iterate over Cartesian product of bindings with lazy evaluation.
 ///
 /// This helper handles the recursive iteration for for/quantified expressions.
-/// For each binding, it iterates over its sequence and recursively processes
-/// the remaining bindings. When all bindings are processed, it evaluates the body.
+/// For each binding, it evaluates the `in_expr` (allowing dependent bindings),
+/// iterates over its sequence, and recursively processes remaining bindings.
+/// When all bindings are processed, it evaluates the body.
+///
+/// IMPORTANT: Each binding's `in_expr` is evaluated lazily, AFTER all previous
+/// binding variables have been bound. This allows dependent bindings like:
+/// `for $x in 1 to 3, $y in $x+1 return $y`
 ///
 /// The function is generic over the break type `B`, allowing callers to use
 /// different types for different control flow needs:
@@ -696,31 +678,49 @@ fn eval_for_expression<N: DomNavigator>(
 /// - Quantified expressions use `B = QuantifiedExit` (break on short-circuit or error)
 fn eval_for_bindings<N: DomNavigator, B>(
     arena: &AstArena,
-    slots: &[u32],
-    binding_values: &[Vec<XmlItem<N>>],
+    bindings: &[ForBinding],
     binding_index: usize,
     body_id: AstNodeId,
     ctx: &mut DynamicContext<'_, N>,
     collector: &mut impl FnMut(Result<XPathValue<N>, XPathError>) -> ControlFlow<B>,
 ) -> ControlFlow<B> {
-    if binding_index >= slots.len() {
+    if binding_index >= bindings.len() {
         // All bindings processed, evaluate the body
         let result = eval_node(arena, body_id, ctx);
         return collector(result);
     }
 
-    let slot = slots[binding_index];
+    let binding = &bindings[binding_index];
+    let slot = match binding.slot {
+        Some(s) => s,
+        None => {
+            return collector(Err(XPathError::Internal(
+                "For binding slot not assigned".to_string(),
+            )))
+        }
+    };
+
+    // LAZY EVALUATION: Evaluate in_expr NOW (previous variables are already bound)
+    let seq_value = match eval_node(arena, binding.in_expr, ctx) {
+        Ok(v) => v,
+        Err(e) => return collector(Err(e)),
+    };
+    let items = seq_value.into_vec();
+
+    // If binding sequence is empty, we simply don't iterate (produces empty result)
+    if items.is_empty() {
+        return ControlFlow::Continue(());
+    }
 
     // Iterate over each item in the current binding's sequence
-    for item in &binding_values[binding_index] {
+    for item in items {
         // Set the variable for this binding
-        ctx.set_variable(slot, XPathValue::from_item(item.clone()));
+        ctx.set_variable(slot, XPathValue::from_item(item));
 
         // Recursively process remaining bindings
         if let cf @ ControlFlow::Break(_) = eval_for_bindings(
             arena,
-            slots,
-            binding_values,
+            bindings,
             binding_index + 1,
             body_id,
             ctx,
@@ -754,37 +754,16 @@ enum QuantifiedExit {
 /// - `some`: Returns true if at least one combination satisfies the expression
 /// - `every`: Returns true if all combinations satisfy (including empty - vacuous truth)
 /// - Short-circuit evaluation when result is determined
+///
+/// NOTE: Bindings are evaluated lazily, allowing dependent bindings like:
+/// `some $x in (1,2), $y in ($x*2) satisfies $y > 3`
 fn eval_quantified_expression<N: DomNavigator>(
     arena: &AstArena,
     quant_node: &QuantifiedNode,
     ctx: &mut DynamicContext<'_, N>,
 ) -> Result<XPathValue<N>, XPathError> {
-    // Validate all binding slots are assigned upfront
-    let slots: Vec<u32> = quant_node
-        .bindings
-        .iter()
-        .map(|b| {
-            b.slot
-                .ok_or_else(|| XPathError::Internal("For binding slot not assigned".to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Collect all binding sequences upfront
-    let mut binding_values: Vec<Vec<XmlItem<N>>> = Vec::with_capacity(quant_node.bindings.len());
-    for binding in &quant_node.bindings {
-        let seq_value = eval_node(arena, binding.in_expr, ctx)?;
-        binding_values.push(seq_value.into_vec());
-    }
-
-    // Handle empty binding sequences
-    if binding_values.iter().any(|v| v.is_empty()) {
-        return match quant_node.kind {
-            QuantifierKind::Some => Ok(XPathValue::boolean(false)),
-            QuantifierKind::Every => Ok(XPathValue::boolean(true)), // Vacuous truth
-        };
-    }
-
-    // Iterate over Cartesian product with short-circuit evaluation
+    // Track whether we had any iterations (for vacuous truth handling)
+    let mut had_any_iteration = false;
     let mut found_some = false;
     let mut all_satisfied = true;
 
@@ -792,38 +771,49 @@ fn eval_quantified_expression<N: DomNavigator>(
     // short-circuit (answer found) and real errors
     match eval_for_bindings(
         arena,
-        &slots,
-        &binding_values,
+        &quant_node.bindings,
         0,
         quant_node.satisfies,
         ctx,
-        &mut |result| match result {
-            Ok(value) => match effective_boolean_value(&value) {
-                Ok(satisfied) => {
-                    match quant_node.kind {
-                        QuantifierKind::Some => {
-                            if satisfied {
-                                found_some = true;
-                                return ControlFlow::Break(QuantifiedExit::ShortCircuit);
+        &mut |result| {
+            had_any_iteration = true;
+            match result {
+                Ok(value) => match effective_boolean_value(&value) {
+                    Ok(satisfied) => {
+                        match quant_node.kind {
+                            QuantifierKind::Some => {
+                                if satisfied {
+                                    found_some = true;
+                                    return ControlFlow::Break(QuantifiedExit::ShortCircuit);
+                                }
+                            }
+                            QuantifierKind::Every => {
+                                if !satisfied {
+                                    all_satisfied = false;
+                                    return ControlFlow::Break(QuantifiedExit::ShortCircuit);
+                                }
                             }
                         }
-                        QuantifierKind::Every => {
-                            if !satisfied {
-                                all_satisfied = false;
-                                return ControlFlow::Break(QuantifiedExit::ShortCircuit);
-                            }
-                        }
+                        ControlFlow::Continue(())
                     }
-                    ControlFlow::Continue(())
-                }
+                    Err(e) => ControlFlow::Break(QuantifiedExit::Error(e)),
+                },
                 Err(e) => ControlFlow::Break(QuantifiedExit::Error(e)),
-            },
-            Err(e) => ControlFlow::Break(QuantifiedExit::Error(e)),
+            }
         },
     ) {
         ControlFlow::Continue(()) => {} // Completed all iterations
         ControlFlow::Break(QuantifiedExit::ShortCircuit) => {} // Found answer early
         ControlFlow::Break(QuantifiedExit::Error(e)) => return Err(e),
+    }
+
+    // Handle vacuous truth: if no iterations occurred (empty binding),
+    // "every" is vacuously true, "some" is false
+    if !had_any_iteration {
+        return match quant_node.kind {
+            QuantifierKind::Some => Ok(XPathValue::boolean(false)),
+            QuantifierKind::Every => Ok(XPathValue::boolean(true)),
+        };
     }
 
     match quant_node.kind {

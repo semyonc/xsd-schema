@@ -1619,6 +1619,298 @@ fn test_some_multiple_bindings() {
     }
 }
 
+// ========================================================================
+// Dependent Binding Tests (for/quantified with dependent bindings)
+// ========================================================================
+
+/// Helper to create a for expression with dependent bindings.
+/// The second binding's in_expr is a function of the first binding's variable.
+fn make_dependent_for_expr(
+    arena: &mut AstArena,
+    names: &NameTable,
+    var1_name: &str,
+    in_expr1: AstNodeId,
+    var2_name: &str,
+    in_expr2: AstNodeId, // Can reference var1
+    return_expr: AstNodeId,
+) -> AstNodeId {
+    use crate::xpath::ast::ForBinding;
+
+    let span = SourceSpan::new(0, 50);
+    let _ = names.add(var1_name);
+    let _ = names.add(var2_name);
+
+    let bindings = vec![
+        ForBinding::new(String::new(), var1_name.to_string(), in_expr1, span),
+        ForBinding::new(String::new(), var2_name.to_string(), in_expr2, span),
+    ];
+
+    let for_node = crate::xpath::ast::ForNode::new(bindings, return_expr, span);
+    arena.add(AstNode::For(for_node))
+}
+
+#[test]
+fn test_for_dependent_bindings() {
+    // for $x in (1, 2, 3), $y in ($x + 1) return $y
+    // Expected: (2, 3, 4) - $y depends on $x
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let seq1 = make_int_sequence(&mut arena, &[1, 2, 3]);
+
+    // $y in ($x + 1) - create addition expression
+    let var_x_in_expr = make_var_ref(&mut arena, "x");
+    let one = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let span = SourceSpan::new(0, 10);
+    let add = BinaryOpNode::new(BinaryOpKind::Add, var_x_in_expr, one, span);
+    let add_id = arena.add(AstNode::BinaryOp(add));
+
+    // return $y
+    let var_y = make_var_ref(&mut arena, "y");
+
+    let for_id = make_dependent_for_expr(&mut arena, &names, "x", seq1, "y", add_id, var_y);
+    let root = wrap_in_expr(&mut arena, for_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+    let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+        DynamicContext::new(&ctx, binder.len());
+
+    let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+    let items = result.into_vec();
+    assert_eq!(items.len(), 3);
+
+    // Verify values are 2, 3, 4 (corresponding to $x+1 for $x in 1,2,3)
+    let expected = [2i64, 3, 4];
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            XmlItem::Atomic(v) => {
+                assert_eq!(
+                    v.as_integer().map(|x| x.to_string()),
+                    Some(expected[i].to_string()),
+                    "Expected {} at index {}",
+                    expected[i],
+                    i
+                );
+            }
+            _ => panic!("Expected atomic integer at index {}", i),
+        }
+    }
+}
+
+#[test]
+fn test_for_dependent_range_binding() {
+    // for $x in (1 to 3), $y in (1 to $x) return $y
+    // When $x=1: $y in (1) -> 1
+    // When $x=2: $y in (1,2) -> 1, 2
+    // When $x=3: $y in (1,2,3) -> 1, 2, 3
+    // Expected: (1, 1, 2, 1, 2, 3)
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+
+    // $x in (1 to 3)
+    let one_a = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let three = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+    let span = SourceSpan::new(0, 10);
+    let range1 = RangeNode::new(one_a, three, span);
+    let range1_id = arena.add(AstNode::Range(range1));
+
+    // $y in (1 to $x) - range depends on $x
+    let one_b = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let var_x_in_expr = make_var_ref(&mut arena, "x");
+    let range2 = RangeNode::new(one_b, var_x_in_expr, span);
+    let range2_id = arena.add(AstNode::Range(range2));
+
+    // return $y
+    let var_y = make_var_ref(&mut arena, "y");
+
+    let for_id = make_dependent_for_expr(&mut arena, &names, "x", range1_id, "y", range2_id, var_y);
+    let root = wrap_in_expr(&mut arena, for_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+    let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+        DynamicContext::new(&ctx, binder.len());
+
+    let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+    let items = result.into_vec();
+
+    // Expected: (1, 1, 2, 1, 2, 3)
+    let expected = [1i64, 1, 2, 1, 2, 3];
+    assert_eq!(items.len(), expected.len());
+
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            XmlItem::Atomic(v) => {
+                assert_eq!(
+                    v.as_integer().map(|x| x.to_string()),
+                    Some(expected[i].to_string()),
+                    "Expected {} at index {}",
+                    expected[i],
+                    i
+                );
+            }
+            _ => panic!("Expected atomic integer at index {}", i),
+        }
+    }
+}
+
+#[test]
+fn test_some_dependent_bindings() {
+    // some $x in (1, 2), $y in ($x * 2) satisfies $y > 3
+    // When $x=1: $y=2, 2>3 is false
+    // When $x=2: $y=4, 4>3 is true -> short-circuit, return true
+    // Expected: true
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let seq = make_int_sequence(&mut arena, &[1, 2]);
+
+    // $y in ($x * 2)
+    let var_x_in_expr = make_var_ref(&mut arena, "x");
+    let two = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+    let span = SourceSpan::new(0, 10);
+    let mul = BinaryOpNode::new(BinaryOpKind::Mul, var_x_in_expr, two, span);
+    let mul_id = arena.add(AstNode::BinaryOp(mul));
+
+    // satisfies $y > 3
+    let var_y = make_var_ref(&mut arena, "y");
+    let three = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+    let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_y, three, span);
+    let gt_id = arena.add(AstNode::BinaryOp(gt));
+
+    // Build bindings manually for quantified expression
+    use crate::xpath::ast::ForBinding;
+    let _ = names.add("x");
+    let _ = names.add("y");
+    let bindings = vec![
+        ForBinding::new(String::new(), "x".to_string(), seq, span),
+        ForBinding::new(String::new(), "y".to_string(), mul_id, span),
+    ];
+    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Some, bindings, gt_id, span);
+    let quant_id = arena.add(AstNode::Quantified(quant_node));
+    let root = wrap_in_expr(&mut arena, quant_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+    let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+        DynamicContext::new(&ctx, binder.len());
+
+    let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+    match result {
+        XPathValue::Item(XmlItem::Atomic(v)) => {
+            assert_eq!(v.as_boolean(), Some(true));
+        }
+        _ => panic!("Expected boolean true"),
+    }
+}
+
+#[test]
+fn test_every_dependent_bindings() {
+    // every $x in (1, 2), $y in (1 to $x) satisfies $y <= $x
+    // When $x=1: $y in (1), 1 <= 1 is true
+    // When $x=2: $y in (1,2), 1 <= 2 is true, 2 <= 2 is true
+    // All satisfied -> true
+    // Expected: true
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let seq = make_int_sequence(&mut arena, &[1, 2]);
+
+    // $y in (1 to $x)
+    let one = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let var_x_in_expr = make_var_ref(&mut arena, "x");
+    let span = SourceSpan::new(0, 10);
+    let range = RangeNode::new(one, var_x_in_expr, span);
+    let range_id = arena.add(AstNode::Range(range));
+
+    // satisfies $y <= $x
+    let var_y = make_var_ref(&mut arena, "y");
+    let var_x = make_var_ref(&mut arena, "x");
+    let le = BinaryOpNode::new(BinaryOpKind::GeneralLe, var_y, var_x, span);
+    let le_id = arena.add(AstNode::BinaryOp(le));
+
+    // Build bindings manually for quantified expression
+    use crate::xpath::ast::ForBinding;
+    let _ = names.add("x");
+    let _ = names.add("y");
+    let bindings = vec![
+        ForBinding::new(String::new(), "x".to_string(), seq, span),
+        ForBinding::new(String::new(), "y".to_string(), range_id, span),
+    ];
+    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, le_id, span);
+    let quant_id = arena.add(AstNode::Quantified(quant_node));
+    let root = wrap_in_expr(&mut arena, quant_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+    let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+        DynamicContext::new(&ctx, binder.len());
+
+    let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+    match result {
+        XPathValue::Item(XmlItem::Atomic(v)) => {
+            assert_eq!(v.as_boolean(), Some(true));
+        }
+        _ => panic!("Expected boolean true"),
+    }
+}
+
+#[test]
+fn test_every_dependent_bindings_fails() {
+    // every $x in (1, 2, 3), $y in (1 to $x) satisfies $y < $x
+    // When $x=1: $y in (1), 1 < 1 is FALSE -> short-circuit, return false
+    // Expected: false
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let seq = make_int_sequence(&mut arena, &[1, 2, 3]);
+
+    // $y in (1 to $x)
+    let one = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let var_x_in_expr = make_var_ref(&mut arena, "x");
+    let span = SourceSpan::new(0, 10);
+    let range = RangeNode::new(one, var_x_in_expr, span);
+    let range_id = arena.add(AstNode::Range(range));
+
+    // satisfies $y < $x (strictly less than)
+    let var_y = make_var_ref(&mut arena, "y");
+    let var_x = make_var_ref(&mut arena, "x");
+    let lt = BinaryOpNode::new(BinaryOpKind::GeneralLt, var_y, var_x, span);
+    let lt_id = arena.add(AstNode::BinaryOp(lt));
+
+    // Build bindings manually for quantified expression
+    use crate::xpath::ast::ForBinding;
+    let _ = names.add("x");
+    let _ = names.add("y");
+    let bindings = vec![
+        ForBinding::new(String::new(), "x".to_string(), seq, span),
+        ForBinding::new(String::new(), "y".to_string(), range_id, span),
+    ];
+    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, lt_id, span);
+    let quant_id = arena.add(AstNode::Quantified(quant_node));
+    let root = wrap_in_expr(&mut arena, quant_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+    let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+        DynamicContext::new(&ctx, binder.len());
+
+    let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+    match result {
+        XPathValue::Item(XmlItem::Atomic(v)) => {
+            assert_eq!(v.as_boolean(), Some(false));
+        }
+        _ => panic!("Expected boolean false"),
+    }
+}
+
 // ============================================================================
 // Integration Tests (Parse -> Bind -> Eval)
 // ============================================================================

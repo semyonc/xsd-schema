@@ -60,14 +60,6 @@ pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathEr
     match op {
         UnaryOpKind::Identity => Ok(value.clone()),
         UnaryOpKind::Negate => eval_numeric_unary(value),
-        UnaryOpKind::BooleanNot => {
-            // TODO: Implement boolean not when needed
-            Err(XPathError::internal("BooleanNot operator not yet implemented"))
-        }
-        UnaryOpKind::Atomize => {
-            // TODO: Implement atomization when needed
-            Err(XPathError::internal("Atomize operator not yet implemented"))
-        }
     }
 }
 
@@ -114,14 +106,28 @@ pub fn eval_binary(
 }
 
 /// Evaluate an XPath range expression (`expr to expr`).
+///
+/// Per XPath 2.0 spec, both operands must be of type `xs:integer`.
+/// Non-integer types produce XPTY0004 type mismatch errors.
 pub fn eval_range(start: &XmlValue, end: &XmlValue) -> Result<Vec<XmlValue>, XPathError> {
-    let start_class = numeric_class(start.type_code)
-        .ok_or_else(|| XPathError::internal("Range start must be numeric"))?;
-    let end_class = numeric_class(end.type_code)
-        .ok_or_else(|| XPathError::internal("Range end must be numeric"))?;
+    let start_class = numeric_class(start.type_code).ok_or_else(|| {
+        XPathError::type_mismatch("xs:integer", type_code_to_name(start.type_code))
+    })?;
+    let end_class = numeric_class(end.type_code).ok_or_else(|| {
+        XPathError::type_mismatch("xs:integer", type_code_to_name(end.type_code))
+    })?;
 
-    if !is_integer_class(start_class) || !is_integer_class(end_class) {
-        return Err(XPathError::internal("Range bounds must be integer types"));
+    if !is_integer_class(start_class) {
+        return Err(XPathError::type_mismatch(
+            "xs:integer",
+            type_code_to_name(start.type_code),
+        ));
+    }
+    if !is_integer_class(end_class) {
+        return Err(XPathError::type_mismatch(
+            "xs:integer",
+            type_code_to_name(end.type_code),
+        ));
     }
 
     let start_val = to_integer_value(start)?;
