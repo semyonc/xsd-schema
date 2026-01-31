@@ -2520,3 +2520,421 @@ fn test_castable_as_empty_required() {
     }
 }
 } // end type_expr_tests
+
+// ============================================================================
+// Path Expression Tests
+// ============================================================================
+
+mod path_expr_tests {
+    use super::*;
+    use crate::xpath::ast::{
+        Axis, ExprNode, FilterExprNode, KindTest,
+        NameTest as AstNameTest, NodeTest as AstNodeTest, PathExprNode, PathStepNode,
+    };
+    use crate::xpath::bind::bind_node;
+    use crate::xpath::context::NameBinder;
+
+    /// Helper to create a path step
+    fn make_path_step(arena: &mut AstArena, axis: Axis, test: AstNodeTest) -> AstNodeId {
+        let span = SourceSpan::new(0, 10);
+        let step = PathStepNode::new(axis, test, span);
+        arena.add(AstNode::PathStep(step))
+    }
+
+    /// Helper to create a name test for any element
+    fn wildcard_name_test() -> AstNodeTest {
+        AstNodeTest::Name(AstNameTest::any())
+    }
+
+    /// Helper to create a kind test for node()
+    fn node_kind_test() -> AstNodeTest {
+        AstNodeTest::Kind(KindTest::AnyKind)
+    }
+
+    #[test]
+    fn test_path_root_only() {
+        // Test "/" - returns document root
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 1);
+        // Create root-only path "/"
+        let path = PathExprNode::root_only(span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Node(n)) => {
+                assert!(
+                    matches!(n.node_type(), crate::xpath::DomNodeType::Root),
+                    "Expected document root"
+                );
+            }
+            _ => panic!("Expected single node result"),
+        }
+    }
+
+    #[test]
+    fn test_path_absolute_child() {
+        // Test "/child::*" - returns root element
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+        nav.move_to_first_child(); // position at a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create step: child::*
+        let step_id = make_path_step(&mut arena, Axis::Child, wildcard_name_test());
+
+        // Create absolute path with that step
+        let path = PathExprNode::absolute(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Node(n)) => {
+                assert_eq!(n.local_name(), "root");
+            }
+            _ => panic!("Expected single node result for /*"),
+        }
+    }
+
+    #[test]
+    fn test_path_relative_child() {
+        // Test "child::*" from <root> - should return <a> and <b>
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create step: child::*
+        let step_id = make_path_step(&mut arena, Axis::Child, wildcard_name_test());
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 2);
+        match (&items[0], &items[1]) {
+            (XmlItem::Node(a), XmlItem::Node(b)) => {
+                assert_eq!(a.local_name(), "a");
+                assert_eq!(b.local_name(), "b");
+            }
+            _ => panic!("Expected two nodes"),
+        }
+    }
+
+    #[test]
+    fn test_path_descendant_or_self() {
+        // Test "descendant-or-self::node()" from <root> - should include root and descendants
+        let doc = roxmltree::Document::parse("<root><a><c/></a><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create step: descendant-or-self::node()
+        let step_id = make_path_step(&mut arena, Axis::DescendantOrSelf, node_kind_test());
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        // Should include: root, a, c, b
+        assert_eq!(items.len(), 4);
+    }
+
+    #[test]
+    fn test_path_parent_axis() {
+        // Test "parent::*" from <a> - should return <root>
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+        nav.move_to_first_child(); // position at a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create step: parent::*
+        let step_id = make_path_step(&mut arena, Axis::Parent, wildcard_name_test());
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Node(n)) => {
+                assert_eq!(n.local_name(), "root");
+            }
+            _ => panic!("Expected single node result for parent::*"),
+        }
+    }
+
+    #[test]
+    fn test_path_with_predicate_position() {
+        // Test "child::*[1]" - returns first child only
+        let doc = roxmltree::Document::parse("<root><a/><b/><c/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create predicate: 1
+        let pred = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+
+        // Create step: child::* with predicate [1]
+        let step = PathStepNode::with_predicates(
+            Axis::Child,
+            wildcard_name_test(),
+            vec![pred],
+            span,
+        );
+        let step_id = arena.add(AstNode::PathStep(step));
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Node(n)) => {
+                assert_eq!(n.local_name(), "a");
+            }
+            _ => panic!("Expected single node result for *[1]"),
+        }
+    }
+
+    #[test]
+    fn test_path_with_predicate_boolean() {
+        // Test "child::*[true()]" - returns all children
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create predicate: true()
+        let pred = make_function_call(&mut arena, "", "true", vec![]);
+
+        // Create step: child::* with predicate [true()]
+        let step = PathStepNode::with_predicates(
+            Axis::Child,
+            wildcard_name_test(),
+            vec![pred],
+            span,
+        );
+        let step_id = arena.add(AstNode::PathStep(step));
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 2, "Expected all children with [true()]");
+    }
+
+    #[test]
+    fn test_path_multi_step() {
+        // Test "child::*/child::*" - returns grandchildren
+        let doc = roxmltree::Document::parse("<root><a><x/><y/></a><b><z/></b></root>")
+            .expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create two steps: child::* / child::*
+        let step1 = make_path_step(&mut arena, Axis::Child, wildcard_name_test());
+        let step2 = make_path_step(&mut arena, Axis::Child, wildcard_name_test());
+
+        // Create relative path with both steps
+        let path = PathExprNode::relative(vec![step1, step2], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        let items = result.into_vec();
+        assert_eq!(items.len(), 3, "Expected 3 grandchildren: x, y, z");
+        let names: Vec<String> = items
+            .iter()
+            .filter_map(|item| match item {
+                XmlItem::Node(n) => Some(n.local_name().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert!(names.contains(&"x".to_string()));
+        assert!(names.contains(&"y".to_string()));
+        assert!(names.contains(&"z".to_string()));
+    }
+
+    #[test]
+    fn test_filter_expr() {
+        // Test "(1, 2, 3)[2]" - returns 2
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create sequence (1, 2, 3)
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v3 = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let expr = ExprNode::sequence(vec![v1, v2, v3], span);
+        let base_id = arena.add(AstNode::Expr(expr));
+
+        // Create predicate: 2
+        let pred = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+
+        // Create filter expression
+        let filter = FilterExprNode::new(base_id, vec![pred], span);
+        let filter_id = arena.add(AstNode::FilterExpr(filter));
+        let root = wrap_in_expr(&mut arena, filter_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("2".to_string()));
+            }
+            _ => panic!("Expected single integer result"),
+        }
+    }
+
+    #[test]
+    fn test_path_self_axis() {
+        // Test "self::*" from <root> - should return <root>
+        let doc = roxmltree::Document::parse("<root><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // position at root
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 10);
+
+        // Create step: self::*
+        let step_id = make_path_step(&mut arena, Axis::SelfAxis, wildcard_name_test());
+
+        // Create relative path
+        let path = PathExprNode::relative(vec![step_id], span);
+        let path_id = arena.add(AstNode::PathExpr(path));
+        let root = wrap_in_expr(&mut arena, path_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Node(n)) => {
+                assert_eq!(n.local_name(), "root");
+            }
+            _ => panic!("Expected single node result for self::*"),
+        }
+    }
+}

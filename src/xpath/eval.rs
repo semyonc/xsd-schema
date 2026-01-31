@@ -18,22 +18,31 @@
 
 use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{
-    AstNode, BinaryOpKind, ForBinding, ForNode, ItemTypeNode, OccurrenceIndicator, QuantifiedNode,
-    QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+    AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode,
+    KindTest, NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode,
+    QuantifiedNode, QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+};
+use crate::xpath::axis_iterators::{
+    AncestorAxis, AttributeAxis, ChildAxis, DescendantNodeIterator, FollowingNodeIterator,
+    FollowingSiblingAxis, NamespaceAxis, ParentAxis, PrecedingNodeIterator, PrecedingSiblingAxis,
+    SelfAxis, SequentialAxisNodeIterator,
 };
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
-use crate::xpath::context::DynamicContext;
+use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
-use crate::xpath::functions::{atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue};
-use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-use crate::xpath::node_ops::{following_node, preceding_node, same_node};
-use crate::xpath::node_test::matches_item_type_node;
+use crate::xpath::functions::{
+    atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue,
+};
+use crate::xpath::iterator::{DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator};
+use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node};
+use crate::xpath::node_test::{matches_item_type_node, NodeTest};
 use crate::xpath::operators::{
     eval_binary, eval_range, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter,
     general_le_iter, general_lt_iter, general_ne_iter,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNavigator;
+use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType};
 
 /// Evaluate an AST node and return the result.
 ///
@@ -146,13 +155,9 @@ pub fn eval_node<N: DomNavigator>(
             eval_quantified_expression(arena, quant_node, ctx)
         }
 
-        AstNode::PathExpr(_) => {
-            Err(XPathError::not_implemented("path expression evaluation"))
-        }
+        AstNode::PathExpr(path_expr) => eval_path_expr(arena, path_expr, ctx),
 
-        AstNode::FilterExpr(_) => {
-            Err(XPathError::not_implemented("filter expression evaluation"))
-        }
+        AstNode::FilterExpr(filter_expr) => eval_filter_expr(arena, filter_expr, ctx),
 
         AstNode::Range(range) => {
             let start_val = eval_node(arena, range.start, ctx)?;
@@ -294,7 +299,10 @@ pub fn eval_node<N: DomNavigator>(
         }
 
         AstNode::PathStep(_) => {
-            Err(XPathError::not_implemented("path step evaluation"))
+            // PathStep should not be evaluated directly - it's processed via eval_path_step
+            Err(XPathError::Internal(
+                "PathStep should not be evaluated directly".to_string(),
+            ))
         }
 
         AstNode::TypeExpr(type_expr) => {
@@ -615,6 +623,499 @@ fn format_item_type<N: DomNavigator>(item: &XmlItem<N>) -> String {
             format!("{:?}", value.type_code)
         }
     }
+}
+
+// ============================================================================
+// Path Expression Evaluation
+// ============================================================================
+
+/// Evaluate a path expression.
+///
+/// Implements XPath 2.0 path expression semantics:
+/// - Root-only path (`/`): Returns the document root
+/// - Absolute paths (`/a/b`): Start from document root
+/// - Relative paths (`a/b`): Start from context node
+/// - Paths are evaluated left-to-right, chaining steps
+fn eval_path_expr<N: DomNavigator>(
+    arena: &AstArena,
+    path_expr: &PathExprNode,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Handle root-only path: "/"
+    if path_expr.is_absolute && path_expr.steps.is_empty() {
+        let context_node = ctx.require_context_node()?;
+        let root = get_root(context_node);
+        return Ok(XPathValue::from_node(root));
+    }
+
+    // Determine the starting nodes based on path type
+    let starting_nodes: Vec<N> = if path_expr.is_absolute {
+        // Absolute path: start from document root
+        let context_node = ctx.require_context_node()?;
+        vec![get_root(context_node)]
+    } else {
+        // Relative path: start from context node
+        let context_node = ctx.require_context_node()?;
+        vec![context_node.clone()]
+    };
+
+    // Check if any step is a FilterExpr as the first step (special case)
+    // or if this path might need document order sorting
+    let needs_doc_order = path_needs_document_order(arena, path_expr);
+
+    // Process steps sequentially
+    let mut current_nodes: Vec<XmlItem<N>> =
+        starting_nodes.into_iter().map(XmlItem::Node).collect();
+
+    for (step_idx, &step_id) in path_expr.steps.iter().enumerate() {
+        let step_node = arena.get(step_id);
+
+        current_nodes = match step_node {
+            AstNode::PathStep(path_step) => {
+                eval_path_step(arena, path_step, current_nodes, ctx, step_idx == 0)?
+            }
+            AstNode::FilterExpr(filter_expr) => {
+                // FilterExpr as a step - evaluate it and use its result
+                if step_idx == 0 {
+                    // First step is a FilterExpr - evaluate it directly
+                    let result = eval_filter_expr(arena, filter_expr, ctx)?;
+                    result.into_vec()
+                } else {
+                    // FilterExpr in a later position - this is applied to each node in sequence
+                    let mut results = Vec::new();
+                    for item in current_nodes {
+                        // Set context to this item and evaluate the filter expression
+                        let saved_context = ctx.context_item.take();
+                        let saved_pos = ctx.context_position;
+                        let saved_size = ctx.context_size;
+
+                        ctx.context_item = Some(item);
+                        ctx.context_position = 1;
+                        ctx.context_size = 1;
+
+                        let step_result = eval_filter_expr(arena, filter_expr, ctx)?;
+                        results.extend(step_result.into_vec());
+
+                        ctx.context_item = saved_context;
+                        ctx.context_position = saved_pos;
+                        ctx.context_size = saved_size;
+                    }
+                    results
+                }
+            }
+            _ => {
+                // Other expression types (like function calls) as steps
+                // Evaluate for each node in the current sequence
+                let mut results = Vec::new();
+                for item in current_nodes {
+                    let saved_context = ctx.context_item.take();
+                    let saved_pos = ctx.context_position;
+                    let saved_size = ctx.context_size;
+
+                    ctx.context_item = Some(item);
+                    ctx.context_position = 1;
+                    ctx.context_size = 1;
+
+                    let step_result = eval_node(arena, step_id, ctx)?;
+                    results.extend(step_result.into_vec());
+
+                    ctx.context_item = saved_context;
+                    ctx.context_position = saved_pos;
+                    ctx.context_size = saved_size;
+                }
+                results
+            }
+        };
+
+        // Early exit if sequence becomes empty
+        if current_nodes.is_empty() {
+            return Ok(XPathValue::empty());
+        }
+    }
+
+    // Apply document order if needed (for paths with reverse axes)
+    if needs_doc_order && !current_nodes.is_empty() {
+        let iter = VecNodeIterator::new(current_nodes);
+        let doc_order_iter = DocumentOrderNodeIterator::new(iter)?;
+        let mut doc_order_iter = doc_order_iter;
+        current_nodes = collect_iterator(&mut doc_order_iter)?;
+    }
+
+    Ok(XPathValue::from_sequence(current_nodes))
+}
+
+/// Check if a path expression needs document order sorting.
+///
+/// Returns true if the path contains:
+/// - Any reverse axis (parent, ancestor, preceding, preceding-sibling, ancestor-or-self)
+/// - FilterExpr at non-first position
+/// - Descendant/DescendantOrSelf/Following axis followed by non-Attribute/non-Namespace steps
+///   (these can produce duplicates when input nodes have overlapping descendants)
+fn path_needs_document_order(arena: &AstArena, path_expr: &PathExprNode) -> bool {
+    let len = path_expr.steps.len();
+    for (idx, &step_id) in path_expr.steps.iter().enumerate() {
+        match arena.get(step_id) {
+            AstNode::PathStep(step) => {
+                // Reverse axes always need sorting
+                if step.axis.is_reverse() {
+                    return true;
+                }
+                // Descendant/DescendantOrSelf/Following axes need sorting if followed
+                // by non-attribute/non-namespace steps (can produce duplicates)
+                if matches!(
+                    step.axis,
+                    Axis::Descendant | Axis::DescendantOrSelf | Axis::Following
+                ) {
+                    for s in (idx + 1)..len {
+                        if let AstNode::PathStep(next_step) = arena.get(path_expr.steps[s]) {
+                            if !matches!(next_step.axis, Axis::Attribute | Axis::Namespace) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            AstNode::FilterExpr(_) if idx > 0 => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Evaluate a single path step against a sequence of nodes.
+fn eval_path_step<N: DomNavigator>(
+    arena: &AstArena,
+    step: &PathStepNode,
+    input_nodes: Vec<XmlItem<N>>,
+    ctx: &mut DynamicContext<'_, N>,
+    _is_first_step: bool,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    // Convert input to nodes only (XPTY0019 if atomic values present)
+    let nodes: Vec<N> = input_nodes
+        .into_iter()
+        .map(|item| match item {
+            XmlItem::Node(n) => Ok(n),
+            XmlItem::Atomic(_) => Err(XPathError::XPTY0019),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if nodes.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Convert the step's node test to runtime NodeTest
+    let node_test = step_to_node_test(step, ctx.static_context);
+
+    // Create the base iterator from input nodes
+    let base_iter = VecNodeIterator::new(nodes.into_iter().map(XmlItem::Node).collect());
+
+    // Apply axis iterator
+    let xpath_ctx = ctx.static_context.clone();
+    let stepped_items = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter)?;
+
+    // Apply predicates if any
+    if step.predicates.is_empty() {
+        Ok(stepped_items)
+    } else {
+        eval_predicates(arena, &step.predicates, ctx, stepped_items)
+    }
+}
+
+/// Convert a PathStepNode to a runtime NodeTest.
+fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<NodeTest> {
+    // If we have a resolved_test from binding, use it
+    if let Some(ref resolved) = step.resolved_test {
+        return Some(NodeTest::Name(resolved.clone()));
+    }
+
+    // Otherwise, convert from AST node test
+    match &step.test {
+        AstNodeTest::Name(name_test) => {
+            // Convert AST NameTest to runtime NameTest
+            match (&name_test.prefix, &name_test.local_name) {
+                (None, None) => {
+                    // * - wildcard
+                    Some(NodeTest::Name(RuntimeNameTest::Wildcard))
+                }
+                (None, Some(local)) => {
+                    // *:local - namespace wildcard
+                    let local_id = ctx.names.add(local);
+                    Some(NodeTest::Name(RuntimeNameTest::NamespaceWildcard(local_id)))
+                }
+                (Some(prefix), None) => {
+                    // prefix:* - local wildcard
+                    if let Some(ns_uri) = ctx.resolve_prefix(prefix) {
+                        let ns_id = ctx.names.add(&ns_uri);
+                        Some(NodeTest::Name(RuntimeNameTest::LocalWildcard(ns_id)))
+                    } else {
+                        None // Unknown prefix
+                    }
+                }
+                (Some(prefix), Some(local)) => {
+                    // prefix:local - specific QName
+                    let local_id = ctx.names.add(local);
+                    let ns_uri = if prefix.is_empty() {
+                        ctx.default_element_ns
+                    } else {
+                        ctx.resolve_prefix(prefix).map(|s| ctx.names.add(&s))
+                    };
+                    let qname =
+                        crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None);
+                    Some(NodeTest::Name(RuntimeNameTest::QName(qname)))
+                }
+            }
+        }
+        AstNodeTest::Kind(kind_test) => {
+            // Convert AST KindTest to SequenceType
+            let seq_type = kind_test_to_sequence_type(kind_test);
+            Some(NodeTest::Type(seq_type))
+        }
+    }
+}
+
+/// Convert an AST KindTest to a SequenceType.
+fn kind_test_to_sequence_type(kind: &KindTest) -> SequenceType {
+    match kind {
+        KindTest::AnyKind => SequenceType::node(),
+        KindTest::Text => SequenceType::one(ItemType::Text),
+        KindTest::Comment => SequenceType::one(ItemType::Comment),
+        KindTest::ProcessingInstruction(target) => {
+            SequenceType::one(ItemType::ProcessingInstruction(target.clone()))
+        }
+        KindTest::Document(inner) => {
+            let inner_type = inner.as_ref().map(|k| Box::new(kind_test_to_item_type(k)));
+            SequenceType::one(ItemType::Document(inner_type))
+        }
+        KindTest::Element(_) => {
+            // For simplicity, treat as element() without name/type constraints
+            // The actual name test is handled separately
+            SequenceType::one(ItemType::Element(None, None))
+        }
+        KindTest::Attribute(_) => {
+            // For simplicity, treat as attribute() without name/type constraints
+            SequenceType::one(ItemType::Attribute(None, None))
+        }
+        KindTest::SchemaElement(_) | KindTest::SchemaAttribute(_) => {
+            // Schema-aware types - treat as generic element/attribute for now
+            SequenceType::node()
+        }
+    }
+}
+
+/// Convert an AST KindTest to an ItemType (for nested tests like document-node(element(...))).
+fn kind_test_to_item_type(kind: &KindTest) -> ItemType {
+    match kind {
+        KindTest::AnyKind => ItemType::AnyNode,
+        KindTest::Text => ItemType::Text,
+        KindTest::Comment => ItemType::Comment,
+        KindTest::ProcessingInstruction(target) => {
+            ItemType::ProcessingInstruction(target.clone())
+        }
+        KindTest::Document(inner) => {
+            let inner_type = inner.as_ref().map(|k| Box::new(kind_test_to_item_type(k)));
+            ItemType::Document(inner_type)
+        }
+        KindTest::Element(_) => ItemType::Element(None, None),
+        KindTest::Attribute(_) => ItemType::Attribute(None, None),
+        KindTest::SchemaElement(_) | KindTest::SchemaAttribute(_) => ItemType::AnyNode,
+    }
+}
+
+/// Apply an axis iterator to a base iterator.
+fn apply_axis_iterator<N: DomNavigator>(
+    axis: Axis,
+    node_test: Option<NodeTest>,
+    ctx: XPathContext<'_>,
+    base_iter: VecNodeIterator<N>,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    match axis {
+        Axis::Child => {
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, ChildAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::Descendant => {
+            let mut iter = DescendantNodeIterator::new(ctx, node_test, false, base_iter);
+            collect_iterator(&mut iter)
+        }
+        Axis::DescendantOrSelf => {
+            let mut iter = DescendantNodeIterator::new(ctx, node_test, true, base_iter);
+            collect_iterator(&mut iter)
+        }
+        Axis::Attribute => {
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, AttributeAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::SelfAxis => {
+            // SelfAxis returns current node via move_to_first, so match_self=false
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, SelfAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::Parent => {
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, ParentAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::Ancestor => {
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, AncestorAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::AncestorOrSelf => {
+            let mut iter =
+                SequentialAxisNodeIterator::new(ctx, node_test, true, base_iter, AncestorAxis);
+            collect_iterator(&mut iter)
+        }
+        Axis::FollowingSibling => {
+            let mut iter = SequentialAxisNodeIterator::new(
+                ctx,
+                node_test,
+                false,
+                base_iter,
+                FollowingSiblingAxis,
+            );
+            collect_iterator(&mut iter)
+        }
+        Axis::PrecedingSibling => {
+            let mut iter = SequentialAxisNodeIterator::new(
+                ctx,
+                node_test,
+                false,
+                base_iter,
+                PrecedingSiblingAxis,
+            );
+            collect_iterator(&mut iter)
+        }
+        Axis::Following => {
+            let mut iter = FollowingNodeIterator::new(ctx, node_test, base_iter);
+            collect_iterator(&mut iter)
+        }
+        Axis::Preceding => {
+            let mut iter = PrecedingNodeIterator::new(ctx, node_test, base_iter);
+            collect_iterator(&mut iter)
+        }
+        Axis::Namespace => {
+            let mut iter = SequentialAxisNodeIterator::new(
+                ctx,
+                node_test,
+                false,
+                base_iter,
+                NamespaceAxis::default(),
+            );
+            collect_iterator(&mut iter)
+        }
+    }
+}
+
+/// Collect iterator results into a Vec.
+fn collect_iterator<I: XmlNodeIterator>(iter: &mut I) -> Result<Vec<XmlItem<I::Navigator>>, XPathError> {
+    let mut results = Vec::new();
+    while iter.move_next()? {
+        if let Some(item_ref) = iter.current() {
+            let item = match item_ref {
+                crate::xpath::iterator::XmlItemRef::Node(n) => XmlItem::Node(n.clone()),
+                crate::xpath::iterator::XmlItemRef::Atomic(v) => XmlItem::Atomic(v.clone()),
+            };
+            results.push(item);
+        }
+    }
+    Ok(results)
+}
+
+// ============================================================================
+// Filter Expression Evaluation
+// ============================================================================
+
+/// Evaluate a filter expression (`expr[predicate][predicate]...`).
+fn eval_filter_expr<N: DomNavigator>(
+    arena: &AstArena,
+    filter_expr: &FilterExprNode,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Evaluate the base expression
+    let base_value = eval_node(arena, filter_expr.base, ctx)?;
+
+    // If no predicates, return base value directly
+    if filter_expr.predicates.is_empty() {
+        return Ok(base_value);
+    }
+
+    // Apply predicates
+    let items = base_value.into_vec();
+    let filtered = eval_predicates(arena, &filter_expr.predicates, ctx, items)?;
+    Ok(XPathValue::from_sequence(filtered))
+}
+
+/// Evaluate predicates on a sequence of items.
+///
+/// Each predicate is evaluated in order. For each predicate:
+/// - If the predicate evaluates to a number, select the item at that position
+/// - Otherwise, use effective boolean value to filter
+fn eval_predicates<N: DomNavigator>(
+    arena: &AstArena,
+    predicates: &[AstNodeId],
+    ctx: &mut DynamicContext<'_, N>,
+    mut items: Vec<XmlItem<N>>,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    for &pred_id in predicates {
+        if items.is_empty() {
+            break;
+        }
+
+        let size = items.len();
+        let mut filtered = Vec::new();
+
+        for (idx, item) in items.into_iter().enumerate() {
+            let position = idx + 1; // 1-based position
+
+            // Save current context
+            let saved_item = ctx.context_item.take();
+            let saved_pos = ctx.context_position;
+            let saved_size = ctx.context_size;
+
+            // Set predicate context
+            ctx.context_item = Some(item.clone());
+            ctx.context_position = position;
+            ctx.context_size = size;
+
+            // Evaluate predicate
+            let pred_result = eval_node(arena, pred_id, ctx)?;
+
+            // Restore context
+            ctx.context_item = saved_item;
+            ctx.context_position = saved_pos;
+            ctx.context_size = saved_size;
+
+            // Check if item should be included
+            let include = match &pred_result {
+                XPathValue::Item(XmlItem::Atomic(value)) if value.type_code.is_numeric() => {
+                    // Numeric predicate: include if position equals the number exactly.
+                    // Per XPath 2.0 spec, [N] is equivalent to [position() = N].
+                    // No rounding: [2.5] matches nothing (2.5 != 2 and 2.5 != 3).
+                    let num = crate::xpath::atomize::to_number(value);
+                    if num.is_nan() {
+                        false
+                    } else {
+                        // Direct comparison without rounding
+                        (position as f64) == num
+                    }
+                }
+                _ => effective_boolean_value(&pred_result)?,
+            };
+
+            if include {
+                filtered.push(item);
+            }
+        }
+
+        items = filtered;
+    }
+
+    Ok(items)
 }
 
 use std::ops::ControlFlow;
