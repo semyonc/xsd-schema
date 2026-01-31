@@ -27,6 +27,7 @@ use crate::xpath::operators::{
     eval_binary, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter, general_le_iter,
     general_lt_iter, general_ne_iter,
 };
+use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNavigator;
 
 /// Evaluate an AST node and return the result.
@@ -255,9 +256,21 @@ pub fn eval_node<N: DomNavigator>(
                     }
                 }
 
-                // Sequence operators - require path evaluation (deferred)
+                // Sequence operators - node-only, return document order with duplicates removed
                 BinaryOpKind::Union | BinaryOpKind::Intersect | BinaryOpKind::Except => {
-                    Err(XPathError::not_implemented("sequence operators"))
+                    let left_val = eval_node(arena, bin_op.left, ctx)?;
+                    let right_val = eval_node(arena, bin_op.right, ctx)?;
+
+                    let left_vec = left_val.into_vec();
+                    let right_vec = right_val.into_vec();
+
+                    let result = match bin_op.kind {
+                        BinaryOpKind::Union => union_nodes(left_vec, right_vec)?,
+                        BinaryOpKind::Intersect => intersect_nodes(left_vec, right_vec)?,
+                        BinaryOpKind::Except => except_nodes(left_vec, right_vec)?,
+                        _ => unreachable!(),
+                    };
+                    Ok(XPathValue::from_sequence(result))
                 }
             }
         }
@@ -1253,6 +1266,194 @@ mod tests {
         // $a << $b where a precedes b → true
         // $a >> $b where a follows b → true
         // These tests require path evaluation to get different nodes
+    }
+
+    // ========================================================================
+    // Sequence Operator Tests (Union, Intersect, Except)
+    // ========================================================================
+
+    #[test]
+    fn test_union_operator_with_atomic_values() {
+        // Test union with atomic values (should fail with XPTY0004)
+        // (1, 2) | (3, 4) → type error
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v3 = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let v4 = arena.add(AstNode::Value(ValueNode::Integer("4".to_string())));
+        let span = SourceSpan::new(0, 15);
+        let left_seq = ExprNode::sequence(vec![v1, v2], span);
+        let left = arena.add(AstNode::Expr(left_seq));
+        let right_seq = ExprNode::sequence(vec![v3, v4], span);
+        let right = arena.add(AstNode::Expr(right_seq));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Union, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_intersect_operator_with_atomic_values() {
+        // Test intersect with atomic values (should fail with XPTY0004)
+        // (1, 2) intersect (2, 3) → type error
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v3 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v4 = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 20);
+        let left_seq = ExprNode::sequence(vec![v1, v2], span);
+        let left = arena.add(AstNode::Expr(left_seq));
+        let right_seq = ExprNode::sequence(vec![v3, v4], span);
+        let right = arena.add(AstNode::Expr(right_seq));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Intersect, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_except_operator_with_atomic_values() {
+        // Test except with atomic values (should fail with XPTY0004)
+        // (1, 2) except (2, 3) → type error
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v3 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let v4 = arena.add(AstNode::Value(ValueNode::Integer("3".to_string())));
+        let span = SourceSpan::new(0, 20);
+        let left_seq = ExprNode::sequence(vec![v1, v2], span);
+        let left = arena.add(AstNode::Expr(left_seq));
+        let right_seq = ExprNode::sequence(vec![v3, v4], span);
+        let right = arena.add(AstNode::Expr(right_seq));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Except, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_union_operator_with_empty_sequences() {
+        // Test union with empty sequences
+        // () | () → ()
+        let mut arena = AstArena::new();
+        let left = arena.add(AstNode::Value(ValueNode::Empty));
+        let right = arena.add(AstNode::Value(ValueNode::Empty));
+        let span = SourceSpan::new(0, 6);
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Union, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_union_operator_with_nodes() {
+        // Test union with actual nodes
+        use crate::xpath::context::NameBinder;
+
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        // Build AST for: . | .
+        // Same node union should return just one node
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 6);
+        let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Union, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        // Union of same node with itself should give 1 node (deduplicated)
+        assert_eq!(result.into_vec().len(), 1);
+    }
+
+    #[test]
+    fn test_intersect_operator_with_nodes() {
+        // Test intersect with actual nodes
+        use crate::xpath::context::NameBinder;
+
+        let doc = roxmltree::Document::parse("<root><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        // Build AST for: . intersect .
+        // Same node intersect should return that node
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 15);
+        let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Intersect, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        // Intersect of same node with itself should give 1 node
+        assert_eq!(result.into_vec().len(), 1);
+    }
+
+    #[test]
+    fn test_except_operator_with_nodes() {
+        // Test except with actual nodes
+        use crate::xpath::context::NameBinder;
+
+        let doc = roxmltree::Document::parse("<root><a/></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        // Build AST for: . except .
+        // Same node except should return empty (node minus itself = empty)
+        let mut arena = AstArena::new();
+        let span = SourceSpan::new(0, 12);
+        let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+        let bin_op = BinaryOpNode::new(BinaryOpKind::Except, left, right, span);
+        let bin_id = arena.add(AstNode::BinaryOp(bin_op));
+        let root = wrap_in_expr(&mut arena, bin_id);
+
+        bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
+        // Except of same node with itself should give empty sequence
+        assert!(result.is_empty());
     }
 }
 
