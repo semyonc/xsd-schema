@@ -11,18 +11,22 @@ use num_bigint::BigInt;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
 
-use crate::xpath::cast::cast_to;
-use crate::xpath::context::XPathContext;
-use crate::xpath::error::XPathError;
-use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
-use crate::xpath::type_info::type_code_to_name;
-use crate::xpath::DomNavigator;
+use crate::ids::{SimpleTypeKey, TypeKey};
+use crate::namespace::qname::QualifiedName;
+use crate::schema::model::SchemaSet;
+use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{
     DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue,
     TimezoneOffset, YearMonthDurationValue, XmlAtomicValue, XmlValue, XmlValueKind,
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
+use crate::xpath::cast::cast_to;
+use crate::xpath::context::XPathContext;
+use crate::xpath::error::XPathError;
+use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
+use crate::xpath::type_info::type_code_to_name;
+use crate::xpath::DomNavigator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NumericClass {
@@ -1826,11 +1830,222 @@ pub fn magnitude_relationship(
     Ok((left_result, right_result))
 }
 
+// ============================================================================
+// Schema-aware primitive type resolution for magnitude relationship
+// ============================================================================
+
+/// Get the primitive base type for a schema-defined simple type.
+///
+/// Per XPath 2.0 spec, when casting untypedAtomic in general comparisons,
+/// we cast to the **primitive base type** of the other operand's dynamic type.
+/// This walks the base type chain to find the built-in primitive type.
+///
+/// Returns the XmlTypeCode of the primitive base type, or the input type_code
+/// if no schema information is available.
+fn get_primitive_base_type(
+    schema_set: Option<&SchemaSet>,
+    schema_type: Option<SimpleTypeKey>,
+    type_code: XmlTypeCode,
+) -> XmlTypeCode {
+    // If we have schema info, resolve the primitive base type
+    if let (Some(schema_set), Some(type_key)) = (schema_set, schema_type) {
+        let builtin_types = schema_set.builtin_types();
+
+        // Check if the type itself is a built-in
+        if let Some(code) = builtin_types.get_type_code(type_key) {
+            return get_xsd_primitive_type(code);
+        }
+
+        // Walk base type chain to find a built-in type
+        if let Some(type_def) = schema_set.arenas.simple_types.get(type_key) {
+            let mut current_def = type_def;
+            loop {
+                if let Some(TypeKey::Simple(base_key)) = current_def.resolved_base_type {
+                    if let Some(code) = builtin_types.get_type_code(base_key) {
+                        return get_xsd_primitive_type(code);
+                    }
+                    if let Some(base_def) = schema_set.arenas.simple_types.get(base_key) {
+                        current_def = base_def;
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Fallback: use the type_code's primitive base type
+    get_xsd_primitive_type(type_code)
+}
+
+/// Map an XmlTypeCode to its XSD primitive base type.
+///
+/// Per XPath 2.0 spec, these are the 19 primitive types plus special handling
+/// for dayTimeDuration and yearMonthDuration.
+fn get_xsd_primitive_type(code: XmlTypeCode) -> XmlTypeCode {
+    match code {
+        // Already primitive types - return as-is
+        XmlTypeCode::String
+        | XmlTypeCode::Boolean
+        | XmlTypeCode::Decimal
+        | XmlTypeCode::Float
+        | XmlTypeCode::Double
+        | XmlTypeCode::Duration
+        | XmlTypeCode::DateTime
+        | XmlTypeCode::Time
+        | XmlTypeCode::Date
+        | XmlTypeCode::GYearMonth
+        | XmlTypeCode::GYear
+        | XmlTypeCode::GMonthDay
+        | XmlTypeCode::GDay
+        | XmlTypeCode::GMonth
+        | XmlTypeCode::HexBinary
+        | XmlTypeCode::Base64Binary
+        | XmlTypeCode::AnyUri
+        | XmlTypeCode::QName
+        | XmlTypeCode::Notation => code,
+
+        // XPath 2.0 special cases: dayTimeDuration and yearMonthDuration
+        // These are their own "primitive" types for comparison purposes
+        XmlTypeCode::DayTimeDuration => XmlTypeCode::DayTimeDuration,
+        XmlTypeCode::YearMonthDuration => XmlTypeCode::YearMonthDuration,
+
+        // String-derived types → xs:string
+        XmlTypeCode::NormalizedString
+        | XmlTypeCode::Token
+        | XmlTypeCode::Language
+        | XmlTypeCode::NmToken
+        | XmlTypeCode::Name
+        | XmlTypeCode::NCName
+        | XmlTypeCode::Id
+        | XmlTypeCode::IdRef
+        | XmlTypeCode::Entity => XmlTypeCode::String,
+
+        // Integer hierarchy → xs:decimal (the primitive for all integers)
+        XmlTypeCode::Integer
+        | XmlTypeCode::NonPositiveInteger
+        | XmlTypeCode::NegativeInteger
+        | XmlTypeCode::Long
+        | XmlTypeCode::Int
+        | XmlTypeCode::Short
+        | XmlTypeCode::Byte
+        | XmlTypeCode::NonNegativeInteger
+        | XmlTypeCode::UnsignedLong
+        | XmlTypeCode::UnsignedInt
+        | XmlTypeCode::UnsignedShort
+        | XmlTypeCode::UnsignedByte
+        | XmlTypeCode::PositiveInteger => XmlTypeCode::Decimal,
+
+        // dateTimeStamp → xs:dateTime
+        XmlTypeCode::DateTimeStamp => XmlTypeCode::DateTime,
+
+        // List types - shouldn't reach here after atomization, but fallback to string
+        XmlTypeCode::NmTokens | XmlTypeCode::IdRefs | XmlTypeCode::Entities => XmlTypeCode::String,
+
+        // Other/unknown types → xs:string as fallback
+        _ => XmlTypeCode::String,
+    }
+}
+
+/// Cast an UntypedAtomic value to a primitive type.
+///
+/// Uses `cast_to` for types it supports, falls back to `VALIDATOR_REGISTRY`
+/// for other types (date/time/duration/etc). Does NOT apply facets.
+fn cast_to_primitive(
+    value: &XmlValue,
+    target_type: XmlTypeCode,
+) -> Result<XmlValue, XPathError> {
+    // First try cast_to which handles common types
+    match cast_to(value, target_type) {
+        Ok(result) => Ok(result),
+        Err(_) => {
+            // Fallback to VALIDATOR_REGISTRY for date/time/duration types
+            let string_val = value.to_string_value();
+            VALIDATOR_REGISTRY
+                .validate(target_type, &string_val)
+                .map_err(|e| XPathError::FORG0001 {
+                    value: string_val,
+                    target_type: format!("{:?}: {}", target_type, e),
+                })
+        }
+    }
+}
+
+/// Cast an UntypedAtomic value to a primitive type with namespace context.
+///
+/// This handles QName and NOTATION specially by resolving namespace prefixes
+/// using the in-scope namespace bindings from the XPath context.
+fn cast_to_primitive_ctx(
+    context: &XPathContext,
+    value: &XmlValue,
+    target_type: XmlTypeCode,
+) -> Result<XmlValue, XPathError> {
+    match target_type {
+        XmlTypeCode::QName | XmlTypeCode::Notation => {
+            // QName/NOTATION need namespace resolution
+            cast_to_qname_with_context(context, value, target_type)
+        }
+        _ => cast_to_primitive(value, target_type),
+    }
+}
+
+/// Cast an UntypedAtomic value to QName or NOTATION with namespace resolution.
+///
+/// Parses the lexical QName and resolves the prefix using the context's namespace bindings.
+fn cast_to_qname_with_context(
+    context: &XPathContext,
+    value: &XmlValue,
+    type_code: XmlTypeCode,
+) -> Result<XmlValue, XPathError> {
+    use crate::xpath::functions::qname::parse_lexical_qname;
+
+    let lexical = value.to_string_value();
+
+    // Parse prefix:local or local (reuse existing validated parser)
+    let (prefix, local_name) = parse_lexical_qname(&lexical)?;
+
+    // Resolve namespace using context.namespaces
+    let namespace_uri = if let Some(ref pfx) = prefix {
+        let prefix_id = context
+            .names
+            .get(pfx)
+            .ok_or_else(|| XPathError::undefined_prefix(pfx))?;
+        let ns_id = context
+            .namespaces
+            .resolve_prefix(prefix_id)
+            .ok_or_else(|| XPathError::undefined_prefix(pfx))?;
+        Some(ns_id)
+    } else {
+        // Unprefixed QName in casting context - no namespace per XPath spec
+        None
+    };
+
+    // Build QualifiedName
+    let local_id = context.names.add(&local_name);
+    let prefix_id = prefix.as_ref().map(|p| context.names.add(p));
+    let qn = QualifiedName::new(namespace_uri, local_id, prefix_id);
+
+    Ok(XmlValue::new(
+        type_code,
+        XmlValueKind::Atomic(XmlAtomicValue::QName(qn)),
+    ))
+}
+
 /// Perform magnitude relationship promotion with context-aware casting.
 ///
-/// This mirrors `MagnitudeRelationship` in C# with support for schema-aware casts.
+/// Per XPath 2.0 spec (general comparison rules):
+/// - If both operands are numeric → both cast to xs:double
+/// - If both operands are xs:untypedAtomic → both cast to xs:string
+/// - If exactly one operand is xs:untypedAtomic:
+///   - If other is numeric → cast untyped to xs:double
+///   - If other is xs:dayTimeDuration → cast untyped to xs:dayTimeDuration
+///   - If other is xs:yearMonthDuration → cast untyped to xs:yearMonthDuration
+///   - Otherwise → cast untyped to the **primitive base type** of the other operand
+///
+/// Note: This does NOT apply facet validation - facets are for schema validation,
+/// not XPath general comparisons.
 pub fn magnitude_relationship_ctx(
-    _context: &XPathContext,
+    context: &XPathContext,
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<(XmlValue, XmlValue), XPathError> {
@@ -1839,29 +2054,45 @@ pub fn magnitude_relationship_ctx(
 
     if left_result.type_code == XmlTypeCode::UntypedAtomic {
         if right.type_code.is_numeric() {
+            // Numeric → cast to xs:double
             let s = left_result.to_string_value();
             let d: f64 = s.trim().parse().map_err(|_| {
                 XPathError::invalid_cast_value(&s, "xs:double")
             })?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
+            // String-like → cast to xs:string
             left_result = XmlValue::string(left_result.to_string_value());
         } else if right.type_code != XmlTypeCode::UntypedAtomic {
-            left_result = cast_to(&left_result, right.type_code)?;
+            // Other typed value → cast to primitive base type
+            let primitive_type = get_primitive_base_type(
+                context.schema_set,
+                right.schema_type,
+                right.type_code,
+            );
+            left_result = cast_to_primitive_ctx(context, &left_result, primitive_type)?;
         }
     }
 
     if right_result.type_code == XmlTypeCode::UntypedAtomic {
         if left_result.type_code.is_numeric() {
+            // Numeric → cast to xs:double
             let s = right_result.to_string_value();
             let d: f64 = s.trim().parse().map_err(|_| {
                 XPathError::invalid_cast_value(&s, "xs:double")
             })?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
+            // String-like → cast to xs:string
             right_result = XmlValue::string(right_result.to_string_value());
         } else if left_result.type_code != XmlTypeCode::UntypedAtomic {
-            right_result = cast_to(&right_result, left_result.type_code)?;
+            // Other typed value → cast to primitive base type
+            let primitive_type = get_primitive_base_type(
+                context.schema_set,
+                left_result.schema_type,
+                left_result.type_code,
+            );
+            right_result = cast_to_primitive_ctx(context, &right_result, primitive_type)?;
         }
     }
 
@@ -3053,5 +3284,157 @@ mod tests {
 
         let result = general_gt_iter(&context, &left, &right);
         assert!(matches!(result, Err(XPathError::BinaryOperatorNotDefined { .. })));
+    }
+
+    // =========================================================================
+    // Primitive base type resolution tests (XPath 2.0 spec-aligned)
+    // =========================================================================
+
+    #[test]
+    fn test_magnitude_relationship_ctx_numeric_to_double() {
+        // Per XPath spec, UntypedAtomic is promoted to Double when compared with numeric types
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+
+        let untyped = XmlValue::untyped("42");
+        let typed = XmlValue::integer(BigInt::from(100));
+
+        let (left, _right) = magnitude_relationship_ctx(&context, &untyped, &typed).unwrap();
+
+        assert_eq!(left.type_code, XmlTypeCode::Double);
+        assert!((left.as_double().unwrap() - 42.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_ctx_promotes_untyped() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+
+        // Test UntypedAtomic promoted to numeric type
+        let untyped = XmlValue::untyped("2.5");
+        let typed = XmlValue::double(1.5);
+
+        let (left, right) = magnitude_relationship_ctx(&context, &untyped, &typed).unwrap();
+
+        assert_eq!(left.type_code, XmlTypeCode::Double);
+        assert!((left.as_double().unwrap() - 2.5).abs() < 0.001);
+        assert_eq!(right.type_code, XmlTypeCode::Double);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_ctx_string_like() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+
+        // Test UntypedAtomic with string-like type stays as string
+        let untyped = XmlValue::untyped("test");
+        let typed = XmlValue::string("other");
+
+        let (left, right) = magnitude_relationship_ctx(&context, &untyped, &typed).unwrap();
+
+        assert_eq!(left.type_code, XmlTypeCode::String);
+        assert_eq!(left.to_string_value(), "test");
+        assert_eq!(right.type_code, XmlTypeCode::String);
+    }
+
+    #[test]
+    fn test_get_xsd_primitive_type_string_derived() {
+        // String-derived types should map to xs:string
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::NormalizedString), XmlTypeCode::String);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Token), XmlTypeCode::String);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::NCName), XmlTypeCode::String);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Id), XmlTypeCode::String);
+    }
+
+    #[test]
+    fn test_get_xsd_primitive_type_integer_derived() {
+        // Integer-derived types should map to xs:decimal
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Integer), XmlTypeCode::Decimal);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Long), XmlTypeCode::Decimal);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Int), XmlTypeCode::Decimal);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::UnsignedInt), XmlTypeCode::Decimal);
+    }
+
+    #[test]
+    fn test_get_xsd_primitive_type_duration_special_cases() {
+        // dayTimeDuration and yearMonthDuration are their own primitives for XPath
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DayTimeDuration), XmlTypeCode::DayTimeDuration);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::YearMonthDuration), XmlTypeCode::YearMonthDuration);
+        // But xs:duration is already primitive
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Duration), XmlTypeCode::Duration);
+    }
+
+    #[test]
+    fn test_get_xsd_primitive_type_date_time() {
+        // Date/time types are already primitive
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DateTime), XmlTypeCode::DateTime);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Date), XmlTypeCode::Date);
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Time), XmlTypeCode::Time);
+        // dateTimeStamp derives from dateTime
+        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DateTimeStamp), XmlTypeCode::DateTime);
+    }
+
+    #[test]
+    fn test_get_primitive_base_type_without_schema() {
+        // Without schema info, should use the type_code's primitive
+        let primitive = get_primitive_base_type(None, None, XmlTypeCode::Integer);
+        assert_eq!(primitive, XmlTypeCode::Decimal);
+
+        let primitive = get_primitive_base_type(None, None, XmlTypeCode::NCName);
+        assert_eq!(primitive, XmlTypeCode::String);
+    }
+
+    #[test]
+    fn test_get_primitive_base_type_with_schema() {
+        // With schema info, should resolve from the type definition
+        let schema_set = SchemaSet::new();
+        let builtin_types = schema_set.builtin_types();
+
+        // xs:integer should resolve to xs:decimal
+        let primitive = get_primitive_base_type(
+            Some(&schema_set),
+            Some(builtin_types.integer),
+            XmlTypeCode::Integer,
+        );
+        assert_eq!(primitive, XmlTypeCode::Decimal);
+
+        // xs:string should stay as xs:string (already primitive)
+        let primitive = get_primitive_base_type(
+            Some(&schema_set),
+            Some(builtin_types.string),
+            XmlTypeCode::String,
+        );
+        assert_eq!(primitive, XmlTypeCode::String);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_ctx_to_date() {
+        // Test that UntypedAtomic is cast to xs:date when compared with date
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+
+        let untyped = XmlValue::untyped("2024-01-15");
+        let typed = date_value(2024, 6, 1);
+
+        let (left, right) = magnitude_relationship_ctx(&context, &untyped, &typed).unwrap();
+
+        assert_eq!(left.type_code, XmlTypeCode::Date);
+        assert_eq!(right.type_code, XmlTypeCode::Date);
+    }
+
+    #[test]
+    fn test_magnitude_relationship_ctx_to_boolean() {
+        // Test that UntypedAtomic is cast to xs:boolean when compared with boolean
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+
+        let untyped = XmlValue::untyped("true");
+        let typed = XmlValue::boolean(false);
+
+        let (left, right) = magnitude_relationship_ctx(&context, &untyped, &typed).unwrap();
+
+        assert_eq!(left.type_code, XmlTypeCode::Boolean);
+        assert_eq!(left.as_boolean(), Some(true));
+        assert_eq!(right.type_code, XmlTypeCode::Boolean);
     }
 }

@@ -278,7 +278,10 @@ pub fn in_scope_prefixes<N: DomNavigator>(
 // ============================================================================
 
 /// Parse a lexical QName string into (prefix, local_name).
-fn parse_lexical_qname(qname: &str) -> Result<(Option<String>, String), XPathError> {
+///
+/// This function validates that both the prefix (if present) and local name
+/// are valid NCNames per XML namespaces specification.
+pub fn parse_lexical_qname(qname: &str) -> Result<(Option<String>, String), XPathError> {
     let qname = qname.trim();
 
     if qname.is_empty() {

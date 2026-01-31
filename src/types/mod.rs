@@ -54,6 +54,7 @@ pub use sequence::{
 };
 pub use validators::{
     TypeValidator, ValidatorRegistry, ValidationError, ValidationResult,
+    VALIDATOR_REGISTRY,
 };
 pub use convert::{
     TypeConverter, ConversionError, ConversionResult, IntoXmlValue,

@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use num_bigint::BigInt;
+use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 
 use crate::error::FacetError;
@@ -221,6 +222,23 @@ impl Default for ValidatorRegistry {
         Self::new()
     }
 }
+
+/// Global validator registry instance.
+///
+/// This is a lazily-initialized singleton containing all built-in type validators.
+/// Use this instead of creating new `ValidatorRegistry` instances to avoid
+/// the overhead of re-registering 50+ validators on each call.
+///
+/// # Example
+///
+/// ```ignore
+/// use crate::types::validators::VALIDATOR_REGISTRY;
+///
+/// if let Some(validator) = VALIDATOR_REGISTRY.get_by_code(XmlTypeCode::Integer) {
+///     let result = validator.validate("42")?;
+/// }
+/// ```
+pub static VALIDATOR_REGISTRY: Lazy<ValidatorRegistry> = Lazy::new(ValidatorRegistry::new);
 
 // ============================================================================
 // String Validators
