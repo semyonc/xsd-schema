@@ -17,12 +17,17 @@
 //! Other node types return `not_implemented` errors for now.
 
 use crate::xpath::arena::{AstArena, AstNodeId};
-use crate::xpath::ast::{AstNode, BinaryOpKind, ForNode, QuantifiedNode, QuantifierKind, ValueNode};
+use crate::xpath::ast::{
+    AstNode, BinaryOpKind, ForNode, ItemTypeNode, OccurrenceIndicator, QuantifiedNode,
+    QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+};
+use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue};
 use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::node_ops::{following_node, preceding_node, same_node};
+use crate::xpath::node_test::matches_item_type_node;
 use crate::xpath::operators::{
     eval_binary, eval_range, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter,
     general_le_iter, general_lt_iter, general_ne_iter,
@@ -292,8 +297,322 @@ pub fn eval_node<N: DomNavigator>(
             Err(XPathError::not_implemented("path step evaluation"))
         }
 
-        AstNode::TypeExpr(_) => {
-            Err(XPathError::not_implemented("type expression evaluation"))
+        AstNode::TypeExpr(type_expr) => {
+            eval_type_expr(arena, type_expr, ctx)
+        }
+    }
+}
+
+// ============================================================================
+// Type Expression Evaluation
+// ============================================================================
+
+/// Evaluate a type expression (`instance of`, `treat as`, `cast as`, `castable as`).
+fn eval_type_expr<N: DomNavigator>(
+    arena: &AstArena,
+    type_expr: &TypeExprNode,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Evaluate the operand
+    let operand = eval_node(arena, type_expr.operand, ctx)?;
+
+    match type_expr.kind {
+        TypeExprKind::InstanceOf => eval_instance_of(operand, type_expr, ctx),
+        TypeExprKind::TreatAs => eval_treat_as(operand, type_expr, ctx),
+        TypeExprKind::CastAs => eval_cast_as(operand, type_expr, ctx),
+        TypeExprKind::CastableAs => eval_castable_as(operand, type_expr, ctx),
+    }
+}
+
+/// Evaluate `expr instance of type`.
+///
+/// Returns true if the value matches the sequence type (cardinality + item type).
+fn eval_instance_of<N: DomNavigator>(
+    operand: XPathValue<N>,
+    type_expr: &TypeExprNode,
+    ctx: &DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    let items = operand.into_vec();
+    let count = items.len();
+
+    // Handle empty-sequence() first (special case - only matches empty)
+    if type_expr.target_type.item_type.is_none() {
+        return Ok(XPathValue::boolean(count == 0));
+    }
+
+    // Check cardinality
+    if !occurrence_allows_count(type_expr.target_type.occurrence, count) {
+        return Ok(XPathValue::boolean(false));
+    }
+
+    // Get item type (we know it's Some from the check above)
+    let item_type = type_expr.target_type.item_type.as_ref().unwrap();
+
+    // Check each item matches the item type
+    for item in &items {
+        if !matches_item_type_node(
+            item,
+            item_type,
+            type_expr.resolved_atomic_type.as_ref(),
+            ctx.static_context,
+        ) {
+            return Ok(XPathValue::boolean(false));
+        }
+    }
+
+    Ok(XPathValue::boolean(true))
+}
+
+/// Evaluate `expr treat as type`.
+///
+/// Returns the value unchanged if it matches the type, otherwise raises XPTY0004.
+fn eval_treat_as<N: DomNavigator>(
+    operand: XPathValue<N>,
+    type_expr: &TypeExprNode,
+    ctx: &DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    let items = operand.into_vec();
+    let count = items.len();
+
+    // Check cardinality
+    if !occurrence_allows_count(type_expr.target_type.occurrence, count) {
+        return Err(XPathError::XPTY0004 {
+            expected: format_sequence_type(&type_expr.target_type, ctx),
+            found: format!("sequence of {} items", count),
+        });
+    }
+
+    // Handle empty-sequence()
+    let item_type = match &type_expr.target_type.item_type {
+        None => {
+            // empty-sequence() - only accepts empty
+            if count == 0 {
+                return Ok(XPathValue::empty());
+            } else {
+                return Err(XPathError::XPTY0004 {
+                    expected: "empty-sequence()".to_string(),
+                    found: format!("sequence of {} items", count),
+                });
+            }
+        }
+        Some(it) => it,
+    };
+
+    // Check each item matches the item type
+    for item in &items {
+        if !matches_item_type_node(
+            item,
+            item_type,
+            type_expr.resolved_atomic_type.as_ref(),
+            ctx.static_context,
+        ) {
+            return Err(XPathError::XPTY0004 {
+                expected: format_sequence_type(&type_expr.target_type, ctx),
+                found: format_item_type(item),
+            });
+        }
+    }
+
+    // Return the original value
+    Ok(XPathValue::from_sequence(items))
+}
+
+/// Evaluate `expr cast as type`.
+///
+/// Atomizes the operand and casts to the target atomic type.
+fn eval_cast_as<N: DomNavigator>(
+    operand: XPathValue<N>,
+    type_expr: &TypeExprNode,
+    ctx: &DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Cast only works with atomic types
+    let item_type = type_expr.target_type.item_type.as_ref().ok_or_else(|| {
+        XPathError::XPTY0004 {
+            expected: "atomic type".to_string(),
+            found: "empty-sequence()".to_string(),
+        }
+    })?;
+
+    // The item type must be Atomic for cast
+    if !matches!(item_type, ItemTypeNode::Atomic(_)) {
+        return Err(XPathError::XPTY0004 {
+            expected: "atomic type".to_string(),
+            found: "non-atomic type".to_string(),
+        });
+    }
+
+    // Atomize the operand to get at most one atomic value
+    let atomic_opt = atomize_to_single_opt(operand)?;
+
+    // Check cardinality
+    let allows_empty = matches!(
+        type_expr.target_type.occurrence,
+        OccurrenceIndicator::ZeroOrOne | OccurrenceIndicator::ZeroOrMore
+    );
+
+    match atomic_opt {
+        None => {
+            if allows_empty {
+                Ok(XPathValue::empty())
+            } else {
+                Err(XPathError::XPTY0004 {
+                    expected: format_sequence_type(&type_expr.target_type, ctx),
+                    found: "empty-sequence()".to_string(),
+                })
+            }
+        }
+        Some(value) => {
+            // Get target type code from resolved QName
+            let qname = type_expr.resolved_atomic_type.as_ref().ok_or_else(|| {
+                XPathError::Internal("Cast target type not resolved".to_string())
+            })?;
+            let target_type = resolved_type_to_type_code(qname, ctx.static_context.names)?;
+
+            // Perform the cast
+            let result = cast_to(&value, target_type)?;
+            Ok(XPathValue::from_atomic(result))
+        }
+    }
+}
+
+/// Evaluate `expr castable as type`.
+///
+/// Returns true if the cast would succeed, false otherwise.
+fn eval_castable_as<N: DomNavigator>(
+    operand: XPathValue<N>,
+    type_expr: &TypeExprNode,
+    ctx: &DynamicContext<'_, N>,
+) -> Result<XPathValue<N>, XPathError> {
+    // Cast only works with atomic types
+    let item_type = type_expr.target_type.item_type.as_ref();
+    if !matches!(item_type, Some(ItemTypeNode::Atomic(_))) {
+        return Ok(XPathValue::boolean(false));
+    }
+
+    // Atomize the operand
+    let atomic_opt = match atomize_to_single_opt(operand) {
+        Ok(opt) => opt,
+        Err(_) => return Ok(XPathValue::boolean(false)), // More than one item
+    };
+
+    // Check cardinality
+    let allows_empty = matches!(
+        type_expr.target_type.occurrence,
+        OccurrenceIndicator::ZeroOrOne | OccurrenceIndicator::ZeroOrMore
+    );
+
+    match atomic_opt {
+        None => {
+            // Empty sequence - allowed if occurrence allows it
+            Ok(XPathValue::boolean(allows_empty))
+        }
+        Some(value) => {
+            // Get target type code from resolved QName
+            let qname = match type_expr.resolved_atomic_type.as_ref() {
+                Some(q) => q,
+                None => return Ok(XPathValue::boolean(false)),
+            };
+            let target_type = match resolved_type_to_type_code(qname, ctx.static_context.names) {
+                Ok(tc) => tc,
+                Err(_) => return Ok(XPathValue::boolean(false)),
+            };
+
+            // Check if castable
+            Ok(XPathValue::boolean(castable(&value, target_type)))
+        }
+    }
+}
+
+/// Format a sequence type for error messages.
+fn format_sequence_type<N: DomNavigator>(
+    seq_type: &crate::xpath::ast::SequenceTypeNode,
+    _ctx: &DynamicContext<'_, N>,
+) -> String {
+    let item_str = match &seq_type.item_type {
+        None => "empty-sequence()".to_string(),
+        Some(ItemTypeNode::Item) => "item()".to_string(),
+        Some(ItemTypeNode::Atomic(qname)) => {
+            if qname.prefix.is_empty() {
+                qname.local.clone()
+            } else {
+                format!("{}:{}", qname.prefix, qname.local)
+            }
+        }
+        Some(ItemTypeNode::Kind(kind)) => format_kind_test(kind),
+    };
+
+    let occ_str = match seq_type.occurrence {
+        OccurrenceIndicator::One => "",
+        OccurrenceIndicator::ZeroOrOne => "?",
+        OccurrenceIndicator::ZeroOrMore => "*",
+        OccurrenceIndicator::OneOrMore => "+",
+    };
+
+    format!("{}{}", item_str, occ_str)
+}
+
+/// Format a kind test for error messages.
+fn format_kind_test(kind: &crate::xpath::ast::KindTest) -> String {
+    use crate::xpath::ast::KindTest;
+    match kind {
+        KindTest::AnyKind => "node()".to_string(),
+        KindTest::Text => "text()".to_string(),
+        KindTest::Comment => "comment()".to_string(),
+        KindTest::ProcessingInstruction(None) => "processing-instruction()".to_string(),
+        KindTest::ProcessingInstruction(Some(name)) => {
+            format!("processing-instruction('{}')", name)
+        }
+        KindTest::Document(None) => "document-node()".to_string(),
+        KindTest::Document(Some(inner)) => {
+            format!("document-node({})", format_kind_test(inner))
+        }
+        KindTest::Element(test) => {
+            if let Some(ref qname) = test.name {
+                if qname.prefix.is_empty() {
+                    format!("element({})", qname.local)
+                } else {
+                    format!("element({}:{})", qname.prefix, qname.local)
+                }
+            } else {
+                "element()".to_string()
+            }
+        }
+        KindTest::Attribute(test) => {
+            if let Some(ref qname) = test.name {
+                if qname.prefix.is_empty() {
+                    format!("attribute({})", qname.local)
+                } else {
+                    format!("attribute({}:{})", qname.prefix, qname.local)
+                }
+            } else {
+                "attribute()".to_string()
+            }
+        }
+        KindTest::SchemaElement(name) => format!("schema-element({})", name),
+        KindTest::SchemaAttribute(name) => format!("schema-attribute({})", name),
+    }
+}
+
+/// Format an XmlItem type for error messages.
+fn format_item_type<N: DomNavigator>(item: &XmlItem<N>) -> String {
+    match item {
+        XmlItem::Node(nav) => {
+            use crate::xpath::DomNodeType;
+            match nav.node_type() {
+                DomNodeType::Root => "document-node()".to_string(),
+                DomNodeType::Element => format!("element({})", nav.local_name()),
+                DomNodeType::Attribute => format!("attribute({})", nav.local_name()),
+                DomNodeType::Text
+                | DomNodeType::Whitespace
+                | DomNodeType::SignificantWhitespace => "text()".to_string(),
+                DomNodeType::Comment => "comment()".to_string(),
+                DomNodeType::ProcessingInstruction => "processing-instruction()".to_string(),
+                DomNodeType::Namespace => "namespace-node()".to_string(),
+                DomNodeType::All => "node()".to_string(),
+            }
+        }
+        XmlItem::Atomic(value) => {
+            format!("{:?}", value.type_code)
         }
     }
 }
@@ -2250,4 +2569,565 @@ mod integration_tests {
         // assert_eq!(eval_xpath("5 - 3").unwrap().as_integer().map(|i| i.to_string()), Some("2".to_string()));
         // assert_eq!(eval_xpath("2 * 3").unwrap().as_integer().map(|i| i.to_string()), Some("6".to_string()));
     }
+
+    // ========================================================================
+    // Type Expression Tests (instance of, treat as, cast as, castable as)
+    // ========================================================================
+
+    mod type_expr_tests {
+        use crate::namespace::table::NameTable;
+        use crate::xpath::arena::{AstArena, AstNodeId, SourceSpan};
+        use crate::xpath::ast::{
+            AstNode, ExprNode, ItemTypeNode as AstItemTypeNode, OccurrenceIndicator,
+            QName as AstQName, SequenceTypeNode, TypeExprKind, TypeExprNode, ValueNode,
+        };
+        use crate::xpath::bind::bind_node;
+        use crate::xpath::context::{DynamicContext, NameBinder, XPathContext};
+        use crate::xpath::error::XPathError;
+        use crate::xpath::functions::XPathValue;
+        use crate::xpath::iterator::XmlItem;
+        use crate::namespace::context::NamespaceContextSnapshot;
+        use crate::namespace::table::well_known;
+        use crate::xpath::RoXmlNavigator;
+        use crate::xpath::eval::eval_node;
+
+        /// Helper to wrap a node in an Expr
+        fn wrap_in_expr(arena: &mut AstArena, node_id: AstNodeId) -> AstNodeId {
+            let span = SourceSpan::new(0, 10);
+            let expr = ExprNode::single(node_id, span);
+            arena.add(AstNode::Expr(expr))
+        }
+
+        /// Helper to bind and eval a manually constructed AST
+        fn bind_and_eval(arena: &mut AstArena, root: AstNodeId) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+            let names = NameTable::new();
+            // Set up namespace context with "xs" prefix bound to XSD namespace
+            let xs_prefix = names.add("xs");
+            let ns_snapshot = NamespaceContextSnapshot {
+                default_ns: None,
+                bindings: vec![(xs_prefix, well_known::XS_NAMESPACE)],
+            };
+            let ctx = XPathContext::new(&names).with_namespaces(ns_snapshot);
+            let mut binder = NameBinder::new();
+
+            bind_node(arena, root, &ctx, &mut binder)?;
+
+            let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+                DynamicContext::new(&ctx, binder.len());
+
+            eval_node(arena, root, &mut dyn_ctx)
+        }
+
+        /// Helper to create a TypeExpr node with atomic target type
+        fn make_type_expr(
+            arena: &mut AstArena,
+            kind: TypeExprKind,
+            operand: AstNodeId,
+            type_name: &str,
+            occurrence: OccurrenceIndicator,
+        ) -> AstNodeId {
+            let span = SourceSpan::new(0, 20);
+            let qname = AstQName::new("xs".to_string(), type_name.to_string());
+            let item_type = AstItemTypeNode::Atomic(qname);
+            let target_type = SequenceTypeNode::single(item_type, occurrence, span);
+            let type_expr = TypeExprNode::new(kind, operand, target_type, span);
+            arena.add(AstNode::TypeExpr(type_expr))
+        }
+
+        /// Helper to create a TypeExpr node with item() target type
+        fn make_type_expr_item(
+            arena: &mut AstArena,
+            kind: TypeExprKind,
+            operand: AstNodeId,
+            occurrence: OccurrenceIndicator,
+        ) -> AstNodeId {
+            let span = SourceSpan::new(0, 20);
+            let item_type = AstItemTypeNode::Item;
+            let target_type = SequenceTypeNode::single(item_type, occurrence, span);
+            let type_expr = TypeExprNode::new(kind, operand, target_type, span);
+            arena.add(AstNode::TypeExpr(type_expr))
+        }
+
+        /// Helper to create an empty-sequence() type expression
+        fn make_type_expr_empty_seq(
+            arena: &mut AstArena,
+            kind: TypeExprKind,
+            operand: AstNodeId,
+        ) -> AstNodeId {
+            let span = SourceSpan::new(0, 20);
+            let target_type = SequenceTypeNode::empty(span);
+            let type_expr = TypeExprNode::new(kind, operand, target_type, span);
+            arena.add(AstNode::TypeExpr(type_expr))
+        }
+
+    #[test]
+    fn test_instance_of_atomic_matching() {
+        // 42 instance of xs:integer -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_atomic_not_matching() {
+        // 42 instance of xs:string -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_string() {
+        // "hello" instance of xs:string -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_cardinality_too_many() {
+        // (1, 2) instance of xs:integer -> false (too many items)
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let seq = ExprNode::sequence(vec![v1, v2], span);
+        let seq_id = arena.add(AstNode::Expr(seq));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            seq_id,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_cardinality_star() {
+        // (1, 2) instance of xs:integer* -> true
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let seq = ExprNode::sequence(vec![v1, v2], span);
+        let seq_id = arena.add(AstNode::Expr(seq));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            seq_id,
+            "integer",
+            OccurrenceIndicator::ZeroOrMore,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_empty_sequence() {
+        // () instance of xs:integer? -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+
+        // () instance of xs:integer -> false
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_item() {
+        // 42 instance of item() -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr_item(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_instance_of_empty_sequence_type() {
+        // () instance of empty-sequence() -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, empty);
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+
+        // 42 instance of empty-sequence() -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, val);
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_treat_as_success() {
+        // "hello" treat as xs:string -> "hello"
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_string(), Some("hello"));
+            }
+            _ => panic!("Expected string 'hello'"),
+        }
+    }
+
+    #[test]
+    fn test_treat_as_failure() {
+        // 42 treat as xs:string -> XPTY0004 error
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
+    }
+
+    #[test]
+    fn test_treat_as_empty_optional() {
+        // () treat as xs:integer? -> ()
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cast_as_string_to_integer() {
+        // "42" cast as xs:integer -> 42
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("42".to_string()));
+            }
+            _ => panic!("Expected integer 42"),
+        }
+    }
+
+    #[test]
+    fn test_cast_as_double_to_integer() {
+        // 42.7 cast as xs:integer -> 42 (truncated)
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Double("42.7".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_integer().map(|i| i.to_string()), Some("42".to_string()));
+            }
+            _ => panic!("Expected integer 42"),
+        }
+    }
+
+    #[test]
+    fn test_cast_as_empty_optional() {
+        // () cast as xs:integer? -> ()
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cast_as_empty_required() {
+        // () cast as xs:integer -> XPTY0004 error
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
+    }
+
+    #[test]
+    fn test_cast_as_invalid() {
+        // "abc" cast as xs:integer -> FORG0001 error
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
+    }
+
+    #[test]
+    fn test_castable_as_success() {
+        // "42" castable as xs:integer -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_failure() {
+        // "abc" castable as xs:integer -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_empty_optional() {
+        // () castable as xs:integer? -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_empty_required() {
+        // () castable as xs:integer -> false
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+    } // end type_expr_tests
 }

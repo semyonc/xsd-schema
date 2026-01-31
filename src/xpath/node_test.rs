@@ -6,7 +6,11 @@
 use crate::ids::TypeKey;
 use crate::namespace::qname::QualifiedName;
 use crate::schema::model::DerivationSet;
+use crate::types::value::XmlValue;
 use crate::types::{ItemType, NameTest, SequenceType};
+use crate::xpath::ast::{ItemTypeNode, KindTest};
+use crate::xpath::cast::type_matches;
+use crate::xpath::iterator::XmlItem;
 
 use super::{DomNavigator, DomNodeType};
 use super::context::XPathContext;
@@ -205,6 +209,204 @@ fn qname_matches<N: DomNavigator>(
     };
 
     nav.local_name() == local && nav.namespace_uri() == ns
+}
+
+// ============================================================================
+// AST KindTest and ItemTypeNode Matching
+// ============================================================================
+
+/// Check if an XmlItem matches an AST ItemTypeNode.
+///
+/// This is used for `instance of` and `treat as` expressions to check
+/// if a value matches the target type specification.
+///
+/// # Arguments
+///
+/// * `item` - The item to check (node or atomic value)
+/// * `item_type` - The AST item type node to match against
+/// * `resolved_atomic_type` - The resolved QualifiedName for atomic types (from binding)
+/// * `ctx` - The XPath context for name resolution
+///
+/// # Returns
+///
+/// `true` if the item matches the item type, `false` otherwise.
+pub fn matches_item_type_node<N: DomNavigator>(
+    item: &XmlItem<N>,
+    item_type: &ItemTypeNode,
+    resolved_atomic_type: Option<&QualifiedName>,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    match item_type {
+        ItemTypeNode::Item => {
+            // item() matches any item (node or atomic)
+            true
+        }
+        ItemTypeNode::Atomic(_) => {
+            // Atomic type - item must be an atomic value matching the type
+            match item {
+                XmlItem::Node(_) => false,
+                XmlItem::Atomic(value) => {
+                    // Use the resolved atomic type from binding
+                    if let Some(qname) = resolved_atomic_type {
+                        matches_atomic_type(value, qname, ctx)
+                    } else {
+                        // No resolved type - this shouldn't happen after binding
+                        false
+                    }
+                }
+            }
+        }
+        ItemTypeNode::Kind(kind_test) => {
+            // Kind test - item must be a node matching the kind test
+            match item {
+                XmlItem::Node(nav) => matches_kind_test(nav, kind_test, ctx),
+                XmlItem::Atomic(_) => false,
+            }
+        }
+    }
+}
+
+/// Check if an atomic value matches a resolved atomic type QualifiedName.
+fn matches_atomic_type(
+    value: &XmlValue,
+    qname: &QualifiedName,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    use crate::namespace::table::well_known;
+    use crate::xpath::cast::resolved_type_to_type_code;
+
+    // Verify it's in XS namespace
+    match qname.namespace_uri {
+        Some(ns_id) if ns_id == well_known::XS_NAMESPACE => {}
+        _ => return false,
+    }
+
+    // Get the target type code
+    let target_type = match resolved_type_to_type_code(qname, ctx.names) {
+        Ok(tc) => tc,
+        Err(_) => return false,
+    };
+
+    // Check if the value's type matches
+    type_matches(value.type_code, target_type)
+}
+
+/// Check if a DOM node matches an AST KindTest.
+///
+/// This converts the AST KindTest to runtime type checks.
+pub fn matches_kind_test<N: DomNavigator>(
+    nav: &N,
+    kind_test: &KindTest,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    match kind_test {
+        KindTest::AnyKind => {
+            // node() matches any node
+            true
+        }
+        KindTest::Text => {
+            nav.node_type().is_text_like()
+        }
+        KindTest::Comment => {
+            nav.node_type() == DomNodeType::Comment
+        }
+        KindTest::ProcessingInstruction(target) => {
+            if nav.node_type() != DomNodeType::ProcessingInstruction {
+                return false;
+            }
+            match target {
+                None => true,
+                Some(name) => nav.local_name() == *name,
+            }
+        }
+        KindTest::Document(inner) => {
+            if nav.node_type() != DomNodeType::Root {
+                return false;
+            }
+            match inner {
+                None => true,
+                Some(inner_kind) => {
+                    // document-node(element(...)) - check if document has matching element
+                    let mut cursor = nav.clone();
+                    if !cursor.move_to_first_child() {
+                        return false;
+                    }
+                    loop {
+                        if matches_kind_test(&cursor, inner_kind, ctx) {
+                            return true;
+                        }
+                        if !cursor.move_to_next_sibling() {
+                            break;
+                        }
+                    }
+                    false
+                }
+            }
+        }
+        KindTest::Element(elem_test) => {
+            if nav.node_type() != DomNodeType::Element {
+                return false;
+            }
+            // Check element name if specified
+            if let Some(ref qname) = elem_test.name {
+                if !ast_qname_matches(qname, nav, ctx) {
+                    return false;
+                }
+            }
+            // TODO: Check type annotation if specified (elem_test.type_name)
+            true
+        }
+        KindTest::Attribute(attr_test) => {
+            if nav.node_type() != DomNodeType::Attribute {
+                return false;
+            }
+            // Check attribute name if specified
+            if let Some(ref qname) = attr_test.name {
+                if !ast_qname_matches(qname, nav, ctx) {
+                    return false;
+                }
+            }
+            // TODO: Check type annotation if specified (attr_test.type_name)
+            true
+        }
+        KindTest::SchemaElement(name) => {
+            if nav.node_type() != DomNodeType::Element {
+                return false;
+            }
+            nav.local_name() == *name
+        }
+        KindTest::SchemaAttribute(name) => {
+            if nav.node_type() != DomNodeType::Attribute {
+                return false;
+            }
+            nav.local_name() == *name
+        }
+    }
+}
+
+/// Check if a node matches an AST QName (from paths.rs).
+fn ast_qname_matches<N: DomNavigator>(
+    qname: &crate::xpath::ast::QName,
+    nav: &N,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    // For AST QName, prefix is stored directly as a string
+    // Local name must match
+    if nav.local_name() != qname.local {
+        return false;
+    }
+
+    // Resolve prefix to namespace URI
+    if qname.prefix.is_empty() {
+        // No prefix - match empty namespace
+        nav.namespace_uri().is_empty()
+    } else {
+        // Resolve the prefix to namespace URI
+        match ctx.resolve_prefix(&qname.prefix) {
+            Some(ns_uri) => nav.namespace_uri() == ns_uri,
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]

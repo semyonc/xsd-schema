@@ -13,8 +13,11 @@
 use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
+use crate::namespace::qname::QualifiedName;
+use crate::namespace::table::{well_known, NameTable};
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use crate::xpath::ast::OccurrenceIndicator;
 use super::error::XPathError;
 
 /// Cast an atomic value to a target type.
@@ -331,7 +334,7 @@ fn is_integer_derived(code: XmlTypeCode) -> bool {
 /// - anyAtomicType matches any atomic type
 /// - String derived types match string
 /// - Integer derived types match integer
-fn type_matches(source: XmlTypeCode, target: XmlTypeCode) -> bool {
+pub fn type_matches(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     if source == target {
         return true;
     }
@@ -367,6 +370,52 @@ fn type_matches(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     }
 
     false
+}
+
+/// Convert a resolved atomic type QualifiedName to XmlTypeCode.
+///
+/// The QualifiedName should have been resolved during binding phase
+/// and must be in the XS (XML Schema) namespace.
+///
+/// # Errors
+///
+/// Returns XPST0051 if the type name is not a known atomic type.
+pub fn resolved_type_to_type_code(
+    qname: &QualifiedName,
+    names: &NameTable,
+) -> Result<XmlTypeCode, XPathError> {
+    // Check namespace is XS_NAMESPACE
+    match qname.namespace_uri {
+        Some(ns_id) if ns_id == well_known::XS_NAMESPACE => {}
+        _ => {
+            let local = names.resolve(qname.local_name);
+            return Err(XPathError::XPST0051 {
+                type_name: local.to_string(),
+            });
+        }
+    }
+
+    // Get local name and convert to type code
+    let local_name = names.resolve(qname.local_name);
+    XmlTypeCode::from_local_name(&local_name).ok_or_else(|| XPathError::XPST0051 {
+        type_name: local_name.to_string(),
+    })
+}
+
+/// Check if an occurrence indicator allows the given item count.
+///
+/// This implements XPath 2.0 sequence type cardinality matching:
+/// - `One` (no indicator): exactly 1 item
+/// - `ZeroOrOne` (`?`): 0 or 1 items
+/// - `ZeroOrMore` (`*`): any count
+/// - `OneOrMore` (`+`): at least 1 item
+pub fn occurrence_allows_count(occ: OccurrenceIndicator, count: usize) -> bool {
+    match occ {
+        OccurrenceIndicator::One => count == 1,
+        OccurrenceIndicator::ZeroOrOne => count <= 1,
+        OccurrenceIndicator::ZeroOrMore => true,
+        OccurrenceIndicator::OneOrMore => count >= 1,
+    }
 }
 
 /// Cast a numeric value to a specific integer subtype.
