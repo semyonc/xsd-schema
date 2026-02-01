@@ -14,6 +14,7 @@
 
 pub mod signature;
 pub mod registry;
+pub mod extensible;
 pub mod string;
 pub mod numeric;
 pub mod sequence;
@@ -27,6 +28,10 @@ pub mod special;
 
 pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
+pub use extensible::{
+    BuiltinCatalog, BuiltinEvaluator, CustomFn, DynamicFunctionSignature, FunctionCatalog,
+    FunctionEvaluator, FunctionHandle, FunctionSet,
+};
 
 use num_bigint::BigInt;
 

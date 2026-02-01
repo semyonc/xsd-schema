@@ -134,6 +134,18 @@ impl FunctionRegistry {
         self.entries.iter().find(|e| e.id == id)
     }
 
+    /// Get an entry by its FunctionId discriminant value.
+    ///
+    /// This is used internally for converting FunctionHandle back to FunctionId.
+    pub fn by_id_value(&self, value: u16) -> Option<&FunctionEntry> {
+        self.entries.iter().find(|e| (e.id as u16) == value)
+    }
+
+    /// Get a slice of all registered entries.
+    pub fn entries(&self) -> &[FunctionEntry] {
+        &self.entries
+    }
+
     /// Get the number of registered functions
     pub fn len(&self) -> usize {
         self.entries.len()

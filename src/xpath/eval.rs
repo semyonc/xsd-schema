@@ -30,9 +30,7 @@ use crate::xpath::axis_iterators::{
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
-use crate::xpath::functions::{
-    atomize_to_single_opt, eval_function, effective_boolean_value, XPathValue,
-};
+use crate::xpath::functions::{atomize_to_single_opt, effective_boolean_value, XPathValue};
 use crate::xpath::iterator::{DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator};
 use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node};
 use crate::xpath::node_test::{matches_item_type_node, NodeTest};
@@ -132,8 +130,8 @@ pub fn eval_node<N: DomNavigator>(
         }
 
         AstNode::FunctionCall(func_call) => {
-            // Get the resolved function ID
-            let function_id = func_call.function_id.ok_or_else(|| {
+            // Get the resolved function handle
+            let handle = func_call.function_handle.ok_or_else(|| {
                 XPathError::Internal("Function call not bound".to_string())
             })?;
 
@@ -143,8 +141,8 @@ pub fn eval_node<N: DomNavigator>(
                 args.push(eval_node(arena, *arg_id, ctx)?);
             }
 
-            // Dispatch to the function
-            eval_function(function_id, ctx, args)
+            // Dispatch via the context's eval_function method (supports custom functions)
+            ctx.eval_function(handle, args)
         }
 
         AstNode::For(for_node) => {

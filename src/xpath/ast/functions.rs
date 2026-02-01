@@ -3,7 +3,7 @@
 // ============================================================================
 
 use super::{AstNodeId, SourceSpan};
-use crate::xpath::functions::FunctionId;
+use crate::xpath::functions::FunctionHandle;
 
 /// Function call expression (`prefix:name(args...)`).
 #[derive(Debug, Clone)]
@@ -16,8 +16,11 @@ pub struct FunctionCallNode {
     pub args: Vec<AstNodeId>,
     /// Source location.
     pub span: SourceSpan,
-    /// Resolved function identifier (set during binding phase).
-    pub function_id: Option<FunctionId>,
+    /// Resolved function handle (set during binding phase).
+    ///
+    /// This replaces the previous `function_id` field. The handle works for
+    /// both built-in and custom functions.
+    pub function_handle: Option<FunctionHandle>,
 }
 
 impl FunctionCallNode {
@@ -27,7 +30,7 @@ impl FunctionCallNode {
             local_name,
             args,
             span,
-            function_id: None,
+            function_handle: None,
         }
     }
 }

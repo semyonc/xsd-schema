@@ -11,7 +11,7 @@ use crate::xpath::ast::{ExprNode, FunctionCallNode, IfNode, ValueNode};
 use crate::xpath::context::{DynamicContext, NameBinder, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::eval::eval_node;
-use crate::xpath::functions::{FunctionId, XPathValue};
+use crate::xpath::functions::{FunctionHandle, FunctionId, XPathValue};
 use crate::xpath::parser;
 use crate::xpath::RoXmlNavigator;
 
@@ -54,9 +54,9 @@ fn test_bind_function_call_default_ns() {
 
     bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
 
-    // Verify the function call has function_id set
+    // Verify the function call has function_handle set
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_id, Some(FunctionId::Concat));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::Concat)));
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -76,7 +76,7 @@ fn test_bind_true_false() {
     bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
 
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_id, Some(FunctionId::True));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::True)));
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -89,7 +89,7 @@ fn test_bind_true_false() {
     bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
 
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_id, Some(FunctionId::False));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::False)));
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -150,12 +150,12 @@ fn test_bind_nested_function() {
 
     // The outer function should be upper-case
     if let AstNode::FunctionCall(func) = arena.get(outer_func) {
-        assert_eq!(func.function_id, Some(FunctionId::UpperCase));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::UpperCase)));
     }
 
     // The inner function should be concat
     if let AstNode::FunctionCall(func) = arena.get(inner_func) {
-        assert_eq!(func.function_id, Some(FunctionId::Concat));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::Concat)));
     }
 }
 
@@ -181,7 +181,7 @@ fn test_bind_if_expression() {
 
     // Verify the condition function was bound
     if let AstNode::FunctionCall(func) = arena.get(test_func) {
-        assert_eq!(func.function_id, Some(FunctionId::True));
+        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::True)));
     }
 }
 

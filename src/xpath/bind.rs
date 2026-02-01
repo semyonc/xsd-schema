@@ -17,7 +17,6 @@ use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{AstNode, ItemTypeNode, NameTest, NodeTest, QName};
 use crate::xpath::context::{NameBinder, XPathContext};
 use crate::xpath::error::XPathError;
-use crate::xpath::functions::FUNCTION_REGISTRY;
 
 /// Bind an AST node and all its children.
 ///
@@ -157,17 +156,18 @@ pub fn bind_node(
                     .to_string()
             };
 
-            // Look up the function in the registry
+            // Look up the function via the catalog (supports custom functions)
             let arity = func_call.args.len();
-            let entry = FUNCTION_REGISTRY
+            let handle = ctx
+                .function_catalog()
                 .lookup(&namespace, &func_call.local_name, arity)
                 .ok_or_else(|| {
                     XPathError::function_not_found(&func_call.local_name, arity, &namespace)
                 })?;
 
-            // Store the resolved function ID
+            // Store the resolved function handle
             if let AstNode::FunctionCall(ref mut node) = arena.get_mut(id) {
-                node.function_id = Some(entry.id);
+                node.function_handle = Some(handle);
             }
         }
 

@@ -14,6 +14,7 @@ use crate::schema::SchemaSet;
 use crate::types::value::{TimezoneOffset, DateTimeValue};
 
 use super::DomNavigator;
+use super::functions::{BuiltinCatalog, BuiltinEvaluator, FunctionCatalog, FunctionEvaluator};
 use super::iterator::XmlItem;
 
 // ============================================================================
@@ -44,6 +45,8 @@ pub struct XPathContext<'a> {
     pub implicit_timezone: Option<TimezoneOffset>,
     /// Base URI for relative URI resolution
     pub base_uri: Option<String>,
+    /// Function catalog for bind-time lookup (None = use builtins).
+    function_catalog: Option<&'a dyn FunctionCatalog>,
 }
 
 impl<'a> XPathContext<'a> {
@@ -57,6 +60,7 @@ impl<'a> XPathContext<'a> {
             default_function_ns: Some(super::functions::FN_NAMESPACE),
             implicit_timezone: None,
             base_uri: None,
+            function_catalog: None,
         }
     }
 
@@ -94,6 +98,20 @@ impl<'a> XPathContext<'a> {
     pub fn with_base_uri(mut self, base_uri: impl Into<String>) -> Self {
         self.base_uri = Some(base_uri.into());
         self
+    }
+
+    /// Set the function catalog for custom function support.
+    pub fn with_function_catalog(mut self, catalog: &'a dyn FunctionCatalog) -> Self {
+        self.function_catalog = Some(catalog);
+        self
+    }
+
+    /// Get the function catalog, using built-in functions as default.
+    ///
+    /// Returns a reference to the configured catalog, or `BuiltinCatalog` if none set.
+    pub fn function_catalog(&self) -> &dyn FunctionCatalog {
+        static BUILTIN: BuiltinCatalog = BuiltinCatalog;
+        self.function_catalog.unwrap_or(&BUILTIN)
     }
 
     /// Resolve a prefix to a namespace URI.
@@ -335,6 +353,8 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     pub base_uri: Option<String>,
     /// Variable bindings (indexed by VarSlotId from NameBinder)
     pub variables: VarStore<super::functions::XPathValue<N>>,
+    /// Function evaluator for eval-time dispatch (None = use builtins).
+    function_evaluator: Option<&'a dyn FunctionEvaluator<N>>,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -351,6 +371,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             implicit_timezone: static_context.implicit_timezone,
             base_uri: static_context.base_uri.clone(),
             variables: VarStore::new(var_count),
+            function_evaluator: None,
         }
     }
 
@@ -414,6 +435,60 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     /// Set a variable value.
     pub fn set_variable(&mut self, slot: VarSlotId, value: super::functions::XPathValue<N>) {
         self.variables.set(slot, value);
+    }
+
+    /// Set the function evaluator for custom function support.
+    pub fn with_function_evaluator(mut self, evaluator: &'a dyn FunctionEvaluator<N>) -> Self {
+        self.function_evaluator = Some(evaluator);
+        self
+    }
+
+    /// Get the function evaluator, using built-in functions as default.
+    ///
+    /// Returns a reference to the configured evaluator, or `BuiltinEvaluator` if none set.
+    pub fn function_evaluator(&self) -> &dyn FunctionEvaluator<N> {
+        static BUILTIN: BuiltinEvaluator = BuiltinEvaluator;
+        self.function_evaluator.unwrap_or(&BUILTIN)
+    }
+
+    /// Check if a custom function evaluator is configured.
+    pub fn has_custom_evaluator(&self) -> bool {
+        self.function_evaluator.is_some()
+    }
+
+    /// Evaluate a function using the configured evaluator.
+    ///
+    /// This method exists to work around borrow checker issues with calling
+    /// `self.function_evaluator().eval(handle, self, args)` where the evaluator
+    /// borrow conflicts with the mutable self borrow.
+    pub fn eval_function(
+        &mut self,
+        handle: super::functions::FunctionHandle,
+        args: Vec<super::functions::XPathValue<N>>,
+    ) -> Result<super::functions::XPathValue<N>, super::error::XPathError> {
+        // For built-in handles, use the builtin evaluator directly (fast path)
+        if handle.is_builtin() {
+            return BuiltinEvaluator.eval(handle, self, args);
+        }
+
+        // For custom handles, we need to call through the configured evaluator.
+        // Get the evaluator pointer before borrowing self mutably.
+        match self.function_evaluator {
+            Some(evaluator) => {
+                // SAFETY: The evaluator reference has lifetime 'a which is valid
+                // for the duration of this DynamicContext. We're converting to a
+                // raw pointer and back to work around the borrow checker, but the
+                // reference is valid for this call.
+                let evaluator_ptr = evaluator as *const dyn FunctionEvaluator<N>;
+                // Re-borrow as shared reference for the call
+                let evaluator_ref = unsafe { &*evaluator_ptr };
+                evaluator_ref.eval(handle, self, args)
+            }
+            None => {
+                // Should not happen for custom handles, but use builtin as fallback
+                BuiltinEvaluator.eval(handle, self, args)
+            }
+        }
     }
 }
 
