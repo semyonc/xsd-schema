@@ -33,7 +33,8 @@ enum RoCursor<'a> {
 /// Navigator adapter for roxmltree documents
 ///
 /// This is an untyped navigator - `schema_type()` and `typed_value()`
-/// always return `None`. Use `atomized_value()` to get untyped atomic values.
+/// always return `None` by default. For testing purposes, a schema type
+/// can be set via `with_schema_type()`.
 #[derive(Clone)]
 pub struct RoXmlNavigator<'a> {
     /// Reference to the source document
@@ -44,6 +45,9 @@ pub struct RoXmlNavigator<'a> {
     base_uri: String,
     /// Cached qualified name (prefix:local)
     name_cache: String,
+    /// Schema type override for testing (normally None)
+    #[cfg(test)]
+    schema_type_override: Option<SimpleTypeKey>,
 }
 
 impl<'a> RoXmlNavigator<'a> {
@@ -54,6 +58,8 @@ impl<'a> RoXmlNavigator<'a> {
             cursor: RoCursor::Node(doc.root()),
             base_uri: String::new(),
             name_cache: String::new(),
+            #[cfg(test)]
+            schema_type_override: None,
         }
     }
 
@@ -64,6 +70,8 @@ impl<'a> RoXmlNavigator<'a> {
             cursor: RoCursor::Node(doc.root()),
             base_uri: base_uri.into(),
             name_cache: String::new(),
+            #[cfg(test)]
+            schema_type_override: None,
         }
     }
 
@@ -74,7 +82,16 @@ impl<'a> RoXmlNavigator<'a> {
             cursor: RoCursor::Node(node),
             base_uri: String::new(),
             name_cache: String::new(),
+            #[cfg(test)]
+            schema_type_override: None,
         }
+    }
+
+    /// Set a schema type for testing purposes
+    #[cfg(test)]
+    pub fn with_schema_type(mut self, schema_type: SimpleTypeKey) -> Self {
+        self.schema_type_override = Some(schema_type);
+        self
     }
 
     /// Get the underlying roxmltree node (if positioned on a node)
@@ -600,7 +617,13 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
     }
 
     fn schema_type(&self) -> Option<SimpleTypeKey> {
-        // roxmltree is schema-unaware
+        // roxmltree is schema-unaware, but can be overridden for testing
+        #[cfg(test)]
+        {
+            if self.schema_type_override.is_some() {
+                return self.schema_type_override;
+            }
+        }
         None
     }
 
