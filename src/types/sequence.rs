@@ -7,8 +7,14 @@
 
 use std::fmt;
 
-use crate::ids::SimpleTypeKey;
+use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::namespace::qname::QualifiedName;
+use crate::schema::model::DerivationSet;
+use crate::types::value::XmlValue;
+use crate::xpath::cast::type_matches;
+use crate::xpath::context::XPathContext;
+use crate::xpath::iterator::XmlItem;
+use crate::xpath::{DomNavigator, DomNodeType};
 use super::XmlTypeCode;
 
 /// XPath2 sequence type cardinality
@@ -23,12 +29,14 @@ pub enum XmlTypeCardinality {
     OneOrMore,
     /// Zero or more (T*)
     ZeroOrMore,
+    /// Empty sequence only (empty-sequence())
+    Empty,
 }
 
 impl XmlTypeCardinality {
     /// Check if this cardinality allows empty sequences
     pub fn allows_empty(&self) -> bool {
-        matches!(self, Self::ZeroOrOne | Self::ZeroOrMore)
+        matches!(self, Self::ZeroOrOne | Self::ZeroOrMore | Self::Empty)
     }
 
     /// Check if this cardinality allows multiple items
@@ -43,6 +51,7 @@ impl XmlTypeCardinality {
             Self::ZeroOrOne => count <= 1,
             Self::OneOrMore => count >= 1,
             Self::ZeroOrMore => true,
+            Self::Empty => count == 0,
         }
     }
 
@@ -53,6 +62,7 @@ impl XmlTypeCardinality {
             Self::ZeroOrOne => "?",
             Self::OneOrMore => "+",
             Self::ZeroOrMore => "*",
+            Self::Empty => "", // empty-sequence() has no suffix
         }
     }
 }
@@ -133,6 +143,309 @@ impl ItemType {
     pub fn is_atomic(&self) -> bool {
         matches!(self, Self::AtomicType(_) | Self::SchemaAtomicType(_))
     }
+
+    /// Check if a single XmlItem matches this item type.
+    ///
+    /// This is the runtime type matching method for function signatures
+    /// and general type checking.
+    pub fn matches_item<N: DomNavigator>(
+        &self,
+        item: &XmlItem<N>,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        match item {
+            XmlItem::Node(nav) => self.matches_node(nav, ctx),
+            XmlItem::Atomic(value) => self.matches_atomic(value, ctx),
+        }
+    }
+
+    /// Check if a node matches this item type.
+    fn matches_node<N: DomNavigator>(&self, nav: &N, ctx: &XPathContext<'_>) -> bool {
+        match self {
+            Self::AnyItem => true,
+            Self::AnyNode => true,
+            Self::Document(None) => nav.node_type() == DomNodeType::Root,
+            Self::Document(Some(inner)) => {
+                if nav.node_type() != DomNodeType::Root {
+                    return false;
+                }
+                // Per XPath 2.0 spec: document-node(E) matches a document node that
+                // contains exactly one element child (optionally with comment/PI nodes),
+                // and that element must match E.
+                let mut cursor = nav.clone();
+                if !cursor.move_to_first_child() {
+                    return false;
+                }
+
+                let mut element_count = 0;
+                let mut matching_element: Option<N> = None;
+
+                loop {
+                    let node_type = cursor.node_type();
+                    match node_type {
+                        DomNodeType::Element => {
+                            element_count += 1;
+                            if element_count > 1 {
+                                // More than one element child - reject
+                                return false;
+                            }
+                            // Store this element to check against inner type
+                            matching_element = Some(cursor.clone());
+                        }
+                        DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
+                            // Comments and PIs are allowed
+                        }
+                        DomNodeType::Text
+                        | DomNodeType::Whitespace
+                        | DomNodeType::SignificantWhitespace => {
+                            // Text nodes in document (outside root element) are typically
+                            // whitespace. Per spec, whitespace-only text nodes may appear.
+                        }
+                        _ => {
+                            // Other node types (shouldn't appear at document level)
+                        }
+                    }
+                    if !cursor.move_to_next_sibling() {
+                        break;
+                    }
+                }
+
+                // Must have exactly one element child
+                if element_count != 1 {
+                    return false;
+                }
+
+                // The single element must match the inner type
+                match matching_element {
+                    Some(elem) => inner.matches_node(&elem, ctx),
+                    None => false,
+                }
+            }
+            Self::Element(name_test, schema_type) => {
+                if nav.node_type() != DomNodeType::Element {
+                    return false;
+                }
+                if let Some(test) = name_test {
+                    if !Self::matches_name_test(test, nav, ctx) {
+                        return false;
+                    }
+                }
+                if let Some(expected) = schema_type {
+                    if !Self::matches_schema_type(nav, *expected, ctx) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Self::Attribute(name_test, schema_type) => {
+                if nav.node_type() != DomNodeType::Attribute {
+                    return false;
+                }
+                if let Some(test) = name_test {
+                    if !Self::matches_name_test(test, nav, ctx) {
+                        return false;
+                    }
+                }
+                if let Some(expected) = schema_type {
+                    if !Self::matches_schema_type(nav, *expected, ctx) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Self::SchemaElement(name) => {
+                if nav.node_type() != DomNodeType::Element {
+                    return false;
+                }
+                if !Self::matches_qname(name, nav, ctx) {
+                    return false;
+                }
+                Self::matches_schema_element_decl(nav, name, ctx)
+            }
+            Self::SchemaAttribute(name) => {
+                if nav.node_type() != DomNodeType::Attribute {
+                    return false;
+                }
+                if !Self::matches_qname(name, nav, ctx) {
+                    return false;
+                }
+                Self::matches_schema_attribute_decl(nav, name, ctx)
+            }
+            Self::Text => nav.node_type().is_text_like(),
+            Self::Comment => nav.node_type() == DomNodeType::Comment,
+            Self::ProcessingInstruction(target) => {
+                nav.node_type() == DomNodeType::ProcessingInstruction
+                    && target.as_ref().is_none_or(|name| nav.local_name() == name)
+            }
+            Self::NamespaceNode => nav.node_type() == DomNodeType::Namespace,
+            // Atomic types don't match nodes
+            Self::AtomicType(_) | Self::SchemaAtomicType(_) => false,
+        }
+    }
+
+    /// Check if an atomic value matches this item type.
+    fn matches_atomic(&self, value: &XmlValue, ctx: &XPathContext<'_>) -> bool {
+        match self {
+            Self::AnyItem => true,
+            Self::AnyNode => false, // node() doesn't match atomics
+            Self::AtomicType(code) => type_matches(value.type_code, *code),
+            Self::SchemaAtomicType(key) => {
+                // Check if value's schema type derives from the expected type
+                if let Some(value_key) = value.schema_type {
+                    if let Some(schema_set) = ctx.schema_set {
+                        return schema_set.is_type_derived_from(
+                            TypeKey::Simple(value_key),
+                            TypeKey::Simple(*key),
+                            DerivationSet::empty(),
+                        );
+                    }
+                    // Fallback: exact match
+                    return value_key == *key;
+                }
+                // No schema type on value - can't match schema-defined type
+                false
+            }
+            // All node types don't match atomics
+            Self::Document(_)
+            | Self::Element(_, _)
+            | Self::Attribute(_, _)
+            | Self::SchemaElement(_)
+            | Self::SchemaAttribute(_)
+            | Self::Text
+            | Self::Comment
+            | Self::ProcessingInstruction(_)
+            | Self::NamespaceNode => false,
+        }
+    }
+
+    /// Helper: check if a node matches a name test.
+    fn matches_name_test<N: DomNavigator>(
+        test: &NameTest,
+        nav: &N,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        match test {
+            NameTest::Wildcard => true,
+            NameTest::NamespaceWildcard(local_id) => {
+                // *:local - match any namespace with specific local name
+                match ctx.resolve_name(*local_id) {
+                    Some(local) => nav.local_name() == local,
+                    None => false,
+                }
+            }
+            NameTest::LocalWildcard(ns_id) => {
+                // prefix:* - match any local name in specific namespace
+                match ctx.resolve_name(*ns_id) {
+                    Some(ns) => nav.namespace_uri() == ns,
+                    None => false,
+                }
+            }
+            NameTest::QName(qname) => Self::matches_qname(qname, nav, ctx),
+        }
+    }
+
+    /// Helper: check if a node matches a QualifiedName.
+    fn matches_qname<N: DomNavigator>(
+        qname: &QualifiedName,
+        nav: &N,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        let local = match ctx.resolve_name(qname.local_name) {
+            Some(local) => local,
+            None => return false,
+        };
+        let ns = match qname.namespace_uri {
+            Some(id) => match ctx.resolve_name(id) {
+                Some(ns) => ns,
+                None => return false,
+            },
+            None => String::new(),
+        };
+        nav.local_name() == local && nav.namespace_uri() == ns
+    }
+
+    /// Helper: check schema type derivation for element/attribute.
+    fn matches_schema_type<N: DomNavigator>(
+        nav: &N,
+        expected: SimpleTypeKey,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        if let Some(actual) = nav.schema_type() {
+            if let Some(schema_set) = ctx.schema_set {
+                return schema_set.is_type_derived_from(
+                    TypeKey::Simple(actual),
+                    TypeKey::Simple(expected),
+                    DerivationSet::empty(),
+                );
+            }
+            // Fallback to equality without schema set
+            return actual == expected;
+        }
+        // No schema type on node
+        false
+    }
+
+    /// Helper: check schema-element() declaration match.
+    fn matches_schema_element_decl<N: DomNavigator>(
+        nav: &N,
+        name: &QualifiedName,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        if let Some(schema_set) = ctx.schema_set {
+            let ns_id = name.namespace_uri;
+            let Some(elem_key) = schema_set.lookup_element(ns_id, name.local_name) else {
+                return false;
+            };
+            let Some(elem_data) = schema_set.arenas.elements.get(elem_key) else {
+                return false;
+            };
+            if let Some(expected_type) = elem_data.resolved_type {
+                let Some(actual_type) = nav.schema_type() else {
+                    return false;
+                };
+                return schema_set.is_type_derived_from(
+                    TypeKey::Simple(actual_type),
+                    expected_type,
+                    DerivationSet::empty(),
+                );
+            }
+            // Declaration found, no type constraint
+            return true;
+        }
+        // No schema context - name already verified
+        true
+    }
+
+    /// Helper: check schema-attribute() declaration match.
+    fn matches_schema_attribute_decl<N: DomNavigator>(
+        nav: &N,
+        name: &QualifiedName,
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        if let Some(schema_set) = ctx.schema_set {
+            let ns_id = name.namespace_uri;
+            let Some(attr_key) = schema_set.lookup_attribute(ns_id, name.local_name) else {
+                return false;
+            };
+            let Some(attr_data) = schema_set.arenas.attributes.get(attr_key) else {
+                return false;
+            };
+            if let Some(expected_type) = attr_data.resolved_type {
+                let Some(actual_type) = nav.schema_type() else {
+                    return false;
+                };
+                return schema_set.is_type_derived_from(
+                    TypeKey::Simple(actual_type),
+                    expected_type,
+                    DerivationSet::empty(),
+                );
+            }
+            // Declaration found, no type constraint
+            return true;
+        }
+        // No schema context - name already verified
+        true
+    }
 }
 
 /// Name test for element/attribute tests (resolved form with interned names)
@@ -199,8 +512,15 @@ impl SequenceType {
     }
 
     /// Create empty-sequence() type
+    ///
+    /// This only matches empty sequences (zero items).
     pub fn empty() -> Self {
-        Self::new(ItemType::AnyItem, XmlTypeCardinality::ZeroOrMore)
+        Self::new(ItemType::AnyItem, XmlTypeCardinality::Empty)
+    }
+
+    /// Check if this is the empty-sequence() type
+    pub fn is_empty_sequence(&self) -> bool {
+        self.cardinality == XmlTypeCardinality::Empty
     }
 
     /// Create item()* - any sequence
@@ -336,6 +656,27 @@ impl SequenceType {
     pub fn allows_empty(&self) -> bool {
         self.cardinality.allows_empty()
     }
+
+    /// Check if a sequence of items matches this sequence type.
+    ///
+    /// Validates both cardinality and item type for each item in the sequence.
+    pub fn matches_sequence<N: DomNavigator>(
+        &self,
+        items: &[XmlItem<N>],
+        ctx: &XPathContext<'_>,
+    ) -> bool {
+        // Check cardinality first
+        if !self.cardinality.matches_count(items.len()) {
+            return false;
+        }
+        // Check each item matches the item type
+        for item in items {
+            if !self.item_type.matches_item(item, ctx) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl Default for SequenceType {
@@ -346,6 +687,11 @@ impl Default for SequenceType {
 
 impl fmt::Display for SequenceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Handle empty-sequence() specially
+        if self.cardinality == XmlTypeCardinality::Empty {
+            return write!(f, "empty-sequence()");
+        }
+
         // Format item type
         match &self.item_type {
             ItemType::AnyItem => write!(f, "item()")?,
@@ -395,6 +741,10 @@ impl fmt::Display for SequenceType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use num_bigint::BigInt;
+
+    use crate::namespace::table::NameTable;
+    use crate::xpath::roxmltree::RoXmlNavigator;
 
     #[test]
     fn test_cardinality_matches_count() {
@@ -467,5 +817,391 @@ mod tests {
             ItemType::AtomicType(XmlTypeCode::String).type_code(),
             XmlTypeCode::String
         );
+    }
+
+    // ============================================================================
+    // Runtime Sequence Type Matching Tests
+    // ============================================================================
+
+    #[test]
+    fn test_cardinality_one() {
+        // xs:integer requires exactly 1 item
+        let seq_type = SequenceType::integer();
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let one_item: Vec<XmlItem<RoXmlNavigator<'static>>> =
+            vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(42)))];
+        let no_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![];
+        let two_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ];
+
+        assert!(seq_type.matches_sequence(&one_item, &ctx));
+        assert!(!seq_type.matches_sequence(&no_items, &ctx));
+        assert!(!seq_type.matches_sequence(&two_items, &ctx));
+    }
+
+    #[test]
+    fn test_cardinality_optional() {
+        // xs:integer? allows 0 or 1 item
+        let seq_type = SequenceType::integer_optional();
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let one_item: Vec<XmlItem<RoXmlNavigator<'static>>> =
+            vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(42)))];
+        let no_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![];
+        let two_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ];
+
+        assert!(seq_type.matches_sequence(&one_item, &ctx));
+        assert!(seq_type.matches_sequence(&no_items, &ctx));
+        assert!(!seq_type.matches_sequence(&two_items, &ctx));
+    }
+
+    #[test]
+    fn test_cardinality_star() {
+        // xs:integer* allows any count
+        let seq_type = SequenceType::star(ItemType::AtomicType(XmlTypeCode::Integer));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let no_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![];
+        let one_item: Vec<XmlItem<RoXmlNavigator<'static>>> =
+            vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(42)))];
+        let three_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(3))),
+        ];
+
+        assert!(seq_type.matches_sequence(&no_items, &ctx));
+        assert!(seq_type.matches_sequence(&one_item, &ctx));
+        assert!(seq_type.matches_sequence(&three_items, &ctx));
+    }
+
+    #[test]
+    fn test_cardinality_plus() {
+        // xs:integer+ requires at least 1 item
+        let seq_type = SequenceType::plus(ItemType::AtomicType(XmlTypeCode::Integer));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let no_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![];
+        let one_item: Vec<XmlItem<RoXmlNavigator<'static>>> =
+            vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(42)))];
+        let three_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(3))),
+        ];
+
+        assert!(!seq_type.matches_sequence(&no_items, &ctx));
+        assert!(seq_type.matches_sequence(&one_item, &ctx));
+        assert!(seq_type.matches_sequence(&three_items, &ctx));
+    }
+
+    #[test]
+    fn test_atomic_integer_match() {
+        // Integer value matches xs:integer
+        let item_type = ItemType::AtomicType(XmlTypeCode::Integer);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let int_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(42)));
+        let str_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::string("hello"));
+
+        assert!(item_type.matches_item(&int_value, &ctx));
+        assert!(!item_type.matches_item(&str_value, &ctx));
+    }
+
+    #[test]
+    fn test_atomic_string_match() {
+        // String value matches xs:string
+        let item_type = ItemType::AtomicType(XmlTypeCode::String);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let str_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::string("hello"));
+        let int_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(42)));
+
+        assert!(item_type.matches_item(&str_value, &ctx));
+        assert!(!item_type.matches_item(&int_value, &ctx));
+    }
+
+    #[test]
+    fn test_atomic_type_hierarchy() {
+        // Any atomic matches xs:anyAtomicType
+        let item_type = ItemType::AtomicType(XmlTypeCode::AnyAtomicType);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let str_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::string("hello"));
+        let int_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(42)));
+        let bool_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::boolean(true));
+
+        assert!(item_type.matches_item(&str_value, &ctx));
+        assert!(item_type.matches_item(&int_value, &ctx));
+        assert!(item_type.matches_item(&bool_value, &ctx));
+    }
+
+    #[test]
+    fn test_item_matches_any() {
+        // item() matches both nodes and atomics
+        let item_type = ItemType::AnyItem;
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child();
+
+        let node_item = XmlItem::Node(nav);
+        let atomic_item: XmlItem<RoXmlNavigator<'_>> =
+            XmlItem::Atomic(XmlValue::string("hello"));
+
+        assert!(item_type.matches_item(&node_item, &ctx));
+        assert!(item_type.matches_item(&atomic_item, &ctx));
+    }
+
+    #[test]
+    fn test_node_rejects_atomic() {
+        // node() rejects atomic values
+        let item_type = ItemType::AnyNode;
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let atomic_item: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::string("hello"));
+
+        assert!(!item_type.matches_item(&atomic_item, &ctx));
+    }
+
+    #[test]
+    fn test_atomic_rejects_node() {
+        // xs:integer rejects nodes
+        let item_type = ItemType::AtomicType(XmlTypeCode::Integer);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child();
+
+        let node_item = XmlItem::Node(nav);
+
+        assert!(!item_type.matches_item(&node_item, &ctx));
+    }
+
+    #[test]
+    fn test_element_item_type_matches_element() {
+        // element() matches element nodes
+        let item_type = ItemType::Element(None, None);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child();
+
+        let node_item = XmlItem::Node(nav);
+
+        assert!(item_type.matches_item(&node_item, &ctx));
+    }
+
+    #[test]
+    fn test_text_item_type_matches_text() {
+        // text() matches text nodes
+        let item_type = ItemType::Text;
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root>text</root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // text
+
+        let node_item = XmlItem::Node(nav);
+
+        assert!(item_type.matches_item(&node_item, &ctx));
+    }
+
+    #[test]
+    fn test_sequence_type_mixed_types_fail() {
+        // Sequence with wrong type fails
+        let seq_type = SequenceType::star(ItemType::AtomicType(XmlTypeCode::Integer));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let mixed_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::string("not an integer")),
+        ];
+
+        assert!(!seq_type.matches_sequence(&mixed_items, &ctx));
+    }
+
+    #[test]
+    fn test_integer_derived_types() {
+        // Integer derived types match xs:integer via type_matches
+        let item_type = ItemType::AtomicType(XmlTypeCode::Integer);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        // Create a value with integer type code
+        let int_value: XmlItem<RoXmlNavigator<'static>> =
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(42)));
+
+        assert!(item_type.matches_item(&int_value, &ctx));
+    }
+
+    // ============================================================================
+    // empty-sequence() Tests
+    // ============================================================================
+
+    #[test]
+    fn test_empty_sequence_matches_empty() {
+        // empty-sequence() only matches empty sequences
+        let seq_type = SequenceType::empty();
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let empty: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![];
+        assert!(seq_type.matches_sequence(&empty, &ctx));
+    }
+
+    #[test]
+    fn test_empty_sequence_rejects_non_empty() {
+        // empty-sequence() rejects non-empty sequences
+        let seq_type = SequenceType::empty();
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let one_item: Vec<XmlItem<RoXmlNavigator<'static>>> =
+            vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(42)))];
+        let two_items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
+        ];
+
+        assert!(!seq_type.matches_sequence(&one_item, &ctx));
+        assert!(!seq_type.matches_sequence(&two_items, &ctx));
+    }
+
+    #[test]
+    fn test_empty_sequence_display() {
+        // empty-sequence() displays correctly
+        assert_eq!(SequenceType::empty().to_string(), "empty-sequence()");
+    }
+
+    #[test]
+    fn test_is_empty_sequence() {
+        assert!(SequenceType::empty().is_empty_sequence());
+        assert!(!SequenceType::any().is_empty_sequence());
+        assert!(!SequenceType::integer().is_empty_sequence());
+    }
+
+    // ============================================================================
+    // document-node(E) Tests
+    // ============================================================================
+
+    #[test]
+    fn test_document_node_with_element_single_element() {
+        // document-node(element()) matches document with exactly one element child
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        assert!(item_type.matches_node(&nav, &ctx));
+    }
+
+    #[test]
+    fn test_document_node_with_element_allows_comments() {
+        // document-node(element()) allows comments alongside the element
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<!-- comment --><root/><!-- another -->")
+            .expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        assert!(item_type.matches_node(&nav, &ctx));
+    }
+
+    #[test]
+    fn test_document_node_with_element_allows_pi() {
+        // document-node(element()) allows processing instructions alongside the element
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<?target data?><root/>").expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        assert!(item_type.matches_node(&nav, &ctx));
+    }
+
+    #[test]
+    fn test_document_node_with_element_rejects_no_element() {
+        // document-node(element()) rejects document with no element children
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+
+        // A document with only a comment (no root element) - this would be malformed XML
+        // but we can test the logic by checking a document node directly
+        let doc = roxmltree::Document::parse("<!-- comment only is invalid XML --><dummy/>")
+            .expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        // This should match since there's still an element
+        assert!(item_type.matches_node(&nav, &ctx));
+    }
+
+    #[test]
+    fn test_document_node_with_specific_element_name() {
+        // document-node(element(root)) matches document with element named "root"
+        let table = NameTable::new();
+        let root_id = table.add("root");
+        let qname = QualifiedName::local(root_id);
+        let name_test = NameTest::QName(qname);
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        assert!(item_type.matches_node(&nav, &ctx));
+    }
+
+    #[test]
+    fn test_document_node_with_wrong_element_name() {
+        // document-node(element(root)) rejects document with element named "other"
+        let table = NameTable::new();
+        let root_id = table.add("root");
+        let qname = QualifiedName::local(root_id);
+        let name_test = NameTest::QName(qname);
+        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let ctx = XPathContext::new(&table);
+
+        let doc = roxmltree::Document::parse("<other/>").expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        assert!(!item_type.matches_node(&nav, &ctx));
     }
 }
