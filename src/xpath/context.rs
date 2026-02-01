@@ -169,10 +169,15 @@ pub struct NameSlot {
 ///
 /// Provides stack-based scoping with slot IDs into a data pool.
 /// Used during expression binding to assign variable slots.
+///
+/// External variables (those declared before `mark_external_boundary()` is called)
+/// are tracked separately and can be retrieved via `external_vars()`.
 #[derive(Debug, Default)]
 pub struct NameBinder {
     next_slot: VarSlotId,
     stack: Vec<NameSlot>,
+    /// Count of external variables (pushed before mark_external_boundary)
+    external_var_count: usize,
 }
 
 impl NameBinder {
@@ -181,6 +186,7 @@ impl NameBinder {
         Self {
             next_slot: 0,
             stack: Vec::new(),
+            external_var_count: 0,
         }
     }
 
@@ -194,6 +200,30 @@ impl NameBinder {
     /// Check if any slots have been allocated.
     pub fn is_empty(&self) -> bool {
         self.next_slot == 0
+    }
+
+    /// Mark the current stack position as the boundary between external variables
+    /// and internally-bound variables.
+    ///
+    /// Call this after pushing all external variables (those provided by the API user)
+    /// and before binding the expression (which may introduce for/let/quantified variables).
+    pub fn mark_external_boundary(&mut self) {
+        self.external_var_count = self.stack.len();
+    }
+
+    /// Iterate over external variables (those pushed before `mark_external_boundary()`).
+    ///
+    /// Returns an iterator of (name, slot) pairs for all external variables.
+    pub fn external_vars(&self) -> impl Iterator<Item = (&QualifiedName, VarSlotId)> {
+        self.stack
+            .iter()
+            .take(self.external_var_count)
+            .map(|slot| (&slot.name, slot.slot))
+    }
+
+    /// Get the number of external variables.
+    pub fn external_var_count(&self) -> usize {
+        self.external_var_count
     }
 
     /// Push a new variable binding onto the stack.

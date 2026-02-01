@@ -66,7 +66,7 @@ impl SourceSpan {
 ///
 /// Nodes are stored in a contiguous vector and referenced by `AstNodeId`.
 /// This enables efficient allocation and avoids recursive Box structures.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AstArena {
     nodes: Vec<AstNode>,
 }

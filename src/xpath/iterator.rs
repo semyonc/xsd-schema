@@ -69,6 +69,22 @@ impl<N: DomNavigator> XmlItem<N> {
     }
 }
 
+// ============================================================================
+// From Trait Implementations for XmlItem
+// ============================================================================
+
+impl<N: DomNavigator> From<N> for XmlItem<N> {
+    fn from(node: N) -> Self {
+        XmlItem::Node(node)
+    }
+}
+
+impl<N: DomNavigator> From<XmlValue> for XmlItem<N> {
+    fn from(value: XmlValue) -> Self {
+        XmlItem::Atomic(value)
+    }
+}
+
 /// Borrowed view of an XPath item.
 #[derive(Debug, Clone, Copy)]
 pub enum XmlItemRef<'a, N: DomNavigator> {

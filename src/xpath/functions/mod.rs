@@ -852,6 +852,64 @@ fn item_boolean_value<N: DomNavigator>(item: &XmlItem<N>) -> Result<bool, XPathE
     }
 }
 
+// ============================================================================
+// From Trait Implementations for XPathValue
+// ============================================================================
+
+impl<N: DomNavigator> From<bool> for XPathValue<N> {
+    fn from(b: bool) -> Self {
+        XPathValue::boolean(b)
+    }
+}
+
+impl<N: DomNavigator> From<i32> for XPathValue<N> {
+    fn from(i: i32) -> Self {
+        XPathValue::integer(BigInt::from(i))
+    }
+}
+
+impl<N: DomNavigator> From<i64> for XPathValue<N> {
+    fn from(i: i64) -> Self {
+        XPathValue::integer(BigInt::from(i))
+    }
+}
+
+impl<N: DomNavigator> From<f64> for XPathValue<N> {
+    fn from(d: f64) -> Self {
+        XPathValue::double(d)
+    }
+}
+
+impl<N: DomNavigator> From<f32> for XPathValue<N> {
+    fn from(f: f32) -> Self {
+        XPathValue::double(f as f64)
+    }
+}
+
+impl<N: DomNavigator> From<String> for XPathValue<N> {
+    fn from(s: String) -> Self {
+        XPathValue::string(s)
+    }
+}
+
+impl<N: DomNavigator> From<&str> for XPathValue<N> {
+    fn from(s: &str) -> Self {
+        XPathValue::string(s)
+    }
+}
+
+impl<N: DomNavigator> From<()> for XPathValue<N> {
+    fn from(_: ()) -> Self {
+        XPathValue::empty()
+    }
+}
+
+impl<N: DomNavigator> From<BigInt> for XPathValue<N> {
+    fn from(i: BigInt) -> Self {
+        XPathValue::integer(i)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

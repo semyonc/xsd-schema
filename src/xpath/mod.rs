@@ -54,10 +54,16 @@ pub mod functions;
 pub mod bind;
 pub mod eval;
 
+// High-level public API
+pub mod api;
+
 // Navigator modules
 pub mod roxmltree;
 
 pub use self::roxmltree::RoXmlNavigator;
+
+// High-level API re-exports
+pub use self::api::{XPathExpr, XPathEvaluator, ExternalVar, EvalValue, TypedEvaluator};
 
 // Re-export key parser types
 pub use self::arena::{AstArena, AstNodeId, SourceSpan};
