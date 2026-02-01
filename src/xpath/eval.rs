@@ -648,11 +648,28 @@ fn eval_path_expr<N: DomNavigator>(
         return Ok(XPathValue::from_node(root));
     }
 
+    // Check if the first step is a "primary expression" that doesn't require context.
+    // This includes function calls, literals, parenthesized expressions, and variable references.
+    // PathStep and ContextItem DO require context.
+    let first_is_primary = path_expr.steps.first().is_some_and(|&step_id| {
+        matches!(
+            arena.get(step_id),
+            AstNode::FilterExpr(_)
+                | AstNode::FunctionCall(_)
+                | AstNode::Value(_)
+                | AstNode::Expr(_)
+                | AstNode::VarRef(_)
+        )
+    });
+
     // Determine the starting nodes based on path type
     let starting_nodes: Vec<N> = if path_expr.is_absolute {
         // Absolute path: start from document root
         let context_node = ctx.require_context_node()?;
         vec![get_root(context_node)]
+    } else if first_is_primary {
+        // First step is a primary expression - no initial context nodes needed
+        Vec::new()
     } else {
         // Relative path: start from context node
         let context_node = ctx.require_context_node()?;
@@ -704,26 +721,33 @@ fn eval_path_expr<N: DomNavigator>(
                 }
             }
             _ => {
-                // Other expression types (like function calls) as steps
-                // Evaluate for each node in the current sequence
-                let mut results = Vec::new();
-                for item in current_nodes {
-                    let saved_context = ctx.context_item.take();
-                    let saved_pos = ctx.context_position;
-                    let saved_size = ctx.context_size;
+                // Other expression types (like function calls, parenthesized exprs) as steps
+                if step_idx == 0 && current_nodes.is_empty() {
+                    // First step is a primary expression (function call, etc.) with no initial context
+                    // Evaluate it directly
+                    let result = eval_node(arena, step_id, ctx)?;
+                    result.into_vec()
+                } else {
+                    // Evaluate for each node in the current sequence
+                    let mut results = Vec::new();
+                    for item in current_nodes {
+                        let saved_context = ctx.context_item.take();
+                        let saved_pos = ctx.context_position;
+                        let saved_size = ctx.context_size;
 
-                    ctx.context_item = Some(item);
-                    ctx.context_position = 1;
-                    ctx.context_size = 1;
+                        ctx.context_item = Some(item);
+                        ctx.context_position = 1;
+                        ctx.context_size = 1;
 
-                    let step_result = eval_node(arena, step_id, ctx)?;
-                    results.extend(step_result.into_vec());
+                        let step_result = eval_node(arena, step_id, ctx)?;
+                        results.extend(step_result.into_vec());
 
-                    ctx.context_item = saved_context;
-                    ctx.context_position = saved_pos;
-                    ctx.context_size = saved_size;
+                        ctx.context_item = saved_context;
+                        ctx.context_position = saved_pos;
+                        ctx.context_size = saved_size;
+                    }
+                    results
                 }
-                results
             }
         };
 

@@ -240,7 +240,7 @@ QuantifiedExprOper: ForBinding = {
 // ============================================================================
 
 IfExpr: AstNodeId = {
-    <l:@L> "if" "(" <test:Expr> ")" "then" <then_br:ExprSingle> "else" <else_br:ExprSingle> <r:@R> => {
+    <l:@L> "if" "(" <test:ExprInner> ")" "then" <then_br:ExprSingle> "else" <else_br:ExprSingle> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::If(IfNode::new(test, then_br, else_br, span)))
     },
@@ -984,7 +984,7 @@ ParenthesizedExpr: AstNodeId = {
     <l:@L> "(" ")" <r:@R> => {
         arena.add(AstNode::Value(ValueNode::Empty))
     },
-    "(" <e:Expr> ")" => e,
+    "(" <e:ExprInner> ")" => e,
 };
 
 ContextItemExpr: AstNodeId = {

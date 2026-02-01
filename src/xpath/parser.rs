@@ -91,7 +91,7 @@ impl ParsedXPath {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use xsd_schema::xpath::parser::parse;
 ///
 /// let result = parse("/a/b/c").unwrap();

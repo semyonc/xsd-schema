@@ -393,6 +393,54 @@ impl<N: DomNavigator> XPathValue<N> {
             Self::Sequence(items) => items.first(),
         }
     }
+
+    // ========================================================================
+    // Atomic Value Extraction Methods
+    // ========================================================================
+
+    /// Try to extract a string from a single atomic item.
+    ///
+    /// Returns `None` if:
+    /// - The value is empty
+    /// - The value is a sequence
+    /// - The item is a node (not atomic)
+    /// - The atomic value is not a string type
+    pub fn as_str(&self) -> Option<String> {
+        match self {
+            Self::Item(XmlItem::Atomic(v)) => v.as_string().map(|s| s.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a boolean from a single atomic item.
+    ///
+    /// Returns `None` if the value is not a single atomic boolean.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Item(XmlItem::Atomic(v)) => v.as_boolean(),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a double from a single atomic item.
+    ///
+    /// Returns `None` if the value is not a single atomic numeric value.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::Item(XmlItem::Atomic(v)) => v.as_double(),
+            _ => None,
+        }
+    }
+
+    /// Try to extract an integer from a single atomic item.
+    ///
+    /// Returns `None` if the value is not a single atomic integer.
+    pub fn as_integer(&self) -> Option<num_bigint::BigInt> {
+        match self {
+            Self::Item(XmlItem::Atomic(v)) => v.as_integer().cloned(),
+            _ => None,
+        }
+    }
 }
 
 // ============================================================================

@@ -74,6 +74,10 @@ pub enum XPathError {
     #[error("[XPTY0019] Step result in path expression must not be an atomic value")]
     XPTY0019,
 
+    /// XPTY0020: Context item in axis step is not a node.
+    #[error("[XPTY0020] Context item for axis step is not a node")]
+    XPTY0020,
+
     // ========================================================================
     // XQuery Type Errors (XQTY)
     // ========================================================================
@@ -305,6 +309,11 @@ impl XPathError {
         }
     }
 
+    /// Create XPTY0020 context item not a node error.
+    pub fn context_not_a_node() -> Self {
+        XPathError::XPTY0020
+    }
+
     /// Create FORG0001 invalid cast value error.
     pub fn invalid_cast_value(value: impl Into<String>, target_type: impl Into<String>) -> Self {
         XPathError::FORG0001 {
@@ -425,6 +434,7 @@ impl XPathError {
             XPathError::XPTY0004Cast { .. } => Some("XPTY0004"),
             XPathError::XPTY0018 => Some("XPTY0018"),
             XPathError::XPTY0019 => Some("XPTY0019"),
+            XPathError::XPTY0020 => Some("XPTY0020"),
             XPathError::XQTY0030 => Some("XQTY0030"),
             XPathError::XQST0076 { .. } => Some("XQST0076"),
             XPathError::FORG0001 { .. } => Some("FORG0001"),

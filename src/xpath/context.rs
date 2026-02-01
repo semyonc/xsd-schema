@@ -394,13 +394,12 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     }
 
     /// Get the context node, returning an error if undefined or not a node.
+    ///
+    /// Returns XPTY0020 if the context item is not a node (per XPath 2.0 spec for axis steps).
     pub fn require_context_node(&self) -> Result<&N, super::error::XPathError> {
         match self.context_item.as_ref() {
             Some(XmlItem::Node(node)) => Ok(node),
-            Some(XmlItem::Atomic(_)) => Err(super::error::XPathError::XPTY0004 {
-                expected: "node()".to_string(),
-                found: "atomic value".to_string(),
-            }),
+            Some(XmlItem::Atomic(_)) => Err(super::error::XPathError::XPTY0020),
             None => Err(super::error::XPathError::XPDY0002 {
                 message: "Context item is undefined".to_string(),
             }),

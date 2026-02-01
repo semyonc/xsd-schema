@@ -21,6 +21,54 @@ pub enum XmlItem<N: DomNavigator> {
     Atomic(XmlValue),
 }
 
+impl<N: DomNavigator> XmlItem<N> {
+    /// Check if this item is a node.
+    pub fn is_node(&self) -> bool {
+        matches!(self, XmlItem::Node(_))
+    }
+
+    /// Check if this item is an atomic value.
+    pub fn is_atomic(&self) -> bool {
+        matches!(self, XmlItem::Atomic(_))
+    }
+
+    /// Try to get a reference to the node.
+    pub fn as_node(&self) -> Option<&N> {
+        match self {
+            XmlItem::Node(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Try to get a reference to the atomic value.
+    pub fn as_atomic(&self) -> Option<&XmlValue> {
+        match self {
+            XmlItem::Atomic(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Try to extract a string from an atomic item.
+    pub fn as_str(&self) -> Option<String> {
+        self.as_atomic().and_then(|v| v.as_string().map(|s| s.to_string()))
+    }
+
+    /// Try to extract a boolean from an atomic item.
+    pub fn as_bool(&self) -> Option<bool> {
+        self.as_atomic().and_then(|v| v.as_boolean())
+    }
+
+    /// Try to extract a double from an atomic item.
+    pub fn as_f64(&self) -> Option<f64> {
+        self.as_atomic().and_then(|v| v.as_double())
+    }
+
+    /// Try to extract an integer from an atomic item.
+    pub fn as_integer(&self) -> Option<BigInt> {
+        self.as_atomic().and_then(|v| v.as_integer().cloned())
+    }
+}
+
 /// Borrowed view of an XPath item.
 #[derive(Debug, Clone, Copy)]
 pub enum XmlItemRef<'a, N: DomNavigator> {

@@ -906,11 +906,49 @@ fn test_node_is_type_error() {
 }
 
 #[test]
-#[ignore = "Requires path evaluation for different nodes"]
 fn test_node_before_after() {
-    // $a << $b where a precedes b → true
-    // $a >> $b where a follows b → true
-    // These tests require path evaluation to get different nodes
+    // Test << and >> operators with nodes from a document
+    // /root/a << /root/b → true (a comes before b)
+    // /root/b >> /root/a → true (b comes after a)
+    use crate::xpath::bind::bind_node;
+    use crate::xpath::context::NameBinder;
+    use crate::xpath::parser;
+
+    let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+    let nav = RoXmlNavigator::new(&doc);
+
+    // Helper to eval xpath with document context
+    let eval_with_doc = |expr: &str| -> Result<XPathValue<RoXmlNavigator<'_>>, XPathError> {
+        let mut parsed =
+            parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
+
+        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
+            .with_context_item(XmlItem::Node(nav.clone()));
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
+    };
+
+    // Test: /root/a << /root/b → true (a comes before b in document order)
+    let result = eval_with_doc("/root/a << /root/b").unwrap();
+    assert_eq!(result.as_bool(), Some(true), "a << b should be true");
+
+    // Test: /root/b >> /root/a → true (b comes after a in document order)
+    let result = eval_with_doc("/root/b >> /root/a").unwrap();
+    assert_eq!(result.as_bool(), Some(true), "b >> a should be true");
+
+    // Test: /root/a >> /root/b → false (a does not come after b)
+    let result = eval_with_doc("/root/a >> /root/b").unwrap();
+    assert_eq!(result.as_bool(), Some(false), "a >> b should be false");
+
+    // Test: /root/b << /root/a → false (b does not come before a)
+    let result = eval_with_doc("/root/b << /root/a").unwrap();
+    assert_eq!(result.as_bool(), Some(false), "b << a should be false");
 }
 
 // ========================================================================
@@ -1917,47 +1955,115 @@ fn test_every_dependent_bindings_fails() {
 
 #[cfg(test)]
 mod integration_tests {
-//! Integration tests for the full parse -> bind -> eval pipeline.
-//!
-//! These tests are marked `#[ignore]` until the XPath parser is implemented.
-//! They serve as a specification for the expected behavior of the full pipeline.
+    //! Integration tests for the full parse -> bind -> eval pipeline.
 
-#[test]
-#[ignore = "Requires parser implementation"]
-fn test_parse_bind_eval_if_expression() {
-    // let result = eval_xpath("if (true()) then 'yes' else 'no'");
-    // assert_eq!(result.unwrap().as_string(), Some("yes".to_string()));
-}
+    use crate::namespace::table::NameTable;
+    use crate::xpath::bind::bind_node;
+    use crate::xpath::context::{DynamicContext, NameBinder, XPathContext};
+    use crate::xpath::error::XPathError;
+    use crate::xpath::eval::eval_node;
+    use crate::xpath::functions::XPathValue;
+    use crate::xpath::parser;
+    use crate::xpath::RoXmlNavigator;
 
-#[test]
-#[ignore = "Requires parser implementation"]
-fn test_parse_bind_eval_nested_functions() {
-    // let result = eval_xpath("upper-case(concat('a', 'b'))");
-    // assert_eq!(result.unwrap().as_string(), Some("AB".to_string()));
-}
+    /// Helper to parse, bind, and evaluate an XPath expression without context item
+    fn eval_xpath(expr: &str) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+        let mut parsed =
+            parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
 
-#[test]
-#[ignore = "Requires parser implementation"]
-fn test_parse_bind_eval_variable_reference() {
-    // let result = eval_xpath_with_var("$x + 1", "x", 5);
-    // assert_eq!(result.unwrap().as_integer().map(|i| i.to_string()), Some("6".to_string()));
-}
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
 
-#[test]
-#[ignore = "Requires parser implementation"]
-fn test_parse_bind_eval_comparison() {
-    // assert_eq!(eval_xpath("1 = 1").unwrap().as_boolean(), Some(true));
-    // assert_eq!(eval_xpath("1 = 2").unwrap().as_boolean(), Some(false));
-    // assert_eq!(eval_xpath("1 < 2").unwrap().as_boolean(), Some(true));
-}
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
 
-#[test]
-#[ignore = "Requires parser implementation"]
-fn test_parse_bind_eval_arithmetic() {
-    // assert_eq!(eval_xpath("1 + 2").unwrap().as_integer().map(|i| i.to_string()), Some("3".to_string()));
-    // assert_eq!(eval_xpath("5 - 3").unwrap().as_integer().map(|i| i.to_string()), Some("2".to_string()));
-    // assert_eq!(eval_xpath("2 * 3").unwrap().as_integer().map(|i| i.to_string()), Some("6".to_string()));
-}
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
+    }
+
+    /// Helper to parse, bind, and evaluate with a variable bound
+    fn eval_xpath_with_var(
+        expr: &str,
+        var_name: &str,
+        var_value: i64,
+    ) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+        use crate::namespace::qname::QualifiedName;
+        use crate::types::value::XmlValue;
+        use crate::xpath::iterator::XmlItem;
+
+        let mut parsed =
+            parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        // Push the variable into scope before binding
+        let var_name_id = names.add(var_name);
+        let qname = QualifiedName::local(var_name_id);
+        let var_ref = binder.push_var(qname);
+
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
+
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        // Set the variable value
+        dyn_ctx.set_variable(
+            var_ref.slot,
+            XPathValue::Item(XmlItem::Atomic(XmlValue::integer(
+                num_bigint::BigInt::from(var_value),
+            ))),
+        );
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
+    }
+
+    #[test]
+    fn test_parse_bind_eval_if_expression() {
+        let result = eval_xpath("if (true()) then 'yes' else 'no'").unwrap();
+        assert_eq!(result.as_str(), Some("yes".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bind_eval_nested_functions() {
+        let result = eval_xpath("upper-case(concat('a', 'b'))").unwrap();
+        assert_eq!(result.as_str(), Some("AB".to_string()));
+    }
+
+    #[test]
+    fn test_parse_bind_eval_variable_reference() {
+        let result = eval_xpath_with_var("$x + 1", "x", 5).unwrap();
+        assert_eq!(
+            result.as_integer().map(|i| i.to_string()),
+            Some("6".to_string())
+        );
+    }
+
+    #[test]
+    fn test_parse_bind_eval_comparison() {
+        assert_eq!(eval_xpath("1 = 1").unwrap().as_bool(), Some(true));
+        assert_eq!(eval_xpath("1 = 2").unwrap().as_bool(), Some(false));
+        assert_eq!(eval_xpath("1 < 2").unwrap().as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_parse_bind_eval_arithmetic() {
+        assert_eq!(
+            eval_xpath("1 + 2").unwrap().as_integer().map(|i| i.to_string()),
+            Some("3".to_string())
+        );
+        assert_eq!(
+            eval_xpath("5 - 3").unwrap().as_integer().map(|i| i.to_string()),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            eval_xpath("2 * 3").unwrap().as_integer().map(|i| i.to_string()),
+            Some("6".to_string())
+        );
+    }
 }
 
 // ========================================================================
