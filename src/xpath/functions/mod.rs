@@ -30,7 +30,7 @@ pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAME
 pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
 pub use extensible::{
     BuiltinCatalog, BuiltinEvaluator, CustomFn, DynamicFunctionSignature, FunctionCatalog,
-    FunctionEvaluator, FunctionHandle, FunctionSet,
+    FunctionEvaluator, FunctionHandle, FunctionSet, XPath10Catalog, XPath10Evaluator,
 };
 
 use num_bigint::BigInt;
@@ -165,6 +165,8 @@ pub enum FunctionId {
     Lang,
     /// fn:root($arg?)
     Root,
+    /// fn:id($arg as xs:string*, $node as node()) as element()*
+    Id,
 
     // ========== DateTime Functions ==========
     /// fn:dateTime($arg1, $arg2)
@@ -697,6 +699,7 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::DocumentUri => node::document_uri(context, args),
         FunctionId::Lang => node::lang(context, args),
         FunctionId::Root => node::root(context, args),
+        FunctionId::Id => node::id(context, args),
 
         // ====================================================================
         // DateTime functions (Phase 6)
@@ -760,11 +763,12 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Replace => regex::replace(context, args),
         FunctionId::Tokenize => regex::tokenize(context, args),
 
-        // All other functions will be implemented in later phases
-        _ => Err(XPathError::not_implemented(format!(
-            "Function {:?} not yet implemented",
-            id
-        ))),
+        // ====================================================================
+        // Conversion functions (fn:string, fn:number, fn:boolean)
+        // ====================================================================
+        FunctionId::String => eval_fn_string(context, args),
+        FunctionId::Number => eval_fn_number(context, args),
+        FunctionId::Boolean => eval_boolean(args),
     }
 }
 
@@ -803,6 +807,64 @@ fn eval_count<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValu
     Ok(XPathValue::integer(arg.len() as i64))
 }
 
+fn eval_fn_string<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    match args.len() {
+        0 => {
+            // 0 args: string-value of context item
+            let item = context.require_context_item()?.clone();
+            let s = match item {
+                XmlItem::Node(nav) => nav.value(),
+                XmlItem::Atomic(v) => atomize::string_value(&v),
+            };
+            Ok(XPathValue::string(s))
+        }
+        1 => {
+            let arg = args.remove(0);
+            let s = atomize_to_string(arg)?;
+            Ok(XPathValue::string(s))
+        }
+        _ => Err(XPathError::wrong_number_of_arguments("string", 1, args.len())),
+    }
+}
+
+fn eval_fn_number<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    match args.len() {
+        0 => {
+            // 0 args: to_number of context item
+            let item = context.require_context_item()?.clone();
+            let d = match item {
+                XmlItem::Node(nav) => {
+                    let s = nav.value();
+                    s.trim().parse().unwrap_or(f64::NAN)
+                }
+                XmlItem::Atomic(v) => atomize::to_number(&v),
+            };
+            Ok(XPathValue::double(d))
+        }
+        1 => {
+            let arg = args.remove(0);
+            let d = atomize_to_double(arg)?;
+            Ok(XPathValue::double(d))
+        }
+        _ => Err(XPathError::wrong_number_of_arguments("number", 1, args.len())),
+    }
+}
+
+fn eval_boolean<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError> {
+    if args.len() != 1 {
+        return Err(XPathError::wrong_number_of_arguments("boolean", 1, args.len()));
+    }
+    let arg = args.remove(0);
+    let ebv = effective_boolean_value(&arg)?;
+    Ok(XPathValue::boolean(ebv))
+}
+
 /// Compute the effective boolean value of an XPathValue.
 pub fn effective_boolean_value<N: DomNavigator>(value: &XPathValue<N>) -> Result<bool, XPathError> {
     match value {
@@ -821,6 +883,30 @@ pub fn effective_boolean_value<N: DomNavigator>(value: &XPathValue<N>) -> Result
                 Err(XPathError::FORG0006 {
                     message: "Effective boolean value not defined for sequence of multiple atomic values".to_string(),
                 })
+            }
+        }
+    }
+}
+
+/// Compute the effective boolean value in XPath 1.0 mode.
+///
+/// Differences from XPath 2.0:
+/// - Multi-item sequences don't raise FORG0006; non-empty sequences are `true`
+/// - Node-sets: true if non-empty
+pub fn effective_boolean_value_10<N: DomNavigator>(
+    value: &XPathValue<N>,
+) -> Result<bool, XPathError> {
+    match value {
+        XPathValue::Empty => Ok(false),
+        XPathValue::Item(item) => item_boolean_value(item),
+        XPathValue::Sequence(items) => {
+            if items.is_empty() {
+                Ok(false)
+            } else if items.len() == 1 {
+                item_boolean_value(&items[0])
+            } else {
+                // XPath 1.0: non-empty node-set/sequence is true (no FORG0006 error)
+                Ok(true)
             }
         }
     }
@@ -975,5 +1061,77 @@ mod tests {
 
         let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::double(f64::NAN);
         assert!(!effective_boolean_value(&value).unwrap());
+    }
+
+    // ========================================================================
+    // fn:string, fn:number, fn:boolean tests (XPath 2.0 semantics)
+    // ========================================================================
+
+    use crate::namespace::table::NameTable;
+    use crate::xpath::context::{DynamicContext, XPathContext};
+
+    #[test]
+    fn test_eval_fn_string_integer() {
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&static_ctx, 0);
+        let args = vec![XPathValue::integer(42i64)];
+        let result = eval_fn_string(&mut ctx, args).unwrap();
+        assert_eq!(result.as_str(), Some("42".to_string()));
+    }
+
+    #[test]
+    fn test_eval_fn_string_string() {
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&static_ctx, 0);
+        let args = vec![XPathValue::string("hello")];
+        let result = eval_fn_string(&mut ctx, args).unwrap();
+        assert_eq!(result.as_str(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn test_eval_fn_number_string() {
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&static_ctx, 0);
+        let args = vec![XPathValue::string("42.5")];
+        let result = eval_fn_number(&mut ctx, args).unwrap();
+        assert_eq!(result.as_f64(), Some(42.5));
+    }
+
+    #[test]
+    fn test_eval_fn_number_invalid() {
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&static_ctx, 0);
+        let args = vec![XPathValue::string("abc")];
+        let result = eval_fn_number(&mut ctx, args).unwrap();
+        assert!(result.as_f64().unwrap().is_nan());
+    }
+
+    #[test]
+    fn test_eval_boolean_false_empty_string() {
+        let args: Vec<XPathValue<RoXmlNavigator<'static>>> = vec![XPathValue::string("")];
+        let result = eval_boolean(args).unwrap();
+        assert_eq!(result.as_bool(), Some(false));
+    }
+
+    #[test]
+    fn test_eval_boolean_true_nonempty_string() {
+        let args: Vec<XPathValue<RoXmlNavigator<'static>>> = vec![XPathValue::string("x")];
+        let result = eval_boolean(args).unwrap();
+        assert_eq!(result.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_eval_boolean_false_zero() {
+        let args: Vec<XPathValue<RoXmlNavigator<'static>>> = vec![XPathValue::double(0.0)];
+        let result = eval_boolean(args).unwrap();
+        assert_eq!(result.as_bool(), Some(false));
     }
 }

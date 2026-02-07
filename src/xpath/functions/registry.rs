@@ -442,6 +442,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
         FunctionId::Root,
         FunctionSignature::range(FN_NAMESPACE, "root", 0, 1, vec![node_opt()], node_opt()),
     ));
+    registry.register(FunctionEntry::new(
+        FunctionId::Id,
+        FunctionSignature::range(
+            FN_NAMESPACE, "id", 1, 2,
+            vec![string_star(), node()],
+            SequenceType::star(crate::types::sequence::ItemType::AnyNode),
+        ),
+    ));
 
     // ========================================================================
     // DateTime Functions

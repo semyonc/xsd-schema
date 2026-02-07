@@ -64,7 +64,7 @@ pub fn string_join<N: DomNavigator>(
     let sequence = args.pop().unwrap();
 
     // Collect all string values from the sequence
-    let strings: Result<Vec<String>, _> = sequence.into_vec()
+    let strings: Result<Vec<String>, XPathError> = sequence.into_vec()
         .into_iter()
         .map(|item| match item {
             XmlItem::Atomic(v) => Ok(v.to_string_value()),

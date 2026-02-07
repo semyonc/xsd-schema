@@ -70,7 +70,7 @@ pub use self::arena::{AstArena, AstNodeId, SourceSpan};
 pub use self::ast::AstNode;
 pub use self::error::XPathError;
 pub use self::lexer::{Lexer, Token};
-pub use self::parser::{parse, ParseError, ParsedXPath};
+pub use self::parser::{parse, parse_with_options, parse_xpath10, parse_xpath20, ParseError, ParsedXPath};
 pub use self::iterator::{
     XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
     EmptyIterator, BufferedNodeIterator, RangeIterator,
@@ -158,6 +158,28 @@ pub enum NamespaceAxisScope {
     Local,
     /// All namespaces except the xml namespace
     ExcludeXml,
+}
+
+/// Selects XPath language version for parsing and evaluation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum XPathMode {
+    XPath10,
+    #[default]
+    XPath20,
+}
+
+/// Options for XPath parsing.
+#[derive(Debug, Clone)]
+pub struct XPathParseOptions {
+    pub mode: XPathMode,
+}
+
+impl Default for XPathParseOptions {
+    fn default() -> Self {
+        Self {
+            mode: XPathMode::XPath20,
+        }
+    }
 }
 
 /// Read-only cursor-based navigator for XPath2 evaluation
@@ -310,6 +332,19 @@ pub trait DomNavigator: Clone {
             }
             _ => XmlValue::untyped(self.value()),
         }
+    }
+
+    /// Find an element by its ID attribute value.
+    ///
+    /// Returns `Ok(Some(navigator))` positioned at the matching element,
+    /// `Ok(None)` if no element with this ID exists.
+    ///
+    /// The default implementation always returns `Ok(None)`, which is
+    /// spec-compliant for documents without DTD/schema ID declarations.
+    /// Schema-aware navigators should override this method.
+    fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, error::XPathError> {
+        let _ = id;
+        Ok(None)
     }
 }
 

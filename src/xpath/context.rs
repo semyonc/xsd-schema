@@ -14,6 +14,7 @@ use crate::schema::SchemaSet;
 use crate::types::value::{TimezoneOffset, DateTimeValue};
 
 use super::DomNavigator;
+use super::XPathMode;
 use super::functions::{BuiltinCatalog, BuiltinEvaluator, FunctionCatalog, FunctionEvaluator};
 use super::iterator::XmlItem;
 
@@ -45,6 +46,8 @@ pub struct XPathContext<'a> {
     pub implicit_timezone: Option<TimezoneOffset>,
     /// Base URI for relative URI resolution
     pub base_uri: Option<String>,
+    /// XPath language mode (1.0 or 2.0)
+    pub mode: XPathMode,
     /// Function catalog for bind-time lookup (None = use builtins).
     function_catalog: Option<&'a dyn FunctionCatalog>,
 }
@@ -60,6 +63,7 @@ impl<'a> XPathContext<'a> {
             default_function_ns: Some(super::functions::FN_NAMESPACE),
             implicit_timezone: None,
             base_uri: None,
+            mode: XPathMode::XPath20,
             function_catalog: None,
         }
     }
@@ -100,6 +104,17 @@ impl<'a> XPathContext<'a> {
         self
     }
 
+    /// Set the XPath language mode.
+    pub fn with_mode(mut self, mode: XPathMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Get the XPath language mode.
+    pub fn mode(&self) -> XPathMode {
+        self.mode
+    }
+
     /// Set the function catalog for custom function support.
     pub fn with_function_catalog(mut self, catalog: &'a dyn FunctionCatalog) -> Self {
         self.function_catalog = Some(catalog);
@@ -135,8 +150,14 @@ impl<'a> XPathContext<'a> {
     }
 
     /// Get the default function namespace.
+    ///
+    /// In XPath 1.0 mode, core functions live in no namespace (empty string).
+    /// In XPath 2.0 mode, the default is the fn: namespace.
     pub fn default_function_namespace(&self) -> &str {
-        self.default_function_ns.unwrap_or(super::functions::FN_NAMESPACE)
+        match self.mode {
+            XPathMode::XPath10 => "",
+            XPathMode::XPath20 => self.default_function_ns.unwrap_or(super::functions::FN_NAMESPACE),
+        }
     }
 
     /// Resolve a name from the name table.
@@ -496,11 +517,12 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         handle: super::functions::FunctionHandle,
         args: Vec<super::functions::XPathValue<N>>,
     ) -> Result<super::functions::XPathValue<N>, super::error::XPathError> {
-        // For built-in handles, use the builtin evaluator directly (fast path)
-        if handle.is_builtin() {
+        // Fast path: built-in handles with no custom evaluator go directly to BuiltinEvaluator
+        if handle.is_builtin() && self.function_evaluator.is_none() {
             return BuiltinEvaluator.eval(handle, self, args);
         }
 
+        // Route through the custom evaluator (e.g. XPath10Evaluator intercepts builtins).
         // For custom handles, we need to call through the configured evaluator.
         // Get the evaluator pointer before borrowing self mutably.
         match self.function_evaluator {
@@ -515,7 +537,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
                 evaluator_ref.eval(handle, self, args)
             }
             None => {
-                // Should not happen for custom handles, but use builtin as fallback
+                // Fallback for custom handles without a configured evaluator
                 BuiltinEvaluator.eval(handle, self, args)
             }
         }

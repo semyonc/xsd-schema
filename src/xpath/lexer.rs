@@ -22,6 +22,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use super::XPathMode;
+
 /// Token type for XPath 2.0 expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
@@ -132,6 +134,11 @@ pub enum Token {
     Pipe,
     Plus,
     Minus,
+    // Mode-specific unary operators (for precedence routing in grammar)
+    Minus10, // XPath 1.0 unary minus (pre-union precedence)
+    Plus10,  // XPath 1.0 unary plus (pre-union precedence)
+    Minus20, // XPath 2.0 unary minus (post-union precedence)
+    Plus20,  // XPath 2.0 unary plus (post-union precedence)
     Star,
     Equals,
     LessThan,
@@ -236,6 +243,8 @@ impl fmt::Display for Token {
             Token::Pipe => write!(f, "|"),
             Token::Plus => write!(f, "+"),
             Token::Minus => write!(f, "-"),
+            Token::Minus10 | Token::Minus20 => write!(f, "-"),
+            Token::Plus10 | Token::Plus20 => write!(f, "+"),
             Token::Star => write!(f, "*"),
             Token::Equals => write!(f, "="),
             Token::LessThan => write!(f, "<"),
@@ -300,10 +309,11 @@ pub struct Lexer<'input> {
     state_stack: Vec<LexerState>,
     token_queue: VecDeque<Spanned>,
     finished: bool,
+    mode: XPathMode,
 }
 
 impl<'input> Lexer<'input> {
-    /// Create a new lexer for the given input.
+    /// Create a new lexer for the given input (XPath 2.0 mode).
     pub fn new(input: &'input str) -> Self {
         Self {
             input,
@@ -313,7 +323,27 @@ impl<'input> Lexer<'input> {
             state_stack: Vec::new(),
             token_queue: VecDeque::new(),
             finished: false,
+            mode: XPathMode::XPath20,
         }
+    }
+
+    /// Create a new lexer with an explicit XPath mode.
+    pub fn new_with_mode(input: &'input str, mode: XPathMode) -> Self {
+        Self {
+            input,
+            chars: input.chars().collect(),
+            pos: 0,
+            state: LexerState::Default,
+            state_stack: Vec::new(),
+            token_queue: VecDeque::new(),
+            finished: false,
+            mode,
+        }
+    }
+
+    /// Check if the lexer is in XPath 1.0 mode.
+    fn is_xpath10(&self) -> bool {
+        self.mode == XPathMode::XPath10
     }
 
     /// Peek at a character at the given offset from current position.
@@ -806,10 +836,10 @@ impl<'input> Lexer<'input> {
                     ';' => Token::Comma, // Semicolon treated as comma? Actually not standard
                     ',' => Token::Comma,
                     '(' => Token::LParen,
-                    '-' => Token::Minus,
-                    '+' => Token::Plus,
+                    '-' => if self.is_xpath10() { Token::Minus10 } else { Token::Minus20 },
+                    '+' => if self.is_xpath10() { Token::Plus10 } else { Token::Plus20 },
                     '@' => Token::At,
-                    '~' => Token::Minus, // Tilde not standard, treating as minus
+                    '~' => if self.is_xpath10() { Token::Minus10 } else { Token::Minus20 },
                     _ => unreachable!(),
                 };
                 self.enqueue(token, start, self.pos);
@@ -883,15 +913,15 @@ impl<'input> Lexer<'input> {
     fn process_name_in_default_state(&mut self, start: usize) -> Result<(), LexerError> {
         // Check for keywords and special constructs with lookahead
 
-        // if (
-        if self.match_identifier(&["if", "("]) {
+        // if ( — XPath 2.0 only; in 1.0 mode, "if(" is a function call
+        if !self.is_xpath10() && self.match_identifier(&["if", "("]) {
             self.enqueue(Token::If, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             return Ok(());
         }
 
-        // for $
-        if self.try_match_identifier(&["for"]) {
+        // for $ — XPath 2.0 only; in 1.0 mode, "for" is a plain NCName
+        if !self.is_xpath10() && self.try_match_identifier(&["for"]) {
             self.match_identifier(&["for"]);
             self.enqueue(Token::For, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -904,8 +934,8 @@ impl<'input> Lexer<'input> {
             return Ok(());
         }
 
-        // some $
-        if self.try_match_identifier(&["some"]) {
+        // some $ — XPath 2.0 only
+        if !self.is_xpath10() && self.try_match_identifier(&["some"]) {
             self.match_identifier(&["some"]);
             self.enqueue(Token::Some, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -918,8 +948,8 @@ impl<'input> Lexer<'input> {
             return Ok(());
         }
 
-        // every $
-        if self.try_match_identifier(&["every"]) {
+        // every $ — XPath 2.0 only
+        if !self.is_xpath10() && self.try_match_identifier(&["every"]) {
             self.match_identifier(&["every"]);
             self.enqueue(Token::Every, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -933,34 +963,37 @@ impl<'input> Lexer<'input> {
         }
 
         // Kind tests with (
-        if self.match_identifier(&["element", "("]) {
+        // XPath 2.0-only kind tests: element(, attribute(, schema-element(, schema-attribute(, document-node(
+        // In XPath 1.0 mode these fall through to QName + "(" (function call)
+        if !self.is_xpath10() && self.match_identifier(&["element", "("]) {
             self.enqueue(Token::Element, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             self.state_stack.push(LexerState::Operator);
             self.state = LexerState::KindTest;
             return Ok(());
         }
-        if self.match_identifier(&["attribute", "("]) {
+        if !self.is_xpath10() && self.match_identifier(&["attribute", "("]) {
             self.enqueue(Token::Attribute, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             self.state_stack.push(LexerState::Operator);
             self.state = LexerState::KindTest;
             return Ok(());
         }
-        if self.match_identifier(&["schema-element", "("]) {
+        if !self.is_xpath10() && self.match_identifier(&["schema-element", "("]) {
             self.enqueue(Token::SchemaElement, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             self.state_stack.push(LexerState::Operator);
             self.state = LexerState::KindTest;
             return Ok(());
         }
-        if self.match_identifier(&["schema-attribute", "("]) {
+        if !self.is_xpath10() && self.match_identifier(&["schema-attribute", "("]) {
             self.enqueue(Token::SchemaAttribute, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             self.state_stack.push(LexerState::Operator);
             self.state = LexerState::KindTest;
             return Ok(());
         }
+        // XPath 1.0 kind tests kept in both modes: comment(, text(, node(, processing-instruction(
         if self.match_identifier(&["comment", "("]) {
             self.enqueue(Token::Comment, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
@@ -982,7 +1015,7 @@ impl<'input> Lexer<'input> {
             self.state = LexerState::KindTest;
             return Ok(());
         }
-        if self.match_identifier(&["document-node", "("]) {
+        if !self.is_xpath10() && self.match_identifier(&["document-node", "("]) {
             self.enqueue(Token::DocumentNode, start, self.pos - 1);
             self.enqueue(Token::LParen, self.pos - 1, self.pos);
             self.state_stack.push(LexerState::Operator);
@@ -1145,7 +1178,7 @@ impl<'input> Lexer<'input> {
                 if self.peek(1) == Some('=') {
                     self.advance(2);
                     self.enqueue(Token::GreaterEquals, start, self.pos);
-                } else if self.peek(1) == Some('>') {
+                } else if !self.is_xpath10() && self.peek(1) == Some('>') {
                     self.advance(2);
                     self.enqueue(Token::DoubleGreater, start, self.pos);
                 } else {
@@ -1159,7 +1192,7 @@ impl<'input> Lexer<'input> {
                 if self.peek(1) == Some('=') {
                     self.advance(2);
                     self.enqueue(Token::LessEquals, start, self.pos);
-                } else if self.peek(1) == Some('<') {
+                } else if !self.is_xpath10() && self.peek(1) == Some('<') {
                     self.advance(2);
                     self.enqueue(Token::DoubleLess, start, self.pos);
                 } else {
@@ -1235,54 +1268,39 @@ impl<'input> Lexer<'input> {
 
     /// Process keywords in Operator state.
     fn process_keyword_in_operator_state(&mut self, start: usize) -> Result<(), LexerError> {
-        // Two-word type keywords
-        if self.match_identifier(&["castable", "as"]) {
-            self.enqueue(Token::CastableAs, start, self.pos);
-            self.state = LexerState::SingleType;
-            return Ok(());
-        }
-        if self.match_identifier(&["cast", "as"]) {
-            self.enqueue(Token::CastAs, start, self.pos);
-            self.state = LexerState::SingleType;
-            return Ok(());
-        }
-        if self.match_identifier(&["instance", "of"]) {
-            self.enqueue(Token::InstanceOf, start, self.pos);
-            self.state = LexerState::ItemType;
-            return Ok(());
-        }
-        if self.match_identifier(&["treat", "as"]) {
-            self.enqueue(Token::TreatAs, start, self.pos);
-            self.state = LexerState::ItemType;
-            return Ok(());
+        // Two-word type keywords — XPath 2.0 only
+        if !self.is_xpath10() {
+            if self.match_identifier(&["castable", "as"]) {
+                self.enqueue(Token::CastableAs, start, self.pos);
+                self.state = LexerState::SingleType;
+                return Ok(());
+            }
+            if self.match_identifier(&["cast", "as"]) {
+                self.enqueue(Token::CastAs, start, self.pos);
+                self.state = LexerState::SingleType;
+                return Ok(());
+            }
+            if self.match_identifier(&["instance", "of"]) {
+                self.enqueue(Token::InstanceOf, start, self.pos);
+                self.state = LexerState::ItemType;
+                return Ok(());
+            }
+            if self.match_identifier(&["treat", "as"]) {
+                self.enqueue(Token::TreatAs, start, self.pos);
+                self.state = LexerState::ItemType;
+                return Ok(());
+            }
         }
 
-        // Single-word keywords
-        let keywords: &[(&str, Token, LexerState)] = &[
-            ("then", Token::Then, LexerState::Default),
-            ("else", Token::Else, LexerState::Default),
+        // Single-word keywords shared by both XPath 1.0 and 2.0
+        let shared_keywords: &[(&str, Token, LexerState)] = &[
             ("and", Token::And, LexerState::Default),
             ("or", Token::Or, LexerState::Default),
             ("div", Token::Div, LexerState::Default),
-            ("idiv", Token::IDiv, LexerState::Default),
             ("mod", Token::Mod, LexerState::Default),
-            ("except", Token::Except, LexerState::Default),
-            ("intersect", Token::Intersect, LexerState::Default),
-            ("union", Token::Union, LexerState::Default),
-            ("return", Token::Return, LexerState::Default),
-            ("satisfies", Token::Satisfies, LexerState::Default),
-            ("to", Token::To, LexerState::Default),
-            ("in", Token::In, LexerState::Default),
-            ("is", Token::Is, LexerState::Default),
-            ("eq", Token::Eq, LexerState::Default),
-            ("ne", Token::Ne, LexerState::Default),
-            ("lt", Token::Lt, LexerState::Default),
-            ("le", Token::Le, LexerState::Default),
-            ("gt", Token::Gt, LexerState::Default),
-            ("ge", Token::Ge, LexerState::Default),
         ];
 
-        for (kw, tok, next_state) in keywords {
+        for (kw, tok, next_state) in shared_keywords {
             if self.match_identifier(&[kw]) {
                 self.enqueue(tok.clone(), start, self.pos);
                 self.state = *next_state;
@@ -1290,8 +1308,39 @@ impl<'input> Lexer<'input> {
             }
         }
 
-        // for $ in operator context
-        if self.try_match_identifier(&["for"]) {
+        // Single-word keywords — XPath 2.0 only
+        if !self.is_xpath10() {
+            let xpath20_keywords: &[(&str, Token, LexerState)] = &[
+                ("then", Token::Then, LexerState::Default),
+                ("else", Token::Else, LexerState::Default),
+                ("idiv", Token::IDiv, LexerState::Default),
+                ("except", Token::Except, LexerState::Default),
+                ("intersect", Token::Intersect, LexerState::Default),
+                ("union", Token::Union, LexerState::Default),
+                ("return", Token::Return, LexerState::Default),
+                ("satisfies", Token::Satisfies, LexerState::Default),
+                ("to", Token::To, LexerState::Default),
+                ("in", Token::In, LexerState::Default),
+                ("is", Token::Is, LexerState::Default),
+                ("eq", Token::Eq, LexerState::Default),
+                ("ne", Token::Ne, LexerState::Default),
+                ("lt", Token::Lt, LexerState::Default),
+                ("le", Token::Le, LexerState::Default),
+                ("gt", Token::Gt, LexerState::Default),
+                ("ge", Token::Ge, LexerState::Default),
+            ];
+
+            for (kw, tok, next_state) in xpath20_keywords {
+                if self.match_identifier(&[kw]) {
+                    self.enqueue(tok.clone(), start, self.pos);
+                    self.state = *next_state;
+                    return Ok(());
+                }
+            }
+        }
+
+        // for $ in operator context — XPath 2.0 only
+        if !self.is_xpath10() && self.try_match_identifier(&["for"]) {
             self.match_identifier(&["for"]);
             self.enqueue(Token::For, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -1306,7 +1355,22 @@ impl<'input> Lexer<'input> {
             return Ok(());
         }
 
-        // Not a keyword - error in operator context
+        // In XPath 1.0 mode, unrecognized names in operator context are path steps (QNames)
+        if self.is_xpath10() {
+            let name = self.consume_qname();
+            let end = self.pos;
+            self.skip_whitespace_and_comments();
+            // If followed by '(', it's a function call - stay in Default
+            if self.current() != Some('(') {
+                self.state = LexerState::Operator;
+            } else {
+                self.state = LexerState::Default;
+            }
+            self.enqueue(Token::QName(name), start, end);
+            return Ok(());
+        }
+
+        // Not a keyword - error in operator context (XPath 2.0)
         let name = self.consume_qname();
         Err(LexerError {
             message: format!("Unexpected identifier in operator context: '{}'", name),
@@ -2035,5 +2099,210 @@ mod tests {
     fn test_occurrence_indicators() {
         let tokens = tokenize("$x instance of xs:integer?");
         assert!(tokens.contains(&Token::OccurrenceZeroOrOne));
+    }
+
+    // ---- XPath 1.0 mode tests ----
+
+    fn tokenize_10(input: &str) -> Vec<Token> {
+        Lexer::new_with_mode(input, XPathMode::XPath10)
+            .map(|r| r.unwrap().1)
+            .filter(|t| *t != Token::Eof)
+            .collect()
+    }
+
+    #[test]
+    fn test_xpath10_if_as_element_name() {
+        // //if → DoubleSlash, QName("if")
+        let tokens = tokenize_10("//if");
+        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("if".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_for_as_element_name() {
+        let tokens = tokenize_10("//for");
+        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("for".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_every_as_element_name() {
+        let tokens = tokenize_10("//every");
+        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("every".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_some_as_element_name() {
+        let tokens = tokenize_10("//some");
+        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("some".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_xpath20_keywords_as_qnames() {
+        // Various XPath 2.0-only keywords used as element names in 1.0 mode
+        for name in &[
+            "then", "else", "return", "to", "union", "except", "intersect",
+            "eq", "ne", "lt", "le", "gt", "ge", "is", "idiv", "satisfies", "in",
+        ] {
+            let input = format!("a/{}", name);
+            let tokens = tokenize_10(&input);
+            assert_eq!(
+                tokens,
+                vec![
+                    Token::QName("a".into()),
+                    Token::Slash,
+                    Token::QName((*name).into()),
+                ],
+                "Failed for keyword: {}",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_xpath10_unary_minus() {
+        let tokens = tokenize_10("-a");
+        assert_eq!(tokens, vec![Token::Minus10, Token::QName("a".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_unary_plus() {
+        let tokens = tokenize_10("+a");
+        assert_eq!(tokens, vec![Token::Plus10, Token::QName("a".into())]);
+    }
+
+    #[test]
+    fn test_xpath20_unary_minus() {
+        let tokens = tokenize("-a");
+        assert_eq!(tokens, vec![Token::Minus20, Token::QName("a".into())]);
+    }
+
+    #[test]
+    fn test_xpath10_binary_minus() {
+        let tokens = tokenize_10("a - b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::Minus, Token::QName("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_binary_plus() {
+        let tokens = tokenize_10("a + b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::Plus, Token::QName("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_and_or_div_mod() {
+        let tokens = tokenize_10("a and b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::And, Token::QName("b".into())]
+        );
+        let tokens = tokenize_10("a or b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::Or, Token::QName("b".into())]
+        );
+        let tokens = tokenize_10("a div b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::Div, Token::QName("b".into())]
+        );
+        let tokens = tokenize_10("a mod b");
+        assert_eq!(
+            tokens,
+            vec![Token::QName("a".into()), Token::Mod, Token::QName("b".into())]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_node_kind_test() {
+        let tokens = tokenize_10("node()");
+        assert_eq!(tokens, vec![Token::Node, Token::LParen, Token::RParen]);
+    }
+
+    #[test]
+    fn test_xpath10_comment_kind_test() {
+        let tokens = tokenize_10("comment()");
+        assert_eq!(tokens, vec![Token::Comment, Token::LParen, Token::RParen]);
+    }
+
+    #[test]
+    fn test_xpath10_text_kind_test() {
+        let tokens = tokenize_10("text()");
+        assert_eq!(tokens, vec![Token::Text, Token::LParen, Token::RParen]);
+    }
+
+    #[test]
+    fn test_xpath10_processing_instruction_kind_test() {
+        let tokens = tokenize_10("processing-instruction()");
+        assert_eq!(
+            tokens,
+            vec![Token::ProcessingInstruction, Token::LParen, Token::RParen]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_element_as_function() {
+        // element(foo) in 1.0 → QName("element"), LParen, QName("foo"), RParen
+        let tokens = tokenize_10("element(foo)");
+        assert_eq!(
+            tokens,
+            vec![
+                Token::QName("element".into()),
+                Token::LParen,
+                Token::QName("foo".into()),
+                Token::RParen
+            ]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_axis_specifiers() {
+        let tokens = tokenize_10("child::*");
+        assert_eq!(tokens, vec![Token::AxisChild, Token::Star]);
+    }
+
+    #[test]
+    fn test_xpath10_ancestor_or_self_axis() {
+        let tokens = tokenize_10("ancestor-or-self::node()");
+        assert_eq!(
+            tokens,
+            vec![Token::AxisAncestorOrSelf, Token::Node, Token::LParen, Token::RParen]
+        );
+    }
+
+    #[test]
+    fn test_xpath10_no_double_less() {
+        // In XPath 1.0, << should not produce DoubleLess
+        let tokens: Vec<Token> = Lexer::new_with_mode("a<<b", XPathMode::XPath10)
+            .filter_map(|r| r.ok().map(|t| t.1))
+            .filter(|t| *t != Token::Eof)
+            .collect();
+        assert!(!tokens.contains(&Token::DoubleLess));
+    }
+
+    #[test]
+    fn test_xpath10_no_double_greater() {
+        // In XPath 1.0, >> should not produce DoubleGreater
+        let tokens: Vec<Token> = Lexer::new_with_mode("a>>b", XPathMode::XPath10)
+            .filter_map(|r| r.ok().map(|t| t.1))
+            .filter(|t| *t != Token::Eof)
+            .collect();
+        assert!(!tokens.contains(&Token::DoubleGreater));
+    }
+
+    #[test]
+    fn test_xpath20_double_less_still_works() {
+        let tokens = tokenize("a<<b");
+        assert!(tokens.contains(&Token::DoubleLess));
+    }
+
+    #[test]
+    fn test_xpath20_double_greater_still_works() {
+        let tokens = tokenize("a>>b");
+        assert!(tokens.contains(&Token::DoubleGreater));
     }
 }

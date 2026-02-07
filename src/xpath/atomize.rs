@@ -15,6 +15,9 @@
 use crate::types::value::{XmlValue, XmlValueKind, XmlAtomicValue};
 use crate::types::XmlTypeCode;
 use super::error::XPathError;
+use super::DomNavigator;
+use super::functions::XPathValue;
+use super::iterator::XmlItem;
 
 /// Atomize an XmlValue, returning its atomic representation.
 ///
@@ -226,6 +229,64 @@ pub fn unwrap_union(value: &XmlValue) -> &XmlValue {
     }
 }
 
+/// Extract the string value of the first node in an XPathValue (XPath 1.0 rule).
+///
+/// In XPath 1.0, converting a node-set to string returns the string-value
+/// of the first node in document order, or "" if empty.
+/// For atomic values, delegates to the standard string conversion.
+pub(crate) fn first_node_string_value<N: DomNavigator>(value: &XPathValue<N>) -> String {
+    match value {
+        XPathValue::Empty => String::new(),
+        XPathValue::Item(XmlItem::Node(n)) => n.value(),
+        XPathValue::Item(XmlItem::Atomic(v)) => v.to_string_value(),
+        XPathValue::Sequence(items) => {
+            // Find the document-order-first node in a single pass
+            let mut first_node: Option<&N> = None;
+            for item in items {
+                if let XmlItem::Node(n) = item {
+                    if let Some(current) = first_node {
+                        if crate::xpath::node_ops::compare_document_order(n, current)
+                            == std::cmp::Ordering::Less
+                        {
+                            first_node = Some(n);
+                        }
+                    } else {
+                        first_node = Some(n);
+                    }
+                }
+            }
+            if let Some(n) = first_node {
+                return n.value();
+            }
+            // Fallback: if no nodes, use first atomic's string value
+            if let Some(XmlItem::Atomic(v)) = items.first() {
+                v.to_string_value()
+            } else {
+                String::new()
+            }
+        }
+    }
+}
+
+/// Convert an XPathValue to string using XPath 1.0 rules.
+///
+/// Same as `first_node_string_value` — for node-sets, uses first node.
+/// For atomics, uses canonical string form.
+pub(crate) fn to_string_10<N: DomNavigator>(value: &XPathValue<N>) -> String {
+    first_node_string_value(value)
+}
+
+/// Convert an XPathValue to number using XPath 1.0 rules.
+///
+/// Converts to string first (via `to_string_10`), then parses as f64.
+pub(crate) fn to_number_10<N: DomNavigator>(value: &XPathValue<N>) -> f64 {
+    match value {
+        XPathValue::Empty => f64::NAN,
+        XPathValue::Item(XmlItem::Atomic(v)) => to_number(v),
+        _ => to_string_10(value).trim().parse().unwrap_or(f64::NAN),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +395,82 @@ mod tests {
             XmlValueKind::UntypedAtomic("element content".to_string()),
         );
         assert!(is_node(&node_value));
+    }
+
+    // --- XPath 1.0 conversion tests ---
+
+    use crate::xpath::RoXmlNavigator;
+
+    #[test]
+    fn test_first_node_string_value_empty() {
+        let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::empty();
+        assert_eq!(first_node_string_value(&value), "");
+    }
+
+    #[test]
+    fn test_first_node_string_value_single_atomic() {
+        let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::string("hello");
+        assert_eq!(first_node_string_value(&value), "hello");
+    }
+
+    #[test]
+    fn test_first_node_string_value_single_node() {
+        let doc = roxmltree::Document::parse("<root>text content</root>").unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // move to <root>
+        let value = XPathValue::from_node(nav);
+        assert_eq!(first_node_string_value(&value), "text content");
+    }
+
+    #[test]
+    fn test_first_node_string_value_multi_node_sequence() {
+        let doc = roxmltree::Document::parse("<r><a>first</a><b>second</b></r>").unwrap();
+        let mut nav_a = RoXmlNavigator::new(&doc);
+        nav_a.move_to_first_child(); // <r>
+        nav_a.move_to_first_child(); // <a>
+        let mut nav_b = nav_a.clone();
+        nav_b.move_to_next_sibling(); // <b>
+        let value = XPathValue::from_sequence(vec![
+            XmlItem::Node(nav_a),
+            XmlItem::Node(nav_b),
+        ]);
+        // XPath 1.0: first node's string value
+        assert_eq!(first_node_string_value(&value), "first");
+    }
+
+    #[test]
+    fn test_to_string_10_delegates() {
+        let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::string("abc");
+        assert_eq!(to_string_10(&value), "abc");
+    }
+
+    #[test]
+    fn test_to_number_10_empty() {
+        let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::empty();
+        assert!(to_number_10(&value).is_nan());
+    }
+
+    #[test]
+    fn test_to_number_10_atomic() {
+        let value: XPathValue<RoXmlNavigator<'static>> = XPathValue::double(2.75);
+        assert_eq!(to_number_10(&value), 2.75);
+    }
+
+    #[test]
+    fn test_to_number_10_node_numeric() {
+        let doc = roxmltree::Document::parse("<n>42.5</n>").unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // <n>
+        let value = XPathValue::from_node(nav);
+        assert_eq!(to_number_10(&value), 42.5);
+    }
+
+    #[test]
+    fn test_to_number_10_node_non_numeric() {
+        let doc = roxmltree::Document::parse("<n>not a number</n>").unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // <n>
+        let value = XPathValue::from_node(nav);
+        assert!(to_number_10(&value).is_nan());
     }
 }

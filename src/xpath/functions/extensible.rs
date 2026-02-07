@@ -522,6 +522,154 @@ impl<N: DomNavigator> FunctionEvaluator<N> for FunctionSet<N> {
     }
 }
 
+// ============================================================================
+// XPath10Catalog - Function catalog restricting to XPath 1.0 core functions
+// ============================================================================
+
+/// Static list of XPath 1.0 core function names (27 functions).
+const XPATH10_FUNCTIONS: &[&str] = &[
+    "last", "position", "count", "id",
+    "name", "local-name", "namespace-uri", "lang",
+    "string", "concat", "starts-with", "contains",
+    "substring-before", "substring-after", "substring",
+    "string-length", "normalize-space", "translate",
+    "boolean", "not", "true", "false",
+    "number", "sum", "floor", "ceiling", "round",
+];
+
+/// Catalog that restricts available functions to the XPath 1.0 core set.
+///
+/// For empty-namespace lookups (XPath 1.0 mode), only the 27 core functions
+/// are allowed, and they are resolved via `FUNCTION_REGISTRY` using `FN_NAMESPACE`.
+/// For non-empty namespace lookups, delegates to `BuiltinCatalog` unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XPath10Catalog;
+
+impl FunctionCatalog for XPath10Catalog {
+    fn lookup(&self, namespace: &str, local_name: &str, arity: usize) -> Option<FunctionHandle> {
+        if namespace.is_empty() {
+            // XPath 1.0 mode: only allow core 1.0 functions, resolve via FN_NAMESPACE
+            if XPATH10_FUNCTIONS.contains(&local_name) {
+                FUNCTION_REGISTRY
+                    .lookup(super::signature::FN_NAMESPACE, local_name, arity)
+                    .map(|entry| FunctionHandle::from(entry.id))
+            } else {
+                None
+            }
+        } else {
+            // Non-empty namespace: delegate to builtin catalog
+            BuiltinCatalog.lookup(namespace, local_name, arity)
+        }
+    }
+
+    fn get_signature(&self, handle: FunctionHandle) -> Option<DynamicFunctionSignature> {
+        BuiltinCatalog.get_signature(handle)
+    }
+}
+
+// ============================================================================
+// XPath10Evaluator - Evaluator applying XPath 1.0 semantics
+// ============================================================================
+
+/// Convert an XPathValue result to double if it's an integer.
+///
+/// XPath 1.0 has no integer type — all numeric results are doubles.
+fn wrap_as_double<N: DomNavigator>(result: XPathValue<N>) -> XPathValue<N> {
+    // Check integer first — as_f64() also succeeds for integers via conversion
+    if let Some(i) = result.as_integer() {
+        return XPathValue::double(i.to_string().parse::<f64>().unwrap_or(f64::NAN));
+    }
+    result
+}
+
+/// Evaluator that applies XPath 1.0 semantics to function results.
+///
+/// Intercepts specific functions to:
+/// - Use first-node-string-value rule for `fn:string`
+/// - Use first-node-to-number rule for `fn:number`
+/// - Convert integer results to double for `count`, `string-length`, `last`, `position`
+/// - Ensure `sum`, `floor`, `ceiling`, `round` return doubles
+///
+/// All other functions delegate to `BuiltinEvaluator` unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct XPath10Evaluator;
+
+impl<N: DomNavigator> FunctionEvaluator<N> for XPath10Evaluator {
+    fn eval(
+        &self,
+        handle: FunctionHandle,
+        ctx: &mut DynamicContext<'_, N>,
+        args: Vec<XPathValue<N>>,
+    ) -> Result<XPathValue<N>, XPathError> {
+        let id = handle_to_function_id(handle)?;
+        match id {
+            // fn:string — use XPath 1.0 first-node rule
+            FunctionId::String => {
+                use crate::xpath::atomize;
+                match args.len() {
+                    0 => {
+                        let item = ctx.require_context_item()?.clone();
+                        let s = match item {
+                            crate::xpath::iterator::XmlItem::Node(nav) => nav.value(),
+                            crate::xpath::iterator::XmlItem::Atomic(v) => atomize::string_value(&v),
+                        };
+                        Ok(XPathValue::string(s))
+                    }
+                    1 => {
+                        let s = atomize::to_string_10(&args[0]);
+                        Ok(XPathValue::string(s))
+                    }
+                    _ => Err(XPathError::wrong_number_of_arguments("string", 1, args.len())),
+                }
+            }
+
+            // fn:number — use XPath 1.0 first-node rule
+            FunctionId::Number => {
+                use crate::xpath::atomize;
+                match args.len() {
+                    0 => {
+                        let item = ctx.require_context_item()?.clone();
+                        let d = match item {
+                            crate::xpath::iterator::XmlItem::Node(nav) => {
+                                let s = nav.value();
+                                s.trim().parse().unwrap_or(f64::NAN)
+                            }
+                            crate::xpath::iterator::XmlItem::Atomic(v) => atomize::to_number(&v),
+                        };
+                        Ok(XPathValue::double(d))
+                    }
+                    1 => {
+                        let d = atomize::to_number_10(&args[0]);
+                        Ok(XPathValue::double(d))
+                    }
+                    _ => Err(XPathError::wrong_number_of_arguments("number", 1, args.len())),
+                }
+            }
+
+            // Functions that return integer in 2.0 but should return double in 1.0
+            FunctionId::Count
+            | FunctionId::StringLength
+            | FunctionId::Last
+            | FunctionId::Position => {
+                let result = eval_function(id, ctx, args)?;
+                Ok(wrap_as_double(result))
+            }
+
+            // Numeric functions — ensure double result in 1.0
+            FunctionId::Sum
+            | FunctionId::Floor
+            | FunctionId::Ceiling
+            | FunctionId::Round => {
+                let result = eval_function(id, ctx, args)?;
+                Ok(wrap_as_double(result))
+            }
+
+            // All other functions: delegate unchanged
+            _ => eval_function(id, ctx, args),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,5 +942,118 @@ mod tests {
         // Should not match arities < 2
         assert!(functions.lookup("http://example.com/ext", "varargs", 0).is_none());
         assert!(functions.lookup("http://example.com/ext", "varargs", 1).is_none());
+    }
+
+    // ========================================================================
+    // XPath10Catalog tests
+    // ========================================================================
+
+    #[test]
+    fn test_xpath10_catalog_resolves_core_function() {
+        let catalog = XPath10Catalog;
+        // count is in the 1.0 core set — empty namespace should resolve
+        let handle = catalog.lookup("", "count", 1);
+        assert!(handle.is_some());
+        assert!(handle.unwrap().is_builtin());
+    }
+
+    #[test]
+    fn test_xpath10_catalog_rejects_non_core_function() {
+        let catalog = XPath10Catalog;
+        // deep-equal is XPath 2.0 only — should be rejected in empty namespace
+        let handle = catalog.lookup("", "deep-equal", 2);
+        assert!(handle.is_none());
+    }
+
+    #[test]
+    fn test_xpath10_catalog_non_empty_ns_delegates() {
+        let catalog = XPath10Catalog;
+        // Non-empty namespace delegates to BuiltinCatalog unchanged
+        let handle = catalog.lookup("http://www.w3.org/2005/xpath-functions", "count", 1);
+        assert!(handle.is_some());
+    }
+
+    #[test]
+    fn test_xpath10_catalog_all_core_functions() {
+        let catalog = XPath10Catalog;
+        // Verify all 27 core functions resolve
+        let functions_with_arity: &[(&str, usize)] = &[
+            ("last", 0), ("position", 0), ("count", 1), ("id", 1),
+            ("name", 0), ("local-name", 0), ("namespace-uri", 0), ("lang", 1),
+            ("string", 0), ("concat", 2), ("starts-with", 2), ("contains", 2),
+            ("substring-before", 2), ("substring-after", 2), ("substring", 2),
+            ("string-length", 0), ("normalize-space", 0), ("translate", 3),
+            ("boolean", 1), ("not", 1), ("true", 0), ("false", 0),
+            ("number", 0), ("sum", 1), ("floor", 1), ("ceiling", 1), ("round", 1),
+        ];
+        for (name, arity) in functions_with_arity {
+            let handle = catalog.lookup("", name, *arity);
+            assert!(handle.is_some(), "XPath 1.0 function '{}' with arity {} not found", name, arity);
+        }
+    }
+
+    // ========================================================================
+    // XPath10Evaluator tests
+    // ========================================================================
+
+    #[test]
+    fn test_xpath10_evaluator_count_returns_double() {
+        use crate::namespace::table::NameTable;
+        use crate::xpath::context::{DynamicContext, XPathContext};
+        use crate::xpath::iterator::XmlItem;
+        use crate::types::value::XmlValue;
+
+        let evaluator = XPath10Evaluator;
+
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&static_ctx, 0);
+
+        // Create a sequence of 3 items
+        let items = vec![
+            XmlItem::Atomic(XmlValue::integer(1.into())),
+            XmlItem::Atomic(XmlValue::integer(2.into())),
+            XmlItem::Atomic(XmlValue::integer(3.into())),
+        ];
+        let args = vec![XPathValue::from_sequence(items)];
+        let handle = FunctionHandle::from(FunctionId::Count);
+
+        let result = evaluator.eval(handle, &mut dyn_ctx, args).unwrap();
+        // In XPath 1.0, count() should return double, not integer
+        assert_eq!(result.as_f64(), Some(3.0));
+        // Should NOT be an integer
+        assert!(result.as_integer().is_none());
+    }
+
+    #[test]
+    fn test_xpath10_evaluator_string_with_node() {
+        let evaluator = XPath10Evaluator;
+
+        let doc = roxmltree::Document::parse("<r><a>first</a><b>second</b></r>").unwrap();
+        let mut nav_a = RoXmlNavigator::new(&doc);
+        nav_a.move_to_first_child(); // <r>
+        nav_a.move_to_first_child(); // <a>
+        let mut nav_b = nav_a.clone();
+        nav_b.move_to_next_sibling(); // <b>
+
+        use crate::namespace::table::NameTable;
+        use crate::xpath::context::{DynamicContext, XPathContext};
+        use crate::xpath::iterator::XmlItem;
+
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut dyn_ctx = DynamicContext::new(&static_ctx, 0);
+
+        // Sequence of two nodes — XPath 1.0 string() should use first node
+        let node_seq = XPathValue::from_sequence(vec![
+            XmlItem::Node(nav_a),
+            XmlItem::Node(nav_b),
+        ]);
+        let args = vec![node_seq];
+        let handle = FunctionHandle::from(FunctionId::String);
+
+        let result = evaluator.eval(handle, &mut dyn_ctx, args).unwrap();
+        assert_eq!(result.as_str(), Some("first".to_string()));
     }
 }

@@ -231,6 +231,14 @@ pub enum XPathError {
     Internal(String),
 }
 
+impl From<crate::xpath::parser::ParseError> for XPathError {
+    fn from(e: crate::xpath::parser::ParseError) -> Self {
+        XPathError::XPST0003 {
+            message: e.to_string(),
+        }
+    }
+}
+
 impl XPathError {
     // ========================================================================
     // Convenience Constructors

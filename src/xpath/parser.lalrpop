@@ -126,6 +126,12 @@ extern {
         "question" => Token::Question,
         "." => Token::Dot,
 
+        // Mode-specific unary operators
+        "minus10" => Token::Minus10,
+        "plus10" => Token::Plus10,
+        "minus20" => Token::Minus20,
+        "plus20" => Token::Plus20,
+
         // End of input
         "eof" => Token::Eof,
     }
@@ -416,29 +422,47 @@ AdditiveExpr: AstNodeId = {
 };
 
 MultiplicativeExpr: AstNodeId = {
-    UnionExpr,
-    <l:@L> <left:MultiplicativeExpr> "star" <right:UnionExpr> <r:@R> => {
+    Xpath10UnaryExpr,
+    <l:@L> <left:MultiplicativeExpr> "star" <right:Xpath10UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::BinaryOp(BinaryOpNode::new(
             BinaryOpKind::Mul, left, right, span
         )))
     },
-    <l:@L> <left:MultiplicativeExpr> "div" <right:UnionExpr> <r:@R> => {
+    <l:@L> <left:MultiplicativeExpr> "div" <right:Xpath10UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::BinaryOp(BinaryOpNode::new(
             BinaryOpKind::Div, left, right, span
         )))
     },
-    <l:@L> <left:MultiplicativeExpr> "idiv" <right:UnionExpr> <r:@R> => {
+    <l:@L> <left:MultiplicativeExpr> "idiv" <right:Xpath10UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::BinaryOp(BinaryOpNode::new(
             BinaryOpKind::IDiv, left, right, span
         )))
     },
-    <l:@L> <left:MultiplicativeExpr> "mod" <right:UnionExpr> <r:@R> => {
+    <l:@L> <left:MultiplicativeExpr> "mod" <right:Xpath10UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::BinaryOp(BinaryOpNode::new(
             BinaryOpKind::Mod, left, right, span
+        )))
+    },
+};
+
+// XPath 1.0 unary operators: lower precedence than | (union)
+// Only activated in XPath 1.0 mode (lexer emits Minus10/Plus10)
+Xpath10UnaryExpr: AstNodeId = {
+    UnionExpr,
+    <l:@L> "minus10" <e:Xpath10UnaryExpr> <r:@R> => {
+        let span = SourceSpan::new(l, r);
+        arena.add(AstNode::UnaryOp(UnaryOpNode::new(
+            UnaryOpKind::Negate, e, span
+        )))
+    },
+    <l:@L> "plus10" <e:Xpath10UnaryExpr> <r:@R> => {
+        let span = SourceSpan::new(l, r);
+        arena.add(AstNode::UnaryOp(UnaryOpNode::new(
+            UnaryOpKind::Identity, e, span
         )))
     },
 };
@@ -529,13 +553,13 @@ CastExpr: AstNodeId = {
 
 UnaryExpr: AstNodeId = {
     ValueExpr,
-    <l:@L> "minus" <e:UnaryExpr> <r:@R> => {
+    <l:@L> "minus20" <e:UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::UnaryOp(UnaryOpNode::new(
             UnaryOpKind::Negate, e, span
         )))
     },
-    <l:@L> "plus" <e:UnaryExpr> <r:@R> => {
+    <l:@L> "plus20" <e:UnaryExpr> <r:@R> => {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::UnaryOp(UnaryOpNode::new(
             UnaryOpKind::Identity, e, span

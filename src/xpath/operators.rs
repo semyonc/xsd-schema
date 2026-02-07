@@ -2419,6 +2419,213 @@ where
 }
 
 // ============================================================================
+// XPath 1.0 comparison helpers
+// ============================================================================
+
+/// XPath 1.0 type coercion for comparisons (spec §3.4).
+///
+/// For `=`/`!=`:
+///   1. If either operand is boolean → convert both to boolean
+///   2. If either operand is numeric → convert both to number
+///   3. Otherwise → compare as strings
+///
+/// For `<`/`<=`/`>`/`>=`:
+///   Always convert both to number
+fn coerce_for_comparison_10(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+) -> (XmlValue, XmlValue) {
+    let is_equality = matches!(op, BinaryOpKind::GeneralEq | BinaryOpKind::GeneralNe);
+
+    if is_equality {
+        // Rule 1: if either is boolean, convert both to boolean
+        if left.type_code == XmlTypeCode::Boolean || right.type_code == XmlTypeCode::Boolean {
+            let l_bool = ebv_atomic(left);
+            let r_bool = ebv_atomic(right);
+            return (XmlValue::boolean(l_bool), XmlValue::boolean(r_bool));
+        }
+
+        // Rule 2: if either is numeric, convert both to number
+        if left.type_code.is_numeric() || right.type_code.is_numeric() {
+            let l_num = crate::xpath::atomize::to_number(left);
+            let r_num = crate::xpath::atomize::to_number(right);
+            return (XmlValue::double(l_num), XmlValue::double(r_num));
+        }
+
+        // Rule 3: otherwise string comparison
+        let l_str = left.to_string_value();
+        let r_str = right.to_string_value();
+        return (XmlValue::string(l_str), XmlValue::string(r_str));
+    }
+
+    // Relational operators: always numeric
+    let l_num = crate::xpath::atomize::to_number(left);
+    let r_num = crate::xpath::atomize::to_number(right);
+    (XmlValue::double(l_num), XmlValue::double(r_num))
+}
+
+/// Effective boolean value of a single atomic value (for XPath 1.0 coercion).
+fn ebv_atomic(value: &XmlValue) -> bool {
+    if let Some(b) = value.as_boolean() {
+        return b;
+    }
+    if let Some(s) = value.as_string() {
+        return !s.is_empty();
+    }
+    if let Some(d) = value.as_double() {
+        return !d.is_nan() && d != 0.0;
+    }
+    if value.type_code.is_numeric() {
+        let d = crate::xpath::atomize::to_number(value);
+        return !d.is_nan() && d != 0.0;
+    }
+    let s = value.to_string_value();
+    !s.is_empty()
+}
+
+/// XPath 1.0 general equality comparison (iterator-based, Cartesian product).
+pub fn general_eq_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralEq, left, right)
+}
+
+/// XPath 1.0 general not-equal comparison (iterator-based, Cartesian product).
+pub fn general_ne_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralNe, left, right)
+}
+
+/// XPath 1.0 general less-than comparison (iterator-based, Cartesian product).
+pub fn general_lt_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralLt, left, right)
+}
+
+/// XPath 1.0 general less-than-or-equal comparison (iterator-based, Cartesian product).
+pub fn general_le_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralLe, left, right)
+}
+
+/// XPath 1.0 general greater-than comparison (iterator-based, Cartesian product).
+pub fn general_gt_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralGt, left, right)
+}
+
+/// XPath 1.0 general greater-than-or-equal comparison (iterator-based, Cartesian product).
+pub fn general_ge_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    general_compare_iter_10(BinaryOpKind::GeneralGe, left, right)
+}
+
+/// Shared implementation for all XPath 1.0 general comparison iterators.
+fn general_compare_iter_10<I1, I2>(
+    op: BinaryOpKind,
+    left: &I1,
+    right: &I2,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let mut left_iter = left.clone();
+
+    while left_iter.move_next()? {
+        let left_item = left_iter
+            .current()
+            .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+        let left_value = atomize_item(left_item)?;
+        let mut right_iter = right_buf.clone();
+
+        while right_iter.move_next()? {
+            let right_item = right_iter
+                .current()
+                .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
+            let right_value = atomize_item(right_item)?;
+            let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
+
+            let satisfied = match op {
+                BinaryOpKind::GeneralEq => compare_eq(&l, &r).unwrap_or(false),
+                BinaryOpKind::GeneralNe => !compare_eq(&l, &r).unwrap_or(true),
+                BinaryOpKind::GeneralLt => compare_lt(&l, &r).unwrap_or(false),
+                BinaryOpKind::GeneralLe => compare_le(&l, &r).unwrap_or(false),
+                BinaryOpKind::GeneralGt => compare_gt(&l, &r).unwrap_or(false),
+                BinaryOpKind::GeneralGe => compare_ge(&l, &r).unwrap_or(false),
+                _ => unreachable!(),
+            };
+
+            if satisfied {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+/// Evaluate a numeric binary operation in XPath 1.0 mode.
+///
+/// In XPath 1.0, arithmetic always returns double (never integer or decimal).
+pub fn eval_numeric_binary_10(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+) -> Result<XmlValue, XPathError> {
+    let l = crate::xpath::atomize::to_number(left);
+    let r = crate::xpath::atomize::to_number(right);
+
+    let result = match op {
+        BinaryOpKind::Add => l + r,
+        BinaryOpKind::Sub => l - r,
+        BinaryOpKind::Mul => l * r,
+        BinaryOpKind::Div => {
+            if r == 0.0 {
+                if l == 0.0 || l.is_nan() {
+                    f64::NAN
+                } else if l > 0.0 {
+                    f64::INFINITY
+                } else {
+                    f64::NEG_INFINITY
+                }
+            } else {
+                l / r
+            }
+        }
+        BinaryOpKind::Mod => {
+            if r == 0.0 {
+                f64::NAN
+            } else {
+                l % r
+            }
+        }
+        _ => return Err(XPathError::internal("Unsupported arithmetic operator")),
+    };
+
+    Ok(XmlValue::double(result))
+}
+
+// ============================================================================
 // General comparisons for sequences (Cartesian product semantics)
 // ============================================================================
 
@@ -3436,5 +3643,123 @@ mod tests {
         assert_eq!(left.type_code, XmlTypeCode::Boolean);
         assert_eq!(left.as_boolean(), Some(true));
         assert_eq!(right.type_code, XmlTypeCode::Boolean);
+    }
+
+    // ========================================================================
+    // XPath 1.0 comparison tests
+    // ========================================================================
+
+    #[test]
+    fn test_xpath10_eq_boolean_priority() {
+        // "1" = true() → both convert to boolean → true (string "1" is truthy)
+        let left = XmlValue::string("1".to_string());
+        let right = XmlValue::boolean(true);
+        let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
+        assert_eq!(l.type_code, XmlTypeCode::Boolean);
+        assert_eq!(r.type_code, XmlTypeCode::Boolean);
+        assert!(compare_eq(&l, &r).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_eq_boolean_priority_empty_string() {
+        // "" = true() → both to boolean → false = true → false
+        let left = XmlValue::string("".to_string());
+        let right = XmlValue::boolean(true);
+        let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
+        assert_eq!(l.as_boolean(), Some(false));
+        assert_eq!(r.as_boolean(), Some(true));
+        assert!(!compare_eq(&l, &r).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_relational_numeric() {
+        // "3" < "10" → 3.0 < 10.0 → true (numeric comparison, not string)
+        let left = XmlValue::string("3".to_string());
+        let right = XmlValue::string("10".to_string());
+        let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralLt, &left, &right);
+        assert_eq!(l.type_code, XmlTypeCode::Double);
+        assert_eq!(r.type_code, XmlTypeCode::Double);
+        assert!(compare_lt(&l, &r).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_eq_string_comparison() {
+        // "3" = "10" → string compare → false
+        let left = XmlValue::string("3".to_string());
+        let right = XmlValue::string("10".to_string());
+        let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
+        assert_eq!(l.type_code, XmlTypeCode::String);
+        assert_eq!(r.type_code, XmlTypeCode::String);
+        assert!(!compare_eq(&l, &r).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_eq_numeric_priority() {
+        // "3" = 3.0 → numeric coercion → 3.0 = 3.0 → true
+        let left = XmlValue::string("3".to_string());
+        let right = XmlValue::double(3.0);
+        let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
+        assert_eq!(l.type_code, XmlTypeCode::Double);
+        assert_eq!(r.type_code, XmlTypeCode::Double);
+        assert!(compare_eq(&l, &r).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_arithmetic_returns_double() {
+        // 1 + 2 in XPath 1.0 → 3.0 (double, not integer)
+        let left = XmlValue::integer(BigInt::from(1));
+        let right = XmlValue::integer(BigInt::from(2));
+        let result = eval_numeric_binary_10(BinaryOpKind::Add, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double(), Some(3.0));
+    }
+
+    #[test]
+    fn test_xpath10_arithmetic_div_by_zero() {
+        let left = XmlValue::double(1.0);
+        let right = XmlValue::double(0.0);
+        let result = eval_numeric_binary_10(BinaryOpKind::Div, &left, &right).unwrap();
+        assert_eq!(result.as_double(), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn test_xpath10_arithmetic_mod() {
+        let left = XmlValue::integer(BigInt::from(5));
+        let right = XmlValue::integer(BigInt::from(3));
+        let result = eval_numeric_binary_10(BinaryOpKind::Mod, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double(), Some(2.0));
+    }
+
+    #[test]
+    fn test_xpath10_general_eq_iter() {
+        // Test iterator-based XPath 1.0 comparison: existential over sequences
+        type Item = XmlItem<RoXmlNavigator<'static>>;
+        let left_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("hello".to_string()))];
+        let right_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("hello".to_string()))];
+        let left_iter = VecNodeIterator::new(left_items);
+        let right_iter = VecNodeIterator::new(right_items);
+        assert!(general_eq_iter_10(&left_iter, &right_iter).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_general_ne_iter() {
+        type Item = XmlItem<RoXmlNavigator<'static>>;
+        let left_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("a".to_string()))];
+        let right_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("b".to_string()))];
+        let left_iter = VecNodeIterator::new(left_items);
+        let right_iter = VecNodeIterator::new(right_items);
+        assert!(general_ne_iter_10(&left_iter, &right_iter).unwrap());
+    }
+
+    #[test]
+    fn test_xpath10_general_lt_iter_numeric_coercion() {
+        // "3" < "10" in XPath 1.0 → numeric → 3.0 < 10.0 → true
+        type Item = XmlItem<RoXmlNavigator<'static>>;
+        let left_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("3".to_string()))];
+        let right_items: Vec<Item> = vec![XmlItem::Atomic(XmlValue::string("10".to_string()))];
+        let left_iter = VecNodeIterator::new(left_items);
+        let right_iter = VecNodeIterator::new(right_items);
+        assert!(general_lt_iter_10(&left_iter, &right_iter).unwrap());
     }
 }

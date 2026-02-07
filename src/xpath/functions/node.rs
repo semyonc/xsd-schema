@@ -10,6 +10,7 @@
 //! - fn:document-uri
 //! - fn:lang
 //! - fn:root
+//! - fn:id
 
 use crate::ids::NameId;
 use crate::namespace::qname::QualifiedName;
@@ -370,6 +371,137 @@ pub fn root<N: DomNavigator>(
 }
 
 // ============================================================================
+// fn:id($arg as xs:string*, $node as node()) as element()*
+// ============================================================================
+
+/// Implements fn:id - selects elements by their ID attribute value.
+///
+/// If 1 arg: uses context item as reference node.
+/// If 2 args: second arg is the reference node.
+///
+/// The reference node determines which document tree to search.
+/// Each string argument is tokenized by whitespace and each token
+/// is looked up via `find_element_by_id`. Results are deduplicated
+/// and returned in document order.
+///
+/// Without DTD/schema ID declarations, the default `find_element_by_id`
+/// returns `None`, so this returns an empty sequence.
+pub fn id<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(XPathError::wrong_number_of_arguments("id", 1, args.len()));
+    }
+
+    let mut args = args;
+
+    // Get the reference node (arg 2 or context item)
+    let ref_node = if args.len() == 2 {
+        let node_arg = args.remove(1);
+        let items = materialize(node_arg);
+        if items.len() != 1 {
+            return Err(XPathError::XPTY0004 {
+                expected: "node()".to_string(),
+                found: if items.is_empty() {
+                    "empty-sequence()".to_string()
+                } else {
+                    format!("sequence of {} items", items.len())
+                },
+            });
+        }
+        match items.into_iter().next().unwrap() {
+            XmlItem::Node(n) => n,
+            XmlItem::Atomic(_) => {
+                return Err(XPathError::XPTY0004 {
+                    expected: "node()".to_string(),
+                    found: "atomic value".to_string(),
+                });
+            }
+        }
+    } else {
+        match &context.context_item {
+            Some(XmlItem::Node(n)) => n.clone(),
+            Some(XmlItem::Atomic(_)) => {
+                return Err(XPathError::XPTY0004 {
+                    expected: "node()".to_string(),
+                    found: "atomic value".to_string(),
+                });
+            }
+            None => {
+                return Err(XPathError::XPDY0002 {
+                    message: "Context item is absent".to_string(),
+                });
+            }
+        }
+    };
+
+    // Navigate reference node to document root
+    let mut root_nav = ref_node;
+    root_nav.move_to_root();
+
+    // Collect all ID tokens from the first argument
+    let id_arg = args.into_iter().next().unwrap();
+    let tokens = collect_id_tokens(id_arg);
+
+    // Look up each token, dedup by position
+    let mut result_nodes: Vec<N> = Vec::new();
+    for token in &tokens {
+        if let Some(found) = root_nav.find_element_by_id(token)? {
+            // Deduplicate: only add if not already present
+            let already_present = result_nodes.iter().any(|n| n.is_same_position(&found));
+            if !already_present {
+                result_nodes.push(found);
+            }
+        }
+    }
+
+    // Sort in document order
+    result_nodes.sort_by(|a, b| {
+        use crate::xpath::node_ops::compare_document_order;
+        compare_document_order(a, b)
+    });
+
+    // Convert to XPathValue
+    let items: Vec<XmlItem<N>> = result_nodes.into_iter().map(XmlItem::Node).collect();
+    Ok(XPathValue::from_sequence(items))
+}
+
+/// Collect whitespace-tokenized ID strings from an XPathValue argument.
+///
+/// Per the spec, each string value in the argument is split on whitespace
+/// and each resulting token is an IDREF to look up.
+fn collect_id_tokens<N: DomNavigator>(value: XPathValue<N>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    match value {
+        XPathValue::Empty => {}
+        XPathValue::Item(item) => {
+            let s = item_string_value(item);
+            for token in s.split_whitespace() {
+                tokens.push(token.to_string());
+            }
+        }
+        XPathValue::Sequence(items) => {
+            for item in items {
+                let s = item_string_value(item);
+                for token in s.split_whitespace() {
+                    tokens.push(token.to_string());
+                }
+            }
+        }
+    }
+    tokens
+}
+
+/// Get the string value of an XmlItem for ID tokenization.
+fn item_string_value<N: DomNavigator>(item: XmlItem<N>) -> String {
+    match item {
+        XmlItem::Node(nav) => nav.value(),
+        XmlItem::Atomic(v) => crate::xpath::atomize::string_value(&v),
+    }
+}
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -719,6 +851,79 @@ mod tests {
         assert_eq!(
             resolve_uri("", Some("http://example.com/base.xml")),
             "http://example.com/base.xml"
+        );
+    }
+
+    // ========================================================================
+    // fn:id tests
+    // ========================================================================
+
+    #[test]
+    fn test_collect_id_tokens_single_string() {
+        use crate::xpath::RoXmlNavigator;
+        let value: super::super::XPathValue<RoXmlNavigator<'static>> =
+            super::super::XPathValue::string("abc");
+        let tokens = collect_id_tokens(value);
+        assert_eq!(tokens, vec!["abc"]);
+    }
+
+    #[test]
+    fn test_collect_id_tokens_multi_whitespace() {
+        use crate::xpath::RoXmlNavigator;
+        let value: super::super::XPathValue<RoXmlNavigator<'static>> =
+            super::super::XPathValue::string("  foo   bar  baz  ");
+        let tokens = collect_id_tokens(value);
+        assert_eq!(tokens, vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn test_collect_id_tokens_empty() {
+        use crate::xpath::RoXmlNavigator;
+        let value: super::super::XPathValue<RoXmlNavigator<'static>> =
+            super::super::XPathValue::Empty;
+        let tokens = collect_id_tokens(value);
+        assert!(tokens.is_empty());
+    }
+
+    #[test]
+    fn test_collect_id_tokens_sequence() {
+        use crate::xpath::RoXmlNavigator;
+        use crate::xpath::iterator::XmlItem;
+        use crate::types::value::XmlValue;
+
+        let items = vec![
+            XmlItem::Atomic(XmlValue::string("a1 a2")),
+            XmlItem::Atomic(XmlValue::string("b1")),
+        ];
+        let value: super::super::XPathValue<RoXmlNavigator<'static>> =
+            super::super::XPathValue::from_sequence(items);
+        let tokens = collect_id_tokens(value);
+        assert_eq!(tokens, vec!["a1", "a2", "b1"]);
+    }
+
+    #[test]
+    fn test_fn_id_empty_without_dtd() {
+        // RoXmlNavigator inherits default find_element_by_id (returns None),
+        // so fn:id should return empty sequence, not an error.
+        use crate::namespace::table::NameTable;
+        use crate::xpath::context::{DynamicContext, XPathContext};
+        use crate::xpath::RoXmlNavigator;
+
+        let doc = roxmltree::Document::parse("<root><a id='x'/></root>").unwrap();
+        let nav = RoXmlNavigator::new(&doc);
+
+        let names = NameTable::new();
+        let static_ctx = XPathContext::new(&names);
+        let mut dyn_ctx = DynamicContext::new(&static_ctx, 0);
+        dyn_ctx.context_item = Some(XmlItem::Node(nav));
+
+        let args = vec![super::super::XPathValue::string("x")];
+        let result = id(&mut dyn_ctx, args).unwrap();
+
+        // Should be empty (no DTD/schema means no ID declarations)
+        assert!(
+            matches!(result, super::super::XPathValue::Empty),
+            "Expected empty sequence from fn:id without DTD"
         );
     }
 }

@@ -47,7 +47,7 @@ use super::error::XPathError;
 use super::eval::eval_node;
 use super::functions::{effective_boolean_value, XPathValue};
 use super::iterator::XmlItem;
-use super::parser::{parse, ParseError};
+use super::parser::{parse, parse_with_mode};
 use super::DomNavigator;
 
 // ============================================================================
@@ -174,22 +174,12 @@ impl XPathExpr {
         ctx: &XPathContext<'_>,
         vars: &[&str],
     ) -> Result<Self, XPathError> {
-        // Parse the expression
-        let parsed = parse(expr).map_err(|e| match e {
-            ParseError::Lexer(le) => XPathError::XPST0003 {
-                message: le.to_string(),
-            },
-            ParseError::Parser { message, location } => XPathError::XPST0003 {
-                message: if let Some(loc) = location {
-                    format!("at position {}: {}", loc, message)
-                } else {
-                    message
-                },
-            },
-            ParseError::UnexpectedEof => XPathError::XPST0003 {
-                message: "Unexpected end of input".to_string(),
-            },
-        })?;
+        // Parse the expression using the mode from context (ParseError → XPathError via From)
+        let parsed = if ctx.mode() == super::XPathMode::XPath20 {
+            parse(expr)?
+        } else {
+            parse_with_mode(expr, ctx.mode())?
+        };
 
         let mut arena = parsed.arena;
         let root = parsed.root;

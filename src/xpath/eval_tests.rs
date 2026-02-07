@@ -3044,3 +3044,178 @@ mod path_expr_tests {
         }
     }
 }
+
+// ============================================================================
+// XPath 1.0 Mode Integration Tests
+// ============================================================================
+
+mod xpath10_eval_tests {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::bind::bind_node;
+    use crate::xpath::context::{DynamicContext, NameBinder, XPathContext};
+    use crate::xpath::error::XPathError;
+    use crate::xpath::eval::eval_node;
+    use crate::xpath::functions::XPathValue;
+    use crate::xpath::functions::{XPath10Catalog, XPath10Evaluator};
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::parser;
+    use crate::xpath::parser::parse_with_mode;
+    use crate::xpath::RoXmlNavigator;
+    use crate::xpath::XPathMode;
+
+    /// Helper to parse, bind, and evaluate an XPath 1.0 expression without context item
+    fn eval_xpath10(expr: &str) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+        let mut parsed = parse_with_mode(expr, XPathMode::XPath10)
+            .map_err(|e| XPathError::syntax_error(e.to_string()))?;
+
+        let names = NameTable::new();
+        let catalog = XPath10Catalog;
+        let ctx = XPathContext::new(&names)
+            .with_mode(XPathMode::XPath10)
+            .with_function_catalog(&catalog);
+        let mut binder = NameBinder::new();
+
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
+
+        let evaluator = XPath10Evaluator;
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len())
+                .with_function_evaluator(&evaluator);
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
+    }
+
+    /// Helper to parse, bind, and evaluate an XPath 2.0 expression without context item
+    fn eval_xpath20(expr: &str) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+        let mut parsed =
+            parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let mut binder = NameBinder::new();
+
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
+
+        let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+            DynamicContext::new(&ctx, binder.len());
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
+    }
+
+    #[test]
+    fn test_xpath10_arithmetic_returns_double() {
+        // In XPath 1.0, 1 + 2 = 3.0 (double), not 3 (integer)
+        let result = eval_xpath10("1 + 2").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.type_code, crate::types::XmlTypeCode::Double);
+                assert_eq!(v.as_double(), Some(3.0));
+            }
+            _ => panic!("Expected atomic double"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_arithmetic_mul() {
+        let result = eval_xpath10("3 * 4").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.type_code, crate::types::XmlTypeCode::Double);
+                assert_eq!(v.as_double(), Some(12.0));
+            }
+            _ => panic!("Expected atomic double"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_comparison_eq_boolean_priority() {
+        // "1" = true() → XPath 1.0: both to boolean → true = true → true
+        let result = eval_xpath10("'1' = true()").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_comparison_lt_numeric_coercion() {
+        // 3 < 10 → numeric comparison → true
+        let result = eval_xpath10("3 < 10").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_comparison_eq_string() {
+        // 'abc' = 'abc' → string comparison → true
+        let result = eval_xpath10("'abc' = 'abc'").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_comparison_eq_string_ne() {
+        // 'abc' = 'def' → string comparison → false
+        let result = eval_xpath10("'abc' = 'def'").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_rejects_sequence_expression() {
+        // (1, 2, 3) uses the comma operator which is not available in XPath 1.0
+        let result = eval_xpath10("(1, 2, 3)");
+        match result {
+            Err(ref e) => assert_eq!(e.error_code(), Some("XPST0003")),
+            Ok(_) => panic!("Expected XPST0003 error for comma sequence in 1.0 mode"),
+        }
+    }
+
+    #[test]
+    fn test_xpath20_predicate_no_rounding() {
+        // (1, 2, 3)[2.5] in XPath 2.0 → 2.5 matches no position → empty
+        let result = eval_xpath20("(1, 2, 3)[2.5]").unwrap();
+        assert!(
+            matches!(result, XPathValue::Empty),
+            "Expected empty sequence for [2.5] predicate in 2.0 mode",
+        );
+    }
+
+    #[test]
+    fn test_xpath10_and_with_ebv() {
+        // true() and true() → true
+        let result = eval_xpath10("true() and true()").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_xpath10_or_with_ebv() {
+        // false() or true() → true
+        let result = eval_xpath10("false() or true()").unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+}

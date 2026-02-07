@@ -30,16 +30,20 @@ use crate::xpath::axis_iterators::{
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
-use crate::xpath::functions::{atomize_to_single_opt, effective_boolean_value, XPathValue};
+use crate::xpath::functions::{
+    atomize_to_single_opt, effective_boolean_value, effective_boolean_value_10, XPathValue,
+};
 use crate::xpath::iterator::{DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator};
 use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node};
 use crate::xpath::node_test::{matches_item_type_node, NodeTest};
 use crate::xpath::operators::{
-    eval_binary, eval_range, eval_unary, general_eq_iter, general_ge_iter, general_gt_iter,
-    general_le_iter, general_lt_iter, general_ne_iter,
+    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter,
+    general_eq_iter_10, general_ge_iter, general_ge_iter_10, general_gt_iter, general_gt_iter_10,
+    general_le_iter, general_le_iter_10, general_lt_iter, general_lt_iter_10, general_ne_iter,
+    general_ne_iter_10,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
-use crate::xpath::DomNavigator;
+use crate::xpath::{DomNavigator, XPathMode};
 use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType};
 
 /// Evaluate an AST node and return the result.
@@ -80,6 +84,14 @@ pub fn eval_node<N: DomNavigator>(
                 return eval_node(arena, expr.items[0], ctx);
             }
 
+            // XPath 1.0: comma-separated sequences are not allowed
+            // (the comma operator only appears in function args, which use a separate grammar production)
+            if ctx.static_context.mode() == XPathMode::XPath10 {
+                return Err(XPathError::XPST0003 {
+                    message: "Sequence expressions (comma operator) are not available in XPath 1.0".to_string(),
+                });
+            }
+
             // Multiple items - collect all results
             let mut results: Vec<XmlItem<N>> = Vec::new();
             for item_id in &expr.items {
@@ -90,6 +102,19 @@ pub fn eval_node<N: DomNavigator>(
         }
 
         AstNode::Value(value_node) => {
+            // XPath 1.0: reject constructs that slipped past the lexer
+            if ctx.static_context.mode() == XPathMode::XPath10 {
+                if matches!(value_node, ValueNode::Empty) {
+                    return Err(XPathError::XPST0003 {
+                        message: "Empty sequence () is not available in XPath 1.0".to_string(),
+                    });
+                }
+                if matches!(value_node, ValueNode::Double(_)) {
+                    return Err(XPathError::XPST0003 {
+                        message: "Double literals (e.g. 1e10) are not available in XPath 1.0".to_string(),
+                    });
+                }
+            }
             // Convert ValueNode to XPathValue
             eval_value(value_node)
         }
@@ -192,22 +217,38 @@ pub fn eval_node<N: DomNavigator>(
                 // Logical operators - short-circuit evaluation
                 BinaryOpKind::And => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = effective_boolean_value(&left_val)?;
+                    let left_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                        effective_boolean_value_10(&left_val)?
+                    } else {
+                        effective_boolean_value(&left_val)?
+                    };
                     if !left_bool {
                         return Ok(XPathValue::boolean(false));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = effective_boolean_value(&right_val)?;
+                    let right_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                        effective_boolean_value_10(&right_val)?
+                    } else {
+                        effective_boolean_value(&right_val)?
+                    };
                     Ok(XPathValue::boolean(right_bool))
                 }
                 BinaryOpKind::Or => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = effective_boolean_value(&left_val)?;
+                    let left_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                        effective_boolean_value_10(&left_val)?
+                    } else {
+                        effective_boolean_value(&left_val)?
+                    };
                     if left_bool {
                         return Ok(XPathValue::boolean(true));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = effective_boolean_value(&right_val)?;
+                    let right_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                        effective_boolean_value_10(&right_val)?
+                    } else {
+                        effective_boolean_value(&right_val)?
+                    };
                     Ok(XPathValue::boolean(right_bool))
                 }
 
@@ -226,7 +267,16 @@ pub fn eval_node<N: DomNavigator>(
                     match (left_opt, right_opt) {
                         (None, _) | (_, None) => Ok(XPathValue::empty()),
                         (Some(left), Some(right)) => {
-                            let result = eval_binary(bin_op.kind, &left, &right)?;
+                            let is_arithmetic = matches!(
+                                bin_op.kind,
+                                BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul |
+                                BinaryOpKind::Div | BinaryOpKind::Mod
+                            );
+                            let result = if is_arithmetic && ctx.static_context.mode() == XPathMode::XPath10 {
+                                eval_numeric_binary_10(bin_op.kind, &left, &right)?
+                            } else {
+                                eval_binary(bin_op.kind, &left, &right)?
+                            };
                             Ok(XPathValue::from_atomic(result))
                         }
                     }
@@ -239,17 +289,60 @@ pub fn eval_node<N: DomNavigator>(
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
+                    // XPath 1.0 §3.4: node-set vs boolean → convert node-set to boolean as a whole
+                    if ctx.static_context.mode() == XPathMode::XPath10 {
+                        let left_is_bool = is_boolean_value(&left_val);
+                        let right_is_bool = is_boolean_value(&right_val);
+                        let left_has_nodes = has_nodes_or_empty(&left_val);
+                        let right_has_nodes = has_nodes_or_empty(&right_val);
+
+                        if (left_is_bool && right_has_nodes) || (right_is_bool && left_has_nodes) {
+                            let l = effective_boolean_value_10(&left_val)?;
+                            let r = effective_boolean_value_10(&right_val)?;
+                            let result = match bin_op.kind {
+                                BinaryOpKind::GeneralEq => l == r,
+                                BinaryOpKind::GeneralNe => l != r,
+                                BinaryOpKind::GeneralLt | BinaryOpKind::GeneralLe |
+                                BinaryOpKind::GeneralGt | BinaryOpKind::GeneralGe => {
+                                    let ln = if l { 1.0_f64 } else { 0.0 };
+                                    let rn = if r { 1.0_f64 } else { 0.0 };
+                                    match bin_op.kind {
+                                        BinaryOpKind::GeneralLt => ln < rn,
+                                        BinaryOpKind::GeneralLe => ln <= rn,
+                                        BinaryOpKind::GeneralGt => ln > rn,
+                                        BinaryOpKind::GeneralGe => ln >= rn,
+                                        _ => unreachable!(),
+                                    }
+                                }
+                                _ => unreachable!(),
+                            };
+                            return Ok(XPathValue::boolean(result));
+                        }
+                    }
+
                     let left_iter = VecNodeIterator::new(left_val.into_vec());
                     let right_iter = VecNodeIterator::new(right_val.into_vec());
 
-                    let result = match bin_op.kind {
-                        BinaryOpKind::GeneralEq => general_eq_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        BinaryOpKind::GeneralNe => general_ne_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        BinaryOpKind::GeneralLt => general_lt_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        BinaryOpKind::GeneralLe => general_le_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        BinaryOpKind::GeneralGt => general_gt_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        BinaryOpKind::GeneralGe => general_ge_iter(ctx.static_context, &left_iter, &right_iter)?,
-                        _ => unreachable!(),
+                    let result = if ctx.static_context.mode() == XPathMode::XPath10 {
+                        match bin_op.kind {
+                            BinaryOpKind::GeneralEq => general_eq_iter_10(&left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralNe => general_ne_iter_10(&left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralLt => general_lt_iter_10(&left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralLe => general_le_iter_10(&left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralGt => general_gt_iter_10(&left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralGe => general_ge_iter_10(&left_iter, &right_iter)?,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        match bin_op.kind {
+                            BinaryOpKind::GeneralEq => general_eq_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralNe => general_ne_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralLt => general_lt_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralLe => general_le_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralGt => general_gt_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralGe => general_ge_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            _ => unreachable!(),
+                        }
                     };
                     Ok(XPathValue::boolean(result))
                 }
@@ -1113,20 +1206,24 @@ fn eval_predicates<N: DomNavigator>(
             ctx.context_size = saved_size;
 
             // Check if item should be included
+            let is_10 = ctx.static_context.mode() == XPathMode::XPath10;
             let include = match &pred_result {
                 XPathValue::Item(XmlItem::Atomic(value)) if value.type_code.is_numeric() => {
-                    // Numeric predicate: include if position equals the number exactly.
-                    // Per XPath 2.0 spec, [N] is equivalent to [position() = N].
-                    // No rounding: [2.5] matches nothing (2.5 != 2 and 2.5 != 3).
+                    // XPath 1.0 §2.4 and 2.0: exact comparison, no rounding
                     let num = crate::xpath::atomize::to_number(value);
                     if num.is_nan() {
                         false
                     } else {
-                        // Direct comparison without rounding
                         (position as f64) == num
                     }
                 }
-                _ => effective_boolean_value(&pred_result)?,
+                _ => {
+                    if is_10 {
+                        effective_boolean_value_10(&pred_result)?
+                    } else {
+                        effective_boolean_value(&pred_result)?
+                    }
+                }
             };
 
             if include {
@@ -1408,6 +1505,24 @@ fn extract_single_node<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<N
                 Err(XPathError::more_than_one_item())
             }
         }
+    }
+}
+
+/// Check if an XPathValue is a single boolean value (XPath 1.0 §3.4 helper).
+fn is_boolean_value<N: DomNavigator>(val: &XPathValue<N>) -> bool {
+    matches!(val, XPathValue::Item(XmlItem::Atomic(v)) if v.type_code == crate::types::XmlTypeCode::Boolean)
+}
+
+/// Check if an XPathValue contains nodes or is empty (i.e., is a node-set in XPath 1.0 terms).
+///
+/// In XPath 1.0, the empty result of a path expression is an empty node-set,
+/// so `XPathValue::Empty` is treated as a node-set (boolean false).
+fn has_nodes_or_empty<N: DomNavigator>(val: &XPathValue<N>) -> bool {
+    match val {
+        XPathValue::Empty => true,
+        XPathValue::Item(XmlItem::Node(_)) => true,
+        XPathValue::Sequence(items) => items.iter().any(|i| matches!(i, XmlItem::Node(_))),
+        _ => false,
     }
 }
 
