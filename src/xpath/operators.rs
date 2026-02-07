@@ -813,11 +813,19 @@ fn numeric_div(
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => {
+            if r == BigInt::from(0) {
+                return Err(XPathError::FOAR0001);
+            }
             let left_dec = decimal_from_bigint(&l)?;
             let right_dec = decimal_from_bigint(&r)?;
             NumericValue::Decimal(left_dec / right_dec)
         }
-        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l / r),
+        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            if r.is_zero() {
+                return Err(XPathError::FOAR0001);
+            }
+            NumericValue::Decimal(l / r)
+        }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l / r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l / r),
         _ => return Err(XPathError::internal("Numeric div type mismatch")),
@@ -833,16 +841,32 @@ fn numeric_div(
 
 fn numeric_idiv(left: NumericValue, right: NumericValue) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
-        (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l / r),
+        (NumericValue::Integer(l), NumericValue::Integer(r)) => {
+            if r == BigInt::from(0) {
+                return Err(XPathError::FOAR0001);
+            }
+            NumericValue::Integer(l / r)
+        }
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            if r.is_zero() {
+                return Err(XPathError::FOAR0001);
+            }
             let q = (l / r).trunc();
             NumericValue::Integer(decimal_to_bigint(&q)?)
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => {
-            NumericValue::Integer(BigInt::from((l / r).trunc() as i64))
+            let q = l / r;
+            if q.is_nan() || q.is_infinite() {
+                return Err(XPathError::FOAR0001);
+            }
+            NumericValue::Integer(BigInt::from(q.trunc() as i64))
         }
         (NumericValue::Double(l), NumericValue::Double(r)) => {
-            NumericValue::Integer(BigInt::from((l / r).trunc() as i64))
+            let q = l / r;
+            if q.is_nan() || q.is_infinite() {
+                return Err(XPathError::FOAR0001);
+            }
+            NumericValue::Integer(BigInt::from(q.trunc() as i64))
         }
         _ => return Err(XPathError::internal("Numeric idiv type mismatch")),
     };
@@ -857,9 +881,17 @@ fn numeric_mod(
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => {
+            if r == BigInt::from(0) {
+                return Err(XPathError::FOAR0001);
+            }
             NumericValue::Integer(l % r)
         }
-        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l % r),
+        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            if r.is_zero() {
+                return Err(XPathError::FOAR0001);
+            }
+            NumericValue::Decimal(l % r)
+        }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l % r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l % r),
         _ => return Err(XPathError::internal("Numeric mod type mismatch")),

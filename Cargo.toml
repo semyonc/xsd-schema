@@ -63,3 +63,8 @@ path = "src/lib.rs"
 name = "conformance"
 path = "tests/conformance/driver.rs"
 harness = false
+
+[[test]]
+name = "xqts_xpath"
+path = "tests/xqts/driver.rs"
+harness = false

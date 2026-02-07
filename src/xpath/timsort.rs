@@ -326,7 +326,7 @@ where
         // run now, also slide over the last run (which isn't involved
         // in this merge). The current run (i+1) goes away in any case.
         self.run_len[i] = len1 + len2;
-        if i == self.stack_size - 3 {
+        if i + 3 == self.stack_size {
             self.run_base[i + 1] = self.run_base[i + 2];
             self.run_len[i + 1] = self.run_len[i + 2];
         }
@@ -838,8 +838,8 @@ where
             ofs = max_ofs;
         }
 
-        // Make offsets relative to base
-        last_ofs += hint;
+        // Make offsets relative to base (and pre-increment last_ofs)
+        last_ofs += hint + 1;
         ofs += hint;
     } else {
         // key <= a[base + hint]
@@ -857,17 +857,18 @@ where
             ofs = max_ofs;
         }
 
-        // Make offsets relative to base
+        // Make offsets relative to base (and pre-increment last_ofs)
+        // Note: ofs can be hint+1 so hint-ofs would underflow for usize;
+        // folding the +1 avoids this since (hint+1)-ofs >= 0
         let tmp = last_ofs;
-        last_ofs = hint - ofs;
+        last_ofs = (hint + 1) - ofs;
         ofs = hint - tmp;
     }
-    debug_assert!(last_ofs < ofs && ofs <= len);
+    debug_assert!(last_ofs <= ofs && ofs <= len);
 
-    // Now a[base+lastOfs] < key <= a[base+ofs], so key belongs somewhere
+    // Now a[base+lastOfs-1] < key <= a[base+ofs], so key belongs somewhere
     // to the right of lastOfs but no farther right than ofs. Do a binary
     // search, with invariant a[base + lastOfs - 1] < key <= a[base + ofs].
-    last_ofs += 1;
     while last_ofs < ofs {
         let m = last_ofs + ((ofs - last_ofs) / 2);
 
@@ -907,9 +908,11 @@ where
             ofs = max_ofs;
         }
 
-        // Make offsets relative to b
+        // Make offsets relative to b (and pre-increment last_ofs)
+        // Note: ofs can be hint+1 so hint-ofs would underflow for usize;
+        // folding the +1 avoids this since (hint+1)-ofs >= 0
         let tmp = last_ofs;
-        last_ofs = hint - ofs;
+        last_ofs = (hint + 1) - ofs;
         ofs = hint - tmp;
     } else {
         // a[b + hint] <= key
@@ -927,16 +930,15 @@ where
             ofs = max_ofs;
         }
 
-        // Make offsets relative to b
-        last_ofs += hint;
+        // Make offsets relative to b (and pre-increment last_ofs)
+        last_ofs += hint + 1;
         ofs += hint;
     }
-    debug_assert!(last_ofs < ofs && ofs <= len);
+    debug_assert!(last_ofs <= ofs && ofs <= len);
 
-    // Now a[b + lastOfs] <= key < a[b + ofs], so key belongs somewhere to
+    // Now a[b + lastOfs - 1] <= key < a[b + ofs], so key belongs somewhere to
     // the right of lastOfs but no farther right than ofs. Do a binary
     // search, with invariant a[b + lastOfs - 1] <= key < a[b + ofs].
-    last_ofs += 1;
     while last_ofs < ofs {
         let m = last_ofs + ((ofs - last_ofs) / 2);
 
