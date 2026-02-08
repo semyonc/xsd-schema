@@ -48,6 +48,8 @@ pub struct XPathContext<'a> {
     pub base_uri: Option<String>,
     /// XPath language mode (1.0 or 2.0)
     pub mode: XPathMode,
+    /// Enable fn:trace() output to stderr (disabled by default)
+    pub trace_enabled: bool,
     /// Function catalog for bind-time lookup (None = use builtins).
     function_catalog: Option<&'a dyn FunctionCatalog>,
 }
@@ -64,6 +66,7 @@ impl<'a> XPathContext<'a> {
             implicit_timezone: None,
             base_uri: None,
             mode: XPathMode::XPath20,
+            trace_enabled: false,
             function_catalog: None,
         }
     }
@@ -107,6 +110,12 @@ impl<'a> XPathContext<'a> {
     /// Set the XPath language mode.
     pub fn with_mode(mut self, mode: XPathMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    /// Enable fn:trace() output to stderr.
+    pub fn with_trace_enabled(mut self, enabled: bool) -> Self {
+        self.trace_enabled = enabled;
         self
     }
 

@@ -53,7 +53,9 @@ fn print_usage() {
     println!("  -t, --test NAME     Run a specific test");
     println!("  -a, --all           Run all XPath 2.0 applicable tests");
     println!("  -v, --verbose       Print each test result");
+    println!("  -f, --failed        Output only failed tests");
     println!("  -l, --list          List test groups and exit");
+    println!("  --trace             Enable fn:trace() output to stderr");
     println!("  -h, --help          Show this help message");
 }
 
@@ -103,6 +105,7 @@ fn execute_test(
     sources: &HashMap<String, PathBuf>,
     names: &NameTable,
     verbose: bool,
+    trace_enabled: bool,
 ) -> TestResult {
     let start = Instant::now();
 
@@ -141,7 +144,7 @@ fn execute_test(
         };
     }
 
-    let ctx = build_xpath_context(names);
+    let ctx = build_xpath_context(names).with_trace_enabled(trace_enabled);
 
     // Collect variable names
     let mut var_names: Vec<String> = Vec::new();
@@ -185,6 +188,7 @@ fn execute_test(
     // parsed Documents alive for the RoXmlNavigators to reference.
     let mut doc_contents: Vec<String> = Vec::new();
     let mut doc_source_ids: Vec<String> = Vec::new();
+    let mut doc_paths: Vec<String> = Vec::new();
 
     // Collect all source IDs we need
     let mut needed_sources: Vec<String> = Vec::new();
@@ -211,6 +215,7 @@ fn execute_test(
             Ok(content) => {
                 doc_contents.push(content);
                 doc_source_ids.push(source_id.clone());
+                doc_paths.push(source_path.to_string_lossy().to_string());
             }
             Err(e) => {
                 return TestResult {
@@ -252,7 +257,7 @@ fn execute_test(
     let context_nav: Option<RoXmlNavigator> = tc.context_item.as_ref().and_then(|ctx_id| {
         source_doc_index
             .get(ctx_id.as_str())
-            .map(|&idx| RoXmlNavigator::new(&parsed_docs[idx]))
+            .map(|&idx| RoXmlNavigator::with_base_uri(&parsed_docs[idx], &doc_paths[idx]))
     });
 
     // Evaluate
@@ -265,7 +270,7 @@ fn execute_test(
                 continue;
             }
             if let Some(&idx) = source_doc_index.get(input.source_id.as_str()) {
-                let nav = RoXmlNavigator::new(&parsed_docs[idx]);
+                let nav = RoXmlNavigator::with_base_uri(&parsed_docs[idx], &doc_paths[idx]);
                 let val = XPathValue::from_node(nav);
                 if let Err(e) = typed_eval.set_variable_by_name(&input.variable, val) {
                     if verbose {
@@ -327,8 +332,11 @@ fn execute_test(
     // Handle scenarios
     match tc.scenario {
         Scenario::Standard => {
-            // Compare against each output file; pass if any match
+            // Compare against each output file; pass if any match.
+            // First pass: try all variants without debug output, so we don't
+            // print "not accepted" noise for variants when the test passes overall.
             let mut last_error: Option<String> = None;
+            let mut any_passed = false;
             for output in &tc.output_files {
                 let result_path = config.base_path.join(
                     format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
@@ -360,19 +368,16 @@ fn execute_test(
                     };
                 }
 
-                match compare::compare_result(
+                let cmp_result = compare::compare_result(
                     &tc.name,
                     result.clone(),
                     &result_path.to_string_lossy(),
                     xml_compare,
-                ) {
+                );
+                match cmp_result {
                     Ok(true) => {
-                        return TestResult {
-                            name: tc.name.clone(),
-                            outcome: TestOutcome::Pass,
-                            duration: start.elapsed(),
-                            message: None,
-                        };
+                        any_passed = true;
+                        break;
                     }
                     Ok(false) => {
                         last_error = Some("Result did not match expected output".to_string());
@@ -381,6 +386,15 @@ fn execute_test(
                         last_error = Some(format!("Compare error: {}", e));
                     }
                 }
+            }
+
+            if any_passed {
+                return TestResult {
+                    name: tc.name.clone(),
+                    outcome: TestOutcome::Pass,
+                    duration: start.elapsed(),
+                    message: None,
+                };
             }
 
             // If no output files were specified, pass
@@ -393,6 +407,28 @@ fn execute_test(
                 };
             }
 
+            // Test failed — re-run with debug output if verbose, to show
+            // ACTUAL vs EXPECTED for the first non-Inspect/Ignore variant.
+            if verbose {
+                for output in &tc.output_files {
+                    if output.compare == "Inspect" || output.compare == "Ignore" {
+                        continue;
+                    }
+                    let result_path = config.base_path.join(
+                        format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
+                            .replace('\\', "/"),
+                    );
+                    let xml_compare = output.compare == "XML";
+                    let _ = compare::compare_result_debug(
+                        &tc.name,
+                        result.clone(),
+                        &result_path.to_string_lossy(),
+                        xml_compare,
+                    );
+                    break;
+                }
+            }
+
             TestResult {
                 name: tc.name.clone(),
                 outcome: TestOutcome::Fail,
@@ -402,9 +438,38 @@ fn execute_test(
         }
         Scenario::RuntimeError => {
             // For runtime-error scenario: force materialization, expecting error
-            // The result already materialized successfully, so this is a failure
             // (the C# code iterates through the result to trigger lazy eval errors)
-            let _items = result.into_vec();
+            let _items = result.clone().into_vec();
+
+            // Some runtime-error tests also have output files as acceptable alternatives.
+            // Try comparing against them before declaring failure.
+            if !tc.output_files.is_empty() {
+                for output in &tc.output_files {
+                    let result_path = config.base_path.join(
+                        format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
+                            .replace('\\', "/"),
+                    );
+                    let xml_compare = output.compare == "XML";
+                    if output.compare == "Inspect" || output.compare == "Ignore" {
+                        continue;
+                    }
+                    let cmp_result = compare::compare_result(
+                        &tc.name,
+                        result.clone(),
+                        &result_path.to_string_lossy(),
+                        xml_compare,
+                    );
+                    if let Ok(true) = cmp_result {
+                        return TestResult {
+                            name: tc.name.clone(),
+                            outcome: TestOutcome::Pass,
+                            duration: start.elapsed(),
+                            message: None,
+                        };
+                    }
+                }
+            }
+
             TestResult {
                 name: tc.name.clone(),
                 outcome: TestOutcome::Fail,
@@ -432,7 +497,9 @@ fn main() {
     let mut test_name: Option<String> = None;
     let mut run_all = false;
     let mut verbose = false;
+    let mut failed_only = false;
     let mut list_mode = false;
+    let mut trace_enabled = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -461,8 +528,14 @@ fn main() {
             "--verbose" | "-v" => {
                 verbose = true;
             }
+            "--failed" | "-f" => {
+                failed_only = true;
+            }
             "--list" | "-l" => {
                 list_mode = true;
+            }
+            "--trace" => {
+                trace_enabled = true;
             }
             "--help" | "-h" => {
                 print_usage();
@@ -540,8 +613,13 @@ fn main() {
     let overall_start = Instant::now();
 
     for tc in &tests {
-        let tr = execute_test(tc, &config, &sources, &names, verbose);
-        if verbose {
+        let tr = execute_test(tc, &config, &sources, &names, verbose, trace_enabled);
+        let show = if failed_only {
+            tr.outcome == TestOutcome::Fail
+        } else {
+            verbose
+        };
+        if show {
             let status = match tr.outcome {
                 TestOutcome::Pass => "PASS",
                 TestOutcome::Fail => "FAIL",
@@ -577,8 +655,8 @@ fn main() {
     println!("Time:    {:.2}s", total_duration.as_secs_f64());
     println!("{}", "=".repeat(60));
 
-    // Print failed tests if not verbose (verbose already showed them)
-    if !verbose && failed > 0 {
+    // Print failed tests if not already shown (verbose or --failed already showed them)
+    if !verbose && !failed_only && failed > 0 {
         println!("\nFailed tests:");
         for r in &results {
             if r.outcome == TestOutcome::Fail {

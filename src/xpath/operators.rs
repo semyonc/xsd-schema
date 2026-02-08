@@ -59,6 +59,13 @@ enum Promote {
     None,
 }
 
+/// XQTS-compatible scale for non-terminating decimal division results.
+///
+/// XPath 2.0 allows implementation-defined precision for xs:decimal division
+/// (with a minimum of 18 fractional digits). We normalize to 18 here to keep
+/// stable lexical output across platforms and match expected XQTS baselines.
+const XPATH_DECIMAL_DIV_SCALE: u32 = 18;
+
 /// Evaluate a unary operator for a single atomic value.
 pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathError> {
     match op {
@@ -210,6 +217,12 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     }
 
     if left.type_code == right.type_code {
+        // Special case: QName equality compares namespace URI + local name only, ignoring prefix
+        if left.type_code == XmlTypeCode::QName {
+            if let (Some(lq), Some(rq)) = (left.as_qname(), right.as_qname()) {
+                return Ok(lq.namespace_uri == rq.namespace_uri && lq.local_name == rq.local_name);
+            }
+        }
         return Ok(left.value == right.value);
     }
 
@@ -226,6 +239,12 @@ fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 
     if left.type_code.is_numeric() && right.type_code.is_numeric() {
         return numeric_gt(left, right);
+    }
+
+    if left.type_code == XmlTypeCode::Boolean && right.type_code == XmlTypeCode::Boolean {
+        let l = left.as_boolean().unwrap_or(false);
+        let r = right.as_boolean().unwrap_or(false);
+        return Ok(l && !r);
     }
 
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
@@ -616,9 +635,8 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
-            let factor = numeric_to_decimal(right)?;
             return Ok(xml_day_time_duration_value(
-                day_time_mul_numeric(duration, factor)?,
+                day_time_mul_numeric_value(duration, right)?,
             ));
         }
         return Err(unsupported_operator(BinaryOpKind::Mul, left, right));
@@ -632,9 +650,8 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
             ));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let factor = numeric_to_decimal(left)?;
             return Ok(xml_day_time_duration_value(
-                day_time_mul_numeric(duration, factor)?,
+                day_time_mul_numeric_value(duration, left)?,
             ));
         }
     }
@@ -659,9 +676,8 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
-            let divisor = numeric_to_decimal(right)?;
             return Ok(xml_day_time_duration_value(
-                day_time_div_numeric(duration, divisor)?,
+                day_time_div_numeric_value(duration, right)?,
             ));
         }
         if let Some(right_duration) = as_day_time_duration(right) {
@@ -719,6 +735,14 @@ fn numeric_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 }
 
 fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
+    // Per XPath 2.0 spec, UntypedAtomic is cast to xs:double for arithmetic
+    let promoted;
+    let value = if value.type_code == XmlTypeCode::UntypedAtomic {
+        promoted = cast_untyped_to_double(value)?;
+        &promoted
+    } else {
+        value
+    };
     let class = numeric_class(value.type_code)
         .ok_or_else(|| XPathError::internal("Unary operator requires numeric operand"))?;
 
@@ -818,13 +842,13 @@ fn numeric_div(
             }
             let left_dec = decimal_from_bigint(&l)?;
             let right_dec = decimal_from_bigint(&r)?;
-            NumericValue::Decimal(left_dec / right_dec)
+            NumericValue::Decimal((left_dec / right_dec).round_dp(XPATH_DECIMAL_DIV_SCALE))
         }
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
             if r.is_zero() {
                 return Err(XPathError::FOAR0001);
             }
-            NumericValue::Decimal(l / r)
+            NumericValue::Decimal((l / r).round_dp(XPATH_DECIMAL_DIV_SCALE))
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l / r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l / r),
@@ -899,13 +923,41 @@ fn numeric_mod(
     Ok(numeric_to_xml_value(result, result_type))
 }
 
+/// Cast an `UntypedAtomic` value to `xs:double` for arithmetic promotion.
+///
+/// Per XPath 2.0 Section 3.5.1, `UntypedAtomic` operands in arithmetic
+/// expressions are cast to `xs:double`.
+fn cast_untyped_to_double(value: &XmlValue) -> Result<XmlValue, XPathError> {
+    let s = value.to_string_value();
+    let d: f64 = s.trim().parse().map_err(|_| {
+        XPathError::invalid_cast_value(&s, "xs:double")
+    })?;
+    Ok(XmlValue::double(d))
+}
+
 fn promote_numeric(
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<(NumericValue, NumericValue, NumericClass), XPathError> {
-    let left_class = numeric_class(left.type_code)
+    // Per XPath 2.0 spec, UntypedAtomic is cast to xs:double for arithmetic
+    let left_promoted;
+    let left_ref = if left.type_code == XmlTypeCode::UntypedAtomic {
+        left_promoted = cast_untyped_to_double(left)?;
+        &left_promoted
+    } else {
+        left
+    };
+    let right_promoted;
+    let right_ref = if right.type_code == XmlTypeCode::UntypedAtomic {
+        right_promoted = cast_untyped_to_double(right)?;
+        &right_promoted
+    } else {
+        right
+    };
+
+    let left_class = numeric_class(left_ref.type_code)
         .ok_or_else(|| XPathError::internal("Left operand not numeric"))?;
-    let right_class = numeric_class(right.type_code)
+    let right_class = numeric_class(right_ref.type_code)
         .ok_or_else(|| XPathError::internal("Right operand not numeric"))?;
 
     let promotion = numeric_promotion(left_class, right_class);
@@ -915,8 +967,8 @@ fn promote_numeric(
         Promote::None => left_class,
     };
 
-    let left_val = to_numeric_value(left, target_class)?;
-    let right_val = to_numeric_value(right, target_class)?;
+    let left_val = to_numeric_value(left_ref, target_class)?;
+    let right_val = to_numeric_value(right_ref, target_class)?;
 
     Ok((left_val, right_val, target_class))
 }
@@ -1607,6 +1659,49 @@ fn day_time_div_numeric(
     day_time_from_seconds(total)
 }
 
+/// Multiply dayTimeDuration by a numeric value, falling back to f64 arithmetic
+/// when the numeric value is outside Decimal's representable range (e.g. ±1.8e308).
+fn day_time_mul_numeric_value(
+    value: &DayTimeDurationValue,
+    factor: &XmlValue,
+) -> Result<DayTimeDurationValue, XPathError> {
+    match numeric_to_decimal(factor) {
+        Ok(d) => day_time_mul_numeric(value, d),
+        Err(_) => {
+            let f = numeric_to_f64(factor)?;
+            let total = day_time_total_seconds(value)?
+                .to_f64()
+                .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
+            let result =
+                Decimal::from_f64(total * f).ok_or(XPathError::FODT0002)?;
+            day_time_from_seconds(result)
+        }
+    }
+}
+
+/// Divide dayTimeDuration by a numeric value, falling back to f64 arithmetic
+/// when the numeric value is outside Decimal's representable range.
+fn day_time_div_numeric_value(
+    value: &DayTimeDurationValue,
+    divisor: &XmlValue,
+) -> Result<DayTimeDurationValue, XPathError> {
+    match numeric_to_decimal(divisor) {
+        Ok(d) => day_time_div_numeric(value, d),
+        Err(_) => {
+            let f = numeric_to_f64(divisor)?;
+            if f == 0.0 {
+                return Err(XPathError::FODT0002);
+            }
+            let total = day_time_total_seconds(value)?
+                .to_f64()
+                .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
+            let result =
+                Decimal::from_f64(total / f).ok_or(XPathError::FODT0002)?;
+            day_time_from_seconds(result)
+        }
+    }
+}
+
 fn day_time_div_duration(
     left: &DayTimeDurationValue,
     right: &DayTimeDurationValue,
@@ -1625,10 +1720,19 @@ fn add_months_to_date(
     day: u8,
     delta_months: i64,
 ) -> Result<(i32, u8, u8), XPathError> {
+    // Convert XSD year (no year 0) to astronomical year (continuous, with year 0)
+    // XSD year > 0 → astro = year; XSD year < 0 → astro = year + 1
+    let astro_year = if year <= 0 { year as i64 + 1 } else { year as i64 };
     let month_index = month as i64 - 1;
-    let total = year as i64 * 12 + month_index + delta_months;
-    let new_year = total.div_euclid(12);
+    let total = astro_year * 12 + month_index + delta_months;
+    let new_astro_year = total.div_euclid(12);
     let new_month = total.rem_euclid(12) + 1;
+    // Convert back to XSD year (skip year 0)
+    let new_year = if new_astro_year <= 0 {
+        new_astro_year - 1
+    } else {
+        new_astro_year
+    };
     let year = i32::try_from(new_year)
         .map_err(|_| XPathError::internal("Year out of range"))?;
     let month = u8::try_from(new_month)
@@ -1654,19 +1758,36 @@ fn days_in_month(year: i32, month: u8) -> Result<u8, XPathError> {
     Ok(days)
 }
 
-fn is_leap_year(year: i32) -> bool {
-    let year = year as i64;
+fn is_leap_year(xsd_year: i32) -> bool {
+    // Convert XSD year (no year 0) to astronomical year (with year 0) for correct leap year calc
+    let year = if xsd_year <= 0 {
+        xsd_year as i64 + 1
+    } else {
+        xsd_year as i64
+    };
     year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
 }
 
 fn datetime_to_instant(value: &DateTimeValue) -> Result<Decimal, XPathError> {
-    let days = days_from_civil(value.year, value.month, value.day);
+    // Convert XSD year (no year 0) to astronomical year for days_from_civil
+    let astro_year = if value.year <= 0 {
+        value.year + 1
+    } else {
+        value.year
+    };
+    let days = days_from_civil(astro_year, value.month, value.day);
     let seconds = time_to_seconds_components(value.hour, value.minute, value.second)?;
     Ok(decimal_from_i64(days)? * Decimal::from(86_400) + seconds)
 }
 
 fn date_to_instant(value: &DateValue) -> Result<Decimal, XPathError> {
-    let days = days_from_civil(value.year, value.month, value.day);
+    // Convert XSD year (no year 0) to astronomical year for days_from_civil
+    let astro_year = if value.year <= 0 {
+        value.year + 1
+    } else {
+        value.year
+    };
+    let days = days_from_civil(astro_year, value.month, value.day);
     Ok(decimal_from_i64(days)? * Decimal::from(86_400))
 }
 
@@ -1695,7 +1816,13 @@ fn instant_to_datetime(
         seconds_in_day += day_seconds;
     }
     let days = decimal_to_i64(days, "day count")?;
-    let (year, month, day) = civil_from_days(days);
+    let (astro_year, month, day) = civil_from_days(days);
+    // Convert astronomical year back to XSD year (skip year 0)
+    let year = if astro_year <= 0 {
+        astro_year - 1
+    } else {
+        astro_year
+    };
     let (hour, minute, second) = time_components_from_seconds(seconds_in_day)?;
     Ok(DateTimeValue {
         year,
@@ -1715,7 +1842,13 @@ fn instant_to_date(
     let day_seconds = decimal_from_i64(86_400)?;
     let days = (instant / day_seconds).floor();
     let days = decimal_to_i64(days, "day count")?;
-    let (year, month, day) = civil_from_days(days);
+    let (astro_year, month, day) = civil_from_days(days);
+    // Convert astronomical year back to XSD year (skip year 0)
+    let year = if astro_year <= 0 {
+        astro_year - 1
+    } else {
+        astro_year
+    };
     Ok(DateValue {
         year,
         month,
@@ -2024,7 +2157,7 @@ fn cast_to_primitive_ctx(
 /// Cast an UntypedAtomic value to QName or NOTATION with namespace resolution.
 ///
 /// Parses the lexical QName and resolves the prefix using the context's namespace bindings.
-fn cast_to_qname_with_context(
+pub(crate) fn cast_to_qname_with_context(
     context: &XPathContext,
     value: &XmlValue,
     type_code: XmlTypeCode,
@@ -2991,6 +3124,18 @@ mod tests {
     }
 
     #[test]
+    fn test_div_short_bounds_rounds_to_xpath_precision() {
+        let left = int_value(XmlTypeCode::Short, -32768);
+        let right = int_value(XmlTypeCode::Short, 32767);
+        let result = eval_binary(BinaryOpKind::Div, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Decimal);
+        assert_eq!(
+            result.as_decimal().unwrap().to_string(),
+            "-1.000030518509475997"
+        );
+    }
+
+    #[test]
     fn test_idiv_double_truncates() {
         let left = XmlValue::double(5.9);
         let right = XmlValue::double(2.0);
@@ -3793,5 +3938,56 @@ mod tests {
         let left_iter = VecNodeIterator::new(left_items);
         let right_iter = VecNodeIterator::new(right_items);
         assert!(general_lt_iter_10(&left_iter, &right_iter).unwrap());
+    }
+
+    // ========================================================================
+    // UntypedAtomic arithmetic promotion (XPath 2.0 Section 3.5.1)
+    // ========================================================================
+
+    #[test]
+    fn test_untyped_atomic_add() {
+        // UntypedAtomic("40") + integer(1) → double(41.0)
+        let left = XmlValue::untyped("40");
+        let right = int_value(XmlTypeCode::Integer, 1);
+        let result = eval_binary(BinaryOpKind::Add, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double().unwrap(), 41.0);
+    }
+
+    #[test]
+    fn test_untyped_atomic_both_sides() {
+        // UntypedAtomic("40") + UntypedAtomic("40") → double(80.0)
+        let left = XmlValue::untyped("40");
+        let right = XmlValue::untyped("40");
+        let result = eval_binary(BinaryOpKind::Add, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double().unwrap(), 80.0);
+    }
+
+    #[test]
+    fn test_untyped_atomic_div() {
+        // UntypedAtomic("40") div integer(2) → double(20.0)
+        let left = XmlValue::untyped("40");
+        let right = int_value(XmlTypeCode::Integer, 2);
+        let result = eval_binary(BinaryOpKind::Div, &left, &right).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double().unwrap(), 20.0);
+    }
+
+    #[test]
+    fn test_untyped_atomic_negate() {
+        // -(UntypedAtomic("42")) → double(-42.0)
+        let value = XmlValue::untyped("42");
+        let result = eval_unary(UnaryOpKind::Negate, &value).unwrap();
+        assert_eq!(result.type_code, XmlTypeCode::Double);
+        assert_eq!(result.as_double().unwrap(), -42.0);
+    }
+
+    #[test]
+    fn test_untyped_atomic_non_numeric_fails() {
+        // UntypedAtomic("abc") + integer(1) → cast error
+        let left = XmlValue::untyped("abc");
+        let right = int_value(XmlTypeCode::Integer, 1);
+        assert!(eval_binary(BinaryOpKind::Add, &left, &right).is_err());
     }
 }

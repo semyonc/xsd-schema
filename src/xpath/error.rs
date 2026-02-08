@@ -156,6 +156,10 @@ pub enum XPathError {
     #[error("[FOCA0002] QName '{qname}' has null namespace but non-empty prefix")]
     FOCA0002 { qname: String },
 
+    /// FOCA0003: Input value too large for integer.
+    #[error("[FOCA0003] {message}")]
+    FOCA0003 { message: String },
+
     /// FOCA0005: NaN supplied as float/double value.
     #[error("[FOCA0005] NaN supplied as float/double value")]
     FOCA0005,
@@ -458,6 +462,7 @@ impl XPathError {
             XPathError::FOAR0001 => Some("FOAR0001"),
             XPathError::FOAR0002 => Some("FOAR0002"),
             XPathError::FOCA0002 { .. } => Some("FOCA0002"),
+            XPathError::FOCA0003 { .. } => Some("FOCA0003"),
             XPathError::FOCA0005 => Some("FOCA0005"),
             XPathError::FODT0001 => Some("FODT0001"),
             XPathError::FODT0002 => Some("FODT0002"),

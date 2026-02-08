@@ -68,7 +68,7 @@ pub fn last<N: DomNavigator>(
 ///
 /// XPath 2.0 requires two arguments, but we support 1-2 for flexibility.
 pub fn trace<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
@@ -86,12 +86,14 @@ pub fn trace<N: DomNavigator>(
     // Get value (first argument) - we'll return this unchanged
     let value = args.remove(0);
 
-    // Write trace output to stderr
-    let value_str = value_to_trace_string(&value);
-    if let Some(label) = label {
-        eprintln!("[trace] {}: {}", label, value_str);
-    } else {
-        eprintln!("[trace] {}", value_str);
+    // Write trace output to stderr only when trace is enabled
+    if context.static_context.trace_enabled {
+        let value_str = value_to_trace_string(&value);
+        if let Some(label) = label {
+            eprintln!("[trace] {}: {}", label, value_str);
+        } else {
+            eprintln!("[trace] {}", value_str);
+        }
     }
 
     // Return value unchanged

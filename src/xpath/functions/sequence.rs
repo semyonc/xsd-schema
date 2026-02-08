@@ -11,7 +11,7 @@
 use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
 
-use crate::types::value::XmlValue;
+use crate::types::value::{XmlAtomicValue, XmlValue};
 use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
@@ -90,17 +90,113 @@ fn values_equal(left: &XmlValue, right: &XmlValue) -> bool {
     left_norm == right_norm
 }
 
-/// Compare two numeric values for equality using double promotion.
+/// Compare two numeric values for equality using XPath 2.0 type promotion.
+/// Promotion: decimal→float→double. Uses the least common type.
 /// NaN is not equal to NaN for value comparison per XPath spec.
 fn numeric_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
-    match (left.as_double(), right.as_double()) {
-        (Some(l), Some(r)) => {
-            // NaN != NaN for value comparison
+    numeric_values_equal_inner(left, right, false)
+}
+
+/// Inner implementation for numeric equality comparison.
+/// If `nan_equal` is true, NaN == NaN (used by fn:distinct-values).
+fn numeric_values_equal_inner(left: &XmlValue, right: &XmlValue, nan_equal: bool) -> bool {
+    let lt = left.type_code;
+    let rt = right.type_code;
+    let is_decimal_or_int =
+        |tc: XmlTypeCode| tc.is_numeric() && tc != XmlTypeCode::Float && tc != XmlTypeCode::Double;
+
+    // If either operand is xs:double, promote both to double
+    if lt == XmlTypeCode::Double || rt == XmlTypeCode::Double {
+        if let (Some(l), Some(r)) = (left.as_double(), right.as_double()) {
+            if nan_equal && l.is_nan() && r.is_nan() {
+                return true;
+            }
             if l.is_nan() || r.is_nan() {
                 return false;
             }
-            // Compare with epsilon for floating point tolerance
-            (l - r).abs() < f64::EPSILON || l == r
+            return l == r;
+        }
+        return false;
+    }
+
+    // If either operand is xs:float, promote the other to float
+    if lt == XmlTypeCode::Float || rt == XmlTypeCode::Float {
+        let lf = match &left.value {
+            crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Some(*f),
+            _ => left.as_decimal().and_then(|d| d.to_f32()),
+        };
+        let rf = match &right.value {
+            crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Some(*f),
+            _ => right.as_decimal().and_then(|d| d.to_f32()),
+        };
+        if let (Some(l), Some(r)) = (lf, rf) {
+            if nan_equal && l.is_nan() && r.is_nan() {
+                return true;
+            }
+            if l.is_nan() || r.is_nan() {
+                return false;
+            }
+            return l == r;
+        }
+        return false;
+    }
+
+    // Both are decimal/integer — compare as Decimal (exact)
+    if is_decimal_or_int(lt) && is_decimal_or_int(rt) {
+        if let (Some(l), Some(r)) = (left.as_decimal(), right.as_decimal()) {
+            return l == r;
+        }
+    }
+
+    false
+}
+
+/// Compare two values for equality for fn:distinct-values.
+/// Like values_equal but treats NaN as equal to NaN per XPath 2.0 spec.
+fn distinct_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
+    let left_norm = normalize_for_comparison(left);
+    let right_norm = normalize_for_comparison(right);
+
+    // Numeric type promotion with NaN == NaN for fn:distinct-values
+    if left_norm.type_code.is_numeric() && right_norm.type_code.is_numeric() {
+        return numeric_values_equal_inner(&left_norm, &right_norm, true);
+    }
+
+    // Duration cross-type comparison: P0M == PT0S (both are zero duration)
+    if is_duration_code(left_norm.type_code) && is_duration_code(right_norm.type_code) {
+        return durations_equal(&left_norm, &right_norm);
+    }
+
+    // Use value equality for non-numeric types
+    left_norm == right_norm
+}
+
+fn is_duration_code(code: XmlTypeCode) -> bool {
+    matches!(
+        code,
+        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
+    )
+}
+
+/// Compare two duration values for equality.
+/// Handles cross-type comparison (YearMonthDuration vs DayTimeDuration).
+fn durations_equal(left: &XmlValue, right: &XmlValue) -> bool {
+    // Same type: use regular equality
+    if left.type_code == right.type_code {
+        return left == right;
+    }
+    // Cross-type: only zero durations are comparable and equal
+    is_zero_duration(left) && is_zero_duration(right)
+}
+
+/// Check if a duration value is zero.
+fn is_zero_duration(value: &XmlValue) -> bool {
+    match &value.value {
+        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(d)) => {
+            d.years == 0 && d.months == 0
+        }
+        crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(d)) => {
+            d.days == 0 && d.hours == 0 && d.minutes == 0 && d.seconds.is_zero()
         }
         _ => false,
     }
@@ -226,10 +322,11 @@ pub fn distinct_values<N: DomNavigator>(
         return Ok(XPathValue::Empty);
     }
 
-    // Remove duplicates using values_equal for comparison
+    // Remove duplicates using distinct_values_equal for comparison
+    // (treats NaN as equal to NaN, unlike value comparison)
     let mut distinct: Vec<XmlValue> = Vec::new();
     for value in values {
-        let is_duplicate = distinct.iter().any(|existing| values_equal(existing, &value));
+        let is_duplicate = distinct.iter().any(|existing| distinct_values_equal(existing, &value));
         if !is_duplicate {
             distinct.push(value);
         }

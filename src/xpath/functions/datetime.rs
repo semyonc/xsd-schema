@@ -1092,11 +1092,14 @@ pub fn create_datetime<N: DomNavigator>(
         (None, None) => None,
     };
 
+    // Normalize 24:00:00 to 00:00:00 (per XQTS expected behavior)
+    let hour = if time.hour == 24 { 0 } else { time.hour };
+
     let result = DateTimeValue {
         year: date.year,
         month: date.month,
         day: date.day,
-        hour: time.hour,
+        hour,
         minute: time.minute,
         second: time.second,
         timezone,

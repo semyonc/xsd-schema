@@ -1453,7 +1453,7 @@ fn split_timezone(s: &str) -> (&str, Option<TimezoneOffset>) {
         (s, None)
     } else if let Some(pos) = s.rfind('-') {
         // Make sure it's a timezone, not part of date
-        if pos > 8 && pos < s.len() - 1 {
+        if pos > 0 && pos < s.len() - 1 {
             let tz_str = &s[pos + 1..];
             if let Some(tz) = parse_timezone_offset(tz_str, true) {
                 return (&s[..pos], Some(tz));
@@ -1700,15 +1700,6 @@ fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue
             value: s.to_string(),
             type_name: "yearMonthDuration",
             message: "Invalid duration format".to_string(),
-        });
-    }
-
-    // Must have at least one component
-    if years == 0 && months == 0 && content != "0M" && content != "0Y" {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Duration must have at least one component".to_string(),
         });
     }
 

@@ -82,6 +82,16 @@ pub fn resolve_uri<N: DomNavigator>(
         Some(b) => b,
     };
 
+    // Validate the relative URI is a syntactically valid URI reference
+    if !relative.is_empty() && !is_valid_uri_reference(&relative) {
+        return Err(XPathError::uri_resolution_error(&relative));
+    }
+
+    // Validate the base URI is a syntactically valid absolute URI
+    if !is_valid_base_uri(&base) {
+        return Err(XPathError::uri_resolution_error(&relative));
+    }
+
     // Resolve the URI
     let resolved = resolve_uri_reference(&relative, &base)
         .map_err(|_| XPathError::uri_resolution_error(&relative))?;
@@ -296,6 +306,68 @@ fn remove_dot_segments(path: &str) -> String {
     }
 
     output.join("")
+}
+
+/// Check if a string is a valid URI reference (absolute or relative).
+///
+/// A relative reference must not start with a colon (which would be an empty scheme).
+/// Per RFC 3986, a relative-reference starts with either a relative-part or is empty.
+/// A path-noscheme segment-nz-nc must not contain ':' before first '/'.
+fn is_valid_uri_reference(uri: &str) -> bool {
+    if uri.is_empty() {
+        return true;
+    }
+
+    // If it's absolute (has a valid scheme), it's a valid URI reference
+    if is_absolute_uri(uri) {
+        return true;
+    }
+
+    // For relative references: the first path segment must not contain ':'
+    // (to avoid ambiguity with scheme). RFC 3986 §4.2
+    if uri.starts_with("//") || uri.starts_with('/') || uri.starts_with('?') || uri.starts_with('#') {
+        return true;
+    }
+
+    // Get the first path segment (up to first '/' or end)
+    let first_segment = uri.split('/').next().unwrap_or(uri);
+    // Remove query and fragment
+    let first_segment = first_segment.split('?').next().unwrap_or(first_segment);
+    let first_segment = first_segment.split('#').next().unwrap_or(first_segment);
+
+    // First segment of a relative path must not contain ':'
+    !first_segment.contains(':')
+}
+
+/// Check if a string is a valid base URI (must be an absolute URI with a valid scheme).
+///
+/// A base URI must have a scheme followed by scheme-specific content.
+/// "http://" alone (scheme + empty authority + empty path) is not a usable base URI.
+fn is_valid_base_uri(uri: &str) -> bool {
+    if !is_absolute_uri(uri) {
+        return false;
+    }
+
+    // Parse to check it has meaningful content after the scheme
+    if let Ok((scheme, authority, path, _)) = parse_uri_components(uri) {
+        // Must have a scheme
+        if scheme.is_none() {
+            return false;
+        }
+        // If it has an authority, it needs at least something (non-empty authority or a path)
+        if let Some(auth) = authority {
+            if auth.is_empty() {
+                // scheme://  with empty authority — check if there's a path
+                if let Some(p) = path {
+                    return !p.is_empty();
+                }
+                return false;
+            }
+        }
+        true
+    } else {
+        false
+    }
 }
 
 #[cfg(test)]

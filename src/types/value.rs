@@ -13,6 +13,7 @@
 use std::fmt;
 
 use num_bigint::BigInt;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::ids::SimpleTypeKey;
@@ -360,7 +361,7 @@ impl fmt::Display for XmlAtomicValue {
                 if d.fract().is_zero() {
                     write!(f, "{}", d.trunc())
                 } else {
-                    write!(f, "{}", d)
+                    write!(f, "{}", d.normalize())
                 }
             }
             Self::Integer(i) => write!(f, "{}", i),
@@ -396,6 +397,24 @@ impl fmt::Display for XmlAtomicValue {
     }
 }
 
+/// Format a scientific notation string to ensure the mantissa has a decimal point.
+///
+/// Rust's `{:E}` may produce `1E7` or `-1E7`; XPath 2.0 requires `1.0E7` or `-1.0E7`.
+fn fix_scientific_notation(s: &str) -> String {
+    // Find the position of 'E'
+    if let Some(e_pos) = s.find('E') {
+        let mantissa = &s[..e_pos];
+        let exponent = &s[e_pos..]; // includes 'E'
+        if !mantissa.contains('.') {
+            format!("{}.0{}", mantissa, exponent)
+        } else {
+            s.to_string()
+        }
+    } else {
+        s.to_string()
+    }
+}
+
 /// Format float according to XSD canonical representation
 fn format_float(v: f32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if v.is_nan() {
@@ -407,17 +426,19 @@ fn format_float(v: f32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "-INF")
         }
     } else if v == 0.0 {
-        if v.is_sign_positive() {
-            write!(f, "0")
-        } else {
+        // Per XPath 2.0: negative zero serializes as "-0", positive zero as "0"
+        if v.is_sign_negative() {
             write!(f, "-0")
+        } else {
+            write!(f, "0")
         }
     } else if v.abs() >= 1e-6 && v.abs() < 1e6 {
         // Use regular notation for values in this range
         write!(f, "{}", v)
     } else {
-        // Use scientific notation
-        write!(f, "{:E}", v)
+        // Use scientific notation with guaranteed decimal point in mantissa
+        let s = format!("{:E}", v);
+        write!(f, "{}", fix_scientific_notation(&s))
     }
 }
 
@@ -432,23 +453,37 @@ fn format_double(v: f64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(f, "-INF")
         }
     } else if v == 0.0 {
-        if v.is_sign_positive() {
-            write!(f, "0")
-        } else {
+        // Per XPath 2.0: negative zero serializes as "-0", positive zero as "0"
+        if v.is_sign_negative() {
             write!(f, "-0")
+        } else {
+            write!(f, "0")
         }
     } else if v.abs() >= 1e-6 && v.abs() < 1e6 {
         // Use regular notation for values in this range
         write!(f, "{}", v)
     } else {
-        // Use scientific notation
-        write!(f, "{:E}", v)
+        // Use scientific notation with guaranteed decimal point in mantissa
+        let s = format!("{:E}", v);
+        write!(f, "{}", fix_scientific_notation(&s))
     }
 }
 
 // ============================================================================
 // Date/Time Value Types
 // ============================================================================
+
+/// Format a year value according to XPath 2.0 rules.
+///
+/// Negative years must be formatted as sign + 4-digit year (e.g., -12 → "-0012").
+/// Positive years use standard 4-digit zero-padded format.
+fn format_year(year: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if year < 0 {
+        write!(f, "-{:04}", -year)
+    } else {
+        write!(f, "{:04}", year)
+    }
+}
 
 /// xs:dateTime value
 #[derive(Debug, Clone, PartialEq)]
@@ -464,8 +499,9 @@ pub struct DateTimeValue {
 
 impl fmt::Display for DateTimeValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}-{:02}-{:02}T{:02}:{:02}:",
-            self.year, self.month, self.day,
+        format_year(self.year, f)?;
+        write!(f, "-{:02}-{:02}T{:02}:{:02}:",
+            self.month, self.day,
             self.hour, self.minute)?;
         format_seconds(self.second, f)?;
         if let Some(tz) = &self.timezone {
@@ -486,7 +522,8 @@ pub struct DateValue {
 
 impl fmt::Display for DateValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}-{:02}-{:02}", self.year, self.month, self.day)?;
+        format_year(self.year, f)?;
+        write!(f, "-{:02}-{:02}", self.month, self.day)?;
         if let Some(tz) = &self.timezone {
             write!(f, "{}", tz)?;
         }
@@ -528,35 +565,44 @@ pub struct DurationValue {
 
 impl fmt::Display for DurationValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Normalize year-month part
+        let total_months = self.years * 12 + self.months;
+        let years = total_months / 12;
+        let months = total_months % 12;
+
+        // Normalize day-time part
+        let (days, hours, minutes, seconds) =
+            normalize_day_time(self.days, self.hours, self.minutes, self.seconds);
+
         if self.negative {
             write!(f, "-")?;
         }
         write!(f, "P")?;
-        if self.years > 0 {
-            write!(f, "{}Y", self.years)?;
+        if years > 0 {
+            write!(f, "{}Y", years)?;
         }
-        if self.months > 0 {
-            write!(f, "{}M", self.months)?;
+        if months > 0 {
+            write!(f, "{}M", months)?;
         }
-        if self.days > 0 {
-            write!(f, "{}D", self.days)?;
+        if days > 0 {
+            write!(f, "{}D", days)?;
         }
-        if self.hours > 0 || self.minutes > 0 || !self.seconds.is_zero() {
+        if hours > 0 || minutes > 0 || !seconds.is_zero() {
             write!(f, "T")?;
-            if self.hours > 0 {
-                write!(f, "{}H", self.hours)?;
+            if hours > 0 {
+                write!(f, "{}H", hours)?;
             }
-            if self.minutes > 0 {
-                write!(f, "{}M", self.minutes)?;
+            if minutes > 0 {
+                write!(f, "{}M", minutes)?;
             }
-            if !self.seconds.is_zero() {
-                format_seconds(self.seconds, f)?;
+            if !seconds.is_zero() {
+                format_duration_seconds(seconds, f)?;
                 write!(f, "S")?;
             }
         }
         // Handle zero duration
-        if self.years == 0 && self.months == 0 && self.days == 0
-            && self.hours == 0 && self.minutes == 0 && self.seconds.is_zero() {
+        if years == 0 && months == 0 && days == 0
+            && hours == 0 && minutes == 0 && seconds.is_zero() {
             write!(f, "T0S")?;
         }
         Ok(())
@@ -573,17 +619,23 @@ pub struct YearMonthDurationValue {
 
 impl fmt::Display for YearMonthDurationValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.negative {
+        // Normalize months → years + months
+        let total_months = self.years * 12 + self.months;
+        let years = total_months / 12;
+        let months = total_months % 12;
+
+        // Negative zero is normalized to positive zero
+        if self.negative && (years > 0 || months > 0) {
             write!(f, "-")?;
         }
         write!(f, "P")?;
-        if self.years > 0 {
-            write!(f, "{}Y", self.years)?;
+        if years > 0 {
+            write!(f, "{}Y", years)?;
         }
-        if self.months > 0 {
-            write!(f, "{}M", self.months)?;
+        if months > 0 {
+            write!(f, "{}M", months)?;
         }
-        if self.years == 0 && self.months == 0 {
+        if years == 0 && months == 0 {
             write!(f, "0M")?;
         }
         Ok(())
@@ -602,27 +654,32 @@ pub struct DayTimeDurationValue {
 
 impl fmt::Display for DayTimeDurationValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.negative {
+        // Normalize seconds → minutes → hours → days
+        let (days, hours, minutes, seconds) =
+            normalize_day_time(self.days, self.hours, self.minutes, self.seconds);
+
+        // Negative zero is normalized to positive zero
+        if self.negative && (days > 0 || hours > 0 || minutes > 0 || !seconds.is_zero()) {
             write!(f, "-")?;
         }
         write!(f, "P")?;
-        if self.days > 0 {
-            write!(f, "{}D", self.days)?;
+        if days > 0 {
+            write!(f, "{}D", days)?;
         }
-        if self.hours > 0 || self.minutes > 0 || !self.seconds.is_zero() {
+        if hours > 0 || minutes > 0 || !seconds.is_zero() {
             write!(f, "T")?;
-            if self.hours > 0 {
-                write!(f, "{}H", self.hours)?;
+            if hours > 0 {
+                write!(f, "{}H", hours)?;
             }
-            if self.minutes > 0 {
-                write!(f, "{}M", self.minutes)?;
+            if minutes > 0 {
+                write!(f, "{}M", minutes)?;
             }
-            if !self.seconds.is_zero() {
-                format_seconds(self.seconds, f)?;
+            if !seconds.is_zero() {
+                format_duration_seconds(seconds, f)?;
                 write!(f, "S")?;
             }
         }
-        if self.days == 0 && self.hours == 0 && self.minutes == 0 && self.seconds.is_zero() {
+        if days == 0 && hours == 0 && minutes == 0 && seconds.is_zero() {
             write!(f, "T0S")?;
         }
         Ok(())
@@ -639,7 +696,8 @@ pub struct GYearMonthValue {
 
 impl fmt::Display for GYearMonthValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}-{:02}", self.year, self.month)?;
+        format_year(self.year, f)?;
+        write!(f, "-{:02}", self.month)?;
         if let Some(tz) = &self.timezone {
             write!(f, "{}", tz)?;
         }
@@ -656,7 +714,7 @@ pub struct GYearValue {
 
 impl fmt::Display for GYearValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:04}", self.year)?;
+        format_year(self.year, f)?;
         if let Some(tz) = &self.timezone {
             write!(f, "{}", tz)?;
         }
@@ -753,7 +811,27 @@ impl fmt::Display for TimezoneOffset {
     }
 }
 
-/// Format seconds with optional fractional part
+/// Normalize day-time duration components.
+///
+/// Carries over whole seconds into minutes, minutes into hours, hours into days.
+/// Only the integer part of seconds is carried; the fractional part stays in seconds.
+fn normalize_day_time(days: u32, hours: u32, minutes: u32, seconds: Decimal) -> (u32, u32, u32, Decimal) {
+    let whole_secs = seconds.trunc();
+    let frac_secs = seconds - whole_secs;
+
+    let total_secs: u64 = whole_secs.to_u64().unwrap_or(0);
+    let mut mins = minutes as u64 + total_secs / 60;
+    let rem_secs = (total_secs % 60) as u32;
+    let mut hrs = hours as u64 + mins / 60;
+    mins %= 60;
+    let d = days as u64 + hrs / 24;
+    hrs %= 24;
+
+    let out_seconds = Decimal::from(rem_secs) + frac_secs;
+    (d as u32, hrs as u32, mins as u32, out_seconds)
+}
+
+/// Format seconds with optional fractional part (zero-padded for time-of-day: HH:MM:SS)
 fn format_seconds(s: Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if s.fract().is_zero() {
         write!(f, "{:02}", s.trunc())
@@ -770,6 +848,22 @@ fn format_seconds(s: Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             }
         } else {
             write!(f, "{:02}", s)
+        }
+    }
+}
+
+/// Format seconds for duration values (no zero-padding)
+fn format_duration_seconds(s: Decimal, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    if s.fract().is_zero() {
+        write!(f, "{}", s.trunc())
+    } else {
+        let formatted = format!("{}", s);
+        if let Some(dot_pos) = formatted.find('.') {
+            let int_part = &formatted[..dot_pos];
+            let frac_part = formatted[dot_pos + 1..].trim_end_matches('0');
+            write!(f, "{}.{}", int_part, frac_part)
+        } else {
+            write!(f, "{}", s)
         }
     }
 }

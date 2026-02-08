@@ -768,6 +768,14 @@ impl<'input> Lexer<'input> {
             }
         }
 
+        // Decode entity/character references (e.g., &amp; &#xHHHH;) in string literals,
+        // matching the C# Tokenizer's ConsumeLiteral() behavior.
+        let value = crate::xpath::string_ops::normalize_string_value(&value, false, true)
+            .map_err(|e| LexerError {
+                message: format!("{}", e),
+                position: start,
+            })?;
+
         Ok((Token::StringLiteral(value), start, self.pos))
     }
 

@@ -12,11 +12,16 @@
 //! Binding must complete successfully before evaluation can proceed.
 
 use crate::namespace::qname::QualifiedName;
-use crate::types::NameTest as ResolvedNameTest;
+use crate::namespace::table::XS_NAMESPACE;
+use crate::types::{NameTest as ResolvedNameTest, XmlTypeCode};
 use crate::xpath::arena::{AstArena, AstNodeId};
-use crate::xpath::ast::{AstNode, ItemTypeNode, NameTest, NodeTest, QName};
+use crate::xpath::ast::{
+    AstNode, FunctionCallNode, ItemTypeNode, NameTest, NodeTest, OccurrenceIndicator, QName,
+    SequenceTypeNode, TypeExprKind, TypeExprNode,
+};
 use crate::xpath::context::{NameBinder, XPathContext};
 use crate::xpath::error::XPathError;
+use crate::xpath::XPathMode;
 
 /// Bind an AST node and all its children.
 ///
@@ -86,7 +91,8 @@ pub fn bind_node(
             // For expressions introduce variables into scope
             // Each binding's in_expr is evaluated in the outer scope,
             // then the variable is pushed for the next binding and return_expr
-            for binding in &for_node.bindings {
+            for binding_idx in 0..for_node.bindings.len() {
+                let binding = &for_node.bindings[binding_idx];
                 // Bind the in_expr in current scope
                 bind_node(arena, binding.in_expr, ctx, binder)?;
 
@@ -94,14 +100,9 @@ pub fn bind_node(
                 let name = resolve_var_qname(&binding.prefix, &binding.local_name, ctx)?;
                 let var = binder.push_var(name);
 
-                // Update the binding with the resolved slot
+                // Update the binding with the resolved slot (by index, not name)
                 if let AstNode::For(ref mut node) = arena.get_mut(id) {
-                    for b in &mut node.bindings {
-                        if b.local_name == binding.local_name && b.prefix == binding.prefix {
-                            b.slot = Some(var.slot);
-                            break;
-                        }
-                    }
+                    node.bindings[binding_idx].slot = Some(var.slot);
                 }
             }
 
@@ -116,19 +117,15 @@ pub fn bind_node(
 
         AstNode::Quantified(quant_node) => {
             // Similar to for expressions
-            for binding in &quant_node.bindings {
+            for binding_idx in 0..quant_node.bindings.len() {
+                let binding = &quant_node.bindings[binding_idx];
                 bind_node(arena, binding.in_expr, ctx, binder)?;
 
                 let name = resolve_var_qname(&binding.prefix, &binding.local_name, ctx)?;
                 let var = binder.push_var(name);
 
                 if let AstNode::Quantified(ref mut node) = arena.get_mut(id) {
-                    for b in &mut node.bindings {
-                        if b.local_name == binding.local_name && b.prefix == binding.prefix {
-                            b.slot = Some(var.slot);
-                            break;
-                        }
-                    }
+                    node.bindings[binding_idx].slot = Some(var.slot);
                 }
             }
 
@@ -155,6 +152,12 @@ pub fn bind_node(
                     .ok_or_else(|| XPathError::undefined_prefix(&func_call.prefix))?
                     .to_string()
             };
+
+            // Check if this is an XPath 2.0 constructor function (e.g. xs:integer(...))
+            if let Some(type_expr) = try_bind_constructor_function(&func_call, &namespace, ctx)? {
+                *arena.get_mut(id) = AstNode::TypeExpr(type_expr);
+                return Ok(());
+            }
 
             // Look up the function via the catalog (supports custom functions)
             let arity = func_call.args.len();
@@ -363,6 +366,74 @@ fn resolve_atomic_type_qname(
         })?;
         Ok(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id)))
     }
+}
+
+/// Try to bind a function call as an XPath 2.0 constructor function.
+///
+/// Constructor functions allow XML Schema type names (e.g. `xs:integer`, `xs:date`)
+/// to be used as single-argument function calls for type casting. For example,
+/// `xs:unsignedShort(42)` is equivalent to `42 cast as xs:unsignedShort`.
+///
+/// Returns `Ok(Some(type_expr))` if this is a valid constructor function,
+/// `Ok(None)` if it's not a constructor (fall through to normal lookup),
+/// or `Err` for invalid usage (e.g. `xs:NOTATION(...)` is XPST0051).
+fn try_bind_constructor_function(
+    func_call: &FunctionCallNode,
+    namespace: &str,
+    ctx: &XPathContext<'_>,
+) -> Result<Option<TypeExprNode>, XPathError> {
+    // Constructor functions are an XPath 2.0 feature
+    if ctx.mode() != XPathMode::XPath20 {
+        return Ok(None);
+    }
+
+    // Must be in the XML Schema namespace with exactly 1 argument
+    if namespace != XS_NAMESPACE || func_call.args.len() != 1 {
+        return Ok(None);
+    }
+
+    // Check if the local name matches a known XSD type
+    let type_code = match XmlTypeCode::from_local_name(&func_call.local_name) {
+        Some(tc) => tc,
+        None => return Ok(None),
+    };
+
+    // NOTATION is not allowed as a constructor target (XPST0051)
+    if type_code == XmlTypeCode::Notation {
+        return Err(XPathError::unknown_type(&func_call.local_name));
+    }
+
+    // List types and abstract types are not constructor functions —
+    // fall through to normal function lookup (which will produce XPST0017)
+    if type_code.is_list()
+        || matches!(
+            type_code,
+            XmlTypeCode::AnyType | XmlTypeCode::AnySimpleType
+        )
+    {
+        return Ok(None);
+    }
+
+    // Build a CastAs type expression
+    // Per XPath 2.0 spec B.1, constructor functions are xs:TYPE($arg as xs:anyAtomicType?) as xs:TYPE?
+    // so they use ZeroOrOne occurrence (equivalent to "cast as xs:TYPE?")
+    let qname = QName {
+        prefix: func_call.prefix.clone(),
+        local: func_call.local_name.clone(),
+    };
+    let target_type = SequenceTypeNode::single(
+        ItemTypeNode::Atomic(qname.clone()),
+        OccurrenceIndicator::ZeroOrOne,
+        func_call.span,
+    );
+    let mut type_expr =
+        TypeExprNode::new(TypeExprKind::CastAs, func_call.args[0], target_type, func_call.span);
+
+    // Eagerly resolve the atomic type QName
+    let resolved = resolve_atomic_type_qname(&qname, ctx)?;
+    type_expr.resolved_atomic_type = Some(resolved);
+
+    Ok(Some(type_expr))
 }
 
 #[cfg(test)]

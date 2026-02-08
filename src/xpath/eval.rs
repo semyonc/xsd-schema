@@ -28,6 +28,7 @@ use crate::xpath::axis_iterators::{
     SelfAxis, SequentialAxisNodeIterator,
 };
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
+use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{
@@ -44,7 +45,7 @@ use crate::xpath::operators::{
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::{DomNavigator, XPathMode};
-use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType};
+use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType, XmlTypeCode};
 
 /// Evaluate an AST node and return the result.
 ///
@@ -116,7 +117,7 @@ pub fn eval_node<N: DomNavigator>(
                 }
             }
             // Convert ValueNode to XPathValue
-            eval_value(value_node)
+            eval_value(value_node, ctx.static_context.mode())
         }
 
         AstNode::ContextItem(_) => {
@@ -567,8 +568,12 @@ fn eval_cast_as<N: DomNavigator>(
             })?;
             let target_type = resolved_type_to_type_code(qname, ctx.static_context.names)?;
 
-            // Perform the cast
-            let result = cast_to(&value, target_type)?;
+            // QName/NOTATION require namespace resolution from static context
+            let result = if matches!(target_type, XmlTypeCode::QName | XmlTypeCode::Notation) {
+                cast_to_qname_with_context(ctx.static_context, &value, target_type)?
+            } else {
+                cast_to(&value, target_type)?
+            };
             Ok(XPathValue::from_atomic(result))
         }
     }
@@ -616,8 +621,13 @@ fn eval_castable_as<N: DomNavigator>(
                 Err(_) => return Ok(XPathValue::boolean(false)),
             };
 
-            // Check if castable
-            Ok(XPathValue::boolean(castable(&value, target_type)))
+            // QName/NOTATION require namespace resolution from static context
+            let is_castable = if matches!(target_type, XmlTypeCode::QName | XmlTypeCode::Notation) {
+                cast_to_qname_with_context(ctx.static_context, &value, target_type).is_ok()
+            } else {
+                castable(&value, target_type)
+            };
+            Ok(XPathValue::boolean(is_castable))
         }
     }
 }
@@ -739,9 +749,13 @@ fn eval_path_expr<N: DomNavigator>(
         return Ok(XPathValue::from_node(root));
     }
 
-    // Check if the first step is a "primary expression" that doesn't require context.
-    // This includes function calls, literals, parenthesized expressions, and variable references.
-    // PathStep and ContextItem DO require context.
+    // Check if the first step is a "primary expression" that doesn't require context nodes.
+    // This includes function calls, literals, parenthesized expressions, variable references,
+    // type expressions (constructor functions like xs:int(...) that the binder
+    // converts from FunctionCall to TypeExpr/CastAs in-place), and ContextItem.
+    // ContextItem (`.`) accesses the dynamic context item directly (which may be atomic),
+    // so it must not go through require_context_node() which demands a node.
+    // Only PathStep (axis steps) truly require a node context.
     let first_is_primary = path_expr.steps.first().is_some_and(|&step_id| {
         matches!(
             arena.get(step_id),
@@ -750,6 +764,8 @@ fn eval_path_expr<N: DomNavigator>(
                 | AstNode::Value(_)
                 | AstNode::Expr(_)
                 | AstNode::VarRef(_)
+                | AstNode::TypeExpr(_)
+                | AstNode::ContextItem(_)
         )
     });
 
@@ -1443,7 +1459,7 @@ fn eval_quantified_expression<N: DomNavigator>(
 }
 
 /// Evaluate a ValueNode to an XPathValue.
-fn eval_value<N: DomNavigator>(value: &ValueNode) -> Result<XPathValue<N>, XPathError> {
+fn eval_value<N: DomNavigator>(value: &ValueNode, mode: XPathMode) -> Result<XPathValue<N>, XPathError> {
     match value {
         ValueNode::Empty => Ok(XPathValue::empty()),
 
@@ -1463,9 +1479,19 @@ fn eval_value<N: DomNavigator>(value: &ValueNode) -> Result<XPathValue<N>, XPath
         }
 
         ValueNode::Decimal(s) => {
-            // For now, treat decimal as double
-            let d: f64 = s.parse().unwrap_or(f64::NAN);
-            Ok(XPathValue::double(d))
+            if mode == XPathMode::XPath10 {
+                // XPath 1.0: all numbers are doubles
+                let d: f64 = s.parse().unwrap_or(f64::NAN);
+                Ok(XPathValue::double(d))
+            } else {
+                let d: rust_decimal::Decimal = s.parse().map_err(|_| {
+                    XPathError::FORG0001 {
+                        value: s.clone(),
+                        target_type: "xs:decimal".to_string(),
+                    }
+                })?;
+                Ok(XPathValue::decimal(d))
+            }
         }
 
         ValueNode::Double(s) => {

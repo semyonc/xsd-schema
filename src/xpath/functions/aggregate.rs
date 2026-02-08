@@ -128,10 +128,11 @@ pub fn min<N: DomNavigator>(
     }
 
     // Promote all values first
-    let promoted: Vec<XmlValue> = values
+    let mut promoted: Vec<XmlValue> = values
         .iter()
         .map(promote_for_comparison)
         .collect::<Result<Vec<_>, _>>()?;
+    promote_to_common_numeric_type(&mut promoted);
 
     // Per XPath 2.0: If sequence contains NaN, return NaN
     if contains_nan(&promoted) {
@@ -176,10 +177,11 @@ pub fn max<N: DomNavigator>(
     }
 
     // Promote all values first
-    let promoted: Vec<XmlValue> = values
+    let mut promoted: Vec<XmlValue> = values
         .iter()
         .map(promote_for_comparison)
         .collect::<Result<Vec<_>, _>>()?;
+    promote_to_common_numeric_type(&mut promoted);
 
     // Per XPath 2.0: If sequence contains NaN, return NaN
     if contains_nan(&promoted) {
@@ -261,6 +263,36 @@ fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
     }
 }
 
+/// Promote all numeric values to the common numeric type.
+/// Per F&O §15.4.3/4: if any value is double, all become double; if any is float, all become float.
+fn promote_to_common_numeric_type(values: &mut [XmlValue]) {
+    let has_double = values
+        .iter()
+        .any(|v| v.type_code == XmlTypeCode::Double);
+    let has_float = !has_double
+        && values
+            .iter()
+            .any(|v| v.type_code == XmlTypeCode::Float);
+
+    if has_double {
+        for v in values.iter_mut() {
+            if v.type_code != XmlTypeCode::Double && v.type_code.is_numeric() {
+                if let Some(d) = v.as_double() {
+                    *v = XmlValue::double(d);
+                }
+            }
+        }
+    } else if has_float {
+        for v in values.iter_mut() {
+            if v.type_code != XmlTypeCode::Float && v.type_code.is_numeric() {
+                if let Some(d) = v.as_double() {
+                    *v = XmlValue::float(d as f32);
+                }
+            }
+        }
+    }
+}
+
 /// Promote a value for comparison (min/max).
 ///
 /// UntypedAtomic is promoted to double for numeric context, string otherwise.
@@ -269,7 +301,9 @@ fn promote_for_comparison(value: &XmlValue) -> Result<XmlValue, XPathError> {
         XmlTypeCode::Double
         | XmlTypeCode::Float
         | XmlTypeCode::Decimal
-        | XmlTypeCode::String => Ok(value.clone()),
+        | XmlTypeCode::String
+        | XmlTypeCode::DayTimeDuration
+        | XmlTypeCode::YearMonthDuration => Ok(value.clone()),
         code if is_integer_type(code) => Ok(value.clone()),
         XmlTypeCode::UntypedAtomic => {
             // Treat as double for min/max - throw FORG0001 for invalid values

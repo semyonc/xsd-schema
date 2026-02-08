@@ -187,7 +187,11 @@ pub fn nilled<N: DomNavigator>(
         ));
     }
 
-    let node = get_node_arg_required(context, args)?;
+    let node = get_node_arg(context, args)?;
+    let node = match node {
+        None => return Ok(XPathValue::Empty),
+        Some(n) => n,
+    };
 
     match node.node_type() {
         DomNodeType::Element => {
@@ -267,7 +271,11 @@ pub fn document_uri<N: DomNavigator>(
         ));
     }
 
-    let node = get_node_arg_required(context, args)?;
+    let node = get_node_arg(context, args)?;
+    let node = match node {
+        None => return Ok(XPathValue::Empty),
+        Some(n) => n,
+    };
 
     match node.node_type() {
         DomNodeType::Root => {
@@ -566,41 +574,6 @@ fn get_node_arg<N: DomNavigator>(
                 // Non-node returns empty for these functions
                 Ok(None)
             }
-        }
-    }
-}
-
-/// Get a required node argument.
-fn get_node_arg_required<N: DomNavigator>(
-    context: &DynamicContext<'_, N>,
-    args: Vec<XPathValue<N>>,
-) -> Result<N, XPathError> {
-    if args.is_empty() {
-        // Use context item
-        match &context.context_item {
-            Some(XmlItem::Node(n)) => Ok(n.clone()),
-            Some(XmlItem::Atomic(_)) => Err(XPathError::XPTY0004 {
-                expected: "node()".to_string(),
-                found: "atomic value".to_string(),
-            }),
-            None => Err(XPathError::XPDY0002 {
-                message: "Context item is absent".to_string(),
-            }),
-        }
-    } else {
-        let items = materialize(args.into_iter().next().unwrap());
-        if items.is_empty() {
-            return Err(XPathError::XPTY0004 {
-                expected: "node()".to_string(),
-                found: "empty-sequence()".to_string(),
-            });
-        }
-        match &items[0] {
-            XmlItem::Node(n) => Ok(n.clone()),
-            XmlItem::Atomic(_) => Err(XPathError::XPTY0004 {
-                expected: "node()".to_string(),
-                found: "atomic value".to_string(),
-            }),
         }
     }
 }

@@ -10,7 +10,7 @@ use crate::xpath::string_ops;
 use crate::xpath::DomNavigator;
 
 use crate::xpath::context::DynamicContext;
-use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, atomize_to_double, XPathValue};
+use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, atomize_to_string_strict, atomize_to_string_strict_opt, atomize_to_double, XPathValue};
 
 /// Default collation URI (codepoint collation).
 const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
@@ -175,7 +175,7 @@ pub fn normalize_unicode<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("normalize-unicode", 1, args.len()));
     }
 
-    let source = atomize_to_string(args.remove(0))?;
+    let source = atomize_to_string_strict(args.remove(0))?;
 
     let form = if !args.is_empty() {
         let form_str = atomize_to_string_required(args.remove(0))?;
@@ -247,9 +247,9 @@ pub fn translate<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("translate", 3, args.len()));
     }
 
-    let source = atomize_to_string(args.remove(0))?;
-    let map_string = atomize_to_string_required(args.remove(0))?;
-    let trans_string = atomize_to_string_required(args.remove(0))?;
+    let source = atomize_to_string_strict(args.remove(0))?;
+    let map_string = atomize_to_string_strict(args.remove(0))?;
+    let trans_string = atomize_to_string_strict(args.remove(0))?;
 
     let result = string_ops::translate(&source, &map_string, &trans_string);
     Ok(XPathValue::string(result))
@@ -266,7 +266,7 @@ pub fn encode_for_uri<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("encode-for-uri", 1, args.len()));
     }
 
-    let source = atomize_to_string(args.remove(0))?;
+    let source = atomize_to_string_strict(args.remove(0))?;
     let result = string_ops::encode_for_uri(&source);
     Ok(XPathValue::string(result))
 }
@@ -282,7 +282,7 @@ pub fn iri_to_uri<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("iri-to-uri", 1, args.len()));
     }
 
-    let source = atomize_to_string(args.remove(0))?;
+    let source = atomize_to_string_strict(args.remove(0))?;
     let result = string_ops::iri_to_uri(&source);
     Ok(XPathValue::string(result))
 }
@@ -298,7 +298,7 @@ pub fn escape_html_uri<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("escape-html-uri", 1, args.len()));
     }
 
-    let source = atomize_to_string(args.remove(0))?;
+    let source = atomize_to_string_strict(args.remove(0))?;
     let result = string_ops::escape_html_uri(&source);
     Ok(XPathValue::string(result))
 }
@@ -429,7 +429,7 @@ pub fn string_to_codepoints<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("string-to-codepoints", 1, args.len()));
     }
 
-    let source = atomize_to_string_opt(args.remove(0))?;
+    let source = atomize_to_string_strict_opt(args.remove(0))?;
 
     match source {
         None => Ok(XPathValue::empty()),
@@ -488,18 +488,30 @@ pub fn codepoints_to_string<N: DomNavigator>(
     }
 }
 
+/// Check if a codepoint is a valid XML character per XML 1.0 spec.
+///
+/// Valid XML chars: #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] | [#x10000-#x10FFFF]
+fn is_valid_xml_char(cp: u32) -> bool {
+    matches!(cp,
+        0x9 | 0xA | 0xD |
+        0x20..=0xD7FF |
+        0xE000..=0xFFFD |
+        0x10000..=0x10FFFF
+    )
+}
+
 /// Convert an atomic value to a codepoint (u32).
 /// Handles integer types directly and numeric types that are whole numbers.
+/// Validates the codepoint is a valid XML character (FOCH0001 if not).
 fn atomize_to_codepoint(value: &XmlValue) -> Result<u32, XPathError> {
+    let cp;
+
     // Try integer first (most common case)
     if let Some(i) = value.as_integer() {
-        return i.try_into().map_err(|_| XPathError::FOCH0001 {
+        cp = i.try_into().map_err(|_| XPathError::FOCH0001 {
             codepoint: i.to_string(),
-        });
-    }
-
-    // Handle other numeric types (double, float, decimal)
-    if value.type_code.is_numeric() {
+        })?;
+    } else if value.type_code.is_numeric() {
         if let Some(d) = value.as_double() {
             // Check it's a whole number
             if d.is_nan() || d.is_infinite() || d.fract() != 0.0 {
@@ -514,14 +526,28 @@ fn atomize_to_codepoint(value: &XmlValue) -> Result<u32, XPathError> {
                     codepoint: d.to_string(),
                 });
             }
-            return Ok(d as u32);
+            cp = d as u32;
+        } else {
+            return Err(XPathError::XPTY0004 {
+                expected: "xs:integer".to_string(),
+                found: format!("{:?}", value.type_code),
+            });
         }
+    } else {
+        return Err(XPathError::XPTY0004 {
+            expected: "xs:integer".to_string(),
+            found: format!("{:?}", value.type_code),
+        });
     }
 
-    Err(XPathError::XPTY0004 {
-        expected: "xs:integer".to_string(),
-        found: format!("{:?}", value.type_code),
-    })
+    // Validate the codepoint is a valid XML character
+    if !is_valid_xml_char(cp) {
+        return Err(XPathError::FOCH0001 {
+            codepoint: cp.to_string(),
+        });
+    }
+
+    Ok(cp)
 }
 
 /// fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?) as xs:integer?
@@ -564,8 +590,8 @@ pub fn codepoint_equal<N: DomNavigator>(
         return Err(XPathError::wrong_number_of_arguments("codepoint-equal", 2, args.len()));
     }
 
-    let s1 = atomize_to_string_opt(args.remove(0))?;
-    let s2 = atomize_to_string_opt(args.remove(0))?;
+    let s1 = atomize_to_string_strict_opt(args.remove(0))?;
+    let s2 = atomize_to_string_strict_opt(args.remove(0))?;
 
     match (s1, s2) {
         (Some(a), Some(b)) => {

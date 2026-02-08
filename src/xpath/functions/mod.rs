@@ -36,6 +36,7 @@ pub use extensible::{
 use num_bigint::BigInt;
 
 use crate::types::value::XmlValue;
+use crate::types::XmlTypeCode;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::XmlItem;
 use crate::xpath::atomize;
@@ -346,6 +347,11 @@ impl<N: DomNavigator> XPathValue<N> {
         Self::from_atomic(XmlValue::integer(i.into()))
     }
 
+    /// Create a decimal value
+    pub fn decimal(d: rust_decimal::Decimal) -> Self {
+        Self::from_atomic(XmlValue::decimal(d))
+    }
+
     /// Create a double value
     pub fn double(d: f64) -> Self {
         Self::from_atomic(XmlValue::double(d))
@@ -484,6 +490,65 @@ pub fn atomize_to_string_required<N: DomNavigator>(value: XPathValue<N>) -> Resu
             found: "empty-sequence()".to_string(),
         }),
         other => atomize_to_string(other),
+    }
+}
+
+/// Atomize a value and convert to string with strict type checking.
+///
+/// Per XPath 2.0, only xs:string, xs:untypedAtomic, and xs:anyURI can be
+/// promoted to xs:string. Other types (e.g., xs:integer) raise XPTY0004.
+/// Empty value returns empty string.
+pub fn atomize_to_string_strict<N: DomNavigator>(value: XPathValue<N>) -> Result<String, XPathError> {
+    match value {
+        XPathValue::Empty => Ok(String::new()),
+        XPathValue::Item(item) => item_to_string_strict(item),
+        XPathValue::Sequence(items) => {
+            if items.len() == 1 {
+                item_to_string_strict(items.into_iter().next().unwrap())
+            } else {
+                Err(XPathError::more_than_one_item())
+            }
+        }
+    }
+}
+
+/// Atomize a value and convert to optional string with strict type checking.
+///
+/// Returns None for empty sequences.
+pub fn atomize_to_string_strict_opt<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<String>, XPathError> {
+    match value {
+        XPathValue::Empty => Ok(None),
+        other => atomize_to_string_strict(other).map(Some),
+    }
+}
+
+/// Convert an XmlItem to string with strict type checking.
+/// Only xs:string, xs:untypedAtomic, and xs:anyURI types are accepted.
+fn item_to_string_strict<N: DomNavigator>(item: XmlItem<N>) -> Result<String, XPathError> {
+    match item {
+        XmlItem::Atomic(value) => {
+            match value.type_code {
+                XmlTypeCode::String
+                | XmlTypeCode::UntypedAtomic
+                | XmlTypeCode::AnyUri
+                | XmlTypeCode::NormalizedString
+                | XmlTypeCode::Token
+                | XmlTypeCode::Language
+                | XmlTypeCode::NmToken
+                | XmlTypeCode::Name
+                | XmlTypeCode::NCName
+                | XmlTypeCode::Id
+                | XmlTypeCode::IdRef
+                | XmlTypeCode::Entity => {
+                    Ok(atomize::string_value(&value))
+                }
+                _ => Err(XPathError::XPTY0004 {
+                    expected: "xs:string".to_string(),
+                    found: crate::xpath::type_info::type_code_to_name(value.type_code).to_string(),
+                }),
+            }
+        }
+        XmlItem::Node(nav) => Ok(nav.value()),
     }
 }
 
@@ -919,8 +984,12 @@ fn item_boolean_value<N: DomNavigator>(item: &XmlItem<N>) -> Result<bool, XPathE
             match value.as_boolean() {
                 Some(b) => Ok(b),
                 None => {
-                    // For strings, empty is false, non-empty is true
+                    // For strings (and untypedAtomic), empty is false, non-empty is true
                     if let Some(s) = value.as_string() {
+                        Ok(!s.is_empty())
+                    } else if value.type_code == crate::types::XmlTypeCode::AnyUri {
+                        // xs:anyURI promoted to string for EBV
+                        let s = value.to_string_value();
                         Ok(!s.is_empty())
                     } else if let Some(d) = value.as_double() {
                         // For numbers, 0 and NaN are false
@@ -928,9 +997,14 @@ fn item_boolean_value<N: DomNavigator>(item: &XmlItem<N>) -> Result<bool, XPathE
                     } else if let Some(i) = value.as_integer() {
                         Ok(*i != BigInt::from(0))
                     } else {
-                        // Other types - try string conversion
-                        let s = value.to_string_value();
-                        Ok(!s.is_empty())
+                        // Per XPath 2.0: EBV is only defined for boolean, string,
+                        // numeric, node, untypedAtomic, anyURI. Other types raise FORG0006.
+                        Err(XPathError::FORG0006 {
+                            message: format!(
+                                "Effective boolean value not defined for type {:?}",
+                                value.type_code
+                            ),
+                        })
                     }
                 }
             }

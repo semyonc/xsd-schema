@@ -274,9 +274,16 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
     }
 
     fn compare_position(&self, other: &Self) -> XmlNodeOrder {
-        // Check same document (by comparing document pointers)
+        // Cross-document ordering: use stable pointer-based ordering
+        // Per XPath 2.0, cross-document order is implementation-defined but must be consistent
         if !std::ptr::eq(self.doc, other.doc) {
-            return XmlNodeOrder::Unknown;
+            let self_ptr = self.doc as *const _ as usize;
+            let other_ptr = other.doc as *const _ as usize;
+            return if self_ptr < other_ptr {
+                XmlNodeOrder::Before
+            } else {
+                XmlNodeOrder::After
+            };
         }
 
         let self_key = self.order_key();
@@ -557,21 +564,28 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
     fn prefix(&self) -> &str {
         match &self.cursor {
             RoCursor::Node(n) => {
-                // roxmltree provides lookup_prefix for a URI, but not the prefix of the current element
-                // We need to extract it from the raw tag name if present
                 if n.is_element() {
-                    // The tag_name().name() returns local name only
-                    // We don't have direct access to the prefix in roxmltree's API
-                    // Return empty string for now
-                    ""
+                    // Reverse-lookup: find the prefix for this element's namespace URI
+                    if let Some(uri) = n.tag_name().namespace() {
+                        n.lookup_prefix(uri).unwrap_or("")
+                    } else {
+                        ""
+                    }
                 } else {
                     ""
                 }
             }
             RoCursor::Attribute { owner, index } => {
-                // roxmltree Attribute doesn't expose prefix directly
-                let _attr = owner.attributes().nth(*index);
-                ""
+                // Reverse-lookup: find the prefix for this attribute's namespace URI
+                if let Some(attr) = owner.attributes().nth(*index) {
+                    if let Some(ns_uri) = attr.namespace() {
+                        owner.lookup_prefix(ns_uri).unwrap_or("")
+                    } else {
+                        ""
+                    }
+                } else {
+                    ""
+                }
             }
             RoCursor::Namespace { .. } => "",
         }
@@ -965,7 +979,12 @@ mod tests {
         let nav1 = RoXmlNavigator::new(&doc1);
         let nav2 = RoXmlNavigator::new(&doc2);
 
-        assert_eq!(nav1.compare_position(&nav2), XmlNodeOrder::Unknown);
+        // Cross-document ordering is implementation-defined but must be consistent
+        let order = nav1.compare_position(&nav2);
+        assert!(order == XmlNodeOrder::Before || order == XmlNodeOrder::After);
+        // Reverse comparison must be opposite
+        let reverse = nav2.compare_position(&nav1);
+        assert_ne!(order, reverse);
     }
 
     #[test]

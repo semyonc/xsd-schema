@@ -333,3 +333,135 @@ fn test_unknown_function_xpst0017() {
     let err = result.err().unwrap();
     assert_eq!(err.error_code(), Some("XPST0017"));
 }
+
+// ============================================================================
+// Constructor Function Tests
+// ============================================================================
+
+use crate::namespace::context::NamespaceContextSnapshot;
+use crate::namespace::table::well_known;
+use crate::xpath::ast::TypeExprKind;
+use crate::xpath::XPathMode;
+
+/// Helper to create an XPathContext with the xs: prefix bound to the XSD namespace.
+fn make_xs_context(names: &NameTable) -> XPathContext<'_> {
+    let ns_snapshot = NamespaceContextSnapshot {
+        default_ns: None,
+        bindings: vec![(well_known::XS_PREFIX, well_known::XS_NAMESPACE)],
+    };
+    XPathContext::new(names).with_namespaces(ns_snapshot)
+}
+
+#[test]
+fn test_bind_constructor_xs_integer() {
+    let names = NameTable::new();
+    let ctx = make_xs_context(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+    let func_id = make_function_call(&mut arena, "xs", "integer", vec![arg]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
+
+    // The function call should have been rewritten to a CastAs TypeExpr
+    match arena.get(func_id) {
+        AstNode::TypeExpr(te) => {
+            assert_eq!(te.kind, TypeExprKind::CastAs);
+            assert!(te.resolved_atomic_type.is_some());
+        }
+        other => panic!("Expected TypeExpr(CastAs), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_bind_constructor_xs_unsigned_short() {
+    let names = NameTable::new();
+    let ctx = make_xs_context(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+    let func_id = make_function_call(&mut arena, "xs", "unsignedShort", vec![arg]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
+
+    match arena.get(func_id) {
+        AstNode::TypeExpr(te) => {
+            assert_eq!(te.kind, TypeExprKind::CastAs);
+            assert!(te.resolved_atomic_type.is_some());
+        }
+        other => panic!("Expected TypeExpr(CastAs), got {:?}", other),
+    }
+}
+
+#[test]
+fn test_bind_constructor_notation_rejected() {
+    let names = NameTable::new();
+    let ctx = make_xs_context(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg = arena.add(AstNode::Value(ValueNode::String("x".to_string())));
+    let func_id = make_function_call(&mut arena, "xs", "NOTATION", vec![arg]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    let result = bind_node(&mut arena, root, &ctx, &mut binder);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().error_code(), Some("XPST0051"));
+}
+
+#[test]
+fn test_bind_constructor_wrong_arity() {
+    let names = NameTable::new();
+    let ctx = make_xs_context(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+    let arg2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+    let func_id = make_function_call(&mut arena, "xs", "integer", vec![arg1, arg2]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    // Should fail with XPST0017 (not a constructor, falls through to function lookup)
+    let result = bind_node(&mut arena, root, &ctx, &mut binder);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().error_code(), Some("XPST0017"));
+}
+
+#[test]
+fn test_bind_constructor_non_xs_namespace() {
+    let names = NameTable::new();
+    let ctx = XPathContext::new(&names);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+    // "fn:" prefix -> default function namespace, not xs:
+    let func_id = make_function_call(&mut arena, "", "integer", vec![arg]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    // Should fail with XPST0017 (fn:integer doesn't exist)
+    let result = bind_node(&mut arena, root, &ctx, &mut binder);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().error_code(), Some("XPST0017"));
+}
+
+#[test]
+fn test_bind_constructor_xpath10_mode_ignored() {
+    let names = NameTable::new();
+    let ctx = make_xs_context(&names).with_mode(XPathMode::XPath10);
+    let mut binder = NameBinder::new();
+
+    let mut arena = AstArena::new();
+    let arg = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+    let func_id = make_function_call(&mut arena, "xs", "integer", vec![arg]);
+    let root = wrap_in_expr(&mut arena, func_id);
+
+    // In XPath 1.0 mode, constructor functions should NOT be recognized
+    let result = bind_node(&mut arena, root, &ctx, &mut binder);
+    assert!(result.is_err());
+    assert_eq!(result.unwrap_err().error_code(), Some("XPST0017"));
+}

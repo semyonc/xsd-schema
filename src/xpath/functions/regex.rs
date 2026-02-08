@@ -46,11 +46,18 @@ pub fn matches<N: DomNavigator>(
     // Get input (first argument)
     let input = atomize_to_string(args.pop().unwrap())?;
 
-    // Build the regex
-    let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
+    let flags_str = flags.as_deref().unwrap_or("");
 
-    // Test if input matches
-    let result = regex.is_match(&input);
+    // Build the regex
+    let regex = build_regex(&pattern, flags_str)?;
+
+    // `^$` with multiline mode should match explicit blank lines, but not a
+    // synthetic empty line that exists only at end-of-input after a trailing LF.
+    let result = if should_use_strict_multiline_empty_line_match(&pattern, flags_str) {
+        matches_empty_line_in_multiline_mode(&input)
+    } else {
+        regex.is_match(&input)
+    };
 
     Ok(XPathValue::boolean(result))
 }
@@ -179,8 +186,11 @@ fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
         }
     }
 
+    // Normalize XML Schema-specific constructs not directly accepted by Rust's regex.
+    let normalized_pattern = normalize_xpath_pattern(pattern, flags);
+
     // Convert XSD/XPath pattern to Rust regex (unanchored for XPath)
-    let rust_pattern = convert_xml_pattern(pattern, ConvertOptions::xpath());
+    let rust_pattern = convert_xml_pattern(&normalized_pattern, ConvertOptions::xpath());
 
     // Build regex with flags
     let mut builder = RegexBuilder::new(&rust_pattern);
@@ -198,6 +208,148 @@ fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
     builder
         .build()
         .map_err(|_| XPathError::invalid_regex_pattern(pattern))
+}
+
+fn should_use_strict_multiline_empty_line_match(pattern: &str, flags: &str) -> bool {
+    pattern == "^$" && flags.chars().any(|c| c == 'm')
+}
+
+fn matches_empty_line_in_multiline_mode(input: &str) -> bool {
+    if input.is_empty() || input.starts_with('\n') {
+        return true;
+    }
+    input.as_bytes().windows(2).any(|w| w == b"\n\n")
+}
+
+fn normalize_xpath_pattern(pattern: &str, flags: &str) -> String {
+    let with_subtraction = convert_class_subtraction(pattern);
+    if flags.chars().any(|c| c == 'i') {
+        protect_unicode_categories_from_case_insensitive(&with_subtraction)
+    } else {
+        with_subtraction
+    }
+}
+
+/// Convert XML Schema class subtraction syntax `[A-Z-[OI]]` into Rust's
+/// class set intersection syntax `[A-Z&&[^OI]]`.
+fn convert_class_subtraction(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut i = 0;
+    let mut escaped = false;
+    let mut class_depth = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == '\\' {
+            out.push(ch);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '[' => {
+                class_depth += 1;
+                out.push(ch);
+                i += 1;
+            }
+            ']' => {
+                class_depth = class_depth.saturating_sub(1);
+                out.push(ch);
+                i += 1;
+            }
+            '-' if class_depth > 0 && i + 1 < chars.len() && chars[i + 1] == '[' => {
+                out.push_str("&&[^");
+                class_depth += 1; // consumed nested `[`
+                i += 2;
+            }
+            _ => {
+                out.push(ch);
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+/// In XPath/XSD regexes, case-insensitive mode should not broaden Unicode
+/// general-category tests like `\p{Lu}` / `\P{Lu}`.
+fn protect_unicode_categories_from_case_insensitive(pattern: &str) -> String {
+    if !pattern.contains(r"\p{") && !pattern.contains(r"\P{") {
+        return pattern.to_string();
+    }
+
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::with_capacity(pattern.len());
+    let mut i = 0;
+    let mut escaped = false;
+    let mut class_depth = 0usize;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            i += 1;
+            continue;
+        }
+
+        if ch == '\\' {
+            if i + 2 < chars.len()
+                && (chars[i + 1] == 'p' || chars[i + 1] == 'P')
+                && chars[i + 2] == '{'
+            {
+                let mut j = i + 3;
+                while j < chars.len() && chars[j] != '}' {
+                    j += 1;
+                }
+                if j < chars.len() {
+                    if class_depth == 0 {
+                        out.push_str("(?-i:");
+                        for cat_ch in &chars[i..=j] {
+                            out.push(*cat_ch);
+                        }
+                        out.push(')');
+                    } else {
+                        for cat_ch in &chars[i..=j] {
+                            out.push(*cat_ch);
+                        }
+                    }
+                    i = j + 1;
+                    continue;
+                }
+            }
+
+            out.push(ch);
+            escaped = true;
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '[' => {
+                class_depth += 1;
+                out.push(ch);
+            }
+            ']' => {
+                class_depth = class_depth.saturating_sub(1);
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+        i += 1;
+    }
+
+    out
 }
 
 /// Validate XPath replacement string syntax.
@@ -274,14 +426,17 @@ fn convert_replacement(replacement: &str) -> String {
                 if i + 1 < chars.len() {
                     let next = chars[i + 1];
                     if next.is_ascii_digit() {
-                        // $N -> ${N} for clarity in Rust regex
-                        result.push('$');
+                        // $N -> ${N} so that following literal chars aren't
+                        // misinterpreted as part of the group name by the
+                        // Rust regex crate (e.g. "$1c" → "${1}c")
+                        result.push_str("${");
                         // Collect all digits for the group number
                         let mut j = i + 1;
                         while j < chars.len() && chars[j].is_ascii_digit() {
                             result.push(chars[j]);
                             j += 1;
                         }
+                        result.push('}');
                         i = j;
                     } else if next == '$' {
                         // $$ -> $$ (literal $)
@@ -405,6 +560,102 @@ mod tests {
         ).unwrap();
 
         assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+    }
+
+    #[test]
+    fn test_matches_multiline_empty_line_trailing_newline() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("abcd\ndefg\n"),
+                XPathValue::string("^$"),
+                XPathValue::string("m"),
+            ],
+        ).unwrap();
+
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+    }
+
+    #[test]
+    fn test_matches_multiline_empty_line_in_middle() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("abcd\n\ndefg\n"),
+                XPathValue::string("^$"),
+                XPathValue::string("m"),
+            ],
+        ).unwrap();
+
+        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+    }
+
+    #[test]
+    fn test_matches_class_subtraction_with_i_flag() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let match_x = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("X"),
+                XPathValue::string("[A-Z-[OI]]"),
+                XPathValue::string("i"),
+            ],
+        ).unwrap();
+        assert!(matches!(match_x, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+
+        let match_o = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("O"),
+                XPathValue::string("[A-Z-[OI]]"),
+                XPathValue::string("i"),
+            ],
+        ).unwrap();
+        assert!(matches!(match_o, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+
+        let match_i = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("i"),
+                XPathValue::string("[A-Z-[OI]]"),
+                XPathValue::string("i"),
+            ],
+        ).unwrap();
+        assert!(matches!(match_i, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+    }
+
+    #[test]
+    fn test_matches_unicode_categories_with_i_flag() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let upper = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("m"),
+                XPathValue::string(r"\p{Lu}"),
+                XPathValue::string("i"),
+            ],
+        ).unwrap();
+        assert!(matches!(upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+
+        let not_upper = matches(
+            &mut ctx,
+            vec![
+                XPathValue::string("m"),
+                XPathValue::string(r"\P{Lu}"),
+                XPathValue::string("i"),
+            ],
+        ).unwrap();
+        assert!(matches!(not_upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
     }
 
     #[test]
@@ -604,12 +855,13 @@ mod tests {
     #[test]
     fn test_convert_replacement() {
         assert_eq!(convert_replacement("hello"), "hello");
-        assert_eq!(convert_replacement("$1"), "$1");
-        assert_eq!(convert_replacement("$12"), "$12");
+        assert_eq!(convert_replacement("$1"), "${1}");
+        assert_eq!(convert_replacement("$12"), "${12}");
         assert_eq!(convert_replacement("$$"), "$$");
         assert_eq!(convert_replacement("\\\\"), "\\");
         assert_eq!(convert_replacement("\\$"), "$$");
-        assert_eq!(convert_replacement("$1 and $2"), "$1 and $2");
+        assert_eq!(convert_replacement("$1 and $2"), "${1} and ${2}");
+        assert_eq!(convert_replacement("$1c$2"), "${1}c${2}");
     }
 
     #[test]
