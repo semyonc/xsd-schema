@@ -586,6 +586,7 @@ mod tests {
             "Should either reject empty union or parse it for later validation");
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_assert_rejected_in_10_mode() {
         use crate::schema::model::XsdVersion;
@@ -610,6 +611,7 @@ mod tests {
         assert!(result.is_err(), "xs:assert should be rejected in XSD 1.0 mode");
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_assert_allowed_in_11_mode() {
         use crate::schema::model::XsdVersion;
@@ -633,6 +635,7 @@ mod tests {
         assert!(result.is_ok(), "xs:assert should be allowed in XSD 1.1 mode: {:?}", result);
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_alternative_rejected_in_10_mode() {
         use crate::schema::model::XsdVersion;

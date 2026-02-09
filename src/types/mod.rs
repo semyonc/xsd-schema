@@ -21,6 +21,7 @@ pub mod simple;
 pub mod complex;
 pub mod builtin;
 pub mod value;
+#[cfg(feature = "xsd11")]
 pub mod sequence;
 pub mod validators;
 pub mod convert;
@@ -49,6 +50,7 @@ pub use value::{
     GYearMonthValue, GYearValue, GMonthDayValue, GDayValue, GMonthValue,
     YearMonthDurationValue, DayTimeDurationValue, TimezoneOffset,
 };
+#[cfg(feature = "xsd11")]
 pub use sequence::{
     SequenceType, XmlTypeCardinality, ItemType, NameTest,
 };

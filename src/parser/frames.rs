@@ -26,8 +26,10 @@ include!("frames/core.rs");
 include!("frames/schema.rs");
 include!("frames/types.rs");
 include!("frames/elements.rs");
+#[cfg(feature = "xsd11")]
 include!("frames/xsd11.rs");
 include!("frames/notation.rs");
+#[cfg(feature = "xsd11")]
 include!("frames/open_content.rs");
 include!("frames/groups.rs");
 include!("frames/wildcards.rs");

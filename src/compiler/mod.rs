@@ -34,6 +34,7 @@ mod particle;
 mod all_group;
 mod upa;
 mod substitution;
+#[cfg(feature = "xsd11")]
 mod open_content;
 
 pub use nfa::{
@@ -60,7 +61,26 @@ pub use all_group::{
 };
 pub use upa::check_upa;
 pub use substitution::{build_substitution_group_map, SubstitutionGroupMap};
+
+use crate::types::complex::{OpenContentMode as TypesOpenContentMode, WildcardRef};
+
+/// Strategy for matching compiled content models.
+#[derive(Debug, Clone)]
+pub enum ContentModelMatcher {
+    /// Standard NFA-based content model.
+    Nfa(NfaTable),
+    /// All-group content model.
+    AllGroup(AllGroupModel),
+    /// NFA content model with open content wildcard.
+    WithOpenContent {
+        nfa: NfaTable,
+        mode: TypesOpenContentMode,
+        wildcard: Option<WildcardRef>,
+    },
+}
+
+#[cfg(feature = "xsd11")]
 pub use open_content::{
-    ContentModelMatcher, OpenContent, OpenContentMode as CompilerOpenContentMode, validate_interleave,
+    OpenContent, OpenContentMode as CompilerOpenContentMode, validate_interleave,
     validate_suffix,
 };

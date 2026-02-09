@@ -243,6 +243,12 @@ impl From<crate::xpath::parser::ParseError> for XPathError {
     }
 }
 
+impl From<crate::navigator::NavigatorError> for XPathError {
+    fn from(e: crate::navigator::NavigatorError) -> Self {
+        XPathError::Internal(e.to_string())
+    }
+}
+
 impl XPathError {
     // ========================================================================
     // Convenience Constructors

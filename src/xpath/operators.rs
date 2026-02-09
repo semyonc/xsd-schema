@@ -2954,7 +2954,7 @@ mod tests {
     use crate::namespace::qname::QualifiedName;
     use crate::xpath::context::XPathContext;
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
 
     fn int_value(type_code: XmlTypeCode, value: i64) -> XmlValue {
         XmlValue {

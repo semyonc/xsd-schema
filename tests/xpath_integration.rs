@@ -1,3 +1,4 @@
+#![cfg(feature = "xsd11")]
 //! XPath integration tests using sample XML files.
 
 use std::fs;

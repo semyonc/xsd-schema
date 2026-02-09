@@ -1,4 +1,4 @@
-use xsd_schema::xpath::roxmltree::RoXmlNavigator;
+use xsd_schema::RoXmlNavigator;
 use xsd_schema::xpath::tree_comparer::TreeComparer;
 use xsd_schema::xpath::functions::XPathValue;
 use xsd_schema::xpath::iterator::XmlItem;

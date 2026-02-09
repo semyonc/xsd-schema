@@ -308,7 +308,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
 
     #[test]
     fn test_deep_equal_ignores_whitespace_nodes() {

@@ -25,7 +25,7 @@ use xsd_schema::namespace::table::NameTable;
 use xsd_schema::xpath::api::{XPathExpr, XPathEvaluator};
 use xsd_schema::xpath::context::XPathContext;
 use xsd_schema::xpath::functions::XPathValue;
-use xsd_schema::xpath::roxmltree::RoXmlNavigator;
+use xsd_schema::RoXmlNavigator;
 
 #[derive(Debug, Clone, PartialEq)]
 enum TestOutcome {

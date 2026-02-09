@@ -216,6 +216,14 @@ impl RestrictionFrame {
 
 impl Frame for RestrictionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(
+            local_name,
+            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
         matches!(
             local_name,
             xsd_names::ANNOTATION
@@ -239,9 +247,7 @@ impl Frame for RestrictionFrame {
                 | xsd_names::ATTRIBUTE
                 | xsd_names::ATTRIBUTE_GROUP
                 | xsd_names::ANY_ATTRIBUTE
-                | xsd_names::OPEN_CONTENT
-                | xsd_names::ASSERT
-        )
+        ) || is_xsd11_element
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
@@ -394,10 +400,17 @@ impl ExtensionFrame {
 
 impl Frame for ExtensionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(
+            local_name,
+            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
         matches!(
             local_name,
             xsd_names::ANNOTATION
-                | xsd_names::OPEN_CONTENT
                 | xsd_names::SEQUENCE
                 | xsd_names::CHOICE
                 | xsd_names::ALL
@@ -405,8 +418,7 @@ impl Frame for ExtensionFrame {
                 | xsd_names::ATTRIBUTE
                 | xsd_names::ATTRIBUTE_GROUP
                 | xsd_names::ANY_ATTRIBUTE
-                | xsd_names::ASSERT
-        )
+        ) || is_xsd11_element
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
@@ -1059,13 +1071,20 @@ impl ComplexTypeFrame {
 
 impl Frame for ComplexTypeFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(
+            local_name,
+            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
         match self.phase {
             ComplexTypePhase::Annotation => matches!(
                 local_name,
                 xsd_names::ANNOTATION
                     | xsd_names::SIMPLE_CONTENT
                     | xsd_names::COMPLEX_CONTENT
-                    | xsd_names::OPEN_CONTENT
                     | xsd_names::SEQUENCE
                     | xsd_names::CHOICE
                     | xsd_names::ALL
@@ -1073,13 +1092,11 @@ impl Frame for ComplexTypeFrame {
                     | xsd_names::ATTRIBUTE
                     | xsd_names::ATTRIBUTE_GROUP
                     | xsd_names::ANY_ATTRIBUTE
-                    | xsd_names::ASSERT
-            ),
+            ) || is_xsd11_element,
             ComplexTypePhase::Content => matches!(
                 local_name,
                 xsd_names::SIMPLE_CONTENT
                     | xsd_names::COMPLEX_CONTENT
-                    | xsd_names::OPEN_CONTENT
                     | xsd_names::SEQUENCE
                     | xsd_names::CHOICE
                     | xsd_names::ALL
@@ -1087,15 +1104,13 @@ impl Frame for ComplexTypeFrame {
                     | xsd_names::ATTRIBUTE
                     | xsd_names::ATTRIBUTE_GROUP
                     | xsd_names::ANY_ATTRIBUTE
-                    | xsd_names::ASSERT
-            ),
+            ) || is_xsd11_element,
             ComplexTypePhase::Attributes => matches!(
                 local_name,
                 xsd_names::ATTRIBUTE
                     | xsd_names::ATTRIBUTE_GROUP
                     | xsd_names::ANY_ATTRIBUTE
-                    | xsd_names::ASSERT
-            ),
+            ) || is_xsd11_element,
             ComplexTypePhase::Done => false,
         }
     }

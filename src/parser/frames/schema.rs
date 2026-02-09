@@ -106,13 +106,20 @@ impl SchemaFrame {
 
 impl Frame for SchemaFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(
+            local_name,
+            xsd_names::OVERRIDE | xsd_names::DEFAULT_OPEN_CONTENT
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
         match self.phase {
             SchemaPhase::Composition => matches!(
                 local_name,
                 xsd_names::INCLUDE
                     | xsd_names::IMPORT
                     | xsd_names::REDEFINE
-                    | xsd_names::OVERRIDE
                     | xsd_names::ANNOTATION
                     | xsd_names::SIMPLE_TYPE
                     | xsd_names::COMPLEX_TYPE
@@ -121,8 +128,7 @@ impl Frame for SchemaFrame {
                     | xsd_names::GROUP
                     | xsd_names::ATTRIBUTE_GROUP
                     | xsd_names::NOTATION
-                    | xsd_names::DEFAULT_OPEN_CONTENT
-            ),
+            ) || is_xsd11_element,
             SchemaPhase::Components => matches!(
                 local_name,
                 xsd_names::ANNOTATION

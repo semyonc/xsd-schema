@@ -131,31 +131,34 @@ impl ElementFrame {
 
 impl Frame for ElementFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(local_name, xsd_names::ALTERNATIVE);
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
         match self.phase {
             ElementPhase::Annotation => matches!(
                 local_name,
                 xsd_names::ANNOTATION
                     | xsd_names::SIMPLE_TYPE
                     | xsd_names::COMPLEX_TYPE
-                    | xsd_names::ALTERNATIVE
                     | xsd_names::KEY
                     | xsd_names::KEYREF
                     | xsd_names::UNIQUE
-            ),
+            ) || is_xsd11_element,
             ElementPhase::Type => matches!(
                 local_name,
                 xsd_names::SIMPLE_TYPE
                     | xsd_names::COMPLEX_TYPE
-                    | xsd_names::ALTERNATIVE
                     | xsd_names::KEY
                     | xsd_names::KEYREF
                     | xsd_names::UNIQUE
-            ),
+            ) || is_xsd11_element,
             ElementPhase::Identity => {
                 matches!(
                     local_name,
-                    xsd_names::ALTERNATIVE | xsd_names::KEY | xsd_names::KEYREF | xsd_names::UNIQUE
-                )
+                    xsd_names::KEY | xsd_names::KEYREF | xsd_names::UNIQUE
+                ) || is_xsd11_element
             }
             ElementPhase::Done => false,
         }

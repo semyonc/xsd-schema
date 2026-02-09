@@ -692,9 +692,7 @@ impl SourceRefExt for SourceRef {
 mod tests {
     use super::*;
     use crate::ids::TypeKey;
-    use crate::parser::frames::TypeFrameResult;
-    use crate::schema::model::{FormChoice, OpenContentMode};
-    use crate::schema::wildcard::{NamespaceConstraint, ProcessContents};
+    use crate::schema::model::FormChoice;
 
     #[test]
     fn test_parse_minimal_schema() {
@@ -774,8 +772,13 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_parse_schema_assembles_arena_fields() {
+        use crate::parser::frames::TypeFrameResult;
+        use crate::schema::model::OpenContentMode;
+        use crate::schema::wildcard::{NamespaceConstraint, ProcessContents};
+
         let mut schema_set = SchemaSet::new();
         let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"

@@ -258,20 +258,13 @@ impl SchemaSetBuilder {
     /// Apply redefine and override directives to the schema set.
     fn apply_redefine_override(&mut self) -> SchemaResult<()> {
         use crate::schema::redefine::apply_redefine;
-        use crate::schema::override_dir::apply_override;
 
-        // Collect all redefine/override directives
+        // Collect all redefine directives
         let redefines: Vec<_> = self
             .schema_set
             .documents
             .iter()
             .flat_map(|doc| doc.redefines.iter().cloned())
-            .collect();
-        let overrides: Vec<_> = self
-            .schema_set
-            .documents
-            .iter()
-            .flat_map(|doc| doc.overrides.iter().cloned())
             .collect();
 
         // Apply redefines
@@ -279,9 +272,21 @@ impl SchemaSetBuilder {
             apply_redefine(&mut self.schema_set, &redefine)?;
         }
 
-        // Apply overrides
-        for override_dir in overrides {
-            apply_override(&mut self.schema_set, &override_dir)?;
+        // Apply overrides (XSD 1.1 only)
+        #[cfg(feature = "xsd11")]
+        {
+            use crate::schema::override_dir::apply_override;
+
+            let overrides: Vec<_> = self
+                .schema_set
+                .documents
+                .iter()
+                .flat_map(|doc| doc.overrides.iter().cloned())
+                .collect();
+
+            for override_dir in overrides {
+                apply_override(&mut self.schema_set, &override_dir)?;
+            }
         }
 
         Ok(())

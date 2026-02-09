@@ -163,6 +163,7 @@ impl Frame for ImportFrame {
     }
 }
 
+#[cfg(feature = "xsd11")]
 /// Frame for xs:override (XSD 1.1)
 pub struct OverrideFrame {
     schema_location: Option<String>,
@@ -180,6 +181,7 @@ pub struct OverrideFrame {
     notations: Vec<NotationResult>,
 }
 
+#[cfg(feature = "xsd11")]
 impl OverrideFrame {
     pub fn new(
         attrs: &AttributeMap,
@@ -211,6 +213,7 @@ impl OverrideFrame {
     }
 }
 
+#[cfg(feature = "xsd11")]
 impl Frame for OverrideFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
         // Override can contain annotation and schemaTop elements

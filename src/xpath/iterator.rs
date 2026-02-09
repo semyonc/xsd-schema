@@ -624,7 +624,7 @@ impl<I: XmlNodeIterator> XmlNodeIterator for ItemIterator<I> {
 mod tests {
     use super::*;
 
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
     use crate::types::XmlValue;
 
     fn current_integer<N: DomNavigator>(iter: &impl XmlNodeIterator<Navigator = N>) -> BigInt {

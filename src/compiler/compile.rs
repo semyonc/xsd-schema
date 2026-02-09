@@ -22,7 +22,7 @@ use crate::types::complex::{
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 use super::nfa::{NfaTable, NfaTerm};
-use super::open_content::ContentModelMatcher;
+use super::ContentModelMatcher;
 use super::particle::{apply_occurs, MaxOccurs};
 
 /// Maximum recursion depth for compiling nested groups

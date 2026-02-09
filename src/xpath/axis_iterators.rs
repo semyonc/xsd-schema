@@ -1050,7 +1050,7 @@ mod tests {
     use crate::namespace::table::NameTable;
     use crate::types::{ItemType, NameTest, SequenceType};
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
 
     fn collect_local_names<N: DomNavigator>(
         iter: &mut impl XmlNodeIterator<Navigator = N>,

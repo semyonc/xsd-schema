@@ -593,7 +593,7 @@ mod tests {
 
     use crate::namespace::table::NameTable;
     use crate::types::XmlTypeCode;
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
     use crate::xpath::context::XPathContext;
 
     // Helper to create ElementDeclData for tests

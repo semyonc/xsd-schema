@@ -744,7 +744,7 @@ mod tests {
     use num_bigint::BigInt;
 
     use crate::namespace::table::NameTable;
-    use crate::xpath::roxmltree::RoXmlNavigator;
+    use crate::navigator::RoXmlNavigator;
 
     #[test]
     fn test_cardinality_matches_count() {

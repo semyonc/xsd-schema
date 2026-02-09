@@ -97,7 +97,11 @@ pub mod namespace;
 pub mod schema;
 pub mod types;
 
-// XPath navigation
+// DOM navigation (always available)
+pub mod navigator;
+
+// XPath 2.0 engine (only with xsd11 feature)
+#[cfg(feature = "xsd11")]
 pub mod xpath;
 
 // Pipeline orchestration
@@ -141,11 +145,18 @@ pub use types::{
     facet_applicable, facet_applicable_for_type, normalize_whitespace,
 };
 
-// Re-export XPath navigation types
+// Re-export navigator types (always available)
+pub use navigator::{
+    DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope,
+    RoXmlNavigator, NavigatorError,
+};
+
+// Re-export XPath types (only with xsd11 feature)
+#[cfg(feature = "xsd11")]
 pub use xpath::{
-    DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope, RoXmlNavigator,
     XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
     EmptyIterator, BufferedNodeIterator, RangeIterator, TreeComparer, XPathContext,
+    XPathExpr, XPathEvaluator, ExternalVar, EvalValue, TypedEvaluator,
 };
 
 // Re-export pipeline functions

@@ -45,13 +45,16 @@ pub fn create_frame(
         xsd_names::INCLUDE => Box::new(IncludeFrame::new(attrs, name_table, source)?),
         xsd_names::IMPORT => Box::new(ImportFrame::new(attrs, name_table, source)?),
         xsd_names::REDEFINE => Box::new(RedefineFrame::new(attrs, name_table, source)?),
+        #[cfg(feature = "xsd11")]
         xsd_names::OVERRIDE => Box::new(OverrideFrame::new(attrs, name_table, source)?),
         xsd_names::KEY => Box::new(IdentityFrame::new(IdentityKind::Key, attrs, name_table, source, ns_snapshot)?),
         xsd_names::KEYREF => Box::new(IdentityFrame::new(IdentityKind::Keyref, attrs, name_table, source, ns_snapshot)?),
         xsd_names::UNIQUE => Box::new(IdentityFrame::new(IdentityKind::Unique, attrs, name_table, source, ns_snapshot)?),
         xsd_names::SELECTOR => Box::new(SelectorFrame::new(attrs, name_table, source)?),
         xsd_names::FIELD => Box::new(FieldFrame::new(attrs, name_table, source)?),
+        #[cfg(feature = "xsd11")]
         xsd_names::ALTERNATIVE => Box::new(AlternativeFrame::new(attrs, name_table, source, ns_snapshot)?),
+        #[cfg(feature = "xsd11")]
         xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source)?),
         xsd_names::ENUMERATION => {
             Box::new(FacetFrame::new(FacetKind::Enumeration, attrs, name_table, source)?)
@@ -75,7 +78,9 @@ pub fn create_frame(
         xsd_names::TOTAL_DIGITS => Box::new(FacetFrame::new(FacetKind::TotalDigits, attrs, name_table, source)?),
         xsd_names::FRACTION_DIGITS => Box::new(FacetFrame::new(FacetKind::FractionDigits, attrs, name_table, source)?),
         xsd_names::WHITE_SPACE => Box::new(FacetFrame::new(FacetKind::WhiteSpace, attrs, name_table, source)?),
+        #[cfg(feature = "xsd11")]
         xsd_names::OPEN_CONTENT => Box::new(OpenContentFrame::new(attrs, name_table, source)?),
+        #[cfg(feature = "xsd11")]
         xsd_names::DEFAULT_OPEN_CONTENT => {
             Box::new(DefaultOpenContentFrame::new(attrs, name_table, source)?)
         }

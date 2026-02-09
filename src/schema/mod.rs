@@ -26,6 +26,7 @@ pub mod inline;
 pub mod dependencies;
 pub mod derivation;
 pub mod redefine;
+#[cfg(feature = "xsd11")]
 pub mod override_dir;
 
 // Re-exports from model
@@ -85,4 +86,5 @@ pub use derivation::{
 pub use redefine::apply_redefine;
 
 // Re-exports from override_dir
+#[cfg(feature = "xsd11")]
 pub use override_dir::apply_override;

@@ -112,6 +112,7 @@ fn parse_process_contents_value(value: &str) -> Result<ProcessContents, String> 
     }
 }
 
+#[cfg(feature = "xsd11")]
 fn parse_open_content_mode(value: &str) -> Result<OpenContentMode, String> {
     match value {
         "none" => Ok(OpenContentMode::None),
@@ -132,6 +133,7 @@ fn parse_process_contents_attr(
     }
 }
 
+#[cfg(feature = "xsd11")]
 fn parse_open_content_mode_attr(
     attrs: &AttributeMap,
     name_table: &NameTable,

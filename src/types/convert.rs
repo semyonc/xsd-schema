@@ -17,6 +17,7 @@ use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
 use super::value::{XmlValue, XmlValueKind, XmlAtomicValue};
+#[cfg(feature = "xsd11")]
 use super::sequence::{SequenceType, ItemType};
 use super::{XmlTypeCode, PrimitiveTypeCode};
 use super::validators::{ValidatorRegistry, ValidationError};
@@ -292,6 +293,7 @@ impl TypeConverter {
     }
 
     /// Check if value matches the given sequence type
+    #[cfg(feature = "xsd11")]
     pub fn matches(&self, value: &XmlValue, seq_type: &SequenceType) -> bool {
         match &seq_type.item_type {
             ItemType::AnyItem => true,
@@ -460,6 +462,7 @@ fn can_cast(from: XmlTypeCode, to: XmlTypeCode) -> bool {
 }
 
 /// Check if a type derives from another (for type matching)
+#[cfg(feature = "xsd11")]
 fn derives_from(derived: XmlTypeCode, base: XmlTypeCode) -> bool {
     if derived == base {
         return true;
@@ -755,6 +758,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_derives_from() {
         // Integer hierarchy

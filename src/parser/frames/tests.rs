@@ -73,6 +73,7 @@ mod tests {
         assert!(parse_process_contents_attr(&attrs, &name_table, "processContents").is_err());
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_parse_open_content_mode_attr() {
         let mut name_table = NameTable::new();
@@ -92,6 +93,7 @@ mod tests {
         assert!(parse_open_content_mode_attr(&attrs, &name_table, "mode").is_err());
     }
 
+    #[cfg(feature = "xsd11")]
     #[test]
     fn test_override_requires_schema_location() {
         let name_table = NameTable::new();
