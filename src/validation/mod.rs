@@ -9,5 +9,5 @@ pub use errors::{
     ValidationError, ValidationResult,
     error, error_with_path,
     from_value_error, from_facet_error,
-    facet_constraint_code,
+    facet_constraint_code, value_error_constraint_code,
 };

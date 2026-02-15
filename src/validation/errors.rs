@@ -39,6 +39,18 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
+impl ValidationError {
+    pub fn with_location(mut self, location: SourceLocation) -> Self {
+        self.location = Some(location);
+        self
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.element_path = Some(path.into());
+        self
+    }
+}
+
 /// Result type for instance validation operations
 pub type ValidationResult<T> = Result<T, ValidationError>;
 
@@ -150,6 +162,30 @@ pub fn facet_constraint_code(err: &FacetError) -> &'static str {
         FacetError::FixedFacetViolation { .. } => "cos-st-restricts",
         FacetError::ConflictingFacets { .. } => "cos-st-restricts",
         FacetError::NotApplicable { .. } => "cos-applicable-facets",
+    }
+}
+
+/// Map a TypeValidationError variant to its default cvc-* constraint code
+///
+/// Returns `cvc-datatype-valid` for lexical/type/range errors, and delegates
+/// to `facet_constraint_code()` for facet violations.
+///
+/// # Constraint code context
+///
+/// - `cvc-datatype-valid` (datatypes.html) is the default for lexical/type/range
+///   errors. Callers validating at the structures.html level (e.g., element or
+///   attribute value checks) should override to `cvc-simple-type` instead.
+/// - `FacetViolation` delegates to `facet_constraint_code()`, which returns
+///   `cvc-*-valid` for runtime facet checks. Schema-level `FacetError` variants
+///   (`DerivationRestriction`, `FixedFacetViolation`, `ConflictingFacets`,
+///   `NotApplicable`) map to `cos-*` codes and should not appear during instance
+///   validation — they are schema compilation errors.
+pub fn value_error_constraint_code(err: &TypeValidationError) -> &'static str {
+    match err {
+        TypeValidationError::InvalidLexical { .. } => "cvc-datatype-valid",
+        TypeValidationError::FacetViolation(facet_err) => facet_constraint_code(facet_err),
+        TypeValidationError::TypeError { .. } => "cvc-datatype-valid",
+        TypeValidationError::RangeError { .. } => "cvc-datatype-valid",
     }
 }
 
@@ -308,5 +344,84 @@ mod tests {
         let val_err = from_facet_error(code, facet_err, None);
         assert_eq!(val_err.constraint, "cvc-minLength-valid");
         assert!(val_err.message.contains("minLength"));
+    }
+
+    #[test]
+    fn test_value_error_constraint_code_invalid_lexical() {
+        let err = TypeValidationError::InvalidLexical {
+            value: "abc".to_string(),
+            type_name: "integer",
+            message: "not a valid integer".to_string(),
+        };
+        assert_eq!(value_error_constraint_code(&err), "cvc-datatype-valid");
+    }
+
+    #[test]
+    fn test_value_error_constraint_code_facet_violation() {
+        let err = TypeValidationError::FacetViolation(FacetError::PatternViolation {
+            value: "abc".to_string(),
+            pattern: "[0-9]+".to_string(),
+        });
+        assert_eq!(value_error_constraint_code(&err), "cvc-pattern-valid");
+    }
+
+    #[test]
+    fn test_value_error_constraint_code_type_error() {
+        use crate::types::XmlTypeCode;
+        let err = TypeValidationError::TypeError {
+            expected: XmlTypeCode::String,
+            actual: XmlTypeCode::Integer,
+        };
+        assert_eq!(value_error_constraint_code(&err), "cvc-datatype-valid");
+    }
+
+    #[test]
+    fn test_value_error_constraint_code_range_error() {
+        let err = TypeValidationError::RangeError {
+            value: "999999".to_string(),
+            type_name: "short",
+        };
+        assert_eq!(value_error_constraint_code(&err), "cvc-datatype-valid");
+    }
+
+    #[test]
+    fn test_with_location() {
+        let loc = SourceLocation { base_uri: "test.xsd".to_string(), line: 10, column: 5 };
+        let err = error("cvc-elt", "test", None).with_location(loc.clone());
+        assert_eq!(err.location, Some(loc));
+    }
+
+    #[test]
+    fn test_with_path() {
+        let err = error("cvc-elt", "test", None).with_path("/root/child");
+        assert_eq!(err.element_path.as_deref(), Some("/root/child"));
+    }
+
+    #[test]
+    fn test_builder_chaining() {
+        let loc = SourceLocation { base_uri: "test.xsd".to_string(), line: 3, column: 1 };
+        let err = error("cvc-type", "Type mismatch", None)
+            .with_location(loc)
+            .with_path("/root/elem[2]");
+        assert_eq!(err.constraint, "cvc-type");
+        assert_eq!(err.location.as_ref().unwrap().line, 3);
+        assert_eq!(err.element_path.as_deref(), Some("/root/elem[2]"));
+        let display = format!("{}", err);
+        assert!(display.contains("[cvc-type]"));
+        assert!(display.contains("Type mismatch"));
+        assert!(display.contains("/root/elem[2]"));
+    }
+
+    #[test]
+    fn test_from_value_error_with_auto_code() {
+        let type_err = TypeValidationError::InvalidLexical {
+            value: "not-a-number".to_string(),
+            type_name: "decimal",
+            message: "invalid decimal".to_string(),
+        };
+        let code = value_error_constraint_code(&type_err);
+        let val_err = from_value_error(code, type_err, None);
+        assert_eq!(val_err.constraint, "cvc-datatype-valid");
+        assert!(val_err.message.contains("invalid decimal"));
     }
 }
