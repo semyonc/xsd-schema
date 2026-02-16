@@ -1227,6 +1227,30 @@ impl Frame for ComplexTypeFrame {
                     use_kind,
                 });
             }
+            FrameResult::Group(GroupFrameResult::Model(mg)) => {
+                let min_occurs = mg.min_occurs;
+                let max_occurs = mg.max_occurs;
+                let particle = ParticleResult {
+                    term: ParticleTerm::Group(*mg),
+                    min_occurs,
+                    max_occurs,
+                    source: None,
+                };
+                self.content = ComplexContentResult::Complex(ComplexContentDefResult {
+                    particle: Some(particle),
+                    derivation: DerivationMethod::Restriction,
+                    mixed: self.mixed,
+                    base_type: None,
+                    open_content: None,
+                    attributes: Vec::new(),
+                    attribute_groups: Vec::new(),
+                    attribute_wildcard: None,
+                    assertions: Vec::new(),
+                    id: None,
+                    derivation_id: None,
+                    source: None,
+                });
+            }
             FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
                 if let Some(ref_name) = ag.ref_name {
                     self.attribute_groups.push(ref_name);

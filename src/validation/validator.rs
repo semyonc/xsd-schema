@@ -1834,4 +1834,69 @@ mod tests {
         assert!(v.end_validation().is_ok());
         assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
     }
+
+    #[test]
+    fn test_group_ref_with_nillable_fixed_default() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:group name="fields">
+                    <xs:sequence>
+                        <xs:element name="nillableField" type="xs:string" nillable="true"/>
+                        <xs:element name="fixedField" type="xs:string" fixed="LOCKED"/>
+                        <xs:element name="defaultField" type="xs:string" default="fallback"/>
+                    </xs:sequence>
+                </xs:group>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:group ref="fields"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // 1. Nillable from group — xsi:nil="true" should be accepted
+        let info = v.validate_element("nillableField", "", None, Some("true"), &ns);
+        assert!(info.is_nil, "nillableField should report is_nil=true");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // 2. Fixed value mismatch from group — wrong text should produce cvc-elt.5.2.2
+        v.validate_element("fixedField", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("WRONG");
+        let end_info = v.validate_end_element();
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.5.2.2"),
+            "expected cvc-elt.5.2.2 for fixed value mismatch, errors: {:?}",
+            v.sink.errors
+        );
+        assert_eq!(end_info.validity, SchemaValidity::Invalid);
+
+        // 3. Default value from group — empty content should set is_default
+        v.validate_element("defaultField", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        let end_info = v.validate_end_element();
+        assert!(
+            end_info.is_default,
+            "defaultField with no text should report is_default=true"
+        );
+
+        v.validate_end_element(); // close root
+        assert!(v.end_validation().is_ok());
+        // Only the fixed-value error is expected
+        assert_eq!(
+            v.sink.errors.len(),
+            1,
+            "expected exactly 1 error (cvc-elt.5.2.2), got: {:?}",
+            v.sink.errors
+        );
+    }
 }
