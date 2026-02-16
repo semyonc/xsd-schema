@@ -4,6 +4,8 @@
 //! from content model particles. Fragments are composable building blocks that
 //! can be concatenated, alternated, or repeated.
 
+use std::collections::HashMap;
+
 use crate::parser::location::SourceRef;
 
 use super::nfa::{NfaState, NfaTable, NfaTerm, StateId};
@@ -31,6 +33,31 @@ impl NfaFragment {
         Self { states, start, end }
     }
 
+    /// Normalize state IDs so that each state's ID matches its position in
+    /// the `states` vector.
+    ///
+    /// `FragmentBuilder` allocates globally unique IDs, but composition
+    /// methods (`concat`, `alternate`, etc.) assume position-based IDs.
+    /// Calling this before composition ensures all transition targets are
+    /// consistent.
+    fn normalize_ids(&mut self) {
+        let id_map: HashMap<StateId, StateId> = self
+            .states
+            .iter()
+            .enumerate()
+            .map(|(pos, state)| (state.id, pos as StateId))
+            .collect();
+
+        for (pos, state) in self.states.iter_mut().enumerate() {
+            state.id = pos as StateId;
+            for trans in &mut state.transitions {
+                if let Some(&new_target) = id_map.get(&trans.target) {
+                    trans.target = new_target;
+                }
+            }
+        }
+    }
+
     /// Get the start state
     pub fn start_state(&self) -> &NfaState {
         &self.states[self.start]
@@ -51,6 +78,10 @@ impl NfaFragment {
     /// Creates an epsilon transition from self's end state to other's start state.
     /// The resulting fragment starts at self's start and ends at other's end.
     pub fn concat(mut self, mut other: NfaFragment) -> NfaFragment {
+        // Normalize IDs to match positions before composing
+        self.normalize_ids();
+        other.normalize_ids();
+
         let offset = self.states.len();
 
         // Offset all state IDs in other fragment
@@ -81,6 +112,10 @@ impl NfaFragment {
     /// Creates a new start state with epsilon transitions to both fragments,
     /// and a new end state that both fragments converge to.
     pub fn alternate(mut self, mut other: NfaFragment) -> NfaFragment {
+        // Normalize IDs to match positions before composing
+        self.normalize_ids();
+        other.normalize_ids();
+
         // Create new start and end states
         let new_start_id = (self.states.len() + other.states.len()) as StateId;
         let new_end_id = new_start_id + 1;
@@ -123,6 +158,7 @@ impl NfaFragment {
     /// Adds an epsilon transition from start to end, allowing the fragment
     /// to be skipped entirely.
     pub fn optional(mut self) -> NfaFragment {
+        self.normalize_ids();
         // Add epsilon from start to end
         let end_id = self.end as StateId;
         self.states[self.start].add_epsilon(end_id);
@@ -134,12 +170,15 @@ impl NfaFragment {
     /// Allows zero or more repetitions of the fragment.
     /// Adds loop back from end to start, plus makes it optional.
     pub fn repeat_star(mut self) -> NfaFragment {
+        self.normalize_ids();
         // Add epsilon loop from end back to start
         let start_id = self.start as StateId;
         self.states[self.end].add_epsilon(start_id);
 
-        // Make optional (zero occurrences allowed)
-        self.optional()
+        // Make optional (zero occurrences allowed) — already normalized
+        let end_id = self.end as StateId;
+        self.states[self.start].add_epsilon(end_id);
+        self
     }
 
     /// Plus repetition: self+
@@ -147,6 +186,7 @@ impl NfaFragment {
     /// Requires at least one occurrence, then allows more.
     /// Adds loop back from end to start (no optional bypass).
     pub fn repeat_plus(mut self) -> NfaFragment {
+        self.normalize_ids();
         // Add epsilon loop from end back to start
         let start_id = self.start as StateId;
         self.states[self.end].add_epsilon(start_id);
@@ -274,9 +314,10 @@ impl Default for FragmentBuilder {
 ///
 /// Renumbers all state IDs to be contiguous starting from 0,
 /// and identifies the start and accept states.
-pub fn fragment_to_table(fragment: NfaFragment) -> NfaTable {
-    // States are already in order with contiguous IDs from fragment construction
-    // Just need to identify start and accept states
+pub fn fragment_to_table(mut fragment: NfaFragment) -> NfaTable {
+    // Ensure all state IDs match their vector positions
+    fragment.normalize_ids();
+
     let start_state = fragment.start as StateId;
     let accept_state = fragment.end as StateId;
 

@@ -4,16 +4,19 @@
 //! XSD content model particles into NFAs.
 
 use crate::arenas::{ComplexTypeDefData, ModelGroupData};
-use crate::ids::NameId;
+use crate::parser::frames::DerivationMethod;
+use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::frames::{
     Compositor, ComplexContentResult, ElementFrameResult, ModelGroupDefResult, OpenContentMode,
-    OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef, WildcardNamespace,
-    WildcardResult,
+    OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef, TypeRefResult,
+    WildcardNamespace, WildcardResult,
 };
 use crate::parser::location::SourceRef;
 use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
 use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint as SchemaNamespaceConstraint};
-use crate::schema::{FormChoice, SchemaSet};
+use crate::schema::SchemaSet;
+#[cfg(test)]
+use crate::schema::FormChoice;
 use crate::types::complex::{
     NamespaceConstraint, OpenContent, OpenContentMode as TypesOpenContentMode,
     ProcessContents as TypesProcessContents, WildcardRef,
@@ -40,6 +43,15 @@ pub struct CompileContext<'a> {
     builder: FragmentBuilder,
     /// Current recursion depth
     depth: usize,
+    /// Resolved types from resolved_particles (set when compiling a model group)
+    resolved_particle_types: Vec<Option<TypeKey>>,
+    /// Current particle index within the model group being compiled
+    current_particle_idx: Option<usize>,
+    /// Flat depth-first element counter for content particle compilation.
+    /// When Some, overrides per-level `current_particle_idx` for type resolution.
+    content_flat_idx: Option<usize>,
+    /// Resolved element keys for local elements in content particles (flat depth-first order)
+    resolved_particle_elements: Vec<Option<ElementKey>>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -50,6 +62,10 @@ impl<'a> CompileContext<'a> {
             target_namespace,
             builder: FragmentBuilder::new(),
             depth: 0,
+            resolved_particle_types: Vec::new(),
+            current_particle_idx: None,
+            content_flat_idx: None,
+            resolved_particle_elements: Vec::new(),
         }
     }
 
@@ -132,6 +148,14 @@ impl<'a> CompileContext<'a> {
         elem: &ElementFrameResult,
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
+        // Grab and increment flat element index (if compiling content particles)
+        let current_flat_idx = if let Some(flat_idx) = self.content_flat_idx {
+            self.content_flat_idx = Some(flat_idx + 1);
+            Some(flat_idx)
+        } else {
+            None
+        };
+
         // Determine element name and namespace
         let (name, namespace, element_key) = if let Some(ref_name) = &elem.ref_name {
             // Element reference - look up in schema set
@@ -143,7 +167,14 @@ impl<'a> CompileContext<'a> {
             // Local element declaration
             let source_ref = source.or(elem.source.as_ref());
             let namespace = self.effective_element_namespace(elem, source_ref);
-            (name, namespace, None)
+            // Look up local element key from resolved_particle_elements
+            let local_key = current_flat_idx
+                .and_then(|idx| self.resolved_particle_elements.get(idx).copied().flatten())
+                .or_else(|| {
+                    self.current_particle_idx
+                        .and_then(|idx| self.resolved_particle_elements.get(idx).copied().flatten())
+                });
+            (name, namespace, local_key)
         } else {
             return Err(NfaCompileError::unresolved_element(
                 "anonymous element without name or ref".to_string(),
@@ -151,8 +182,38 @@ impl<'a> CompileContext<'a> {
             ));
         };
 
-        let nfa_term = NfaTerm::element(name, namespace, element_key);
+        // For local elements (element_key is None), resolve type
+        let resolved_type = if element_key.is_none() {
+            // First: check context for resolved type
+            let type_from_context = if let Some(flat_idx) = current_flat_idx {
+                self.resolved_particle_types.get(flat_idx).copied().flatten()
+            } else {
+                self.current_particle_idx
+                    .and_then(|idx| self.resolved_particle_types.get(idx).copied().flatten())
+            };
+            // Then: try QName resolution
+            type_from_context.or_else(|| self.resolve_element_type_ref(elem))
+        } else {
+            None // Elements with key get type from element declaration via arena
+        };
+
+        let nfa_term = NfaTerm::element_with_type(name, namespace, element_key, resolved_type);
         Ok(self.builder.single_term(nfa_term, source.cloned()))
+    }
+
+    /// Resolve a local element's QName type reference to a TypeKey
+    fn resolve_element_type_ref(&self, elem: &ElementFrameResult) -> Option<TypeKey> {
+        match &elem.type_ref {
+            Some(TypeRefResult::QName(qname)) => {
+                self.schema_set
+                    .lookup_type(qname.namespace, qname.local_name)
+                    .or_else(|| {
+                        self.schema_set
+                            .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                    })
+            }
+            _ => None, // Inline types not resolved at compile time
+        }
     }
 
     /// Compile a wildcard to a fragment
@@ -194,15 +255,32 @@ impl<'a> CompileContext<'a> {
         }
     }
 
+    /// Compile a particle with a tracked index for resolved type lookup
+    fn compile_particle_with_index(
+        &mut self,
+        particle: &ParticleResult,
+        particle_idx: usize,
+    ) -> NfaCompileResult<NfaFragment> {
+        if self.content_flat_idx.is_some() {
+            // When using flat element counter, skip per-level positional indexing
+            return self.compile_particle_to_fragment(particle);
+        }
+        let saved_idx = self.current_particle_idx;
+        self.current_particle_idx = Some(particle_idx);
+        let result = self.compile_particle_to_fragment(particle);
+        self.current_particle_idx = saved_idx;
+        result
+    }
+
     /// Compile a sequence (xs:sequence)
     fn compile_sequence(&mut self, particles: &[ParticleResult]) -> NfaCompileResult<NfaFragment> {
         if particles.is_empty() {
             return Ok(self.builder.epsilon_fragment());
         }
 
-        let mut result = self.compile_particle_to_fragment(&particles[0])?;
-        for particle in &particles[1..] {
-            let frag = self.compile_particle_to_fragment(particle)?;
+        let mut result = self.compile_particle_with_index(&particles[0], 0)?;
+        for (i, particle) in particles[1..].iter().enumerate() {
+            let frag = self.compile_particle_with_index(particle, i + 1)?;
             result = result.concat(frag);
         }
 
@@ -215,9 +293,9 @@ impl<'a> CompileContext<'a> {
             return Ok(self.builder.epsilon_fragment());
         }
 
-        let mut result = self.compile_particle_to_fragment(&particles[0])?;
-        for particle in &particles[1..] {
-            let frag = self.compile_particle_to_fragment(particle)?;
+        let mut result = self.compile_particle_with_index(&particles[0], 0)?;
+        for (i, particle) in particles[1..].iter().enumerate() {
+            let frag = self.compile_particle_with_index(particle, i + 1)?;
             result = result.alternate(frag);
         }
 
@@ -266,9 +344,9 @@ impl<'a> CompileContext<'a> {
         // Simple approach: create choice of all elements, then wrap in repeat
         // This allows any order but doesn't enforce "each element at most once"
         // Full enforcement requires AllGroupModel (Task 4.3)
-        let mut choice = self.compile_particle_to_fragment(&particles[0])?;
-        for particle in &particles[1..] {
-            let frag = self.compile_particle_to_fragment(particle)?;
+        let mut choice = self.compile_particle_with_index(&particles[0], 0)?;
+        for (i, particle) in particles[1..].iter().enumerate() {
+            let frag = self.compile_particle_with_index(particle, i + 1)?;
             choice = choice.alternate(frag);
         }
 
@@ -327,11 +405,30 @@ impl<'a> CompileContext<'a> {
             return Ok(self.builder.epsilon_fragment());
         }
 
-        match compositor {
+        // Save context and set up flat indexing for the named group
+        let saved_flat_idx = self.content_flat_idx.take();
+        let saved_particle_elements = std::mem::take(&mut self.resolved_particle_elements);
+        let saved_types = std::mem::take(&mut self.resolved_particle_types);
+        let saved_idx = self.current_particle_idx;
+
+        // Use flat-indexed fields from ModelGroupData
+        self.resolved_particle_types = group.resolved_particle_types.clone();
+        self.resolved_particle_elements = group.resolved_particle_elements.clone();
+        // Enable flat indexing within the group
+        self.content_flat_idx = Some(0);
+
+        let result = match compositor {
             Compositor::Sequence => self.compile_sequence(&group.particles),
             Compositor::Choice => self.compile_choice(&group.particles),
             Compositor::All => self.compile_all(&group.particles, source),
-        }
+        };
+
+        // Restore previous context
+        self.content_flat_idx = saved_flat_idx;
+        self.resolved_particle_elements = saved_particle_elements;
+        self.resolved_particle_types = saved_types;
+        self.current_particle_idx = saved_idx;
+        result
     }
 
     /// Apply occurrence constraints to a fragment
@@ -381,28 +478,12 @@ impl<'a> CompileContext<'a> {
         elem: &ElementFrameResult,
         source: Option<&SourceRef>,
     ) -> Option<NameId> {
-        if elem.target_namespace.is_some() {
-            return elem.target_namespace;
-        }
-
-        let doc = source.and_then(|s| self.schema_set.documents.get(s.doc_id as usize));
-        let default_form = doc
-            .map(|d| d.element_form_default)
-            .unwrap_or(FormChoice::Unqualified);
-        let target_namespace = doc
-            .map(|d| d.target_namespace)
-            .unwrap_or(self.target_namespace);
-
-        let form = match elem.form.as_deref() {
-            Some("qualified") => FormChoice::Qualified,
-            Some("unqualified") => FormChoice::Unqualified,
-            _ => default_form,
-        };
-
-        match form {
-            FormChoice::Qualified => target_namespace,
-            FormChoice::Unqualified => None,
-        }
+        self.schema_set.effective_local_element_namespace(
+            elem.target_namespace,
+            elem.form.as_deref(),
+            source,
+            self.target_namespace,
+        )
     }
 }
 
@@ -433,15 +514,51 @@ pub fn compile_content_model_matcher(
 ) -> NfaCompileResult<ContentModelMatcher> {
     let target_namespace = type_def.target_namespace;
     let mut ctx = CompileContext::new(schema_set, target_namespace);
-    let base_matcher = match &type_def.content {
+
+    // Compile this type's own particle
+    let own_nfa = match &type_def.content {
         ComplexContentResult::Complex(def) => match &def.particle {
-            Some(particle) => ContentModelMatcher::Nfa(ctx.compile_particle(particle)?),
-            None => ContentModelMatcher::Nfa(empty_nfa()),
+            Some(particle) => {
+                ctx.resolved_particle_types =
+                    type_def.resolved_content_particle_types.to_vec();
+                ctx.resolved_particle_elements =
+                    type_def.resolved_content_particle_elements.to_vec();
+                ctx.content_flat_idx = Some(0);
+                Some(ctx.compile_particle(particle)?)
+            }
+            None => None,
         },
-        ComplexContentResult::Empty | ComplexContentResult::Simple(_) => {
-            ContentModelMatcher::Nfa(empty_nfa())
-        }
+        ComplexContentResult::Empty | ComplexContentResult::Simple(_) => None,
     };
+
+    // For extensions, prepend the base type's content model
+    let base_nfa =
+        if matches!(type_def.derivation_method, Some(DerivationMethod::Extension)) {
+            if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
+                let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
+                // Recursive call handles chained extensions (base-of-base)
+                let base_matcher =
+                    compile_content_model_matcher(schema_set, base_type_def)?;
+                match base_matcher {
+                    ContentModelMatcher::Nfa(nfa) => Some(nfa),
+                    ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),
+                    ContentModelMatcher::AllGroup(_) => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    let effective_nfa = match (base_nfa, own_nfa) {
+        (Some(base), Some(own)) => base.concat(own),
+        (Some(base), None) => base,
+        (None, Some(own)) => own,
+        (None, None) => empty_nfa(),
+    };
+
+    let base_matcher = ContentModelMatcher::Nfa(effective_nfa);
 
     let open_content = resolve_open_content(
         schema_set,
@@ -702,6 +819,8 @@ mod tests {
             resolved_base_type: None,
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
+            resolved_content_particle_types: Vec::new(),
+            resolved_content_particle_elements: Vec::new(),
         }
     }
 

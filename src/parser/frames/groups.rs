@@ -333,9 +333,14 @@ impl Frame for AttributeGroupFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Attribute(attr) => {
+                let use_kind = match attr.use_kind.as_deref() {
+                    Some("required") => AttributeUseKind::Required,
+                    Some("prohibited") => AttributeUseKind::Prohibited,
+                    _ => AttributeUseKind::Optional,
+                };
                 self.attributes.push(AttributeUseResult {
                     attribute: attr,
-                    use_kind: AttributeUseKind::Optional,
+                    use_kind,
                 });
             }
             FrameResult::Group(GroupFrameResult::Attribute(ag)) => {

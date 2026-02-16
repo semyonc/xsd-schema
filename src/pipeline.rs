@@ -29,8 +29,8 @@ use crate::ids::DocumentId;
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
 use crate::parser::resolver::{resolve_all_directives, ResolverConfig, SchemaResolver, ResolutionResult};
 use crate::schema::{
-    assemble_inline_types, resolve_all_references,
-    InlineAssemblyStats, ResolutionStats,
+    allocate_content_particle_elements, allocate_model_group_particle_elements,
+    assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
 };
 use crate::SchemaSet;
 
@@ -222,6 +222,12 @@ pub fn load_and_process_schema(
         stats.resolution_stats = Some(resolution_stats);
     }
 
+    // Phase 5: Allocate arena element declarations for local elements in content particles
+    if config.assemble_inline_types && config.resolve_references {
+        allocate_content_particle_elements(schema_set);
+        allocate_model_group_particle_elements(schema_set);
+    }
+
     Ok(stats)
 }
 
@@ -258,6 +264,8 @@ pub fn parse_schema_only(
 pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     let inline_stats = assemble_inline_types(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
+    allocate_content_particle_elements(schema_set);
+    allocate_model_group_particle_elements(schema_set);
     Ok((inline_stats, resolution_stats))
 }
 

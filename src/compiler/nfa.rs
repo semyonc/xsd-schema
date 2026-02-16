@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 
-use crate::ids::{ElementKey, NameId};
+use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
 use crate::types::complex::{NamespaceConstraint, ProcessContents};
 use super::substitution::SubstitutionGroupMap;
@@ -55,6 +55,23 @@ impl NfaTable {
     /// Check if a state is the accept state
     pub fn is_accept(&self, state_id: StateId) -> bool {
         state_id == self.accept_state
+    }
+
+    /// Concatenate two NFA tables: self followed by other.
+    /// Creates an epsilon transition from self's accept state to other's start state.
+    pub fn concat(mut self, mut other: NfaTable) -> NfaTable {
+        let offset = self.states.len() as StateId;
+        for state in &mut other.states {
+            state.id += offset;
+            for trans in &mut state.transitions {
+                trans.target += offset;
+            }
+        }
+        let other_start = other.start_state + offset;
+        self.states[self.accept_state as usize].add_epsilon(other_start);
+        let new_accept = other.accept_state + offset;
+        self.states.extend(other.states);
+        NfaTable::new(self.states, self.start_state, new_accept)
     }
 
     /// Get all transitions from a given state
@@ -155,6 +172,8 @@ pub enum NfaTerm {
         namespace: Option<NameId>,
         /// Resolved element key (for type lookup during validation)
         element_key: Option<ElementKey>,
+        /// Resolved type for local elements (without element key)
+        resolved_type: Option<TypeKey>,
     },
     /// Match any element satisfying wildcard constraints
     Wildcard {
@@ -172,6 +191,22 @@ impl NfaTerm {
             name,
             namespace,
             element_key,
+            resolved_type: None,
+        }
+    }
+
+    /// Create an element term with a resolved type
+    pub fn element_with_type(
+        name: NameId,
+        namespace: Option<NameId>,
+        element_key: Option<ElementKey>,
+        resolved_type: Option<TypeKey>,
+    ) -> Self {
+        NfaTerm::Element {
+            name,
+            namespace,
+            element_key,
+            resolved_type,
         }
     }
 
@@ -266,6 +301,7 @@ pub fn term_matches(
             name,
             namespace,
             element_key,
+            ..
         } => {
             if let (Some(map), Some(key)) = (substitution_groups, element_key) {
                 if let Some(names) = map.get(key) {

@@ -331,6 +331,7 @@ pub fn term_matches_with_substitution(
             name,
             namespace,
             element_key,
+            ..
         } => {
             if let (Some(map), Some(key)) = (substitution_groups, element_key) {
                 if let Some(names) = map.get(key) {

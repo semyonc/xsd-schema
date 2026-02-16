@@ -214,6 +214,8 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_base_type: None,
                     resolved_attribute_groups: Vec::new(),
                     resolved_attributes: Vec::new(),
+                    resolved_content_particle_types: Vec::new(),
+                    resolved_content_particle_elements: Vec::new(),
                 };
                 let key = self.schema_set.arenas.alloc_complex_type(data);
                 let type_key = TypeKey::Complex(key);
@@ -388,6 +390,8 @@ impl<'a> SchemaAssembler<'a> {
                     // Resolved references (populated after reference resolution phase)
                     resolved_ref: None,
                     resolved_particles: Vec::new(),
+                    resolved_particle_types: Vec::new(),
+                    resolved_particle_elements: Vec::new(),
                 };
                 let key = self.schema_set.arenas.alloc_model_group(data);
                 if register {

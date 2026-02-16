@@ -274,9 +274,14 @@ impl Frame for RestrictionFrame {
                 self.open_content = Some(open_content);
             }
             FrameResult::Attribute(attr) => {
+                let use_kind = match attr.use_kind.as_deref() {
+                    Some("required") => AttributeUseKind::Required,
+                    Some("prohibited") => AttributeUseKind::Prohibited,
+                    _ => AttributeUseKind::Optional,
+                };
                 self.attributes.push(AttributeUseResult {
                     attribute: attr,
-                    use_kind: AttributeUseKind::Optional,
+                    use_kind,
                 });
             }
             FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
@@ -439,9 +444,14 @@ impl Frame for ExtensionFrame {
                 self.open_content = Some(open_content);
             }
             FrameResult::Attribute(attr) => {
+                let use_kind = match attr.use_kind.as_deref() {
+                    Some("required") => AttributeUseKind::Required,
+                    Some("prohibited") => AttributeUseKind::Prohibited,
+                    _ => AttributeUseKind::Optional,
+                };
                 self.attributes.push(AttributeUseResult {
                     attribute: attr,
-                    use_kind: AttributeUseKind::Optional,
+                    use_kind,
                 });
             }
             FrameResult::Group(GroupFrameResult::Attribute(ag)) => {
@@ -1207,9 +1217,14 @@ impl Frame for ComplexTypeFrame {
                 });
             }
             FrameResult::Attribute(attr) => {
+                let use_kind = match attr.use_kind.as_deref() {
+                    Some("required") => AttributeUseKind::Required,
+                    Some("prohibited") => AttributeUseKind::Prohibited,
+                    _ => AttributeUseKind::Optional,
+                };
                 self.attributes.push(AttributeUseResult {
                     attribute: attr,
-                    use_kind: AttributeUseKind::Optional,
+                    use_kind,
                 });
             }
             FrameResult::Group(GroupFrameResult::Attribute(ag)) => {

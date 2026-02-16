@@ -529,6 +529,38 @@ impl SchemaSet {
 
         false
     }
+
+    /// Compute the effective namespace for a local element declaration per XSD spec.
+    ///
+    /// Rules: explicit targetNamespace > form attribute > elementFormDefault > Unqualified.
+    /// Qualified → document target namespace; Unqualified → None.
+    pub fn effective_local_element_namespace(
+        &self,
+        elem_target_namespace: Option<NameId>,
+        elem_form: Option<&str>,
+        source: Option<&SourceRef>,
+        fallback_namespace: Option<NameId>,
+    ) -> Option<NameId> {
+        if elem_target_namespace.is_some() {
+            return elem_target_namespace;
+        }
+        let doc = source.and_then(|s| self.documents.get(s.doc_id as usize));
+        let default_form = doc
+            .map(|d| d.element_form_default)
+            .unwrap_or(FormChoice::Unqualified);
+        let target_namespace = doc
+            .map(|d| d.target_namespace)
+            .unwrap_or(fallback_namespace);
+        let form = match elem_form {
+            Some("qualified") => FormChoice::Qualified,
+            Some("unqualified") => FormChoice::Unqualified,
+            _ => default_form,
+        };
+        match form {
+            FormChoice::Qualified => target_namespace,
+            FormChoice::Unqualified => None,
+        }
+    }
 }
 
 impl Default for SchemaSet {
@@ -951,6 +983,8 @@ mod tests {
             resolved_base_type: None,
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
+            resolved_content_particle_types: Vec::new(),
+            resolved_content_particle_elements: Vec::new(),
         });
 
         assert!(set.is_type_derived_from(

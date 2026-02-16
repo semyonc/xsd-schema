@@ -695,6 +695,12 @@ fn resolve_model_group_references(
     // Clone references we need to resolve
     let ref_name = group.ref_name.clone();
     let source = group.source.clone();
+    let particles_clone = group.particles.clone();
+
+    // Read existing resolved_particles BEFORE building new ones,
+    // so we can preserve inline-resolved types from Phase 3.
+    let existing_resolved: Vec<_> = group.resolved_particles.clone();
+    let existing_particle_types = group.resolved_particle_types.clone();
 
     // Extract particle info for resolution
     let particle_info: Vec<_> = group.particles.iter().map(|p| {
@@ -729,11 +735,20 @@ fn resolve_model_group_references(
 
     // Resolve particle references
     let mut resolved_particles = Vec::with_capacity(particle_info.len());
-    for (kind, elem_or_group_ref, type_qname, particle_source) in &particle_info {
+    for (i, (kind, elem_or_group_ref, type_qname, particle_source)) in particle_info.iter().enumerate() {
         match kind {
             0 => {
-                // Element particle
-                let resolved_type = if let Some(ref qname) = type_qname {
+                // Element particle — preserve inline-resolved type from Phase 3
+                let already_resolved_type = existing_resolved.get(i).and_then(|rp| {
+                    if let ResolvedParticleTerm::Element { resolved_type: Some(key), .. } = rp {
+                        Some(*key)
+                    } else {
+                        None
+                    }
+                });
+                let resolved_type = if let Some(key) = already_resolved_type {
+                    Some(key)
+                } else if let Some(ref qname) = type_qname {
                     let type_key = resolver.resolve_type_ref(qname, particle_source.as_ref())?;
                     stats.types_resolved += 1;
                     Some(type_key)
@@ -772,12 +787,78 @@ fn resolve_model_group_references(
         }
     }
 
+    // Build flat-indexed resolved_particle_types (including nested inline groups)
+    let mut resolved_particle_types = Vec::new();
+    let mut flat_idx = 0;
+    resolve_model_group_particle_types_recursive(
+        &particles_clone,
+        &existing_particle_types,
+        &resolver,
+        &mut flat_idx,
+        &mut resolved_particle_types,
+        stats,
+    )?;
+
     // Store resolved references back
     if let Some(group) = schema_set.arenas.model_groups.get_mut(key) {
         group.resolved_ref = resolved_ref;
         group.resolved_particles = resolved_particles;
+        group.resolved_particle_types = resolved_particle_types;
     }
 
+    Ok(())
+}
+
+/// Recursive helper: resolve types for model group particles in depth-first order
+fn resolve_model_group_particle_types_recursive(
+    particles: &[crate::parser::frames::ParticleResult],
+    existing_types: &[Option<TypeKey>],
+    resolver: &ReferenceResolver,
+    flat_idx: &mut usize,
+    resolved_types: &mut Vec<Option<TypeKey>>,
+    stats: &mut ResolutionStats,
+) -> SchemaResult<()> {
+    use crate::parser::frames::ParticleTerm;
+
+    for particle in particles {
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                let idx = *flat_idx;
+                *flat_idx += 1;
+                // Preserve inline-resolved type from Phase 3
+                let already_resolved = existing_types.get(idx).copied().flatten();
+                let resolved_type = if let Some(key) = already_resolved {
+                    Some(key)
+                } else {
+                    // Try QName resolution
+                    match &elem.type_ref {
+                        Some(TypeRefResult::QName(qname)) => {
+                            let type_key =
+                                resolver.resolve_type_ref(qname, particle.source.as_ref())?;
+                            stats.types_resolved += 1;
+                            Some(type_key)
+                        }
+                        _ => None,
+                    }
+                };
+                while resolved_types.len() <= idx {
+                    resolved_types.push(None);
+                }
+                resolved_types[idx] = resolved_type;
+            }
+            ParticleTerm::Group(group_def) if group_def.ref_name.is_none() => {
+                resolve_model_group_particle_types_recursive(
+                    &group_def.particles,
+                    existing_types,
+                    resolver,
+                    flat_idx,
+                    resolved_types,
+                    stats,
+                )?;
+            }
+            _ => {} // Skip group refs and wildcards
+        }
+    }
     Ok(())
 }
 
@@ -1199,5 +1280,90 @@ mod tests {
         let elem = schema_set.arenas.elements.get(elem_key).unwrap();
         assert!(elem.resolved_type.is_some());
         assert_eq!(elem.resolved_type, Some(TypeKey::Simple(string_key)));
+    }
+
+    #[test]
+    fn test_resolver_preserves_inline_resolved_type_in_model_group() {
+        use crate::arenas::{ModelGroupData, ResolvedParticleTerm};
+        use crate::parser::frames::{Compositor, ElementFrameResult, ParticleResult, ParticleTerm};
+        use crate::schema::model::DerivationSet;
+
+        let mut schema_set = SchemaSet::new();
+
+        let elem_name = schema_set.name_table.add("detail");
+        let group_name = schema_set.name_table.add("myGroup");
+
+        // Pre-resolved type (as if from inline type assembly)
+        let string_key = schema_set.builtin_types().string;
+
+        // Create a model group with one element particle
+        let group_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Element(ElementFrameResult {
+                    name: Some(elem_name),
+                    ref_name: None,
+                    target_namespace: None,
+                    type_ref: None, // No QName type ref
+                    inline_type: None,
+                    substitution_group: vec![],
+                    default_value: None,
+                    fixed_value: None,
+                    nillable: false,
+                    is_abstract: false,
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    block: DerivationSet::empty(),
+                    final_derivation: DerivationSet::empty(),
+                    form: None,
+                    id: None,
+                    alternatives: vec![],
+                    identity_constraints: vec![],
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            // Pre-populate with inline-resolved type
+            resolved_particles: vec![ResolvedParticleTerm::Element {
+                resolved_type: Some(TypeKey::Simple(string_key)),
+                resolved_ref: None,
+            }],
+            resolved_particle_types: vec![Some(TypeKey::Simple(string_key))],
+            resolved_particle_elements: Vec::new(),
+        };
+
+        let group_key = schema_set.arenas.alloc_model_group(group_data);
+
+        // Resolve references - should preserve the pre-resolved type
+        let result = resolve_all_references(&mut schema_set);
+        assert!(result.is_ok());
+
+        // Verify the pre-resolved type was preserved
+        let group = schema_set.arenas.model_groups.get(group_key).unwrap();
+        assert_eq!(group.resolved_particles.len(), 1);
+        match &group.resolved_particles[0] {
+            ResolvedParticleTerm::Element {
+                resolved_type: Some(TypeKey::Simple(key)),
+                ..
+            } => {
+                assert_eq!(*key, string_key, "Inline-resolved type should be preserved");
+            }
+            other => panic!(
+                "Expected Element with pre-resolved type, got {:?}",
+                other
+            ),
+        }
     }
 }

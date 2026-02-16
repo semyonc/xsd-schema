@@ -23,12 +23,13 @@
 //!    arena and update the owner's resolved_* field with the TypeKey.
 
 use crate::arenas::{
-    ComplexTypeDefData, ResolvedAttributeUse, ResolvedParticleTerm, SimpleTypeDefData,
+    ComplexTypeDefData, ElementDeclData, ResolvedAttributeUse, SimpleTypeDefData,
 };
 use crate::error::SchemaResult;
 use crate::ids::*;
 use crate::parser::frames::{
-    ComplexContentResult, ParticleTerm, TypeFrameResult, TypeRefResult,
+    ComplexContentResult, ElementFrameResult, ParticleResult, ParticleTerm, TypeFrameResult,
+    TypeRefResult,
 };
 use crate::schema::SchemaSet;
 
@@ -74,6 +75,8 @@ enum InlineRole {
     ModelGroupParticle(usize),
     /// Attribute use inline type in attribute group (attributes[index])
     AttributeGroupAttribute(usize),
+    /// Inline type on element at index in content particle's model group
+    ContentParticleType(usize),
 }
 
 /// Owner of an inline type
@@ -221,22 +224,17 @@ fn collect_inline_type_jobs(schema_set: &SchemaSet) -> Vec<InlineTypeJob> {
         collect_content_inline_types(&complex.content, key, target_ns, &mut jobs);
     }
 
-    // Scan model groups
+    // Scan model groups (recursively, including nested inline groups)
     for (key, group) in schema_set.arenas.model_groups.iter() {
         let target_ns = group.target_namespace;
-
-        for (idx, particle) in group.particles.iter().enumerate() {
-            if let ParticleTerm::Element(elem) = &particle.term {
-                if let Some(inline_type) = &elem.inline_type {
-                    jobs.push(InlineTypeJob {
-                        owner: InlineOwner::ModelGroup(key),
-                        role: InlineRole::ModelGroupParticle(idx),
-                        type_frame: (**inline_type).clone(),
-                        target_namespace: target_ns,
-                    });
-                }
-            }
-        }
+        let mut flat_idx = 0;
+        collect_model_group_inline_types_recursive(
+            &group.particles,
+            key,
+            target_ns,
+            &mut flat_idx,
+            &mut jobs,
+        );
     }
 
     // Scan attribute groups
@@ -288,6 +286,11 @@ fn collect_content_inline_types(
                     });
                 }
             }
+
+            // Scan content particle for inline types on element children
+            if let Some(particle) = &complex_content.particle {
+                collect_particle_inline_types(particle, owner_key, target_ns, jobs);
+            }
         }
         ComplexContentResult::Simple(simple_content) => {
             // Check base type inline
@@ -313,6 +316,372 @@ fn collect_content_inline_types(
             }
         }
         ComplexContentResult::Empty => {}
+    }
+}
+
+/// Collect inline types from a content particle's model group elements (recursive)
+fn collect_particle_inline_types(
+    particle: &ParticleResult,
+    owner_key: ComplexTypeKey,
+    target_ns: Option<NameId>,
+    jobs: &mut Vec<InlineTypeJob>,
+) {
+    if let ParticleTerm::Group(group_def) = &particle.term {
+        let mut flat_idx = 0;
+        collect_group_elements_recursive(
+            &group_def.particles,
+            owner_key,
+            target_ns,
+            &mut flat_idx,
+            jobs,
+        );
+    }
+}
+
+/// Recursive helper: walk particles in depth-first order, assigning flat element indices
+fn collect_group_elements_recursive(
+    particles: &[ParticleResult],
+    owner_key: ComplexTypeKey,
+    target_ns: Option<NameId>,
+    flat_idx: &mut usize,
+    jobs: &mut Vec<InlineTypeJob>,
+) {
+    for particle in particles {
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                if let Some(inline_type) = &elem.inline_type {
+                    jobs.push(InlineTypeJob {
+                        owner: InlineOwner::ComplexType(owner_key),
+                        role: InlineRole::ContentParticleType(*flat_idx),
+                        type_frame: (**inline_type).clone(),
+                        target_namespace: target_ns,
+                    });
+                }
+                *flat_idx += 1;
+            }
+            ParticleTerm::Group(group_def) if group_def.ref_name.is_none() => {
+                // Inline group (no ref) - recurse into its particles
+                collect_group_elements_recursive(
+                    &group_def.particles,
+                    owner_key,
+                    target_ns,
+                    flat_idx,
+                    jobs,
+                );
+            }
+            _ => {} // Skip group refs and wildcards
+        }
+    }
+}
+
+/// Recursive helper: walk model group particles in depth-first order, collecting inline types
+/// with flat element indices (mirroring collect_group_elements_recursive for complex types)
+fn collect_model_group_inline_types_recursive(
+    particles: &[ParticleResult],
+    owner_key: ModelGroupKey,
+    target_ns: Option<NameId>,
+    flat_idx: &mut usize,
+    jobs: &mut Vec<InlineTypeJob>,
+) {
+    for particle in particles {
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                if let Some(inline_type) = &elem.inline_type {
+                    jobs.push(InlineTypeJob {
+                        owner: InlineOwner::ModelGroup(owner_key),
+                        role: InlineRole::ModelGroupParticle(*flat_idx),
+                        type_frame: (**inline_type).clone(),
+                        target_namespace: target_ns,
+                    });
+                }
+                *flat_idx += 1;
+            }
+            ParticleTerm::Group(group_def) if group_def.ref_name.is_none() => {
+                // Inline group (no ref) - recurse into its particles
+                collect_model_group_inline_types_recursive(
+                    &group_def.particles,
+                    owner_key,
+                    target_ns,
+                    flat_idx,
+                    jobs,
+                );
+            }
+            _ => {} // Skip group refs and wildcards
+        }
+    }
+}
+
+/// Allocation job for a local element in a content particle
+struct ContentParticleElementJob {
+    complex_type_key: ComplexTypeKey,
+    flat_idx: usize,
+    elem: ElementFrameResult,
+    target_namespace: Option<NameId>,
+}
+
+/// Walk content particles recursively and collect local element allocation jobs
+fn collect_content_particle_elements_recursive(
+    particles: &[ParticleResult],
+    complex_type_key: ComplexTypeKey,
+    target_ns: Option<NameId>,
+    flat_idx: &mut usize,
+    jobs: &mut Vec<ContentParticleElementJob>,
+) {
+    for particle in particles {
+        match &particle.term {
+            ParticleTerm::Element(elem) if elem.ref_name.is_none() => {
+                jobs.push(ContentParticleElementJob {
+                    complex_type_key,
+                    flat_idx: *flat_idx,
+                    elem: elem.clone(),
+                    target_namespace: target_ns,
+                });
+                *flat_idx += 1;
+            }
+            ParticleTerm::Element(_) => {
+                // Ref element - skip allocation but still increment counter
+                *flat_idx += 1;
+            }
+            ParticleTerm::Group(group_def) if group_def.ref_name.is_none() => {
+                collect_content_particle_elements_recursive(
+                    &group_def.particles,
+                    complex_type_key,
+                    target_ns,
+                    flat_idx,
+                    jobs,
+                );
+            }
+            _ => {} // Skip group refs and wildcards
+        }
+    }
+}
+
+/// Allocate arena element declarations for local elements in content particles.
+///
+/// This enables the validator to look up nillable, fixed_value, default_value
+/// and other properties for local elements via their ElementKey.
+///
+/// Must be called after inline type assembly and reference resolution.
+pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
+    // Collection pass: walk all complex types and collect jobs
+    let mut jobs = Vec::new();
+    for (key, complex) in schema_set.arenas.complex_types.iter() {
+        let target_ns = complex.target_namespace;
+        if let ComplexContentResult::Complex(def) = &complex.content {
+            if let Some(particle) = &def.particle {
+                if let ParticleTerm::Group(group_def) = &particle.term {
+                    let mut flat_idx = 0;
+                    collect_content_particle_elements_recursive(
+                        &group_def.particles,
+                        key,
+                        target_ns,
+                        &mut flat_idx,
+                        &mut jobs,
+                    );
+                }
+            }
+        }
+    }
+
+    // Allocation pass: create element declarations and store keys
+    for job in jobs {
+        let resolved_type = schema_set
+            .arenas
+            .complex_types
+            .get(job.complex_type_key)
+            .and_then(|ct| {
+                ct.resolved_content_particle_types
+                    .get(job.flat_idx)
+                    .copied()
+                    .flatten()
+            })
+            .or_else(|| {
+                // Try QName resolution
+                match &job.elem.type_ref {
+                    Some(TypeRefResult::QName(qname)) => schema_set
+                        .lookup_type(qname.namespace, qname.local_name)
+                        .or_else(|| {
+                            schema_set
+                                .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                        }),
+                    _ => None,
+                }
+            });
+
+        let effective_ns = schema_set.effective_local_element_namespace(
+            job.elem.target_namespace,
+            job.elem.form.as_deref(),
+            job.elem.source.as_ref(),
+            job.target_namespace,
+        );
+        let elem_data = ElementDeclData {
+            name: job.elem.name,
+            target_namespace: effective_ns,
+            ref_name: None,
+            type_ref: job.elem.type_ref.clone(),
+            inline_type: job.elem.inline_type.clone(),
+            substitution_group: Vec::new(),
+            default_value: job.elem.default_value.clone(),
+            fixed_value: job.elem.fixed_value.clone(),
+            nillable: job.elem.nillable,
+            is_abstract: job.elem.is_abstract,
+            min_occurs: job.elem.min_occurs,
+            max_occurs: job.elem.max_occurs,
+            block: job.elem.block,
+            final_derivation: job.elem.final_derivation,
+            form: job.elem.form.clone(),
+            id: job.elem.id.clone(),
+            alternatives: job.elem.alternatives.clone(),
+            identity_constraints: job.elem.identity_constraints.clone(),
+            annotation: job.elem.annotation.clone(),
+            source: job.elem.source.clone(),
+            resolved_type,
+            resolved_ref: None,
+            resolved_substitution_groups: Vec::new(),
+        };
+
+        let elem_key = schema_set.arenas.alloc_element(elem_data);
+
+        if let Some(ct) = schema_set.arenas.complex_types.get_mut(job.complex_type_key) {
+            while ct.resolved_content_particle_elements.len() <= job.flat_idx {
+                ct.resolved_content_particle_elements.push(None);
+            }
+            ct.resolved_content_particle_elements[job.flat_idx] = Some(elem_key);
+        }
+    }
+}
+
+/// Allocation job for a local element in a named model group particle
+struct ModelGroupElementJob {
+    group_key: ModelGroupKey,
+    particle_idx: usize,
+    elem: ElementFrameResult,
+    target_namespace: Option<NameId>,
+}
+
+/// Allocate arena element declarations for local elements in named model group particles.
+///
+/// This enables the validator to look up nillable, fixed_value, default_value
+/// and other properties for local elements inside named groups via their ElementKey.
+///
+/// Must be called after inline type assembly and reference resolution.
+pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
+    // Collection pass: walk all model groups recursively and collect jobs
+    let mut jobs = Vec::new();
+    for (key, group) in schema_set.arenas.model_groups.iter() {
+        let target_ns = group.target_namespace;
+        let mut flat_idx = 0;
+        collect_model_group_elements_recursive(
+            &group.particles,
+            key,
+            target_ns,
+            &mut flat_idx,
+            &mut jobs,
+        );
+    }
+
+    // Allocation pass: create element declarations and store keys
+    for job in jobs {
+        let resolved_type = schema_set
+            .arenas
+            .model_groups
+            .get(job.group_key)
+            .and_then(|g| {
+                g.resolved_particle_types
+                    .get(job.particle_idx)
+                    .copied()
+                    .flatten()
+            })
+            .or_else(|| {
+                // Try QName resolution
+                match &job.elem.type_ref {
+                    Some(TypeRefResult::QName(qname)) => schema_set
+                        .lookup_type(qname.namespace, qname.local_name)
+                        .or_else(|| {
+                            schema_set
+                                .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                        }),
+                    _ => None,
+                }
+            });
+
+        let effective_ns = schema_set.effective_local_element_namespace(
+            job.elem.target_namespace,
+            job.elem.form.as_deref(),
+            job.elem.source.as_ref(),
+            job.target_namespace,
+        );
+        let elem_data = ElementDeclData {
+            name: job.elem.name,
+            target_namespace: effective_ns,
+            ref_name: None,
+            type_ref: job.elem.type_ref.clone(),
+            inline_type: job.elem.inline_type.clone(),
+            substitution_group: Vec::new(),
+            default_value: job.elem.default_value.clone(),
+            fixed_value: job.elem.fixed_value.clone(),
+            nillable: job.elem.nillable,
+            is_abstract: job.elem.is_abstract,
+            min_occurs: job.elem.min_occurs,
+            max_occurs: job.elem.max_occurs,
+            block: job.elem.block,
+            final_derivation: job.elem.final_derivation,
+            form: job.elem.form.clone(),
+            id: job.elem.id.clone(),
+            alternatives: job.elem.alternatives.clone(),
+            identity_constraints: job.elem.identity_constraints.clone(),
+            annotation: job.elem.annotation.clone(),
+            source: job.elem.source.clone(),
+            resolved_type,
+            resolved_ref: None,
+            resolved_substitution_groups: Vec::new(),
+        };
+
+        let elem_key = schema_set.arenas.alloc_element(elem_data);
+
+        if let Some(group) = schema_set.arenas.model_groups.get_mut(job.group_key) {
+            while group.resolved_particle_elements.len() <= job.particle_idx {
+                group.resolved_particle_elements.push(None);
+            }
+            group.resolved_particle_elements[job.particle_idx] = Some(elem_key);
+        }
+    }
+}
+
+/// Walk model group particles recursively and collect local element allocation jobs
+fn collect_model_group_elements_recursive(
+    particles: &[ParticleResult],
+    group_key: ModelGroupKey,
+    target_ns: Option<NameId>,
+    flat_idx: &mut usize,
+    jobs: &mut Vec<ModelGroupElementJob>,
+) {
+    for particle in particles {
+        match &particle.term {
+            ParticleTerm::Element(elem) if elem.ref_name.is_none() => {
+                jobs.push(ModelGroupElementJob {
+                    group_key,
+                    particle_idx: *flat_idx,
+                    elem: elem.clone(),
+                    target_namespace: target_ns,
+                });
+                *flat_idx += 1;
+            }
+            ParticleTerm::Element(_) => {
+                // Ref element - skip allocation but still increment counter
+                *flat_idx += 1;
+            }
+            ParticleTerm::Group(group_def) if group_def.ref_name.is_none() => {
+                collect_model_group_elements_recursive(
+                    &group_def.particles,
+                    group_key,
+                    target_ns,
+                    flat_idx,
+                    jobs,
+                );
+            }
+            _ => {} // Skip group refs and wildcards
+        }
     }
 }
 
@@ -375,6 +744,8 @@ fn assemble_inline_type(
                 resolved_base_type: None,
                 resolved_attribute_groups: Vec::new(),
                 resolved_attributes: Vec::new(),
+                resolved_content_particle_types: Vec::new(),
+                resolved_content_particle_elements: Vec::new(),
             };
             let key = schema_set.arenas.alloc_complex_type(data);
             Ok(TypeKey::Complex(key))
@@ -447,6 +818,13 @@ fn update_owner(
                         complex.resolved_attributes[idx].resolved_type = Some(type_key);
                         stats.complex_type_attribute_inline_types += 1;
                     }
+                    InlineRole::ContentParticleType(idx) => {
+                        while complex.resolved_content_particle_types.len() <= idx {
+                            complex.resolved_content_particle_types.push(None);
+                        }
+                        complex.resolved_content_particle_types[idx] = Some(type_key);
+                        stats.complex_type_inline_derivations += 1;
+                    }
                     _ => {}
                 }
                 stats.total_inline_types += 1;
@@ -454,15 +832,12 @@ fn update_owner(
         }
         InlineOwner::ModelGroup(key) => {
             if let Some(group) = schema_set.arenas.model_groups.get_mut(key) {
-                if let InlineRole::ModelGroupParticle(idx) = job.role {
-                    // Ensure resolved_particles vec is large enough
-                    while group.resolved_particles.len() <= idx {
-                        group.resolved_particles.push(ResolvedParticleTerm::Any);
+                if let InlineRole::ModelGroupParticle(flat_idx) = job.role {
+                    // Store in flat-indexed resolved_particle_types
+                    while group.resolved_particle_types.len() <= flat_idx {
+                        group.resolved_particle_types.push(None);
                     }
-                    group.resolved_particles[idx] = ResolvedParticleTerm::Element {
-                        resolved_type: Some(type_key),
-                        resolved_ref: None,
-                    };
+                    group.resolved_particle_types[flat_idx] = Some(type_key);
                     stats.model_group_inline_types += 1;
                     stats.total_inline_types += 1;
                 }
@@ -759,5 +1134,282 @@ mod tests {
         // Verify resolved_member_types has both members
         let simple = schema_set.arenas.simple_types.get(type_key).unwrap();
         assert_eq!(simple.resolved_member_types.len(), 2);
+    }
+
+    #[test]
+    fn test_inline_type_in_model_group_resolved() {
+        use crate::arenas::ModelGroupData;
+        use crate::parser::frames::{Compositor, ElementFrameResult};
+
+        let mut schema_set = SchemaSet::new();
+
+        let elem_name = schema_set.name_table.add("detail");
+        let inline_type = Box::new(create_simple_type_frame(SimpleTypeVariety::Atomic));
+
+        // Create a named model group with an element that has an inline type
+        let group_data = ModelGroupData {
+            name: Some(schema_set.name_table.add("myGroup")),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Element(ElementFrameResult {
+                    name: Some(elem_name),
+                    ref_name: None,
+                    target_namespace: None,
+                    type_ref: None,
+                    inline_type: Some(inline_type),
+                    substitution_group: vec![],
+                    default_value: None,
+                    fixed_value: None,
+                    nillable: false,
+                    is_abstract: false,
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    block: Default::default(),
+                    final_derivation: Default::default(),
+                    form: None,
+                    id: None,
+                    alternatives: vec![],
+                    identity_constraints: vec![],
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+        };
+
+        let _group_key = schema_set.arenas.alloc_model_group(group_data);
+
+        let result = assemble_inline_types(&mut schema_set);
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert_eq!(stats.model_group_inline_types, 1);
+        assert_eq!(stats.total_inline_types, 1);
+
+        // Verify resolved_particle_types has the type set
+        let group = schema_set.arenas.model_groups.get(_group_key).unwrap();
+        assert_eq!(group.resolved_particle_types.len(), 1);
+        assert!(
+            group.resolved_particle_types[0].is_some(),
+            "Expected resolved type at flat index 0"
+        );
+    }
+
+    #[test]
+    fn test_inline_type_in_content_particle_resolved() {
+        use crate::parser::frames::{
+            Compositor, ComplexContentDefResult, ElementFrameResult, ModelGroupDefResult,
+        };
+
+        let mut schema_set = SchemaSet::new();
+
+        let elem_name = schema_set.name_table.add("child");
+        let inline_type = Box::new(create_simple_type_frame(SimpleTypeVariety::Atomic));
+
+        // Create a complex type with a content particle containing an element with inline type
+        let content_particle = ParticleResult {
+            term: ParticleTerm::Group(ModelGroupDefResult {
+                name: None,
+                ref_name: None,
+                compositor: Some(Compositor::Sequence),
+                particles: vec![ParticleResult {
+                    term: ParticleTerm::Element(ElementFrameResult {
+                        name: Some(elem_name),
+                        ref_name: None,
+                        target_namespace: None,
+                        type_ref: None,
+                        inline_type: Some(inline_type),
+                        substitution_group: vec![],
+                        default_value: None,
+                        fixed_value: None,
+                        nillable: false,
+                        is_abstract: false,
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        block: Default::default(),
+                        final_derivation: Default::default(),
+                        form: None,
+                        id: None,
+                        alternatives: vec![],
+                        identity_constraints: vec![],
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    source: None,
+                }],
+                min_occurs: 1,
+                max_occurs: Some(1),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        };
+
+        let complex_data = ComplexTypeDefData {
+            name: Some(schema_set.name_table.add("MyComplexType")),
+            target_namespace: None,
+            base_type: None,
+            derivation_method: None,
+            content: ComplexContentResult::Complex(ComplexContentDefResult {
+                particle: Some(content_particle),
+                derivation: crate::parser::frames::DerivationMethod::Restriction,
+                mixed: false,
+                base_type: None,
+                open_content: None,
+                attributes: Vec::new(),
+                attribute_groups: Vec::new(),
+                attribute_wildcard: None,
+                assertions: Vec::new(),
+                id: None,
+                derivation_id: None,
+                source: None,
+            }),
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            mixed: false,
+            is_abstract: false,
+            final_derivation: DerivationSet::empty(),
+            block: DerivationSet::empty(),
+            default_attributes_apply: true,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_base_type: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            resolved_content_particle_types: Vec::new(),
+            resolved_content_particle_elements: Vec::new(),
+        };
+
+        let ct_key = schema_set.arenas.alloc_complex_type(complex_data);
+
+        let result = assemble_inline_types(&mut schema_set);
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert!(stats.total_inline_types >= 1);
+
+        // Verify resolved_content_particle_types has the type set
+        let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
+        assert_eq!(ct.resolved_content_particle_types.len(), 1);
+        assert!(ct.resolved_content_particle_types[0].is_some());
+    }
+
+    #[test]
+    fn test_nested_inline_type_in_model_group() {
+        use crate::arenas::ModelGroupData;
+        use crate::parser::frames::{Compositor, ElementFrameResult, ModelGroupDefResult};
+
+        let mut schema_set = SchemaSet::new();
+
+        let elem_name = schema_set.name_table.add("nested_elem");
+        let inline_type = Box::new(create_simple_type_frame(SimpleTypeVariety::Atomic));
+
+        // Create a named model group:
+        //   <xs:group name="G">
+        //     <xs:sequence>
+        //       <xs:choice>
+        //         <xs:element name="nested_elem">
+        //           <xs:simpleType>...</xs:simpleType>
+        //         </xs:element>
+        //       </xs:choice>
+        //     </xs:sequence>
+        //   </xs:group>
+        let group_data = ModelGroupData {
+            name: Some(schema_set.name_table.add("G")),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Group(ModelGroupDefResult {
+                    name: None,
+                    ref_name: None,
+                    compositor: Some(Compositor::Choice),
+                    particles: vec![ParticleResult {
+                        term: ParticleTerm::Element(ElementFrameResult {
+                            name: Some(elem_name),
+                            ref_name: None,
+                            target_namespace: None,
+                            type_ref: None,
+                            inline_type: Some(inline_type),
+                            substitution_group: vec![],
+                            default_value: None,
+                            fixed_value: None,
+                            nillable: false,
+                            is_abstract: false,
+                            min_occurs: 1,
+                            max_occurs: Some(1),
+                            block: Default::default(),
+                            final_derivation: Default::default(),
+                            form: None,
+                            id: None,
+                            alternatives: vec![],
+                            identity_constraints: vec![],
+                            annotation: None,
+                            source: None,
+                        }),
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        source: None,
+                    }],
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    id: None,
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+        };
+
+        let group_key = schema_set.arenas.alloc_model_group(group_data);
+
+        // Run inline assembly
+        let result = assemble_inline_types(&mut schema_set);
+        assert!(result.is_ok());
+        let stats = result.unwrap();
+        assert_eq!(stats.model_group_inline_types, 1);
+        assert_eq!(stats.total_inline_types, 1);
+
+        // Verify resolved_particle_types has the type at flat index 0
+        let group = schema_set.arenas.model_groups.get(group_key).unwrap();
+        assert_eq!(group.resolved_particle_types.len(), 1);
+        assert!(
+            group.resolved_particle_types[0].is_some(),
+            "Expected resolved type for nested element at flat index 0"
+        );
+        assert!(matches!(
+            group.resolved_particle_types[0],
+            Some(TypeKey::Simple(_))
+        ));
     }
 }

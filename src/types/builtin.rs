@@ -239,6 +239,8 @@ impl BuiltinTypes {
             resolved_base_type: None,
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
+            resolved_content_particle_types: Vec::new(),
+            resolved_content_particle_elements: Vec::new(),
         });
 
         // Helper to create and register a built-in type

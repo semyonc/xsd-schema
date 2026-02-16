@@ -69,6 +69,7 @@ pub use resolver::{
 
 // Re-exports from inline
 pub use inline::{
+    allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, InlineAssemblyStats,
 };
 

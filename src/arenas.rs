@@ -83,6 +83,10 @@ pub struct ComplexTypeDefData {
     pub resolved_attribute_groups: Vec<AttributeGroupKey>,
     /// Resolved attribute uses (parallel to attributes vec)
     pub resolved_attributes: Vec<ResolvedAttributeUse>,
+    /// Resolved inline types for content particle elements (flat depth-first element order)
+    pub resolved_content_particle_types: Vec<Option<TypeKey>>,
+    /// Resolved element keys for local elements in content particles (flat depth-first element order)
+    pub resolved_content_particle_elements: Vec<Option<ElementKey>>,
 }
 
 /// Placeholder for ElementDecl (defined in schema/decl.rs)
@@ -199,6 +203,10 @@ pub struct ModelGroupData {
     pub resolved_ref: Option<ModelGroupKey>,
     /// Resolved particle terms (parallel to particles vec)
     pub resolved_particles: Vec<ResolvedParticleTerm>,
+    /// Flat depth-first indexed resolved types for all particles (including nested inline groups)
+    pub resolved_particle_types: Vec<Option<TypeKey>>,
+    /// Flat depth-first indexed resolved element keys for all particles (including nested inline groups)
+    pub resolved_particle_elements: Vec<Option<ElementKey>>,
 }
 
 /// Placeholder for Notation (defined in schema/decl.rs)

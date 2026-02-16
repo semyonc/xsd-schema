@@ -182,6 +182,7 @@ fn element_substitutable_names(
             name,
             namespace,
             element_key,
+            ..
         } => {
             if let Some(key) = element_key {
                 if let Some(names) = substitution_sets.get(key) {
