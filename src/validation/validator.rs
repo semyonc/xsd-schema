@@ -314,6 +314,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     is_default: false,
                     is_nil,
                     content_type,
+                    typed_value: None,
                 };
             }
 
@@ -419,6 +420,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             is_default: false,
             is_nil,
             content_type: Some(content_type),
+            typed_value: None,
         }
     }
 
@@ -487,6 +489,9 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 "cvc-complex-type.3",
                 format!("Duplicate attribute '{}'", attr_name),
             );
+            if let Some(s) = self.validation_stack.last_mut() {
+                s.validity = SchemaValidity::Invalid;
+            }
             self.current_state = ValidatorState::Attribute;
             return SchemaInfo::invalid();
         }
@@ -525,21 +530,52 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                                 attr_name, fixed, value
                             ),
                         );
+                        if let Some(s) = self.validation_stack.last_mut() {
+                            s.validity = SchemaValidity::Invalid;
+                        }
                     }
                 }
 
-                // Basic value validation deferred to Task 5.2
+                // Validate attribute value against its simple type
+                let mut member_type = None;
+                let mut typed_value = None;
+                let mut attr_validity = SchemaValidity::Valid;
+                if let Some(type_key) = attr_type {
+                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+                        Ok(result) => {
+                            member_type = result.member_type;
+                            typed_value = Some(result.typed_value);
+                        }
+                        Err(err) => {
+                            let err = match &self.current_location {
+                                Some(loc) => err.with_location(loc.clone()),
+                                None => err,
+                            };
+                            let err = if self.element_path.is_empty() {
+                                err
+                            } else {
+                                err.with_path(self.element_path.clone())
+                            };
+                            self.sink.on_error(err);
+                            attr_validity = SchemaValidity::Invalid;
+                            if let Some(s) = self.validation_stack.last_mut() {
+                                s.validity = SchemaValidity::Invalid;
+                            }
+                        }
+                    }
+                }
 
                 self.current_state = ValidatorState::Attribute;
                 SchemaInfo {
                     element_decl: None,
                     attribute_decl: attr_key,
                     schema_type: attr_type,
-                    member_type: None,
-                    validity: SchemaValidity::Valid,
+                    member_type,
+                    validity: attr_validity,
                     is_default: false,
                     is_nil: false,
                     content_type: None,
+                    typed_value,
                 }
             }
             None => {
@@ -559,6 +595,9 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                         attr_name
                     ),
                 );
+                if let Some(s) = self.validation_stack.last_mut() {
+                    s.validity = SchemaValidity::Invalid;
+                }
                 self.current_state = ValidatorState::Attribute;
                 SchemaInfo::invalid()
             }
@@ -590,7 +629,11 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         // Check required attributes
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
             let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-            self.check_required_attributes(ct_data, &seen_attributes);
+            if self.check_required_attributes(ct_data, &seen_attributes) {
+                if let Some(ev_state) = self.validation_stack.last_mut() {
+                    ev_state.validity = SchemaValidity::Invalid;
+                }
+            }
         }
 
         self.current_state = ValidatorState::EndOfAttributes;
@@ -760,9 +803,47 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         }
 
         // 2. For TextOnly: validate text content against simple type
-        // (Full facet/type validation deferred to Task 5.2)
         if ev_state.content_type == Some(ContentType::TextOnly) && !ev_state.is_nil {
-            // Check fixed/default value on element
+            // Handle default value before validation: if the element has no text
+            // content and has a default, substitute the default value so that
+            // simple-type validation runs against it (not the empty string).
+            if let Some(elem_key) = ev_state.element_decl {
+                let elem_data = &self.schema_set.arenas.elements[elem_key];
+                if !ev_state.has_text && !ev_state.has_element_children {
+                    if let Some(default_value) = &elem_data.default_value {
+                        ev_state.is_default = true;
+                        ev_state.text_content = default_value.clone();
+                    }
+                }
+            }
+
+            if let Some(schema_type) = ev_state.schema_type {
+                match super::simple::validate_simple_type(
+                    &ev_state.text_content,
+                    schema_type,
+                    self.schema_set,
+                ) {
+                    Ok(result) => {
+                        ev_state.member_type = result.member_type;
+                        ev_state.typed_value = Some(result.typed_value);
+                    }
+                    Err(err) => {
+                        let err = match &self.current_location {
+                            Some(loc) => err.with_location(loc.clone()),
+                            None => err,
+                        };
+                        let err = if self.element_path.is_empty() {
+                            err
+                        } else {
+                            err.with_path(self.element_path.clone())
+                        };
+                        self.sink.on_error(err);
+                        ev_state.validity = SchemaValidity::Invalid;
+                    }
+                }
+            }
+
+            // Check fixed value on element
             if let Some(elem_key) = ev_state.element_decl {
                 let elem_data = &self.schema_set.arenas.elements[elem_key];
                 if let Some(fixed) = &elem_data.fixed_value {
@@ -779,13 +860,6 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
-                // Handle default value
-                if !ev_state.has_text
-                    && !ev_state.has_element_children
-                    && elem_data.default_value.is_some()
-                {
-                    ev_state.is_default = true;
-                }
             }
         }
 
@@ -799,11 +873,12 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             element_decl: ev_state.element_decl,
             attribute_decl: None,
             schema_type: ev_state.schema_type,
-            member_type: None,
+            member_type: ev_state.member_type,
             validity,
             is_default: ev_state.is_default,
             is_nil: ev_state.is_nil,
             content_type: ev_state.content_type,
+            typed_value: ev_state.typed_value,
         }
     }
 
@@ -1194,7 +1269,8 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         &mut self,
         ct_data: &ComplexTypeDefData,
         seen: &HashSet<(Option<NameId>, NameId)>,
-    ) {
+    ) -> bool {
+        let mut has_missing = false;
         for attr_use in &ct_data.attributes {
             if attr_use.use_kind != AttributeUseKind::Required {
                 continue;
@@ -1209,8 +1285,10 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     "cvc-complex-type.4",
                     format!("Required attribute '{}' is missing", name_str),
                 );
+                has_missing = true;
             }
         }
+        has_missing
     }
 }
 

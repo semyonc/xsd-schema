@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use crate::ids::{ElementKey, NameId, TypeKey};
+use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
 use super::info::{ContentProcessing, ContentType, SchemaValidity};
@@ -33,6 +34,10 @@ pub struct ElementValidationState {
     pub is_nil: bool,
     /// Whether the element value came from a default declaration
     pub is_default: bool,
+    /// For union types: the actual member type that matched the value
+    pub member_type: Option<TypeKey>,
+    /// The parsed typed value from simple-type validation
+    pub typed_value: Option<XmlValue>,
     /// Current validity status
     pub validity: SchemaValidity,
     /// How to process wildcard-matched content
@@ -59,6 +64,8 @@ impl ElementValidationState {
             content_type: None,
             is_nil: false,
             is_default: false,
+            member_type: None,
+            typed_value: None,
             validity: SchemaValidity::NotKnown,
             process_contents: ContentProcessing::Strict,
             seen_attributes: HashSet::new(),

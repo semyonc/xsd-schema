@@ -839,6 +839,30 @@ impl FacetSet {
         Ok(())
     }
 
+    /// Validate only pattern and enumeration facets on a string value.
+    /// Used for list types where length facets are checked separately as item count.
+    pub fn validate_string_patterns_enums(&self, value: &str) -> FacetResult<()> {
+        let normalized = match &self.whitespace {
+            Some(ws) => normalize_whitespace(value, ws.value),
+            None => value.to_string(),
+        };
+        let check_value = &normalized;
+
+        for pattern in &self.patterns {
+            if !pattern.matches(check_value) {
+                return Err(FacetError::pattern(check_value, &pattern.value));
+            }
+        }
+
+        if let Some(ref enumeration) = self.enumeration {
+            if !enumeration.values.contains(check_value) {
+                return Err(FacetError::enumeration(check_value));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Validate a decimal value against numeric facets
     pub fn validate_decimal(&self, value: &rust_decimal::Decimal) -> FacetResult<()> {
         // Check totalDigits

@@ -6,6 +6,7 @@
 use bitflags::bitflags;
 
 use crate::ids::{AttributeKey, ElementKey, NameId, TypeKey};
+use crate::types::value::XmlValue;
 
 /// Validity status of a validated node
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,6 +92,8 @@ pub struct SchemaInfo {
     pub is_nil: bool,
     /// Content type of the element (Empty, TextOnly, ElementOnly, Mixed)
     pub content_type: Option<ContentType>,
+    /// The parsed typed value from simple-type validation
+    pub typed_value: Option<XmlValue>,
 }
 
 impl SchemaInfo {
@@ -105,6 +108,7 @@ impl SchemaInfo {
             is_default: false,
             is_nil: false,
             content_type: None,
+            typed_value: None,
         }
     }
 
@@ -119,6 +123,7 @@ impl SchemaInfo {
             is_default: false,
             is_nil: false,
             content_type: Some(content_type),
+            typed_value: None,
         }
     }
 
@@ -133,6 +138,7 @@ impl SchemaInfo {
             is_default: false,
             is_nil: false,
             content_type: None,
+            typed_value: None,
         }
     }
 
@@ -197,6 +203,7 @@ mod tests {
         assert!(!info.is_default);
         assert!(!info.is_nil);
         assert!(info.content_type.is_none());
+        assert!(info.typed_value.is_none());
     }
 
     #[test]

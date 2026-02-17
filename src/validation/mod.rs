@@ -7,6 +7,7 @@ pub mod errors;
 pub mod info;
 pub mod content;
 pub mod context;
+pub mod simple;
 pub mod validator;
 
 pub use errors::{
@@ -25,6 +26,8 @@ pub use info::{
 pub use content::{ContentValidatorState, ElementMatchInfo};
 
 pub use context::{ElementValidationState, ValidatorState};
+
+pub use simple::{validate_simple_type, SimpleTypeResult};
 
 pub use validator::{
     ValidationSink, ValidationWarning,
