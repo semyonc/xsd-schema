@@ -6,12 +6,12 @@
 
 use std::collections::HashSet;
 
-use crate::arenas::ComplexTypeDefData;
+use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
-use crate::ids::{NameId, TypeKey, AttributeKey};
+use crate::ids::{AttributeGroupKey, NameId, TypeKey, AttributeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::table::well_known;
-use crate::parser::frames::AttributeUseKind;
+use crate::parser::frames::{AttributeUseKind, AttributeUseResult, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
@@ -90,6 +90,35 @@ impl<'a> ValidationSink for ErrorOnlySink<'a> {
     fn on_warning(&mut self, _warning: ValidationWarning) {
         // Discarded
     }
+}
+
+// ---------------------------------------------------------------------------
+// GroupAttribute — flat representation of an attribute from an attribute group
+// ---------------------------------------------------------------------------
+
+/// An attribute use collected from a resolved attribute group.
+struct GroupAttribute {
+    name: NameId,
+    namespace: Option<NameId>,
+    use_kind: AttributeUseKind,
+    type_key: Option<TypeKey>,
+    attr_key: Option<AttributeKey>,
+    fixed_value: Option<String>,
+    default_value: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// AttributeLookup — three-state result from find_attribute_in_type
+// ---------------------------------------------------------------------------
+
+/// Result of looking up an attribute in a complex type's attribute list.
+enum AttributeLookup {
+    /// Found a matching attribute declaration
+    Found(Option<AttributeKey>, Option<TypeKey>, Option<String>),
+    /// The attribute is explicitly prohibited
+    Prohibited,
+    /// No matching attribute found
+    NotFound,
 }
 
 // ---------------------------------------------------------------------------
@@ -518,7 +547,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         let found = self.find_attribute_in_type(ct_data, local_name, namespace);
 
         match found {
-            Some((attr_key, attr_type, fixed_value)) => {
+            AttributeLookup::Found(attr_key, attr_type, fixed_value) => {
                 // 6. Check fixed value
                 if let Some(fixed) = fixed_value {
                     if value != fixed {
@@ -578,15 +607,43 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     typed_value,
                 }
             }
-            None => {
-                // 4. Check attribute wildcard
-                if ct_data.attribute_wildcard.is_some() {
-                    // Wildcard allows this attribute
-                    self.current_state = ValidatorState::Attribute;
-                    return SchemaInfo::empty();
+            AttributeLookup::Prohibited => {
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-complex-type.3.2.2",
+                    format!("Attribute '{}' is prohibited", attr_name),
+                );
+                if let Some(s) = self.validation_stack.last_mut() {
+                    s.validity = SchemaValidity::Invalid;
+                }
+                self.current_state = ValidatorState::Attribute;
+                SchemaInfo::invalid()
+            }
+            AttributeLookup::NotFound => {
+                // 4. Check attribute wildcard (including from attribute groups)
+                let effective_wildcard = self.find_effective_wildcard(ct_data);
+                if let Some(ref wildcard) = effective_wildcard {
+                    let target_ns = ct_data.target_namespace;
+                    if self.wildcard_allows_namespace(wildcard, namespace, target_ns) {
+                        self.current_state = ValidatorState::Attribute;
+                        return match wildcard.process_contents {
+                            ProcessContents::Skip => SchemaInfo::empty(),
+                            ProcessContents::Strict => {
+                                self.validate_wildcard_attribute_strict(
+                                    local_name, namespace, value,
+                                )
+                            }
+                            ProcessContents::Lax => {
+                                self.validate_wildcard_attribute_lax(
+                                    local_name, namespace, value,
+                                )
+                            }
+                        };
+                    }
+                    // wildcard present but namespace not allowed — fall through to error
                 }
 
-                // Not found and no wildcard
+                // Not found and no matching wildcard
                 let attr_name = self.schema_set.name_table.resolve(local_name);
                 self.report_error(
                     "cvc-complex-type.3.2.2",
@@ -993,9 +1050,8 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             if use_kind == AttributeUseKind::Prohibited {
                 continue;
             }
-            let attr_name = attr_use.attribute.name.unwrap_or(well_known::EMPTY);
-            let attr_ns = attr_use.attribute.target_namespace;
             let resolved = ct_data.resolved_attributes.get(i);
+            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
             let attr_key = resolved.and_then(|r| r.resolved_ref);
 
             result.push(ExpectedAttribute {
@@ -1003,6 +1059,19 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 namespace: attr_ns,
                 attribute_key: attr_key,
                 required: use_kind == AttributeUseKind::Required,
+            });
+        }
+
+        // Include attributes from attribute groups
+        for ga in self.collect_group_attributes(ct_data) {
+            if ga.use_kind == AttributeUseKind::Prohibited {
+                continue;
+            }
+            result.push(ExpectedAttribute {
+                local_name: ga.name,
+                namespace: ga.namespace,
+                attribute_key: ga.attr_key,
+                required: ga.use_kind == AttributeUseKind::Required,
             });
         }
 
@@ -1029,24 +1098,48 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 continue;
             }
 
-            let attr_name = attr_use.attribute.name.unwrap_or(well_known::EMPTY);
-            let attr_ns = attr_use.attribute.target_namespace;
+            let resolved = ct_data.resolved_attributes.get(i);
+            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let attr_key = resolved.and_then(|r| r.resolved_ref);
 
             // Skip if already provided
             if ev_state.seen_attributes.contains(&(attr_ns, attr_name)) {
                 continue;
             }
 
-            // Check for default value — first on the use, then on the decl
-            let default = attr_use.attribute.default_value.as_deref();
+            // Check for default value — first on the use, then on the global decl
+            let default = attr_use.attribute.default_value.as_deref().or_else(|| {
+                attr_key
+                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                    .and_then(|d| d.default_value.as_deref())
+            });
             if let Some(value) = default {
-                let resolved = ct_data.resolved_attributes.get(i);
-                if let Some(attr_key) = resolved.and_then(|r| r.resolved_ref) {
+                if let Some(attr_key) = attr_key {
                     result.push(DefaultAttribute {
                         local_name: attr_name,
                         namespace: attr_ns,
                         attribute_key: attr_key,
                         value: value.to_string(),
+                    });
+                }
+            }
+        }
+
+        // Include defaults from attribute groups
+        for ga in self.collect_group_attributes(ct_data) {
+            if ga.use_kind == AttributeUseKind::Prohibited {
+                continue;
+            }
+            if ev_state.seen_attributes.contains(&(ga.namespace, ga.name)) {
+                continue;
+            }
+            if let Some(value) = ga.default_value {
+                if let Some(attr_key) = ga.attr_key {
+                    result.push(DefaultAttribute {
+                        local_name: ga.name,
+                        namespace: ga.namespace,
+                        attribute_key: attr_key,
+                        value,
                     });
                 }
             }
@@ -1225,25 +1318,332 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         }
     }
 
-    /// Find an attribute declaration in a complex type's attribute list
+    /// Validate an attribute matched by a wildcard with processContents="strict".
     ///
-    /// Returns (attribute_key, type_key, fixed_value) if found.
+    /// A global attribute declaration must exist; its value is validated against
+    /// the declared type.
+    fn validate_wildcard_attribute_strict(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        match self.schema_set.lookup_attribute(namespace, local_name) {
+            Some(attr_key) => {
+                let attr_data = self.schema_set.arenas.attributes.get(attr_key);
+                let attr_type = attr_data.and_then(|d| d.resolved_type);
+                let fixed = attr_data.and_then(|d| d.fixed_value.clone());
+
+                if let Some(fixed_val) = fixed {
+                    if value != fixed_val {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed_val, value
+                            ),
+                        );
+                        if let Some(s) = self.validation_stack.last_mut() {
+                            s.validity = SchemaValidity::Invalid;
+                        }
+                    }
+                }
+
+                let mut member_type = None;
+                let mut typed_value = None;
+                let mut attr_validity = SchemaValidity::Valid;
+                if let Some(type_key) = attr_type {
+                    match super::simple::validate_simple_type(
+                        value,
+                        type_key,
+                        self.schema_set,
+                    ) {
+                        Ok(result) => {
+                            member_type = result.member_type;
+                            typed_value = Some(result.typed_value);
+                        }
+                        Err(err) => {
+                            let err = match &self.current_location {
+                                Some(loc) => err.with_location(loc.clone()),
+                                None => err,
+                            };
+                            let err = if self.element_path.is_empty() {
+                                err
+                            } else {
+                                err.with_path(self.element_path.clone())
+                            };
+                            self.sink.on_error(err);
+                            attr_validity = SchemaValidity::Invalid;
+                            if let Some(s) = self.validation_stack.last_mut() {
+                                s.validity = SchemaValidity::Invalid;
+                            }
+                        }
+                    }
+                }
+
+                SchemaInfo {
+                    element_decl: None,
+                    attribute_decl: Some(attr_key),
+                    schema_type: attr_type,
+                    member_type,
+                    validity: attr_validity,
+                    is_default: false,
+                    is_nil: false,
+                    content_type: None,
+                    typed_value,
+                }
+            }
+            None => {
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-assess-attr.1.2",
+                    format!(
+                        "No global attribute declaration for '{}' (wildcard processContents=\"strict\")",
+                        attr_name
+                    ),
+                );
+                if let Some(s) = self.validation_stack.last_mut() {
+                    s.validity = SchemaValidity::Invalid;
+                }
+                SchemaInfo::invalid()
+            }
+        }
+    }
+
+    /// Validate an attribute matched by a wildcard with processContents="lax".
+    ///
+    /// If a global attribute declaration exists, validate; otherwise skip.
+    fn validate_wildcard_attribute_lax(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        match self.schema_set.lookup_attribute(namespace, local_name) {
+            Some(attr_key) => {
+                // Found a global declaration — validate like strict
+                let attr_data = self.schema_set.arenas.attributes.get(attr_key);
+                let attr_type = attr_data.and_then(|d| d.resolved_type);
+                let fixed = attr_data.and_then(|d| d.fixed_value.clone());
+
+                if let Some(fixed_val) = fixed {
+                    if value != fixed_val {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed_val, value
+                            ),
+                        );
+                        if let Some(s) = self.validation_stack.last_mut() {
+                            s.validity = SchemaValidity::Invalid;
+                        }
+                    }
+                }
+
+                let mut member_type = None;
+                let mut typed_value = None;
+                let mut attr_validity = SchemaValidity::Valid;
+                if let Some(type_key) = attr_type {
+                    match super::simple::validate_simple_type(
+                        value,
+                        type_key,
+                        self.schema_set,
+                    ) {
+                        Ok(result) => {
+                            member_type = result.member_type;
+                            typed_value = Some(result.typed_value);
+                        }
+                        Err(err) => {
+                            let err = match &self.current_location {
+                                Some(loc) => err.with_location(loc.clone()),
+                                None => err,
+                            };
+                            let err = if self.element_path.is_empty() {
+                                err
+                            } else {
+                                err.with_path(self.element_path.clone())
+                            };
+                            self.sink.on_error(err);
+                            attr_validity = SchemaValidity::Invalid;
+                            if let Some(s) = self.validation_stack.last_mut() {
+                                s.validity = SchemaValidity::Invalid;
+                            }
+                        }
+                    }
+                }
+
+                SchemaInfo {
+                    element_decl: None,
+                    attribute_decl: Some(attr_key),
+                    schema_type: attr_type,
+                    member_type,
+                    validity: attr_validity,
+                    is_default: false,
+                    is_nil: false,
+                    content_type: None,
+                    typed_value,
+                }
+            }
+            None => {
+                // No global declaration — lax means skip
+                SchemaInfo::empty()
+            }
+        }
+    }
+
+    /// Check whether a wildcard allows a given namespace.
+    fn wildcard_allows_namespace(
+        &self,
+        wildcard: &WildcardResult,
+        namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+    ) -> bool {
+        match &wildcard.namespace {
+            WildcardNamespace::Any => true,
+            WildcardNamespace::Other => namespace != target_namespace,
+            WildcardNamespace::TargetNamespace => namespace == target_namespace,
+            WildcardNamespace::Local => namespace.is_none(),
+            WildcardNamespace::List(ns_list) => ns_list.contains(&namespace),
+        }
+    }
+
+    /// Collect all attribute uses from resolved attribute groups (recursively).
+    fn collect_group_attributes(
+        &self,
+        ct_data: &ComplexTypeDefData,
+    ) -> Vec<GroupAttribute> {
+        let mut result = Vec::new();
+        let mut visited = HashSet::new();
+        for &group_key in &ct_data.resolved_attribute_groups {
+            self.collect_group_attributes_recursive(group_key, &mut result, &mut visited);
+        }
+        result
+    }
+
+    fn collect_group_attributes_recursive(
+        &self,
+        group_key: AttributeGroupKey,
+        result: &mut Vec<GroupAttribute>,
+        visited: &mut HashSet<AttributeGroupKey>,
+    ) {
+        if !visited.insert(group_key) {
+            return; // prevent infinite recursion on circular refs
+        }
+        let group_data = match self.schema_set.arenas.get_attribute_group(group_key) {
+            Some(g) => g,
+            None => return,
+        };
+        for (i, attr_use) in group_data.attributes.iter().enumerate() {
+            let resolved = group_data.resolved_attributes.get(i);
+            let attr_key = resolved.and_then(|r| r.resolved_ref);
+            let attr_type = resolved.and_then(|r| r.resolved_type);
+            let (name, namespace) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
+                attr_key
+                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                    .and_then(|d| d.fixed_value.clone())
+            });
+            let default_value = attr_use.attribute.default_value.clone().or_else(|| {
+                attr_key
+                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                    .and_then(|d| d.default_value.clone())
+            });
+            result.push(GroupAttribute {
+                name,
+                namespace,
+                use_kind: attr_use.use_kind,
+                type_key: attr_type,
+                attr_key,
+                fixed_value,
+                default_value,
+            });
+        }
+        for &nested_key in &group_data.resolved_attribute_groups {
+            self.collect_group_attributes_recursive(nested_key, result, visited);
+        }
+    }
+
+    /// Resolve the effective name and namespace for an attribute use.
+    ///
+    /// For inline attributes, returns the name directly from the use.
+    /// For `<xs:attribute ref="..."/>`, resolves through the global declaration.
+    fn resolve_attr_use_name_ns(
+        &self,
+        attr_use: &AttributeUseResult,
+        resolved: Option<&ResolvedAttributeUse>,
+    ) -> (NameId, Option<NameId>) {
+        if let Some(name) = attr_use.attribute.name {
+            return (name, attr_use.attribute.target_namespace);
+        }
+        if let Some(attr_key) = resolved.and_then(|r| r.resolved_ref) {
+            if let Some(decl) = self.schema_set.arenas.attributes.get(attr_key) {
+                if let Some(name) = decl.name {
+                    return (name, decl.target_namespace);
+                }
+            }
+        }
+        (well_known::EMPTY, None)
+    }
+
+    /// Find the effective attribute wildcard for a complex type.
+    ///
+    /// Checks the type's own `attribute_wildcard` first, then walks
+    /// referenced attribute groups recursively.
+    fn find_effective_wildcard(
+        &self,
+        ct_data: &ComplexTypeDefData,
+    ) -> Option<WildcardResult> {
+        if ct_data.attribute_wildcard.is_some() {
+            return ct_data.attribute_wildcard.clone();
+        }
+        let mut visited = HashSet::new();
+        self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited)
+    }
+
+    fn find_group_wildcard_recursive(
+        &self,
+        group_keys: &[AttributeGroupKey],
+        visited: &mut HashSet<AttributeGroupKey>,
+    ) -> Option<WildcardResult> {
+        for &gk in group_keys {
+            if !visited.insert(gk) {
+                continue;
+            }
+            if let Some(group_data) = self.schema_set.arenas.get_attribute_group(gk) {
+                if let Some(ref wc) = group_data.attribute_wildcard {
+                    return Some(wc.clone());
+                }
+                let result = self.find_group_wildcard_recursive(
+                    &group_data.resolved_attribute_groups,
+                    visited,
+                );
+                if result.is_some() {
+                    return result;
+                }
+            }
+        }
+        None
+    }
+
+    /// Find an attribute declaration in a complex type's attribute list
     fn find_attribute_in_type(
         &self,
         ct_data: &ComplexTypeDefData,
         local_name: NameId,
         namespace: Option<NameId>,
-    ) -> Option<(Option<AttributeKey>, Option<TypeKey>, Option<String>)> {
+    ) -> AttributeLookup {
         for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            let attr_name = attr_use.attribute.name.unwrap_or(well_known::EMPTY);
-            let attr_ns = attr_use.attribute.target_namespace;
+            let resolved = ct_data.resolved_attributes.get(i);
+            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
 
             if attr_name == local_name && attr_ns == namespace {
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
-                    return None; // prohibited means not allowed
+                    return AttributeLookup::Prohibited;
                 }
 
-                let resolved = ct_data.resolved_attributes.get(i);
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
                 let attr_type = resolved.and_then(|r| r.resolved_type);
 
@@ -1258,10 +1658,21 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                             .and_then(|d| d.fixed_value.clone())
                     });
 
-                return Some((attr_key, attr_type, fixed));
+                return AttributeLookup::Found(attr_key, attr_type, fixed);
             }
         }
-        None
+
+        // Search attribute groups
+        for ga in self.collect_group_attributes(ct_data) {
+            if ga.name == local_name && ga.namespace == namespace {
+                if ga.use_kind == AttributeUseKind::Prohibited {
+                    return AttributeLookup::Prohibited;
+                }
+                return AttributeLookup::Found(ga.attr_key, ga.type_key, ga.fixed_value);
+            }
+        }
+
+        AttributeLookup::NotFound
     }
 
     /// Check that all required attributes are present
@@ -1271,13 +1682,13 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         seen: &HashSet<(Option<NameId>, NameId)>,
     ) -> bool {
         let mut has_missing = false;
-        for attr_use in &ct_data.attributes {
+        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
             if attr_use.use_kind != AttributeUseKind::Required {
                 continue;
             }
 
-            let attr_name = attr_use.attribute.name.unwrap_or(well_known::EMPTY);
-            let attr_ns = attr_use.attribute.target_namespace;
+            let resolved = ct_data.resolved_attributes.get(i);
+            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
 
             if !seen.contains(&(attr_ns, attr_name)) {
                 let name_str = self.schema_set.name_table.resolve(attr_name);
@@ -1288,6 +1699,22 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 has_missing = true;
             }
         }
+
+        // Check required attributes from attribute groups
+        for ga in self.collect_group_attributes(ct_data) {
+            if ga.use_kind != AttributeUseKind::Required {
+                continue;
+            }
+            if !seen.contains(&(ga.namespace, ga.name)) {
+                let name_str = self.schema_set.name_table.resolve(ga.name);
+                self.report_error(
+                    "cvc-complex-type.4",
+                    format!("Required attribute '{}' is missing", name_str),
+                );
+                has_missing = true;
+            }
+        }
+
         has_missing
     }
 }
@@ -1976,5 +2403,537 @@ mod tests {
             "expected exactly 1 error (cvc-elt.5.2.2), got: {:?}",
             v.sink.errors
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Attribute group tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_attribute_group_basic() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attributeGroup name="myAttrs">
+                    <xs:attribute name="color" type="xs:string"/>
+                    <xs:attribute name="size" type="xs:integer"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="myAttrs"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        let info = v.validate_attribute("color", "", "red");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+
+        let info = v.validate_attribute("size", "", "42");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_attribute_group_nested() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attributeGroup name="inner">
+                    <xs:attribute name="depth" type="xs:integer"/>
+                </xs:attributeGroup>
+                <xs:attributeGroup name="outer">
+                    <xs:attribute name="width" type="xs:string"/>
+                    <xs:attributeGroup ref="inner"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="outer"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        let info = v.validate_attribute("width", "", "100px");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+
+        // "depth" comes from the nested inner group
+        let info = v.validate_attribute("depth", "", "5");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_attribute_group_required_missing() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attributeGroup name="myAttrs">
+                    <xs:attribute name="id" type="xs:string" use="required"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="myAttrs"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        // Do NOT supply the required "id" attribute
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+            "expected cvc-complex-type.4 for missing required attribute from group, errors: {:?}",
+            v.sink.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wildcard tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wildcard_namespace_other_rejects_same_ns() {
+        // anyAttribute namespace="##other" should reject attributes in the same
+        // (target) namespace.
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/ns"
+                        xmlns:tns="http://example.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:anyAttribute namespace="##other" processContents="skip"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let tns_id = schema_set.name_table.add("http://example.com/ns");
+        let tns_prefix = schema_set.name_table.add("tns");
+        let ns = NamespaceContextSnapshot {
+            default_ns: Some(tns_id),
+            bindings: vec![(tns_prefix, tns_id)],
+        };
+
+        v.validate_element("root", "http://example.com/ns", None, None, &ns);
+
+        // Attribute in a *different* namespace should be accepted (skip → NotKnown)
+        let info = v.validate_attribute("foreign", "http://other.com/ns", "val");
+        assert_ne!(info.validity, SchemaValidity::Invalid);
+
+        // Attribute in the *same* (target) namespace should be rejected
+        let info = v.validate_attribute("local", "http://example.com/ns", "val");
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+            "expected cvc-complex-type.3.2.2, errors: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+    }
+
+    #[test]
+    fn test_wildcard_process_contents_strict() {
+        // processContents="strict" with a global attribute declaration
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="globalAttr" type="xs:integer"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:anyAttribute namespace="##any" processContents="strict"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+
+        // Valid global attribute with correct value
+        let info = v.validate_attribute("globalAttr", "", "42");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+        assert!(info.attribute_decl.is_some());
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_wildcard_process_contents_strict_unknown() {
+        // processContents="strict" with an unknown attribute -> error
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:anyAttribute namespace="##any" processContents="strict"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+
+        let info = v.validate_attribute("unknownAttr", "", "anything");
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-assess-attr.1.2"),
+            "expected cvc-assess-attr.1.2 for strict wildcard with unknown attr, errors: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+    }
+
+    #[test]
+    fn test_wildcard_process_contents_lax() {
+        // processContents="lax" with an unknown attribute -> no error
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:anyAttribute namespace="##any" processContents="lax"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+
+        // Unknown attr with lax → accepted (NotKnown, no error)
+        let info = v.validate_attribute("whatever", "", "anything");
+        assert_ne!(info.validity, SchemaValidity::Invalid);
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_wildcard_process_contents_skip() {
+        // processContents="skip" should accept anything without validation
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="globalAttr" type="xs:integer"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:anyAttribute namespace="##any" processContents="skip"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+
+        // Even an invalid value for a known global attr should pass with skip (NotKnown)
+        let info = v.validate_attribute("globalAttr", "", "not_an_integer");
+        assert_ne!(info.validity, SchemaValidity::Invalid);
+
+        // Unknown attributes also accepted (NotKnown)
+        let info = v.validate_attribute("madeUp", "", "anything");
+        assert_ne!(info.validity, SchemaValidity::Invalid);
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue fix tests: attribute ref, prohibited, group wildcard, defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_attribute_ref_basic() {
+        // Issue 1: <xs:attribute ref="globalAttr"/> should match and validate
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="globalAttr" type="xs:integer"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:attribute ref="globalAttr"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        let info = v.validate_attribute("globalAttr", "", "42");
+        assert_eq!(
+            info.validity,
+            SchemaValidity::Valid,
+            "attribute ref should match by resolved name; errors: {:?}",
+            v.sink.errors
+        );
+        assert!(info.attribute_decl.is_some(), "should resolve attribute decl key");
+
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_attribute_ref_required_missing() {
+        // Issue 1: required attribute ref should be checked properly
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="reqAttr" type="xs:string"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:attribute ref="reqAttr" use="required"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        // Don't provide the required attribute
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+            "expected cvc-complex-type.4 for missing required ref attribute, errors: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_prohibited_attribute_despite_wildcard() {
+        // Issue 2: use="prohibited" should NOT fall through to anyAttribute
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="blocked" type="xs:string"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:attribute ref="blocked" use="prohibited"/>
+                                <xs:anyAttribute namespace="##any" processContents="skip"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        let info = v.validate_attribute("blocked", "", "value");
+        assert_eq!(
+            info.validity,
+            SchemaValidity::Invalid,
+            "prohibited attribute must be rejected even when anyAttribute is present"
+        );
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"
+                && e.message.contains("prohibited")),
+            "expected 'prohibited' error, errors: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+    }
+
+    #[test]
+    fn test_group_wildcard_honored() {
+        // Issue 3: anyAttribute inside attributeGroup should be honored
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attributeGroup name="flexAttrs">
+                    <xs:attribute name="known" type="xs:string"/>
+                    <xs:anyAttribute namespace="##any" processContents="skip"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="flexAttrs"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+
+        // Known attribute from the group
+        let info = v.validate_attribute("known", "", "hello");
+        assert_eq!(info.validity, SchemaValidity::Valid);
+
+        // Unknown attribute should be accepted via the group's anyAttribute
+        let info = v.validate_attribute("extra", "", "anything");
+        assert_ne!(
+            info.validity,
+            SchemaValidity::Invalid,
+            "group wildcard should accept unknown attributes; errors: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_default_from_global_declaration() {
+        // Issue 4: default value from global attribute decl should be exposed
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="lang" type="xs:string" default="en"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:attribute ref="lang"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        // Do NOT provide the "lang" attribute — it should appear as a default
+        v.validate_end_of_attributes();
+
+        let defaults = v.get_default_attributes();
+        assert!(
+            defaults.iter().any(|d| {
+                let name = schema_set.name_table.resolve(d.local_name);
+                name == "lang" && d.value == "en"
+            }),
+            "expected default attribute lang='en', got: {:?}",
+            defaults
+                .iter()
+                .map(|d| (schema_set.name_table.resolve(d.local_name), &d.value))
+                .collect::<Vec<_>>()
+        );
+
+        v.validate_text("hello");
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_default_from_global_declaration_in_group() {
+        // Issue 4: default from global decl via attributeGroup ref
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:attribute name="lang" type="xs:string" default="en"/>
+                <xs:attributeGroup name="grp">
+                    <xs:attribute ref="lang"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="grp"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        let defaults = v.get_default_attributes();
+        assert!(
+            defaults.iter().any(|d| {
+                let name = schema_set.name_table.resolve(d.local_name);
+                name == "lang" && d.value == "en"
+            }),
+            "expected default attribute lang='en' from group, got: {:?}",
+            defaults
+                .iter()
+                .map(|d| (schema_set.name_table.resolve(d.local_name), &d.value))
+                .collect::<Vec<_>>()
+        );
+
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
     }
 }
