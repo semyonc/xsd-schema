@@ -53,6 +53,7 @@ pub use value::{
 #[cfg(feature = "xsd11")]
 pub use sequence::{
     SequenceType, XmlTypeCardinality, ItemType, NameTest,
+    resolve_list_item_schema_type,
 };
 pub use validators::{
     TypeValidator, ValidatorRegistry, ValidationError, ValidationResult,

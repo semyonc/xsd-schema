@@ -735,6 +735,24 @@ impl fmt::Display for SequenceType {
 }
 
 // ============================================================================
+// Helpers (xsd11)
+// ============================================================================
+
+/// Resolve the item type's `SimpleTypeKey` from a list type definition.
+///
+/// Given a list type's `SimpleTypeKey`, looks up its `resolved_item_type` and
+/// extracts the `SimpleTypeKey` (if it refers to a simple type).
+/// Returns `None` if the type is not found or item type is not a simple type.
+#[cfg(feature = "xsd11")]
+pub fn resolve_list_item_schema_type(
+    list_type_key: SimpleTypeKey,
+    schema_set: &crate::schema::SchemaSet,
+) -> Option<SimpleTypeKey> {
+    let st_data = schema_set.arenas.simple_types.get(list_type_key)?;
+    st_data.resolved_item_type?.as_simple()
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

@@ -211,6 +211,46 @@ impl XmlValue {
             _ => None,
         }
     }
+
+    /// Convert this `XmlValue` to an `XPathValue` for use as `$value` in assertion evaluation.
+    ///
+    /// - **Atomic/UntypedAtomic** → single `XPathValue::Item`
+    /// - **List** → `XPathValue::Sequence` of atomic items, each with `item_schema_type`
+    /// - **Union** → recursively converts the inner value
+    ///
+    /// The `item_schema_type` parameter is needed because `XmlValueKind::List` stores bare
+    /// `XmlAtomicValue` items without per-item `schema_type`. Callers pass it from the
+    /// list type's `resolved_item_type`.
+    #[cfg(feature = "xsd11")]
+    pub fn to_xpath_value<N: crate::xpath::DomNavigator>(
+        &self,
+        item_schema_type: Option<SimpleTypeKey>,
+    ) -> crate::xpath::XPathValue<N> {
+        use crate::xpath::iterator::XmlItem;
+        use crate::xpath::XPathValue;
+
+        match &self.value {
+            XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_) => {
+                XPathValue::from_atomic(self.clone())
+            }
+            XmlValueKind::List { item_type, items } => {
+                let xml_items: Vec<XmlItem<N>> = items
+                    .iter()
+                    .map(|atom| {
+                        let val = XmlValue {
+                            type_code: atom.type_code(),
+                            schema_type: item_schema_type,
+                            value: XmlValueKind::Atomic(atom.clone()),
+                        };
+                        XmlItem::Atomic(val)
+                    })
+                    .collect();
+                let _ = item_type; // item_type already embedded in each atom's type_code
+                XPathValue::from_sequence(xml_items)
+            }
+            XmlValueKind::Union(inner) => inner.to_xpath_value(item_schema_type),
+        }
+    }
 }
 
 /// Value kind discriminant for XmlValue

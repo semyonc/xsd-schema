@@ -176,10 +176,16 @@ fn validate_atomic_type(
     };
 
     match typed_value {
-        Ok(val) => Ok(SimpleTypeResult {
-            typed_value: val,
-            member_type: None,
-        }),
+        Ok(mut val) => {
+            // Propagate schema type so XPath2 sequence type matching works
+            if val.schema_type.is_none() {
+                val.schema_type = Some(sk);
+            }
+            Ok(SimpleTypeResult {
+                typed_value: val,
+                member_type: None,
+            })
+        }
         Err(type_err) => {
             let code = errors::value_error_constraint_code(&type_err);
             Err(errors::from_value_error(code, type_err, None))
@@ -264,8 +270,9 @@ fn validate_list_type(
     }
 
     Ok(SimpleTypeResult {
-        typed_value: XmlValue::new(
+        typed_value: XmlValue::with_schema_type(
             item_type_code,
+            sk,
             XmlValueKind::List {
                 item_type: item_type_code,
                 items,
@@ -308,10 +315,17 @@ fn validate_union_type(
                 })?;
             }
 
+            // Propagate schema type on inner value from the matched member type
+            let mut inner = result.typed_value;
+            if inner.schema_type.is_none() {
+                inner.schema_type = member_key.as_simple();
+            }
+
             return Ok(SimpleTypeResult {
-                typed_value: XmlValue::new(
-                    result.typed_value.type_code,
-                    XmlValueKind::Union(Box::new(result.typed_value)),
+                typed_value: XmlValue::with_schema_type(
+                    inner.type_code,
+                    sk,
+                    XmlValueKind::Union(Box::new(inner)),
                 ),
                 member_type: Some(member_key),
             });
@@ -548,5 +562,182 @@ mod tests {
         let result = validate_simple_type("hello", tk, &schema).unwrap();
         assert!(result.member_type.is_some());
         assert_eq!(result.typed_value.type_code, XmlTypeCode::String);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// XSD 1.1 tests: schema_type propagation and to_xpath_value conversion
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "xsd11"))]
+mod xsd11_tests {
+    use super::*;
+    use crate::navigator::RoXmlNavigator;
+    use crate::pipeline::load_and_process_schema;
+    use crate::types::sequence::resolve_list_item_schema_type;
+    use crate::xpath::XPathValue;
+
+    fn load_schema(xsd: &str) -> SchemaSet {
+        let mut schema_set = SchemaSet::new();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+            .expect("failed to load schema");
+        schema_set
+    }
+
+    fn element_type(schema_set: &SchemaSet, local_name: &str) -> TypeKey {
+        let name_id = schema_set.name_table.add(local_name);
+        let elem_key = schema_set
+            .lookup_element(None, name_id)
+            .expect("element not found");
+        schema_set.arenas.elements[elem_key]
+            .resolved_type
+            .expect("element has no resolved type")
+    }
+
+    #[test]
+    fn test_atomic_schema_type_set() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="score">
+                    <xs:restriction base="xs:integer">
+                        <xs:minInclusive value="0"/>
+                        <xs:maxInclusive value="100"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="score"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("50", tk, &schema).unwrap();
+        assert!(
+            result.typed_value.schema_type.is_some(),
+            "atomic value should have schema_type set"
+        );
+    }
+
+    #[test]
+    fn test_list_schema_type_set() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="intList">
+                    <xs:list itemType="xs:integer"/>
+                </xs:simpleType>
+                <xs:element name="e" type="intList"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("1 2 3", tk, &schema).unwrap();
+        assert!(
+            result.typed_value.schema_type.is_some(),
+            "list value should have schema_type set"
+        );
+    }
+
+    #[test]
+    fn test_union_schema_type_set() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="intOrString">
+                    <xs:union memberTypes="xs:integer xs:string"/>
+                </xs:simpleType>
+                <xs:element name="e" type="intOrString"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("42", tk, &schema).unwrap();
+
+        // Outer union value has schema_type
+        assert!(
+            result.typed_value.schema_type.is_some(),
+            "union value should have schema_type set"
+        );
+
+        // Inner value also has schema_type (from matched member)
+        if let XmlValueKind::Union(ref inner) = result.typed_value.value {
+            assert!(
+                inner.schema_type.is_some(),
+                "inner union value should have schema_type set from matched member"
+            );
+        } else {
+            panic!("expected Union variant");
+        }
+    }
+
+    #[test]
+    fn test_list_to_xpath_value() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="intList">
+                    <xs:list itemType="xs:integer"/>
+                </xs:simpleType>
+                <xs:element name="e" type="intList"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("1 2 3", tk, &schema).unwrap();
+
+        // Resolve list item schema type
+        let list_sk = tk.as_simple().expect("should be simple type");
+        let item_sk = resolve_list_item_schema_type(list_sk, &schema);
+
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
+            result.typed_value.to_xpath_value(item_sk);
+
+        // Should produce a sequence of 3 items
+        let items = xpath_val.into_vec();
+        assert_eq!(items.len(), 3, "list should produce 3 XPath items");
+
+        // Each item should have schema_type set
+        for item in &items {
+            let val = item.as_atomic().expect("should be atomic");
+            assert!(
+                val.schema_type.is_some(),
+                "each list item should have schema_type"
+            );
+        }
+    }
+
+    #[test]
+    fn test_union_to_xpath_value() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="intOrString">
+                    <xs:union memberTypes="xs:integer xs:string"/>
+                </xs:simpleType>
+                <xs:element name="e" type="intOrString"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("42", tk, &schema).unwrap();
+
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
+            result.typed_value.to_xpath_value(None);
+
+        // Union unwraps to the inner atomic value
+        let items = xpath_val.into_vec();
+        assert_eq!(items.len(), 1, "union should unwrap to single item");
+        assert!(items[0].is_atomic());
+    }
+
+    #[test]
+    fn test_atomic_to_xpath_value() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="e" type="xs:integer"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("42", tk, &schema).unwrap();
+
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
+            result.typed_value.to_xpath_value(None);
+
+        let items = xpath_val.into_vec();
+        assert_eq!(items.len(), 1, "atomic should produce single item");
+        assert!(items[0].is_atomic());
+        assert_eq!(
+            items[0].as_atomic().unwrap().type_code,
+            XmlTypeCode::Integer
+        );
     }
 }
