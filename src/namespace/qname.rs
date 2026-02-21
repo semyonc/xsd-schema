@@ -5,7 +5,8 @@
 //! - UndefinedPrefix (XPST0081): Prefix not in scope
 
 use crate::ids::NameId;
-use super::context::NamespaceContext;
+use super::context::{NamespaceContext, NamespaceContextSnapshot};
+use super::table::NameTable;
 use std::fmt;
 
 /// Qualified name with interned strings via NameTable
@@ -161,6 +162,95 @@ pub fn parse_qname(
     Ok(QualifiedName::new(namespace_uri, local_id, prefix_id))
 }
 
+/// Parse a QName string using an immutable `NamespaceContextSnapshot` + `NameTable`
+///
+/// Same parsing/validation logic as [`parse_qname`] but works with a snapshot
+/// of namespace bindings instead of a mutable `NamespaceContext`. This is useful
+/// during validation where only a snapshot is available (e.g., xsi:type resolution).
+///
+/// Uses `name_table.add()` to intern names, since instance values may contain
+/// names not yet present in the table.
+///
+/// # Arguments
+///
+/// * `qname` - The QName string to parse (e.g., "xs:string" or "localName")
+/// * `ns_snapshot` - Snapshot of namespace bindings for prefix resolution
+/// * `name_table` - Name table for string interning
+/// * `use_default_ns` - Whether to use default namespace for unprefixed names
+///
+/// # Errors
+///
+/// - `InvalidLexical` if the QName syntax is invalid
+/// - `UndefinedPrefix` if the prefix is not bound in the snapshot
+pub fn parse_qname_with_snapshot(
+    qname: &str,
+    ns_snapshot: &NamespaceContextSnapshot,
+    name_table: &NameTable,
+    use_default_ns: bool,
+) -> Result<QualifiedName, QNameError> {
+    let qname = qname.trim();
+
+    if qname.is_empty() {
+        return Err(QNameError::EmptyLocalName);
+    }
+
+    // Split on ':' to find prefix
+    let (prefix_str, local_str) = match qname.find(':') {
+        Some(pos) => {
+            if pos == 0 {
+                return Err(QNameError::InvalidLexical(qname.to_string()));
+            }
+            let prefix = &qname[..pos];
+            let local = &qname[pos + 1..];
+
+            // Check for multiple colons
+            if local.contains(':') {
+                return Err(QNameError::InvalidLexical(qname.to_string()));
+            }
+
+            (Some(prefix), local)
+        }
+        None => (None, qname),
+    };
+
+    // Validate local name
+    if local_str.is_empty() {
+        return Err(QNameError::EmptyLocalName);
+    }
+
+    if !is_ncname(local_str) {
+        return Err(QNameError::InvalidLexical(qname.to_string()));
+    }
+
+    // Validate and resolve prefix
+    let (namespace_uri, prefix_id) = match prefix_str {
+        Some(prefix) => {
+            if !is_ncname(prefix) {
+                return Err(QNameError::InvalidLexical(qname.to_string()));
+            }
+
+            let prefix_id = name_table.add(prefix);
+            match ns_snapshot.resolve_prefix(prefix_id) {
+                Some(ns_id) => (Some(ns_id), Some(prefix_id)),
+                None => return Err(QNameError::UndefinedPrefix(prefix.to_string())),
+            }
+        }
+        None => {
+            // Unprefixed name - use default namespace if requested
+            let namespace_uri = if use_default_ns {
+                ns_snapshot.default_namespace()
+            } else {
+                None
+            };
+            (namespace_uri, None)
+        }
+    };
+
+    let local_id = name_table.add(local_str);
+
+    Ok(QualifiedName::new(namespace_uri, local_id, prefix_id))
+}
+
 /// Check if a string is a valid NCName (non-colonized name)
 ///
 /// NCName = Name - ':'
@@ -258,5 +348,102 @@ mod tests {
         let qn = QualifiedName::new(Some(NameId(1)), NameId(2), Some(NameId(3)));
         assert!(qn.has_namespace());
         assert!(qn.is_prefixed());
+    }
+
+    // --- parse_qname_with_snapshot tests ---
+
+    /// Helper: create a NameTable + NamespaceContextSnapshot with given bindings
+    fn make_snapshot(
+        prefixes: &[(&str, &str)],
+        default_ns: Option<&str>,
+    ) -> (NameTable, NamespaceContextSnapshot) {
+        use super::super::context::NamespaceContext;
+        let mut table = NameTable::new();
+        let mut ctx = NamespaceContext::new(&mut table);
+        ctx.push_scope();
+        for &(prefix, uri) in prefixes {
+            ctx.add_namespace(prefix, uri);
+        }
+        if let Some(uri) = default_ns {
+            ctx.add_namespace("", uri);
+        }
+        let snapshot = ctx.snapshot();
+        drop(ctx);
+        (table, snapshot)
+    }
+
+    #[test]
+    fn test_snapshot_prefixed_qname() {
+        let (table, snapshot) = make_snapshot(&[("xs", "http://www.w3.org/2001/XMLSchema")], None);
+        let result = parse_qname_with_snapshot("xs:string", &snapshot, &table, true).unwrap();
+        assert_eq!(table.resolve(result.local_name), "string");
+        assert!(result.prefix.is_some());
+        assert_eq!(table.resolve(result.prefix.unwrap()), "xs");
+        assert!(result.namespace_uri.is_some());
+        assert_eq!(
+            table.resolve(result.namespace_uri.unwrap()),
+            "http://www.w3.org/2001/XMLSchema"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_unprefixed_with_default_ns() {
+        let (table, snapshot) = make_snapshot(&[], Some("http://default.com"));
+        let result = parse_qname_with_snapshot("localName", &snapshot, &table, true).unwrap();
+        assert_eq!(table.resolve(result.local_name), "localName");
+        assert!(result.prefix.is_none());
+        assert!(result.namespace_uri.is_some());
+        assert_eq!(table.resolve(result.namespace_uri.unwrap()), "http://default.com");
+    }
+
+    #[test]
+    fn test_snapshot_unprefixed_without_default_ns() {
+        let (table, snapshot) = make_snapshot(&[], None);
+        let result = parse_qname_with_snapshot("localName", &snapshot, &table, true).unwrap();
+        assert_eq!(table.resolve(result.local_name), "localName");
+        assert!(result.namespace_uri.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_unprefixed_default_ns_not_used() {
+        let (table, snapshot) = make_snapshot(&[], Some("http://default.com"));
+        // use_default_ns = false => namespace should be None
+        let result = parse_qname_with_snapshot("localName", &snapshot, &table, false).unwrap();
+        assert!(result.namespace_uri.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_invalid_ncname_local() {
+        let (table, snapshot) = make_snapshot(&[("xs", "http://www.w3.org/2001/XMLSchema")], None);
+        let err = parse_qname_with_snapshot("xs:123bad", &snapshot, &table, true).unwrap_err();
+        assert!(matches!(err, QNameError::InvalidLexical(_)));
+    }
+
+    #[test]
+    fn test_snapshot_invalid_ncname_prefix() {
+        let (table, snapshot) = make_snapshot(&[], None);
+        let err = parse_qname_with_snapshot("123:foo", &snapshot, &table, true).unwrap_err();
+        assert!(matches!(err, QNameError::InvalidLexical(_)));
+    }
+
+    #[test]
+    fn test_snapshot_undefined_prefix() {
+        let (table, snapshot) = make_snapshot(&[], None);
+        let err = parse_qname_with_snapshot("nope:foo", &snapshot, &table, true).unwrap_err();
+        assert!(matches!(err, QNameError::UndefinedPrefix(_)));
+    }
+
+    #[test]
+    fn test_snapshot_empty_input() {
+        let (table, snapshot) = make_snapshot(&[], None);
+        let err = parse_qname_with_snapshot("", &snapshot, &table, true).unwrap_err();
+        assert!(matches!(err, QNameError::EmptyLocalName));
+    }
+
+    #[test]
+    fn test_snapshot_whitespace_trimmed() {
+        let (table, snapshot) = make_snapshot(&[("xs", "http://www.w3.org/2001/XMLSchema")], None);
+        let result = parse_qname_with_snapshot("  xs:string  ", &snapshot, &table, true).unwrap();
+        assert_eq!(table.resolve(result.local_name), "string");
     }
 }

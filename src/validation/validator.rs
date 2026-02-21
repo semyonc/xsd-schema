@@ -10,6 +10,7 @@ use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
 use crate::ids::{AttributeGroupKey, NameId, TypeKey, AttributeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
+use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
 use crate::parser::frames::{AttributeUseKind, AttributeUseResult, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
@@ -1257,36 +1258,34 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         declared_type: Option<TypeKey>,
         ns_context: &NamespaceContextSnapshot,
     ) -> Option<TypeKey> {
-        // Parse QName: "prefix:local" or "local"
-        let (prefix, local) = match xsi_type_str.find(':') {
-            Some(pos) => (&xsi_type_str[..pos], &xsi_type_str[pos + 1..]),
-            None => ("", xsi_type_str),
-        };
-
-        // Resolve prefix to namespace
-        let namespace = if prefix.is_empty() {
-            ns_context.default_namespace()
-        } else {
-            let prefix_id = self.schema_set.name_table.add(prefix);
-            match ns_context.resolve_prefix(prefix_id) {
-                Some(ns) => Some(ns),
-                None => {
-                    self.report_error(
-                        "cvc-elt.4.1",
-                        format!("Undeclared prefix '{}' in xsi:type value '{}'", prefix, xsi_type_str),
-                    );
-                    return None;
-                }
+        // Parse and validate the QName using shared parsing logic
+        let qname = match parse_qname_with_snapshot(
+            xsi_type_str,
+            ns_context,
+            &self.schema_set.name_table,
+            true,
+        ) {
+            Ok(qn) => qn,
+            Err(e) => {
+                let msg = match e {
+                    QNameError::UndefinedPrefix(p) => {
+                        format!("Undeclared prefix '{}' in xsi:type value '{}'", p, xsi_type_str)
+                    }
+                    _ => format!("Invalid xsi:type value '{}': {}", xsi_type_str, e),
+                };
+                self.report_error("cvc-elt.4.1", msg);
+                return None;
             }
         };
-
-        let local_id = self.schema_set.name_table.add(local);
 
         // Look up the type
         let resolved = self
             .schema_set
-            .lookup_type(namespace, local_id)
-            .or_else(|| self.schema_set.get_built_in_type_by_qname(namespace, local_id));
+            .lookup_type(qname.namespace_uri, qname.local_name)
+            .or_else(|| {
+                self.schema_set
+                    .get_built_in_type_by_qname(qname.namespace_uri, qname.local_name)
+            });
 
         match resolved {
             Some(type_key) => {
@@ -1311,7 +1310,10 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             None => {
                 self.report_error(
                     "cvc-elt.4.1",
-                    format!("Type '{}' specified in xsi:type is not declared", xsi_type_str),
+                    format!(
+                        "Type '{}' specified in xsi:type is not declared",
+                        xsi_type_str
+                    ),
                 );
                 None
             }

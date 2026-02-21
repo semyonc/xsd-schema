@@ -14,5 +14,5 @@ pub mod context;
 
 // Re-exports
 pub use table::{NameTable, well_known, XS_NAMESPACE, XSI_NAMESPACE, XML_NAMESPACE, XMLNS_NAMESPACE};
-pub use qname::{QualifiedName, QNameError, parse_qname, is_ncname};
+pub use qname::{QualifiedName, QNameError, parse_qname, parse_qname_with_snapshot, is_ncname};
 pub use context::{NamespaceContext, NamespaceScope, NamespaceContextSnapshot};
