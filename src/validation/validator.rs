@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
-use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
+use crate::compiler::{compile_content_model_matcher, build_substitution_group_map, SubstitutionGroupMap};
 use crate::ids::{AttributeGroupKey, NameId, TypeKey, AttributeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
@@ -18,6 +18,7 @@ use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
 
 use super::content::ContentValidatorState;
+use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::info::{
@@ -153,9 +154,10 @@ pub struct SchemaValidator<'a, S: ValidationSink> {
 impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
     /// Create a new `SchemaValidator`
     pub fn new(schema_set: &'a SchemaSet, sink: S, flags: ValidationFlags) -> Self {
+        let subst_groups = build_substitution_group_map(schema_set);
         SchemaValidator {
             schema_set,
-            subst_groups: None,
+            subst_groups: Some(subst_groups),
             sink,
             flags,
             validation_stack: Vec::new(),
@@ -240,27 +242,43 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         let mut match_info: Option<super::content::ElementMatchInfo> = None;
         let mut content_model_accepted = false;
         let mut content_model_error = None;
+        let mut nil_error: Option<String> = None;
         if let Some(parent) = self.validation_stack.last_mut() {
-            parent.has_element_children = true;
-            match parent.content_state.advance_element(
-                local_name,
-                namespace,
-                parent.namespace, // parent's target_namespace for wildcard matching
-                self.schema_set.xsd_version,
-                self.subst_groups.as_ref(),
-            ) {
-                Some(info) => {
-                    match_info = Some(info);
-                    content_model_accepted = true;
-                }
-                None => {
-                    let elem_name = self.schema_set.name_table.resolve(local_name);
-                    content_model_error = Some(format!(
-                        "Element '{}' is not allowed at this position in the content model",
-                        elem_name,
-                    ));
+            if parent.is_nil {
+                let parent_name = self
+                    .schema_set
+                    .name_table
+                    .resolve(parent.local_name)
+                    .to_string();
+                nil_error = Some(format!(
+                    "Element '{}' is nilled (xsi:nil='true') but has child element content",
+                    parent_name,
+                ));
+            } else {
+                parent.has_element_children = true;
+                match parent.content_state.advance_element(
+                    local_name,
+                    namespace,
+                    parent.namespace, // parent's target_namespace for wildcard matching
+                    self.schema_set.xsd_version,
+                    self.subst_groups.as_ref(),
+                ) {
+                    Some(info) => {
+                        match_info = Some(info);
+                        content_model_accepted = true;
+                    }
+                    None => {
+                        let elem_name = self.schema_set.name_table.resolve(local_name);
+                        content_model_error = Some(format!(
+                            "Element '{}' is not allowed at this position in the content model",
+                            elem_name,
+                        ));
+                    }
                 }
             }
+        }
+        if let Some(msg) = nil_error {
+            self.report_error("cvc-elt.3.2.1", msg);
         }
         if let Some(msg) = content_model_error {
             self.report_error("cvc-complex-type.2.4", msg);
@@ -281,11 +299,19 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         };
 
         // 4. Handle missing element
-        let process_contents = self
-            .validation_stack
-            .last()
-            .map(|p| p.process_contents)
-            .unwrap_or(ContentProcessing::Strict);
+        let process_contents = match_info
+            .and_then(|i| i.process_contents)
+            .map(|pc| match pc {
+                TypesProcessContents::Strict => ContentProcessing::Strict,
+                TypesProcessContents::Lax => ContentProcessing::Lax,
+                TypesProcessContents::Skip => ContentProcessing::Skip,
+            })
+            .unwrap_or_else(|| {
+                self.validation_stack
+                    .last()
+                    .map(|p| p.process_contents)
+                    .unwrap_or(ContentProcessing::Strict)
+            });
 
         if element_key.is_none() {
             if content_model_accepted {
@@ -983,7 +1009,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         };
 
         match &ev_state.content_state {
-            ContentValidatorState::Nfa { nfa, active_states } => {
+            ContentValidatorState::Nfa { nfa, active_states, .. } => {
                 let mut result = Vec::new();
                 let closure =
                     crate::compiler::epsilon_closure(nfa, active_states.iter().copied());
@@ -1009,7 +1035,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             ContentValidatorState::AllGroup { model, state } => {
                 let mut result = Vec::new();
                 for (i, particle) in model.particles.iter().enumerate() {
-                    if state.can_accept(i) {
+                    if state.can_accept(model, i) {
                         if let crate::compiler::NfaTerm::Element {
                             ref name,
                             ref namespace,
@@ -1022,6 +1048,84 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                                 namespace: *namespace,
                                 element_key: *element_key,
                             });
+                        }
+                    }
+                }
+                result
+            }
+            #[cfg(feature = "xsd11")]
+            ContentValidatorState::AllGroupExtension {
+                model, state, extension_nfa, phase,
+            } => {
+                use super::content::AllGroupExtPhase;
+
+                let mut result = Vec::new();
+                match phase {
+                    AllGroupExtPhase::AllGroup => {
+                        // Include acceptable all-group particles
+                        for (i, particle) in model.particles.iter().enumerate() {
+                            if state.can_accept(model, i) {
+                                if let crate::compiler::NfaTerm::Element {
+                                    ref name,
+                                    ref namespace,
+                                    ref element_key,
+                                    ..
+                                } = particle.term
+                                {
+                                    result.push(ExpectedElement {
+                                        local_name: *name,
+                                        namespace: *namespace,
+                                        element_key: *element_key,
+                                    });
+                                }
+                            }
+                        }
+                        // If all-group is satisfied, also include extension NFA elements
+                        if state.is_satisfied(model) {
+                            let initial = crate::compiler::epsilon_closure(
+                                extension_nfa,
+                                std::iter::once(extension_nfa.start_state),
+                            );
+                            for state_id in initial {
+                                if let Some(nfa_state) = extension_nfa.get_state(state_id) {
+                                    if let Some(crate::compiler::NfaTerm::Element {
+                                        ref name,
+                                        ref namespace,
+                                        ref element_key,
+                                        ..
+                                    }) = nfa_state.term
+                                    {
+                                        result.push(ExpectedElement {
+                                            local_name: *name,
+                                            namespace: *namespace,
+                                            element_key: *element_key,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    AllGroupExtPhase::Nfa(active_states) => {
+                        let closure = crate::compiler::epsilon_closure(
+                            extension_nfa,
+                            active_states.iter().copied(),
+                        );
+                        for state_id in closure {
+                            if let Some(nfa_state) = extension_nfa.get_state(state_id) {
+                                if let Some(crate::compiler::NfaTerm::Element {
+                                    ref name,
+                                    ref namespace,
+                                    ref element_key,
+                                    ..
+                                }) = nfa_state.term
+                                {
+                                    result.push(ExpectedElement {
+                                        local_name: *name,
+                                        namespace: *namespace,
+                                        element_key: *element_key,
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -2243,8 +2347,9 @@ mod tests {
     }
 
     #[test]
-    fn test_local_element_with_inline_type_fallback() {
-        // Local element with inline <xs:simpleType>. Verify graceful fallback.
+    fn test_local_element_with_inline_type() {
+        // Local element with inline <xs:simpleType> — verify that the inline
+        // type is resolved and facets are enforced.
         let schema_set = load_schema(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:element name="root">
@@ -2263,25 +2368,72 @@ mod tests {
             </xs:schema>"#,
         );
 
-        let sink = TestSink::new();
-        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
-        let ns = empty_ns_context();
+        // Verify schema internals: inline type is assembled and propagated
+        let root_name = schema_set.name_table.get("root")
+            .expect("name 'root' not interned");
+        let root_key = schema_set.lookup_element(None, root_name)
+            .expect("root element not found");
+        let root_type = schema_set.arenas.elements[root_key].resolved_type
+            .expect("root element has no resolved_type");
+        let ct_key = match root_type {
+            crate::ids::TypeKey::Complex(k) => k,
+            _ => panic!("root type is not complex"),
+        };
+        let ct = &schema_set.arenas.complex_types[ct_key];
+        assert!(
+            !ct.resolved_content_particle_types.is_empty(),
+            "resolved_content_particle_types is empty"
+        );
+        assert!(
+            ct.resolved_content_particle_types[0].is_some(),
+            "resolved_content_particle_types[0] is None"
+        );
 
-        v.validate_element("root", "", None, None, &ns);
-        v.validate_end_of_attributes();
+        // Valid value (within maxLength=10)
+        {
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            let ns = empty_ns_context();
 
-        let info = v.validate_element("code", "", None, None, &ns);
-        assert_eq!(info.validity, SchemaValidity::Valid);
-        // Inline type is not resolved at compile time — fallback to TextOnly
-        assert_eq!(info.content_type, Some(ContentType::TextOnly));
+            v.validate_element("root", "", None, None, &ns);
+            v.validate_end_of_attributes();
 
-        v.validate_end_of_attributes();
-        v.validate_text("ABC");
-        v.validate_end_element();
+            let info = v.validate_element("code", "", None, None, &ns);
+            assert_eq!(info.validity, SchemaValidity::Valid);
+            assert!(info.schema_type.is_some(), "inline type not resolved");
+            assert_eq!(info.content_type, Some(ContentType::TextOnly));
 
-        v.validate_end_element();
-        assert!(v.end_validation().is_ok());
-        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+            v.validate_end_of_attributes();
+            v.validate_text("ABC");
+            v.validate_end_element();
+
+            v.validate_end_element();
+            assert!(v.end_validation().is_ok());
+            assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+        }
+
+        // Invalid value (exceeds maxLength=10) — facet must be enforced
+        {
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            let ns = empty_ns_context();
+
+            v.validate_element("root", "", None, None, &ns);
+            v.validate_end_of_attributes();
+
+            v.validate_element("code", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("this text exceeds maxLength of 10");
+            v.validate_end_element();
+
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            assert!(
+                !v.sink.errors.is_empty(),
+                "expected facet error for text exceeding maxLength=10"
+            );
+        }
     }
 
     #[test]
@@ -2938,4 +3090,470 @@ mod tests {
         assert!(v.end_validation().is_ok());
         assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
     }
+
+    // ── Mixed content tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_mixed_content_text_allowed() {
+        // A mixed complex type with a sequence of child elements.
+        // Text between child elements should be valid.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                            <xs:element name="b" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", None, None, &ns);
+        assert_eq!(info.content_type, Some(ContentType::Mixed));
+        v.validate_end_of_attributes();
+
+        // Text before first child
+        v.validate_text("hello ");
+
+        // Child <a>
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("val_a");
+        v.validate_end_element();
+
+        // Text between children
+        v.validate_text(" middle ");
+
+        // Child <b>
+        v.validate_element("b", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("val_b");
+        v.validate_end_element();
+
+        // Text after last child
+        v.validate_text(" world");
+
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_mixed_content_text_only_incomplete_model() {
+        // A mixed complex type with required children in a sequence.
+        // Pushing only text (no child elements) → content model incomplete error.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Only text, no child elements
+        v.validate_text("just text");
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // Content model is incomplete because required child <a> was never provided
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+            "expected content model incomplete error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_mixed_content_whitespace_accumulated() {
+        // A mixed complex type should accumulate whitespace (not discard it
+        // like element-only content does). We push whitespace between
+        // required children to verify it is accepted without error.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", None, None, &ns);
+        assert_eq!(info.content_type, Some(ContentType::Mixed));
+        v.validate_end_of_attributes();
+
+        // Whitespace before the child — accumulated in mixed, discarded in element-only
+        v.validate_whitespace("   ");
+
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("val");
+        v.validate_end_element();
+
+        // Whitespace after the child
+        v.validate_whitespace("  \n  ");
+
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_element_only_rejects_non_whitespace_text() {
+        // A non-mixed complex type with a sequence. Pushing non-whitespace
+        // text should produce a cvc-complex-type.2.3 error.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", None, None, &ns);
+        assert_eq!(info.content_type, Some(ContentType::ElementOnly));
+        v.validate_end_of_attributes();
+
+        // Non-whitespace text in element-only content
+        v.validate_text("not allowed here");
+
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("val");
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.3"),
+            "expected element-only text error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_mixed_content_wrong_child_order() {
+        // A mixed complex type with xs:sequence(a, b). Children in wrong
+        // order should still produce a content model error — mixed allows
+        // text but still enforces child element order.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                            <xs:element name="b" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_text("some text ");
+
+        // Wrong order: b before a
+        v.validate_element("b", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_text(" more text ");
+
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+            "expected content model error for wrong child order, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_mixed_content_model_complete() {
+        // A mixed complex type where all required children are provided.
+        // Text is interleaved; content model should be complete → valid.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", None, None, &ns);
+        assert_eq!(info.content_type, Some(ContentType::Mixed));
+        v.validate_end_of_attributes();
+
+        // Text before required child
+        v.validate_text("prefix ");
+
+        // Provide the required child
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("child value");
+        v.validate_end_element();
+
+        // Text after child — content model should be complete
+        v.validate_text(" suffix");
+
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_minoccurs_zero_element_in_sequence() {
+        // An element with minOccurs="0" inside a sequence.
+        // Omitting the optional element should produce no errors.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        // Do NOT push child <a> — it is optional
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_maxoccurs_unbounded_element_in_sequence() {
+        // An element with maxOccurs="unbounded" inside a sequence.
+        // Pushing multiple children should produce no errors.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Push three <a> children — all should be accepted
+        for _ in 0..3 {
+            v.validate_element("a", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("value");
+            v.validate_end_element();
+        }
+
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_mixed_content_optional_children_text_only() {
+        // Mixed complex type where all children are optional.
+        // Pushing only text (no child elements) should be valid.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType mixed="true">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                            <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Only text, no child elements
+        v.validate_text("just text content");
+
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[test]
+    fn test_nil_element_rejects_child_elements() {
+        // cvc-elt.3.2.1: A nilled element must not have child element content
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="parent" nillable="true">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="child" type="xs:string"/>
+                                    </xs:sequence>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Open "parent" with xsi:nil="true"
+        let info = v.validate_element("parent", "", None, Some("true"), &ns);
+        assert!(info.is_nil);
+        v.validate_end_of_attributes();
+
+        // Try to add a child element — should trigger cvc-elt.3.2.1
+        v.validate_element("child", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // close parent
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink
+                .errors
+                .iter()
+                .any(|e| e.constraint == "cvc-elt.3.2.1"),
+            "expected cvc-elt.3.2.1 error for child element in nilled parent, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_nil_element_allows_attributes_only() {
+        // A nilled element with only attributes (no child elements, no text) is valid
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" nillable="true">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="child" type="xs:string"/>
+                                    </xs:sequence>
+                                    <xs:attribute name="id" type="xs:string"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        let info = v.validate_element("item", "", None, Some("true"), &ns);
+        assert!(info.is_nil);
+        // Attribute on nilled element is valid
+        v.validate_attribute("id", "", "123");
+        v.validate_end_of_attributes();
+
+        // No child elements, no text — just close
+        v.validate_end_element(); // close item
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "nilled element with attributes only should be valid, got: {:?}",
+            v.sink.errors
+        );
+    }
+
 }

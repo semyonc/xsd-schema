@@ -74,30 +74,37 @@ impl Frame for ModelGroupFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Element(elem) => {
+                let min_occurs = elem.min_occurs;
+                let max_occurs = elem.max_occurs;
+                let source = elem.source.clone();
                 self.particles.push(ParticleResult {
                     term: ParticleTerm::Element(elem),
-                    min_occurs: 1,
-                    max_occurs: Some(1),
-                    source: None,
+                    min_occurs,
+                    max_occurs,
+                    source,
                 });
             }
             FrameResult::Particle(particle) => {
                 self.particles.push(particle);
             }
             FrameResult::Wildcard(wc) => {
+                let source = wc.source.clone();
                 self.particles.push(ParticleResult {
                     term: ParticleTerm::Any(wc),
                     min_occurs: 1,
                     max_occurs: Some(1),
-                    source: None,
+                    source,
                 });
             }
             FrameResult::Group(GroupFrameResult::Model(mg)) => {
+                let min_occurs = mg.min_occurs;
+                let max_occurs = mg.max_occurs;
+                let source = mg.source.clone();
                 self.particles.push(ParticleResult {
                     term: ParticleTerm::Group(*mg),
-                    min_occurs: 1,
-                    max_occurs: Some(1),
-                    source: None,
+                    min_occurs,
+                    max_occurs,
+                    source,
                 });
             }
             FrameResult::Skip => {}

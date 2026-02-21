@@ -22,6 +22,7 @@ use crate::types::complex::{
     ProcessContents as TypesProcessContents, WildcardRef,
 };
 
+use super::all_group::{AllGroupModel, AllParticle, OpenContentWildcard, OpenContentMode as AllGroupOpenContentMode};
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 use super::nfa::{NfaTable, NfaTerm};
@@ -142,12 +143,16 @@ impl<'a> CompileContext<'a> {
         }
     }
 
-    /// Compile an element to a fragment
-    fn compile_element(
+    /// Build an NfaTerm for an element declaration, resolving name, namespace,
+    /// element_key, and type information.
+    ///
+    /// This is the shared logic used by both `compile_element()` (NFA path)
+    /// and `compile_all_group_model()` (AllGroup path).
+    fn build_element_term(
         &mut self,
         elem: &ElementFrameResult,
         source: Option<&SourceRef>,
-    ) -> NfaCompileResult<NfaFragment> {
+    ) -> NfaCompileResult<NfaTerm> {
         // Grab and increment flat element index (if compiling content particles)
         let current_flat_idx = if let Some(flat_idx) = self.content_flat_idx {
             self.content_flat_idx = Some(flat_idx + 1);
@@ -197,7 +202,16 @@ impl<'a> CompileContext<'a> {
             None // Elements with key get type from element declaration via arena
         };
 
-        let nfa_term = NfaTerm::element_with_type(name, namespace, element_key, resolved_type);
+        Ok(NfaTerm::element_with_type(name, namespace, element_key, resolved_type))
+    }
+
+    /// Compile an element to a fragment
+    fn compile_element(
+        &mut self,
+        elem: &ElementFrameResult,
+        source: Option<&SourceRef>,
+    ) -> NfaCompileResult<NfaFragment> {
+        let nfa_term = self.build_element_term(elem, source)?;
         Ok(self.builder.single_term(nfa_term, source.cloned()))
     }
 
@@ -302,57 +316,87 @@ impl<'a> CompileContext<'a> {
         Ok(result)
     }
 
-    /// Compile an all-group (xs:all)
-    ///
-    /// Note: Full all-group support with order-independent matching is
-    /// implemented in Task 4.3. This provides a basic implementation that
-    /// treats all-groups as sequences for now.
+    /// Compile an all-group (xs:all) as NFA — used as fallback for nested
+    /// all-groups that cannot use `AllGroupModel` (e.g. inside a sequence
+    /// or choice). Top-level all-groups (both inline and named refs) use
+    /// `compile_all_group_model()` instead.
     fn compile_all(
         &mut self,
         particles: &[ParticleResult],
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
-        // XSD 1.0 restrictions: all-groups can only contain elements with maxOccurs <= 1
-        // For now, we compile as a sequence (which is overly restrictive but correct)
-        // Full implementation in Task 4.3 will use AllGroupModel for proper any-order matching
-
         // Validate XSD 1.0 constraints
         for particle in particles {
-            // Check that term is an element (not a group or wildcard)
             if !matches!(particle.term, ParticleTerm::Element(_)) {
                 return Err(NfaCompileError::invalid_all_group(source.cloned()));
             }
 
-            // Check maxOccurs constraint (XSD 1.0: must be 0 or 1)
             if let Some(max) = particle.max_occurs {
                 if max > 1 {
                     return Err(NfaCompileError::invalid_all_group(source.cloned()));
                 }
             } else {
-                // unbounded not allowed in XSD 1.0 all-groups
                 return Err(NfaCompileError::invalid_all_group(source.cloned()));
             }
         }
 
-        // For now, compile as a permutation of all optional elements
-        // This is a simplification - proper implementation needs AllGroupModel
-        // We'll create a hub state that can match any element, then loop back
         if particles.is_empty() {
             return Ok(self.builder.epsilon_fragment());
         }
 
-        // Simple approach: create choice of all elements, then wrap in repeat
-        // This allows any order but doesn't enforce "each element at most once"
-        // Full enforcement requires AllGroupModel (Task 4.3)
+        // Choice-of-all with bounded repeat: allows any order but doesn't
+        // enforce "each element at most once". Named-group all-groups land
+        // here; inline top-level all-groups use AllGroupModel instead.
         let mut choice = self.compile_particle_with_index(&particles[0], 0)?;
         for (i, particle) in particles[1..].iter().enumerate() {
             let frag = self.compile_particle_with_index(particle, i + 1)?;
             choice = choice.alternate(frag);
         }
 
-        // Allow 0 to n occurrences where n = number of particles
         let n = particles.len() as u32;
         Ok(choice.repeat_range(0, Some(n)))
+    }
+
+    /// Compile an all-group's particles into an `AllGroupModel`.
+    ///
+    /// Each particle is resolved to an `AllParticle` with its `NfaTerm`,
+    /// min/max occurs, and source location. Only element and wildcard
+    /// particles are supported; group references inside all-groups are
+    /// rejected (XSD 1.0 forbids them; XSD 1.1 named-group support deferred).
+    fn compile_all_group_model(
+        &mut self,
+        particles: &[ParticleResult],
+        source: Option<&SourceRef>,
+    ) -> NfaCompileResult<AllGroupModel> {
+        let mut all_particles = Vec::with_capacity(particles.len());
+
+        for particle in particles {
+            let term = match &particle.term {
+                ParticleTerm::Element(elem) => {
+                    self.build_element_term(elem, particle.source.as_ref().or(source))?
+                }
+                ParticleTerm::Any(wildcard) => {
+                    let ns = self.convert_wildcard_namespace(&wildcard.namespace);
+                    let pc = self.convert_process_contents(wildcard.process_contents);
+                    NfaTerm::wildcard(ns, pc)
+                }
+                ParticleTerm::Group(_) => {
+                    // Group references inside all-groups are not yet supported.
+                    // XSD 1.0 forbids them; XSD 1.1 support is deferred.
+                    return Err(NfaCompileError::invalid_all_group(source.cloned()));
+                }
+            };
+
+            let max_occurs = MaxOccurs::from_option(particle.max_occurs);
+            all_particles.push(AllParticle::new(
+                term,
+                particle.min_occurs,
+                max_occurs,
+                particle.source.clone().or_else(|| source.cloned()),
+            ));
+        }
+
+        Ok(AllGroupModel::new(all_particles))
     }
 
     /// Compile a group reference
@@ -507,6 +551,91 @@ pub fn compile_model_group(
     ctx.compile_model_group(group)
 }
 
+/// Detect an inline `xs:all` at the top level of a particle.
+///
+/// Returns the all-group's particles and source if the particle's term is a
+/// group with `compositor == All` and no `ref_name` (i.e., an inline definition,
+/// not a named model group reference).
+fn is_top_level_all_group(particle: &ParticleResult) -> Option<(&[ParticleResult], Option<&SourceRef>)> {
+    if let ParticleTerm::Group(group) = &particle.term {
+        if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
+            return Some((&group.particles, group.source.as_ref()));
+        }
+    }
+    None
+}
+
+/// Detect a named model group reference at the top level that resolves to
+/// an `xs:all` group.
+///
+/// Returns the resolved [`ModelGroupData`] when the particle's term is a
+/// group with a `ref_name` and the referenced definition has
+/// `compositor == All`.
+fn resolve_top_level_all_group_ref<'a>(
+    particle: &ParticleResult,
+    schema_set: &'a SchemaSet,
+) -> Option<&'a ModelGroupData> {
+    if let ParticleTerm::Group(group) = &particle.term {
+        let ref_name = group.ref_name.as_ref()?;
+        let group_key = schema_set.lookup_model_group(ref_name.namespace, ref_name.local_name)?;
+        let group_data = schema_set.arenas.get_model_group(group_key)?;
+        if group_data.compositor == Some(Compositor::All) {
+            return Some(group_data);
+        }
+    }
+    None
+}
+
+/// Compile the base type's all-group model for an extension type.
+///
+/// If the extension's resolved base type is a complex type whose content model
+/// compiles to an `AllGroup`, returns the `AllGroupModel`. Otherwise returns `None`.
+#[cfg(feature = "xsd11")]
+fn compile_base_all_group(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+) -> NfaCompileResult<Option<AllGroupModel>> {
+    let base_ct_key = match type_def.resolved_base_type {
+        Some(TypeKey::Complex(key)) => key,
+        _ => return Ok(None),
+    };
+    let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
+    let base_matcher = compile_content_model_matcher(schema_set, base_type_def)?;
+    match base_matcher {
+        ContentModelMatcher::AllGroup(model) => Ok(Some(model)),
+        _ => Ok(None),
+    }
+}
+
+/// Convert an `AllGroupModel` into an NFA table for concatenation with
+/// extension content. Each particle becomes a choice alternative wrapped
+/// in repeat(0, max_occurs).
+fn all_group_to_nfa(model: &AllGroupModel) -> NfaTable {
+    let mut builder = FragmentBuilder::new();
+    if model.particles.is_empty() {
+        return fragment_to_table(builder.epsilon_fragment());
+    }
+
+    let fragments: Vec<NfaFragment> = model
+        .particles
+        .iter()
+        .map(|p| {
+            let frag = builder.single_term(p.term.clone(), p.source.clone());
+            let max = match p.max_occurs {
+                MaxOccurs::Bounded(n) => Some(n),
+                MaxOccurs::Unbounded => None,
+            };
+            apply_occurs(frag, p.min_occurs, MaxOccurs::from_option(max))
+        })
+        .collect();
+
+    let mut choice = fragments.into_iter().reduce(|a, b| a.alternate(b)).unwrap();
+    let n = model.particles.len() as u32;
+    choice = choice.repeat_range(0, Some(n));
+
+    fragment_to_table(choice)
+}
+
 /// Compile a complex type's content model into a matcher, applying open content defaults.
 pub fn compile_content_model_matcher(
     schema_set: &SchemaSet,
@@ -514,8 +643,118 @@ pub fn compile_content_model_matcher(
 ) -> NfaCompileResult<ContentModelMatcher> {
     let target_namespace = type_def.target_namespace;
     let mut ctx = CompileContext::new(schema_set, target_namespace);
+    let is_extension = matches!(type_def.derivation_method, Some(DerivationMethod::Extension));
 
-    // Compile this type's own particle
+    // Try the all-group path for non-extension types with an inline xs:all
+    if !is_extension {
+        if let ComplexContentResult::Complex(def) = &type_def.content {
+            if let Some(particle) = &def.particle {
+                if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
+                    ctx.resolved_particle_types =
+                        type_def.resolved_content_particle_types.to_vec();
+                    ctx.resolved_particle_elements =
+                        type_def.resolved_content_particle_elements.to_vec();
+                    ctx.content_flat_idx = Some(0);
+                    let model = ctx.compile_all_group_model(all_particles, all_source)?;
+                    let base_matcher = ContentModelMatcher::AllGroup(model);
+
+                    let open_content = resolve_open_content(
+                        schema_set,
+                        &type_def.content,
+                        type_def.open_content.as_ref(),
+                        type_def.source.as_ref(),
+                    );
+
+                    return Ok(attach_open_content(base_matcher, open_content));
+                }
+
+                // Named group ref resolving to all-group
+                if let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) {
+                    ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
+                    ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
+                    ctx.content_flat_idx = Some(0);
+                    let model = ctx.compile_all_group_model(
+                        &group_data.particles,
+                        group_data.source.as_ref(),
+                    )?;
+                    let base_matcher = ContentModelMatcher::AllGroup(model);
+
+                    let open_content = resolve_open_content(
+                        schema_set,
+                        &type_def.content,
+                        type_def.open_content.as_ref(),
+                        type_def.source.as_ref(),
+                    );
+
+                    return Ok(attach_open_content(base_matcher, open_content));
+                }
+            }
+        }
+    }
+
+    // XSD 1.1: Extension from an all-group base type — produce AllGroup or
+    // AllGroupExtension instead of the lossy NFA conversion.
+    #[cfg(feature = "xsd11")]
+    if is_extension {
+        if let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? {
+            let open_content = resolve_open_content(
+                schema_set,
+                &type_def.content,
+                type_def.open_content.as_ref(),
+                type_def.source.as_ref(),
+            );
+
+            // Determine what the extension adds
+            let own_particle = match &type_def.content {
+                ComplexContentResult::Complex(def) => def.particle.as_ref(),
+                _ => None,
+            };
+
+            match own_particle {
+                None => {
+                    // Extension adds only attributes — return base AllGroup directly
+                    let matcher = ContentModelMatcher::AllGroup(base_all_model);
+                    return Ok(attach_open_content(matcher, open_content));
+                }
+                Some(particle) => {
+                    // Check if extension's own particle is an inline all-group
+                    if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
+                        // Merge: base all-group + extension all-group → single AllGroup
+                        let mut ctx = CompileContext::new(schema_set, type_def.target_namespace);
+                        ctx.resolved_particle_types =
+                            type_def.resolved_content_particle_types.to_vec();
+                        ctx.resolved_particle_elements =
+                            type_def.resolved_content_particle_elements.to_vec();
+                        ctx.content_flat_idx = Some(0);
+                        let ext_model = ctx.compile_all_group_model(ext_particles, ext_source)?;
+
+                        let mut merged_particles = base_all_model.particles;
+                        merged_particles.extend(ext_model.particles);
+                        let merged = AllGroupModel::new(merged_particles);
+                        let matcher = ContentModelMatcher::AllGroup(merged);
+                        return Ok(attach_open_content(matcher, open_content));
+                    }
+
+                    // Extension is sequence/choice — compile as NFA, return composite
+                    let mut ctx = CompileContext::new(schema_set, type_def.target_namespace);
+                    ctx.resolved_particle_types =
+                        type_def.resolved_content_particle_types.to_vec();
+                    ctx.resolved_particle_elements =
+                        type_def.resolved_content_particle_elements.to_vec();
+                    ctx.content_flat_idx = Some(0);
+                    let ext_nfa = ctx.compile_particle(particle)?;
+
+                    let matcher = ContentModelMatcher::AllGroupExtension {
+                        base_model: base_all_model,
+                        extension_nfa: ext_nfa,
+                    };
+                    return Ok(attach_open_content(matcher, open_content));
+                }
+            }
+        }
+    }
+
+    // Standard NFA path (sequences, choices, named group refs, extensions)
     let own_nfa = match &type_def.content {
         ComplexContentResult::Complex(def) => match &def.particle {
             Some(particle) => {
@@ -532,24 +771,40 @@ pub fn compile_content_model_matcher(
     };
 
     // For extensions, prepend the base type's content model
-    let base_nfa =
-        if matches!(type_def.derivation_method, Some(DerivationMethod::Extension)) {
-            if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
-                let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
-                // Recursive call handles chained extensions (base-of-base)
-                let base_matcher =
-                    compile_content_model_matcher(schema_set, base_type_def)?;
-                match base_matcher {
-                    ContentModelMatcher::Nfa(nfa) => Some(nfa),
-                    ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),
-                    ContentModelMatcher::AllGroup(_) => None,
+    let base_nfa = if is_extension {
+        if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
+            let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
+            let base_matcher = compile_content_model_matcher(schema_set, base_type_def)?;
+            match base_matcher {
+                ContentModelMatcher::Nfa(nfa) => Some(nfa),
+                ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),
+                ContentModelMatcher::AllGroup(ref model) => {
+                    if own_nfa.is_none() {
+                        // Extension adds only attributes — return base AllGroup directly
+                        let open_content = resolve_open_content(
+                            schema_set,
+                            &type_def.content,
+                            type_def.open_content.as_ref(),
+                            type_def.source.as_ref(),
+                        );
+                        return Ok(attach_open_content(base_matcher, open_content));
+                    }
+                    // Extension has own particles — convert AllGroup to NFA for concat
+                    // (XSD 1.0 path; XSD 1.1 is handled above via compile_base_all_group)
+                    Some(all_group_to_nfa(model))
                 }
-            } else {
-                None
+                #[cfg(feature = "xsd11")]
+                ContentModelMatcher::AllGroupExtension { .. } => {
+                    // Should not occur: base type should not produce AllGroupExtension
+                    unreachable!("base type produced AllGroupExtension")
+                }
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     let effective_nfa = match (base_nfa, own_nfa) {
         (Some(base), Some(own)) => base.concat(own),
@@ -590,6 +845,37 @@ fn attach_open_content(
             mode: open_content.mode,
             wildcard: open_content.wildcard,
         },
+        ContentModelMatcher::AllGroup(mut model) => {
+            if let Some(wildcard_ref) = open_content.wildcard {
+                let mode = match open_content.mode {
+                    TypesOpenContentMode::Interleave => AllGroupOpenContentMode::Interleave,
+                    TypesOpenContentMode::Suffix => AllGroupOpenContentMode::Suffix,
+                    TypesOpenContentMode::None => AllGroupOpenContentMode::None,
+                };
+                model.open_content = Some(OpenContentWildcard {
+                    namespace_constraint: wildcard_ref.namespace_constraint,
+                    process_contents: wildcard_ref.process_contents,
+                    mode,
+                });
+            }
+            ContentModelMatcher::AllGroup(model)
+        }
+        #[cfg(feature = "xsd11")]
+        ContentModelMatcher::AllGroupExtension { mut base_model, extension_nfa } => {
+            if let Some(wildcard_ref) = open_content.wildcard {
+                let mode = match open_content.mode {
+                    TypesOpenContentMode::Interleave => AllGroupOpenContentMode::Interleave,
+                    TypesOpenContentMode::Suffix => AllGroupOpenContentMode::Suffix,
+                    TypesOpenContentMode::None => AllGroupOpenContentMode::None,
+                };
+                base_model.open_content = Some(OpenContentWildcard {
+                    namespace_constraint: wildcard_ref.namespace_constraint,
+                    process_contents: wildcard_ref.process_contents,
+                    mode,
+                });
+            }
+            ContentModelMatcher::AllGroupExtension { base_model, extension_nfa }
+        }
         other => other,
     }
 }
@@ -1070,6 +1356,370 @@ mod tests {
                 assert_eq!(*namespace, None);
             }
             _ => panic!("expected element term"),
+        }
+    }
+
+    fn make_all_particle(particles: Vec<ParticleResult>) -> ParticleResult {
+        ParticleResult {
+            term: ParticleTerm::Group(ModelGroupDefResult {
+                name: None,
+                ref_name: None,
+                compositor: Some(Compositor::All),
+                particles,
+                min_occurs: 1,
+                max_occurs: Some(1),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        }
+    }
+
+    fn make_complex_type_with_content(
+        content: ComplexContentResult,
+    ) -> ComplexTypeDefData {
+        make_complex_type_data(None, content)
+    }
+
+    #[test]
+    fn test_all_group_produces_all_group_matcher() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let schema_set = SchemaSet::new();
+        let all_particle = make_all_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 0, Some(1)),
+        ]);
+
+        let content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(all_particle),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+
+        let type_def = make_complex_type_with_content(content);
+        let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
+
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 2);
+                // First particle required, second optional
+                assert!(!model.particles[0].is_optional());
+                assert!(model.particles[1].is_optional());
+            }
+            other => panic!("expected AllGroup matcher, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_sequence_still_produces_nfa() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let schema_set = SchemaSet::new();
+        let seq_particle = make_sequence_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ]);
+
+        let content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(seq_particle),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+
+        let type_def = make_complex_type_with_content(content);
+        let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
+        assert!(matches!(matcher, ContentModelMatcher::Nfa(_)));
+    }
+
+    #[test]
+    fn test_extension_from_all_group_base_no_own_particles() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let mut schema_set = SchemaSet::new();
+
+        // Create base type with all-group
+        let base_all = make_all_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ]);
+        let base_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(base_all),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let base_ct = make_complex_type_data(None, base_content);
+        let base_key = schema_set.arenas.alloc_complex_type(base_ct);
+
+        // Create extension type with no own particle
+        let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: None,
+            derivation: DerivationMethod::Extension,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let mut ext_type = make_complex_type_data(None, ext_content);
+        ext_type.derivation_method = Some(DerivationMethod::Extension);
+        ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
+
+        let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
+        // Extension with no own particles should inherit AllGroup from base
+        assert!(matches!(matcher, ContentModelMatcher::AllGroup(_)));
+    }
+
+    #[test]
+    fn test_extension_from_all_group_base_with_own_particles() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let mut schema_set = SchemaSet::new();
+
+        // Create base type with all-group
+        let base_all = make_all_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+        ]);
+        let base_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(base_all),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let base_ct = make_complex_type_data(None, base_content);
+        let base_key = schema_set.arenas.alloc_complex_type(base_ct);
+
+        // Create extension type with its own sequence particle
+        let ext_seq = make_sequence_particle(vec![
+            make_element_particle(NameId(3), 1, Some(1)),
+        ]);
+        let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(ext_seq),
+            derivation: DerivationMethod::Extension,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let mut ext_type = make_complex_type_data(None, ext_content);
+        ext_type.derivation_method = Some(DerivationMethod::Extension);
+        ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
+
+        let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
+        // XSD 1.0: AllGroup converted to NFA, concat with own → Nfa
+        // XSD 1.1: AllGroup base + sequence extension → AllGroupExtension
+        #[cfg(not(feature = "xsd11"))]
+        assert!(matches!(matcher, ContentModelMatcher::Nfa(_)));
+        #[cfg(feature = "xsd11")]
+        assert!(matches!(matcher, ContentModelMatcher::AllGroupExtension { .. }));
+    }
+
+    #[test]
+    fn test_attach_open_content_all_group() {
+        use crate::types::complex::{
+            OpenContent, OpenContentMode as TypesOpenContentMode, WildcardRef,
+            NamespaceConstraint, ProcessContents as TypesProcessContents,
+        };
+
+        let a_name = NameId(1);
+        let model = AllGroupModel::new(vec![
+            AllParticle::new(
+                NfaTerm::element(a_name, None, None),
+                1,
+                MaxOccurs::Bounded(1),
+                None,
+            ),
+        ]);
+        let matcher = ContentModelMatcher::AllGroup(model);
+        let oc = OpenContent {
+            mode: TypesOpenContentMode::Interleave,
+            wildcard: Some(WildcardRef {
+                namespace_constraint: NamespaceConstraint::Any,
+                process_contents: TypesProcessContents::Lax,
+                source: None,
+            }),
+            source: None,
+        };
+
+        let result = attach_open_content(matcher, Some(oc));
+        match result {
+            ContentModelMatcher::AllGroup(model) => {
+                assert!(model.open_content.is_some(), "open content should be populated");
+                let oc = model.open_content.unwrap();
+                assert_eq!(oc.mode, crate::compiler::OpenContentMode::Interleave);
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_merged_all_groups() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let mut schema_set = SchemaSet::new();
+
+        // Base type: all(A, B)
+        let base_all = make_all_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ]);
+        let base_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(base_all),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let base_ct = make_complex_type_data(None, base_content);
+        let base_key = schema_set.arenas.alloc_complex_type(base_ct);
+
+        // Extension type: all(C, D)
+        let ext_all = make_all_particle(vec![
+            make_element_particle(NameId(3), 1, Some(1)),
+            make_element_particle(NameId(4), 0, Some(1)),
+        ]);
+        let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(ext_all),
+            derivation: DerivationMethod::Extension,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let mut ext_type = make_complex_type_data(None, ext_content);
+        ext_type.derivation_method = Some(DerivationMethod::Extension);
+        ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
+
+        let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
+        // Two all-groups should merge into a single AllGroup with 4 particles
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 4);
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_all_group_base_with_sequence() {
+        use crate::parser::frames::ComplexContentDefResult;
+
+        let mut schema_set = SchemaSet::new();
+
+        // Base type: all(A, B)
+        let base_all = make_all_particle(vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ]);
+        let base_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(base_all),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let base_ct = make_complex_type_data(None, base_content);
+        let base_key = schema_set.arenas.alloc_complex_type(base_ct);
+
+        // Extension type: sequence(C)
+        let ext_seq = make_sequence_particle(vec![
+            make_element_particle(NameId(3), 1, Some(1)),
+        ]);
+        let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(ext_seq),
+            derivation: DerivationMethod::Extension,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let mut ext_type = make_complex_type_data(None, ext_content);
+        ext_type.derivation_method = Some(DerivationMethod::Extension);
+        ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
+
+        let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroupExtension { base_model, .. } => {
+                assert_eq!(base_model.particle_count(), 2);
+            }
+            other => panic!("expected AllGroupExtension, got {:?}", other),
         }
     }
 }

@@ -58,6 +58,7 @@ pub use particle::{MaxOccurs, CountedParticle, apply_occurs, MAX_OCCURS_LIMIT};
 pub use all_group::{
     AllGroupModel, AllParticle, AllGroupState, OpenContentWildcard, OpenContentMode,
     validate_all_group_constraints, term_matches, term_matches_with_substitution, TermMatchResult,
+    wildcard_matches,
 };
 pub use upa::check_upa;
 pub use substitution::{build_substitution_group_map, SubstitutionGroupMap};
@@ -76,6 +77,12 @@ pub enum ContentModelMatcher {
         nfa: NfaTable,
         mode: TypesOpenContentMode,
         wildcard: Option<WildcardRef>,
+    },
+    /// All-group base + NFA extension (XSD 1.1 complex type extension).
+    #[cfg(feature = "xsd11")]
+    AllGroupExtension {
+        base_model: AllGroupModel,
+        extension_nfa: NfaTable,
     },
 }
 

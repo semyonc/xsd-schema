@@ -1,14 +1,16 @@
-//! Open content preparation helpers (XSD 1.1)
+//! Open content schema-level validation helpers (XSD 1.1)
 //!
-//! Full open content validation is implemented in Phase 6. This module provides
-//! placeholder structures and entrypoints used by the compiler.
+//! This module provides helpers for validating that open content declarations
+//! in the schema are well-formed (schema-level checks). Runtime instance
+//! validation of open content (matching additional elements against the
+//! wildcard) is implemented in `crate::validation::content`.
 
 use crate::error::SchemaResult;
 pub use crate::types::complex::{OpenContent, OpenContentMode};
 
 use super::ContentModelMatcher;
 
-/// Stub for interleaved open content validation (Phase 6).
+/// Schema-level validation for interleaved open content declarations.
 pub fn validate_interleave(
     _matcher: &ContentModelMatcher,
     _open_content: &OpenContent,
@@ -16,7 +18,7 @@ pub fn validate_interleave(
     Ok(())
 }
 
-/// Stub for suffix open content validation (Phase 6).
+/// Schema-level validation for suffix open content declarations.
 pub fn validate_suffix(
     _matcher: &ContentModelMatcher,
     _open_content: &OpenContent,

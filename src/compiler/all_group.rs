@@ -77,12 +77,11 @@ pub enum OpenContentMode {
 
 /// Mutable state during all-group validation
 ///
-/// Tracks how many more times each particle can be matched.
+/// Tracks how many times each particle has been matched (consumed count).
 #[derive(Debug, Clone)]
 pub struct AllGroupState {
-    /// Remaining match count for each particle (by index)
-    /// For Unbounded, we use u32::MAX as sentinel
-    remaining: Vec<u32>,
+    /// Number of times each particle has been matched (by index)
+    consumed: Vec<u32>,
 }
 
 impl AllGroupModel {
@@ -144,68 +143,58 @@ impl AllParticle {
         consumed >= self.min_occurs
     }
 
-    /// Get the initial remaining count for validation
-    fn initial_remaining(&self) -> u32 {
-        match self.max_occurs {
-            MaxOccurs::Unbounded => u32::MAX,
-            MaxOccurs::Bounded(n) => n,
-        }
-    }
 }
 
 impl AllGroupState {
     /// Create a new validation state for an all-group
     pub fn new(model: &AllGroupModel) -> Self {
-        let remaining = model.particles.iter().map(|p| p.initial_remaining()).collect();
-        Self { remaining }
+        Self {
+            consumed: vec![0; model.particles.len()],
+        }
     }
 
     /// Reset the state for a new validation run
     pub fn reset(&mut self, model: &AllGroupModel) {
-        self.remaining.clear();
-        self.remaining.extend(model.particles.iter().map(|p| p.initial_remaining()));
+        self.consumed.clear();
+        self.consumed.resize(model.particles.len(), 0);
     }
 
     /// Check if a particle can still accept matches
-    pub fn can_accept(&self, index: usize) -> bool {
-        self.remaining.get(index).map(|&r| r > 0).unwrap_or(false)
+    pub fn can_accept(&self, model: &AllGroupModel, index: usize) -> bool {
+        if let (Some(&count), Some(particle)) =
+            (self.consumed.get(index), model.particles.get(index))
+        {
+            match particle.max_occurs {
+                MaxOccurs::Unbounded => true,
+                MaxOccurs::Bounded(max) => count < max,
+            }
+        } else {
+            false
+        }
     }
 
     /// Accept a match for the particle at the given index
     ///
     /// Returns true if the match was accepted, false if the particle
     /// cannot accept any more matches.
-    pub fn accept(&mut self, index: usize) -> bool {
-        if let Some(remaining) = self.remaining.get_mut(index) {
-            if *remaining > 0 {
-                if *remaining != u32::MAX {
-                    *remaining -= 1;
-                }
-                return true;
-            }
+    pub fn accept(&mut self, model: &AllGroupModel, index: usize) -> bool {
+        if self.can_accept(model, index) {
+            self.consumed[index] += 1;
+            true
+        } else {
+            false
         }
-        false
     }
 
     /// Get how many times a particle has been matched
-    pub fn consumed(&self, model: &AllGroupModel, index: usize) -> u32 {
-        let particle = &model.particles[index];
-        let initial = particle.initial_remaining();
-        if initial == u32::MAX {
-            // For unbounded, we track separately or assume consumed = MAX - remaining
-            // Since we don't decrement u32::MAX, we can't compute consumed directly
-            // We'll need to track consumed separately for unbounded particles
-            0 // Placeholder - unbounded particles always satisfy minOccurs check
-        } else {
-            initial.saturating_sub(self.remaining[index])
-        }
+    pub fn consumed(&self, index: usize) -> u32 {
+        self.consumed.get(index).copied().unwrap_or(0)
     }
 
     /// Check if all particles have satisfied their minOccurs constraints
     pub fn is_satisfied(&self, model: &AllGroupModel) -> bool {
         for (i, particle) in model.particles.iter().enumerate() {
-            let consumed = self.consumed(model, i);
-            if !particle.is_satisfied(consumed) {
+            if !particle.is_satisfied(self.consumed(i)) {
                 return false;
             }
         }
@@ -216,8 +205,7 @@ impl AllGroupState {
     pub fn unsatisfied_indices(&self, model: &AllGroupModel) -> Vec<usize> {
         let mut result = Vec::new();
         for (i, particle) in model.particles.iter().enumerate() {
-            let consumed = self.consumed(model, i);
-            if !particle.is_satisfied(consumed) {
+            if !particle.is_satisfied(self.consumed(i)) {
                 result.push(i);
             }
         }
@@ -363,7 +351,7 @@ pub fn term_matches_with_substitution(
 }
 
 /// Check if a wildcard namespace constraint matches an element
-fn wildcard_matches(
+pub fn wildcard_matches(
     constraint: &NamespaceConstraint,
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
@@ -476,8 +464,8 @@ mod tests {
         let model = AllGroupModel::new(particles);
         let state = model.create_state();
 
-        assert!(state.can_accept(0));
-        assert!(state.can_accept(1));
+        assert!(state.can_accept(&model, 0));
+        assert!(state.can_accept(&model, 1));
     }
 
     #[test]
@@ -486,12 +474,12 @@ mod tests {
         let model = AllGroupModel::new(particles);
         let mut state = model.create_state();
 
-        assert!(state.can_accept(0));
-        assert!(state.accept(0));
-        assert!(state.can_accept(0)); // Still has 1 remaining
-        assert!(state.accept(0));
-        assert!(!state.can_accept(0)); // No more remaining
-        assert!(!state.accept(0)); // Should return false
+        assert!(state.can_accept(&model, 0));
+        assert!(state.accept(&model, 0));
+        assert!(state.can_accept(&model, 0)); // Still has 1 remaining
+        assert!(state.accept(&model, 0));
+        assert!(!state.can_accept(&model, 0)); // No more remaining
+        assert!(!state.accept(&model, 0)); // Should return false
     }
 
     #[test]
@@ -501,10 +489,10 @@ mod tests {
         let mut state = model.create_state();
 
         for _ in 0..1000 {
-            assert!(state.can_accept(0));
-            assert!(state.accept(0));
+            assert!(state.can_accept(&model, 0));
+            assert!(state.accept(&model, 0));
         }
-        assert!(state.can_accept(0)); // Still accepting
+        assert!(state.can_accept(&model, 0)); // Still accepting
     }
 
     #[test]
@@ -518,7 +506,7 @@ mod tests {
 
         assert!(!state.is_satisfied(&model)); // First particle not satisfied
 
-        state.accept(0); // Match first particle once
+        state.accept(&model, 0); // Match first particle once
         assert!(state.is_satisfied(&model)); // Now satisfied
     }
 
@@ -535,7 +523,7 @@ mod tests {
         let unsatisfied = state.unsatisfied_indices(&model);
         assert_eq!(unsatisfied, vec![0, 1]); // Particles 0 and 1 require matching
 
-        state.accept(0);
+        state.accept(&model, 0);
         let unsatisfied = state.unsatisfied_indices(&model);
         assert_eq!(unsatisfied, vec![1]); // Only particle 1 unsatisfied now
     }
