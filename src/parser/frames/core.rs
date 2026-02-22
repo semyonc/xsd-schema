@@ -122,6 +122,8 @@ pub struct ComplexTypeResult {
     pub block: DerivationSet,
     pub default_attributes_apply: bool,
     pub id: Option<String>,
+    #[cfg(feature = "xsd11")]
+    pub xpath_default_namespace: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
 }
@@ -373,6 +375,7 @@ pub enum FacetKind {
 pub struct SelectorResult {
     pub xpath: String,
     pub xpath_default_namespace: Option<String>,
+    pub ns_snapshot: NamespaceContextSnapshot,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
@@ -394,6 +397,7 @@ pub struct NotationResult {
 pub struct FieldResult {
     pub xpath: String,
     pub xpath_default_namespace: Option<String>,
+    pub ns_snapshot: NamespaceContextSnapshot,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
@@ -404,6 +408,7 @@ pub struct FieldResult {
 pub struct AssertResult {
     pub test: String,
     pub xpath_default_namespace: Option<String>,
+    pub ns_snapshot: NamespaceContextSnapshot,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,

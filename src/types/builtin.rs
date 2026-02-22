@@ -233,6 +233,10 @@ impl BuiltinTypes {
             block: crate::schema::model::DerivationSet::empty(),
             default_attributes_apply: true,
             id: None,
+            #[cfg(feature = "xsd11")]
+            assertions: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace: None,
             annotation: None,
             source: None,
             // Resolved references (built-in types have no unresolved references)

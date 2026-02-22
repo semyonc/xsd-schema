@@ -1021,6 +1021,8 @@ pub struct ComplexTypeFrame {
     attribute_groups: Vec<QNameRef>,
     attribute_wildcard: Option<WildcardResult>,
     assertions: Vec<AssertResult>,
+    #[cfg(feature = "xsd11")]
+    xpath_default_namespace: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
@@ -1055,6 +1057,11 @@ impl ComplexTypeFrame {
             .get_value_by_name(name_table, "id")
             .map(String::from);
 
+        #[cfg(feature = "xsd11")]
+        let xpath_default_namespace = attrs
+            .get_value_by_name(name_table, "xpathDefaultNamespace")
+            .map(String::from);
+
         Ok(Self {
             phase: ComplexTypePhase::Annotation,
             name,
@@ -1072,6 +1079,8 @@ impl ComplexTypeFrame {
             attribute_groups: Vec::new(),
             attribute_wildcard: None,
             assertions: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace,
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
@@ -1126,6 +1135,10 @@ impl Frame for ComplexTypeFrame {
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        if local_name == "xpathDefaultNamespace" {
+            return true;
+        }
         matches!(
             local_name,
             "name"
@@ -1319,6 +1332,8 @@ impl Frame for ComplexTypeFrame {
             block: self.block,
             default_attributes_apply: self.default_attributes_apply,
             id: self.id,
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace: self.xpath_default_namespace,
             annotation,
             source: self.source,
         }))))

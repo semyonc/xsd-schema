@@ -117,6 +117,7 @@ impl Frame for AlternativeFrame {
 pub struct AssertFrame {
     test: String,
     xpath_default_namespace: Option<String>,
+    ns_snapshot: NamespaceContextSnapshot,
     id: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
@@ -128,6 +129,7 @@ impl AssertFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
+        ns_snapshot: NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
         let test = attrs
             .get_value_by_name(name_table, "test")
@@ -145,6 +147,7 @@ impl AssertFrame {
         Ok(Self {
             test,
             xpath_default_namespace,
+            ns_snapshot,
             id,
             annotation: None,
             source,
@@ -180,6 +183,7 @@ impl Frame for AssertFrame {
         Ok(FrameResult::Assert(AssertResult {
             test: self.test,
             xpath_default_namespace: self.xpath_default_namespace,
+            ns_snapshot: self.ns_snapshot,
             id: self.id,
             annotation,
             source: self.source,

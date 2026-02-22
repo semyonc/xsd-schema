@@ -50,12 +50,12 @@ pub fn create_frame(
         xsd_names::KEY => Box::new(IdentityFrame::new(IdentityKind::Key, attrs, name_table, source, ns_snapshot)?),
         xsd_names::KEYREF => Box::new(IdentityFrame::new(IdentityKind::Keyref, attrs, name_table, source, ns_snapshot)?),
         xsd_names::UNIQUE => Box::new(IdentityFrame::new(IdentityKind::Unique, attrs, name_table, source, ns_snapshot)?),
-        xsd_names::SELECTOR => Box::new(SelectorFrame::new(attrs, name_table, source)?),
-        xsd_names::FIELD => Box::new(FieldFrame::new(attrs, name_table, source)?),
+        xsd_names::SELECTOR => Box::new(SelectorFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
+        xsd_names::FIELD => Box::new(FieldFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         #[cfg(feature = "xsd11")]
         xsd_names::ALTERNATIVE => Box::new(AlternativeFrame::new(attrs, name_table, source, ns_snapshot)?),
         #[cfg(feature = "xsd11")]
-        xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source)?),
+        xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         xsd_names::ENUMERATION => {
             Box::new(FacetFrame::new(FacetKind::Enumeration, attrs, name_table, source)?)
         }

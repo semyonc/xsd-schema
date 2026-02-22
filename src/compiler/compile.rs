@@ -1100,6 +1100,10 @@ mod tests {
             block: Default::default(),
             default_attributes_apply: true,
             id: None,
+            #[cfg(feature = "xsd11")]
+            assertions: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace: None,
             annotation: None,
             source,
             resolved_base_type: None,

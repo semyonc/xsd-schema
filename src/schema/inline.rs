@@ -722,6 +722,12 @@ fn assemble_inline_type(
                 ComplexContentResult::Complex(def) => def.open_content.clone(),
                 _ => None,
             };
+            #[cfg(feature = "xsd11")]
+            let assertions = match &complex.content {
+                ComplexContentResult::Simple(sc) => sc.assertions.clone(),
+                ComplexContentResult::Complex(cc) => cc.assertions.clone(),
+                ComplexContentResult::Empty => Vec::new(),
+            };
             let data = ComplexTypeDefData {
                 name: complex.name, // May be None for anonymous types
                 target_namespace,
@@ -738,6 +744,10 @@ fn assemble_inline_type(
                 block: complex.block,
                 default_attributes_apply: complex.default_attributes_apply,
                 id: complex.id.clone(),
+                #[cfg(feature = "xsd11")]
+                assertions,
+                #[cfg(feature = "xsd11")]
+                xpath_default_namespace: complex.xpath_default_namespace.clone(),
                 annotation: complex.annotation.clone(),
                 source: complex.source.clone(),
                 // Resolved references (to be populated later)
@@ -1291,6 +1301,10 @@ mod tests {
             block: DerivationSet::empty(),
             default_attributes_apply: true,
             id: None,
+            #[cfg(feature = "xsd11")]
+            assertions: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace: None,
             annotation: None,
             source: None,
             resolved_base_type: None,

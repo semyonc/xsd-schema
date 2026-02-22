@@ -175,6 +175,8 @@ impl<'a> SchemaAssembler<'a> {
                     block,
                     default_attributes_apply,
                     id,
+                    #[cfg(feature = "xsd11")]
+                    xpath_default_namespace,
                     annotation,
                     source,
                 } = *complex;
@@ -189,6 +191,12 @@ impl<'a> SchemaAssembler<'a> {
                 let open_content = match &content {
                     ComplexContentResult::Complex(def) => def.open_content.clone(),
                     _ => None,
+                };
+                #[cfg(feature = "xsd11")]
+                let assertions = match &content {
+                    ComplexContentResult::Simple(sc) => sc.assertions.clone(),
+                    ComplexContentResult::Complex(cc) => cc.assertions.clone(),
+                    ComplexContentResult::Empty => Vec::new(),
                 };
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("complexType", source_ref.as_ref(), self.schema_set))?;
@@ -208,6 +216,10 @@ impl<'a> SchemaAssembler<'a> {
                     block,
                     default_attributes_apply,
                     id,
+                    #[cfg(feature = "xsd11")]
+                    assertions,
+                    #[cfg(feature = "xsd11")]
+                    xpath_default_namespace,
                     annotation,
                     source,
                     // Resolved references (populated after reference resolution phase)

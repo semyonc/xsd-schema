@@ -6,6 +6,7 @@
 pub struct SelectorFrame {
     xpath: String,
     xpath_default_namespace: Option<String>,
+    ns_snapshot: NamespaceContextSnapshot,
     id: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
@@ -17,6 +18,7 @@ impl SelectorFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
+        ns_snapshot: NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
         let xpath = attrs
             .get_value_by_name(name_table, "xpath")
@@ -34,6 +36,7 @@ impl SelectorFrame {
         Ok(Self {
             xpath,
             xpath_default_namespace,
+            ns_snapshot,
             id,
             annotation: None,
             source,
@@ -69,6 +72,7 @@ impl Frame for SelectorFrame {
         Ok(FrameResult::Selector(SelectorResult {
             xpath: self.xpath,
             xpath_default_namespace: self.xpath_default_namespace,
+            ns_snapshot: self.ns_snapshot,
             id: self.id,
             annotation,
             source: self.source,
@@ -88,6 +92,7 @@ impl Frame for SelectorFrame {
 pub struct FieldFrame {
     xpath: String,
     xpath_default_namespace: Option<String>,
+    ns_snapshot: NamespaceContextSnapshot,
     id: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
@@ -99,6 +104,7 @@ impl FieldFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
+        ns_snapshot: NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
         let xpath = attrs
             .get_value_by_name(name_table, "xpath")
@@ -116,6 +122,7 @@ impl FieldFrame {
         Ok(Self {
             xpath,
             xpath_default_namespace,
+            ns_snapshot,
             id,
             annotation: None,
             source,
@@ -151,6 +158,7 @@ impl Frame for FieldFrame {
         Ok(FrameResult::Field(FieldResult {
             xpath: self.xpath,
             xpath_default_namespace: self.xpath_default_namespace,
+            ns_snapshot: self.ns_snapshot,
             id: self.id,
             annotation,
             source: self.source,

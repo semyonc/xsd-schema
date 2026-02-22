@@ -9,10 +9,12 @@ use slotmap::SlotMap;
 
 use crate::ids::*;
 use crate::parser::frames::{
-    AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor, DerivationMethod,
-    IdentityResult, OpenContentResult, ParticleResult, QNameRef, SimpleTypeResult,
-    SimpleTypeVariety, TypeFrameResult, TypeRefResult, WildcardResult,
+    AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor,
+    DerivationMethod, IdentityResult, OpenContentResult, ParticleResult, QNameRef,
+    SimpleTypeResult, SimpleTypeVariety, TypeFrameResult, TypeRefResult, WildcardResult,
 };
+#[cfg(feature = "xsd11")]
+use crate::parser::frames::AssertResult;
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::Annotation;
 use crate::schema::model::DerivationSet;
@@ -73,6 +75,10 @@ pub struct ComplexTypeDefData {
     pub block: DerivationSet,
     pub default_attributes_apply: bool,
     pub id: Option<String>,
+    #[cfg(feature = "xsd11")]
+    pub assertions: Vec<AssertResult>,
+    #[cfg(feature = "xsd11")]
+    pub xpath_default_namespace: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
 

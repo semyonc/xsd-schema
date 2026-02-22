@@ -171,6 +171,7 @@ mod tests {
             .attach(FrameResult::Selector(SelectorResult {
                 xpath: ".//a".to_string(),
                 xpath_default_namespace: None,
+                ns_snapshot: empty_snapshot(),
                 id: None,
                 annotation: None,
                 source: None,
