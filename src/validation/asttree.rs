@@ -11,6 +11,7 @@ use std::fmt;
 use crate::ids::NameId;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::table::NameTable;
+use crate::schema::model::XsdVersion;
 
 use super::identity_lexer::IdXPathLexError;
 
@@ -141,6 +142,7 @@ impl Asttree {
     /// Compile a selector XPath expression.
     ///
     /// Selector expressions may not contain attribute steps.
+    /// In XSD 1.0 mode, `xpathDefaultNamespace` is ignored (forced to `NoNamespace`).
     pub fn compile_selector(
         xpath: &str,
         ns_snapshot: &NamespaceContextSnapshot,
@@ -148,12 +150,19 @@ impl Asttree {
         own_xpath_default_ns: Option<&str>,
         schema_xpath_default_ns: Option<NameId>,
         target_namespace: Option<NameId>,
+        xsd_version: XsdVersion,
     ) -> Result<Asttree, IdentityXPathError> {
         use super::identity_parser::IdXPathParser;
 
+        // In XSD 1.0 mode, xpathDefaultNamespace is not supported
+        let (effective_own, effective_schema) = match xsd_version {
+            XsdVersion::V1_0 => (None, None),
+            XsdVersion::V1_1 => (own_xpath_default_ns, schema_xpath_default_ns),
+        };
+
         let unprefixed_ns = resolve_effective_default_ns(
-            own_xpath_default_ns,
-            schema_xpath_default_ns,
+            effective_own,
+            effective_schema,
             ns_snapshot,
             target_namespace,
             name_table,
@@ -165,6 +174,7 @@ impl Asttree {
     /// Compile a field XPath expression.
     ///
     /// Field expressions allow an optional final attribute step.
+    /// In XSD 1.0 mode, `xpathDefaultNamespace` is ignored (forced to `NoNamespace`).
     pub fn compile_field(
         xpath: &str,
         ns_snapshot: &NamespaceContextSnapshot,
@@ -172,12 +182,19 @@ impl Asttree {
         own_xpath_default_ns: Option<&str>,
         schema_xpath_default_ns: Option<NameId>,
         target_namespace: Option<NameId>,
+        xsd_version: XsdVersion,
     ) -> Result<Asttree, IdentityXPathError> {
         use super::identity_parser::IdXPathParser;
 
+        // In XSD 1.0 mode, xpathDefaultNamespace is not supported
+        let (effective_own, effective_schema) = match xsd_version {
+            XsdVersion::V1_0 => (None, None),
+            XsdVersion::V1_1 => (own_xpath_default_ns, schema_xpath_default_ns),
+        };
+
         let unprefixed_ns = resolve_effective_default_ns(
-            own_xpath_default_ns,
-            schema_xpath_default_ns,
+            effective_own,
+            effective_schema,
             ns_snapshot,
             target_namespace,
             name_table,
@@ -419,5 +436,102 @@ mod tests {
             local_name: ln1,
         };
         assert!(!test.matches(ns, ln2));
+    }
+
+    // --- XSD version gating tests ---
+
+    #[test]
+    fn compile_selector_v10_ignores_own_xpath_default_ns() {
+        // In XSD 1.0 mode, xpathDefaultNamespace should be ignored,
+        // so unprefixed element names resolve to NoNamespace.
+        let table = NameTable::new();
+        let snapshot = NamespaceContextSnapshot::default();
+        let tree = Asttree::compile_selector(
+            "foo",
+            &snapshot,
+            &table,
+            Some("http://example.com/default"),
+            None,
+            None,
+            XsdVersion::V1_0,
+        )
+        .unwrap();
+        match &tree.paths[0].steps[0] {
+            AstStep::Child(NameTest::QName { namespace, .. }) => {
+                assert_eq!(*namespace, NamespaceMatch::NoNamespace);
+            }
+            other => panic!("expected Child(QName{{NoNamespace, ..}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_selector_v11_applies_own_xpath_default_ns() {
+        // In XSD 1.1 mode, xpathDefaultNamespace should be applied.
+        let table = NameTable::new();
+        let snapshot = NamespaceContextSnapshot::default();
+        let ns_id = table.add("http://example.com/default");
+        let tree = Asttree::compile_selector(
+            "foo",
+            &snapshot,
+            &table,
+            Some("http://example.com/default"),
+            None,
+            None,
+            XsdVersion::V1_1,
+        )
+        .unwrap();
+        match &tree.paths[0].steps[0] {
+            AstStep::Child(NameTest::QName { namespace, .. }) => {
+                assert_eq!(*namespace, NamespaceMatch::Exact(ns_id));
+            }
+            other => panic!("expected Child(QName{{Exact, ..}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_selector_v10_ignores_schema_xpath_default_ns() {
+        // In XSD 1.0 mode, even schema-level xpathDefaultNamespace is ignored.
+        let table = NameTable::new();
+        let schema_ns = table.add("http://example.com/schema");
+        let snapshot = NamespaceContextSnapshot::default();
+        let tree = Asttree::compile_selector(
+            "foo",
+            &snapshot,
+            &table,
+            None,
+            Some(schema_ns),
+            None,
+            XsdVersion::V1_0,
+        )
+        .unwrap();
+        match &tree.paths[0].steps[0] {
+            AstStep::Child(NameTest::QName { namespace, .. }) => {
+                assert_eq!(*namespace, NamespaceMatch::NoNamespace);
+            }
+            other => panic!("expected Child(QName{{NoNamespace, ..}}), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compile_field_v10_ignores_xpath_default_ns() {
+        // In XSD 1.0 mode, field compilation ignores xpathDefaultNamespace.
+        let table = NameTable::new();
+        let snapshot = NamespaceContextSnapshot::default();
+        let tree = Asttree::compile_field(
+            "foo",
+            &snapshot,
+            &table,
+            Some("http://example.com/default"),
+            None,
+            None,
+            XsdVersion::V1_0,
+        )
+        .unwrap();
+        match &tree.paths[0].steps[0] {
+            AstStep::Child(NameTest::QName { namespace, .. }) => {
+                assert_eq!(*namespace, NamespaceMatch::NoNamespace);
+            }
+            other => panic!("expected Child(QName{{NoNamespace, ..}}), got {other:?}"),
+        }
     }
 }

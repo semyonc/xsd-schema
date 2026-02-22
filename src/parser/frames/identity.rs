@@ -25,9 +25,12 @@ impl SelectorFrame {
             .map(String::from)
             .unwrap_or_default();
 
+        #[cfg(feature = "xsd11")]
         let xpath_default_namespace = attrs
             .get_value_by_name(name_table, "xpathDefaultNamespace")
             .map(String::from);
+        #[cfg(not(feature = "xsd11"))]
+        let xpath_default_namespace: Option<String> = None;
 
         let id = attrs
             .get_value_by_name(name_table, "id")
@@ -51,7 +54,11 @@ impl Frame for SelectorFrame {
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        matches!(local_name, "xpath" | "xpathDefaultNamespace" | "id")
+        #[cfg(feature = "xsd11")]
+        if local_name == "xpathDefaultNamespace" {
+            return true;
+        }
+        matches!(local_name, "xpath" | "id")
     }
 
     fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
@@ -111,9 +118,12 @@ impl FieldFrame {
             .map(String::from)
             .unwrap_or_default();
 
+        #[cfg(feature = "xsd11")]
         let xpath_default_namespace = attrs
             .get_value_by_name(name_table, "xpathDefaultNamespace")
             .map(String::from);
+        #[cfg(not(feature = "xsd11"))]
+        let xpath_default_namespace: Option<String> = None;
 
         let id = attrs
             .get_value_by_name(name_table, "id")
@@ -137,7 +147,11 @@ impl Frame for FieldFrame {
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        matches!(local_name, "xpath" | "xpathDefaultNamespace" | "id")
+        #[cfg(feature = "xsd11")]
+        if local_name == "xpathDefaultNamespace" {
+            return true;
+        }
+        matches!(local_name, "xpath" | "id")
     }
 
     fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}

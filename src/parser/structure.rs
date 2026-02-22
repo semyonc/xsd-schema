@@ -674,9 +674,14 @@ pub fn validate_xsd_version_attribute(
             ("attribute", "targetNamespace") => true,
             ("attribute", "inheritable") => true,
             ("complexType", "defaultAttributesApply") => true,
+            ("complexType", "xpathDefaultNamespace") => true,
             ("any", "notNamespace") | ("any", "notQName") => true,
             ("anyAttribute", "notNamespace") | ("anyAttribute", "notQName") => true,
             ("schema", "xpathDefaultNamespace") => true,
+            ("selector", "xpathDefaultNamespace") => true,
+            ("field", "xpathDefaultNamespace") => true,
+            // targetNamespace on schema is valid in XSD 1.0
+            ("schema", "targetNamespace") => false,
             _ => XSD_1_1_ATTRIBUTES.contains(&attr_name),
         };
 
@@ -960,6 +965,50 @@ mod tests {
         let ctx = ValidationContext::new(XsdVersion::V1_1, true);
 
         let result = validate_notation_structure(&attrs, &name_table, &ctx);
+        assert!(result.is_ok());
+    }
+
+    // --- xpathDefaultNamespace version gating tests ---
+
+    #[test]
+    fn test_xpath_default_ns_on_selector_rejected_in_1_0() {
+        let ctx = ValidationContext::new(XsdVersion::V1_0, false);
+        let result = validate_xsd_version_attribute("xpathDefaultNamespace", "selector", &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xpath_default_ns_on_field_rejected_in_1_0() {
+        let ctx = ValidationContext::new(XsdVersion::V1_0, false);
+        let result = validate_xsd_version_attribute("xpathDefaultNamespace", "field", &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_xpath_default_ns_on_schema_rejected_in_1_0() {
+        let ctx = ValidationContext::new(XsdVersion::V1_0, true);
+        let result = validate_xsd_version_attribute("xpathDefaultNamespace", "schema", &ctx);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_target_namespace_on_schema_allowed_in_1_0() {
+        let ctx = ValidationContext::new(XsdVersion::V1_0, true);
+        let result = validate_xsd_version_attribute("targetNamespace", "schema", &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xpath_default_ns_on_selector_allowed_in_1_1() {
+        let ctx = ValidationContext::new(XsdVersion::V1_1, false);
+        let result = validate_xsd_version_attribute("xpathDefaultNamespace", "selector", &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xpath_default_ns_on_field_allowed_in_1_1() {
+        let ctx = ValidationContext::new(XsdVersion::V1_1, false);
+        let result = validate_xsd_version_attribute("xpathDefaultNamespace", "field", &ctx);
         assert!(result.is_ok());
     }
 }

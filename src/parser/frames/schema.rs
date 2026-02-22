@@ -64,9 +64,12 @@ impl SchemaFrame {
             .map(|s| parse_qname_ref(s, name_table, ns_snapshot))
             .transpose()?;
 
+        #[cfg(feature = "xsd11")]
         let xpath_default_namespace = attrs
             .get_value_by_name(name_table, "xpathDefaultNamespace")
             .map(String::from);
+        #[cfg(not(feature = "xsd11"))]
+        let xpath_default_namespace: Option<String> = None;
 
         let final_default = parse_derivation_set(
             attrs.get_value_by_name(name_table, "finalDefault"),
@@ -144,6 +147,10 @@ impl Frame for SchemaFrame {
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        #[cfg(feature = "xsd11")]
+        if local_name == "xpathDefaultNamespace" {
+            return true;
+        }
         matches!(
             local_name,
             "targetNamespace"
@@ -151,7 +158,6 @@ impl Frame for SchemaFrame {
                 | "attributeFormDefault"
                 | "blockDefault"
                 | "defaultAttributes"
-                | "xpathDefaultNamespace"
                 | "finalDefault"
                 | "version"
                 | "id"

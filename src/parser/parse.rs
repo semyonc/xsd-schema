@@ -42,7 +42,7 @@ use crate::parser::frames::{
 use crate::parser::location::{SourceLocation, SourceMap, SourceRef, SourceSpan};
 use crate::parser::reader::{split_qname, TrackedReader};
 use crate::parser::structure::{
-    ValidationContext, validate_xsd_version_element,
+    ValidationContext, validate_xsd_version_element, validate_xsd_version_attribute,
     validate_element_structure, validate_attribute_structure,
     validate_simple_type_structure, validate_complex_type_structure,
     validate_extension_structure,
@@ -126,8 +126,8 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
         self.xsd_ns_id
     }
 
-    /// Check if an element is in the XSD namespace
-    fn is_xsd_element(&mut self, namespace: Option<NameId>) -> bool {
+    /// Check if a namespace URI is the XSD namespace
+    fn is_in_xsd_namespace(&mut self, namespace: Option<NameId>) -> bool {
         match (namespace, self.get_xsd_ns_id()) {
             (Some(ns), Some(xsd_ns)) => ns == xsd_ns,
             (None, _) => false, // Unqualified elements are not XSD elements
@@ -409,7 +409,7 @@ fn handle_start_element(
         *seen_root = true;
 
         // Must be xs:schema
-        if local_name != xsd_names::SCHEMA || !state.is_xsd_element(element_ns) {
+        if local_name != xsd_names::SCHEMA || !state.is_in_xsd_namespace(element_ns) {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!(
@@ -432,7 +432,7 @@ fn handle_start_element(
     let attr_map = AttributeMap::new(xsd_attrs);
 
     // Check if this is an XSD element (must do before borrowing frame)
-    let is_xsd_element = state.is_xsd_element(element_ns);
+    let is_in_xsd_ns = state.is_in_xsd_namespace(element_ns);
 
     // Check if current frame allows this child and handle skip frames
     let (allows_child, has_frame, in_skip_frame) = {
@@ -458,7 +458,7 @@ fn handle_start_element(
             return Ok(());
         }
 
-        if !is_xsd_element {
+        if !is_in_xsd_ns {
             // Non-XSD element - could be in annotation or skip
             // For now, skip it by pushing a skip frame
             push_skip_frame(state, source_ref, foreign_attrs)?;
@@ -514,8 +514,22 @@ fn handle_start_element(
         }
     }
 
+    // Validate XSD version for individual attributes
+    if is_in_xsd_ns {
+        for attr_name_id in attr_map.names() {
+            let attr_name = state.ns_context.name_table().resolve(attr_name_id);
+            if let Err(e) = validate_xsd_version_attribute(&attr_name, local_name, &validation_ctx) {
+                if state.config.error_recovery {
+                    state.add_error(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
     // Intern attribute values that are represented as NameId in frame results
-    if is_xsd_element {
+    if is_in_xsd_ns {
         intern_attribute_values(local_name, &attr_map, state.ns_context.name_table_mut());
     }
 

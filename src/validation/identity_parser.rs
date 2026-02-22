@@ -434,16 +434,18 @@ mod tests {
 
     /// Helper: compile a selector with no namespace context.
     fn compile_selector(input: &str) -> Result<Asttree, IdentityXPathError> {
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
-        Asttree::compile_selector(input, &snapshot, &table, None, None, None)
+        Asttree::compile_selector(input, &snapshot, &table, None, None, None, XsdVersion::V1_1)
     }
 
     /// Helper: compile a field with no namespace context.
     fn compile_field(input: &str) -> Result<Asttree, IdentityXPathError> {
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
-        Asttree::compile_field(input, &snapshot, &table, None, None, None)
+        Asttree::compile_field(input, &snapshot, &table, None, None, None, XsdVersion::V1_1)
     }
 
     // --- Parser tests ---
@@ -509,10 +511,11 @@ mod tests {
 
     #[test]
     fn ns_wildcard() {
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = snapshot_with_prefix(&table, "ns", "http://example.com");
         let tree =
-            Asttree::compile_selector("ns:*", &snapshot, &table, None, None, None).unwrap();
+            Asttree::compile_selector("ns:*", &snapshot, &table, None, None, None, XsdVersion::V1_1).unwrap();
         assert!(matches!(
             &tree.paths[0].steps[0],
             AstStep::Child(NameTest::NamespaceWildcard(_))
@@ -521,11 +524,12 @@ mod tests {
 
     #[test]
     fn prefixed_qname() {
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = snapshot_with_prefix(&table, "ns", "http://example.com");
         let ns_id = table.add("http://example.com");
         let tree =
-            Asttree::compile_selector("ns:foo", &snapshot, &table, None, None, None).unwrap();
+            Asttree::compile_selector("ns:foo", &snapshot, &table, None, None, None, XsdVersion::V1_1).unwrap();
         match &tree.paths[0].steps[0] {
             AstStep::Child(NameTest::QName {
                 namespace: NamespaceMatch::Exact(ns),
@@ -646,6 +650,7 @@ mod tests {
     fn unprefixed_attr_ignores_xpath_default_ns() {
         // Even with xpathDefaultNamespace set, unprefixed attribute names
         // must resolve to no-namespace (XPath static context rule).
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
         let tree = Asttree::compile_field(
@@ -655,6 +660,7 @@ mod tests {
             Some("http://example.com/default"),
             None,
             None,
+            XsdVersion::V1_1,
         )
         .unwrap();
         match &tree.paths[0].steps[0] {
@@ -667,6 +673,7 @@ mod tests {
 
     #[test]
     fn unprefixed_attr_via_explicit_axis_ignores_xpath_default_ns() {
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
         let tree = Asttree::compile_field(
@@ -676,6 +683,7 @@ mod tests {
             Some("http://example.com/default"),
             None,
             None,
+            XsdVersion::V1_1,
         )
         .unwrap();
         match &tree.paths[0].steps[0] {
@@ -689,6 +697,7 @@ mod tests {
     #[test]
     fn unprefixed_child_uses_xpath_default_ns() {
         // Child axis should still use xpathDefaultNamespace.
+        use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
         let ns_id = table.add("http://example.com/default");
@@ -699,6 +708,7 @@ mod tests {
             Some("http://example.com/default"),
             None,
             None,
+            XsdVersion::V1_1,
         )
         .unwrap();
         match &tree.paths[0].steps[0] {
