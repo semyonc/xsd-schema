@@ -23,9 +23,12 @@
 //!    arena and update the owner's resolved_* field with the TypeKey.
 
 use crate::arenas::{
-    ComplexTypeDefData, ElementDeclData, ResolvedAttributeUse, SimpleTypeDefData,
+    ComplexTypeDefData, ElementDeclData, IdentityConstraintData, ResolvedAttributeUse,
+    SimpleTypeDefData,
 };
-use crate::error::SchemaResult;
+use std::collections::{HashMap, HashSet};
+
+use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
 use crate::parser::frames::{
     ComplexContentResult, ElementFrameResult, ParticleResult, ParticleTerm, TypeFrameResult,
@@ -462,7 +465,7 @@ fn collect_content_particle_elements_recursive(
 /// and other properties for local elements via their ElementKey.
 ///
 /// Must be called after inline type assembly and reference resolution.
-pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
+pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     // Collection pass: walk all complex types and collect jobs
     let mut jobs = Vec::new();
     for (key, complex) in schema_set.arenas.complex_types.iter() {
@@ -480,6 +483,15 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
                     );
                 }
             }
+        }
+    }
+
+    // Build per-document sets of already-known identity constraint names for uniqueness checking
+    // XSD §4.2.1: IC names must be unique per schema document, not globally
+    let mut ic_names_by_doc: HashMap<DocumentId, HashSet<NameId>> = HashMap::new();
+    for ic in schema_set.arenas.identity_constraints.values() {
+        if let Some(source) = &ic.source {
+            ic_names_by_doc.entry(source.doc_id).or_default().insert(ic.name);
         }
     }
 
@@ -514,6 +526,36 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
             job.elem.source.as_ref(),
             job.target_namespace,
         );
+        let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
+        for ic in job.elem.identity_constraints {
+            // Check per-document uniqueness using the IC's source document
+            if let Some(source) = &ic.source {
+                let doc_names = ic_names_by_doc.entry(source.doc_id).or_default();
+                if !doc_names.insert(ic.name) {
+                    let location = schema_set.source_maps.locate(source);
+                    let name_str = schema_set.name_table.resolve(ic.name);
+                    return Err(SchemaError::structural(
+                        "ic-unique",
+                        format!("Duplicate identity constraint name '{}' in schema document", name_str),
+                        location,
+                    ));
+                }
+            }
+            identity_constraint_keys.push(
+                schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                }),
+            );
+        }
+
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -532,7 +574,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
-            identity_constraints: job.elem.identity_constraints.clone(),
+            identity_constraints: identity_constraint_keys,
             annotation: job.elem.annotation.clone(),
             source: job.elem.source.clone(),
             resolved_type,
@@ -549,6 +591,8 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) {
             ct.resolved_content_particle_elements[job.flat_idx] = Some(elem_key);
         }
     }
+
+    Ok(())
 }
 
 /// Allocation job for a local element in a named model group particle
@@ -565,7 +609,7 @@ struct ModelGroupElementJob {
 /// and other properties for local elements inside named groups via their ElementKey.
 ///
 /// Must be called after inline type assembly and reference resolution.
-pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
+pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     // Collection pass: walk all model groups recursively and collect jobs
     let mut jobs = Vec::new();
     for (key, group) in schema_set.arenas.model_groups.iter() {
@@ -578,6 +622,15 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
             &mut flat_idx,
             &mut jobs,
         );
+    }
+
+    // Build per-document sets of already-known identity constraint names for uniqueness checking
+    // XSD §4.2.1: IC names must be unique per schema document, not globally
+    let mut ic_names_by_doc: HashMap<DocumentId, HashSet<NameId>> = HashMap::new();
+    for ic in schema_set.arenas.identity_constraints.values() {
+        if let Some(source) = &ic.source {
+            ic_names_by_doc.entry(source.doc_id).or_default().insert(ic.name);
+        }
     }
 
     // Allocation pass: create element declarations and store keys
@@ -611,6 +664,36 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
             job.elem.source.as_ref(),
             job.target_namespace,
         );
+        let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
+        for ic in job.elem.identity_constraints {
+            // Check per-document uniqueness using the IC's source document
+            if let Some(source) = &ic.source {
+                let doc_names = ic_names_by_doc.entry(source.doc_id).or_default();
+                if !doc_names.insert(ic.name) {
+                    let location = schema_set.source_maps.locate(source);
+                    let name_str = schema_set.name_table.resolve(ic.name);
+                    return Err(SchemaError::structural(
+                        "ic-unique",
+                        format!("Duplicate identity constraint name '{}' in schema document", name_str),
+                        location,
+                    ));
+                }
+            }
+            identity_constraint_keys.push(
+                schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                }),
+            );
+        }
+
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -629,7 +712,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
-            identity_constraints: job.elem.identity_constraints.clone(),
+            identity_constraints: identity_constraint_keys,
             annotation: job.elem.annotation.clone(),
             source: job.elem.source.clone(),
             resolved_type,
@@ -646,6 +729,8 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) {
             group.resolved_particle_elements[job.particle_idx] = Some(elem_key);
         }
     }
+
+    Ok(())
 }
 
 /// Walk model group particles recursively and collect local element allocation jobs

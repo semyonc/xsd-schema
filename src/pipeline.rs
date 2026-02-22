@@ -224,8 +224,8 @@ pub fn load_and_process_schema(
 
     // Phase 5: Allocate arena element declarations for local elements in content particles
     if config.assemble_inline_types && config.resolve_references {
-        allocate_content_particle_elements(schema_set);
-        allocate_model_group_particle_elements(schema_set);
+        allocate_content_particle_elements(schema_set)?;
+        allocate_model_group_particle_elements(schema_set)?;
     }
 
     Ok(stats)
@@ -264,8 +264,8 @@ pub fn parse_schema_only(
 pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     let inline_stats = assemble_inline_types(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
-    allocate_content_particle_elements(schema_set);
-    allocate_model_group_particle_elements(schema_set);
+    allocate_content_particle_elements(schema_set)?;
+    allocate_model_group_particle_elements(schema_set)?;
     Ok((inline_stats, resolution_stats))
 }
 

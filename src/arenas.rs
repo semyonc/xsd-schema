@@ -10,8 +10,9 @@ use slotmap::SlotMap;
 use crate::ids::*;
 use crate::parser::frames::{
     AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor,
-    DerivationMethod, IdentityResult, OpenContentResult, ParticleResult, QNameRef,
-    SimpleTypeResult, SimpleTypeVariety, TypeFrameResult, TypeRefResult, WildcardResult,
+    DerivationMethod, FieldResult, IdentityKind, OpenContentResult, ParticleResult, QNameRef,
+    SelectorResult, SimpleTypeResult, SimpleTypeVariety, TypeFrameResult, TypeRefResult,
+    WildcardResult,
 };
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::AssertResult;
@@ -115,7 +116,7 @@ pub struct ElementDeclData {
     pub form: Option<String>,
     pub id: Option<String>,
     pub alternatives: Vec<AlternativeResult>,
-    pub identity_constraints: Vec<IdentityResult>,
+    pub identity_constraints: Vec<IdentityConstraintKey>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
 
@@ -227,11 +228,18 @@ pub struct NotationData {
     pub source: Option<SourceRef>,
 }
 
-/// Placeholder for IdentityConstraint
+/// Identity constraint (key, unique, keyref) stored in the arena
 #[derive(Debug)]
 pub struct IdentityConstraintData {
+    pub kind: IdentityKind,
     pub name: NameId,
-    // TODO: Add full fields
+    pub ref_name: Option<QNameRef>,
+    pub refer: Option<QNameRef>,
+    pub selector: SelectorResult,
+    pub fields: Vec<FieldResult>,
+    pub id: Option<String>,
+    pub annotation: Option<Annotation>,
+    pub source: Option<SourceRef>,
 }
 
 /// Arena storage for all schema component types

@@ -7,12 +7,12 @@ use std::collections::HashSet;
 
 use crate::arenas::{
     AttributeDeclData, AttributeGroupData, ComplexTypeDefData, ElementDeclData,
-    ModelGroupData, NotationData, SimpleTypeDefData,
+    IdentityConstraintData, ModelGroupData, NotationData, SimpleTypeDefData,
 };
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{
-    AttributeGroupKey, AttributeKey, DocumentId, ElementKey, ModelGroupKey, NameId, NotationKey,
-    TypeKey,
+    AttributeGroupKey, AttributeKey, DocumentId, ElementKey, IdentityConstraintKey, ModelGroupKey,
+    NameId, NotationKey, TypeKey,
 };
 use crate::parser::frames::{
     AttributeFrameResult, AttributeGroupDefResult, ComplexContentResult, ComplexTypeResult,
@@ -291,6 +291,24 @@ impl<'a> SchemaAssembler<'a> {
             }
         }
 
+        // Allocate identity constraints into the arena
+        let identity_constraint_keys: Vec<IdentityConstraintKey> = identity_constraints
+            .into_iter()
+            .map(|ic| {
+                self.schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                })
+            })
+            .collect();
+
         let data = ElementDeclData {
             name: Some(name),
             target_namespace,
@@ -309,7 +327,7 @@ impl<'a> SchemaAssembler<'a> {
             form,
             id,
             alternatives,
-            identity_constraints,
+            identity_constraints: identity_constraint_keys,
             annotation,
             source,
             // Resolved references (populated after reference resolution phase)
