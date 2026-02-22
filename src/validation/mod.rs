@@ -9,6 +9,9 @@ pub mod content;
 pub mod context;
 pub mod simple;
 pub mod validator;
+pub mod identity_lexer;
+pub mod asttree;
+pub mod identity_parser;
 
 pub use errors::{
     ValidationError, ValidationResult,
