@@ -13,6 +13,7 @@ pub mod identity_lexer;
 pub mod asttree;
 pub mod identity_parser;
 pub mod active_axis;
+pub mod identity;
 
 pub use errors::{
     ValidationError, ValidationResult,

@@ -110,6 +110,18 @@ impl ActiveAxis {
                     awaiting_attribute: false,
                     try_from_start: false,
                 });
+            } else if matches!(path.steps[first_real], AstStep::Attribute(_))
+                && !path.descendant
+            {
+                // `./@attr` — SelfNode followed by an attribute step (non-descendant).
+                // The attribute belongs to the scope element, so mark it
+                // awaiting immediately (no `move_to_start_element` needed).
+                state.context_stack.push(MatchContext {
+                    active_steps: vec![],
+                    matched_here: vec![first_real],
+                    awaiting_attribute: true,
+                    try_from_start: false,
+                });
             } else {
                 state.context_stack.push(MatchContext {
                     active_steps: vec![first_real],
