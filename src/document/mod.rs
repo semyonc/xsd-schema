@@ -8,6 +8,8 @@
 //!
 //! The entire module is compiled only when the `xsd11` feature is enabled.
 
+pub mod buffer;
+pub mod builder;
 pub mod error;
 pub mod node;
 pub mod page;
@@ -34,6 +36,8 @@ pub use namespace::{
 };
 pub use element_index::ElementIndex;
 pub use source_spans::NodeSourceSpans;
+pub use buffer::BufferDocument;
+pub use builder::BufferDocumentBuilder;
 
 /// Whether the document is a complete XML document or a validation fragment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

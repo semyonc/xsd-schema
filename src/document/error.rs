@@ -17,6 +17,9 @@ pub enum BufferDocumentError {
 
     #[error("Node allocation overflow (exceeds u32::MAX - 1 nodes)")]
     Overflow,
+
+    #[error("end_element called without matching start_element")]
+    UnmatchedEndElement,
 }
 
 #[cfg(test)]
