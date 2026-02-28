@@ -41,6 +41,9 @@ lalrpop-util = { version = "0.22.2", optional = true }
 # Lazy statics (used by validator registry and xpath function registry)
 once_cell = "1.19"
 
+# Arena allocator for BufferDocument (only with xsd11)
+bumpalo = { version = "3", features = ["collections"], optional = true }
+
 # Unicode normalization (for fn:normalize-unicode)
 unicode-normalization = { version = "0.1", optional = true }
 
@@ -53,7 +56,7 @@ criterion = "0.5"            # Benchmarking (optional)
 
 [features]
 default = ["unicode-normalization"]
-xsd11 = ["dep:lalrpop-util", "dep:lalrpop"]
+xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo"]
 unicode-normalization = ["dep:unicode-normalization"]
 
 [lib]

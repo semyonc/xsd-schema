@@ -104,6 +104,10 @@ pub mod navigator;
 #[cfg(feature = "xsd11")]
 pub mod xpath;
 
+// Page-based XML document buffer (only with xsd11 feature)
+#[cfg(feature = "xsd11")]
+pub mod document;
+
 // Pipeline orchestration
 pub mod pipeline;
 
