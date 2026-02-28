@@ -4,23 +4,26 @@
 //! receive `SchemaInfo` decisions back. Errors and warnings are reported to
 //! a `ValidationSink`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, build_substitution_group_map, SubstitutionGroupMap};
-use crate::ids::{AttributeGroupKey, NameId, TypeKey, AttributeKey};
+use crate::ids::{AttributeGroupKey, ElementKey, IdentityConstraintKey, NameId, TypeKey, AttributeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
-use crate::parser::frames::{AttributeUseKind, AttributeUseResult, ProcessContents, WildcardNamespace, WildcardResult};
+use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
+use crate::types::XmlTypeCode;
+use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
 use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
+use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
     SchemaInfo, SchemaValidity, ValidationFlags,
@@ -149,6 +152,18 @@ pub struct SchemaValidator<'a, S: ValidationSink> {
     current_location: Option<SourceLocation>,
     /// XPath-like element path (e.g., "/root/child[1]")
     element_path: String,
+    /// Pre-compiled identity constraints (lazy cache; None = compilation failed)
+    compiled_constraints: HashMap<IdentityConstraintKey, Option<CompiledIdentityConstraint>>,
+    /// Active constraint state instances
+    active_constraints: Vec<ConstraintStruct>,
+    /// Collected ID values (for cvc-id.2 duplicate check and cvc-id.1 IDREF validation)
+    id_values: HashSet<String>,
+    /// Pending IDREF values: (value, location, element_path)
+    pending_idrefs: Vec<(String, Option<SourceLocation>, String)>,
+    /// Per-element scope stack of key/unique tables. Each entry corresponds to
+    /// a validation stack frame. Tables propagate upward on element close,
+    /// modelling the XSD "node table propagates to parent" semantics.
+    ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
 }
 
 impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
@@ -164,6 +179,11 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             current_state: ValidatorState::None,
             current_location: None,
             element_path: String::new(),
+            compiled_constraints: HashMap::new(),
+            active_constraints: Vec::new(),
+            id_values: HashSet::new(),
+            pending_idrefs: Vec::new(),
+            ic_scope_tables: Vec::new(),
         }
     }
 
@@ -361,6 +381,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 let schema_type = ev_state.schema_type;
                 let content_type = ev_state.content_type;
                 self.push_element(ev_state);
+                self.advance_constraints_start_element(local_name, namespace, None);
                 return SchemaInfo {
                     element_decl: None,
                     attribute_decl: None,
@@ -382,6 +403,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     ev_state.content_state = ContentValidatorState::Simple; // accept anything
                     ev_state.validity = SchemaValidity::NotKnown;
                     self.push_element(ev_state);
+                    self.advance_constraints_start_element(local_name, namespace, None);
                     return SchemaInfo::empty();
                 }
                 ContentProcessing::Lax => {
@@ -391,6 +413,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     ev_state.content_state = ContentValidatorState::Simple;
                     ev_state.validity = SchemaValidity::NotKnown;
                     self.push_element(ev_state);
+                    self.advance_constraints_start_element(local_name, namespace, None);
                     return SchemaInfo::empty();
                 }
                 ContentProcessing::Strict => {
@@ -402,6 +425,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
                     ev_state.validity = SchemaValidity::Invalid;
                     self.push_element(ev_state);
+                    self.advance_constraints_start_element(local_name, namespace, None);
                     return SchemaInfo::invalid();
                 }
             }
@@ -465,6 +489,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         ev_state.validity = SchemaValidity::Valid;
         ev_state.process_contents = process_contents;
         self.push_element(ev_state);
+        self.advance_constraints_start_element(local_name, namespace, Some(elem_key));
 
         // 10. Return SchemaInfo
         SchemaInfo {
@@ -558,13 +583,12 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             Some(TypeKey::Complex(ct)) => ct,
             _ => {
                 // Simple type or no type: no attributes expected (except xsi:*)
-                // For Skip/Lax process contents, just accept
-                if ev_state.process_contents != ContentProcessing::Strict {
-                    self.current_state = ValidatorState::Attribute;
-                    return SchemaInfo::empty();
-                }
+                // Still run post-processing so IC attribute fields and
+                // ID/IDREF collection are not skipped.
                 self.current_state = ValidatorState::Attribute;
-                return SchemaInfo::empty();
+                let result = SchemaInfo::empty();
+                self.post_process_attribute(local_name, namespace, value, &result);
+                return result;
             }
         };
 
@@ -622,7 +646,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 }
 
                 self.current_state = ValidatorState::Attribute;
-                SchemaInfo {
+                let result = SchemaInfo {
                     element_decl: None,
                     attribute_decl: attr_key,
                     schema_type: attr_type,
@@ -632,7 +656,9 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     is_nil: false,
                     content_type: None,
                     typed_value,
-                }
+                };
+                self.post_process_attribute(local_name, namespace, value, &result);
+                result
             }
             AttributeLookup::Prohibited => {
                 let attr_name = self.schema_set.name_table.resolve(local_name);
@@ -653,7 +679,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     let target_ns = ct_data.target_namespace;
                     if self.wildcard_allows_namespace(wildcard, namespace, target_ns) {
                         self.current_state = ValidatorState::Attribute;
-                        return match wildcard.process_contents {
+                        let result = match wildcard.process_contents {
                             ProcessContents::Skip => SchemaInfo::empty(),
                             ProcessContents::Strict => {
                                 self.validate_wildcard_attribute_strict(
@@ -666,6 +692,8 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                                 )
                             }
                         };
+                        self.post_process_attribute(local_name, namespace, value, &result);
+                        return result;
                     }
                     // wildcard present but namespace not allowed — fall through to error
                 }
@@ -947,7 +975,30 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             }
         }
 
-        // 3. Update element path
+        // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
+        self.process_constraints_end_element(&ev_state.text_content, ev_state.typed_value.as_ref());
+
+        // 3b. Pop scope table and propagate key/unique tables upward to parent
+        if let Some(Some(scope_map)) = self.ic_scope_tables.pop() {
+            if let Some(parent_slot) = self.ic_scope_tables.last_mut() {
+                let parent_map = parent_slot.get_or_insert_with(HashMap::new);
+                for (ic_key, key_table) in scope_map {
+                    parent_map
+                        .entry(ic_key)
+                        .and_modify(|existing| {
+                            existing.sequences.extend(key_table.sequences.clone())
+                        })
+                        .or_insert(key_table);
+                }
+            }
+        }
+
+        // 4. ID/IDREF collection from element text content
+        if let Some(ref tv) = ev_state.typed_value {
+            self.collect_id_idref(tv, &ev_state.text_content);
+        }
+
+        // 5. Update element path
         self.pop_element_path();
 
         let validity = ev_state.validity;
@@ -968,8 +1019,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
 
     /// Finalize validation
     ///
-    /// Checks that the validation stack is empty. IDREF/keyref checks
-    /// will be added in Task 5.6.
+    /// Checks that the validation stack is empty and performs IDREF validation.
     pub fn end_validation(&mut self) -> Result<(), ValidationError> {
         if !self.current_state.can_finish() {
             return Err(errors::error(
@@ -991,6 +1041,21 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 ),
                 self.current_location.clone(),
             ));
+        }
+
+        // IDREF validation (cvc-id.1): check all pending IDREFs resolve
+        for (idref_value, location, element_path) in &self.pending_idrefs {
+            if !self.id_values.contains(idref_value) {
+                self.sink.on_error(errors::error_with_path(
+                    "cvc-id.1",
+                    format!(
+                        "IDREF '{}' does not match any ID in the document",
+                        idref_value
+                    ),
+                    location.clone(),
+                    element_path,
+                ));
+            }
         }
 
         self.current_state = ValidatorState::Finish;
@@ -1274,6 +1339,7 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         self.element_path.push_str(&local_name);
 
         self.validation_stack.push(ev_state);
+        self.ic_scope_tables.push(None);
 
         if self.current_state == ValidatorState::None {
             self.current_state = ValidatorState::Start;
@@ -1299,6 +1365,328 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             err.with_path(self.element_path.clone())
         };
         self.sink.on_error(err);
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity constraint helpers
+    // -----------------------------------------------------------------------
+
+    /// Resolve a keyref's `refer` target to a concrete `IdentityConstraintKey`.
+    ///
+    /// Scans the identity constraint arena for a Key or Unique constraint
+    /// whose name and target namespace match the given values.
+    fn resolve_refer_key(
+        &self,
+        refer_local_name: NameId,
+        refer_ns: Option<NameId>,
+    ) -> Option<IdentityConstraintKey> {
+        for (key, ic_data) in &self.schema_set.arenas.identity_constraints {
+            if ic_data.kind == IdentityKind::Keyref {
+                continue;
+            }
+            if ic_data.name != refer_local_name {
+                continue;
+            }
+            let ic_target_ns = ic_data
+                .source
+                .as_ref()
+                .and_then(|s| self.schema_set.documents.get(s.doc_id as usize))
+                .and_then(|d| d.target_namespace);
+            if ic_target_ns == refer_ns {
+                return Some(key);
+            }
+        }
+        None
+    }
+
+    /// Lazily compile an identity constraint and cache it.
+    /// Returns `true` if compilation succeeded (constraint is usable).
+    fn ensure_compiled(&mut self, ic_key: IdentityConstraintKey) -> bool {
+        if let Some(cached) = self.compiled_constraints.get(&ic_key) {
+            return cached.is_some();
+        }
+        let ic_data = &self.schema_set.arenas.identity_constraints[ic_key];
+        let doc = ic_data
+            .source
+            .as_ref()
+            .and_then(|s| self.schema_set.documents.get(s.doc_id as usize));
+        let schema_xpath_default_ns = doc.and_then(|d| d.xpath_default_namespace);
+        let target_namespace = doc.and_then(|d| d.target_namespace);
+        let ic_name = ic_data.name;
+        match CompiledIdentityConstraint::compile(
+            ic_data,
+            ic_key,
+            &self.schema_set.name_table,
+            schema_xpath_default_ns,
+            target_namespace,
+            self.schema_set.xsd_version,
+        ) {
+            Ok(mut compiled) => {
+                // Resolve refer_key for keyref constraints
+                if compiled.kind == IdentityKind::Keyref {
+                    if let Some(refer) = &compiled.refer {
+                        let refer_ns = refer.namespace.or(compiled.target_namespace);
+                        compiled.refer_key =
+                            self.resolve_refer_key(refer.local_name, refer_ns);
+                        if compiled.refer_key.is_none() {
+                            let name = self.schema_set.name_table.resolve(ic_name);
+                            let refer_display = match refer_ns {
+                                Some(ns) => format!(
+                                    "{{{}}}{}",
+                                    self.schema_set.name_table.resolve(ns),
+                                    self.schema_set.name_table.resolve(refer.local_name)
+                                ),
+                                None => self
+                                    .schema_set
+                                    .name_table
+                                    .resolve(refer.local_name)
+                                    .to_string(),
+                            };
+                            self.sink.on_warning(ValidationWarning {
+                                code: "cvc-identity-constraint",
+                                message: format!(
+                                    "Keyref '{}': could not resolve refer target '{}'",
+                                    name, refer_display
+                                ),
+                                location: None,
+                            });
+                        }
+                    }
+                }
+                self.compiled_constraints.insert(ic_key, Some(compiled));
+                true
+            }
+            Err(e) => {
+                let name = self.schema_set.name_table.resolve(ic_name);
+                self.sink.on_warning(ValidationWarning {
+                    code: "cvc-identity-constraint",
+                    message: format!(
+                        "Identity constraint '{}': XPath compilation failed: {}",
+                        name, e
+                    ),
+                    location: None,
+                });
+                self.compiled_constraints.insert(ic_key, None);
+                false
+            }
+        }
+    }
+
+    /// Advance existing constraints for a start element, then activate new
+    /// constraints from the element declaration (if any).
+    fn advance_constraints_start_element(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        element_key: Option<ElementKey>,
+    ) {
+        let ns = namespace.unwrap_or(NameId(0));
+
+        // 1. Advance existing active constraints
+        for cs in &mut self.active_constraints {
+            cs.start_element(local_name, ns);
+        }
+
+        // 2. Activate new constraints from element declaration
+        if let Some(ek) = element_key {
+            let ic_keys: Vec<IdentityConstraintKey> =
+                self.schema_set.arenas.elements[ek].identity_constraints.clone();
+            for ic_key in ic_keys {
+                if self.ensure_compiled(ic_key) {
+                    let compiled = self.compiled_constraints[&ic_key].as_ref().unwrap();
+                    let mut cs = ConstraintStruct::new(compiled);
+                    cs.activate();
+                    self.active_constraints.push(cs);
+                }
+            }
+        }
+    }
+
+    /// Process identity constraints at element end: advance fields/selectors,
+    /// deactivate finished constraints, and perform scope-local keyref
+    /// cross-reference.
+    fn process_constraints_end_element(
+        &mut self,
+        text_content: &str,
+        typed_value: Option<&XmlValue>,
+    ) {
+        let name_table = &self.schema_set.name_table;
+        let element_path = self.element_path.clone();
+        let location = self.current_location.clone();
+
+        // 1. Advance all constraints (field value collection + key sequence finalization)
+        let mut ic_errors = Vec::new();
+        for cs in &mut self.active_constraints {
+            let errs = cs.end_element_with_text(
+                text_content,
+                typed_value,
+                name_table,
+                &element_path,
+                location.clone(),
+            );
+            ic_errors.extend(errs);
+        }
+        for err in ic_errors {
+            self.sink.on_error(err);
+        }
+
+        // 2. Collect deactivated constraints (constraints whose scope element just closed)
+        let mut deactivated: Vec<ConstraintStruct> = Vec::new();
+        let mut i = 0;
+        while i < self.active_constraints.len() {
+            if !self.active_constraints[i].is_active() {
+                deactivated.push(self.active_constraints.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+
+        // 3. Scope-local keyref cross-reference using ic_scope_tables
+        if !deactivated.is_empty() {
+            let mut scope_keyrefs: Vec<(KeyTable, Option<IdentityConstraintKey>)> = Vec::new();
+
+            for cs in deactivated {
+                if cs.key_table.kind == IdentityKind::Keyref {
+                    // Extract the resolved refer_key from the compiled constraint
+                    let refer_key = self
+                        .compiled_constraints
+                        .get(&cs.ic_key)
+                        .and_then(|opt| opt.as_ref())
+                        .and_then(|compiled| compiled.refer_key);
+                    scope_keyrefs.push((cs.key_table, refer_key));
+                } else {
+                    // Insert key/unique table into current scope
+                    let scope_slot = self.ic_scope_tables.last_mut();
+                    if let Some(slot) = scope_slot {
+                        let scope_map = slot.get_or_insert_with(HashMap::new);
+                        let ic_key = cs.key_table.ic_key;
+                        scope_map
+                            .entry(ic_key)
+                            .and_modify(|existing| {
+                                existing
+                                    .sequences
+                                    .extend(cs.key_table.sequences.clone())
+                            })
+                            .or_insert(cs.key_table);
+                    }
+                }
+            }
+
+            // Cross-reference each keyref against key/unique tables in current scope.
+            // The scope map already contains child-propagated tables.
+            let name_table = &self.schema_set.name_table;
+            for (keyref_table, refer_key) in &scope_keyrefs {
+                let target = refer_key.and_then(|rk| {
+                    self.ic_scope_tables
+                        .last()
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|map| map.get(&rk))
+                });
+                match target {
+                    Some(target_table) => {
+                        let errs = keyref_table.check_keyref_against(target_table, name_table);
+                        for err in errs {
+                            self.sink.on_error(err);
+                        }
+                    }
+                    None => {
+                        let keyref_name = name_table.resolve(keyref_table.constraint_name);
+                        let refer_display = self
+                            .compiled_constraints
+                            .get(&keyref_table.ic_key)
+                            .and_then(|opt| opt.as_ref())
+                            .and_then(|compiled| compiled.refer.as_ref().map(|refer| {
+                                let refer_ns = refer.namespace.or(compiled.target_namespace);
+                                match refer_ns {
+                                    Some(ns) => format!(
+                                        "{{{}}}{}",
+                                        name_table.resolve(ns),
+                                        name_table.resolve(refer.local_name)
+                                    ),
+                                    None => name_table.resolve(refer.local_name).to_string(),
+                                }
+                            }))
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        self.sink.on_error(errors::error(
+                            "cvc-identity-constraint.4.3",
+                            format!(
+                                "Keyref '{}' references unknown constraint '{}'",
+                                keyref_name, refer_display
+                            ),
+                            location.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Detect ID/IDREF types and collect values for finalization.
+    fn collect_id_idref(&mut self, typed_value: &XmlValue, value_str: &str) {
+        match typed_value.type_code {
+            XmlTypeCode::Id => {
+                if !self.id_values.insert(value_str.to_string()) {
+                    self.report_error(
+                        "cvc-id.2",
+                        format!("Duplicate ID value '{}'", value_str),
+                    );
+                }
+            }
+            XmlTypeCode::IdRef => {
+                self.pending_idrefs.push((
+                    value_str.to_string(),
+                    self.current_location.clone(),
+                    self.element_path.clone(),
+                ));
+            }
+            XmlTypeCode::IdRefs => {
+                // Prefer extracting from validated list items
+                if let crate::types::value::XmlValueKind::List { items, .. } = &typed_value.value {
+                    for item in items {
+                        self.pending_idrefs.push((
+                            item.to_string(),
+                            self.current_location.clone(),
+                            self.element_path.clone(),
+                        ));
+                    }
+                } else {
+                    // Fallback: split lexical text
+                    for token in value_str.split_whitespace() {
+                        self.pending_idrefs.push((
+                            token.to_string(),
+                            self.current_location.clone(),
+                            self.element_path.clone(),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Post-process a validated attribute for identity constraint field matching
+    /// and ID/IDREF collection.
+    fn post_process_attribute(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+        result: &SchemaInfo,
+    ) {
+        let ns = namespace.unwrap_or(NameId(0));
+
+        // Identity constraint: check field attribute matches
+        for cs in &mut self.active_constraints {
+            let matches = cs.matching_fields(local_name, ns);
+            for field_idx in matches {
+                cs.set_field_value(field_idx, value.to_string(), result.typed_value.clone());
+            }
+        }
+
+        // ID/IDREF collection
+        if let Some(ref tv) = result.typed_value {
+            self.collect_id_idref(tv, value);
+        }
     }
 
     /// Initialize content model and ContentType from a TypeKey
@@ -3552,6 +3940,582 @@ mod tests {
         assert!(
             v.sink.errors.is_empty(),
             "nilled element with attributes only should be valid, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Identity constraint regression tests
+    // -----------------------------------------------------------------------
+
+    /// Test 1: Simple key constraint — duplicate detection (cvc-identity-constraint.4.2.2)
+    #[test]
+    fn test_ic_key_duplicate() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="itemKey">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // First item: @id="A"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Second item: @id="A" — duplicate
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+            "Expected duplicate key error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Test 2: Unique constraint — incomplete allowed, duplicates rejected
+    #[test]
+    fn test_ic_unique_incomplete_ok_duplicate_rejected() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:unique name="itemUnique">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:unique>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Item without @id (incomplete key sequence — ok for unique)
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Item with @id="X"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "X");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Item with @id="X" — duplicate
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "X");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        let dup_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-identity-constraint.4.2.2")
+            .collect();
+        assert_eq!(dup_errors.len(), 1, "Expected exactly 1 duplicate error, got: {:?}", dup_errors);
+    }
+
+    /// Test 3: Keyref cross-reference — matching + missing (cvc-identity-constraint.4.3)
+    #[test]
+    fn test_ic_keyref_matching_and_missing() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="ref" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="ref" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="itemKey">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                    <xs:keyref name="itemRef" refer="itemKey">
+                        <xs:selector xpath="./ref"/>
+                        <xs:field xpath="@ref"/>
+                    </xs:keyref>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Item with @id="A"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Ref with @ref="A" — matches
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_attribute("ref", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Ref with @ref="B" — no match
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_attribute("ref", "", "B");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        let keyref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-identity-constraint.4.3")
+            .collect();
+        assert_eq!(keyref_errors.len(), 1, "Expected 1 keyref error for missing 'B', got: {:?}", keyref_errors);
+    }
+
+    /// Test 4: Element field value — field matches element text content
+    #[test]
+    fn test_ic_element_field_value() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="code" type="xs:string"/>
+                                    </xs:sequence>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="codeKey">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="code"/>
+                    </xs:key>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // First item with code="X"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("code", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("X");
+        v.validate_end_element(); // </code>
+        v.validate_end_element(); // </item>
+
+        // Second item with code="X" — duplicate
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("code", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("X");
+        v.validate_end_element(); // </code>
+        v.validate_end_element(); // </item>
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+            "Expected duplicate key error for element field, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Test 5: Attribute field value — field matches @attr
+    #[test]
+    fn test_ic_attribute_field_value() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="val" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:unique name="valUnique">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="@val"/>
+                    </xs:unique>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Two items with different values — should be fine
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("val", "", "alpha");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("val", "", "beta");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Expected no errors for unique values, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Test 7: ID duplicate detection (cvc-id.2)
+    #[test]
+    fn test_id_duplicate() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // First item: @id="a1"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "a1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Second item: @id="a1" — duplicate ID
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "a1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+            "Expected duplicate ID error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Test 8: IDREF validation — valid + missing reference (cvc-id.1)
+    #[test]
+    fn test_idref_valid_and_missing() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="link" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="ref" type="xs:IDREF" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Define ID
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "x1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Valid IDREF
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "x1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Missing IDREF
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "missing");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(idref_errors.len(), 1, "Expected 1 IDREF error for 'missing', got: {:?}", idref_errors);
+    }
+
+    /// Test 9: Nested selector matches (.//item with nested items)
+    #[test]
+    fn test_ic_nested_selector() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="item" minOccurs="0" maxOccurs="unbounded">
+                                            <xs:complexType>
+                                                <xs:attribute name="id" type="xs:string" use="required"/>
+                                            </xs:complexType>
+                                        </xs:element>
+                                    </xs:sequence>
+                                    <xs:attribute name="id" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:unique name="allItems">
+                        <xs:selector xpath=".//item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:unique>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Outer item @id="1"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "1");
+        v.validate_end_of_attributes();
+
+        // Inner item @id="2" (nested)
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "2");
+        v.validate_end_of_attributes();
+        v.validate_end_element(); // </inner item>
+
+        v.validate_end_element(); // </outer item>
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Expected no errors for unique nested items, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Test 10: Keyref + key on same element, scope-local resolution
+    #[test]
+    fn test_ic_keyref_key_same_scope() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="dept" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="emp" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="dept" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="deptKey">
+                        <xs:selector xpath="./dept"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                    <xs:keyref name="empDeptRef" refer="deptKey">
+                        <xs:selector xpath="./emp"/>
+                        <xs:field xpath="@dept"/>
+                    </xs:keyref>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Departments
+        v.validate_element("dept", "", None, None, &ns);
+        v.validate_attribute("id", "", "sales");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("dept", "", None, None, &ns);
+        v.validate_attribute("id", "", "eng");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Employee referencing existing dept — valid
+        v.validate_element("emp", "", None, None, &ns);
+        v.validate_attribute("dept", "", "sales");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Employee referencing non-existing dept — invalid
+        v.validate_element("emp", "", None, None, &ns);
+        v.validate_attribute("dept", "", "hr");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        let keyref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-identity-constraint.4.3")
+            .collect();
+        assert_eq!(keyref_errors.len(), 1, "Expected 1 keyref error for 'hr', got: {:?}", keyref_errors);
+    }
+
+    /// Test: Key constraint with no duplicates — valid document
+    #[test]
+    fn test_ic_key_no_duplicates_valid() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="pk">
+                        <xs:selector xpath="./item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let sink = TestSink::new();
+        let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "B");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Expected no errors for unique keys, got: {:?}",
             v.sink.errors
         );
     }

@@ -8,9 +8,6 @@
 //! - [`KeyFieldValue`] / [`KeySequence`] — extracted field values with XSD equality
 //! - [`KeyTable`] — duplicate detection for key/unique, deferred storage for keyref
 //! - [`ConstraintStruct`] — per-activation state driving `ActiveAxis` matchers
-//! - [`KeyrefEntry`] — deferred keyref checking at end of validation
-
-#![allow(dead_code)]
 
 use crate::ids::NameId;
 use crate::namespace::table::NameTable;
@@ -47,8 +44,13 @@ pub(crate) struct CompiledIdentityConstraint {
     pub fields: Vec<Asttree>,
     /// Keyref target reference (only for `IdentityKind::Keyref`).
     pub refer: Option<QNameRef>,
+    /// Resolved arena key of the referenced key/unique constraint (only for keyrefs).
+    /// Set by the validator after compilation via `resolve_refer_key()`.
+    pub refer_key: Option<IdentityConstraintKey>,
     /// Cached `fields.len()`.
     pub field_count: usize,
+    /// Target namespace of the schema that defines this constraint.
+    pub target_namespace: Option<NameId>,
 }
 
 impl CompiledIdentityConstraint {
@@ -113,7 +115,9 @@ impl CompiledIdentityConstraint {
             selector,
             fields,
             refer: data.refer.clone(),
+            refer_key: None,
             field_count,
+            target_namespace,
         })
     }
 }
@@ -162,7 +166,7 @@ impl Eq for KeyFieldValue {}
 ///
 /// Each slot corresponds to a `<field>` expression. `None` means the field
 /// did not select a node (missing value).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct KeySequence {
     pub fields: Vec<Option<KeyFieldValue>>,
 }
@@ -204,6 +208,8 @@ impl Eq for KeySequence {}
 
 /// Collection of key sequences for one constraint activation with duplicate detection.
 pub(crate) struct KeyTable {
+    /// Arena key identifying which identity constraint produced this table.
+    pub ic_key: IdentityConstraintKey,
     pub constraint_name: NameId,
     pub kind: IdentityKind,
     pub sequences: Vec<KeySequence>,
@@ -211,8 +217,13 @@ pub(crate) struct KeyTable {
 
 impl KeyTable {
     /// Create a new empty key table.
-    pub fn new(constraint_name: NameId, kind: IdentityKind) -> Self {
+    pub fn new(
+        ic_key: IdentityConstraintKey,
+        constraint_name: NameId,
+        kind: IdentityKind,
+    ) -> Self {
         KeyTable {
+            ic_key,
             constraint_name,
             kind,
             sequences: Vec::new(),
@@ -356,8 +367,8 @@ struct FieldCollectionFrame {
 /// pushes a new frame; each selector exit pops the top frame and finalizes
 /// its key sequence.
 pub(crate) struct ConstraintStruct {
-    /// Index into the validator's `Vec<CompiledIdentityConstraint>`.
-    pub compiled_idx: usize,
+    /// Arena key for the compiled constraint (used for deactivation lookup).
+    pub ic_key: IdentityConstraintKey,
     /// Selector axis matcher.
     pub selector: ActiveAxis,
     /// Field Asttree templates for cloning into new collection frames.
@@ -369,8 +380,6 @@ pub(crate) struct ConstraintStruct {
     collection_stack: Vec<FieldCollectionFrame>,
     /// Key table accumulating complete key sequences.
     pub key_table: KeyTable,
-    /// Depth at which this constraint was activated.
-    pub activation_depth: i32,
 }
 
 impl ConstraintStruct {
@@ -378,25 +387,21 @@ impl ConstraintStruct {
     ///
     /// Stores Asttree templates for cloning into fresh `ActiveAxis` instances
     /// on each selector match.
-    pub fn new(
-        compiled: &CompiledIdentityConstraint,
-        compiled_idx: usize,
-        activation_depth: i32,
-    ) -> Self {
+    pub fn new(compiled: &CompiledIdentityConstraint) -> Self {
         let selector = ActiveAxis::new(compiled.selector.clone());
 
         ConstraintStruct {
-            compiled_idx,
+            ic_key: compiled.key,
             selector,
             field_asttrees: compiled.fields.clone(),
             field_count: compiled.field_count,
             collection_stack: Vec::new(),
-            key_table: KeyTable::new(compiled.name, compiled.kind),
-            activation_depth,
+            key_table: KeyTable::new(compiled.key, compiled.name, compiled.kind),
         }
     }
 
     /// Whether field collection is active (at least one selector match on the stack).
+    #[cfg(test)]
     pub fn collecting_fields(&self) -> bool {
         !self.collection_stack.is_empty()
     }
@@ -471,24 +476,45 @@ impl ConstraintStruct {
         }
     }
 
-    /// Handle an element end event.
+    /// Handle an element end event with text content for element-field matching.
     ///
-    /// Advances field axes in all frames, then checks if the selector exits
-    /// its match. On exit, pops the topmost frame and finalizes its key sequence.
-    pub fn end_element(
+    /// Advances field axes in ALL frames FIRST (to detect `exited_match` and
+    /// set values from text content), THEN advances the selector.
+    /// On selector exit, pops the topmost frame and finalizes its key sequence.
+    pub fn end_element_with_text(
         &mut self,
+        text_content: &str,
+        typed_value: Option<&XmlValue>,
         name_table: &NameTable,
         element_path: &str,
         location: Option<SourceLocation>,
     ) -> Vec<ValidationError> {
         let mut errors = Vec::new();
 
-        // Advance selector first to get exited_match status
+        // 1. Advance field axes in ALL frames FIRST (detect exited element-field matches)
+        for frame in &mut self.collection_stack {
+            for (field_idx, field) in frame.fields.iter_mut().enumerate() {
+                field.end_element();
+                if field.exited_match() && frame.current_key_sequence[field_idx].is_none() {
+                    // Guard: only set field value when the element has a valid simple
+                    // typed_value.  For Mixed/ElementOnly/Empty content types and for
+                    // nilled elements, typed_value is None — the element cannot contribute
+                    // a meaningful IC field value, so the slot stays None (absent).
+                    if typed_value.is_some() {
+                        frame.current_key_sequence[field_idx] = Some(KeyFieldValue {
+                            string_value: text_content.to_string(),
+                            typed_value: typed_value.cloned(),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 2. Then advance selector
         self.selector.end_element();
 
+        // 3. If selector exits match, pop frame and finalize key sequence
         if self.selector.exited_match() {
-            // Pop the topmost frame and finalize its key sequence.
-            // The frame's field axes are dropped (no need to end_element them).
             if let Some(frame) = self.collection_stack.pop() {
                 let seq = KeySequence {
                     fields: frame.current_key_sequence,
@@ -499,13 +525,6 @@ impl ConstraintStruct {
                     element_path,
                     location,
                 ));
-            }
-        }
-
-        // Advance remaining frames' field axes (for depth tracking)
-        for frame in &mut self.collection_stack {
-            for field in &mut frame.fields {
-                field.end_element();
             }
         }
 
@@ -534,17 +553,6 @@ impl ConstraintStruct {
             current_key_sequence: vec![None; self.field_count],
         });
     }
-}
-
-// ---------------------------------------------------------------------------
-// KeyrefEntry
-// ---------------------------------------------------------------------------
-
-/// Deferred keyref for end-of-validation checking.
-pub(crate) struct KeyrefEntry {
-    pub constraint_name: NameId,
-    pub refer: QNameRef,
-    pub key_table: KeyTable,
 }
 
 // ---------------------------------------------------------------------------
@@ -740,7 +748,7 @@ mod tests {
     fn key_table_key_duplicate_error() {
         let nt = make_name_table();
         let name = nt.add("pk");
-        let mut table = KeyTable::new(name, IdentityKind::Key);
+        let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Key);
 
         let seq1 = KeySequence {
             fields: vec![Some(make_string_field("1"))],
@@ -760,7 +768,7 @@ mod tests {
     fn key_table_key_incomplete_error() {
         let nt = make_name_table();
         let name = nt.add("pk");
-        let mut table = KeyTable::new(name, IdentityKind::Key);
+        let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Key);
 
         let seq = KeySequence {
             fields: vec![Some(make_string_field("a")), None],
@@ -773,7 +781,7 @@ mod tests {
     fn key_table_unique_duplicate_error() {
         let nt = make_name_table();
         let name = nt.add("uq");
-        let mut table = KeyTable::new(name, IdentityKind::Unique);
+        let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Unique);
 
         let seq1 = KeySequence {
             fields: vec![Some(make_string_field("val"))],
@@ -793,7 +801,7 @@ mod tests {
     fn key_table_unique_incomplete_no_error() {
         let nt = make_name_table();
         let name = nt.add("uq");
-        let mut table = KeyTable::new(name, IdentityKind::Unique);
+        let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Unique);
 
         let seq = KeySequence {
             fields: vec![None],
@@ -806,7 +814,7 @@ mod tests {
     fn key_table_keyref_no_error() {
         let nt = make_name_table();
         let name = nt.add("fk");
-        let mut table = KeyTable::new(name, IdentityKind::Keyref);
+        let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Keyref);
 
         let seq = KeySequence {
             fields: vec![Some(make_string_field("anything"))],
@@ -821,12 +829,12 @@ mod tests {
         let pk_name = nt.add("pk");
         let fk_name = nt.add("fk");
 
-        let mut key_table = KeyTable::new(pk_name, IdentityKind::Key);
+        let mut key_table = KeyTable::new(IdentityConstraintKey::default(), pk_name, IdentityKind::Key);
         key_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("1"))],
         });
 
-        let mut keyref_table = KeyTable::new(fk_name, IdentityKind::Keyref);
+        let mut keyref_table = KeyTable::new(IdentityConstraintKey::default(), fk_name, IdentityKind::Keyref);
         keyref_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("1"))],
         });
@@ -841,9 +849,9 @@ mod tests {
         let pk_name = nt.add("pk");
         let fk_name = nt.add("fk");
 
-        let key_table = KeyTable::new(pk_name, IdentityKind::Key);
+        let key_table = KeyTable::new(IdentityConstraintKey::default(), pk_name, IdentityKind::Key);
 
-        let mut keyref_table = KeyTable::new(fk_name, IdentityKind::Keyref);
+        let mut keyref_table = KeyTable::new(IdentityConstraintKey::default(), fk_name, IdentityKind::Keyref);
         keyref_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("missing"))],
         });
@@ -964,7 +972,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut cs = ConstraintStruct::new(&compiled, 0, 0);
+        let mut cs = ConstraintStruct::new(&compiled);
 
         // Activate at scope element
         let scope_match = cs.activate();
@@ -988,7 +996,7 @@ mod tests {
         cs.set_field_value(0, "val1".to_string(), None);
 
         // End element — should finalize key sequence
-        let errors = cs.end_element(&nt, "/root/item[1]", None);
+        let errors = cs.end_element_with_text("", None, &nt, "/root/item[1]", None);
         assert!(errors.is_empty());
 
         // Key table should have one sequence
@@ -1022,7 +1030,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut cs = ConstraintStruct::new(&compiled, 0, 0);
+        let mut cs = ConstraintStruct::new(&compiled);
         cs.activate();
 
         let item = nt.add("item");
@@ -1044,7 +1052,7 @@ mod tests {
         cs.set_field_value(0, "inner".to_string(), None);
 
         // End inner </item> — finalizes inner sequence
-        let errors = cs.end_element(&nt, "/root/item/item", None);
+        let errors = cs.end_element_with_text("", None, &nt, "/root/item/item", None);
         assert!(errors.is_empty());
         assert_eq!(cs.key_table.sequences.len(), 1);
         assert_eq!(
@@ -1059,7 +1067,7 @@ mod tests {
         assert!(cs.collecting_fields());
 
         // End outer </item> — finalizes outer sequence
-        let errors = cs.end_element(&nt, "/root/item", None);
+        let errors = cs.end_element_with_text("", None, &nt, "/root/item", None);
         assert!(errors.is_empty());
         assert_eq!(cs.key_table.sequences.len(), 2);
         assert_eq!(
@@ -1093,7 +1101,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut cs = ConstraintStruct::new(&compiled, 0, 0);
+        let mut cs = ConstraintStruct::new(&compiled);
         cs.activate();
 
         let item = nt.add("item");
@@ -1107,7 +1115,7 @@ mod tests {
         cs.set_field_value(0, "v".to_string(), None);
         cs.set_field_value(1, "v".to_string(), None);
 
-        let errors = cs.end_element(&nt, "/root/item", None);
+        let errors = cs.end_element_with_text("", None, &nt, "/root/item", None);
         assert!(errors.is_empty());
         assert!(cs.key_table.sequences[0].is_complete());
     }

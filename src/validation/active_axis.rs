@@ -255,7 +255,11 @@ impl ActiveAxis {
 
         for state in &mut self.path_states {
             if let Some(ctx) = state.context_stack.pop() {
-                if !ctx.matched_here.is_empty() {
+                // Only count element-complete matches.  Contexts with
+                // `awaiting_attribute` hold unconsumed attribute steps —
+                // those must not trigger `exited_match` because the
+                // attribute was never actually present on the element.
+                if !ctx.matched_here.is_empty() && !ctx.awaiting_attribute {
                     self.last_exited_match = true;
                 }
             }
