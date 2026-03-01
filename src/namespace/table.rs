@@ -23,13 +23,20 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 /// Entry in the name table
+///
+/// # Invariants (for unsafe `resolve_ref` / `try_resolve_ref`)
+///
+/// 1. `text` is immutable after insertion — no API replaces or removes it.
+/// 2. No future API should remove, compact, or overwrite entries.
+///
+/// Note: `hash` and `next` *are* mutated during rehashing; only `text` stability matters.
 #[derive(Debug)]
 struct Entry {
     /// Cached hash value
     hash: u64,
-    /// Next entry in chain (-1 = none)
+    /// Next entry in chain (-1 = none); mutated during rehashing
     next: i32,
-    /// The interned string
+    /// The interned string (immutable after insertion — never replaced or removed)
     text: Box<str>,
 }
 
@@ -114,22 +121,55 @@ impl NameTable {
         self.find(value, hash)
     }
 
+    /// Resolve a NameId to a string slice (zero-allocation).
+    ///
+    /// Prefer this over `resolve()` in performance-critical paths
+    /// (e.g., DomNavigator implementations).
+    ///
+    /// # Safety (internal)
+    ///
+    /// Uses `RefCell::as_ptr()` to bypass the borrow guard. This is sound because:
+    /// - `Entry.text` is `Box<str>` — heap-stable allocation
+    /// - `Entry.text` is never replaced or removed after insertion
+    ///   (other Entry fields like `next` may be mutated during rehashing,
+    ///   but only `text` stability matters here)
+    /// - The returned `&str` points to the Box's heap data, not the Vec buffer,
+    ///   so it remains valid even if the Vec reallocates during a later `add()`
+    ///
+    /// # Panics
+    ///
+    /// Panics if the NameId is out of bounds.
+    pub fn resolve_ref(&self, id: NameId) -> &str {
+        unsafe { &(&(*self.entries.as_ptr()))[id.0 as usize].text }
+    }
+
+    /// Try to resolve a NameId to a string slice (zero-allocation).
+    ///
+    /// Returns `None` if the NameId is out of bounds.
+    pub fn try_resolve_ref(&self, id: NameId) -> Option<&str> {
+        unsafe {
+            (&(*self.entries.as_ptr()))
+                .get(id.0 as usize)
+                .map(|e| e.text.as_ref())
+        }
+    }
+
     /// Resolve a NameId to its string value
     ///
-    /// Returns a copy of the string to avoid borrow issues.
+    /// Returns a copy of the string. For zero-allocation access, use `resolve_ref()`.
     ///
     /// # Panics
     ///
     /// Panics if the NameId is invalid (out of bounds).
     pub fn resolve(&self, id: NameId) -> String {
-        self.entries.borrow()[id.0 as usize].text.to_string()
+        self.resolve_ref(id).to_string()
     }
 
     /// Try to resolve a NameId to its string value
     ///
-    /// Returns a copy of the string to avoid borrow issues.
+    /// Returns a copy of the string. For zero-allocation access, use `try_resolve_ref()`.
     pub fn try_resolve(&self, id: NameId) -> Option<String> {
-        self.entries.borrow().get(id.0 as usize).map(|e| e.text.to_string())
+        self.try_resolve_ref(id).map(|s| s.to_string())
     }
 
     /// Get the number of interned strings
@@ -352,5 +392,45 @@ mod tests {
         let id2 = table_ref.add("through_ref");
         assert_eq!(id1, id2);
         assert_eq!(table.resolve(id1), "through_ref");
+    }
+
+    #[test]
+    fn test_resolve_ref_basic() {
+        let table = NameTable::new();
+        let id = table.add("hello");
+        assert_eq!(table.resolve_ref(id), "hello");
+        assert_eq!(table.resolve_ref(NameId(0)), "");
+    }
+
+    #[test]
+    fn test_try_resolve_ref_basic() {
+        let table = NameTable::new();
+        let id = table.add("test");
+        assert_eq!(table.try_resolve_ref(id), Some("test"));
+        assert_eq!(table.try_resolve_ref(NameId(9999)), None);
+    }
+
+    #[test]
+    fn test_resolve_ref_stability_across_add() {
+        let table = NameTable::new();
+        let id = table.add("stable_string");
+        let resolved: &str = table.resolve_ref(id);
+        // Trigger multiple Vec reallocations
+        for i in 0..500 {
+            table.add(&format!("extra_{i}"));
+        }
+        assert_eq!(resolved, "stable_string");
+    }
+
+    #[test]
+    fn test_try_resolve_ref_stability_across_add() {
+        let table = NameTable::new();
+        let id = table.add("test_str");
+        let resolved: Option<&str> = table.try_resolve_ref(id);
+        // Trigger multiple Vec reallocations
+        for i in 0..500 {
+            table.add(&format!("filler_{i}"));
+        }
+        assert_eq!(resolved, Some("test_str"));
     }
 }
