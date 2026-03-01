@@ -50,6 +50,9 @@ bitflags! {
         const ALLOW_XML_ATTRIBUTES = 0x0004;
         /// Strict mode: treat all warnings as errors
         const STRICT_MODE = 0x0008;
+        /// Enable XSD 1.1 assertion processing (fragment buffering)
+        #[cfg(feature = "xsd11")]
+        const PROCESS_ASSERTIONS = 0x0010;
     }
 }
 
@@ -249,6 +252,21 @@ mod tests {
 
         let combined = flags | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
         assert!(combined.contains(ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS));
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_process_assertions_flag() {
+        let default_flags = ValidationFlags::default();
+        assert!(
+            !default_flags.contains(ValidationFlags::PROCESS_ASSERTIONS),
+            "PROCESS_ASSERTIONS must not be in defaults"
+        );
+        let with_flag = default_flags | ValidationFlags::PROCESS_ASSERTIONS;
+        assert!(with_flag.contains(ValidationFlags::PROCESS_ASSERTIONS));
+        // Original defaults still present
+        assert!(with_flag.contains(ValidationFlags::REPORT_WARNINGS));
+        assert!(with_flag.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
     }
 
     #[test]

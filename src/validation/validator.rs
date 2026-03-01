@@ -127,6 +127,29 @@ enum AttributeLookup {
 }
 
 // ---------------------------------------------------------------------------
+// AssertionSource — mutual exclusion for assertion evaluation paths
+// ---------------------------------------------------------------------------
+
+/// Selects which assertion evaluation path is active.
+///
+/// XSD 1.1 assertions can be evaluated via two mutually exclusive paths:
+/// - `FragmentBuffer` — inline fragment buffering during streaming validation
+/// - `MainDocument` — external `BufferDocument`, assertions deferred to Phase 2
+///
+/// The `Disabled` default means no assertion evaluation occurs.
+#[cfg(feature = "xsd11")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum AssertionSource {
+    /// No assertion evaluation. `PROCESS_ASSERTIONS` must NOT be set.
+    #[default]
+    Disabled,
+    /// Inline fragment buffering. `PROCESS_ASSERTIONS` MUST be set.
+    FragmentBuffer,
+    /// External `BufferDocument`. `PROCESS_ASSERTIONS` must NOT be set.
+    MainDocument,
+}
+
+// ---------------------------------------------------------------------------
 // SchemaValidator
 // ---------------------------------------------------------------------------
 
@@ -164,6 +187,9 @@ pub struct SchemaValidator<'a, S: ValidationSink> {
     /// a validation stack frame. Tables propagate upward on element close,
     /// modelling the XSD "node table propagates to parent" semantics.
     ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
+    /// Which assertion evaluation path is active (XSD 1.1 only)
+    #[cfg(feature = "xsd11")]
+    assertion_source: AssertionSource,
 }
 
 impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
@@ -184,6 +210,8 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             id_values: HashSet::new(),
             pending_idrefs: Vec::new(),
             ic_scope_tables: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            assertion_source: AssertionSource::default(),
         }
     }
 
@@ -208,6 +236,37 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
     /// Clear the current source location
     pub fn clear_location(&mut self) {
         self.current_location = None;
+    }
+
+    /// Set the assertion evaluation source.
+    ///
+    /// Enforces the mutual exclusion contract between `PROCESS_ASSERTIONS`
+    /// flag and the chosen `AssertionSource` mode:
+    /// - `FragmentBuffer` requires `PROCESS_ASSERTIONS` to be set
+    /// - `Disabled` and `MainDocument` require it to NOT be set
+    ///
+    /// # Panics
+    /// Panics if the flag/mode combination is invalid.
+    #[cfg(feature = "xsd11")]
+    pub fn set_assertion_source(&mut self, source: AssertionSource) -> &mut Self {
+        let has_flag = self.flags.contains(ValidationFlags::PROCESS_ASSERTIONS);
+        match source {
+            AssertionSource::FragmentBuffer => {
+                assert!(
+                    has_flag,
+                    "AssertionSource::FragmentBuffer requires ValidationFlags::PROCESS_ASSERTIONS"
+                );
+            }
+            AssertionSource::Disabled | AssertionSource::MainDocument => {
+                assert!(
+                    !has_flag,
+                    "AssertionSource::{:?} requires PROCESS_ASSERTIONS to NOT be set",
+                    source
+                );
+            }
+        }
+        self.assertion_source = source;
+        self
     }
 
     // -----------------------------------------------------------------------
@@ -256,6 +315,19 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                 ),
             );
             return SchemaInfo::invalid();
+        }
+
+        // 1b. Root element: verify PROCESS_ASSERTIONS ↔ AssertionSource consistency
+        #[cfg(feature = "xsd11")]
+        if self.validation_stack.is_empty() {
+            let has_flag = self.flags.contains(ValidationFlags::PROCESS_ASSERTIONS);
+            let is_fragment = self.assertion_source == AssertionSource::FragmentBuffer;
+            assert!(
+                has_flag == is_fragment,
+                "PROCESS_ASSERTIONS flag and AssertionSource are inconsistent: \
+                 flag={has_flag}, source={:?}. Call set_assertion_source() before validation.",
+                self.assertion_source,
+            );
         }
 
         // 2. If not root: advance parent's content model
@@ -490,6 +562,23 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         ev_state.process_contents = process_contents;
         self.push_element(ev_state);
         self.advance_constraints_start_element(local_name, namespace, Some(elem_key));
+
+        // 9b. Assertion detection hook (XSD 1.1)
+        #[cfg(feature = "xsd11")]
+        {
+            debug_assert!(
+                self.flags.contains(ValidationFlags::PROCESS_ASSERTIONS)
+                    == (self.assertion_source == AssertionSource::FragmentBuffer),
+                "PROCESS_ASSERTIONS / AssertionSource invariant violated mid-validation"
+            );
+            if self.assertion_source == AssertionSource::FragmentBuffer {
+                if let Some(TypeKey::Complex(ct_key)) = type_key {
+                    let _has_assertions =
+                        !self.schema_set.arenas.complex_types[ct_key].assertions.is_empty();
+                    // TODO(Task 5.7): if _has_assertions, create AssertionBufferFrame here
+                }
+            }
+        }
 
         // 10. Return SchemaInfo
         SchemaInfo {
@@ -973,6 +1062,19 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
                     }
                 }
             }
+        }
+
+        // 2b. Assertion evaluation hook (XSD 1.1)
+        // TODO(Task 5.7): evaluate assertions and pop AssertionBufferFrame here.
+        #[cfg(feature = "xsd11")]
+        {
+            debug_assert!(
+                self.flags.contains(ValidationFlags::PROCESS_ASSERTIONS)
+                    == (self.assertion_source == AssertionSource::FragmentBuffer),
+                "PROCESS_ASSERTIONS / AssertionSource invariant violated at end-element"
+            );
+            // TODO(Task 5.7): when assertion_buffer_stack exists, assert it is empty
+            // when assertion_source != FragmentBuffer.
         }
 
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
@@ -4518,6 +4620,163 @@ mod tests {
             "Expected no errors for unique keys, got: {:?}",
             v.sink.errors
         );
+    }
+
+    #[cfg(feature = "xsd11")]
+    mod assertion_source_tests {
+        use super::*;
+
+        #[test]
+        fn test_assertion_source_default_is_disabled() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            assert_eq!(v.assertion_source, AssertionSource::Disabled);
+        }
+
+        #[test]
+        fn test_fragment_buffer_with_process_assertions_ok() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
+            let mut v = SchemaValidator::new(&schema_set, sink, flags);
+            v.set_assertion_source(AssertionSource::FragmentBuffer);
+            assert_eq!(v.assertion_source, AssertionSource::FragmentBuffer);
+        }
+
+        #[test]
+        #[should_panic(expected = "PROCESS_ASSERTIONS")]
+        fn test_fragment_buffer_without_flag_panics() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            v.set_assertion_source(AssertionSource::FragmentBuffer);
+        }
+
+        #[test]
+        #[should_panic(expected = "PROCESS_ASSERTIONS")]
+        fn test_disabled_with_flag_panics() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
+            let mut v = SchemaValidator::new(&schema_set, sink, flags);
+            v.set_assertion_source(AssertionSource::Disabled);
+        }
+
+        #[test]
+        #[should_panic(expected = "PROCESS_ASSERTIONS")]
+        fn test_main_document_with_flag_panics() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
+            let mut v = SchemaValidator::new(&schema_set, sink, flags);
+            v.set_assertion_source(AssertionSource::MainDocument);
+        }
+
+        #[test]
+        fn test_main_document_without_flag_ok() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            v.set_assertion_source(AssertionSource::MainDocument);
+            assert_eq!(v.assertion_source, AssertionSource::MainDocument);
+        }
+
+        #[test]
+        fn test_disabled_mode_no_overhead() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            assert_eq!(v.assertion_source, AssertionSource::Disabled);
+
+            let ns = empty_ns_context();
+            let info = v.validate_element("root", "", None, None, &ns);
+            assert_eq!(info.validity, SchemaValidity::Valid);
+            v.validate_end_of_attributes();
+            v.validate_text("hello");
+            let end_info = v.validate_end_element();
+            assert_eq!(end_info.validity, SchemaValidity::Valid);
+            v.end_validation().ok();
+
+            assert!(
+                v.sink.errors.is_empty(),
+                "Expected no errors in Disabled mode, got: {:?}",
+                v.sink.errors
+            );
+        }
+
+        #[test]
+        #[should_panic(expected = "PROCESS_ASSERTIONS flag and AssertionSource are inconsistent")]
+        fn test_process_assertions_flag_without_set_source_panics() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
+            // Construct with PROCESS_ASSERTIONS but never call set_assertion_source()
+            let mut v = SchemaValidator::new(&schema_set, sink, flags);
+            let ns = empty_ns_context();
+            // Must panic at root element validation
+            v.validate_element("root", "", None, None, &ns);
+        }
+
+        #[test]
+        fn test_main_document_full_roundtrip() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+            v.set_assertion_source(AssertionSource::MainDocument);
+            assert_eq!(v.assertion_source, AssertionSource::MainDocument);
+
+            let ns = empty_ns_context();
+            let info = v.validate_element("root", "", None, None, &ns);
+            assert_eq!(info.validity, SchemaValidity::Valid);
+            v.validate_end_of_attributes();
+            v.validate_text("hello");
+            let end_info = v.validate_end_element();
+            assert_eq!(end_info.validity, SchemaValidity::Valid);
+            v.end_validation().ok();
+
+            assert!(
+                v.sink.errors.is_empty(),
+                "Expected no errors in MainDocument mode, got: {:?}",
+                v.sink.errors
+            );
+        }
     }
 
 }
