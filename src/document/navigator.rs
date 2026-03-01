@@ -17,6 +17,8 @@ use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, XmlNodeOrder,
 };
 use crate::types::value::XmlValue;
+use crate::validation::info::ContentType;
+use crate::validation::simple::validate_simple_type;
 
 use super::buffer::BufferDocument;
 use super::node::{Node, NodeType};
@@ -124,6 +126,27 @@ impl<'a> BufferDocNavigator<'a> {
         } else {
             false
         }
+    }
+
+    /// Returns `true` when the current element has at least one child element.
+    ///
+    /// For non-element nodes (attributes, text, etc.) this always returns `false`.
+    fn has_element_children(&self) -> bool {
+        if self.is_on_namespace() || self.is_on_attribute() {
+            return false;
+        }
+        if let Some(child) = self.doc.first_content_child_of(self.current) {
+            let end = self.doc.subtree_end(self.current);
+            let mut i = child;
+            while i < end {
+                let n = self.doc.nodes.get(i);
+                if n.node_type() == NodeType::Element {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
     }
 
     /// Concatenates all descendant text content (XPath string-value for elements/root).
@@ -647,11 +670,46 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn typed_value(&self) -> Option<XmlValue> {
-        if self.node().has_flag(Node::IS_NIL) {
+        if self.is_on_namespace() {
             return None;
         }
-        // Not yet available — requires parse_value/get_simple_content on SchemaSet (Step 8).
-        None
+        let node = self.node();
+        if node.has_flag(Node::IS_NIL) {
+            return None;
+        }
+        let binding = self.schema_binding()?;
+        let schema_set = self.doc.schema_set?;
+
+        // Complex types: only TextOnly content produces typed values
+        // (ElementOnly/Mixed/Empty never produce typed values — validator.rs:1007)
+        if let TypeKey::Complex(_) = binding.type_key {
+            if binding.content_type != Some(ContentType::TextOnly) {
+                return None;
+            }
+        }
+
+        let value_str = self.value();
+
+        // Default-aware value resolution (cvc-elt.5.2):
+        // Substitute element default only when there is no text content AND
+        // no child elements (matching validator.rs:1013 semantics).
+        let effective_value = if value_str.is_empty() && !self.has_element_children() {
+            if let Some(elem_key) = binding.element_decl {
+                let elem_data = &schema_set.arenas.elements[elem_key];
+                match &elem_data.default_value {
+                    Some(default_val) => default_val.clone(),
+                    None => value_str,
+                }
+            } else {
+                value_str
+            }
+        } else {
+            value_str
+        };
+
+        validate_simple_type(&effective_value, binding.type_key, schema_set)
+            .ok()
+            .map(|r| r.typed_value)
     }
 
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {

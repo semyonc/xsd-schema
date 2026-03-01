@@ -10,6 +10,7 @@ use super::ast::BinaryOpKind;
 use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
 use super::operators::eval_binary;
+use super::string_ops::is_xml_whitespace;
 use super::{DomNavigator, DomNodeType};
 
 /// Compares XPath nodes and sequences for deep equality.
@@ -241,10 +242,6 @@ impl TreeComparer {
         }
         None
     }
-}
-
-fn is_xml_whitespace(ch: char) -> bool {
-    matches!(ch, ' ' | '\t' | '\n' | '\r')
 }
 
 fn count_attributes<N: DomNavigator>(nav: &mut N) -> usize {

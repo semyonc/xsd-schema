@@ -420,6 +420,37 @@ impl<'a> BufferDocumentBuilder<'a> {
         });
     }
 
+    /// Registers an `xml:id` value for the given element.
+    ///
+    /// Returns [`BufferDocumentError::DuplicateId`] if the id has already
+    /// been registered.  This is a no-op in `Fragment` mode.
+    pub fn register_xml_id(
+        &mut self,
+        id: &str,
+        elem_ref: u32,
+    ) -> Result<(), BufferDocumentError> {
+        if self.doc.kind != DocumentKind::Full {
+            return Ok(());
+        }
+        let id_val: Box<str> = id.into();
+        if self.doc.id_elements.contains_key(&id_val) {
+            return Err(BufferDocumentError::DuplicateId(id_val.into_string()));
+        }
+        self.doc.id_elements.insert(id_val, elem_ref);
+        Ok(())
+    }
+
+    /// Returns `true` when source location tracking is enabled.
+    #[inline]
+    pub fn track_source_locations(&self) -> bool {
+        self.options.track_source_locations
+    }
+
+    /// Records a completed source span for a node.
+    pub fn set_source_span(&mut self, node_ref: u32, span: SourceSpan) {
+        self.doc.source_spans.set(node_ref, span);
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────
 
     /// Flushes accumulated text into a content node.
@@ -740,7 +771,7 @@ impl<'a> BufferDocumentBuilder<'a> {
 
 /// Splits `b"prefix:local"` into `(b"prefix", b"local")`.
 /// If no colon, returns `(b"", full_name)`.
-fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
     match name.iter().position(|&b| b == b':') {
         Some(pos) => (&name[..pos], &name[pos + 1..]),
         None => (b"", name),
@@ -748,7 +779,7 @@ fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// Parses PI content into `(target, data)`.
-fn parse_pi_content(raw: &str) -> (&str, &str) {
+pub(crate) fn parse_pi_content(raw: &str) -> (&str, &str) {
     let trimmed = raw.trim();
     match trimmed.find(|c: char| c.is_ascii_whitespace()) {
         Some(pos) => (&trimmed[..pos], trimmed[pos..].trim_start()),

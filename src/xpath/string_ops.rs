@@ -52,6 +52,14 @@ pub fn is_xml_whitespace(ch: char) -> bool {
     matches!(ch, ' ' | '\t' | '\n' | '\r')
 }
 
+/// Check if a string consists entirely of XML whitespace characters.
+///
+/// Returns `true` for the empty string (vacuously all-whitespace).
+#[inline]
+pub fn is_xml_whitespace_str(s: &str) -> bool {
+    s.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
 /// Normalize a string value with entity reference handling.
 ///
 /// Handles standard XML entity references:
@@ -486,6 +494,15 @@ mod tests {
         assert!(is_xml_whitespace('\n'));
         assert!(is_xml_whitespace('\r'));
         assert!(!is_xml_whitespace('a'));
+    }
+
+    #[test]
+    fn test_is_xml_whitespace_str() {
+        assert!(is_xml_whitespace_str(""));
+        assert!(is_xml_whitespace_str(" "));
+        assert!(is_xml_whitespace_str(" \t\n\r"));
+        assert!(!is_xml_whitespace_str("hello"));
+        assert!(!is_xml_whitespace_str(" a "));
     }
 
     #[test]

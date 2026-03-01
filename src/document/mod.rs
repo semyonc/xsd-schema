@@ -17,6 +17,7 @@ pub mod page;
 pub mod qname;
 pub mod strings;
 pub mod type_remap;
+pub mod typed_builder;
 pub mod namespace;
 pub mod element_index;
 pub mod source_spans;
@@ -39,6 +40,7 @@ pub use element_index::ElementIndex;
 pub use source_spans::NodeSourceSpans;
 pub use buffer::BufferDocument;
 pub use builder::BufferDocumentBuilder;
+pub use typed_builder::{SilentValidationSink, build_typed_document};
 pub use navigator::BufferDocNavigator;
 
 /// Whether the document is a complete XML document or a validation fragment.
