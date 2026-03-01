@@ -8,24 +8,44 @@ use crate::ids::NameId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-/// Atomized qualified name — 16 bytes, `Copy`.
+/// Atomized qualified name — 20 bytes, `Copy`.
 ///
-/// Two `QNameAtom` values are considered **equal** when all four fields match
-/// (including `prefix`), which is the behaviour needed for table deduplication.
+/// **Equality** compares `local_name`, `namespace_uri`, `prefix`, and
+/// `local_name_hash`.  The `qualified_name_idx` field is **excluded** from
+/// equality because it is a per-document `StringStore` index whose value
+/// may differ across occurrences even though the string content is identical
+/// (StringStore does not deduplicate).  Since the qualified name is fully
+/// determined by `prefix` + `local_name`, comparing those is sufficient.
 ///
-/// The manual [`Hash`] implementation, however, hashes only `local_name` and
+/// The [`Hash`] trait implementation hashes only `local_name` and
 /// `namespace_uri` because XML namespace identity ignores the prefix.
 /// This means two atoms that differ only in prefix will hash to the same
 /// bucket but will **not** compare as equal, so `QNameTable::atomize` will
 /// store them as separate entries — which is the desired semantics (the
 /// navigator needs to report the original prefix).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct QNameAtom {
     pub local_name: NameId,
     pub namespace_uri: NameId,
     pub prefix: NameId,
     pub local_name_hash: u32,
+    /// Index into the per-document `StringStore` (not `NameTable`).
+    /// Excluded from `PartialEq` / `hash_atom` — see struct doc.
+    pub qualified_name_idx: u32,
 }
+
+// Equality compares all fields *except* qualified_name_idx.
+// See struct doc-comment for rationale.
+impl PartialEq for QNameAtom {
+    fn eq(&self, other: &Self) -> bool {
+        self.local_name == other.local_name
+            && self.namespace_uri == other.namespace_uri
+            && self.prefix == other.prefix
+            && self.local_name_hash == other.local_name_hash
+    }
+}
+
+impl Eq for QNameAtom {}
 
 // Hash only local_name + namespace_uri (prefix is irrelevant per XML namespace identity).
 // See doc-comment on the struct for rationale on the Hash/Eq asymmetry.
@@ -42,12 +62,14 @@ pub const EMPTY_QNAME: QNameAtom = QNameAtom {
     namespace_uri: NameId(0),
     prefix: NameId(0),
     local_name_hash: 0,
+    qualified_name_idx: 0,
 };
 
 /// Chained hash table that deduplicates [`QNameAtom`] values.
 ///
 /// Index 0 is always [`EMPTY_QNAME`] and is never placed into any bucket.
-/// The internal hash used for bucket placement hashes **all four** fields
+/// The internal hash used for bucket placement hashes the four identity
+/// fields (`local_name`, `namespace_uri`, `prefix`, `local_name_hash`)
 /// so that atoms differing only in prefix land in different buckets when
 /// possible, avoiding long chains.
 pub struct QNameTable {
@@ -80,11 +102,12 @@ impl QNameTable {
 
     /// Inserts `qname` into the table if not already present, returning its index.
     ///
-    /// Deduplication compares all four fields (including prefix).
+    /// Deduplication compares the four identity fields (including prefix,
+    /// but excluding `qualified_name_idx`).
     pub fn atomize(&mut self, qname: QNameAtom) -> u32 {
         let hash = Self::hash_atom(&qname);
 
-        // Probe the chain for an exact match (all 4 fields via PartialEq).
+        // Probe the chain for a match on the identity fields (via PartialEq).
         let bucket_idx = (hash as usize) % self.buckets.len();
         let mut entry_idx = self.buckets[bucket_idx];
         while entry_idx >= 0 {
@@ -122,7 +145,8 @@ impl QNameTable {
 
     // ── Internal helpers ──────────────────────────────────────────────
 
-    /// Hash all four fields for bucket placement.
+    /// Hash the four identity fields for bucket placement
+    /// (`qualified_name_idx` excluded — see [`QNameAtom`] doc).
     fn hash_atom(qname: &QNameAtom) -> u64 {
         let mut hasher = DefaultHasher::new();
         qname.local_name.hash(&mut hasher);
@@ -168,6 +192,7 @@ mod tests {
             namespace_uri: NameId(ns),
             prefix: NameId(prefix),
             local_name_hash: hash,
+            qualified_name_idx: 0,
         }
     }
 
@@ -237,6 +262,30 @@ mod tests {
             let q = make_qname(i, i + 1000, i % 5, i.wrapping_mul(2654435761));
             assert_eq!(table.atomize(q), indices[i as usize]);
         }
+    }
+
+    #[test]
+    fn dedup_ignores_qualified_name_idx() {
+        let mut table = QNameTable::new();
+        let q1 = QNameAtom {
+            local_name: NameId(1),
+            namespace_uri: NameId(2),
+            prefix: NameId(3),
+            local_name_hash: 100,
+            qualified_name_idx: 10,
+        };
+        let q2 = QNameAtom {
+            local_name: NameId(1),
+            namespace_uri: NameId(2),
+            prefix: NameId(3),
+            local_name_hash: 100,
+            qualified_name_idx: 99, // different StringStore index, same logical name
+        };
+        let idx1 = table.atomize(q1);
+        let idx2 = table.atomize(q2);
+        assert_eq!(idx1, idx2, "Same identity fields must dedup despite different qualified_name_idx");
+        // The stored atom keeps the first occurrence's qualified_name_idx
+        assert_eq!(table.get(idx1).qualified_name_idx, 10);
     }
 
     #[test]

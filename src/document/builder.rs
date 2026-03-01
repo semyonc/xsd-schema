@@ -164,11 +164,17 @@ impl<'a> BufferDocumentBuilder<'a> {
         let prefix_id = self.doc.names.add(prefix);
         let local_hash = hash_name(local_name);
 
+        let qualified_name_idx = if prefix.is_empty() {
+            self.doc.strings.store(local_name)
+        } else {
+            self.doc.strings.store(&format!("{prefix}:{local_name}"))
+        };
         let qname = QNameAtom {
             local_name: local_id,
             namespace_uri: uri_id,
             prefix: prefix_id,
             local_name_hash: local_hash,
+            qualified_name_idx,
         };
         let qname_idx = self.doc.qname_table.atomize(qname);
 
@@ -233,11 +239,17 @@ impl<'a> BufferDocumentBuilder<'a> {
         let uri_id = self.doc.names.add(ns_uri);
         let prefix_id = self.doc.names.add(prefix);
 
+        let qualified_name_idx = if prefix.is_empty() {
+            self.doc.strings.store(local_name)
+        } else {
+            self.doc.strings.store(&format!("{prefix}:{local_name}"))
+        };
         let qname = QNameAtom {
             local_name: local_id,
             namespace_uri: uri_id,
             prefix: prefix_id,
             local_name_hash: 0, // attrs not indexed
+            qualified_name_idx,
         };
         let qname_idx = self.doc.qname_table.atomize(qname);
 

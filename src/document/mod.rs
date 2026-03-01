@@ -11,6 +11,7 @@
 pub mod buffer;
 pub mod builder;
 pub mod error;
+pub mod navigator;
 pub mod node;
 pub mod page;
 pub mod qname;
@@ -38,6 +39,7 @@ pub use element_index::ElementIndex;
 pub use source_spans::NodeSourceSpans;
 pub use buffer::BufferDocument;
 pub use builder::BufferDocumentBuilder;
+pub use navigator::BufferDocNavigator;
 
 /// Whether the document is a complete XML document or a validation fragment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

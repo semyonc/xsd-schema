@@ -134,7 +134,19 @@ impl<'a> BufferDocument<'a> {
         self.id_elements.get(id).copied()
     }
 
-    // ── Stubs (implemented in later steps) ─────────────────────────────
+    // ── Navigator factory ─────────────────────────────────────────────
+
+    /// Creates a navigator positioned at the document root.
+    pub fn create_navigator(&self) -> super::navigator::BufferDocNavigator<'_> {
+        super::navigator::BufferDocNavigator::new(self, self.root)
+    }
+
+    /// Creates a navigator positioned at the given node reference.
+    pub fn create_navigator_at(&self, node_ref: u32) -> super::navigator::BufferDocNavigator<'_> {
+        super::navigator::BufferDocNavigator::new(self, node_ref)
+    }
+
+    // ── Parsing helpers ───────────────────────────────────────────────
 
     /// Parses an XML document from a reader into a `BufferDocument`.
     pub fn from_reader<R: std::io::BufRead>(
@@ -157,14 +169,6 @@ impl<'a> BufferDocument<'a> {
         Self::from_reader(reader, arena, names, BufferDocumentOptions::default(), None)
     }
 
-    /// Creates a navigator over this document.
-    ///
-    /// # Panics
-    ///
-    /// Always panics — will be implemented in Step 7 (navigator).
-    pub fn create_navigator(&self) {
-        todo!("BufferDocument::create_navigator — implemented in Step 7 (navigator)")
-    }
 }
 
 #[cfg(test)]

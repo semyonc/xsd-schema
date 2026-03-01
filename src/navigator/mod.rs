@@ -135,9 +135,10 @@ pub trait DomNavigator: Clone {
     /// Move to the next namespace in scope
     fn move_to_next_namespace(&mut self, scope: NamespaceAxisScope) -> bool;
 
-    /// Move to the next following node of the given type
+    /// Move to the next node in the **following axis** (excludes descendants).
     ///
     /// If `end` is provided, stop before reaching that position.
+    /// On `false` the cursor position is unchanged.
     fn move_to_following(&mut self, kind: DomNodeType, end: Option<&Self>) -> bool;
 
     // ----- Node information -----
