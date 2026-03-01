@@ -20,6 +20,7 @@ use crate::types::value::XmlValue;
 
 use super::buffer::BufferDocument;
 use super::node::{Node, NodeType};
+use super::type_remap::NodeSchemaBinding;
 use super::{NsRef, NULL};
 
 /// Lightweight cursor for XPath navigation over [`BufferDocument`].
@@ -276,6 +277,30 @@ impl<'a> BufferDocNavigator<'a> {
                 result
             }
         }
+    }
+
+    // ── Schema binding accessors ──────────────────────────────────────
+
+    /// Returns the full [`TypeKey`] from the current node's schema binding.
+    ///
+    /// Returns `None` when positioned on a namespace virtual node.
+    pub fn element_type_key(&self) -> Option<TypeKey> {
+        if self.is_on_namespace() {
+            return None;
+        }
+        let idx = self.node().binding_index();
+        self.doc.binding_remap.get(idx).map(|b| b.type_key)
+    }
+
+    /// Returns the full [`NodeSchemaBinding`] for the current node.
+    ///
+    /// Returns `None` when positioned on a namespace virtual node.
+    pub fn schema_binding(&self) -> Option<&NodeSchemaBinding> {
+        if self.is_on_namespace() {
+            return None;
+        }
+        let idx = self.node().binding_index();
+        self.doc.binding_remap.get(idx)
     }
 }
 
@@ -613,14 +638,18 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         if self.is_on_namespace() {
             return None;
         }
-        let idx = self.node().type_index();
-        match self.doc.type_remap.get(idx)? {
+        let idx = self.node().binding_index();
+        let binding = self.doc.binding_remap.get(idx)?;
+        match binding.type_key {
             TypeKey::Simple(k) => Some(k),
             TypeKey::Complex(_) => None,
         }
     }
 
     fn typed_value(&self) -> Option<XmlValue> {
+        if self.node().has_flag(Node::IS_NIL) {
+            return None;
+        }
         // Not yet available — requires parse_value/get_simple_content on SchemaSet (Step 8).
         None
     }
@@ -1114,6 +1143,52 @@ mod tests {
         nav.move_to_first_child();
 
         assert!(nav.schema_type().is_none());
+    }
+
+    #[test]
+    fn element_type_key_untyped() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<root/>", &arena, &names);
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child();
+
+        assert!(nav.element_type_key().is_none());
+    }
+
+    #[test]
+    fn schema_binding_untyped() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc("<root/>", &arena, &names);
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child();
+
+        assert!(nav.schema_binding().is_none());
+    }
+
+    #[test]
+    fn typed_value_nil_returns_none() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = super::super::builder::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            super::super::BufferDocumentOptions::default(),
+        )
+        .unwrap();
+
+        let elem = builder.start_element("root", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.set_nil(elem);
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child();
+
+        assert!(nav.typed_value().is_none());
     }
 
     // ── 12. find_element_by_id ───────────────────────────────────────

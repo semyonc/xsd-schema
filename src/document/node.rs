@@ -114,9 +114,11 @@ impl NodeType {
 /// 16-byte flat node in the `BufferDocument` node array.
 ///
 /// Layout of `props_type` (32 bits):
-/// - Bits \[3:0\]  — [`NodeType`] discriminant (4 bits)
-/// - Bits \[7:4\]  — property flags (`HAS_ATTRIBUTE`, `HAS_CHILDREN`, `IS_COMPLEX_TYPE`, `HAS_NMSP_DECLS`)
-/// - Bits \[31:8\] — 24-bit type index into `TypeRemapTable` (0 = untyped)
+/// - Bits \[3:0\]   — [`NodeType`] discriminant (4 bits)
+/// - Bits \[7:4\]   — property flags (`HAS_ATTRIBUTE`, `HAS_CHILDREN`, `IS_COMPLEX_TYPE`, `HAS_NMSP_DECLS`)
+/// - Bit  \[8\]     — `IS_NIL` flag (xsi:nil="true")
+/// - Bits \[11:9\]  — reserved (must be 0)
+/// - Bits \[31:12\] — 20-bit binding index into `BindingRemapTable` (0 = unbound)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Node {
@@ -134,16 +136,18 @@ impl Node {
     // ── Bitmask constants ──────────────────────────────────────────────
 
     const NODE_TYPE_MASK: u32 = 0x0F; // bits [3:0]
-    const TYPE_INDEX_SHIFT: u32 = 8; // bits [31:8]
+    const BINDING_INDEX_SHIFT: u32 = 12; // bits [31:12]
 
     /// Element has attribute children.
     pub const HAS_ATTRIBUTE: u32 = 0x10;
     /// Element/Root has content children.
     pub const HAS_CHILDREN: u32 = 0x20;
-    /// `type_index` references a complex type in the remap table.
+    /// `binding_index` references a complex type in the remap table.
     pub const IS_COMPLEX_TYPE: u32 = 0x40;
     /// Element declares namespace bindings.
     pub const HAS_NMSP_DECLS: u32 = 0x80;
+    /// Element has xsi:nil="true".
+    pub const IS_NIL: u32 = 0x100; // bit [8]
 
     // ── Accessors ──────────────────────────────────────────────────────
 
@@ -159,10 +163,10 @@ impl Node {
         self.props_type & 0xF0
     }
 
-    /// Returns the 24-bit type index (bits \[31:8\]).
+    /// Returns the 20-bit binding index (bits \[31:12\]).
     #[inline]
-    pub fn type_index(self) -> u32 {
-        self.props_type >> Self::TYPE_INDEX_SHIFT
+    pub fn binding_index(self) -> u32 {
+        self.props_type >> Self::BINDING_INDEX_SHIFT
     }
 
     /// Overwrites the [`NodeType`] in bits \[3:0\], preserving other fields.
@@ -189,19 +193,21 @@ impl Node {
         self.props_type & flag != 0
     }
 
-    /// Sets the 24-bit type index in bits \[31:8\].
+    /// Sets the 20-bit binding index in bits \[31:12\].
+    ///
+    /// Preserves bits \[11:0\] (node type, flags, and IS_NIL).
     ///
     /// # Panics (debug only)
     ///
-    /// Panics if `idx` exceeds 24 bits (> 0xFF_FFFF).
+    /// Panics if `idx` exceeds 20 bits (>= 0x10_0000).
     #[inline]
-    pub fn set_type_index(&mut self, idx: u32) {
+    pub fn set_binding_index(&mut self, idx: u32) {
         debug_assert!(
-            idx <= 0xFF_FFFF,
-            "type_index {idx} exceeds 24-bit range"
+            idx < (1 << 20),
+            "binding_index {idx} exceeds 20-bit range"
         );
         self.props_type =
-            (self.props_type & 0xFF) | (idx << Self::TYPE_INDEX_SHIFT);
+            (self.props_type & 0xFFF) | (idx << Self::BINDING_INDEX_SHIFT);
     }
 }
 
@@ -257,11 +263,11 @@ mod tests {
     fn node_type_preserves_other_bits() {
         let mut node = Node::default();
         node.set_flag(Node::HAS_CHILDREN);
-        node.set_type_index(42);
+        node.set_binding_index(42);
         node.set_node_type(NodeType::Element);
         assert_eq!(node.node_type(), NodeType::Element);
         assert!(node.has_flag(Node::HAS_CHILDREN));
-        assert_eq!(node.type_index(), 42);
+        assert_eq!(node.binding_index(), 42);
     }
 
     #[test]
@@ -292,19 +298,19 @@ mod tests {
     }
 
     #[test]
-    fn type_index_set_get() {
+    fn binding_index_set_get() {
         let mut node = Node::default();
         node.set_node_type(NodeType::Element);
         node.set_flag(Node::HAS_CHILDREN);
 
-        node.set_type_index(0);
-        assert_eq!(node.type_index(), 0);
+        node.set_binding_index(0);
+        assert_eq!(node.binding_index(), 0);
 
-        node.set_type_index(1);
-        assert_eq!(node.type_index(), 1);
+        node.set_binding_index(1);
+        assert_eq!(node.binding_index(), 1);
 
-        node.set_type_index(0xFF_FFFF); // max 24-bit
-        assert_eq!(node.type_index(), 0xFF_FFFF);
+        node.set_binding_index(0xF_FFFF); // max 20-bit
+        assert_eq!(node.binding_index(), 0xF_FFFF);
 
         // Verify node_type and flags are preserved
         assert_eq!(node.node_type(), NodeType::Element);
@@ -313,10 +319,49 @@ mod tests {
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "type_index")]
-    fn type_index_overflow_panics_in_debug() {
+    #[should_panic(expected = "binding_index")]
+    fn binding_index_overflow_panics_in_debug() {
         let mut node = Node::default();
-        node.set_type_index(0x0100_0000); // 25 bits — too large
+        node.set_binding_index(0x10_0000); // 21 bits — too large
+    }
+
+    #[test]
+    fn is_nil_flag_set_clear() {
+        let mut node = Node::default();
+        node.set_node_type(NodeType::Element);
+        assert!(!node.has_flag(Node::IS_NIL));
+
+        node.set_flag(Node::IS_NIL);
+        assert!(node.has_flag(Node::IS_NIL));
+        assert_eq!(node.node_type(), NodeType::Element);
+
+        node.clear_flag(Node::IS_NIL);
+        assert!(!node.has_flag(Node::IS_NIL));
+    }
+
+    #[test]
+    fn is_nil_and_binding_index_independent() {
+        let mut node = Node::default();
+        node.set_node_type(NodeType::Element);
+        node.set_flag(Node::IS_NIL);
+        node.set_binding_index(123);
+
+        assert!(node.has_flag(Node::IS_NIL));
+        assert_eq!(node.binding_index(), 123);
+        assert_eq!(node.node_type(), NodeType::Element);
+    }
+
+    #[test]
+    fn set_binding_index_preserves_is_nil() {
+        let mut node = Node::default();
+        node.set_node_type(NodeType::Element);
+        node.set_flag(Node::HAS_CHILDREN | Node::IS_NIL);
+
+        node.set_binding_index(42);
+        assert!(node.has_flag(Node::IS_NIL));
+        assert!(node.has_flag(Node::HAS_CHILDREN));
+        assert_eq!(node.binding_index(), 42);
+        assert_eq!(node.node_type(), NodeType::Element);
     }
 
     #[test]

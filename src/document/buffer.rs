@@ -8,8 +8,8 @@ use crate::namespace::NameTable;
 use crate::schema::SchemaSet;
 
 use super::{
-    BufferDocumentOptions, DocumentKind, ElementIndex, NamespacePageFactory, Node, NodePages,
-    NodeSourceSpans, NsRef, QNameTable, StringStore, TypeRemapTable, NULL,
+    BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespacePageFactory,
+    Node, NodePages, NodeSourceSpans, NsRef, QNameTable, StringStore, NULL,
 };
 
 /// Compact, cache-friendly XML document representation.
@@ -25,7 +25,7 @@ pub struct BufferDocument<'a> {
     pub(crate) nodes: NodePages<'a>,
     pub(crate) qname_table: QNameTable,
     pub(crate) strings: StringStore<'a>,
-    pub(crate) type_remap: TypeRemapTable,
+    pub(crate) binding_remap: BindingRemapTable,
     pub(crate) root: u32,
     pub(crate) options: BufferDocumentOptions,
     // Side tables
@@ -185,7 +185,7 @@ mod tests {
             nodes: NodePages::new(arena),
             qname_table: QNameTable::new(),
             strings: StringStore::new(arena),
-            type_remap: TypeRemapTable::new(),
+            binding_remap: BindingRemapTable::new(),
             root: 0,
             options: BufferDocumentOptions::default(),
             namespace_pages: NamespacePageFactory::new(arena),

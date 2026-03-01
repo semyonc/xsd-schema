@@ -21,9 +21,9 @@ use crate::schema::SchemaSet;
 use super::buffer::BufferDocument;
 use super::error::BufferDocumentError;
 use super::{
-    BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode, NamespacePageFactory,
-    Node, NodePages, NodeSourceSpans, NodeType, NsRef, QNameAtom, QNameTable, StringStore,
-    TypeRemapTable, NULL,
+    BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
+    NamespacePageFactory, Node, NodePages, NodeSourceSpans, NodeSchemaBinding, NodeType, NsRef,
+    QNameAtom, QNameTable, StringStore, NULL,
 };
 
 // ── ElementBuildState ─────────────────────────────────────────────────
@@ -108,7 +108,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             nodes,
             qname_table: QNameTable::new(),
             strings: StringStore::new(arena),
-            type_remap: TypeRemapTable::new(),
+            binding_remap: BindingRemapTable::new(),
             root: root_ref,
             options,
             namespace_pages,
@@ -392,23 +392,32 @@ impl<'a> BufferDocumentBuilder<'a> {
         Ok(self.doc)
     }
 
-    /// Sets the type index on a node, returning `true` if the type is complex.
-    pub fn set_node_type(
+    /// Sets the schema binding on a node, returning `true` if the type is complex.
+    ///
+    /// Returns [`BufferDocumentError::Overflow`] if the binding table is full.
+    pub fn set_node_binding(
         &mut self,
         node_ref: u32,
-        type_key: crate::ids::TypeKey,
-    ) -> bool {
-        let idx = self.doc.type_remap.register(type_key);
-        let is_complex = matches!(type_key, crate::ids::TypeKey::Complex(_));
+        binding: NodeSchemaBinding,
+    ) -> Result<bool, BufferDocumentError> {
+        let idx = self.doc.binding_remap.register(binding)?;
+        let is_complex = matches!(binding.type_key, crate::ids::TypeKey::Complex(_));
         self.doc.nodes.update(node_ref, |n| {
-            n.set_type_index(idx);
+            n.set_binding_index(idx);
             if is_complex {
                 n.set_flag(Node::IS_COMPLEX_TYPE);
             } else {
                 n.clear_flag(Node::IS_COMPLEX_TYPE);
             }
         });
-        is_complex
+        Ok(is_complex)
+    }
+
+    /// Sets the `IS_NIL` flag on a node (xsi:nil="true").
+    pub fn set_nil(&mut self, node_ref: u32) {
+        self.doc.nodes.update(node_ref, |n| {
+            n.set_flag(Node::IS_NIL);
+        });
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -1043,7 +1052,7 @@ mod tests {
     }
 
     #[test]
-    fn test_set_node_type() {
+    fn test_set_node_binding() {
         let arena = Bump::new();
         let names = NameTable::new();
         let mut builder = make_builder(&arena, &names);
@@ -1055,9 +1064,15 @@ mod tests {
         use slotmap::SlotMap;
         let mut sm: SlotMap<crate::ids::ComplexTypeKey, ()> = SlotMap::with_key();
         let ck = sm.insert(());
-        let tk = TypeKey::Complex(ck);
 
-        let is_complex = builder.set_node_type(elem, tk);
+        let binding = NodeSchemaBinding {
+            type_key: TypeKey::Complex(ck),
+            element_decl: None,
+            attribute_decl: None,
+            content_type: None,
+        };
+
+        let is_complex = builder.set_node_binding(elem, binding).unwrap();
         assert!(is_complex);
 
         builder.end_element().unwrap();
@@ -1065,7 +1080,25 @@ mod tests {
 
         let node = doc.nodes.get(elem);
         assert!(node.has_flag(Node::IS_COMPLEX_TYPE));
-        assert!(node.type_index() > 0);
+        assert!(node.binding_index() > 0);
+    }
+
+    #[test]
+    fn test_set_nil() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+
+        let elem = builder.start_element("root", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+
+        builder.set_nil(elem);
+
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let node = doc.nodes.get(elem);
+        assert!(node.has_flag(Node::IS_NIL));
     }
 
     // ── quick-xml adapter tests ───────────────────────────────────────

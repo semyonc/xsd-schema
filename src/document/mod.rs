@@ -30,7 +30,7 @@ pub use node::{
 pub use page::NodePages;
 pub use qname::{QNameAtom, QNameTable, EMPTY_QNAME};
 pub use strings::StringStore;
-pub use type_remap::TypeRemapTable;
+pub use type_remap::{BindingRemapTable, NodeSchemaBinding};
 pub use namespace::{
     NamespaceChain, NamespaceNode, NamespacePageFactory, NsRef,
     NS_PAGE_MASK, NS_PAGE_SHIFT, NS_PAGE_SIZE,
