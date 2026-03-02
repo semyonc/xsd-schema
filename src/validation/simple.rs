@@ -181,6 +181,9 @@ fn validate_atomic_type(
             if val.schema_type.is_none() {
                 val.schema_type = Some(sk);
             }
+            // XSD 1.1: evaluate assertion facets
+            #[cfg(feature = "xsd11")]
+            evaluate_assertion_facets(&val, &facets, schema_set, Some(sk))?;
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
@@ -269,15 +272,24 @@ fn validate_list_type(
         })?;
     }
 
+    let typed_value = XmlValue::with_schema_type(
+        item_type_code,
+        sk,
+        XmlValueKind::List {
+            item_type: item_type_code,
+            items,
+        },
+    );
+
+    // XSD 1.1: evaluate assertion facets ($value is the sequence of list items)
+    #[cfg(feature = "xsd11")]
+    {
+        let item_sk = item_type_key.as_simple();
+        evaluate_assertion_facets(&typed_value, &facets, schema_set, item_sk)?;
+    }
+
     Ok(SimpleTypeResult {
-        typed_value: XmlValue::with_schema_type(
-            item_type_code,
-            sk,
-            XmlValueKind::List {
-                item_type: item_type_code,
-                items,
-            },
-        ),
+        typed_value,
         member_type: None,
     })
 }
@@ -321,6 +333,17 @@ fn validate_union_type(
                 inner.schema_type = member_key.as_simple();
             }
 
+            // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
+            #[cfg(feature = "xsd11")]
+            {
+                let item_sk = member_key
+                    .as_simple()
+                    .and_then(|sk| {
+                        crate::types::sequence::resolve_list_item_schema_type(sk, schema_set)
+                    });
+                evaluate_assertion_facets(&inner, &facets, schema_set, item_sk)?;
+            }
+
             return Ok(SimpleTypeResult {
                 typed_value: XmlValue::with_schema_type(
                     inner.type_code,
@@ -341,6 +364,146 @@ fn validate_union_type(
         ),
         None,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// XSD 1.1: Assertion facet evaluation
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "xsd11")]
+fn resolve_assertion_default_ns(
+    raw: Option<&str>,
+    source: Option<&crate::parser::location::SourceRef>,
+    ns_snapshot: &crate::namespace::context::NamespaceContextSnapshot,
+    schema_set: &SchemaSet,
+) -> Option<crate::ids::NameId> {
+    // Look up the schema document that defines this assertion
+    let doc = source.and_then(|s| schema_set.documents.get(s.doc_id as usize));
+
+    // Cascade: facet-level > schema-level (of the defining document)
+    let effective = if let Some(raw) = raw {
+        Some(raw.to_string())
+    } else {
+        doc.and_then(|d| d.xpath_default_namespace)
+            .map(|id| schema_set.name_table.resolve(id))
+    };
+
+    match effective.as_deref() {
+        Some("##defaultNamespace") => ns_snapshot.default_ns,
+        Some("##targetNamespace") => doc.and_then(|d| d.target_namespace),
+        Some("##local") | None => None,
+        Some(uri) => Some(schema_set.name_table.add(uri)),
+    }
+}
+
+/// Evaluate assertion facets against a typed value (XSD 1.1).
+///
+/// Assertion facets on simpleType restrictions receive only the `$value`
+/// variable (the typed value being validated). No context node or DOM
+/// access is needed, so this evaluates inline during streaming validation.
+#[cfg(feature = "xsd11")]
+fn evaluate_assertion_facets(
+    typed_value: &XmlValue,
+    facets: &FacetSet,
+    schema_set: &SchemaSet,
+    item_schema_type: Option<SimpleTypeKey>,
+) -> Result<(), ValidationError> {
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::functions::effective_boolean_value;
+    use crate::xpath::{RoXmlNavigator, XPathContext};
+
+    if facets.assertions.is_empty() {
+        return Ok(());
+    }
+
+    for assertion in &facets.assertions {
+        if assertion.test.is_empty() {
+            continue;
+        }
+
+        // Resolve assertion source location for error reporting
+        let location = assertion
+            .source
+            .as_ref()
+            .and_then(|s| schema_set.source_maps.locate(s));
+
+        // Build XPath static context
+        let ctx = XPathContext::new(&schema_set.name_table)
+            .with_namespaces(assertion.ns_snapshot.clone())
+            .with_schema_set(schema_set);
+
+        // Set default element namespace from xpathDefaultNamespace cascade
+        let ctx = if let Some(default_ns) = resolve_assertion_default_ns(
+            assertion.xpath_default_namespace.as_deref(),
+            assertion.source.as_ref(),
+            &assertion.ns_snapshot,
+            schema_set,
+        ) {
+            ctx.with_default_element_ns(default_ns)
+        } else {
+            ctx
+        };
+
+        // Compile the XPath expression with $value declared
+        let expr = XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]).map_err(
+            |e| {
+                errors::error(
+                    "cvc-assertion",
+                    format!(
+                        "Failed to compile assertion test '{}': {}",
+                        assertion.test, e
+                    ),
+                    location.clone(),
+                )
+            },
+        )?;
+
+        // Convert typed value to XPathValue
+        let xpath_value = typed_value.to_xpath_value::<RoXmlNavigator<'static>>(item_schema_type);
+
+        // Evaluate with $value bound
+        let result = expr
+            .evaluator(&ctx)
+            .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+                eval.set_variable_by_name("value", xpath_value).unwrap();
+            })
+            .map_err(|e| {
+                errors::error(
+                    "cvc-assertion",
+                    format!(
+                        "Failed to evaluate assertion test '{}': {}",
+                        assertion.test, e
+                    ),
+                    location.clone(),
+                )
+            })?;
+
+        // Effective boolean value must be true
+        let ebv = effective_boolean_value(&result).map_err(|e| {
+            errors::error(
+                "cvc-assertion",
+                format!(
+                    "Failed to compute boolean value for assertion '{}': {}",
+                    assertion.test, e
+                ),
+                location.clone(),
+            )
+        })?;
+
+        if !ebv {
+            return Err(errors::error(
+                "cvc-assertion",
+                format!(
+                    "Assertion '{}' failed for value '{}'",
+                    assertion.test,
+                    typed_value.to_string_value()
+                ),
+                location,
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -573,13 +736,22 @@ mod tests {
 mod xsd11_tests {
     use super::*;
     use crate::navigator::RoXmlNavigator;
-    use crate::pipeline::load_and_process_schema;
+    use crate::parser::parse::ParserConfig;
+    use crate::pipeline::{load_and_process_schema, PipelineConfig};
+    use crate::schema::model::XsdVersion;
     use crate::types::sequence::resolve_list_item_schema_type;
     use crate::xpath::XPathValue;
 
     fn load_schema(xsd: &str) -> SchemaSet {
         let mut schema_set = SchemaSet::new();
-        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+        let config = PipelineConfig {
+            parser: ParserConfig {
+                xsd_version: XsdVersion::V1_1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config))
             .expect("failed to load schema");
         schema_set
     }
@@ -739,5 +911,314 @@ mod xsd11_tests {
             items[0].as_atomic().unwrap().type_code,
             XmlTypeCode::Integer
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Assertion facet tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assertion_even_integer() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="evenInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value mod 2 = 0"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="evenInt"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("4", tk, &schema).is_ok());
+        assert!(validate_simple_type("0", tk, &schema).is_ok());
+        assert!(validate_simple_type("-2", tk, &schema).is_ok());
+
+        let err = validate_simple_type("3", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+
+        let err = validate_simple_type("7", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_positive_value() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="posInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value gt 0"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="posInt"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("1", tk, &schema).is_ok());
+        assert!(validate_simple_type("100", tk, &schema).is_ok());
+
+        let err = validate_simple_type("0", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+
+        let err = validate_simple_type("-5", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_string_length() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="shortStr">
+                    <xs:restriction base="xs:string">
+                        <xs:assertion test="string-length($value) le 5"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="shortStr"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("hello", tk, &schema).is_ok());
+        assert!(validate_simple_type("", tk, &schema).is_ok());
+        assert!(validate_simple_type("abcde", tk, &schema).is_ok());
+
+        let err = validate_simple_type("toolong", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_inherited() {
+        // Assertion inherited from base type through derivation chain
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="positiveInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value gt 0"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:simpleType name="smallPositiveInt">
+                    <xs:restriction base="positiveInt">
+                        <xs:maxInclusive value="10"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="smallPositiveInt"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("5", tk, &schema).is_ok());
+        assert!(validate_simple_type("10", tk, &schema).is_ok());
+
+        // Fails maxInclusive
+        assert!(validate_simple_type("11", tk, &schema).is_err());
+        // Fails inherited assertion ($value gt 0)
+        let err = validate_simple_type("0", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_compile_error() {
+        // Invalid XPath in assertion test → cvc-assertion error
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="badAssert">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value @@@ invalid"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="badAssert"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let err = validate_simple_type("42", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+        assert!(err.message.contains("compile"));
+    }
+
+    #[test]
+    fn test_assertion_with_other_facets() {
+        // Assertion combined with pattern and range facets
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="evenScore">
+                    <xs:restriction base="xs:integer">
+                        <xs:minInclusive value="0"/>
+                        <xs:maxInclusive value="100"/>
+                        <xs:assertion test="$value mod 2 = 0"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="evenScore"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("50", tk, &schema).is_ok());
+        assert!(validate_simple_type("0", tk, &schema).is_ok());
+        assert!(validate_simple_type("100", tk, &schema).is_ok());
+
+        // Fails assertion (odd number)
+        let err = validate_simple_type("51", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+
+        // Fails range (out of bounds)
+        assert!(validate_simple_type("102", tk, &schema).is_err());
+        assert!(validate_simple_type("-2", tk, &schema).is_err());
+    }
+
+    #[test]
+    fn test_assertion_multiple() {
+        // Multiple assertion facets on the same type
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="constrained">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value gt 0"/>
+                        <xs:assertion test="$value mod 2 = 0"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="constrained"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        // Must satisfy both: positive AND even
+        assert!(validate_simple_type("2", tk, &schema).is_ok());
+        assert!(validate_simple_type("4", tk, &schema).is_ok());
+
+        // Positive but odd -> fails second assertion
+        let err = validate_simple_type("3", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+
+        // Even but not positive -> fails first assertion
+        let err = validate_simple_type("0", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_boolean_value() {
+        // Assertion on xs:boolean type
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="mustBeTrue">
+                    <xs:restriction base="xs:boolean">
+                        <xs:assertion test="$value"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="mustBeTrue"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(validate_simple_type("true", tk, &schema).is_ok());
+        assert!(validate_simple_type("1", tk, &schema).is_ok());
+
+        let err = validate_simple_type("false", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_union_with_list_member_item_typing() {
+        // Union whose member is a list of xs:integer.
+        // The assertion uses `instance of` on each list item, which requires
+        // item_schema_type to be propagated through the union validation path.
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="intList">
+                    <xs:list itemType="xs:integer"/>
+                </xs:simpleType>
+                <xs:simpleType name="unionWithList">
+                    <xs:union memberTypes="intList">
+                        <xs:simpleType>
+                            <xs:restriction base="xs:string"/>
+                        </xs:simpleType>
+                    </xs:union>
+                </xs:simpleType>
+                <xs:simpleType name="checkedUnion">
+                    <xs:restriction base="unionWithList">
+                        <xs:assertion test="every $i in $value satisfies $i instance of xs:integer"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="checkedUnion"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        // Space-separated integers should match the intList member and pass the assertion
+        assert!(validate_simple_type("1 2 3", tk, &schema).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // xpathDefaultNamespace cascade for assertion facets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_assertion_xpath_default_ns_schema_level_fallback() {
+        // Schema-level xpathDefaultNamespace set to the XS namespace.
+        // The assertion uses an unprefixed type name `integer` which should
+        // resolve to xs:integer via the default element namespace cascade.
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xpathDefaultNamespace="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="checkedInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value instance of integer"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="checkedInt"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        // Unprefixed `integer` resolves to xs:integer → assertion passes
+        assert!(validate_simple_type("42", tk, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_assertion_xpath_default_ns_assertion_level_overrides_schema() {
+        // Schema-level xpathDefaultNamespace is the XS namespace, but the
+        // assertion element overrides it with ##local.  Now unprefixed
+        // `integer` resolves to no-namespace, which has no matching type,
+        // so the assertion must fail.
+        let schema = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        xpathDefaultNamespace="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="checkedInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value instance of integer"
+                                      xpathDefaultNamespace="##local"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="checkedInt"/>
+            </xs:schema>"###,
+        );
+        let tk = element_type(&schema, "e");
+        // ##local overrides → `integer` resolves to no-namespace → assertion fails
+        let err = validate_simple_type("42", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
+    }
+
+    #[test]
+    fn test_assertion_xpath_default_ns_target_namespace_token() {
+        // xpathDefaultNamespace="##targetNamespace" with a non-XS target namespace.
+        // Unprefixed `integer` resolves to http://example.com/ns (the target
+        // namespace), not to the XS namespace, so `instance of integer` must
+        // fail — proving the token is correctly resolved.
+        let schema = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                        targetNamespace="http://example.com/ns"
+                        xmlns:tns="http://example.com/ns"
+                        xpathDefaultNamespace="##targetNamespace">
+                <xs:simpleType name="checkedInt">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="$value instance of integer"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="tns:checkedInt"/>
+            </xs:schema>"###,
+        );
+        let ns_id = schema.name_table.add("http://example.com/ns");
+        let name_id = schema.name_table.add("e");
+        let elem_key = schema
+            .lookup_element(Some(ns_id), name_id)
+            .expect("element not found");
+        let tk = schema.arenas.elements[elem_key]
+            .resolved_type
+            .expect("element has no resolved type");
+        // ##targetNamespace → http://example.com/ns → `integer` is NOT xs:integer → fails
+        let err = validate_simple_type("42", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-assertion");
     }
 }

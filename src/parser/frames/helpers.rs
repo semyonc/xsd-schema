@@ -327,7 +327,12 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::Assertion => {
             // XSD 1.1: assertion facet - the value is the XPath test expression
-            facets.add_assertion(facet.value, None, facet.source);
+            facets.add_assertion(
+                facet.value,
+                facet.xpath_default_namespace,
+                facet.ns_snapshot.unwrap_or_default(),
+                facet.source,
+            );
         }
         FacetKind::ExplicitTimezone => {
             // XSD 1.1: explicitTimezone facet

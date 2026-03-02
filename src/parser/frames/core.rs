@@ -316,6 +316,10 @@ pub struct FacetResult {
     pub fixed: bool,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
+    /// XSD 1.1 assertion: xpathDefaultNamespace attribute value (raw string)
+    pub xpath_default_namespace: Option<String>,
+    /// XSD 1.1 assertion: namespace bindings snapshot for XPath prefix resolution
+    pub ns_snapshot: Option<NamespaceContextSnapshot>,
 }
 
 /// Restriction result

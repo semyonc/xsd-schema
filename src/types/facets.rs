@@ -20,7 +20,7 @@
 //! - Enumerations must be subsets of base enumerations
 
 use crate::error::{FacetError, FacetResult};
-use crate::ids::NameId;
+use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::location::SourceRef;
 use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use regex::Regex;
@@ -208,14 +208,15 @@ pub struct FractionDigitsFacet {
     pub source: Option<SourceRef>,
 }
 
-/// XSD 1.1: Assertion facet (XPath constraint)
-/// TODO: XSD 1.1 - Implement assertion evaluation when XPath2 engine available
+/// XSD 1.1: Assertion facet (XPath constraint on simple type values)
 #[derive(Debug, Clone)]
 pub struct AssertionFacet {
-    /// XPath 2.0 expression
+    /// XPath 2.0 test expression
     pub test: String,
-    /// XPath default namespace
-    pub xpath_default_namespace: Option<NameId>,
+    /// Raw xpathDefaultNamespace attribute (resolved at evaluation time)
+    pub xpath_default_namespace: Option<String>,
+    /// Namespace bindings snapshot at parse time (for prefix resolution in XPath)
+    pub ns_snapshot: NamespaceContextSnapshot,
     pub source: Option<SourceRef>,
 }
 
@@ -368,10 +369,17 @@ impl FacetSet {
     }
 
     /// Add an assertion facet (XSD 1.1)
-    pub fn add_assertion(&mut self, test: String, xpath_default_namespace: Option<NameId>, source: Option<SourceRef>) {
+    pub fn add_assertion(
+        &mut self,
+        test: String,
+        xpath_default_namespace: Option<String>,
+        ns_snapshot: NamespaceContextSnapshot,
+        source: Option<SourceRef>,
+    ) {
         self.assertions.push(AssertionFacet {
             test,
             xpath_default_namespace,
+            ns_snapshot,
             source,
         });
     }

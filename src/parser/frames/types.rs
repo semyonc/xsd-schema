@@ -219,7 +219,10 @@ impl Frame for RestrictionFrame {
         #[cfg(feature = "xsd11")]
         let is_xsd11_element = matches!(
             local_name,
-            xsd_names::OPEN_CONTENT | xsd_names::ASSERT
+            xsd_names::OPEN_CONTENT
+                | xsd_names::ASSERT
+                | xsd_names::ASSERTION
+                | xsd_names::EXPLICIT_TIMEZONE
         );
         #[cfg(not(feature = "xsd11"))]
         let is_xsd11_element = false;

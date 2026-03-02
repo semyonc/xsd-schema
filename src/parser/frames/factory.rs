@@ -57,27 +57,27 @@ pub fn create_frame(
         #[cfg(feature = "xsd11")]
         xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         xsd_names::ENUMERATION => {
-            Box::new(FacetFrame::new(FacetKind::Enumeration, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::Enumeration, attrs, name_table, source, None)?)
         }
-        xsd_names::PATTERN => Box::new(FacetFrame::new(FacetKind::Pattern, attrs, name_table, source)?),
+        xsd_names::PATTERN => Box::new(FacetFrame::new(FacetKind::Pattern, attrs, name_table, source, None)?),
         xsd_names::MIN_INCLUSIVE => {
-            Box::new(FacetFrame::new(FacetKind::MinInclusive, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::MinInclusive, attrs, name_table, source, None)?)
         }
         xsd_names::MAX_INCLUSIVE => {
-            Box::new(FacetFrame::new(FacetKind::MaxInclusive, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::MaxInclusive, attrs, name_table, source, None)?)
         }
         xsd_names::MIN_EXCLUSIVE => {
-            Box::new(FacetFrame::new(FacetKind::MinExclusive, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::MinExclusive, attrs, name_table, source, None)?)
         }
         xsd_names::MAX_EXCLUSIVE => {
-            Box::new(FacetFrame::new(FacetKind::MaxExclusive, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::MaxExclusive, attrs, name_table, source, None)?)
         }
-        xsd_names::MIN_LENGTH => Box::new(FacetFrame::new(FacetKind::MinLength, attrs, name_table, source)?),
-        xsd_names::MAX_LENGTH => Box::new(FacetFrame::new(FacetKind::MaxLength, attrs, name_table, source)?),
-        xsd_names::LENGTH => Box::new(FacetFrame::new(FacetKind::Length, attrs, name_table, source)?),
-        xsd_names::TOTAL_DIGITS => Box::new(FacetFrame::new(FacetKind::TotalDigits, attrs, name_table, source)?),
-        xsd_names::FRACTION_DIGITS => Box::new(FacetFrame::new(FacetKind::FractionDigits, attrs, name_table, source)?),
-        xsd_names::WHITE_SPACE => Box::new(FacetFrame::new(FacetKind::WhiteSpace, attrs, name_table, source)?),
+        xsd_names::MIN_LENGTH => Box::new(FacetFrame::new(FacetKind::MinLength, attrs, name_table, source, None)?),
+        xsd_names::MAX_LENGTH => Box::new(FacetFrame::new(FacetKind::MaxLength, attrs, name_table, source, None)?),
+        xsd_names::LENGTH => Box::new(FacetFrame::new(FacetKind::Length, attrs, name_table, source, None)?),
+        xsd_names::TOTAL_DIGITS => Box::new(FacetFrame::new(FacetKind::TotalDigits, attrs, name_table, source, None)?),
+        xsd_names::FRACTION_DIGITS => Box::new(FacetFrame::new(FacetKind::FractionDigits, attrs, name_table, source, None)?),
+        xsd_names::WHITE_SPACE => Box::new(FacetFrame::new(FacetKind::WhiteSpace, attrs, name_table, source, None)?),
         #[cfg(feature = "xsd11")]
         xsd_names::OPEN_CONTENT => Box::new(OpenContentFrame::new(attrs, name_table, source)?),
         #[cfg(feature = "xsd11")]
@@ -86,10 +86,10 @@ pub fn create_frame(
         }
         // XSD 1.1 facets
         xsd_names::ASSERTION => {
-            Box::new(FacetFrame::new(FacetKind::Assertion, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::Assertion, attrs, name_table, source, Some(ns_snapshot.clone()))?)
         }
         xsd_names::EXPLICIT_TIMEZONE => {
-            Box::new(FacetFrame::new(FacetKind::ExplicitTimezone, attrs, name_table, source)?)
+            Box::new(FacetFrame::new(FacetKind::ExplicitTimezone, attrs, name_table, source, None)?)
         }
         _ => {
             // Unknown element - skip it
