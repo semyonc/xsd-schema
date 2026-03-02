@@ -9,9 +9,8 @@ use std::collections::HashSet;
 use ::roxmltree::{Document, Node, NodeType};
 
 use crate::ids::SimpleTypeKey;
-use crate::types::value::XmlValue;
 
-use super::{DomNavigator, DomNodeType, NamespaceAxisScope, XmlNodeOrder};
+use super::{DomNavigator, DomNodeType, NamespaceAxisScope, TypedValue, XmlNodeOrder};
 
 /// Internal cursor state for RoXmlNavigator
 #[derive(Clone)]
@@ -641,9 +640,9 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         None
     }
 
-    fn typed_value(&self) -> Option<XmlValue> {
-        // roxmltree is schema-unaware
-        None
+    fn typed_value(&self) -> TypedValue {
+        // roxmltree is schema-unaware — all nodes are untyped
+        TypedValue::Untyped
     }
 }
 
@@ -828,25 +827,12 @@ mod tests {
     }
 
     #[test]
-    fn test_typed_value_returns_none() {
+    fn test_typed_value_returns_untyped() {
         let doc = parse("<root>text</root>");
         let nav = RoXmlNavigator::new(&doc);
 
         assert!(nav.schema_type().is_none());
-        assert!(nav.typed_value().is_none());
-    }
-
-    #[test]
-    fn test_atomized_value() {
-        let doc = parse("<root>text</root>");
-        let mut nav = RoXmlNavigator::new(&doc);
-
-        nav.move_to_first_child();
-        let value = nav.atomized_value();
-
-        // Should be untyped atomic
-        assert!(value.is_untyped());
-        assert_eq!(value.to_string_value(), "text");
+        assert_eq!(nav.typed_value(), TypedValue::Untyped);
     }
 
     #[test]

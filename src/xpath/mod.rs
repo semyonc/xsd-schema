@@ -55,7 +55,7 @@ pub mod api;
 // Re-export navigator types for backward compatibility
 pub use crate::navigator::{
     DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope,
-    RoXmlNavigator, NavigatorError,
+    RoXmlNavigator, NavigatorError, TypedValue,
 };
 
 // High-level API re-exports

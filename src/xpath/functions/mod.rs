@@ -629,26 +629,44 @@ pub fn atomize_to_single_opt<N: DomNavigator>(value: XPathValue<N>) -> Result<Op
     }
 }
 
-/// Convert an XmlItem to an atomic XmlValue
+/// Convert an XmlItem to an atomic XmlValue.
+///
+/// For nodes, uses `atomize_node()` which may return `None` for nilled elements.
+/// In a single-item context, `None` is promoted to an error.
 fn item_to_atomic<N: DomNavigator>(item: XmlItem<N>) -> Result<XmlValue, XPathError> {
     match item {
         XmlItem::Atomic(value) => atomize::atomize(&value),
-        XmlItem::Node(nav) => Ok(nav.atomized_value()),
+        XmlItem::Node(nav) => atomize::atomize_node(&nav)?
+            .ok_or_else(|| XPathError::type_mismatch("item()", "empty-sequence()")),
     }
 }
 
 /// Atomize all items in a value to a sequence of XmlValues.
+///
+/// Nilled elements (which atomize to `None`) are silently skipped.
 pub fn atomize_sequence<N: DomNavigator>(value: XPathValue<N>) -> Result<Vec<XmlValue>, XPathError> {
     match value {
         XPathValue::Empty => Ok(Vec::new()),
-        XPathValue::Item(item) => {
-            let atomic = item_to_atomic(item)?;
-            Ok(vec![atomic])
-        }
+        XPathValue::Item(item) => match item {
+            XmlItem::Atomic(value) => Ok(vec![atomize::atomize(&value)?]),
+            XmlItem::Node(nav) => match atomize::atomize_node(&nav)? {
+                Some(v) => Ok(vec![v]),
+                None => Ok(Vec::new()),
+            },
+        },
         XPathValue::Sequence(items) => {
-            items.into_iter()
-                .map(item_to_atomic)
-                .collect()
+            let mut result = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    XmlItem::Atomic(value) => result.push(atomize::atomize(&value)?),
+                    XmlItem::Node(nav) => {
+                        if let Some(v) = atomize::atomize_node(&nav)? {
+                            result.push(v);
+                        }
+                    }
+                }
+            }
+            Ok(result)
         }
     }
 }

@@ -2264,11 +2264,11 @@ pub fn magnitude_relationship_ctx(
     Ok((left_result, right_result))
 }
 
-fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<XmlValue, XPathError> {
-    Ok(match item {
-        XmlItemRef::Atomic(value) => value.clone(),
-        XmlItemRef::Node(node) => node.atomized_value(),
-    })
+fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<Option<XmlValue>, XPathError> {
+    match item {
+        XmlItemRef::Atomic(value) => Ok(Some(value.clone())),
+        XmlItemRef::Node(node) => crate::xpath::atomize::atomize_node(node),
+    }
 }
 
 /// Compare two values for equality (value comparison).
@@ -2361,14 +2361,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
@@ -2399,14 +2405,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
@@ -2437,14 +2449,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_lt(&l, &r) {
@@ -2474,14 +2492,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
@@ -2518,14 +2542,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_gt(&l, &r) {
@@ -2555,14 +2585,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
@@ -2720,14 +2756,20 @@ where
         let left_item = left_iter
             .current()
             .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-        let left_value = atomize_item(left_item)?;
+        let left_value = match atomize_item(left_item)? {
+            Some(v) => v,
+            None => continue, // nilled → skip
+        };
         let mut right_iter = right_buf.clone();
 
         while right_iter.move_next()? {
             let right_item = right_iter
                 .current()
                 .ok_or_else(|| XPathError::internal("Iterator current missing"))?;
-            let right_value = atomize_item(right_item)?;
+            let right_value = match atomize_item(right_item)? {
+                Some(v) => v,
+                None => continue, // nilled → skip
+            };
             let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
 
             let satisfied = match op {

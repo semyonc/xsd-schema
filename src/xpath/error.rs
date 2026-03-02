@@ -180,6 +180,13 @@ pub enum XPathError {
     FODT0003 { value: String },
 
     // ========================================================================
+    // XDM Typed Value Errors (FOTY)
+    // ========================================================================
+    /// FOTY0012: Argument node does not have a typed value.
+    #[error("[FOTY0012] Argument node does not have a typed value")]
+    FOTY0012,
+
+    // ========================================================================
     // Namespace Errors (FONS)
     // ========================================================================
     /// FONS0005: Base-uri not defined in static context.
@@ -386,6 +393,11 @@ impl XPathError {
         }
     }
 
+    /// Create FOTY0012 no typed value error.
+    pub fn no_typed_value() -> Self {
+        XPathError::FOTY0012
+    }
+
     /// Create FONS0005 base-uri not defined error.
     pub fn base_uri_not_defined() -> Self {
         XPathError::FONS0005
@@ -473,6 +485,7 @@ impl XPathError {
             XPathError::FODT0001 => Some("FODT0001"),
             XPathError::FODT0002 => Some("FODT0002"),
             XPathError::FODT0003 { .. } => Some("FODT0003"),
+            XPathError::FOTY0012 => Some("FOTY0012"),
             XPathError::FONS0005 => Some("FONS0005"),
             XPathError::FORG0009 { .. } => Some("FORG0009"),
             XPathError::FORX0001 { .. } => Some("FORX0001"),

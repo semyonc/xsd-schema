@@ -169,8 +169,15 @@ impl TreeComparer {
             return false;
         }
 
-        let left_value = left.atomized_value();
-        let right_value = right.atomized_value();
+        // Attributes cannot be Nilled/Absent; fall back to untyped on error.
+        let left_value = crate::xpath::atomize::atomize_node(left)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| XmlValue::untyped(left.value()));
+        let right_value = crate::xpath::atomize::atomize_node(right)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| XmlValue::untyped(right.value()));
         self.values_equal_or_nan(&left_value, &right_value)
     }
 

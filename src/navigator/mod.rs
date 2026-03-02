@@ -29,6 +29,28 @@ pub enum NavigatorError {
     Other(String),
 }
 
+/// XDM typed-value result for a node.
+///
+/// Distinguishes the four states that the old `Option<XmlValue>` conflated:
+///
+/// | Variant   | XDM meaning                           |
+/// |-----------|---------------------------------------|
+/// | `Value`   | Schema-validated typed atomic value    |
+/// | `Untyped` | No schema — atomizes to untypedAtomic |
+/// | `Nilled`  | `xsi:nil="true"` — empty sequence     |
+/// | `Absent`  | Element-only complex content (FOTY0012)|
+#[derive(Debug, Clone, PartialEq)]
+pub enum TypedValue {
+    /// Schema-validated typed atomic value.
+    Value(XmlValue),
+    /// Untyped node (no schema) — atomizes to `xs:untypedAtomic`.
+    Untyped,
+    /// Nilled element (`xsi:nil="true"`) — typed value is empty sequence.
+    Nilled,
+    /// No typed value (element-only complex content) — FOTY0012 on atomization.
+    Absent,
+}
+
 /// XML node types for XPath navigation
 ///
 /// Maps to XPathNodeType in the C# implementation.
@@ -169,8 +191,11 @@ pub trait DomNavigator: Clone {
     /// Get the schema type of the current node (if known)
     fn schema_type(&self) -> Option<SimpleTypeKey>;
 
-    /// Get the typed value of the current node (if known)
-    fn typed_value(&self) -> Option<XmlValue>;
+    /// Get the typed value of the current node.
+    ///
+    /// Returns a [`TypedValue`] that distinguishes validated values, untyped
+    /// nodes, nilled elements, and element-only complex content.
+    fn typed_value(&self) -> TypedValue;
 
     // ----- Default helper methods -----
 
@@ -225,22 +250,6 @@ pub trait DomNavigator: Clone {
             self.move_to_parent();
         }
         false
-    }
-
-    /// Get the atomized value of the current node
-    ///
-    /// Uses typed_value if available, otherwise falls back to untyped rules.
-    fn atomized_value(&self) -> XmlValue {
-        if let Some(value) = self.typed_value() {
-            return value;
-        }
-        // Fallback per XPath2 Data Model
-        match self.node_type() {
-            DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
-                XmlValue::string(self.value())
-            }
-            _ => XmlValue::untyped(self.value()),
-        }
     }
 
     /// Find an element by its ID attribute value.

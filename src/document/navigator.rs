@@ -14,9 +14,8 @@ use std::collections::HashSet;
 
 use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::navigator::{
-    DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, XmlNodeOrder,
+    DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, TypedValue, XmlNodeOrder,
 };
-use crate::types::value::XmlValue;
 use crate::validation::info::ContentType;
 use crate::validation::simple::validate_simple_type;
 
@@ -669,22 +668,28 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         }
     }
 
-    fn typed_value(&self) -> Option<XmlValue> {
+    fn typed_value(&self) -> TypedValue {
         if self.is_on_namespace() {
-            return None;
+            return TypedValue::Untyped;
         }
         let node = self.node();
         if node.has_flag(Node::IS_NIL) {
-            return None;
+            return TypedValue::Nilled;
         }
-        let binding = self.schema_binding()?;
-        let schema_set = self.doc.schema_set?;
+        let binding = match self.schema_binding() {
+            Some(b) => b,
+            None => return TypedValue::Untyped,
+        };
+        let schema_set = match self.doc.schema_set {
+            Some(s) => s,
+            None => return TypedValue::Untyped,
+        };
 
         // Complex types: only TextOnly content produces typed values
         // (ElementOnly/Mixed/Empty never produce typed values — validator.rs:1007)
         if let TypeKey::Complex(_) = binding.type_key {
             if binding.content_type != Some(ContentType::TextOnly) {
-                return None;
+                return TypedValue::Absent;
             }
         }
 
@@ -707,9 +712,10 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             value_str
         };
 
-        validate_simple_type(&effective_value, binding.type_key, schema_set)
-            .ok()
-            .map(|r| r.typed_value)
+        match validate_simple_type(&effective_value, binding.type_key, schema_set) {
+            Ok(r) => TypedValue::Value(r.typed_value),
+            Err(_) => TypedValue::Untyped,
+        }
     }
 
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
@@ -1226,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_value_nil_returns_none() {
+    fn typed_value_nil_returns_nilled() {
         let arena = Bump::new();
         let names = NameTable::new();
         let mut builder = super::super::builder::BufferDocumentBuilder::new(
@@ -1246,7 +1252,7 @@ mod tests {
         let mut nav = doc.create_navigator();
         nav.move_to_first_child();
 
-        assert!(nav.typed_value().is_none());
+        assert_eq!(nav.typed_value(), TypedValue::Nilled);
     }
 
     // ── 12. find_element_by_id ───────────────────────────────────────

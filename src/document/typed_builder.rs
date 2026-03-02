@@ -446,7 +446,7 @@ fn build_ns_context(
 mod tests {
     use super::*;
     use crate::ids::TypeKey;
-    use crate::navigator::DomNavigator;
+    use crate::navigator::{DomNavigator, TypedValue};
     use crate::pipeline::load_and_process_schema;
     use crate::validation::info::ContentType;
 
@@ -510,7 +510,7 @@ mod tests {
         assert!(nav.move_to_first_attribute());
         assert!(nav.element_type_key().is_some());
         let tv = nav.typed_value();
-        assert!(tv.is_some(), "attribute should have typed value");
+        assert!(matches!(tv, TypedValue::Value(_)), "attribute should have typed value");
     }
 
     // ── Test 3: typed_value() for TextOnly element ────────────────────
@@ -528,13 +528,13 @@ mod tests {
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
         let tv = nav.typed_value();
-        assert!(tv.is_some(), "simple-typed element should have typed value");
+        assert!(matches!(tv, TypedValue::Value(_)), "simple-typed element should have typed value");
     }
 
-    // ── Test 4: typed_value() returns None for ElementOnly/Mixed ──────
+    // ── Test 4: typed_value() returns Absent for ElementOnly/Mixed ────
 
     #[test]
-    fn typed_value_none_for_element_only() {
+    fn typed_value_absent_for_element_only() {
         let schema_set = load_schema(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:element name="root">
@@ -556,9 +556,10 @@ mod tests {
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
         assert!(nav.element_type_key().is_some());
-        assert!(
-            nav.typed_value().is_none(),
-            "ElementOnly complex type should not produce typed_value"
+        assert_eq!(
+            nav.typed_value(),
+            TypedValue::Absent,
+            "ElementOnly complex type should produce Absent"
         );
     }
 
@@ -595,10 +596,10 @@ mod tests {
             "simpleContent should have TextOnly content type"
         );
         let tv = nav.typed_value();
-        assert!(tv.is_some(), "simpleContent element should have typed_value");
+        assert!(matches!(tv, TypedValue::Value(_)), "simpleContent element should have typed_value");
     }
 
-    // ── Test 6: untyped document → binding_index=0, typed_value=None ─
+    // ── Test 6: untyped document → binding_index=0, typed_value=Untyped
 
     #[test]
     fn untyped_document_no_bindings() {
@@ -614,7 +615,7 @@ mod tests {
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
         // Unknown element should still build, just no type binding
-        assert!(nav.typed_value().is_none());
+        assert_eq!(nav.typed_value(), TypedValue::Untyped);
     }
 
     // ── Test 7: xsi:type override ─────────────────────────────────────
@@ -640,10 +641,10 @@ mod tests {
         assert!(nav.element_type_key().is_some());
         // The type should be resolved (either xs:integer or the declared type)
         let tv = nav.typed_value();
-        assert!(tv.is_some(), "xsi:type override should produce typed value");
+        assert!(matches!(tv, TypedValue::Value(_)), "xsi:type override should produce typed value");
     }
 
-    // ── Test 8: xsi:nil → IS_NIL, typed_value() returns None ─────────
+    // ── Test 8: xsi:nil → IS_NIL, typed_value() returns Nilled ───────
 
     #[test]
     fn xsi_nil_sets_flag() {
@@ -662,9 +663,10 @@ mod tests {
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
-        assert!(
-            nav.typed_value().is_none(),
-            "nil element should have no typed value"
+        assert_eq!(
+            nav.typed_value(),
+            TypedValue::Nilled,
+            "nil element should return Nilled"
         );
     }
 
@@ -738,7 +740,7 @@ mod tests {
         assert!(nav.move_to_first_child()); // root element
         let tv = nav.typed_value();
         assert!(
-            tv.is_some(),
+            matches!(tv, TypedValue::Value(_)),
             "empty element with default should produce typed value"
         );
     }

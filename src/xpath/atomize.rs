@@ -12,12 +12,37 @@
 //! - For empty sequences, returns None
 //! - For sequences with more than one item, raises XPDY0050
 
+use crate::navigator::TypedValue;
 use crate::types::value::{XmlValue, XmlValueKind, XmlAtomicValue};
 use crate::types::XmlTypeCode;
 use super::error::XPathError;
-use super::DomNavigator;
+use super::{DomNavigator, DomNodeType};
 use super::functions::XPathValue;
 use super::iterator::XmlItem;
+
+/// Atomize a navigator node to its XDM atomic value.
+///
+/// Interprets [`TypedValue`] with proper error handling:
+/// - `Value(v)` → `Ok(Some(v))`
+/// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for comment/PI)
+/// - `Nilled` → `Ok(None)` (empty sequence)
+/// - `Absent` → `Err(FOTY0012)`
+pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathError> {
+    match nav.typed_value() {
+        TypedValue::Value(v) => Ok(Some(v)),
+        TypedValue::Untyped => {
+            let v = match nav.node_type() {
+                DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
+                    XmlValue::string(nav.value())
+                }
+                _ => XmlValue::untyped(nav.value()),
+            };
+            Ok(Some(v))
+        }
+        TypedValue::Nilled => Ok(None),
+        TypedValue::Absent => Err(XPathError::no_typed_value()),
+    }
+}
 
 /// Atomize an XmlValue, returning its atomic representation.
 ///
