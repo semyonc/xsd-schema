@@ -769,4 +769,55 @@ mod tests {
             "source spans should be recorded with full() options"
         );
     }
+
+    // ── Fragment mode tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fragment_set_node_binding_typed_value() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:integer"/>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_typed_document(
+            "<root>42</root>".as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child()); // root element
+        assert!(nav.element_type_key().is_some());
+        let tv = nav.typed_value();
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "fragment typed_value should resolve, got: {:?}",
+            tv
+        );
+    }
+
+    #[test]
+    fn fragment_schema_set_propagation() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_typed_document(
+            "<root>hello</root>".as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+
+        assert!(
+            doc.schema_set().is_some(),
+            "fragment document should carry schema_set reference"
+        );
+    }
 }

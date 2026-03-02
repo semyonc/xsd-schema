@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+#[cfg(feature = "xsd11")]
+use bumpalo::Bump;
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, build_substitution_group_map, SubstitutionGroupMap};
 use crate::ids::{AttributeGroupKey, ElementKey, IdentityConstraintKey, NameId, TypeKey, AttributeKey};
@@ -190,6 +192,10 @@ pub struct SchemaValidator<'a, S: ValidationSink> {
     /// Which assertion evaluation path is active (XSD 1.1 only)
     #[cfg(feature = "xsd11")]
     assertion_source: AssertionSource,
+    /// Bump arena for assertion fragment documents (XSD 1.1 only).
+    /// Lazily allocated on first use via `fragment_arena_mut()`.
+    #[cfg(feature = "xsd11")]
+    fragment_arena: Option<Bump>,
 }
 
 impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
@@ -212,6 +218,8 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
             ic_scope_tables: Vec::new(),
             #[cfg(feature = "xsd11")]
             assertion_source: AssertionSource::default(),
+            #[cfg(feature = "xsd11")]
+            fragment_arena: None,
         }
     }
 
@@ -267,6 +275,19 @@ impl<'a, S: ValidationSink> SchemaValidator<'a, S> {
         }
         self.assertion_source = source;
         self
+    }
+
+    /// Returns a reference to the fragment arena, if it has been allocated.
+    #[cfg(feature = "xsd11")]
+    pub fn fragment_arena(&self) -> Option<&Bump> {
+        self.fragment_arena.as_ref()
+    }
+
+    /// Returns a mutable reference to the fragment arena, allocating it on
+    /// first use.
+    #[cfg(feature = "xsd11")]
+    pub fn fragment_arena_mut(&mut self) -> &mut Bump {
+        self.fragment_arena.get_or_insert_with(Bump::new)
     }
 
     // -----------------------------------------------------------------------
@@ -4776,6 +4797,51 @@ mod tests {
                 "Expected no errors in MainDocument mode, got: {:?}",
                 v.sink.errors
             );
+        }
+    }
+
+    // ── Fragment arena lifecycle tests ────────────────────────────────
+
+    #[cfg(feature = "xsd11")]
+    mod fragment_arena_tests {
+        use super::*;
+
+        #[test]
+        fn fragment_arena_lifecycle() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+
+            // Initially None
+            assert!(v.fragment_arena().is_none());
+
+            // Lazy allocation via fragment_arena_mut()
+            let _arena = v.fragment_arena_mut();
+
+            // Now Some
+            assert!(v.fragment_arena().is_some());
+        }
+
+        #[test]
+        fn fragment_arena_allocate_and_drop() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let sink = TestSink::new();
+            let mut v = SchemaValidator::new(&schema_set, sink, ValidationFlags::default());
+
+            // Allocate something into the arena
+            let arena = v.fragment_arena_mut();
+            let _s = arena.alloc_str("hello fragment");
+
+            // Drop validator — arena drops cleanly (Miri-safe)
+            drop(v);
         }
     }
 

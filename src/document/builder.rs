@@ -800,6 +800,7 @@ impl From<quick_xml::events::attributes::AttrError> for BufferDocumentError {
 mod tests {
     use super::*;
     use crate::ids::TypeKey;
+    use crate::navigator::DomNavigator;
 
     fn make_builder<'a>(
         arena: &'a Bump,
@@ -1340,5 +1341,176 @@ mod tests {
         assert_eq!(doc.nodes.get(2).node_type(), NodeType::Element);
         assert_eq!(doc.nodes.get(3).node_type(), NodeType::Comment);
         assert_eq!(doc.nodes.get(4).node_type(), NodeType::Nul);
+    }
+
+    // ── Fragment mode helpers ────────────────────────────────────────────
+
+    fn make_builder_fragment<'a>(
+        arena: &'a Bump,
+        names: &'a NameTable,
+    ) -> BufferDocumentBuilder<'a> {
+        BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::fragment()).unwrap()
+    }
+
+    // ── Fragment mode tests ──────────────────────────────────────────────
+
+    #[test]
+    fn fragment_build_navigate() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        let elem = builder.start_element("item", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.text("value");
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+
+        // Navigate: Root → element → text
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child()); // element
+        assert_eq!(nav.current_ref(), elem);
+        assert!(nav.move_to_first_child()); // text child
+    }
+
+    #[test]
+    fn fragment_root_is_synthetic() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        builder.start_element("item", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+
+        // Root node is synthetic
+        let root = doc.nodes.get(0);
+        assert_eq!(root.node_type(), NodeType::Root);
+
+        // move_to_parent from Root returns false (boundary)
+        let mut nav = doc.create_navigator(); // at root
+        assert!(!nav.move_to_parent());
+    }
+
+    #[test]
+    fn fragment_navigation_boundary() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        builder.start_element("item", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child()); // element
+        assert!(nav.move_to_parent());      // back to Root
+        assert!(!nav.move_to_parent());     // boundary — Root has parent=NULL
+    }
+
+    #[test]
+    fn fragment_skips_element_index() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        builder.start_element("item", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+
+        let h = hash_name("item");
+        assert!(
+            doc.element_index.find(h).is_empty(),
+            "Fragment mode should not populate element_index"
+        );
+    }
+
+    #[test]
+    fn fragment_skips_id_registration() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        let elem = builder.start_element("item", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        // Manually register an xml:id — should be a no-op in fragment mode
+        builder.register_xml_id("myid", elem).unwrap();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(
+            doc.get_element_by_id("myid"),
+            None,
+            "Fragment mode register_xml_id should be no-op"
+        );
+    }
+
+    #[test]
+    fn fragment_namespace_inheritance() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        builder
+            .start_element("outer", "http://example.com", "ex", &[("ex", "http://example.com")])
+            .unwrap();
+        builder.end_of_attributes();
+
+        // Child should inherit the namespace
+        let child = builder
+            .start_element("inner", "http://example.com", "ex", &[])
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+
+        let child_qname = doc.qname_table.get(doc.nodes.get(child).value);
+        assert_eq!(
+            doc.names.resolve(child_qname.namespace_uri),
+            "http://example.com",
+            "child should inherit parent namespace in fragment mode"
+        );
+    }
+
+    #[test]
+    fn fragment_push_api_parity() {
+        // Build same structure in Full and Fragment mode — node types should match
+        let arena_full = Bump::new();
+        let names_full = NameTable::new();
+        let mut b_full = make_builder(&arena_full, &names_full);
+
+        let arena_frag = Bump::new();
+        let names_frag = NameTable::new();
+        let mut b_frag = make_builder_fragment(&arena_frag, &names_frag);
+
+        for b in [&mut b_full as &mut BufferDocumentBuilder, &mut b_frag] {
+            b.start_element("root", "", "", &[]).unwrap();
+            b.attribute("id", "", "", "1").unwrap();
+            b.end_of_attributes();
+            b.text("hello");
+            b.end_element().unwrap();
+        }
+
+        let doc_full = b_full.finalize().unwrap();
+        let doc_frag = b_frag.finalize().unwrap();
+
+        assert_eq!(doc_full.nodes.len(), doc_frag.nodes.len());
+        for i in 0..doc_full.nodes.len() as u32 {
+            assert_eq!(
+                doc_full.nodes.get(i).node_type(),
+                doc_frag.nodes.get(i).node_type(),
+                "node type mismatch at index {i}"
+            );
+        }
     }
 }
