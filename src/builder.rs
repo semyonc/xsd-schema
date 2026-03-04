@@ -3,6 +3,9 @@
 //! Provides a fluent API for loading multiple schemas before compilation,
 //! similar to .NET's XmlSchemaSet pattern.
 //!
+//! XSD version is set on the builder — the parser derives it automatically.
+//! Use `SchemaSetBuilder::xsd11()` for XSD 1.1, `SchemaSetBuilder::new()` for XSD 1.0.
+//!
 //! # Example
 //!
 //! ```
@@ -25,6 +28,7 @@ use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
     resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
 };
+use crate::schema::model::XsdVersion;
 use crate::schema::{assemble_inline_types, resolve_all_references, SchemaSet};
 
 /// Builder for creating compiled schema sets.
@@ -95,6 +99,24 @@ impl SchemaSetBuilder {
             pending_docs: Vec::new(),
             errors: Vec::new(),
         }
+    }
+
+    /// Create a builder configured for a specific XSD version.
+    pub fn with_version(version: XsdVersion) -> Self {
+        let mut resolver = SchemaResolver::new();
+        resolver.catalog_mut().add_xml_catalog();
+
+        Self {
+            schema_set: SchemaSet::with_version(version),
+            resolver,
+            pending_docs: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Create a builder configured for XSD 1.1.
+    pub fn xsd11() -> Self {
+        Self::with_version(XsdVersion::V1_1)
     }
 
     /// Add a schema by namespace and location.

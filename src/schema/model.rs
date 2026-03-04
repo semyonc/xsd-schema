@@ -124,6 +124,16 @@ impl SchemaSet {
         Self::with_version(XsdVersion::V1_0)
     }
 
+    /// Create a new schema set configured for XSD 1.0.
+    pub fn xsd10() -> Self {
+        Self::with_version(XsdVersion::V1_0)
+    }
+
+    /// Create a new schema set configured for XSD 1.1.
+    pub fn xsd11() -> Self {
+        Self::with_version(XsdVersion::V1_1)
+    }
+
     /// Create a new schema set with specified version
     pub fn with_version(version: XsdVersion) -> Self {
         let mut set = Self {
@@ -784,6 +794,18 @@ mod tests {
     #[test]
     fn test_schema_set_with_version() {
         let set = SchemaSet::with_version(XsdVersion::V1_1);
+        assert_eq!(set.xsd_version, XsdVersion::V1_1);
+    }
+
+    #[test]
+    fn test_schema_set_xsd10() {
+        let set = SchemaSet::xsd10();
+        assert_eq!(set.xsd_version, XsdVersion::V1_0);
+    }
+
+    #[test]
+    fn test_schema_set_xsd11() {
+        let set = SchemaSet::xsd11();
         assert_eq!(set.xsd_version, XsdVersion::V1_1);
     }
 

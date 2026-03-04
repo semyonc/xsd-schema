@@ -63,8 +63,9 @@ pub struct ParserConfig {
     pub collect_foreign_attributes: bool,
     /// Maximum nesting depth (0 = unlimited)
     pub max_depth: usize,
-    /// XSD version mode (1.0 or 1.1)
-    pub xsd_version: XsdVersion,
+    /// XSD version mode (1.0 or 1.1).
+    /// Derived from `SchemaSet.xsd_version` in `parse_schema_with_config`.
+    pub(crate) xsd_version: XsdVersion,
 }
 
 impl Default for ParserConfig {
@@ -198,13 +199,20 @@ pub fn parse_schema(
     parse_schema_with_config(xml, base_uri, schema_set, &config)
 }
 
-/// Parse an XSD schema document with custom configuration
+/// Parse an XSD schema document with custom configuration.
+///
+/// The XSD version is always derived from `schema_set.xsd_version`,
+/// regardless of what `config.xsd_version` contains.
 pub fn parse_schema_with_config(
     xml: &[u8],
     base_uri: &str,
     schema_set: &mut SchemaSet,
     config: &ParserConfig,
 ) -> SchemaResult<DocumentId> {
+    // Override parser version from the single source of truth
+    let mut config = config.clone();
+    config.xsd_version = schema_set.xsd_version;
+
     // Create source map - keep local reference for location resolution during parsing
     let source_text = String::from_utf8_lossy(xml).into_owned();
     let source_map = SourceMap::new(base_uri.to_string(), source_text);
@@ -213,7 +221,7 @@ pub fn parse_schema_with_config(
     let doc_id = schema_set.source_maps.len() as DocumentId;
 
     // Create parser state with reference to source_map
-    let mut state = ParserState::new(&mut schema_set.name_table, doc_id, config, &source_map);
+    let mut state = ParserState::new(&mut schema_set.name_table, doc_id, &config, &source_map);
 
     // Create XML reader
     let mut reader = TrackedReader::from_bytes(xml);
@@ -793,7 +801,7 @@ mod tests {
         use crate::schema::model::OpenContentMode;
         use crate::schema::wildcard::{NamespaceConstraint, ProcessContents};
 
-        let mut schema_set = SchemaSet::new();
+        let mut schema_set = SchemaSet::xsd11();
         let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                        defaultAttributes="common">
@@ -812,16 +820,11 @@ mod tests {
                 </xs:element>
             </xs:schema>"###;
 
-        let config = ParserConfig {
-            xsd_version: XsdVersion::V1_1,
-            ..Default::default()
-        };
-
         let doc_id = parse_schema_with_config(
             xsd.as_bytes(),
             "test.xsd",
             &mut schema_set,
-            &config,
+            &ParserConfig::default(),
         )
         .unwrap();
 

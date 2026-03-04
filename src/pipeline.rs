@@ -11,13 +11,15 @@
 //! # Usage
 //!
 //! ```
-//! use xsd_schema::{SchemaSet, load_and_process_schema, PipelineConfig};
+//! use xsd_schema::{SchemaSet, load_and_process_schema};
 //!
 //! let mut schema_set = SchemaSet::new();
 //! let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 //!     <xs:element name="root" type="xs:string"/>
 //! </xs:schema>"#;
 //!
+//! // XSD version is derived from schema_set (V1_0 by default).
+//! // Use SchemaSet::xsd11() for XSD 1.1 schemas.
 //! let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
 //!     .expect("failed to process schema");
 //! println!("Processed {} inline types", result.inline_stats.unwrap().total_inline_types);
@@ -597,10 +599,8 @@ mod tests {
     #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_assert_rejected_in_10_mode() {
-        use crate::schema::model::XsdVersion;
-
         // Schema with xs:assert should error in 1.0 mode
-        let mut schema_set = SchemaSet::new();
+        let mut schema_set = SchemaSet::new(); // defaults to V1_0
         let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:complexType name="ValidatedType">
@@ -611,9 +611,10 @@ mod tests {
                 </xs:complexType>
             </xs:schema>"#;
 
-        let mut config = PipelineConfig::default();
-        config.parser.xsd_version = XsdVersion::V1_0;
-        config.parser.error_recovery = false;
+        let config = PipelineConfig {
+            parser: ParserConfig { error_recovery: false, ..Default::default() },
+            ..Default::default()
+        };
 
         let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
         assert!(result.is_err(), "xs:assert should be rejected in XSD 1.0 mode");
@@ -622,10 +623,8 @@ mod tests {
     #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_assert_allowed_in_11_mode() {
-        use crate::schema::model::XsdVersion;
-
         // Schema with xs:assert should be allowed in 1.1 mode
-        let mut schema_set = SchemaSet::new();
+        let mut schema_set = SchemaSet::xsd11();
         let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:complexType name="ValidatedType">
@@ -636,20 +635,15 @@ mod tests {
                 </xs:complexType>
             </xs:schema>"#;
 
-        let mut config = PipelineConfig::default();
-        config.parser.xsd_version = XsdVersion::V1_1;
-
-        let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
+        let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
         assert!(result.is_ok(), "xs:assert should be allowed in XSD 1.1 mode: {:?}", result);
     }
 
     #[cfg(feature = "xsd11")]
     #[test]
     fn test_xsd11_alternative_rejected_in_10_mode() {
-        use crate::schema::model::XsdVersion;
-
         // Schema with xs:alternative should error in 1.0 mode
-        let mut schema_set = SchemaSet::new();
+        let mut schema_set = SchemaSet::new(); // defaults to V1_0
         let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
             <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:element name="item">
@@ -657,9 +651,10 @@ mod tests {
                 </xs:element>
             </xs:schema>"#;
 
-        let mut config = PipelineConfig::default();
-        config.parser.xsd_version = XsdVersion::V1_0;
-        config.parser.error_recovery = false;
+        let config = PipelineConfig {
+            parser: ParserConfig { error_recovery: false, ..Default::default() },
+            ..Default::default()
+        };
 
         let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
         assert!(result.is_err(), "xs:alternative should be rejected in XSD 1.0 mode");

@@ -736,22 +736,13 @@ mod tests {
 mod xsd11_tests {
     use super::*;
     use crate::navigator::RoXmlNavigator;
-    use crate::parser::parse::ParserConfig;
-    use crate::pipeline::{load_and_process_schema, PipelineConfig};
-    use crate::schema::model::XsdVersion;
+    use crate::pipeline::load_and_process_schema;
     use crate::types::sequence::resolve_list_item_schema_type;
     use crate::xpath::XPathValue;
 
     fn load_schema(xsd: &str) -> SchemaSet {
-        let mut schema_set = SchemaSet::new();
-        let config = PipelineConfig {
-            parser: ParserConfig {
-                xsd_version: XsdVersion::V1_1,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config))
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
             .expect("failed to load schema");
         schema_set
     }

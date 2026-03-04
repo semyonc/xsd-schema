@@ -8,11 +8,13 @@
 //!
 //! ## Single Schema (Recommended)
 //!
-//! Use [`load_and_process_schema`] for complete processing of a single schema:
+//! Use [`load_and_process_schema`] for complete processing of a single schema.
+//! XSD version is set on `SchemaSet` — the parser derives it automatically.
 //!
 //! ```
 //! use xsd_schema::{SchemaSet, load_and_process_schema};
 //!
+//! // Use SchemaSet::new() for XSD 1.0, SchemaSet::xsd11() for XSD 1.1
 //! let mut schema_set = SchemaSet::new();
 //! let xml = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 //!     <xs:element name="root" type="xs:string"/>

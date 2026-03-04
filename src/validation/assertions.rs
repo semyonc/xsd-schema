@@ -244,14 +244,11 @@ pub(crate) fn evaluate_complex_type_assertions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::model::XsdVersion;
-    use crate::pipeline::{load_and_process_schema, PipelineConfig};
+    use crate::pipeline::load_and_process_schema;
 
     fn load_schema(xsd: &str) -> SchemaSet {
-        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
-        let mut config = PipelineConfig::default();
-        config.parser.xsd_version = XsdVersion::V1_1;
-        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config))
+        let mut schema_set = SchemaSet::xsd11();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
             .expect("failed to load schema");
         schema_set
     }

@@ -4883,14 +4883,10 @@ mod tests {
     #[cfg(feature = "xsd11")]
     mod assertion_runtime_tests {
         use super::*;
-        use crate::schema::model::XsdVersion;
-        use crate::pipeline::PipelineConfig;
 
         fn load_schema_xsd11(xsd: &str) -> SchemaSet {
-            let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
-            let mut config = PipelineConfig::default();
-            config.parser.xsd_version = XsdVersion::V1_1;
-            load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config))
+            let mut schema_set = SchemaSet::xsd11();
+            load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
                 .expect("failed to load schema");
             schema_set
         }
