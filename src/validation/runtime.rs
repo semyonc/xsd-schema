@@ -5163,6 +5163,615 @@ mod tests {
                 assertion_errors
             );
         }
+
+        // ── Assertion on element content — failure ──────────────────────
+
+        #[test]
+        fn test_assertion_on_element_content_fail() {
+            // qty=0 violates qty > 0
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="order">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="qty" type="xs:integer"/>
+                            </xs:sequence>
+                            <xs:assert test="qty > 0"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <order><qty>0</qty></order>
+            v.validate_element("order", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("qty", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("0");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert_eq!(
+                assertion_errors.len(),
+                1,
+                "qty=0 should fail qty > 0, got: {:?}",
+                v.sink.errors
+            );
+        }
+
+        // ── Inherited assertions: base assertion evaluated on derived type ──
+
+        #[test]
+        fn test_inherited_assertion_pass() {
+            // Base type has assertion @val >= 0; derived type restricts further.
+            // Value 50 satisfies both base (@val >= 0) and derived (@val < 100).
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="baseType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val >= 0"/>
+                    </xs:complexType>
+                    <xs:complexType name="derivedType">
+                        <xs:complexContent>
+                            <xs:restriction base="baseType">
+                                <xs:attribute name="val" type="xs:integer"/>
+                                <xs:assert test="@val &lt; 100"/>
+                            </xs:restriction>
+                        </xs:complexContent>
+                    </xs:complexType>
+                    <xs:element name="item" type="derivedType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            v.validate_element("item", "", None, None, &ns);
+            v.validate_attribute("val", "", "50");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                assertion_errors.is_empty(),
+                "val=50 should satisfy both base and derived assertions, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        #[test]
+        fn test_inherited_assertion_base_fails() {
+            // Value -5 fails the base assertion @val >= 0
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="baseType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val >= 0"/>
+                    </xs:complexType>
+                    <xs:complexType name="derivedType">
+                        <xs:complexContent>
+                            <xs:restriction base="baseType">
+                                <xs:attribute name="val" type="xs:integer"/>
+                                <xs:assert test="@val &lt; 100"/>
+                            </xs:restriction>
+                        </xs:complexContent>
+                    </xs:complexType>
+                    <xs:element name="item" type="derivedType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            v.validate_element("item", "", None, None, &ns);
+            v.validate_attribute("val", "", "-5");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                !assertion_errors.is_empty(),
+                "val=-5 should fail inherited @val >= 0 assertion"
+            );
+        }
+
+        #[test]
+        fn test_inherited_assertion_derived_fails() {
+            // Value 200 passes base (@val >= 0) but fails derived (@val < 100)
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="baseType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val >= 0"/>
+                    </xs:complexType>
+                    <xs:complexType name="derivedType">
+                        <xs:complexContent>
+                            <xs:restriction base="baseType">
+                                <xs:attribute name="val" type="xs:integer"/>
+                                <xs:assert test="@val &lt; 100"/>
+                            </xs:restriction>
+                        </xs:complexContent>
+                    </xs:complexType>
+                    <xs:element name="item" type="derivedType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            v.validate_element("item", "", None, None, &ns);
+            v.validate_attribute("val", "", "200");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert_eq!(
+                assertion_errors.len(),
+                1,
+                "val=200 should fail only derived @val < 100, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        #[test]
+        fn test_inherited_assertion_both_fail() {
+            // Value -200 fails both base (@val >= 0) and derived (@val < 100)
+            // (well, -200 < 100 passes, so use @val > 10 for derived instead)
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="baseType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val >= 0"/>
+                    </xs:complexType>
+                    <xs:complexType name="derivedType">
+                        <xs:complexContent>
+                            <xs:restriction base="baseType">
+                                <xs:attribute name="val" type="xs:integer"/>
+                                <xs:assert test="@val > 10"/>
+                            </xs:restriction>
+                        </xs:complexContent>
+                    </xs:complexType>
+                    <xs:element name="item" type="derivedType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // val=-5: fails base (>= 0) and fails derived (> 10)
+            v.validate_element("item", "", None, None, &ns);
+            v.validate_attribute("val", "", "-5");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert_eq!(
+                assertion_errors.len(),
+                2,
+                "val=-5 should fail both inherited assertions, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        // ── Nested element with its own assertions ──────────────────────
+
+        #[test]
+        fn test_nested_element_assertions() {
+            // Parent and child both have assertions; both should be evaluated
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="parent">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="child">
+                                    <xs:complexType>
+                                        <xs:attribute name="x" type="xs:integer"/>
+                                        <xs:assert test="@x > 0"/>
+                                    </xs:complexType>
+                                </xs:element>
+                            </xs:sequence>
+                            <xs:attribute name="total" type="xs:integer"/>
+                            <xs:assert test="@total >= 0"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <parent total="10"><child x="5"/></parent> — both pass
+            v.validate_element("parent", "", None, None, &ns);
+            v.validate_attribute("total", "", "10");
+            v.validate_end_of_attributes();
+
+            v.validate_element("child", "", None, None, &ns);
+            v.validate_attribute("x", "", "5");
+            v.validate_end_of_attributes();
+            v.validate_end_element(); // </child>
+
+            v.validate_end_element(); // </parent>
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                assertion_errors.is_empty(),
+                "Both assertions should pass, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        #[test]
+        fn test_nested_element_child_assertion_fails() {
+            // Parent assertion passes, child assertion fails
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="parent">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="child">
+                                    <xs:complexType>
+                                        <xs:attribute name="x" type="xs:integer"/>
+                                        <xs:assert test="@x > 0"/>
+                                    </xs:complexType>
+                                </xs:element>
+                            </xs:sequence>
+                            <xs:attribute name="total" type="xs:integer"/>
+                            <xs:assert test="@total >= 0"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <parent total="10"><child x="-1"/></parent>
+            v.validate_element("parent", "", None, None, &ns);
+            v.validate_attribute("total", "", "10");
+            v.validate_end_of_attributes();
+
+            v.validate_element("child", "", None, None, &ns);
+            v.validate_attribute("x", "", "-1");
+            v.validate_end_of_attributes();
+            v.validate_end_element(); // </child>
+
+            v.validate_end_element(); // </parent>
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert_eq!(
+                assertion_errors.len(),
+                1,
+                "Only child assertion should fail, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        // ── Named complex type with assertions ──────────────────────────
+
+        #[test]
+        fn test_named_type_assertion_pass() {
+            // Global element references named type with assertion
+            let errors = validate_with_fragment_buffer(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="positiveType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val > 0"/>
+                    </xs:complexType>
+                    <xs:element name="item" type="positiveType"/>
+                </xs:schema>"#,
+                "item",
+                &[("val", "42")],
+                None,
+            );
+            assert!(
+                errors.is_empty(),
+                "Named type assertion should pass for val=42, got: {:?}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_named_type_assertion_fail() {
+            let errors = validate_with_fragment_buffer(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="positiveType">
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val > 0"/>
+                    </xs:complexType>
+                    <xs:element name="item" type="positiveType"/>
+                </xs:schema>"#,
+                "item",
+                &[("val", "-1")],
+                None,
+            );
+            let has_assertion_error = errors
+                .iter()
+                .any(|e| e.constraint == "cvc-assertion");
+            assert!(
+                has_assertion_error,
+                "Named type assertion should fail for val=-1, got: {:?}",
+                errors
+            );
+        }
+
+        // ── Assertion with child element content on named type ──────────
+
+        #[test]
+        fn test_named_type_child_element_assertion() {
+            // Named type with sequence + assertion referencing child element
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="orderType">
+                        <xs:sequence>
+                            <xs:element name="qty" type="xs:integer"/>
+                            <xs:element name="price" type="xs:decimal"/>
+                        </xs:sequence>
+                        <xs:assert test="qty > 0 and price > 0"/>
+                    </xs:complexType>
+                    <xs:element name="order" type="orderType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <order><qty>3</qty><price>9.99</price></order>
+            v.validate_element("order", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("qty", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("3");
+            v.validate_end_element();
+            v.validate_element("price", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("9.99");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                assertion_errors.is_empty(),
+                "qty=3, price=9.99 should pass assertion, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        #[test]
+        fn test_named_type_child_element_assertion_fail() {
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="orderType">
+                        <xs:sequence>
+                            <xs:element name="qty" type="xs:integer"/>
+                            <xs:element name="price" type="xs:decimal"/>
+                        </xs:sequence>
+                        <xs:assert test="qty > 0 and price > 0"/>
+                    </xs:complexType>
+                    <xs:element name="order" type="orderType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <order><qty>0</qty><price>9.99</price></order> — qty=0 fails
+            v.validate_element("order", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("qty", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("0");
+            v.validate_end_element();
+            v.validate_element("price", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("9.99");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert_eq!(
+                assertion_errors.len(),
+                1,
+                "qty=0 should fail 'qty > 0 and price > 0', got: {:?}",
+                assertion_errors
+            );
+        }
+
+        // ── xpathDefaultNamespace on assertion ──────────────────────────
+
+        #[test]
+        fn test_assertion_xpath_default_namespace() {
+            // Schema with target namespace; assertion uses
+            // xpathDefaultNamespace="##targetNamespace" so unqualified
+            // element steps match the target namespace.
+            let schema_set = load_schema_xsd11(
+                r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                            targetNamespace="http://example.com/ns"
+                            xmlns:tns="http://example.com/ns"
+                            elementFormDefault="qualified">
+                    <xs:element name="order">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="qty" type="xs:integer"/>
+                            </xs:sequence>
+                            <xs:assert test="qty > 0"
+                                       xpathDefaultNamespace="##targetNamespace"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"###,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            let tns = "http://example.com/ns";
+
+            // <tns:order xmlns:tns="..."><tns:qty>5</tns:qty></tns:order>
+            v.validate_element("order", tns, None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("qty", tns, None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("5");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                assertion_errors.is_empty(),
+                "xpathDefaultNamespace=##targetNamespace should allow unqualified 'qty' to match, got: {:?}",
+                assertion_errors
+            );
+        }
+
+        // ── Extension-derived type inherits base assertions ─────────────
+
+        #[test]
+        fn test_extension_inherits_base_assertion() {
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="baseType">
+                        <xs:sequence>
+                            <xs:element name="name" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:assert test="string-length(name) > 0"/>
+                    </xs:complexType>
+                    <xs:complexType name="extType">
+                        <xs:complexContent>
+                            <xs:extension base="baseType">
+                                <xs:sequence>
+                                    <xs:element name="extra" type="xs:string"/>
+                                </xs:sequence>
+                            </xs:extension>
+                        </xs:complexContent>
+                    </xs:complexType>
+                    <xs:element name="item" type="extType"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new_fragment_buffer(
+                &schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+
+            // <item><name>hello</name><extra>world</extra></item>
+            v.validate_element("item", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("name", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("hello");
+            v.validate_end_element();
+            v.validate_element("extra", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("world");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+
+            let assertion_errors: Vec<_> = v
+                .sink
+                .errors
+                .iter()
+                .filter(|e| e.constraint == "cvc-assertion")
+                .collect();
+            assert!(
+                assertion_errors.is_empty(),
+                "Extension type should inherit and pass base assertion, got: {:?}",
+                assertion_errors
+            );
+        }
     }
 
     // ── Fragment arena lifecycle tests ────────────────────────────────
@@ -5208,6 +5817,52 @@ mod tests {
             // Drop validator — arena drops cleanly (Miri-safe)
             drop(v);
         }
+    }
+
+    /// Test: global element with named complex type reference (type="itemType")
+    #[test]
+    fn test_global_element_with_named_complex_type_ref() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="itemType">
+                    <xs:sequence>
+                        <xs:element name="name" type="xs:string"/>
+                        <xs:element name="value" type="xs:integer"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="item" type="itemType"/>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        // Open root element "item" (global, type="itemType")
+        let info = v.validate_element("item", "", None, None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Valid, "item should be valid");
+        assert!(info.schema_type.is_some(), "item should have a schema type");
+
+        v.validate_end_of_attributes();
+
+        // Child "name"
+        let name_info = v.validate_element("name", "", None, None, &ns);
+        assert_eq!(name_info.validity, SchemaValidity::Valid, "name should be valid");
+        v.validate_end_of_attributes();
+        v.validate_text("Widget");
+        v.validate_end_element();
+
+        // Child "value"
+        let value_info = v.validate_element("value", "", None, None, &ns);
+        assert_eq!(value_info.validity, SchemaValidity::Valid, "value should be valid");
+        v.validate_end_of_attributes();
+        v.validate_text("42");
+        v.validate_end_element();
+
+        // Close root
+        v.validate_end_element();
+        assert!(v.end_validation().is_ok());
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
     }
 
 }
