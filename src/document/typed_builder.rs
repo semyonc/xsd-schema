@@ -18,7 +18,8 @@ use crate::schema::SchemaSet;
 use crate::xpath::string_ops::is_xml_whitespace_str;
 use crate::validation::errors::ValidationError;
 use crate::validation::info::ValidationFlags;
-use crate::validation::validator::{SchemaValidator, ValidationSink, ValidationWarning};
+use crate::validation::validator::{ValidationSink, ValidationWarning};
+use crate::validation::{SchemaValidator, ValidationRuntime};
 
 use super::buffer::BufferDocument;
 use super::builder::{parse_pi_content, split_prefix_local, BufferDocumentBuilder};
@@ -63,8 +64,8 @@ pub fn build_typed_document<'a, R: BufRead>(
         options,
     )?;
 
-    let sink = SilentValidationSink;
-    let mut validator = SchemaValidator::new(schema_set, sink, ValidationFlags::default());
+    let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
+    let mut runtime = validator.start_run(SilentValidationSink);
 
     let mut xml_reader = Reader::from_reader(reader);
     xml_reader.trim_text(false);
@@ -103,7 +104,7 @@ pub fn build_typed_document<'a, R: BufRead>(
             Ok(Event::Start(ref e)) => {
                 let elem_ref = handle_start_or_empty(
                     &mut builder,
-                    &mut validator,
+                    &mut runtime,
                     e,
                     false,
                     &mut prefix_map,
@@ -118,7 +119,7 @@ pub fn build_typed_document<'a, R: BufRead>(
             Ok(Event::Empty(ref e)) => {
                 let elem_ref = handle_start_or_empty(
                     &mut builder,
-                    &mut validator,
+                    &mut runtime,
                     e,
                     true,
                     &mut prefix_map,
@@ -153,7 +154,7 @@ pub fn build_typed_document<'a, R: BufRead>(
                     }
                 }
                 builder.end_element()?;
-                validator.validate_end_element();
+                runtime.validate_end_element();
                 element_ref_stack.pop();
             }
             Ok(Event::Text(ref e)) => {
@@ -161,9 +162,9 @@ pub fn build_typed_document<'a, R: BufRead>(
                     let text = e.unescape()?;
                     builder.text(&text);
                     if is_xml_whitespace_str(&text) {
-                        validator.validate_whitespace(&text);
+                        runtime.validate_whitespace(&text);
                     } else {
-                        validator.validate_text(&text);
+                        runtime.validate_text(&text);
                     }
                 }
             }
@@ -172,9 +173,9 @@ pub fn build_typed_document<'a, R: BufRead>(
                     let text = std::str::from_utf8(e)?;
                     builder.text(text);
                     if is_xml_whitespace_str(text) {
-                        validator.validate_whitespace(text);
+                        runtime.validate_whitespace(text);
                     } else {
-                        validator.validate_text(text);
+                        runtime.validate_text(text);
                     }
                 }
             }
@@ -194,7 +195,7 @@ pub fn build_typed_document<'a, R: BufRead>(
         buf.clear();
     }
 
-    let _ = validator.end_validation();
+    let _ = runtime.end_validation();
     builder.finalize()
 }
 
@@ -203,7 +204,7 @@ pub fn build_typed_document<'a, R: BufRead>(
 /// Process an element start (or empty) event with interleaved validation.
 fn handle_start_or_empty<S: ValidationSink>(
     builder: &mut BufferDocumentBuilder<'_>,
-    validator: &mut SchemaValidator<'_, S>,
+    runtime: &mut ValidationRuntime<'_, S>,
     e: &quick_xml::events::BytesStart<'_>,
     is_empty: bool,
     prefix_map: &mut HashMap<Box<[u8]>, Vec<String>>,
@@ -311,7 +312,7 @@ fn handle_start_or_empty<S: ValidationSink>(
     let elem_ref = builder.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
 
     // ── Validate element ──────────────────────────────────────────────
-    let info = validator.validate_element(
+    let info = runtime.validate_element(
         elem_local,
         &elem_ns_uri,
         xsi_type.as_deref(),
@@ -371,7 +372,7 @@ fn handle_start_or_empty<S: ValidationSink>(
 
         // Skip validation for xsi:* attributes (handled internally by the validator)
         if attr_ns_uri != XSI_NAMESPACE {
-            let attr_info = validator.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
+            let attr_info = runtime.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
 
             if let Some(tk) = attr_info.schema_type {
                 let binding = NodeSchemaBinding {
@@ -391,7 +392,7 @@ fn handle_start_or_empty<S: ValidationSink>(
     }
 
     builder.end_of_attributes();
-    validator.validate_end_of_attributes();
+    runtime.validate_end_of_attributes();
 
     // ── Empty element: close immediately ──────────────────────────────
     if is_empty {
@@ -403,7 +404,7 @@ fn handle_start_or_empty<S: ValidationSink>(
             }
         }
         builder.end_element()?;
-        validator.validate_end_element();
+        runtime.validate_end_element();
     }
 
     Ok(elem_ref)

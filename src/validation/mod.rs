@@ -14,6 +14,9 @@ pub mod asttree;
 pub mod identity_parser;
 pub mod active_axis;
 pub mod identity;
+pub mod runtime;
+#[cfg(feature = "xsd11")]
+pub mod assertions;
 
 pub use errors::{
     ValidationError, ValidationResult,
@@ -39,3 +42,4 @@ pub use validator::{
     CollectingValidationSink, ErrorOnlySink,
     SchemaValidator,
 };
+pub use runtime::ValidationRuntime;

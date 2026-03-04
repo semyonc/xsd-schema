@@ -50,6 +50,9 @@ pub struct ElementValidationState {
     pub has_text: bool,
     /// Whether any child element nodes have been seen
     pub has_element_children: bool,
+    /// Whether this element owns an assertion buffer frame (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    pub owns_assertion_buffer: bool,
 }
 
 impl ElementValidationState {
@@ -72,6 +75,8 @@ impl ElementValidationState {
             text_content: String::new(),
             has_text: false,
             has_element_children: false,
+            #[cfg(feature = "xsd11")]
+            owns_assertion_buffer: false,
         }
     }
 }
