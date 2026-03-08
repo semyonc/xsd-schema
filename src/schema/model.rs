@@ -551,22 +551,57 @@ impl SchemaSet {
         source: Option<&SourceRef>,
         fallback_namespace: Option<NameId>,
     ) -> Option<NameId> {
-        if elem_target_namespace.is_some() {
-            return elem_target_namespace;
+        self.effective_local_namespace(
+            elem_target_namespace,
+            elem_form,
+            source,
+            fallback_namespace,
+            |d| d.element_form_default,
+        )
+    }
+
+    /// Compute the effective namespace for a local attribute declaration per XSD spec.
+    ///
+    /// Rules: explicit targetNamespace > form attribute > attributeFormDefault > Unqualified.
+    /// Qualified → document target namespace; Unqualified → None.
+    pub fn effective_local_attribute_namespace(
+        &self,
+        attr_target_namespace: Option<NameId>,
+        attr_form: Option<&str>,
+        source: Option<&SourceRef>,
+        fallback_namespace: Option<NameId>,
+    ) -> Option<NameId> {
+        self.effective_local_namespace(
+            attr_target_namespace,
+            attr_form,
+            source,
+            fallback_namespace,
+            |d| d.attribute_form_default,
+        )
+    }
+
+    fn effective_local_namespace(
+        &self,
+        explicit_target_namespace: Option<NameId>,
+        form: Option<&str>,
+        source: Option<&SourceRef>,
+        fallback_namespace: Option<NameId>,
+        form_default: impl Fn(&SchemaDocument) -> FormChoice,
+    ) -> Option<NameId> {
+        if explicit_target_namespace.is_some() {
+            return explicit_target_namespace;
         }
         let doc = source.and_then(|s| self.documents.get(s.doc_id as usize));
-        let default_form = doc
-            .map(|d| d.element_form_default)
-            .unwrap_or(FormChoice::Unqualified);
+        let default_form = doc.map(&form_default).unwrap_or(FormChoice::Unqualified);
         let target_namespace = doc
             .map(|d| d.target_namespace)
             .unwrap_or(fallback_namespace);
-        let form = match elem_form {
+        let resolved_form = match form {
             Some("qualified") => FormChoice::Qualified,
             Some("unqualified") => FormChoice::Unqualified,
             _ => default_form,
         };
-        match form {
+        match resolved_form {
             FormChoice::Qualified => target_namespace,
             FormChoice::Unqualified => None,
         }

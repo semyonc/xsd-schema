@@ -1671,7 +1671,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 continue;
             }
             let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let (attr_name, attr_ns) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
             let attr_key = resolved.and_then(|r| r.resolved_ref);
 
             result.push(ExpectedAttribute {
@@ -1719,7 +1720,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
 
             let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let (attr_name, attr_ns) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
             let attr_key = resolved.and_then(|r| r.resolved_ref);
 
             // Skip if already provided
@@ -2706,7 +2708,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let resolved = group_data.resolved_attributes.get(i);
             let attr_key = resolved.and_then(|r| r.resolved_ref);
             let attr_type = resolved.and_then(|r| r.resolved_type);
-            let (name, namespace) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let (name, namespace) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
             let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
                 attr_key
                     .and_then(|k| self.schema_set.arenas.attributes.get(k))
@@ -2736,13 +2739,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// For inline attributes, returns the name directly from the use.
     /// For `<xs:attribute ref="..."/>`, resolves through the global declaration.
+    ///
+    /// `fallback_namespace` is used when the attribute's source document is
+    /// unavailable (e.g. synthesized attributes); callers should pass the
+    /// containing type's or group's target namespace.
     fn resolve_attr_use_name_ns(
         &self,
         attr_use: &AttributeUseResult,
         resolved: Option<&ResolvedAttributeUse>,
+        fallback_namespace: Option<NameId>,
     ) -> (NameId, Option<NameId>) {
         if let Some(name) = attr_use.attribute.name {
-            return (name, attr_use.attribute.target_namespace);
+            if attr_use.attribute.ref_name.is_none() {
+                // Inline local attribute: apply form / attributeFormDefault
+                let ns = self.schema_set.effective_local_attribute_namespace(
+                    attr_use.attribute.target_namespace,
+                    attr_use.attribute.form.as_deref(),
+                    attr_use.attribute.source.as_ref(),
+                    fallback_namespace,
+                );
+                return (name, ns);
+            }
+            // ref with name — fall through to ref resolution
         }
         if let Some(attr_key) = resolved.and_then(|r| r.resolved_ref) {
             if let Some(decl) = self.schema_set.arenas.attributes.get(attr_key) {
@@ -2803,7 +2821,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ) -> AttributeLookup {
         for (i, attr_use) in ct_data.attributes.iter().enumerate() {
             let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let (attr_name, attr_ns) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
 
             if attr_name == local_name && attr_ns == namespace {
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
@@ -2854,7 +2873,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
 
             let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) = self.resolve_attr_use_name_ns(attr_use, resolved);
+            let (attr_name, attr_ns) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
 
             if !seen.contains(&(attr_ns, attr_name)) {
                 let name_str = self.schema_set.name_table.resolve(attr_name);
@@ -7048,6 +7068,187 @@ mod tests {
             v.sink.errors
         );
     }
+
+    // -----------------------------------------------------------------------
+    // Attribute form / attributeFormDefault tests
+    // -----------------------------------------------------------------------
+
+    /// Build a namespace context for `http://example.com/ns` with `tns` prefix.
+    fn tns_ns_context(schema_set: &SchemaSet) -> NamespaceContextSnapshot {
+        let tns_id = schema_set.name_table.add("http://example.com/ns");
+        let tns_prefix = schema_set.name_table.add("tns");
+        NamespaceContextSnapshot {
+            default_ns: Some(tns_id),
+            bindings: vec![(tns_prefix, tns_id)],
+        }
+    }
+
+    /// Validate a single attribute on `<root>` and assert accept/reject.
+    ///
+    /// `accept_ns` is the attribute namespace that should be accepted.
+    /// `reject_ns` is the attribute namespace that should be rejected.
+    fn assert_attribute_form(
+        schema_set: &SchemaSet,
+        accept_ns: &str,
+        reject_ns: &str,
+        accept_msg: &str,
+        reject_msg: &str,
+    ) {
+        let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
+        let ns = tns_ns_context(schema_set);
+
+        // --- Accept case
+        let mut v = validator.start_run(TestSink::new());
+        v.validate_element("root", "http://example.com/ns", None, None, &ns);
+        let info = v.validate_attribute("id", accept_ns, "val");
+        assert_ne!(info.validity, SchemaValidity::Invalid, "{accept_msg}, errors: {:?}", v.sink.errors);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "expected no errors, got: {:?}", v.sink.errors);
+
+        // --- Reject case
+        let mut v2 = validator.start_run(TestSink::new());
+        v2.validate_element("root", "http://example.com/ns", None, None, &ns);
+        let info = v2.validate_attribute("id", reject_ns, "val");
+        assert_eq!(info.validity, SchemaValidity::Invalid, "{reject_msg}");
+        v2.validate_end_of_attributes();
+        v2.validate_end_element();
+        v2.end_validation().ok();
+        assert!(
+            v2.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+            "expected cvc-complex-type.3.2.2, got: {:?}", v2.sink.errors
+        );
+    }
+
+    const TNS: &str = "http://example.com/ns";
+
+    #[test]
+    fn test_attribute_form_default_qualified() {
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         attributeFormDefault="qualified"
+                         xmlns:tns="http://example.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="id" type="xs:string"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, TNS, "",
+            "qualified attribute should be valid",
+            "unqualified attribute should be rejected when attributeFormDefault=qualified",
+        );
+    }
+
+    #[test]
+    fn test_attribute_form_qualified_explicit() {
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         xmlns:tns="http://example.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="id" type="xs:string" form="qualified"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, TNS, "",
+            "form=qualified attribute should be valid",
+            "unqualified attribute should be rejected when form=qualified",
+        );
+    }
+
+    #[test]
+    fn test_attribute_form_unqualified_explicit() {
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         attributeFormDefault="qualified"
+                         xmlns:tns="http://example.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="id" type="xs:string" form="unqualified"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, "", TNS,
+            "form=unqualified attribute should be valid",
+            "qualified attribute should be rejected when form=unqualified",
+        );
+    }
+
+    #[test]
+    fn test_attribute_form_default_unqualified() {
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         xmlns:tns="http://example.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="id" type="xs:string"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, "", TNS,
+            "default unqualified attribute should be valid",
+            "qualified attribute should be rejected when default is unqualified",
+        );
+    }
+
+    #[test]
+    fn test_attribute_group_form_qualified() {
+        let schema_set = load_schema(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         attributeFormDefault="qualified"
+                         xmlns:tns="http://example.com/ns">
+                <xs:attributeGroup name="myAttrs">
+                    <xs:attribute name="id" type="xs:string"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attributeGroup ref="tns:myAttrs"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, TNS, "",
+            "qualified attribute from group should be valid",
+            "unqualified attribute should be rejected for qualified group attribute",
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_attribute_explicit_target_namespace() {
+        let schema_set = load_schema_xsd11(
+            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://example.com/ns"
+                         xmlns:tns="http://example.com/ns"
+                         xmlns:other="http://other.com/ns">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="id" type="xs:string"
+                                      targetNamespace="http://other.com/ns"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"###,
+        );
+        assert_attribute_form(
+            &schema_set, "http://other.com/ns", TNS,
+            "explicit targetNamespace attribute should be valid",
+            "attribute with wrong namespace should be rejected",
+        );
+    }
 }
-
-
