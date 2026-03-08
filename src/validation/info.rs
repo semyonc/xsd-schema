@@ -97,6 +97,8 @@ pub struct SchemaInfo {
     pub content_type: Option<ContentType>,
     /// The parsed typed value from simple-type validation
     pub typed_value: Option<XmlValue>,
+    /// Whether this attribute was deferred due to CTA (type alternatives)
+    pub deferred_by_cta: bool,
 }
 
 impl SchemaInfo {
@@ -112,6 +114,7 @@ impl SchemaInfo {
             is_nil: false,
             content_type: None,
             typed_value: None,
+            deferred_by_cta: false,
         }
     }
 
@@ -127,6 +130,7 @@ impl SchemaInfo {
             is_nil: false,
             content_type: Some(content_type),
             typed_value: None,
+            deferred_by_cta: false,
         }
     }
 
@@ -142,6 +146,7 @@ impl SchemaInfo {
             is_nil: false,
             content_type: None,
             typed_value: None,
+            deferred_by_cta: false,
         }
     }
 

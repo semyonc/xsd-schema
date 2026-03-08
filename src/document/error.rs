@@ -20,6 +20,9 @@ pub enum BufferDocumentError {
 
     #[error("end_element called without matching start_element")]
     UnmatchedEndElement,
+
+    #[error("Internal error: {0}")]
+    InternalError(String),
 }
 
 #[cfg(test)]

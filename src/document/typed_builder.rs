@@ -337,6 +337,9 @@ fn handle_start_or_empty<S: ValidationSink>(
     }
 
     // ── Second pass: non-xmlns attributes ─────────────────────────────
+    #[cfg(feature = "xsd11")]
+    let mut deferred_attr_refs: Vec<u32> = Vec::new();
+
     for attr_result in e.attributes() {
         let attr = attr_result?;
         let key = attr.key.as_ref();
@@ -374,6 +377,11 @@ fn handle_start_or_empty<S: ValidationSink>(
         if attr_ns_uri != XSI_NAMESPACE {
             let attr_info = runtime.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
 
+            #[cfg(feature = "xsd11")]
+            if attr_info.deferred_by_cta {
+                deferred_attr_refs.push(attr_ref);
+            }
+
             if let Some(tk) = attr_info.schema_type {
                 let binding = NodeSchemaBinding {
                     type_key: tk,
@@ -403,6 +411,28 @@ fn handle_start_or_empty<S: ValidationSink>(
             content_type: eoa_info.content_type,
         };
         builder.set_node_binding(elem_ref, binding)?;
+    }
+
+    // Apply deferred attribute bindings from CTA processing
+    #[cfg(feature = "xsd11")]
+    {
+        let deferred_results = runtime.take_deferred_attribute_results();
+        if deferred_attr_refs.len() != deferred_results.len() {
+            return Err(BufferDocumentError::InternalError(
+                "deferred attribute count mismatch".into(),
+            ));
+        }
+        for (attr_ref, attr_info) in deferred_attr_refs.iter().zip(deferred_results.iter()) {
+            if let Some(tk) = attr_info.schema_type {
+                let binding = NodeSchemaBinding {
+                    type_key: tk,
+                    element_decl: None,
+                    attribute_decl: attr_info.attribute_decl,
+                    content_type: None,
+                };
+                builder.set_node_binding(*attr_ref, binding)?;
+            }
+        }
     }
 
     // ── Empty element: close immediately ──────────────────────────────
@@ -831,5 +861,258 @@ mod tests {
             doc.schema_set().is_some(),
             "fragment document should carry schema_set reference"
         );
+    }
+
+    // ── CTA deferred attribute binding tests (XSD 1.1) ──────────────
+
+    #[cfg(feature = "xsd11")]
+    mod cta_deferred_bindings {
+        use super::*;
+
+        /// Schema where CTA switches type based on @kind, and the selected type
+        /// declares an attribute with a specific type.
+        const CTA_ATTR_SCHEMA: &str = r#"
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="intType">
+                    <xs:attribute name="kind" type="xs:string"/>
+                    <xs:attribute name="val" type="xs:integer"/>
+                </xs:complexType>
+                <xs:complexType name="strType">
+                    <xs:attribute name="kind" type="xs:string"/>
+                    <xs:attribute name="val" type="xs:string"/>
+                </xs:complexType>
+                <xs:element name="data">
+                    <xs:complexType>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@kind='int'" type="intType"/>
+                    <xs:alternative test="@kind='str'" type="strType"/>
+                </xs:element>
+            </xs:schema>"#;
+
+        #[test]
+        fn cta_selected_type_binds_attribute() {
+            let schema_set = load_schema(CTA_ATTR_SCHEMA);
+            let arena = Bump::new();
+            let doc = build_doc(
+                r#"<data kind="int" val="42"/>"#,
+                &arena,
+                &schema_set,
+            );
+
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child()); // <data>
+            // Element should have intType binding
+            assert!(nav.element_type_key().is_some());
+
+            // Navigate to 'val' attribute — should have xs:integer type from intType
+            assert!(nav.move_to_first_attribute());
+            // Attributes are in document order: kind, val
+            // Move to second attribute 'val'
+            if nav.local_name() == "kind" {
+                assert!(nav.move_to_next_attribute());
+            }
+            assert_eq!(nav.local_name(), "val");
+            assert!(
+                nav.element_type_key().is_some(),
+                "deferred CTA attribute 'val' should have a type binding"
+            );
+        }
+
+        #[test]
+        fn cta_default_type_binds_attribute() {
+            let schema_set = load_schema(CTA_ATTR_SCHEMA);
+            let arena = Bump::new();
+            // kind='str' selects strType — val should be xs:string
+            let doc = build_doc(
+                r#"<data kind="str" val="hello"/>"#,
+                &arena,
+                &schema_set,
+            );
+
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child()); // <data>
+            assert!(nav.element_type_key().is_some());
+
+            assert!(nav.move_to_first_attribute());
+            if nav.local_name() == "kind" {
+                assert!(nav.move_to_next_attribute());
+            }
+            assert_eq!(nav.local_name(), "val");
+            assert!(
+                nav.element_type_key().is_some(),
+                "deferred CTA attribute 'val' should have a type binding for strType"
+            );
+        }
+
+        #[test]
+        fn cta_multiple_deferred_attributes_ordering() {
+            // Schema where CTA type has multiple typed attributes
+            let schema = r#"
+                <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="fullType">
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="x" type="xs:integer"/>
+                        <xs:attribute name="y" type="xs:integer"/>
+                    </xs:complexType>
+                    <xs:element name="point">
+                        <xs:complexType>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="x" type="xs:string"/>
+                            <xs:attribute name="y" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='full'" type="fullType"/>
+                    </xs:element>
+                </xs:schema>"#;
+
+            let schema_set = load_schema(schema);
+            let arena = Bump::new();
+            let doc = build_doc(
+                r#"<point kind="full" x="10" y="20"/>"#,
+                &arena,
+                &schema_set,
+            );
+
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child()); // <point>
+
+            // Check all attributes have bindings
+            assert!(nav.move_to_first_attribute());
+            let mut bound_count = 0;
+            loop {
+                if nav.element_type_key().is_some() {
+                    bound_count += 1;
+                }
+                if !nav.move_to_next_attribute() {
+                    break;
+                }
+            }
+            assert!(
+                bound_count >= 3,
+                "all 3 attributes (kind, x, y) should have type bindings, got {}",
+                bound_count
+            );
+        }
+
+        #[test]
+        fn cta_nested_elements_no_cross_leakage() {
+            // Schema with CTA on two nested elements
+            let schema = r#"
+                <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="outerAlt">
+                        <xs:sequence>
+                            <xs:element ref="inner"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="outerAttr" type="xs:integer"/>
+                    </xs:complexType>
+                    <xs:complexType name="innerAlt">
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="innerAttr" type="xs:integer"/>
+                    </xs:complexType>
+                    <xs:element name="inner">
+                        <xs:complexType>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="innerAttr" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='alt'" type="innerAlt"/>
+                    </xs:element>
+                    <xs:element name="outer">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element ref="inner"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="outerAttr" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='alt'" type="outerAlt"/>
+                    </xs:element>
+                </xs:schema>"#;
+
+            let schema_set = load_schema(schema);
+            let arena = Bump::new();
+            let doc = build_doc(
+                r#"<outer kind="alt" outerAttr="99"><inner kind="alt" innerAttr="42"/></outer>"#,
+                &arena,
+                &schema_set,
+            );
+
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child()); // <outer>
+            assert!(nav.element_type_key().is_some(), "outer should have type binding");
+
+            // Check outerAttr has binding
+            assert!(nav.move_to_first_attribute());
+            let mut found_outer_attr = false;
+            loop {
+                if nav.local_name() == "outerAttr" {
+                    assert!(
+                        nav.element_type_key().is_some(),
+                        "outerAttr should have type binding"
+                    );
+                    found_outer_attr = true;
+                }
+                if !nav.move_to_next_attribute() {
+                    break;
+                }
+            }
+            assert!(found_outer_attr, "should find outerAttr");
+
+            // Navigate to <inner>
+            nav.move_to_parent();
+            assert!(nav.move_to_first_child()); // <inner>
+            assert!(nav.element_type_key().is_some(), "inner should have type binding");
+
+            // Check innerAttr has binding
+            assert!(nav.move_to_first_attribute());
+            let mut found_inner_attr = false;
+            loop {
+                if nav.local_name() == "innerAttr" {
+                    assert!(
+                        nav.element_type_key().is_some(),
+                        "innerAttr should have type binding"
+                    );
+                    found_inner_attr = true;
+                }
+                if !nav.move_to_next_attribute() {
+                    break;
+                }
+            }
+            assert!(found_inner_attr, "should find innerAttr");
+        }
+
+        #[test]
+        fn cta_simple_type_selection_no_panic() {
+            // CTA selects a simple type — the element then has no attribute
+            // declarations. Deferred attributes should produce empty results
+            // (no bindings) rather than triggering an InternalError.
+            let schema = r#"
+                <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="data">
+                        <xs:complexType>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="val" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='simple'" type="xs:string"/>
+                    </xs:element>
+                </xs:schema>"#;
+
+            let schema_set = load_schema(schema);
+            let arena = Bump::new();
+            // kind='simple' triggers CTA → xs:string (a simple type).
+            // Both attributes were deferred; revalidation must not panic.
+            let result = build_typed_document(
+                r#"<data kind="simple" val="hello"/>"#.as_bytes(),
+                &arena,
+                &schema_set,
+                BufferDocumentOptions::default(),
+            );
+            assert!(
+                result.is_ok(),
+                "CTA selecting simple type should not cause InternalError, got: {:?}",
+                result.err()
+            );
+        }
     }
 }

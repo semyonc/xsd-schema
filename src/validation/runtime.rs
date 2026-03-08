@@ -128,6 +128,9 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// Deferred assertion frames from nested asserted elements (XSD 1.1).
     #[cfg(feature = "xsd11")]
     pending_assertion_frames: Vec<AssertionBufferFrame>,
+    /// Deferred attribute PSVI results from CTA processing (XSD 1.1).
+    #[cfg(feature = "xsd11")]
+    deferred_attribute_results: Vec<SchemaInfo>,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -166,6 +169,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             assertion_buffer_stack: Vec::new(),
             #[cfg(feature = "xsd11")]
             pending_assertion_frames: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            deferred_attribute_results: Vec::new(),
             _not_thread_safe: PhantomData,
         }
     }
@@ -681,6 +686,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     is_nil,
                     content_type,
                     typed_value: None,
+                    deferred_by_cta: false,
                 };
             }
 
@@ -806,6 +812,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             is_nil,
             content_type: Some(content_type),
             typed_value: None,
+            deferred_by_cta: false,
         }
     }
 
@@ -910,7 +917,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.current_state = ValidatorState::Attribute;
             // Post-process without type info (IC field matching still works;
             // ID/IDREF will be handled during deferred validation).
-            return SchemaInfo::empty();
+            return SchemaInfo { deferred_by_cta: true, ..SchemaInfo::empty() };
         }
 
         // If the element has no type info, skip detailed attribute validation
@@ -1440,6 +1447,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             is_nil: ev_state.is_nil,
             content_type: ev_state.content_type,
             typed_value: ev_state.typed_value,
+            deferred_by_cta: false,
         }
     }
 
@@ -2183,6 +2191,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    deferred_by_cta: false,
                 };
                 self.post_process_attribute(local_name, namespace, value, &result);
                 result
@@ -2243,19 +2252,39 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &mut self,
         schema_type: Option<TypeKey>,
     ) {
-        let ct_key = match schema_type {
-            Some(TypeKey::Complex(k)) => k,
-            _ => return,
-        };
+        self.deferred_attribute_results.clear();
 
         let collected = match self.validation_stack.last_mut() {
             Some(ev) => std::mem::take(&mut ev.collected_attributes),
             None => return,
         };
 
+        let ct_key = match schema_type {
+            Some(TypeKey::Complex(k)) => k,
+            _ => {
+                // Non-complex type (e.g. simple type selected by CTA):
+                // no attribute declarations exist, but we must produce one
+                // result per collected attribute to keep the 1:1 invariant
+                // with the typed builder's deferred_attr_refs.
+                self.deferred_attribute_results
+                    .resize_with(collected.len(), SchemaInfo::empty);
+                return;
+            }
+        };
+
         for (namespace, local_name, value) in &collected {
-            self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            let info = self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            self.deferred_attribute_results.push(info);
         }
+    }
+
+    /// Drain deferred attribute validation results collected during CTA processing.
+    ///
+    /// Returns the `SchemaInfo` results in the same order as the attributes were
+    /// originally encountered. The internal buffer is emptied.
+    #[cfg(feature = "xsd11")]
+    pub fn take_deferred_attribute_results(&mut self) -> Vec<SchemaInfo> {
+        std::mem::take(&mut self.deferred_attribute_results)
     }
 
     /// Post-process a validated attribute for identity constraint field matching
@@ -2480,6 +2509,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    deferred_by_cta: false,
                 }
             }
             None => {
@@ -2573,6 +2603,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    deferred_by_cta: false,
                 }
             }
             None => {
