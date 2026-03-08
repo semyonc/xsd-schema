@@ -53,6 +53,16 @@ pub struct ElementValidationState {
     /// Whether this element owns an assertion buffer frame (XSD 1.1)
     #[cfg(feature = "xsd11")]
     pub owns_assertion_buffer: bool,
+    /// Whether this element has type alternatives (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    pub has_type_alternatives: bool,
+    /// Collected attributes for type alternative XPath evaluation (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    pub collected_attributes: Vec<(Option<NameId>, NameId, String)>,
+    /// Node ref of this element in the assertion fragment document (XSD 1.1).
+    /// Saved during `detect_assertions_on_element` for CTA re-detection.
+    #[cfg(feature = "xsd11")]
+    pub assertion_element_ref: Option<u32>,
 }
 
 impl ElementValidationState {
@@ -77,6 +87,12 @@ impl ElementValidationState {
             has_element_children: false,
             #[cfg(feature = "xsd11")]
             owns_assertion_buffer: false,
+            #[cfg(feature = "xsd11")]
+            has_type_alternatives: false,
+            #[cfg(feature = "xsd11")]
+            collected_attributes: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            assertion_element_ref: None,
         }
     }
 }

@@ -80,6 +80,9 @@ enum InlineRole {
     AttributeGroupAttribute(usize),
     /// Inline type on element at index in content particle's model group
     ContentParticleType(usize),
+    /// Inline type on alternative at index in element's alternatives vec (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    AlternativeType(usize),
 }
 
 /// Owner of an inline type
@@ -144,6 +147,22 @@ fn collect_inline_type_jobs(schema_set: &SchemaSet) -> Vec<InlineTypeJob> {
                 type_frame: (**inline_type).clone(),
                 target_namespace: target_ns,
             });
+        }
+    }
+
+    // Scan element alternatives (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    for (key, elem) in schema_set.arenas.elements.iter() {
+        let target_ns = elem.target_namespace;
+        for (idx, alt) in elem.alternatives.iter().enumerate() {
+            if let Some(inline_type) = &alt.inline_type {
+                jobs.push(InlineTypeJob {
+                    owner: InlineOwner::Element(key),
+                    role: InlineRole::AlternativeType(idx),
+                    type_frame: (**inline_type).clone(),
+                    target_namespace: target_ns,
+                });
+            }
         }
     }
 
@@ -858,8 +877,18 @@ fn update_owner(
     match job.owner {
         InlineOwner::Element(key) => {
             if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
-                elem.resolved_type = Some(type_key);
-                stats.element_inline_types += 1;
+                match job.role {
+                    #[cfg(feature = "xsd11")]
+                    InlineRole::AlternativeType(idx) => {
+                        if let Some(alt) = elem.alternatives.get_mut(idx) {
+                            alt.resolved_type = Some(type_key);
+                        }
+                    }
+                    _ => {
+                        elem.resolved_type = Some(type_key);
+                        stats.element_inline_types += 1;
+                    }
+                }
                 stats.total_inline_types += 1;
             }
         }

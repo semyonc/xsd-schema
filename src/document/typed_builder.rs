@@ -392,7 +392,18 @@ fn handle_start_or_empty<S: ValidationSink>(
     }
 
     builder.end_of_attributes();
-    runtime.validate_end_of_attributes();
+    let eoa_info = runtime.validate_end_of_attributes();
+
+    // If CTA selected a new type, update the element's schema binding
+    if let Some(tk) = eoa_info.schema_type {
+        let binding = NodeSchemaBinding {
+            type_key: tk,
+            element_decl: info.element_decl,
+            attribute_decl: None,
+            content_type: eoa_info.content_type,
+        };
+        builder.set_node_binding(elem_ref, binding)?;
+    }
 
     // ── Empty element: close immediately ──────────────────────────────
     if is_empty {

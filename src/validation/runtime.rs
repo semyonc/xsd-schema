@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use bumpalo::Bump;
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
-use crate::ids::{AttributeGroupKey, ElementKey, IdentityConstraintKey, NameId, TypeKey, AttributeKey};
+use crate::ids::{AttributeGroupKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId, TypeKey, AttributeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
@@ -284,7 +284,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             _ => None,
         };
 
-        if !self.is_buffering_assertions() && has_assertions.is_none() {
+        let force_start = self
+            .validation_stack
+            .last()
+            .is_some_and(|ev| ev.has_type_alternatives);
+
+        if !self.is_buffering_assertions() && has_assertions.is_none() && !force_start {
             return; // nothing to do
         }
 
@@ -312,6 +317,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             None => return, // builder was not created (error already reported)
         };
 
+        // Save element_ref for potential CTA re-detection
+        if let Some(ev) = self.validation_stack.last_mut() {
+            ev.assertion_element_ref = Some(element_ref);
+        }
+
         // Push assertion frame if this element has assertions
         if let Some(ct_key) = has_assertions {
             self.assertion_buffer_stack.push(AssertionBufferFrame {
@@ -322,6 +332,104 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             });
             if let Some(ev) = self.validation_stack.last_mut() {
                 ev.owns_assertion_buffer = true;
+            }
+        }
+    }
+
+    /// Re-detect assertions after CTA switched the type, without
+    /// re-emitting `start_element` on the fragment builder. Pops any
+    /// stale assertion frame for the old type and pushes a new one
+    /// for the new type if it carries inherited assertions.
+    #[cfg(feature = "xsd11")]
+    fn redetect_assertions_after_cta(&mut self, new_type: Option<TypeKey>) {
+        if self.assertion_source != AssertionSource::FragmentBuffer {
+            return;
+        }
+
+        // Pop old assertion frame, saving its element_ref
+        let old_element_ref = if let Some(ev) = self.validation_stack.last_mut() {
+            if ev.owns_assertion_buffer {
+                let frame = self.assertion_buffer_stack.pop();
+                ev.owns_assertion_buffer = false;
+                frame.map(|f| f.element_ref)
+            } else {
+                None
+            }
+        } else {
+            return;
+        };
+
+        // Check if new type has assertions
+        let new_ct_key = match new_type {
+            Some(TypeKey::Complex(ct_key))
+                if has_inherited_assertions(ct_key, &self.schema_set.arenas) =>
+            {
+                ct_key
+            }
+            _ => {
+                // New type has no assertions. If no parent is buffering,
+                // tear down the builder to avoid a dangling fragment_builder
+                // at end_validation. This covers both the case where we
+                // popped an old frame (old_element_ref is Some) and the
+                // force_start case where no frame was ever pushed
+                // (old_element_ref is None but fragment_builder exists).
+                if self.assertion_buffer_stack.is_empty() && self.fragment_builder.is_some() {
+                    self.fragment_builder.take();
+                    self.pending_assertion_frames.clear();
+                    if let Some(arena) = self.fragment_arena.as_mut() {
+                        arena.reset();
+                    }
+                }
+                return;
+            }
+        };
+
+        // Get element_ref: prefer the old frame's ref, fall back to saved ref
+        let element_ref = old_element_ref.or_else(|| {
+            self.validation_stack
+                .last()
+                .and_then(|ev| ev.assertion_element_ref)
+        });
+
+        let Some(element_ref) = element_ref else {
+            return;
+        };
+
+        // Compute BEFORE pushing: replay needed when no own frame existed AND
+        // no parent was buffering (attrs weren't forwarded during attr phase).
+        let need_replay = old_element_ref.is_none() && !self.is_buffering_assertions();
+
+        self.assertion_buffer_stack.push(AssertionBufferFrame {
+            element_ref,
+            complex_type_key: new_ct_key,
+            element_path: String::new(),
+            location: None,
+        });
+        if let Some(ev) = self.validation_stack.last_mut() {
+            ev.owns_assertion_buffer = true;
+        }
+
+        if need_replay {
+            let collected: Vec<_> = match self.validation_stack.last() {
+                Some(ev) => ev.collected_attributes.clone(),
+                None => return,
+            };
+            for (ns, name, value) in &collected {
+                let local = self.schema_set.name_table.resolve(*name);
+                let ns_str = ns
+                    .map(|id| self.schema_set.name_table.resolve(id).to_string())
+                    .unwrap_or_default();
+                let result = self
+                    .fragment_builder
+                    .as_mut()
+                    .map(|b| b.attribute(&local, &ns_str, "", value));
+                if let Some(Err(e)) = result {
+                    self.abort_assertion_buffering(format!(
+                        "Assertion fragment buffer error (attribute replay): {}",
+                        e
+                    ));
+                    return;
+                }
             }
         }
     }
@@ -675,6 +783,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.is_nil = is_nil;
         ev_state.validity = SchemaValidity::Valid;
         ev_state.process_contents = process_contents;
+        #[cfg(feature = "xsd11")]
+        {
+            ev_state.has_type_alternatives = !self.schema_set.arenas.elements[elem_key]
+                .alternatives.is_empty();
+        }
         self.push_element(ev_state);
         self.advance_constraints_start_element(local_name, namespace, Some(elem_key));
 
@@ -788,6 +901,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return SchemaInfo::invalid();
         }
 
+        // When type alternatives are active, defer type-dependent attribute
+        // validation until after CTA selection in validate_end_of_attributes().
+        // Only collect the attribute data and perform type-independent checks.
+        #[cfg(feature = "xsd11")]
+        if ev_state.has_type_alternatives {
+            ev_state.collected_attributes.push((namespace, local_name, value.to_string()));
+            self.current_state = ValidatorState::Attribute;
+            // Post-process without type info (IC field matching still works;
+            // ID/IDREF will be handled during deferred validation).
+            return SchemaInfo::empty();
+        }
+
         // If the element has no type info, skip detailed attribute validation
         let type_key = ev_state.schema_type;
         let ct_key = match type_key {
@@ -803,128 +928,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         };
 
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-
-        // 3. Find attribute in type's attribute list
-        let found = self.find_attribute_in_type(ct_data, local_name, namespace);
-
-        match found {
-            AttributeLookup::Found(attr_key, attr_type, fixed_value) => {
-                // 6. Check fixed value
-                if let Some(fixed) = fixed_value {
-                    if value != fixed {
-                        let attr_name = self.schema_set.name_table.resolve(local_name);
-                        self.report_error(
-                            "cvc-attribute.4",
-                            format!(
-                                "Attribute '{}' has fixed value '{}' but got '{}'",
-                                attr_name, fixed, value
-                            ),
-                        );
-                        if let Some(s) = self.validation_stack.last_mut() {
-                            s.validity = SchemaValidity::Invalid;
-                        }
-                    }
-                }
-
-                // Validate attribute value against its simple type
-                let mut member_type = None;
-                let mut typed_value = None;
-                let mut attr_validity = SchemaValidity::Valid;
-                if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
-                        Ok(result) => {
-                            member_type = result.member_type;
-                            typed_value = Some(result.typed_value);
-                        }
-                        Err(err) => {
-                            let err = match &self.current_location {
-                                Some(loc) => err.with_location(loc.clone()),
-                                None => err,
-                            };
-                            let err = if self.element_path.is_empty() {
-                                err
-                            } else {
-                                err.with_path(self.element_path.clone())
-                            };
-                            self.sink.on_error(err);
-                            attr_validity = SchemaValidity::Invalid;
-                            if let Some(s) = self.validation_stack.last_mut() {
-                                s.validity = SchemaValidity::Invalid;
-                            }
-                        }
-                    }
-                }
-
-                self.current_state = ValidatorState::Attribute;
-                let result = SchemaInfo {
-                    element_decl: None,
-                    attribute_decl: attr_key,
-                    schema_type: attr_type,
-                    member_type,
-                    validity: attr_validity,
-                    is_default: false,
-                    is_nil: false,
-                    content_type: None,
-                    typed_value,
-                };
-                self.post_process_attribute(local_name, namespace, value, &result);
-                result
-            }
-            AttributeLookup::Prohibited => {
-                let attr_name = self.schema_set.name_table.resolve(local_name);
-                self.report_error(
-                    "cvc-complex-type.3.2.2",
-                    format!("Attribute '{}' is prohibited", attr_name),
-                );
-                if let Some(s) = self.validation_stack.last_mut() {
-                    s.validity = SchemaValidity::Invalid;
-                }
-                self.current_state = ValidatorState::Attribute;
-                SchemaInfo::invalid()
-            }
-            AttributeLookup::NotFound => {
-                // 4. Check attribute wildcard (including from attribute groups)
-                let effective_wildcard = self.find_effective_wildcard(ct_data);
-                if let Some(ref wildcard) = effective_wildcard {
-                    let target_ns = ct_data.target_namespace;
-                    if self.wildcard_allows_namespace(wildcard, namespace, target_ns) {
-                        self.current_state = ValidatorState::Attribute;
-                        let result = match wildcard.process_contents {
-                            ProcessContents::Skip => SchemaInfo::empty(),
-                            ProcessContents::Strict => {
-                                self.validate_wildcard_attribute_strict(
-                                    local_name, namespace, value,
-                                )
-                            }
-                            ProcessContents::Lax => {
-                                self.validate_wildcard_attribute_lax(
-                                    local_name, namespace, value,
-                                )
-                            }
-                        };
-                        self.post_process_attribute(local_name, namespace, value, &result);
-                        return result;
-                    }
-                    // wildcard present but namespace not allowed — fall through to error
-                }
-
-                // Not found and no matching wildcard
-                let attr_name = self.schema_set.name_table.resolve(local_name);
-                self.report_error(
-                    "cvc-complex-type.3.2.2",
-                    format!(
-                        "Attribute '{}' is not allowed for this element",
-                        attr_name
-                    ),
-                );
-                if let Some(s) = self.validation_stack.last_mut() {
-                    s.validity = SchemaValidity::Invalid;
-                }
-                self.current_state = ValidatorState::Attribute;
-                SchemaInfo::invalid()
-            }
-        }
+        self.current_state = ValidatorState::Attribute;
+        self.validate_attribute_against_type(ct_key, local_name, namespace, value)
     }
 
     /// Signal end of attributes; checks for missing required attributes
@@ -940,22 +945,78 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return SchemaInfo::invalid();
         }
 
-        // Extract what we need before calling check_required_attributes
-        let (schema_type, seen_attributes) = match self.validation_stack.last() {
-            Some(s) => (s.schema_type, s.seen_attributes.clone()),
+        let schema_type = match self.validation_stack.last() {
+            Some(s) => s.schema_type,
             None => {
                 self.current_state = ValidatorState::EndOfAttributes;
                 return SchemaInfo::empty();
             }
         };
 
-        // Check required attributes
+        // Evaluate type alternatives (XSD 1.1)
+        #[cfg(feature = "xsd11")]
+        let has_type_alternatives = self
+            .validation_stack
+            .last()
+            .is_some_and(|s| s.has_type_alternatives);
+
+        #[cfg(feature = "xsd11")]
+        let (schema_type, cta_switched) = if has_type_alternatives {
+            let mut st = schema_type;
+            let mut switched = false;
+            if let Some(ev_state) = self.validation_stack.last() {
+                if let Some(elem_key) = ev_state.element_decl {
+                    let new_type = super::alternatives::evaluate_type_alternatives(
+                        elem_key,
+                        ev_state.local_name,
+                        ev_state.namespace,
+                        &ev_state.collected_attributes,
+                        self.schema_set,
+                    );
+                    if let Some(new_type_key) = new_type {
+                        if Some(new_type_key) != st {
+                            let (content_state, content_type) =
+                                self.init_content_model(Some(new_type_key));
+                            st = Some(new_type_key);
+                            switched = true;
+                            if let Some(ev) = self.validation_stack.last_mut() {
+                                ev.schema_type = Some(new_type_key);
+                                ev.content_state = content_state;
+                                ev.content_type = Some(content_type);
+                            }
+                        }
+                    }
+                }
+            }
+            (st, switched)
+        } else {
+            (schema_type, false)
+        };
+
+        #[cfg(not(feature = "xsd11"))]
+        let cta_switched = false;
+
+        // When attributes were deferred for CTA, always validate them
+        // against the (possibly unchanged) type.
+        #[cfg(feature = "xsd11")]
+        if has_type_alternatives {
+            // Re-detect assertions BEFORE draining collected_attributes,
+            // so redetect can replay them into the fragment builder.
+            if cta_switched {
+                self.redetect_assertions_after_cta(schema_type);
+            }
+            self.validate_deferred_attributes(schema_type);
+        }
+
+        // Check required attributes (clone seen_attributes to avoid borrow conflict)
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
+            let seen_attributes = match self.validation_stack.last() {
+                Some(s) => s.seen_attributes.clone(),
+                None => HashSet::new(),
+            };
             let ct_data = &self.schema_set.arenas.complex_types[ct_key];
             if self.check_required_attributes(ct_data, &seen_attributes) {
-                if let Some(ev_state) = self.validation_stack.last_mut() {
-                    ev_state.validity = SchemaValidity::Invalid;
-                }
+                self.mark_current_invalid();
             }
         }
 
@@ -968,7 +1029,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         self.current_state = ValidatorState::EndOfAttributes;
-        SchemaInfo::empty()
+
+        // When CTA switched the type, return updated SchemaInfo so callers
+        // (e.g. typed_builder) can update element bindings.
+        if cta_switched {
+            let content_type = self.validation_stack.last().and_then(|s| s.content_type);
+            SchemaInfo {
+                schema_type,
+                content_type,
+                ..SchemaInfo::empty()
+            }
+        } else {
+            SchemaInfo::empty()
+        }
     }
 
     /// Validate a text content event
@@ -1220,6 +1293,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             );
 
             if !self.is_buffering_assertions() {
+                // Clean up orphan fragment_builder left by force_start when
+                // the CTA element's type had no assertions and cta_switched
+                // was false (so redetect_assertions_after_cta was never called).
+                if self.fragment_builder.is_some() {
+                    self.fragment_builder.take();
+                    self.pending_assertion_frames.clear();
+                    if let Some(arena) = self.fragment_arena.as_mut() {
+                        arena.reset();
+                    }
+                }
                 break 'assertion_eval;
             }
 
@@ -1726,6 +1809,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.sink.on_error(err);
     }
 
+    /// Enrich an existing `ValidationError` with location/path and report it.
+    fn report_validation_error(&mut self, err: ValidationError) {
+        let err = match &self.current_location {
+            Some(loc) => err.with_location(loc.clone()),
+            None => err,
+        };
+        let err = if self.element_path.is_empty() {
+            err
+        } else {
+            err.with_path(self.element_path.clone())
+        };
+        self.sink.on_error(err);
+    }
+
+    /// Mark the current element as invalid.
+    fn mark_current_invalid(&mut self) {
+        if let Some(s) = self.validation_stack.last_mut() {
+            s.validity = SchemaValidity::Invalid;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Identity constraint helpers
     // -----------------------------------------------------------------------
@@ -2020,6 +2124,137 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Validate a single attribute against a complex type's attribute
+    /// declarations, wildcards, and fixed-value constraints. Shared by
+    /// `validate_attribute` and `validate_deferred_attributes`.
+    fn validate_attribute_against_type(
+        &mut self,
+        ct_key: ComplexTypeKey,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+        let found = self.find_attribute_in_type(ct_data, local_name, namespace);
+
+        match found {
+            AttributeLookup::Found(attr_key, attr_type, fixed_value) => {
+                if let Some(fixed) = fixed_value {
+                    if value != fixed {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed, value
+                            ),
+                        );
+                        self.mark_current_invalid();
+                    }
+                }
+
+                let mut member_type = None;
+                let mut typed_value = None;
+                let mut attr_validity = SchemaValidity::Valid;
+                if let Some(type_key) = attr_type {
+                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+                        Ok(result) => {
+                            member_type = result.member_type;
+                            typed_value = Some(result.typed_value);
+                        }
+                        Err(err) => {
+                            self.report_validation_error(err);
+                            attr_validity = SchemaValidity::Invalid;
+                            self.mark_current_invalid();
+                        }
+                    }
+                }
+
+                let result = SchemaInfo {
+                    element_decl: None,
+                    attribute_decl: attr_key,
+                    schema_type: attr_type,
+                    member_type,
+                    validity: attr_validity,
+                    is_default: false,
+                    is_nil: false,
+                    content_type: None,
+                    typed_value,
+                };
+                self.post_process_attribute(local_name, namespace, value, &result);
+                result
+            }
+            AttributeLookup::Prohibited => {
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-complex-type.3.2.2",
+                    format!("Attribute '{}' is prohibited", attr_name),
+                );
+                self.mark_current_invalid();
+                SchemaInfo::invalid()
+            }
+            AttributeLookup::NotFound => {
+                let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+                let effective_wildcard = self.find_effective_wildcard(ct_data);
+                if let Some(ref wildcard) = effective_wildcard {
+                    let target_ns = ct_data.target_namespace;
+                    if self.wildcard_allows_namespace(wildcard, namespace, target_ns) {
+                        let result = match wildcard.process_contents {
+                            ProcessContents::Skip => SchemaInfo::empty(),
+                            ProcessContents::Strict => {
+                                self.validate_wildcard_attribute_strict(
+                                    local_name, namespace, value,
+                                )
+                            }
+                            ProcessContents::Lax => {
+                                self.validate_wildcard_attribute_lax(
+                                    local_name, namespace, value,
+                                )
+                            }
+                        };
+                        self.post_process_attribute(local_name, namespace, value, &result);
+                        return result;
+                    }
+                }
+
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-complex-type.3.2.2",
+                    format!(
+                        "Attribute '{}' is not allowed for this element",
+                        attr_name
+                    ),
+                );
+                self.mark_current_invalid();
+                SchemaInfo::invalid()
+            }
+        }
+    }
+
+    /// Re-validate attributes that were deferred during CTA evaluation.
+    ///
+    /// Called from `validate_end_of_attributes()` after the type alternative
+    /// has been selected.
+    #[cfg(feature = "xsd11")]
+    fn validate_deferred_attributes(
+        &mut self,
+        schema_type: Option<TypeKey>,
+    ) {
+        let ct_key = match schema_type {
+            Some(TypeKey::Complex(k)) => k,
+            _ => return,
+        };
+
+        let collected = match self.validation_stack.last_mut() {
+            Some(ev) => std::mem::take(&mut ev.collected_attributes),
+            None => return,
+        };
+
+        for (namespace, local_name, value) in &collected {
+            self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
         }
     }
 
@@ -2616,6 +2851,14 @@ mod tests {
 
     fn load_schema(xsd: &str) -> SchemaSet {
         let mut schema_set = SchemaSet::new();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+            .expect("failed to load schema");
+        schema_set
+    }
+
+    #[cfg(feature = "xsd11")]
+    fn load_schema_xsd11(xsd: &str) -> SchemaSet {
+        let mut schema_set = SchemaSet::xsd11();
         load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
             .expect("failed to load schema");
         schema_set
@@ -4884,13 +5127,6 @@ mod tests {
     mod assertion_runtime_tests {
         use super::*;
 
-        fn load_schema_xsd11(xsd: &str) -> SchemaSet {
-            let mut schema_set = SchemaSet::xsd11();
-            load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
-                .expect("failed to load schema");
-            schema_set
-        }
-
         #[test]
         fn test_disabled_mode_no_overhead() {
             let schema_set = load_schema(
@@ -5859,6 +6095,669 @@ mod tests {
         v.validate_end_element();
         assert!(v.end_validation().is_ok());
         assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    #[cfg(feature = "xsd11")]
+    mod type_alternatives_tests {
+        use super::*;
+
+        /// Helper: run a full validation pass and return the collected errors.
+        fn validate_errors(schema_set: &SchemaSet, run: impl FnOnce(&mut ValidationRuntime<'_, TestSink>)) -> Vec<ValidationError> {
+            let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
+            let mut v = validator.start_run(TestSink::new());
+            run(&mut v);
+            v.end_validation().ok();
+            v.sink.errors
+        }
+
+        const ALTERNATIVES_SCHEMA: &str = r#"
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="intContent">
+                    <xs:sequence>
+                        <xs:element name="val" type="xs:integer"/>
+                    </xs:sequence>
+                    <xs:attribute name="kind" type="xs:string"/>
+                </xs:complexType>
+                <xs:complexType name="strContent">
+                    <xs:sequence>
+                        <xs:element name="val" type="xs:string"/>
+                    </xs:sequence>
+                    <xs:attribute name="kind" type="xs:string"/>
+                </xs:complexType>
+                <xs:element name="data">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="val" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@kind='int'" type="intContent"/>
+                    <xs:alternative test="@kind='str'" type="strContent"/>
+                </xs:element>
+            </xs:schema>"#;
+
+        #[test]
+        fn test_alternative_selects_int_type() {
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                v.validate_attribute("kind", "", "int");
+                v.validate_end_of_attributes();
+
+                v.validate_element("val", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("42");
+                v.validate_end_element();
+
+                v.validate_end_element();
+            });
+            assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        }
+
+        #[test]
+        fn test_alternative_selects_str_type() {
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                v.validate_attribute("kind", "", "str");
+                v.validate_end_of_attributes();
+
+                v.validate_element("val", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+
+                v.validate_end_element();
+            });
+            assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        }
+
+        #[test]
+        fn test_alternative_int_rejects_non_integer() {
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                v.validate_attribute("kind", "", "int");
+                v.validate_end_of_attributes();
+
+                v.validate_element("val", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                // "hello" is not a valid integer
+                v.validate_text("hello");
+                v.validate_end_element();
+
+                v.validate_end_element();
+            });
+            assert!(!errors.is_empty(), "Expected validation error for non-integer value");
+        }
+
+        #[test]
+        fn test_no_matching_alternative_uses_declared_type() {
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            // kind='other' doesn't match any alternative — use element's declared type
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                v.validate_attribute("kind", "", "other");
+                v.validate_end_of_attributes();
+
+                // Declared type has <val> as xs:string
+                v.validate_element("val", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("anything");
+                v.validate_end_element();
+
+                v.validate_end_element();
+            });
+            assert!(errors.is_empty(), "Expected no errors with declared type, got: {:?}", errors);
+        }
+
+        #[test]
+        fn test_alternative_with_default_fallback() {
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="specialType">
+                        <xs:sequence>
+                            <xs:element name="s" type="xs:integer"/>
+                        </xs:sequence>
+                        <xs:attribute name="mode" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:complexType name="defaultType">
+                        <xs:sequence>
+                            <xs:element name="d" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="mode" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:element name="item">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="x" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="mode" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@mode='special'" type="specialType"/>
+                        <xs:alternative type="defaultType"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // mode='special' -> specialType (expects integer child)
+            let errors_special = validate_errors(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("mode", "", "special");
+                v.validate_end_of_attributes();
+                v.validate_element("s", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("42");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(errors_special.is_empty(), "Expected no errors for special mode, got: {:?}", errors_special);
+
+            // mode='other' -> defaultType (expects string child "d")
+            let errors_default = validate_errors(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("mode", "", "other");
+                v.validate_end_of_attributes();
+                v.validate_element("d", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(errors_default.is_empty(), "Expected no errors for default mode, got: {:?}", errors_default);
+        }
+
+        #[test]
+        fn test_alternative_wrong_child_for_selected_type() {
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="typeA">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:element name="root">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="x" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='A'" type="typeA"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // kind='A' selects typeA which expects child "a", but we provide "x"
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                v.validate_attribute("kind", "", "A");
+                v.validate_end_of_attributes();
+                v.validate_element("x", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(!errors.is_empty(), "Expected content model error for wrong child element");
+        }
+
+        #[test]
+        fn test_alternative_no_attribute_no_match() {
+            // When no attributes are present, XPath test @kind='A' should be false
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                // No kind attribute
+                v.validate_end_of_attributes();
+                v.validate_element("val", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("anything");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            // Falls through to declared type (xs:string child), should be valid
+            assert!(errors.is_empty(), "Expected no errors, got: {:?}", errors);
+        }
+
+        #[test]
+        fn test_alternative_schema_info_reflects_selected_type() {
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+            let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+            let mut v = validator.start_run(TestSink::new());
+
+            v.validate_element("data", "", None, None, &ns);
+            v.validate_attribute("kind", "", "int");
+            let eoa_info = v.validate_end_of_attributes();
+            // CTA switched the type — SchemaInfo should carry the new type
+            assert!(
+                eoa_info.schema_type.is_some(),
+                "validate_end_of_attributes() should return updated type after CTA switch"
+            );
+
+            v.validate_element("val", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text("123");
+            v.validate_end_element();
+            v.validate_end_element();
+            v.end_validation().ok();
+            assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+        }
+
+        // Issue 1: Attribute validation deferred until after CTA selection
+        #[test]
+        fn test_deferred_attr_validation_rejects_prohibited_attr() {
+            // The selected type does not declare "extra" — should be rejected
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="strict">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:element name="root">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="extra" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='strict'" type="strict"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                // "extra" is declared on element's own type, but not on "strict"
+                v.validate_attribute("kind", "", "strict");
+                v.validate_attribute("extra", "", "foo");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            // "extra" should be rejected because CTA selected "strict" type
+            assert!(
+                errors.iter().any(|e| e.message.contains("extra")),
+                "Expected error for undeclared 'extra' attribute in selected type, got: {:?}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_deferred_attr_validation_checks_fixed_value() {
+            // The selected type has a fixed value for an attribute
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="fixed">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="code" type="xs:string" fixed="ABC"/>
+                    </xs:complexType>
+                    <xs:element name="root">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="code" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='fixed'" type="fixed"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // Wrong fixed value
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                v.validate_attribute("kind", "", "fixed");
+                v.validate_attribute("code", "", "XYZ");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors.iter().any(|e| e.constraint == "cvc-attribute.4"),
+                "Expected cvc-attribute.4 error for fixed value mismatch, got: {:?}",
+                errors
+            );
+
+            // Correct fixed value
+            let errors_ok = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                v.validate_attribute("kind", "", "fixed");
+                v.validate_attribute("code", "", "ABC");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(errors_ok.is_empty(), "Expected no errors, got: {:?}", errors_ok);
+        }
+
+        #[test]
+        fn test_deferred_attr_validates_type_against_selected() {
+            // The selected type declares attr as xs:integer — value "abc" should fail
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="numType">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:integer"/>
+                    </xs:complexType>
+                    <xs:element name="root">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="val" type="xs:string"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='num'" type="numType"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // "abc" is valid xs:string (declared type) but not xs:integer (selected type)
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                v.validate_attribute("kind", "", "num");
+                v.validate_attribute("val", "", "abc");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                !errors.is_empty(),
+                "Expected type error for 'abc' against xs:integer in selected type"
+            );
+
+            // "42" should be valid
+            let errors_ok = validate_errors(&schema_set, |v| {
+                v.validate_element("root", "", None, None, &ns);
+                v.validate_attribute("kind", "", "num");
+                v.validate_attribute("val", "", "42");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(errors_ok.is_empty(), "Expected no errors, got: {:?}", errors_ok);
+        }
+
+        // Regression: when CTA evaluates but selects the same type (or no
+        // match), deferred attributes must still be validated.
+        #[test]
+        fn test_cta_no_switch_still_validates_attributes() {
+            // Schema where element "data" has alternatives but we'll supply
+            // kind='other' which matches neither, so no CTA switch occurs.
+            // The default fallback selects the declared type.
+            // The attribute "unknown" is not declared and should be reported.
+            let schema_set = load_schema_xsd11(ALTERNATIVES_SCHEMA);
+            let ns = empty_ns_context();
+
+            let errors = validate_errors(&schema_set, |v| {
+                v.validate_element("data", "", None, None, &ns);
+                v.validate_attribute("kind", "", "other"); // no alternative matches
+                v.validate_attribute("unknown", "", "val"); // undeclared attribute
+                v.validate_end_of_attributes();
+                v.validate_end_element();
+            });
+            assert!(
+                errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+                "Undeclared attribute 'unknown' should be reported even when CTA \
+                 doesn't switch type, got: {:?}",
+                errors
+            );
+        }
+
+        // Issue 3: validate_end_of_attributes returns empty SchemaInfo when no CTA
+        #[test]
+        fn test_no_cta_returns_empty_schema_info() {
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="root" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            v.validate_element("root", "", None, None, &ns);
+            let eoa_info = v.validate_end_of_attributes();
+            // No CTA — schema_type should be None (empty SchemaInfo)
+            assert!(
+                eoa_info.schema_type.is_none(),
+                "No CTA switch should return empty SchemaInfo, got type: {:?}",
+                eoa_info.schema_type
+            );
+        }
+
+        /// Helper: run a full validation pass with PROCESS_ASSERTIONS enabled
+        /// (fragment buffer mode) and return the collected errors.
+        fn validate_errors_with_assertions(
+            schema_set: &SchemaSet,
+            run: impl FnOnce(&mut ValidationRuntime<'_, TestSink>),
+        ) -> Vec<ValidationError> {
+            let validator = SchemaValidator::new_fragment_buffer(
+                schema_set,
+                ValidationFlags::default(),
+            );
+            let mut v = validator.start_run(TestSink::new());
+            run(&mut v);
+            v.end_validation().ok();
+            v.sink.errors
+        }
+
+        // ── CTA + assertion interaction tests ───────────────────────────
+
+        #[test]
+        fn test_cta_non_asserted_to_asserted() {
+            // Default type has NO assertions; CTA-selected type has xs:assert.
+            // Assertion should fire and see the attributes.
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="assertedType">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val > 0"/>
+                    </xs:complexType>
+                    <xs:element name="item">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="val" type="xs:integer"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='checked'" type="assertedType"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // val=-1 violates @val > 0 on the CTA-selected type
+            let errors = validate_errors_with_assertions(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("kind", "", "checked");
+                v.validate_attribute("val", "", "-1");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors.iter().any(|e| e.constraint == "cvc-assertion"),
+                "Expected assertion error for @val > 0 with val=-1, got: {:?}",
+                errors
+            );
+
+            // val=5 satisfies @val > 0
+            let errors_ok = validate_errors_with_assertions(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("kind", "", "checked");
+                v.validate_attribute("val", "", "5");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors_ok.iter().all(|e| e.constraint != "cvc-assertion"),
+                "Expected no assertion errors for @val > 0 with val=5, got: {:?}",
+                errors_ok
+            );
+        }
+
+        #[test]
+        fn test_cta_asserted_to_non_asserted() {
+            // Default type has xs:assert; CTA-selected type has none.
+            // The old assertion should NOT be evaluated.
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="plainType">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:integer"/>
+                    </xs:complexType>
+                    <xs:element name="item">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="val" type="xs:integer"/>
+                            <xs:assert test="@val > 100"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='plain'" type="plainType"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // val=1 would fail @val > 100 on the default type, but CTA selects
+            // plainType which has no assertions — no assertion error expected.
+            let errors = validate_errors_with_assertions(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("kind", "", "plain");
+                v.validate_attribute("val", "", "1");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors.iter().all(|e| e.constraint != "cvc-assertion"),
+                "Expected NO assertion errors (CTA selected non-asserted type), got: {:?}",
+                errors
+            );
+        }
+
+        #[test]
+        fn test_cta_asserted_to_asserted() {
+            // Both default type and CTA-selected type have assertions.
+            // Only the selected type's assertion should run.
+            let schema_set = load_schema_xsd11(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:complexType name="strictType">
+                        <xs:sequence>
+                            <xs:element name="v" type="xs:string"/>
+                        </xs:sequence>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:integer"/>
+                        <xs:assert test="@val > 10"/>
+                    </xs:complexType>
+                    <xs:element name="item">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="v" type="xs:string"/>
+                            </xs:sequence>
+                            <xs:attribute name="kind" type="xs:string"/>
+                            <xs:attribute name="val" type="xs:integer"/>
+                            <xs:assert test="@val > 0"/>
+                        </xs:complexType>
+                        <xs:alternative test="@kind='strict'" type="strictType"/>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let ns = empty_ns_context();
+
+            // val=5 passes default @val > 0 but fails strict @val > 10
+            let errors = validate_errors_with_assertions(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("kind", "", "strict");
+                v.validate_attribute("val", "", "5");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors.iter().any(|e| e.constraint == "cvc-assertion"),
+                "Expected assertion error from strict @val > 10 with val=5, got: {:?}",
+                errors
+            );
+
+            // val=20 passes strict @val > 10
+            let errors_ok = validate_errors_with_assertions(&schema_set, |v| {
+                v.validate_element("item", "", None, None, &ns);
+                v.validate_attribute("kind", "", "strict");
+                v.validate_attribute("val", "", "20");
+                v.validate_end_of_attributes();
+                v.validate_element("v", "", None, None, &ns);
+                v.validate_end_of_attributes();
+                v.validate_text("hello");
+                v.validate_end_element();
+                v.validate_end_element();
+            });
+            assert!(
+                errors_ok.iter().all(|e| e.constraint != "cvc-assertion"),
+                "Expected no assertion errors for @val > 10 with val=20, got: {:?}",
+                errors_ok
+            );
+        }
     }
 
 }

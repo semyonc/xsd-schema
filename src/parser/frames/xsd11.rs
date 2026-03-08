@@ -8,6 +8,7 @@ pub struct AlternativeFrame {
     type_ref: Option<TypeRefResult>,
     inline_type: Option<Box<TypeFrameResult>>,
     xpath_default_namespace: Option<String>,
+    ns_snapshot: NamespaceContextSnapshot,
     id: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
@@ -19,7 +20,7 @@ impl AlternativeFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
-        ns_snapshot: &NamespaceContextSnapshot,
+        ns_snapshot: NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
         let test = attrs
             .get_value_by_name(name_table, "test")
@@ -27,7 +28,7 @@ impl AlternativeFrame {
 
         let type_ref = attrs
             .get_value_by_name(name_table, "type")
-            .map(|s| parse_qname_ref(s, name_table, ns_snapshot))
+            .map(|s| parse_qname_ref(s, name_table, &ns_snapshot))
             .transpose()?
             .map(TypeRefResult::QName);
 
@@ -44,6 +45,7 @@ impl AlternativeFrame {
             type_ref,
             inline_type: None,
             xpath_default_namespace,
+            ns_snapshot,
             id,
             annotation: None,
             source,
@@ -94,6 +96,8 @@ impl Frame for AlternativeFrame {
             type_ref: self.type_ref,
             inline_type: self.inline_type,
             xpath_default_namespace: self.xpath_default_namespace,
+            ns_snapshot: self.ns_snapshot,
+            resolved_type: None,
             id: self.id,
             annotation,
             source: self.source,

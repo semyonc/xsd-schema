@@ -425,6 +425,8 @@ pub struct AlternativeResult {
     pub type_ref: Option<TypeRefResult>,
     pub inline_type: Option<Box<TypeFrameResult>>,
     pub xpath_default_namespace: Option<String>,
+    pub ns_snapshot: NamespaceContextSnapshot,
+    pub resolved_type: Option<TypeKey>,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,

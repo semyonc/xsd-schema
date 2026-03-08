@@ -95,8 +95,7 @@ pub struct ElementDecl {
     /// ID attribute value
     pub id: Option<String>,
 
-    // XSD 1.1: Type alternatives
-    // TODO: XSD 1.1 - Implement type alternatives
+    /// XSD 1.1: Type alternatives (conditional type assignment)
     pub type_alternatives: Vec<TypeAlternative>,
 
     /// Form (qualified/unqualified) - for local elements
@@ -116,7 +115,6 @@ pub enum ElementRef {
 }
 
 /// XSD 1.1: Type alternative
-/// TODO: XSD 1.1 - Implement type alternative processing
 #[derive(Debug, Clone)]
 pub struct TypeAlternative {
     /// XPath test expression

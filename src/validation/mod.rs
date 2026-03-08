@@ -17,6 +17,8 @@ pub mod identity;
 pub mod runtime;
 #[cfg(feature = "xsd11")]
 pub mod assertions;
+#[cfg(feature = "xsd11")]
+pub mod alternatives;
 
 pub use errors::{
     ValidationError, ValidationResult,

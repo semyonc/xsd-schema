@@ -9,7 +9,7 @@
 //! The parser uses a stack of frames to track nested elements.
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::ids::NameId;
+use crate::ids::{NameId, TypeKey};
 use crate::namespace::NameTable;
 use crate::parser::attrs::{parse_boolean, parse_form, parse_occurs, parse_use, AttributeMap};
 use crate::parser::location::SourceRef;

@@ -53,7 +53,7 @@ pub fn create_frame(
         xsd_names::SELECTOR => Box::new(SelectorFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         xsd_names::FIELD => Box::new(FieldFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         #[cfg(feature = "xsd11")]
-        xsd_names::ALTERNATIVE => Box::new(AlternativeFrame::new(attrs, name_table, source, ns_snapshot)?),
+        xsd_names::ALTERNATIVE => Box::new(AlternativeFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         #[cfg(feature = "xsd11")]
         xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         xsd_names::ENUMERATION => {

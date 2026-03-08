@@ -425,11 +425,41 @@ fn resolve_element_references(
         resolved_subst_groups.push(elem_key);
     }
 
+    // Resolve alternative type references (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    let resolved_alt_types = {
+        let elem = schema_set.arenas.elements.get(key)
+            .ok_or_else(|| SchemaError::internal("Element not found in arena"))?;
+        let mut alt_types: Vec<Option<TypeKey>> = Vec::with_capacity(elem.alternatives.len());
+        for alt in &elem.alternatives {
+            if alt.resolved_type.is_some() {
+                // Already resolved (from inline type assembly)
+                alt_types.push(alt.resolved_type);
+            } else if let Some(TypeRefResult::QName(ref qname)) = alt.type_ref {
+                let resolver = ReferenceResolver::new(schema_set);
+                let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
+                stats.types_resolved += 1;
+                alt_types.push(Some(type_key));
+            } else {
+                // No type specified — use element's declared type as fallback
+                alt_types.push(resolved_type);
+            }
+        }
+        alt_types
+    };
+
     // Store resolved references back
     if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
         elem.resolved_type = resolved_type;
         elem.resolved_ref = resolved_ref;
         elem.resolved_substitution_groups = resolved_subst_groups;
+
+        #[cfg(feature = "xsd11")]
+        for (i, alt_type) in resolved_alt_types.into_iter().enumerate() {
+            if let Some(alt) = elem.alternatives.get_mut(i) {
+                alt.resolved_type = alt_type;
+            }
+        }
     }
 
     Ok(())
