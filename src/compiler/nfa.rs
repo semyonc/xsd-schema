@@ -7,7 +7,7 @@ use std::collections::HashSet;
 
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
-use crate::types::complex::{NamespaceConstraint, ProcessContents};
+use crate::types::complex::{NamespaceConstraint, ProcessContents, not_qnames_exclude};
 use super::substitution::SubstitutionGroupMap;
 
 /// Unique identifier for NFA states within a table
@@ -334,13 +334,7 @@ pub fn term_matches(
             if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
                 return false;
             }
-            // Check notQName exclusions
-            for &(ns, name) in not_qnames {
-                if ns == element_namespace && name == element_name {
-                    return false;
-                }
-            }
-            true
+            !not_qnames_exclude(not_qnames, element_namespace, element_name)
         }
     }
 }

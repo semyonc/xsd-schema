@@ -265,6 +265,15 @@ pub enum NamespaceConstraint {
 }
 
 
+/// Check whether a (namespace, name) pair is excluded by a notQName list.
+pub fn not_qnames_exclude(
+    not_qnames: &[(Option<NameId>, NameId)],
+    namespace: Option<NameId>,
+    name: NameId,
+) -> bool {
+    not_qnames.iter().any(|&(ns, n)| ns == namespace && n == name)
+}
+
 /// Process contents mode for wildcards
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProcessContents {

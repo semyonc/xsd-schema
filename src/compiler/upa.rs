@@ -19,7 +19,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::NameId;
 use crate::parser::location::SourceRef;
 use crate::schema::model::{SchemaSet, XsdVersion};
-use crate::types::complex::NamespaceConstraint;
+use crate::types::complex::{NamespaceConstraint, not_qnames_exclude};
 
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{build_substitution_group_map, SubstitutionGroupMap};
@@ -441,7 +441,7 @@ fn check_element_wildcard_conflicts(
                             return false;
                         }
                         // Check if this specific QName is excluded by notQName
-                        !not_qnames.iter().any(|&(ens, en)| ens == *match_ns && en == *match_name)
+                        !not_qnames_exclude(not_qnames, *match_ns, *match_name)
                     });
                     if has_conflict {
                         let element_name = schema_set

@@ -488,6 +488,17 @@ pub enum NamespaceToken {
     TargetNamespace,
 }
 
+impl NamespaceToken {
+    /// Resolve this token to a concrete namespace, given the target namespace.
+    pub fn resolve(&self, target_namespace: Option<NameId>) -> Option<NameId> {
+        match self {
+            NamespaceToken::Uri(id) => Some(*id),
+            NamespaceToken::Local => None,
+            NamespaceToken::TargetNamespace => target_namespace,
+        }
+    }
+}
+
 /// Parsed item from notQName attribute (XSD 1.1)
 #[derive(Debug, Clone)]
 pub enum NotQNameItem {

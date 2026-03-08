@@ -19,7 +19,7 @@ use crate::ids::NameId;
 use crate::parser::frames::{ParticleResult, ParticleTerm};
 use crate::parser::location::SourceRef;
 use crate::schema::model::XsdVersion;
-use crate::types::complex::{NamespaceConstraint, ProcessContents};
+use crate::types::complex::{NamespaceConstraint, ProcessContents, not_qnames_exclude};
 
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::nfa::NfaTerm;
@@ -347,10 +347,8 @@ pub fn term_matches_with_substitution(
             if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
                 return TermMatchResult::NoMatch;
             }
-            for &(ns, name) in not_qnames {
-                if ns == element_namespace && name == element_name {
-                    return TermMatchResult::NoMatch;
-                }
+            if not_qnames_exclude(not_qnames, element_namespace, element_name) {
+                return TermMatchResult::NoMatch;
             }
             TermMatchResult::Match
         }

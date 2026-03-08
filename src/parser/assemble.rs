@@ -842,17 +842,6 @@ fn convert_open_content_mode(
     }
 }
 
-fn resolve_namespace_token(
-    token: &crate::parser::frames::NamespaceToken,
-    target_namespace: Option<NameId>,
-) -> Option<NameId> {
-    match token {
-        crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
-        crate::parser::frames::NamespaceToken::Local => None,
-        crate::parser::frames::NamespaceToken::TargetNamespace => target_namespace,
-    }
-}
-
 fn convert_element_wildcard(
     wildcard: &crate::parser::frames::WildcardResult,
     target_namespace: Option<NameId>,
@@ -871,7 +860,7 @@ fn convert_element_wildcard(
         }
         crate::parser::frames::WildcardNamespace::List(list) => {
             NamespaceConstraint::Enumeration(
-                list.iter().map(|t| resolve_namespace_token(t, target_namespace)).collect()
+                list.iter().map(|t| t.resolve(target_namespace)).collect()
             )
         }
     };
@@ -879,7 +868,7 @@ fn convert_element_wildcard(
     // notNamespace → NamespaceConstraint::Not(...)
     if !wildcard.not_namespace.is_empty() {
         let excluded: Vec<Option<NameId>> = wildcard.not_namespace.iter()
-            .map(|t| resolve_namespace_token(t, target_namespace))
+            .map(|t| t.resolve(target_namespace))
             .collect();
         result.namespace_constraint = NamespaceConstraint::Not(excluded);
     }

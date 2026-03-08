@@ -18,7 +18,7 @@ use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::schema::model::XsdVersion;
 use crate::types::complex::{
     NamespaceConstraint, OpenContentMode as TypesOpenContentMode,
-    ProcessContents,
+    ProcessContents, not_qnames_exclude,
 };
 
 /// Open content information carried through validation
@@ -182,7 +182,7 @@ impl ContentValidatorState {
                             }
                             TypesOpenContentMode::None => false,
                         };
-                        if allow && nfa_open_content_allows(oc, name, namespace, target_ns)
+                        if allow && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns)
                         {
                             // Accept via open content; do NOT advance NFA state
                             return Some(ElementMatchInfo {
@@ -235,7 +235,7 @@ impl ContentValidatorState {
                         AllGroupOpenContentMode::None => false,
                     };
                     if allow
-                        && all_group_open_content_allows(oc, name, namespace, target_ns)
+                        && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns)
                     {
                         return Some(ElementMatchInfo {
                             element_key: None,
@@ -312,8 +312,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && all_group_open_content_allows(
-                                    oc,
+                                && open_content_allows(
+                                    &oc.namespace_constraint,
+                                    &oc.not_qnames,
                                     name,
                                     namespace,
                                     target_ns,
@@ -352,8 +353,9 @@ impl ContentValidatorState {
                                     AllGroupOpenContentMode::None => false,
                                 };
                                 if allow
-                                    && all_group_open_content_allows(
-                                        oc,
+                                    && open_content_allows(
+                                        &oc.namespace_constraint,
+                                        &oc.not_qnames,
                                         name,
                                         namespace,
                                         target_ns,
@@ -459,7 +461,7 @@ impl ContentValidatorState {
                         }
                         TypesOpenContentMode::None => false,
                     };
-                    if allow && nfa_open_content_allows(oc, name, namespace, target_ns) {
+                    if allow && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns) {
                         return true;
                     }
                 }
@@ -488,7 +490,7 @@ impl ContentValidatorState {
                         AllGroupOpenContentMode::Suffix => state.is_satisfied(model),
                         AllGroupOpenContentMode::None => false,
                     };
-                    if allow && all_group_open_content_allows(oc, name, namespace, target_ns) {
+                    if allow && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns) {
                         return true;
                     }
                 }
@@ -540,8 +542,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && all_group_open_content_allows(
-                                    oc,
+                                && open_content_allows(
+                                    &oc.namespace_constraint,
+                                    &oc.not_qnames,
                                     name,
                                     namespace,
                                     target_ns,
@@ -575,8 +578,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && all_group_open_content_allows(
-                                    oc,
+                                && open_content_allows(
+                                    &oc.namespace_constraint,
+                                    &oc.not_qnames,
                                     name,
                                     namespace,
                                     target_ns,
@@ -594,41 +598,17 @@ impl ContentValidatorState {
     }
 }
 
-/// Check if an open content wildcard (from AllGroupModel) allows the given element.
+/// Check if an open content wildcard allows the given element.
 /// Combines namespace matching with notQName exclusion checking.
-fn all_group_open_content_allows(
-    oc: &crate::compiler::OpenContentWildcard,
+fn open_content_allows(
+    ns_constraint: &NamespaceConstraint,
+    not_qnames: &[(Option<NameId>, NameId)],
     name: NameId,
     namespace: Option<NameId>,
     target_ns: Option<NameId>,
 ) -> bool {
-    if !wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
-        return false;
-    }
-    for &(ns, local) in &oc.not_qnames {
-        if ns == namespace && local == name {
-            return false;
-        }
-    }
-    true
-}
-
-/// Check if an OpenContentInfo wildcard (from NFA path) allows the given element.
-fn nfa_open_content_allows(
-    oc: &OpenContentInfo,
-    name: NameId,
-    namespace: Option<NameId>,
-    target_ns: Option<NameId>,
-) -> bool {
-    if !wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
-        return false;
-    }
-    for &(ns, local) in &oc.not_qnames {
-        if ns == namespace && local == name {
-            return false;
-        }
-    }
-    true
+    wildcard_matches(ns_constraint, namespace, target_ns)
+        && !not_qnames_exclude(not_qnames, namespace, name)
 }
 
 /// Find the ElementMatchInfo from the NFA term that matches the given element

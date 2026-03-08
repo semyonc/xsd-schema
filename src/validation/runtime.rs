@@ -2613,19 +2613,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Resolve a NamespaceToken to a concrete namespace Option<NameId>
-    fn resolve_namespace_token(
-        &self,
-        token: &crate::parser::frames::NamespaceToken,
-        target_namespace: Option<NameId>,
-    ) -> Option<NameId> {
-        match token {
-            crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
-            crate::parser::frames::NamespaceToken::Local => None,
-            crate::parser::frames::NamespaceToken::TargetNamespace => target_namespace,
-        }
-    }
-
     /// Check whether a wildcard allows a given namespace.
     fn wildcard_allows_namespace(
         &self,
@@ -2640,7 +2627,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             WildcardNamespace::TargetNamespace => namespace == target_namespace,
             WildcardNamespace::Local => namespace.is_none(),
             WildcardNamespace::List(ns_list) => {
-                ns_list.iter().any(|t| self.resolve_namespace_token(t, target_namespace) == namespace)
+                ns_list.iter().any(|t| t.resolve(target_namespace) == namespace)
             }
         };
         if !ns_ok {
@@ -2648,7 +2635,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
         // Check notNamespace exclusions
         for token in &wildcard.not_namespace {
-            let excluded_ns = self.resolve_namespace_token(token, target_namespace);
+            let excluded_ns = token.resolve(target_namespace);
             if namespace == excluded_ns {
                 return false;
             }
