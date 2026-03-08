@@ -233,6 +233,14 @@ pub struct WildcardRef {
     /// Process contents mode
     pub process_contents: ProcessContents,
 
+    /// Pre-expanded concrete QName exclusions (XSD 1.1 notQName)
+    pub not_qnames: Vec<(Option<NameId>, NameId)>,
+
+    /// XSD 1.1: notQName="##definedSibling" was specified but deferred
+    /// because sibling context was not yet available (open content wildcards).
+    /// Resolved later when attached to a content model.
+    pub has_defined_sibling: bool,
+
     /// Source location
     pub source: Option<SourceRef>,
 }
@@ -252,8 +260,8 @@ pub enum NamespaceConstraint {
     Local,
     /// Specific namespaces
     List(Vec<Option<NameId>>),
-    // XSD 1.1: Not constraints
-    // TODO: XSD 1.1 - Implement notNamespace/notQName
+    /// XSD 1.1: Not these namespaces (notNamespace)
+    Not(Vec<Option<NameId>>),
 }
 
 

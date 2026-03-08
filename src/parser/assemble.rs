@@ -842,10 +842,23 @@ fn convert_open_content_mode(
     }
 }
 
+fn resolve_namespace_token(
+    token: &crate::parser::frames::NamespaceToken,
+    target_namespace: Option<NameId>,
+) -> Option<NameId> {
+    match token {
+        crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
+        crate::parser::frames::NamespaceToken::Local => None,
+        crate::parser::frames::NamespaceToken::TargetNamespace => target_namespace,
+    }
+}
+
 fn convert_element_wildcard(
     wildcard: &crate::parser::frames::WildcardResult,
     target_namespace: Option<NameId>,
 ) -> ElementWildcard {
+    use crate::schema::wildcard::QNameDisallowed;
+
     let mut result = ElementWildcard::new();
     result.namespace_constraint = match &wildcard.namespace {
         crate::parser::frames::WildcardNamespace::Any => NamespaceConstraint::Any,
@@ -857,9 +870,31 @@ fn convert_element_wildcard(
             NamespaceConstraint::Enumeration(vec![None])
         }
         crate::parser::frames::WildcardNamespace::List(list) => {
-            NamespaceConstraint::Enumeration(list.clone())
+            NamespaceConstraint::Enumeration(
+                list.iter().map(|t| resolve_namespace_token(t, target_namespace)).collect()
+            )
         }
     };
+
+    // notNamespace → NamespaceConstraint::Not(...)
+    if !wildcard.not_namespace.is_empty() {
+        let excluded: Vec<Option<NameId>> = wildcard.not_namespace.iter()
+            .map(|t| resolve_namespace_token(t, target_namespace))
+            .collect();
+        result.namespace_constraint = NamespaceConstraint::Not(excluded);
+    }
+
+    // notQName → not_qnames
+    result.not_qnames = wildcard.not_qname.iter().map(|item| {
+        match item {
+            crate::parser::frames::NotQNameItem::QName { namespace, local_name } => {
+                QNameDisallowed::QName { namespace: *namespace, local_name: *local_name }
+            }
+            crate::parser::frames::NotQNameItem::Defined => QNameDisallowed::Defined,
+            crate::parser::frames::NotQNameItem::DefinedSibling => QNameDisallowed::DefinedSibling,
+        }
+    }).collect();
+
     result.process_contents = match wildcard.process_contents {
         crate::parser::frames::ProcessContents::Strict => SchemaProcessContents::Strict,
         crate::parser::frames::ProcessContents::Lax => SchemaProcessContents::Lax,

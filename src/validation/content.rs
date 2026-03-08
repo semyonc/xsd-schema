@@ -30,6 +30,8 @@ pub struct OpenContentInfo {
     pub namespace_constraint: NamespaceConstraint,
     /// How to process matched content
     pub process_contents: ProcessContents,
+    /// QNames excluded by notQName (pre-expanded concrete pairs)
+    pub not_qnames: Vec<(Option<NameId>, NameId)>,
 }
 
 /// Information about a matched element from the content model
@@ -96,6 +98,7 @@ impl ContentValidatorState {
                     mode,
                     namespace_constraint: w.namespace_constraint,
                     process_contents: w.process_contents,
+                    not_qnames: w.not_qnames,
                 });
                 let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
                 Self::Nfa { nfa, active_states: initial, open_content: oc }
@@ -179,7 +182,7 @@ impl ContentValidatorState {
                             }
                             TypesOpenContentMode::None => false,
                         };
-                        if allow && wildcard_matches(&oc.namespace_constraint, namespace, target_ns)
+                        if allow && nfa_open_content_allows(oc, name, namespace, target_ns)
                         {
                             // Accept via open content; do NOT advance NFA state
                             return Some(ElementMatchInfo {
@@ -232,7 +235,7 @@ impl ContentValidatorState {
                         AllGroupOpenContentMode::None => false,
                     };
                     if allow
-                        && wildcard_matches(&oc.namespace_constraint, namespace, target_ns)
+                        && all_group_open_content_allows(oc, name, namespace, target_ns)
                     {
                         return Some(ElementMatchInfo {
                             element_key: None,
@@ -309,8 +312,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && wildcard_matches(
-                                    &oc.namespace_constraint,
+                                && all_group_open_content_allows(
+                                    oc,
+                                    name,
                                     namespace,
                                     target_ns,
                                 )
@@ -348,8 +352,9 @@ impl ContentValidatorState {
                                     AllGroupOpenContentMode::None => false,
                                 };
                                 if allow
-                                    && wildcard_matches(
-                                        &oc.namespace_constraint,
+                                    && all_group_open_content_allows(
+                                        oc,
+                                        name,
                                         namespace,
                                         target_ns,
                                     )
@@ -454,7 +459,7 @@ impl ContentValidatorState {
                         }
                         TypesOpenContentMode::None => false,
                     };
-                    if allow && wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
+                    if allow && nfa_open_content_allows(oc, name, namespace, target_ns) {
                         return true;
                     }
                 }
@@ -483,7 +488,7 @@ impl ContentValidatorState {
                         AllGroupOpenContentMode::Suffix => state.is_satisfied(model),
                         AllGroupOpenContentMode::None => false,
                     };
-                    if allow && wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
+                    if allow && all_group_open_content_allows(oc, name, namespace, target_ns) {
                         return true;
                     }
                 }
@@ -535,8 +540,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && wildcard_matches(
-                                    &oc.namespace_constraint,
+                                && all_group_open_content_allows(
+                                    oc,
+                                    name,
                                     namespace,
                                     target_ns,
                                 )
@@ -569,8 +575,9 @@ impl ContentValidatorState {
                                 AllGroupOpenContentMode::None => false,
                             };
                             if allow
-                                && wildcard_matches(
-                                    &oc.namespace_constraint,
+                                && all_group_open_content_allows(
+                                    oc,
+                                    name,
                                     namespace,
                                     target_ns,
                                 )
@@ -585,6 +592,43 @@ impl ContentValidatorState {
             ContentValidatorState::Simple | ContentValidatorState::Empty => false,
         }
     }
+}
+
+/// Check if an open content wildcard (from AllGroupModel) allows the given element.
+/// Combines namespace matching with notQName exclusion checking.
+fn all_group_open_content_allows(
+    oc: &crate::compiler::OpenContentWildcard,
+    name: NameId,
+    namespace: Option<NameId>,
+    target_ns: Option<NameId>,
+) -> bool {
+    if !wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
+        return false;
+    }
+    for &(ns, local) in &oc.not_qnames {
+        if ns == namespace && local == name {
+            return false;
+        }
+    }
+    true
+}
+
+/// Check if an OpenContentInfo wildcard (from NFA path) allows the given element.
+fn nfa_open_content_allows(
+    oc: &OpenContentInfo,
+    name: NameId,
+    namespace: Option<NameId>,
+    target_ns: Option<NameId>,
+) -> bool {
+    if !wildcard_matches(&oc.namespace_constraint, namespace, target_ns) {
+        return false;
+    }
+    for &(ns, local) in &oc.not_qnames {
+        if ns == namespace && local == name {
+            return false;
+        }
+    }
+    true
 }
 
 /// Find the ElementMatchInfo from the NFA term that matches the given element
@@ -819,6 +863,7 @@ mod tests {
             namespace_constraint: ns_constraint,
             process_contents: ProcessContents::Lax,
             mode,
+            not_qnames: Vec::new(),
         });
         model
     }
@@ -884,6 +929,7 @@ mod tests {
             mode: TypesOpenContentMode::Interleave,
             namespace_constraint: NamespaceConstraint::Any,
             process_contents: ProcessContents::Lax,
+            not_qnames: Vec::new(),
         };
         let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
         let mut state = ContentValidatorState::Nfa {
@@ -911,6 +957,7 @@ mod tests {
             mode: TypesOpenContentMode::Suffix,
             namespace_constraint: NamespaceConstraint::Any,
             process_contents: ProcessContents::Lax,
+            not_qnames: Vec::new(),
         };
         let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
         let mut state = ContentValidatorState::Nfa {
@@ -986,6 +1033,7 @@ mod tests {
             mode: TypesOpenContentMode::Interleave,
             namespace_constraint: NamespaceConstraint::Any,
             process_contents: ProcessContents::Lax,
+            not_qnames: Vec::new(),
         };
         let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
         let state = ContentValidatorState::Nfa {
@@ -1124,5 +1172,124 @@ mod tests {
         assert!(!state.would_accept(a, None, None, XsdVersion::V1_1, None));
         assert!(!state.would_accept(b, None, None, XsdVersion::V1_1, None));
         assert!(state.would_accept(c, None, None, XsdVersion::V1_1, None));
+    }
+
+    // -- Not constraint and notQName tests -----------------------------------
+
+    #[test]
+    fn test_open_content_not_namespace_constraint() {
+        // Open content with Not([ns1]) should reject ns1 but accept others
+        let ns1 = Some(NameId(100));
+        let ns2 = Some(NameId(200));
+        let a = NameId(10);
+        let extra = NameId(99);
+
+        let mut model = AllGroupModel::new(vec![
+            AllParticle::new(NfaTerm::element(a, None, None), 1, MaxOccurs::Bounded(1), None),
+        ]);
+        model.open_content = Some(OpenContentWildcard {
+            namespace_constraint: NamespaceConstraint::Not(vec![ns1]),
+            process_contents: ProcessContents::Lax,
+            mode: AllGroupOCMode::Interleave,
+            not_qnames: Vec::new(),
+        });
+        let mut state = ContentValidatorState::from_all_group(model);
+
+        // Element from excluded namespace rejected
+        assert!(
+            state.advance_element(extra, ns1, None, XsdVersion::V1_1, None).is_none(),
+            "Not([ns1]) should reject elements from ns1"
+        );
+
+        // Element from other namespace accepted
+        assert!(
+            state.advance_element(extra, ns2, None, XsdVersion::V1_1, None).is_some(),
+            "Not([ns1]) should accept elements from ns2"
+        );
+    }
+
+    #[test]
+    fn test_open_content_not_qnames_exclusion() {
+        // Open content with notQName excluding specific element
+        let a = NameId(10);
+        let excluded = NameId(50);
+        let allowed = NameId(60);
+
+        let mut model = AllGroupModel::new(vec![
+            AllParticle::new(NfaTerm::element(a, None, None), 1, MaxOccurs::Bounded(1), None),
+        ]);
+        model.open_content = Some(OpenContentWildcard {
+            namespace_constraint: NamespaceConstraint::Any,
+            process_contents: ProcessContents::Lax,
+            mode: AllGroupOCMode::Interleave,
+            not_qnames: vec![(None, excluded)],  // exclude (absent ns, excluded)
+        });
+        let mut state = ContentValidatorState::from_all_group(model);
+
+        // Excluded element rejected even though namespace matches
+        assert!(
+            state.advance_element(excluded, None, None, XsdVersion::V1_1, None).is_none(),
+            "notQName should reject excluded element"
+        );
+
+        // Non-excluded element accepted
+        assert!(
+            state.advance_element(allowed, None, None, XsdVersion::V1_1, None).is_some(),
+            "notQName should accept non-excluded element"
+        );
+    }
+
+    #[test]
+    fn test_nfa_open_content_not_qnames_exclusion() {
+        // Same test but for NFA path
+        let a = NameId(10);
+        let excluded = NameId(50);
+        let allowed = NameId(60);
+        let nfa = single_element_nfa(a, None);
+        let oc = OpenContentInfo {
+            mode: TypesOpenContentMode::Interleave,
+            namespace_constraint: NamespaceConstraint::Any,
+            process_contents: ProcessContents::Lax,
+            not_qnames: vec![(None, excluded)],
+        };
+        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let mut state = ContentValidatorState::Nfa {
+            nfa,
+            active_states: initial,
+            open_content: Some(oc),
+        };
+
+        // Excluded element rejected
+        assert!(
+            state.advance_element(excluded, None, None, XsdVersion::V1_1, None).is_none(),
+            "NFA open content notQName should reject excluded element"
+        );
+
+        // Non-excluded element accepted
+        assert!(
+            state.advance_element(allowed, None, None, XsdVersion::V1_1, None).is_some(),
+            "NFA open content notQName should accept non-excluded element"
+        );
+    }
+
+    #[test]
+    fn test_would_accept_respects_not_qnames() {
+        let a = NameId(10);
+        let excluded = NameId(50);
+        let allowed = NameId(60);
+
+        let mut model = AllGroupModel::new(vec![
+            AllParticle::new(NfaTerm::element(a, None, None), 1, MaxOccurs::Bounded(1), None),
+        ]);
+        model.open_content = Some(OpenContentWildcard {
+            namespace_constraint: NamespaceConstraint::Any,
+            process_contents: ProcessContents::Lax,
+            mode: AllGroupOCMode::Interleave,
+            not_qnames: vec![(None, excluded)],
+        });
+        let state = ContentValidatorState::from_all_group(model);
+
+        assert!(!state.would_accept(excluded, None, None, XsdVersion::V1_1, None));
+        assert!(state.would_accept(allowed, None, None, XsdVersion::V1_1, None));
     }
 }

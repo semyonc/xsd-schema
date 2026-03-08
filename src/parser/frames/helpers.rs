@@ -232,7 +232,7 @@ fn parse_qname_list(
 /// Parse namespace constraint for wildcards
 fn parse_namespace_constraint(
     value: Option<&str>,
-    _name_table: &NameTable,
+    name_table: &NameTable,
 ) -> SchemaResult<WildcardNamespace> {
     let Some(value) = value else {
         return Ok(WildcardNamespace::Any);
@@ -244,21 +244,83 @@ fn parse_namespace_constraint(
         "##targetNamespace" => Ok(WildcardNamespace::TargetNamespace),
         "##local" => Ok(WildcardNamespace::Local),
         _ => {
-            // List of namespaces
-            let namespaces: Vec<_> = value
+            let namespaces: Vec<NamespaceToken> = value
                 .split_whitespace()
-                .map(|s| {
-                    if s == "##targetNamespace" || s == "##local" {
-                        None
-                    } else {
-                        // TODO: Intern namespace URIs
-                        None
-                    }
+                .map(|s| match s {
+                    "##targetNamespace" => NamespaceToken::TargetNamespace,
+                    "##local" => NamespaceToken::Local,
+                    _ => NamespaceToken::Uri(name_table.add(s)),
                 })
                 .collect();
             Ok(WildcardNamespace::List(namespaces))
         }
     }
+}
+
+/// Parse notNamespace attribute (XSD 1.1)
+#[cfg(feature = "xsd11")]
+pub(crate) fn parse_not_namespace(
+    value: Option<&str>,
+    name_table: &NameTable,
+) -> Vec<NamespaceToken> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    value
+        .split_whitespace()
+        .map(|s| match s {
+            "##targetNamespace" => NamespaceToken::TargetNamespace,
+            "##local" => NamespaceToken::Local,
+            _ => NamespaceToken::Uri(name_table.add(s)),
+        })
+        .collect()
+}
+
+/// Parse notQName attribute (XSD 1.1)
+#[cfg(feature = "xsd11")]
+pub(crate) fn parse_not_qname(
+    value: Option<&str>,
+    name_table: &NameTable,
+    ns_snapshot: &NamespaceContextSnapshot,
+    is_element_wildcard: bool,
+) -> SchemaResult<Vec<NotQNameItem>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut items = Vec::new();
+    for s in value.split_whitespace() {
+        match s {
+            "##defined" => items.push(NotQNameItem::Defined),
+            "##definedSibling" => {
+                if !is_element_wildcard {
+                    return Err(SchemaError::structural(
+                        "src-wildcard",
+                        "##definedSibling is not allowed on xs:anyAttribute".to_string(),
+                        None,
+                    ));
+                }
+                items.push(NotQNameItem::DefinedSibling);
+            }
+            _ => {
+                // Parse as QName
+                let (local, prefix) = if let Some(pos) = s.find(':') {
+                    (&s[pos + 1..], Some(&s[..pos]))
+                } else {
+                    (s, None)
+                };
+                let local_name = name_table.add(local);
+                let namespace = if let Some(p) = prefix {
+                    let prefix_id = name_table.add(p);
+                    ns_snapshot.resolve_prefix(prefix_id)
+                } else {
+                    // Unprefixed: no namespace
+                    None
+                };
+                items.push(NotQNameItem::QName { namespace, local_name });
+            }
+        }
+    }
+    Ok(items)
 }
 
 /// Apply a facet to a facet set

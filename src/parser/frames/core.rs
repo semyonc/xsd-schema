@@ -475,13 +475,37 @@ pub enum IdentityKind {
     Unique,
 }
 
+/// A parsed namespace token from namespace/notNamespace attributes.
+/// Preserves ##targetNamespace and ##local as distinct variants
+/// (resolved to concrete NameIds at assembly time).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NamespaceToken {
+    /// A concrete namespace URI (interned)
+    Uri(NameId),
+    /// ##local (absent namespace)
+    Local,
+    /// ##targetNamespace (resolved at assembly)
+    TargetNamespace,
+}
+
+/// Parsed item from notQName attribute (XSD 1.1)
+#[derive(Debug, Clone)]
+pub enum NotQNameItem {
+    /// Specific QName that is disallowed
+    QName { namespace: Option<NameId>, local_name: NameId },
+    /// ##defined
+    Defined,
+    /// ##definedSibling (xs:any only, not xs:anyAttribute)
+    DefinedSibling,
+}
+
 /// Wildcard result
 #[derive(Debug, Clone)]
 pub struct WildcardResult {
     pub namespace: WildcardNamespace,
     pub process_contents: ProcessContents,
-    pub not_namespace: Option<String>,
-    pub not_qname: Option<String>,
+    pub not_namespace: Vec<NamespaceToken>,
+    pub not_qname: Vec<NotQNameItem>,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
@@ -494,7 +518,7 @@ pub enum WildcardNamespace {
     Other,
     TargetNamespace,
     Local,
-    List(Vec<Option<NameId>>),
+    List(Vec<NamespaceToken>),
 }
 
 /// Process contents mode

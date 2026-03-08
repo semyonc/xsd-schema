@@ -193,8 +193,8 @@ impl BuiltinTypes {
                     term: ParticleTerm::Any(WildcardResult {
                         namespace: WildcardNamespace::Any,
                         process_contents: ProcessContents::Lax,
-                        not_namespace: None,
-                        not_qname: None,
+                        not_namespace: Vec::new(),
+                        not_qname: Vec::new(),
                         id: None,
                         annotation: None,
                         source: None,
@@ -212,8 +212,8 @@ impl BuiltinTypes {
                 attribute_wildcard: Some(WildcardResult {
                     namespace: WildcardNamespace::Any,
                     process_contents: ProcessContents::Lax,
-                    not_namespace: None,
-                    not_qname: None,
+                    not_namespace: Vec::new(),
+                    not_qname: Vec::new(),
                     id: None,
                     annotation: None,
                     source: None,

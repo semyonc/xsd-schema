@@ -181,6 +181,8 @@ pub enum NfaTerm {
         namespace_constraint: NamespaceConstraint,
         /// How to process matched content
         process_contents: ProcessContents,
+        /// Pre-expanded concrete QName exclusions (XSD 1.1 notQName)
+        not_qnames: Vec<(Option<NameId>, NameId)>,
     },
 }
 
@@ -215,6 +217,20 @@ impl NfaTerm {
         NfaTerm::Wildcard {
             namespace_constraint,
             process_contents,
+            not_qnames: Vec::new(),
+        }
+    }
+
+    /// Create a wildcard term with QName exclusions (XSD 1.1)
+    pub fn wildcard_with_not_qnames(
+        namespace_constraint: NamespaceConstraint,
+        process_contents: ProcessContents,
+        not_qnames: Vec<(Option<NameId>, NameId)>,
+    ) -> Self {
+        NfaTerm::Wildcard {
+            namespace_constraint,
+            process_contents,
+            not_qnames,
         }
     }
 
@@ -312,8 +328,20 @@ pub fn term_matches(
         }
         NfaTerm::Wildcard {
             namespace_constraint,
+            not_qnames,
             ..
-        } => wildcard_matches(namespace_constraint, element_namespace, target_namespace),
+        } => {
+            if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
+                return false;
+            }
+            // Check notQName exclusions
+            for &(ns, name) in not_qnames {
+                if ns == element_namespace && name == element_name {
+                    return false;
+                }
+            }
+            true
+        }
     }
 }
 
@@ -422,6 +450,7 @@ fn wildcard_matches(
         NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
         NamespaceConstraint::Local => element_namespace.is_none(),
         NamespaceConstraint::List(list) => list.contains(&element_namespace),
+        NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
     }
 }
 

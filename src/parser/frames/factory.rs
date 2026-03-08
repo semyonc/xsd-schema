@@ -37,8 +37,14 @@ pub fn create_frame(
         xsd_names::ALL => {
             Box::new(ModelGroupFrame::new(Compositor::All, attrs, name_table, source, ns_snapshot)?)
         }
-        xsd_names::ANY => Box::new(AnyFrame::new(attrs, name_table, source)?),
-        xsd_names::ANY_ATTRIBUTE => Box::new(AnyAttributeFrame::new(attrs, name_table, source)?),
+        xsd_names::ANY => Box::new(AnyFrame::new(
+            attrs, name_table, source,
+            #[cfg(feature = "xsd11")] ns_snapshot,
+        )?),
+        xsd_names::ANY_ATTRIBUTE => Box::new(AnyAttributeFrame::new(
+            attrs, name_table, source,
+            #[cfg(feature = "xsd11")] ns_snapshot,
+        )?),
         xsd_names::ANNOTATION => Box::new(AnnotationFrame::new(attrs, name_table, source)?),
         xsd_names::APPINFO => Box::new(AppinfoFrame::new(attrs, name_table, source)?),
         xsd_names::DOCUMENTATION => Box::new(DocumentationFrame::new(attrs, name_table, source)?),

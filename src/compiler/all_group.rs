@@ -61,6 +61,8 @@ pub struct OpenContentWildcard {
     pub process_contents: ProcessContents,
     /// Open content mode
     pub mode: OpenContentMode,
+    /// Pre-expanded concrete QName exclusions (XSD 1.1 notQName)
+    pub not_qnames: Vec<(Option<NameId>, NameId)>,
 }
 
 /// Open content mode for XSD 1.1
@@ -339,13 +341,18 @@ pub fn term_matches_with_substitution(
         }
         NfaTerm::Wildcard {
             namespace_constraint,
+            not_qnames,
             ..
         } => {
-            if wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
-                TermMatchResult::Match
-            } else {
-                TermMatchResult::NoMatch
+            if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
+                return TermMatchResult::NoMatch;
             }
+            for &(ns, name) in not_qnames {
+                if ns == element_namespace && name == element_name {
+                    return TermMatchResult::NoMatch;
+                }
+            }
+            TermMatchResult::Match
         }
     }
 }
@@ -366,6 +373,7 @@ pub fn wildcard_matches(
             // The list contains Option<NameId> where None represents ##local
             list.contains(&element_namespace)
         }
+        NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
     }
 }
 

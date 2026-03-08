@@ -6,8 +6,8 @@
 pub struct AnyFrame {
     namespace: WildcardNamespace,
     process_contents: ProcessContents,
-    not_namespace: Option<String>,
-    not_qname: Option<String>,
+    not_namespace: Vec<NamespaceToken>,
+    not_qname: Vec<NotQNameItem>,
     min_occurs: u32,
     max_occurs: Option<u32>,
     id: Option<String>,
@@ -21,7 +21,20 @@ impl AnyFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
+        #[cfg(feature = "xsd11")] ns_snapshot: &NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
+        let has_namespace = attrs.get_value_by_name(name_table, "namespace").is_some();
+        let has_not_namespace = attrs.get_value_by_name(name_table, "notNamespace").is_some();
+
+        #[cfg(feature = "xsd11")]
+        if has_namespace && has_not_namespace {
+            return Err(SchemaError::structural(
+                "src-wildcard",
+                "Attributes 'namespace' and 'notNamespace' are mutually exclusive on xs:any".to_string(),
+                None,
+            ));
+        }
+
         let namespace = parse_namespace_constraint(
             attrs.get_value_by_name(name_table, "namespace"),
             name_table,
@@ -30,13 +43,27 @@ impl AnyFrame {
         let process_contents =
             parse_process_contents_attr(attrs, name_table, "processContents")?;
 
-        let not_namespace = attrs
-            .get_value_by_name(name_table, "notNamespace")
-            .map(String::from);
+        #[cfg(feature = "xsd11")]
+        let not_namespace = parse_not_namespace(
+            attrs.get_value_by_name(name_table, "notNamespace"),
+            name_table,
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let not_namespace = {
+            let _ = has_namespace;
+            let _ = has_not_namespace;
+            Vec::new()
+        };
 
-        let not_qname = attrs
-            .get_value_by_name(name_table, "notQName")
-            .map(String::from);
+        #[cfg(feature = "xsd11")]
+        let not_qname = parse_not_qname(
+            attrs.get_value_by_name(name_table, "notQName"),
+            name_table,
+            ns_snapshot,
+            true, // is_element_wildcard
+        )?;
+        #[cfg(not(feature = "xsd11"))]
+        let not_qname = Vec::new();
 
         let min_occurs = parse_min_occurs_attr(attrs, name_table, "minOccurs")?;
 
@@ -123,8 +150,8 @@ impl Frame for AnyFrame {
 pub struct AnyAttributeFrame {
     namespace: WildcardNamespace,
     process_contents: ProcessContents,
-    not_namespace: Option<String>,
-    not_qname: Option<String>,
+    not_namespace: Vec<NamespaceToken>,
+    not_qname: Vec<NotQNameItem>,
     id: Option<String>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
@@ -136,7 +163,20 @@ impl AnyAttributeFrame {
         attrs: &AttributeMap,
         name_table: &NameTable,
         source: Option<SourceRef>,
+        #[cfg(feature = "xsd11")] ns_snapshot: &NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
+        let has_namespace = attrs.get_value_by_name(name_table, "namespace").is_some();
+        let has_not_namespace = attrs.get_value_by_name(name_table, "notNamespace").is_some();
+
+        #[cfg(feature = "xsd11")]
+        if has_namespace && has_not_namespace {
+            return Err(SchemaError::structural(
+                "src-wildcard",
+                "Attributes 'namespace' and 'notNamespace' are mutually exclusive on xs:anyAttribute".to_string(),
+                None,
+            ));
+        }
+
         let namespace = parse_namespace_constraint(
             attrs.get_value_by_name(name_table, "namespace"),
             name_table,
@@ -145,13 +185,27 @@ impl AnyAttributeFrame {
         let process_contents =
             parse_process_contents_attr(attrs, name_table, "processContents")?;
 
-        let not_namespace = attrs
-            .get_value_by_name(name_table, "notNamespace")
-            .map(String::from);
+        #[cfg(feature = "xsd11")]
+        let not_namespace = parse_not_namespace(
+            attrs.get_value_by_name(name_table, "notNamespace"),
+            name_table,
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let not_namespace = {
+            let _ = has_namespace;
+            let _ = has_not_namespace;
+            Vec::new()
+        };
 
-        let not_qname = attrs
-            .get_value_by_name(name_table, "notQName")
-            .map(String::from);
+        #[cfg(feature = "xsd11")]
+        let not_qname = parse_not_qname(
+            attrs.get_value_by_name(name_table, "notQName"),
+            name_table,
+            ns_snapshot,
+            false, // is_element_wildcard = false (attribute wildcard)
+        )?;
+        #[cfg(not(feature = "xsd11"))]
+        let not_qname = Vec::new();
 
         let id = attrs
             .get_value_by_name(name_table, "id")

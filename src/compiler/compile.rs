@@ -53,6 +53,9 @@ pub struct CompileContext<'a> {
     content_flat_idx: Option<usize>,
     /// Resolved element keys for local elements in content particles (flat depth-first order)
     resolved_particle_elements: Vec<Option<ElementKey>>,
+    /// Current sibling element QNames for ##definedSibling expansion in wildcard compilation.
+    /// Set before compiling particles in a model group (sequence/choice/all).
+    current_sibling_elements: Vec<(Option<NameId>, NameId)>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -67,6 +70,7 @@ impl<'a> CompileContext<'a> {
             current_particle_idx: None,
             content_flat_idx: None,
             resolved_particle_elements: Vec::new(),
+            current_sibling_elements: Vec::new(),
         }
     }
 
@@ -236,11 +240,53 @@ impl<'a> CompileContext<'a> {
         wildcard: &WildcardResult,
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
-        let namespace_constraint = self.convert_wildcard_namespace(&wildcard.namespace);
+        let mut namespace_constraint = self.convert_wildcard_namespace(&wildcard.namespace);
         let process_contents = self.convert_process_contents(wildcard.process_contents);
 
-        let nfa_term = NfaTerm::wildcard(namespace_constraint, process_contents);
+        // Override with notNamespace if present
+        if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
+            namespace_constraint = not_ns;
+        }
+
+        // Expand notQName items — use current_sibling_elements for ##definedSibling
+        let siblings = self.current_sibling_elements.clone();
+        let not_qnames = self.expand_not_qnames(&wildcard.not_qname, &siblings);
+
+        let nfa_term = NfaTerm::wildcard_with_not_qnames(namespace_constraint, process_contents, not_qnames);
         Ok(self.builder.single_term(nfa_term, source.cloned()))
+    }
+
+    /// Expand NotQNameItems into concrete (namespace, local_name) pairs.
+    /// `sibling_elements` is used for ##definedSibling expansion.
+    fn expand_not_qnames(
+        &self,
+        items: &[crate::parser::frames::NotQNameItem],
+        sibling_elements: &[(Option<NameId>, NameId)],
+    ) -> Vec<(Option<NameId>, NameId)> {
+        let mut result = Vec::new();
+        for item in items {
+            match item {
+                crate::parser::frames::NotQNameItem::QName { namespace, local_name } => {
+                    result.push((*namespace, *local_name));
+                }
+                crate::parser::frames::NotQNameItem::Defined => {
+                    result.extend(self.expand_defined_elements());
+                }
+                crate::parser::frames::NotQNameItem::DefinedSibling => {
+                    result.extend_from_slice(sibling_elements);
+                }
+            }
+        }
+        result
+    }
+
+    /// Expand ##defined for element wildcards: collect all globally declared elements
+    fn expand_defined_elements(&self) -> Vec<(Option<NameId>, NameId)> {
+        self.schema_set.namespaces.iter()
+            .flat_map(|(ns, table)| {
+                table.elements.keys().map(move |name| (*ns, *name))
+            })
+            .collect()
     }
 
     /// Compile a model group definition to a fragment
@@ -292,12 +338,20 @@ impl<'a> CompileContext<'a> {
             return Ok(self.builder.epsilon_fragment());
         }
 
+        // Set sibling elements for ##definedSibling expansion in wildcards
+        let new_siblings = self.collect_sibling_element_qnames(particles);
+        let saved_siblings = std::mem::replace(
+            &mut self.current_sibling_elements,
+            new_siblings,
+        );
+
         let mut result = self.compile_particle_with_index(&particles[0], 0)?;
         for (i, particle) in particles[1..].iter().enumerate() {
             let frag = self.compile_particle_with_index(particle, i + 1)?;
             result = result.concat(frag);
         }
 
+        self.current_sibling_elements = saved_siblings;
         Ok(result)
     }
 
@@ -307,12 +361,20 @@ impl<'a> CompileContext<'a> {
             return Ok(self.builder.epsilon_fragment());
         }
 
+        // Set sibling elements for ##definedSibling expansion in wildcards
+        let new_siblings = self.collect_sibling_element_qnames(particles);
+        let saved_siblings = std::mem::replace(
+            &mut self.current_sibling_elements,
+            new_siblings,
+        );
+
         let mut result = self.compile_particle_with_index(&particles[0], 0)?;
         for (i, particle) in particles[1..].iter().enumerate() {
             let frag = self.compile_particle_with_index(particle, i + 1)?;
             result = result.alternate(frag);
         }
 
+        self.current_sibling_elements = saved_siblings;
         Ok(result)
     }
 
@@ -368,6 +430,10 @@ impl<'a> CompileContext<'a> {
         particles: &[ParticleResult],
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<AllGroupModel> {
+        // Collect sibling element names for ##definedSibling expansion
+        // Uses proper namespace resolution (element refs, form, elementFormDefault)
+        let sibling_elements = self.collect_sibling_element_qnames(particles);
+
         let mut all_particles = Vec::with_capacity(particles.len());
 
         for particle in particles {
@@ -376,9 +442,14 @@ impl<'a> CompileContext<'a> {
                     self.build_element_term(elem, particle.source.as_ref().or(source))?
                 }
                 ParticleTerm::Any(wildcard) => {
-                    let ns = self.convert_wildcard_namespace(&wildcard.namespace);
+                    let mut ns = self.convert_wildcard_namespace(&wildcard.namespace);
                     let pc = self.convert_process_contents(wildcard.process_contents);
-                    NfaTerm::wildcard(ns, pc)
+                    // Override with notNamespace if present
+                    if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
+                        ns = not_ns;
+                    }
+                    let not_qnames = self.expand_not_qnames(&wildcard.not_qname, &sibling_elements);
+                    NfaTerm::wildcard_with_not_qnames(ns, pc, not_qnames)
                 }
                 ParticleTerm::Group(_) => {
                     // Group references inside all-groups are not yet supported.
@@ -497,6 +568,15 @@ impl<'a> CompileContext<'a> {
         Ok(())
     }
 
+    /// Resolve a NamespaceToken to Option<NameId>
+    fn resolve_namespace_token(&self, token: &crate::parser::frames::NamespaceToken) -> Option<NameId> {
+        match token {
+            crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
+            crate::parser::frames::NamespaceToken::Local => None,
+            crate::parser::frames::NamespaceToken::TargetNamespace => self.target_namespace,
+        }
+    }
+
     /// Convert WildcardNamespace to NamespaceConstraint
     fn convert_wildcard_namespace(&self, ns: &WildcardNamespace) -> NamespaceConstraint {
         match ns {
@@ -504,8 +584,24 @@ impl<'a> CompileContext<'a> {
             WildcardNamespace::Other => NamespaceConstraint::Other,
             WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
             WildcardNamespace::Local => NamespaceConstraint::Local,
-            WildcardNamespace::List(list) => NamespaceConstraint::List(list.clone()),
+            WildcardNamespace::List(list) => {
+                NamespaceConstraint::List(
+                    list.iter().map(|t| self.resolve_namespace_token(t)).collect()
+                )
+            }
         }
+    }
+
+    /// Convert WildcardResult's not_namespace to NamespaceConstraint::Not if non-empty.
+    /// Returns None if not_namespace is empty (no override).
+    fn convert_not_namespace(&self, not_namespace: &[crate::parser::frames::NamespaceToken]) -> Option<NamespaceConstraint> {
+        if not_namespace.is_empty() {
+            return None;
+        }
+        let excluded: Vec<Option<NameId>> = not_namespace.iter()
+            .map(|t| self.resolve_namespace_token(t))
+            .collect();
+        Some(NamespaceConstraint::Not(excluded))
     }
 
     /// Convert parser ProcessContents to types ProcessContents
@@ -528,6 +624,31 @@ impl<'a> CompileContext<'a> {
             source,
             self.target_namespace,
         )
+    }
+
+    /// Collect sibling element QNames from a particle list, using proper
+    /// namespace resolution (element refs, form attribute, elementFormDefault).
+    /// Used for ##definedSibling expansion.
+    fn collect_sibling_element_qnames(&self, particles: &[ParticleResult]) -> Vec<(Option<NameId>, NameId)> {
+        particles.iter()
+            .filter_map(|p| {
+                if let ParticleTerm::Element(elem) = &p.term {
+                    if let Some(ref_name) = &elem.ref_name {
+                        // Element reference — use the ref's resolved QName
+                        Some((ref_name.namespace, ref_name.local_name))
+                    } else if let Some(name) = elem.name {
+                        // Local element — resolve namespace through form/elementFormDefault
+                        let source = p.source.as_ref().or(elem.source.as_ref());
+                        let ns = self.effective_element_namespace(elem, source);
+                        Some((ns, name))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -840,13 +961,26 @@ fn attach_open_content(
     };
 
     match matcher {
-        ContentModelMatcher::Nfa(nfa) => ContentModelMatcher::WithOpenContent {
-            nfa,
-            mode: open_content.mode,
-            wildcard: open_content.wildcard,
-        },
+        ContentModelMatcher::Nfa(nfa) => {
+            let wildcard = open_content.wildcard.map(|mut w| {
+                if w.has_defined_sibling {
+                    w.not_qnames.extend(collect_nfa_element_qnames(&nfa));
+                    w.has_defined_sibling = false;
+                }
+                w
+            });
+            ContentModelMatcher::WithOpenContent {
+                nfa,
+                mode: open_content.mode,
+                wildcard,
+            }
+        }
         ContentModelMatcher::AllGroup(mut model) => {
-            if let Some(wildcard_ref) = open_content.wildcard {
+            if let Some(mut wildcard_ref) = open_content.wildcard {
+                if wildcard_ref.has_defined_sibling {
+                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(&model));
+                    wildcard_ref.has_defined_sibling = false;
+                }
                 let mode = match open_content.mode {
                     TypesOpenContentMode::Interleave => AllGroupOpenContentMode::Interleave,
                     TypesOpenContentMode::Suffix => AllGroupOpenContentMode::Suffix,
@@ -856,13 +990,20 @@ fn attach_open_content(
                     namespace_constraint: wildcard_ref.namespace_constraint,
                     process_contents: wildcard_ref.process_contents,
                     mode,
+                    not_qnames: wildcard_ref.not_qnames,
                 });
             }
             ContentModelMatcher::AllGroup(model)
         }
         #[cfg(feature = "xsd11")]
         ContentModelMatcher::AllGroupExtension { mut base_model, extension_nfa } => {
-            if let Some(wildcard_ref) = open_content.wildcard {
+            if let Some(mut wildcard_ref) = open_content.wildcard {
+                if wildcard_ref.has_defined_sibling {
+                    // Collect siblings from both the base all-group and extension NFA
+                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(&base_model));
+                    wildcard_ref.not_qnames.extend(collect_nfa_element_qnames(&extension_nfa));
+                    wildcard_ref.has_defined_sibling = false;
+                }
                 let mode = match open_content.mode {
                     TypesOpenContentMode::Interleave => AllGroupOpenContentMode::Interleave,
                     TypesOpenContentMode::Suffix => AllGroupOpenContentMode::Suffix,
@@ -872,6 +1013,7 @@ fn attach_open_content(
                     namespace_constraint: wildcard_ref.namespace_constraint,
                     process_contents: wildcard_ref.process_contents,
                     mode,
+                    not_qnames: wildcard_ref.not_qnames,
                 });
             }
             ContentModelMatcher::AllGroupExtension { base_model, extension_nfa }
@@ -891,7 +1033,10 @@ fn resolve_open_content(
     }
 
     if let Some(explicit) = explicit {
-        return open_content_from_result(explicit);
+        let target_namespace = source
+            .and_then(|s| schema_set.documents.get(s.doc_id as usize))
+            .and_then(|d| d.target_namespace);
+        return open_content_from_result(explicit, schema_set, target_namespace);
     }
 
     if !matches!(content, ComplexContentResult::Complex(_) | ComplexContentResult::Empty) {
@@ -905,7 +1050,7 @@ fn resolve_open_content(
         return None;
     }
 
-    open_content_from_default(default)
+    open_content_from_default(default, schema_set)
 }
 
 fn content_is_empty(content: &ComplexContentResult) -> bool {
@@ -916,7 +1061,11 @@ fn content_is_empty(content: &ComplexContentResult) -> bool {
     }
 }
 
-fn open_content_from_result(result: &OpenContentResult) -> Option<OpenContent> {
+fn open_content_from_result(
+    result: &OpenContentResult,
+    schema_set: &SchemaSet,
+    target_namespace: Option<NameId>,
+) -> Option<OpenContent> {
     let mode = convert_open_content_mode(result.mode);
     if matches!(mode, TypesOpenContentMode::None) {
         return None;
@@ -924,12 +1073,15 @@ fn open_content_from_result(result: &OpenContentResult) -> Option<OpenContent> {
 
     Some(OpenContent {
         mode,
-        wildcard: result.wildcard.as_ref().map(wildcard_ref_from_result),
+        wildcard: result.wildcard.as_ref().map(|w| wildcard_ref_from_result(w, schema_set, target_namespace)),
         source: result.source.clone(),
     })
 }
 
-fn open_content_from_default(default: &DefaultOpenContent) -> Option<OpenContent> {
+fn open_content_from_default(
+    default: &DefaultOpenContent,
+    schema_set: &SchemaSet,
+) -> Option<OpenContent> {
     let mode = convert_schema_open_content_mode(default.mode);
     if matches!(mode, TypesOpenContentMode::None) {
         return None;
@@ -937,7 +1089,7 @@ fn open_content_from_default(default: &DefaultOpenContent) -> Option<OpenContent
 
     Some(OpenContent {
         mode,
-        wildcard: default.wildcard.as_ref().map(wildcard_ref_from_default),
+        wildcard: default.wildcard.as_ref().map(|w| wildcard_ref_from_default(w, schema_set)),
         source: default.source.clone(),
     })
 }
@@ -958,14 +1110,97 @@ fn convert_schema_open_content_mode(mode: SchemaOpenContentMode) -> TypesOpenCon
     }
 }
 
-fn wildcard_ref_from_result(wildcard: &WildcardResult) -> WildcardRef {
-    let namespace_constraint = match &wildcard.namespace {
+fn resolve_ns_token(
+    token: &crate::parser::frames::NamespaceToken,
+    target_namespace: Option<NameId>,
+) -> Option<NameId> {
+    match token {
+        crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
+        crate::parser::frames::NamespaceToken::Local => None,
+        crate::parser::frames::NamespaceToken::TargetNamespace => target_namespace,
+    }
+}
+
+/// Expand all globally declared element QNames from the schema set.
+fn expand_defined_element_qnames(schema_set: &SchemaSet) -> Vec<(Option<NameId>, NameId)> {
+    schema_set.namespaces.iter()
+        .flat_map(|(ns, table)| {
+            table.elements.keys().map(move |name| (*ns, *name))
+        })
+        .collect()
+}
+
+/// Collect all element QNames from an NFA content model (for ##definedSibling expansion).
+fn collect_nfa_element_qnames(nfa: &NfaTable) -> Vec<(Option<NameId>, NameId)> {
+    let mut result = Vec::new();
+    for state in &nfa.states {
+        if let Some(NfaTerm::Element { namespace, name, .. }) = &state.term {
+            let qname = (*namespace, *name);
+            if !result.contains(&qname) {
+                result.push(qname);
+            }
+        }
+    }
+    result
+}
+
+/// Collect all element QNames from an all-group model (for ##definedSibling expansion).
+fn collect_all_group_element_qnames(model: &AllGroupModel) -> Vec<(Option<NameId>, NameId)> {
+    let mut result = Vec::new();
+    for particle in &model.particles {
+        if let NfaTerm::Element { namespace, name, .. } = &particle.term {
+            let qname = (*namespace, *name);
+            if !result.contains(&qname) {
+                result.push(qname);
+            }
+        }
+    }
+    result
+}
+
+fn wildcard_ref_from_result(
+    wildcard: &WildcardResult,
+    schema_set: &SchemaSet,
+    target_namespace: Option<NameId>,
+) -> WildcardRef {
+    let mut namespace_constraint = match &wildcard.namespace {
         WildcardNamespace::Any => NamespaceConstraint::Any,
         WildcardNamespace::Other => NamespaceConstraint::Other,
         WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
         WildcardNamespace::Local => NamespaceConstraint::Local,
-        WildcardNamespace::List(list) => NamespaceConstraint::List(list.clone()),
+        WildcardNamespace::List(list) => {
+            NamespaceConstraint::List(
+                list.iter().map(|t| resolve_ns_token(t, target_namespace)).collect()
+            )
+        }
     };
+
+    // Override with notNamespace if present
+    if !wildcard.not_namespace.is_empty() {
+        let excluded: Vec<Option<NameId>> = wildcard.not_namespace.iter()
+            .map(|t| resolve_ns_token(t, target_namespace))
+            .collect();
+        namespace_constraint = NamespaceConstraint::Not(excluded);
+    }
+
+    // Expand notQName — resolve ##defined to concrete QNames using schema_set
+    let mut not_qnames: Vec<(Option<NameId>, NameId)> = Vec::new();
+    let mut has_defined_sibling = false;
+    for item in &wildcard.not_qname {
+        match item {
+            crate::parser::frames::NotQNameItem::QName { namespace, local_name } => {
+                not_qnames.push((*namespace, *local_name));
+            }
+            crate::parser::frames::NotQNameItem::Defined => {
+                not_qnames.extend(expand_defined_element_qnames(schema_set));
+            }
+            crate::parser::frames::NotQNameItem::DefinedSibling => {
+                // Defer: sibling context not yet available for open content wildcards.
+                // Resolved in attach_open_content when siblings are known.
+                has_defined_sibling = true;
+            }
+        }
+    }
 
     let process_contents = match wildcard.process_contents {
         ProcessContents::Strict => TypesProcessContents::Strict,
@@ -976,20 +1211,41 @@ fn wildcard_ref_from_result(wildcard: &WildcardResult) -> WildcardRef {
     WildcardRef {
         namespace_constraint,
         process_contents,
+        not_qnames,
+        has_defined_sibling,
         source: wildcard.source.clone(),
     }
 }
 
-fn wildcard_ref_from_default(wildcard: &ElementWildcard) -> WildcardRef {
+fn wildcard_ref_from_default(
+    wildcard: &ElementWildcard,
+    schema_set: &SchemaSet,
+) -> WildcardRef {
     let namespace_constraint = match &wildcard.namespace_constraint {
         SchemaNamespaceConstraint::Any => NamespaceConstraint::Any,
         SchemaNamespaceConstraint::Other => NamespaceConstraint::Other,
         SchemaNamespaceConstraint::Enumeration(list) => NamespaceConstraint::List(list.clone()),
-        SchemaNamespaceConstraint::Not(_) => {
-            // TODO: Preserve notNamespace constraints once supported in types::complex.
-            NamespaceConstraint::Any
-        }
+        SchemaNamespaceConstraint::Not(excluded) => NamespaceConstraint::Not(excluded.clone()),
     };
+
+    // Expand not_qnames from ElementWildcard — resolve ##defined using schema_set
+    let mut not_qnames: Vec<(Option<NameId>, NameId)> = Vec::new();
+    let mut has_defined_sibling = false;
+    for item in &wildcard.not_qnames {
+        match item {
+            crate::schema::wildcard::QNameDisallowed::QName { namespace, local_name } => {
+                not_qnames.push((*namespace, *local_name));
+            }
+            crate::schema::wildcard::QNameDisallowed::Defined => {
+                not_qnames.extend(expand_defined_element_qnames(schema_set));
+            }
+            crate::schema::wildcard::QNameDisallowed::DefinedSibling => {
+                // Defer: sibling context not yet available for open content wildcards.
+                // Resolved in attach_open_content when siblings are known.
+                has_defined_sibling = true;
+            }
+        }
+    }
 
     let process_contents = match wildcard.process_contents {
         crate::schema::wildcard::ProcessContents::Strict => TypesProcessContents::Strict,
@@ -1000,6 +1256,8 @@ fn wildcard_ref_from_default(wildcard: &ElementWildcard) -> WildcardRef {
     WildcardRef {
         namespace_constraint,
         process_contents,
+        not_qnames,
+        has_defined_sibling,
         source: wildcard.source.clone(),
     }
 }
@@ -1589,6 +1847,8 @@ mod tests {
             wildcard: Some(WildcardRef {
                 namespace_constraint: NamespaceConstraint::Any,
                 process_contents: TypesProcessContents::Lax,
+                not_qnames: Vec::new(),
+                has_defined_sibling: false,
                 source: None,
             }),
             source: None,
@@ -1724,6 +1984,434 @@ mod tests {
                 assert_eq!(base_model.particle_count(), 2);
             }
             other => panic!("expected AllGroupExtension, got {:?}", other),
+        }
+    }
+
+    // ========================================================================
+    // End-to-end wildcard conversion tests
+    // ========================================================================
+
+    #[test]
+    fn test_wildcard_ref_from_result_resolves_target_namespace_in_list() {
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let target_ns = schema_set.name_table.add("http://target.example.com");
+        let other_ns = schema_set.name_table.add("http://other.example.com");
+
+        use crate::parser::frames::NamespaceToken;
+
+        let wildcard = WildcardResult {
+            namespace: WildcardNamespace::List(vec![
+                NamespaceToken::TargetNamespace,
+                NamespaceToken::Uri(other_ns),
+                NamespaceToken::Local,
+            ]),
+            process_contents: ProcessContents::Lax,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+
+        let wref = wildcard_ref_from_result(&wildcard, &schema_set, Some(target_ns));
+        match &wref.namespace_constraint {
+            NamespaceConstraint::List(list) => {
+                assert_eq!(list.len(), 3);
+                assert_eq!(list[0], Some(target_ns), "##targetNamespace should resolve to target_ns");
+                assert_eq!(list[1], Some(other_ns));
+                assert_eq!(list[2], None, "##local should resolve to None");
+            }
+            other => panic!("expected List, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wildcard_ref_from_result_resolves_target_namespace_in_not_namespace() {
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let target_ns = schema_set.name_table.add("http://target.example.com");
+
+        use crate::parser::frames::NamespaceToken;
+
+        let wildcard = WildcardResult {
+            namespace: WildcardNamespace::Any,
+            process_contents: ProcessContents::Lax,
+            not_namespace: vec![NamespaceToken::TargetNamespace],
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+
+        let wref = wildcard_ref_from_result(&wildcard, &schema_set, Some(target_ns));
+        match &wref.namespace_constraint {
+            NamespaceConstraint::Not(excluded) => {
+                assert_eq!(excluded.len(), 1);
+                assert_eq!(excluded[0], Some(target_ns), "##targetNamespace in notNamespace should resolve to target_ns");
+            }
+            other => panic!("expected Not, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wildcard_ref_from_result_expands_defined() {
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let ns = schema_set.name_table.add("http://example.com");
+        let elem_name = schema_set.name_table.add("foo");
+
+        // Register a globally declared element in the schema
+        schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+
+        use crate::parser::frames::NotQNameItem;
+
+        let wildcard = WildcardResult {
+            namespace: WildcardNamespace::Any,
+            process_contents: ProcessContents::Lax,
+            not_namespace: Vec::new(),
+            not_qname: vec![NotQNameItem::Defined],
+            id: None,
+            annotation: None,
+            source: None,
+        };
+
+        let wref = wildcard_ref_from_result(&wildcard, &schema_set, None);
+        assert!(
+            wref.not_qnames.contains(&(Some(ns), elem_name)),
+            "##defined should expand to include globally declared element (ns, foo)"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_ref_from_default_expands_defined() {
+        use crate::schema::wildcard::QNameDisallowed;
+
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let ns = schema_set.name_table.add("http://example.com");
+        let elem_name = schema_set.name_table.add("bar");
+
+        // Register a globally declared element
+        schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+
+        let mut wildcard = ElementWildcard::any_lax();
+        wildcard.not_qnames = vec![QNameDisallowed::Defined];
+
+        let wref = wildcard_ref_from_default(&wildcard, &schema_set);
+        assert!(
+            wref.not_qnames.contains(&(Some(ns), elem_name)),
+            "##defined in default open content should expand to include globally declared element"
+        );
+    }
+
+    #[test]
+    fn test_open_content_from_result_e2e_with_not_namespace() {
+        // End-to-end: compile a type with explicit open content using notNamespace=##targetNamespace
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let target_ns = schema_set.name_table.add("http://target.example.com");
+
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.target_namespace = Some(target_ns);
+        schema_set.documents.push(doc);
+
+        use crate::parser::frames::NamespaceToken;
+
+        let oc_result = OpenContentResult {
+            mode: OpenContentMode::Interleave,
+            wildcard: Some(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: vec![NamespaceToken::TargetNamespace],
+                not_qname: Vec::new(),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+
+        let oc = open_content_from_result(&oc_result, &schema_set, Some(target_ns));
+        assert!(oc.is_some());
+        let oc = oc.unwrap();
+        let wildcard = oc.wildcard.unwrap();
+        match &wildcard.namespace_constraint {
+            NamespaceConstraint::Not(excluded) => {
+                assert_eq!(excluded, &vec![Some(target_ns)]);
+            }
+            other => panic!("expected Not constraint, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_default_open_content_e2e_with_defined() {
+        // End-to-end: compile a type using default open content with ##defined notQName
+        use crate::schema::wildcard::QNameDisallowed;
+
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let ns = schema_set.name_table.add("http://example.com");
+        let elem_name = schema_set.name_table.add("globalElem");
+
+        // Register a globally declared element
+        schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        let mut wc = ElementWildcard::any_lax();
+        wc.not_qnames = vec![QNameDisallowed::Defined];
+        doc.default_open_content = Some(DefaultOpenContent {
+            source: None,
+            applies_to_empty: true,
+            mode: SchemaOpenContentMode::Interleave,
+            wildcard: Some(wc),
+        });
+        schema_set.documents.push(doc);
+
+        let source = SourceRef::new(doc_id, SourceSpan::new(0, 0));
+        let ct_key = schema_set.arenas.alloc_complex_type(make_complex_type_data(
+            Some(source),
+            ComplexContentResult::Empty,
+        ));
+        let type_def = schema_set.arenas.complex_types.get(ct_key).unwrap();
+
+        let matcher = compile_content_model_matcher(&schema_set, type_def).unwrap();
+        match matcher {
+            ContentModelMatcher::WithOpenContent { wildcard, .. } => {
+                let wref = wildcard.expect("wildcard should be present");
+                assert!(
+                    wref.not_qnames.contains(&(Some(ns), elem_name)),
+                    "##defined should expand to include globally declared element through full compilation path"
+                );
+            }
+            _ => panic!("expected open content wrapper"),
+        }
+    }
+
+    #[test]
+    fn test_collect_sibling_element_qnames_with_ref() {
+        // Verify that collect_sibling_element_qnames handles element refs properly
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let ref_name = schema_set.name_table.add("refElem");
+        let ref_ns = schema_set.name_table.add("http://ref.example.com");
+        let local_name = schema_set.name_table.add("localElem");
+
+        let ctx = CompileContext::new(&schema_set, None);
+
+        let particles = vec![
+            // Element ref
+            ParticleResult {
+                term: ParticleTerm::Element(ElementFrameResult {
+                    name: None,
+                    ref_name: Some(QNameRef {
+                        prefix: None,
+                        local_name: ref_name,
+                        namespace: Some(ref_ns),
+                    }),
+                    target_namespace: None,
+                    type_ref: None,
+                    inline_type: None,
+                    substitution_group: vec![],
+                    default_value: None,
+                    fixed_value: None,
+                    nillable: false,
+                    is_abstract: false,
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    block: Default::default(),
+                    final_derivation: Default::default(),
+                    form: None,
+                    id: None,
+                    alternatives: vec![],
+                    identity_constraints: vec![],
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            },
+            // Local element
+            make_element_particle(local_name, 1, Some(1)),
+        ];
+
+        let siblings = ctx.collect_sibling_element_qnames(&particles);
+        assert_eq!(siblings.len(), 2);
+        assert!(
+            siblings.contains(&(Some(ref_ns), ref_name)),
+            "should include element ref with resolved namespace"
+        );
+        assert!(
+            siblings.contains(&(None, local_name)),
+            "should include local element with proper namespace"
+        );
+    }
+
+    #[test]
+    fn test_defined_sibling_expansion_in_sequence() {
+        // Verify that ##definedSibling expands to sibling elements in a sequence
+        use crate::parser::frames::NotQNameItem;
+
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let elem_a = schema_set.name_table.add("a");
+        let elem_b = schema_set.name_table.add("b");
+
+        // Build sequence: <a/> <xs:any notQName="##definedSibling"/>
+        let wildcard_particle = ParticleResult {
+            term: ParticleTerm::Any(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: Vec::new(),
+                not_qname: vec![NotQNameItem::DefinedSibling],
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 0,
+            max_occurs: None,
+            source: None,
+        };
+
+        let sequence = make_sequence_particle(vec![
+            make_element_particle(elem_a, 1, Some(1)),
+            make_element_particle(elem_b, 1, Some(1)),
+            wildcard_particle,
+        ]);
+
+        let nfa = compile_particle(&schema_set, &sequence, None).unwrap();
+
+        // The wildcard in the NFA should have not_qnames excluding siblings a and b
+        let mut found_wildcard = false;
+        for state in &nfa.states {
+            if let Some(NfaTerm::Wildcard { not_qnames, .. }) = &state.term {
+                found_wildcard = true;
+                assert!(
+                    not_qnames.contains(&(None, elem_a)),
+                    "##definedSibling should exclude sibling element 'a'"
+                );
+                assert!(
+                    not_qnames.contains(&(None, elem_b)),
+                    "##definedSibling should exclude sibling element 'b'"
+                );
+            }
+        }
+        assert!(found_wildcard, "NFA should contain a wildcard state");
+    }
+
+    #[test]
+    fn test_defined_sibling_open_content_nfa() {
+        // ##definedSibling in open content wildcard should expand to sibling elements
+        // from the NFA content model when attached via attach_open_content
+        use crate::parser::frames::NotQNameItem;
+
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let elem_a = schema_set.name_table.add("a");
+        let elem_b = schema_set.name_table.add("b");
+
+        // Build a sequence: <a/> <b/>
+        let sequence = make_sequence_particle(vec![
+            make_element_particle(elem_a, 1, Some(1)),
+            make_element_particle(elem_b, 1, Some(1)),
+        ]);
+        let nfa = compile_particle(&schema_set, &sequence, None).unwrap();
+        let matcher = ContentModelMatcher::Nfa(nfa);
+
+        // Build open content with ##definedSibling
+        let oc_result = OpenContentResult {
+            mode: OpenContentMode::Interleave,
+            wildcard: Some(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: Vec::new(),
+                not_qname: vec![NotQNameItem::DefinedSibling],
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let oc = open_content_from_result(&oc_result, &schema_set, None).unwrap();
+
+        // has_defined_sibling should be set
+        assert!(oc.wildcard.as_ref().unwrap().has_defined_sibling);
+
+        let result = attach_open_content(matcher, Some(oc));
+        match result {
+            ContentModelMatcher::WithOpenContent { wildcard, .. } => {
+                let wref = wildcard.expect("wildcard should be present");
+                assert!(!wref.has_defined_sibling, "has_defined_sibling should be resolved");
+                assert!(
+                    wref.not_qnames.contains(&(None, elem_a)),
+                    "##definedSibling should exclude sibling element 'a'"
+                );
+                assert!(
+                    wref.not_qnames.contains(&(None, elem_b)),
+                    "##definedSibling should exclude sibling element 'b'"
+                );
+            }
+            _ => panic!("expected WithOpenContent"),
+        }
+    }
+
+    #[test]
+    fn test_defined_sibling_open_content_all_group() {
+        // ##definedSibling in open content wildcard should expand to sibling elements
+        // from AllGroup content model when attached via attach_open_content
+        use crate::parser::frames::NotQNameItem;
+
+        let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let elem_x = schema_set.name_table.add("x");
+        let elem_y = schema_set.name_table.add("y");
+
+        // Build all-group with elements x and y
+        let model = AllGroupModel::new(vec![
+            AllParticle::new(
+                NfaTerm::element(elem_x, None, None),
+                1,
+                MaxOccurs::Bounded(1),
+                None,
+            ),
+            AllParticle::new(
+                NfaTerm::element(elem_y, None, None),
+                1,
+                MaxOccurs::Bounded(1),
+                None,
+            ),
+        ]);
+        let matcher = ContentModelMatcher::AllGroup(model);
+
+        // Build open content with ##definedSibling
+        let oc_result = OpenContentResult {
+            mode: OpenContentMode::Suffix,
+            wildcard: Some(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: Vec::new(),
+                not_qname: vec![NotQNameItem::DefinedSibling],
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let oc = open_content_from_result(&oc_result, &schema_set, None).unwrap();
+
+        let result = attach_open_content(matcher, Some(oc));
+        match result {
+            ContentModelMatcher::AllGroup(model) => {
+                let oc_wc = model.open_content.expect("open content should be present");
+                assert!(
+                    oc_wc.not_qnames.contains(&(None, elem_x)),
+                    "##definedSibling should exclude sibling element 'x'"
+                );
+                assert!(
+                    oc_wc.not_qnames.contains(&(None, elem_y)),
+                    "##definedSibling should exclude sibling element 'y'"
+                );
+            }
+            _ => panic!("expected AllGroup"),
         }
     }
 }

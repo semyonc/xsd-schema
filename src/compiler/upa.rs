@@ -239,6 +239,8 @@ fn element_wildcard_overlap(
             // None in the list represents absent namespace
             namespaces.contains(&element_namespace)
         }
+
+        NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
     }
 }
 
@@ -268,6 +270,30 @@ fn wildcards_overlap(
     use NamespaceConstraint::*;
 
     match (wc1, wc2) {
+        // Not(a) vs Not(b): both exclude finite sets, infinite remainder overlaps
+        (Not(_), Not(_)) => true,
+
+        // Not(a) vs Any / Any vs Not(a): always overlaps
+        (Not(_), Any) | (Any, Not(_)) => true,
+
+        // Not(a) vs Other / Other vs Not(a): both accept "almost everything", overlaps
+        (Not(_), Other) | (Other, Not(_)) => true,
+
+        // Not(a) vs TargetNamespace: overlaps if target ns is not excluded
+        (Not(a), TargetNamespace) | (TargetNamespace, Not(a)) => {
+            !a.contains(&target_namespace)
+        }
+
+        // Not(a) vs Local: overlaps if absent ns is not excluded
+        (Not(a), Local) | (Local, Not(a)) => {
+            !a.contains(&None)
+        }
+
+        // Not(a) vs List(b): overlaps if any ns in list is not excluded
+        (Not(a), List(b)) | (List(b), Not(a)) => {
+            b.iter().any(|ns| !a.contains(ns))
+        }
+
         // Any matches everything, so overlaps with anything
         (Any, _) | (_, Any) => true,
 
@@ -382,6 +408,7 @@ fn check_element_wildcard_conflicts(
     target_namespace: Option<NameId>,
     xsd_version: XsdVersion,
     schema_set: &SchemaSet,
+    substitution_sets: &SubstitutionGroupMap,
 ) -> UpaResult<()> {
     for elem in elements {
         if let NfaTerm::Element {
@@ -390,18 +417,33 @@ fn check_element_wildcard_conflicts(
             ..
         } = &elem.term
         {
+            // Collect all QNames this element particle can match
+            // (head + substitution group members)
+            let matchable_names = element_substitutable_names(&elem.term, substitution_sets);
+
             for wc in wildcards {
                 if let NfaTerm::Wildcard {
                     namespace_constraint,
+                    not_qnames,
                     ..
                 } = &wc.term
                 {
-                    if element_wildcard_overlap(
-                        *elem_ns,
-                        namespace_constraint,
-                        target_namespace,
-                        xsd_version,
-                    ) {
+                    // A conflict exists if ANY matchable QName (head or substitution member)
+                    // both falls within the wildcard's namespace constraint AND is not
+                    // excluded by notQName.
+                    let has_conflict = matchable_names.iter().any(|(match_name, match_ns)| {
+                        if !element_wildcard_overlap(
+                            *match_ns,
+                            namespace_constraint,
+                            target_namespace,
+                            xsd_version,
+                        ) {
+                            return false;
+                        }
+                        // Check if this specific QName is excluded by notQName
+                        !not_qnames.iter().any(|&(ens, en)| ens == *match_ns && en == *match_name)
+                    });
+                    if has_conflict {
                         let element_name = schema_set
                             .name_table
                             .try_resolve(*name)
@@ -514,6 +556,7 @@ pub fn check_upa(
                 target_namespace,
                 xsd_version,
                 schema_set,
+                &substitution_sets,
             ) {
                 return Err(upa_error_to_schema_error(schema_set, error));
             }
@@ -1161,5 +1204,234 @@ mod tests {
             target,
             XsdVersion::V1_1
         ));
+    }
+
+    // ========================================================================
+    // Not constraint tests
+    // ========================================================================
+
+    #[test]
+    fn test_element_wildcard_not_excluded() {
+        let ns1 = Some(NameId(1));
+        // Element in excluded namespace does NOT match Not([ns1])
+        assert!(!element_wildcard_overlap(
+            ns1,
+            &NamespaceConstraint::Not(vec![ns1]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_element_wildcard_not_allowed() {
+        let ns1 = Some(NameId(1));
+        let ns2 = Some(NameId(2));
+        // Element in non-excluded namespace matches Not([ns1])
+        assert!(element_wildcard_overlap(
+            ns2,
+            &NamespaceConstraint::Not(vec![ns1]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_element_wildcard_not_absent_excluded() {
+        // Not([None]) excludes absent namespace
+        assert!(!element_wildcard_overlap(
+            None,
+            &NamespaceConstraint::Not(vec![None]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_not() {
+        let ns1 = Some(NameId(1));
+        let ns2 = Some(NameId(2));
+        // Not(ns1) vs Not(ns2): both exclude finite sets, infinite remainder overlaps
+        assert!(wildcards_overlap(
+            &NamespaceConstraint::Not(vec![ns1]),
+            &NamespaceConstraint::Not(vec![ns2]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_any() {
+        let ns1 = Some(NameId(1));
+        assert!(wildcards_overlap(
+            &NamespaceConstraint::Not(vec![ns1]),
+            &NamespaceConstraint::Any,
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_target_excluded() {
+        let target = Some(NameId(1));
+        // Not([target]) vs TargetNamespace: no overlap (target is excluded)
+        assert!(!wildcards_overlap(
+            &NamespaceConstraint::Not(vec![target]),
+            &NamespaceConstraint::TargetNamespace,
+            target,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_target_not_excluded() {
+        let target = Some(NameId(1));
+        let ns2 = Some(NameId(2));
+        // Not([ns2]) vs TargetNamespace: overlaps (target is not excluded)
+        assert!(wildcards_overlap(
+            &NamespaceConstraint::Not(vec![ns2]),
+            &NamespaceConstraint::TargetNamespace,
+            target,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_list_partial() {
+        let ns1 = Some(NameId(1));
+        let ns2 = Some(NameId(2));
+        // Not([ns1]) vs List([ns1, ns2]): overlaps because ns2 is not excluded
+        assert!(wildcards_overlap(
+            &NamespaceConstraint::Not(vec![ns1]),
+            &NamespaceConstraint::List(vec![ns1, ns2]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    #[test]
+    fn test_wildcards_overlap_not_list_all_excluded() {
+        let ns1 = Some(NameId(1));
+        // Not([ns1]) vs List([ns1]): no overlap (all list items excluded)
+        assert!(!wildcards_overlap(
+            &NamespaceConstraint::Not(vec![ns1]),
+            &NamespaceConstraint::List(vec![ns1]),
+            None,
+            XsdVersion::V1_1
+        ));
+    }
+
+    // ========================================================================
+    // notQName UPA tests
+    // ========================================================================
+
+    #[test]
+    fn test_element_wildcard_no_overlap_via_not_qnames() {
+        // When a wildcard's notQName excludes a specific element,
+        // they should not be considered overlapping
+        let schema_set = create_test_schema_set();
+        let name_a = schema_set.name_table.add("a");
+
+        let mut builder = FragmentBuilder::new();
+        let term1 = NfaTerm::element(name_a, None, None);
+        // Wildcard that explicitly excludes element "a" (absent ns)
+        let term2 = NfaTerm::wildcard_with_not_qnames(
+            NamespaceConstraint::Any,
+            ProcessContents::Lax,
+            vec![(None, name_a)],
+        );
+        let frag1 = builder.single_term(term1, None);
+        let frag2 = builder.single_term(term2, None);
+        let choice = frag1.alternate(frag2);
+        let nfa = fragment_to_table(choice);
+
+        // XSD 1.0: normally element vs ##any wildcard would conflict,
+        // but notQName excludes this element, so no overlap
+        let result = check_upa(&nfa, &schema_set, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_element_wildcard_subst_member_namespace_conflict() {
+        // Head element is in target namespace (no overlap with ##other wildcard),
+        // but a substitution group member is in another namespace (overlaps).
+        // UPA should detect this conflict.
+        let mut schema_set = create_test_schema_set();
+        let target_ns = schema_set.name_table.add("http://target.example.com");
+        let other_ns = schema_set.name_table.add("http://other.example.com");
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let head_key = schema_set
+            .arenas
+            .alloc_element(element_data(head_name, Some(target_ns)));
+        let member_key = schema_set
+            .arenas
+            .alloc_element(element_data(member_name, Some(other_ns)));
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let mut builder = FragmentBuilder::new();
+        // Element in target namespace with substitution group
+        let term1 = NfaTerm::element(head_name, Some(target_ns), Some(head_key));
+        // ##other wildcard — matches other_ns but not target_ns
+        let term2 = NfaTerm::wildcard(NamespaceConstraint::Other, ProcessContents::Lax);
+        let frag1 = builder.single_term(term1, None);
+        let frag2 = builder.single_term(term2, None);
+        let choice = frag1.alternate(frag2);
+        let nfa = fragment_to_table(choice);
+
+        // XSD 1.0: head element is in target_ns (no overlap with ##other),
+        // BUT member is in other_ns (DOES overlap with ##other).
+        // UPA should detect conflict.
+        let result = check_upa(&nfa, &schema_set, Some(target_ns));
+        assert!(result.is_err(), "should detect conflict via substitution member in other namespace");
+        assert_cos_nonambig(result.unwrap_err());
+    }
+
+    #[test]
+    fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
+        // Head element is excluded by notQName, but substitution member is NOT excluded.
+        // UPA should still detect conflict.
+        let mut schema_set = create_test_schema_set();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let head_key = schema_set
+            .arenas
+            .alloc_element(element_data(head_name, None));
+        let member_key = schema_set
+            .arenas
+            .alloc_element(element_data(member_name, None));
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let mut builder = FragmentBuilder::new();
+        let term1 = NfaTerm::element(head_name, None, Some(head_key));
+        // Wildcard excludes head but NOT member
+        let term2 = NfaTerm::wildcard_with_not_qnames(
+            NamespaceConstraint::Any,
+            ProcessContents::Lax,
+            vec![(None, head_name)], // only head excluded
+        );
+        let frag1 = builder.single_term(term1, None);
+        let frag2 = builder.single_term(term2, None);
+        let choice = frag1.alternate(frag2);
+        let nfa = fragment_to_table(choice);
+
+        // XSD 1.0: head is excluded by notQName, but member is not.
+        // The wildcard can still match "member", so UPA conflict exists.
+        let result = check_upa(&nfa, &schema_set, None);
+        assert!(result.is_err(), "should detect conflict: member not excluded by notQName");
+        assert_cos_nonambig(result.unwrap_err());
     }
 }

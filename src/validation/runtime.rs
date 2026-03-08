@@ -2210,7 +2210,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let effective_wildcard = self.find_effective_wildcard(ct_data);
                 if let Some(ref wildcard) = effective_wildcard {
                     let target_ns = ct_data.target_namespace;
-                    if self.wildcard_allows_namespace(wildcard, namespace, target_ns) {
+                    if self.wildcard_allows_attribute(wildcard, namespace, local_name, target_ns) {
                         let result = match wildcard.process_contents {
                             ProcessContents::Skip => SchemaInfo::empty(),
                             ProcessContents::Strict => {
@@ -2613,6 +2613,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Resolve a NamespaceToken to a concrete namespace Option<NameId>
+    fn resolve_namespace_token(
+        &self,
+        token: &crate::parser::frames::NamespaceToken,
+        target_namespace: Option<NameId>,
+    ) -> Option<NameId> {
+        match token {
+            crate::parser::frames::NamespaceToken::Uri(id) => Some(*id),
+            crate::parser::frames::NamespaceToken::Local => None,
+            crate::parser::frames::NamespaceToken::TargetNamespace => target_namespace,
+        }
+    }
+
     /// Check whether a wildcard allows a given namespace.
     fn wildcard_allows_namespace(
         &self,
@@ -2620,13 +2633,60 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
         target_namespace: Option<NameId>,
     ) -> bool {
-        match &wildcard.namespace {
+        // Positive namespace check
+        let ns_ok = match &wildcard.namespace {
             WildcardNamespace::Any => true,
             WildcardNamespace::Other => namespace != target_namespace,
             WildcardNamespace::TargetNamespace => namespace == target_namespace,
             WildcardNamespace::Local => namespace.is_none(),
-            WildcardNamespace::List(ns_list) => ns_list.contains(&namespace),
+            WildcardNamespace::List(ns_list) => {
+                ns_list.iter().any(|t| self.resolve_namespace_token(t, target_namespace) == namespace)
+            }
+        };
+        if !ns_ok {
+            return false;
         }
+        // Check notNamespace exclusions
+        for token in &wildcard.not_namespace {
+            let excluded_ns = self.resolve_namespace_token(token, target_namespace);
+            if namespace == excluded_ns {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Check whether a wildcard allows a given attribute (namespace + notQName).
+    fn wildcard_allows_attribute(
+        &self,
+        wildcard: &WildcardResult,
+        namespace: Option<NameId>,
+        name: NameId,
+        target_namespace: Option<NameId>,
+    ) -> bool {
+        if !self.wildcard_allows_namespace(wildcard, namespace, target_namespace) {
+            return false;
+        }
+        // Check notQName exclusions
+        for item in &wildcard.not_qname {
+            match item {
+                crate::parser::frames::NotQNameItem::QName { namespace: qns, local_name } => {
+                    if *qns == namespace && *local_name == name {
+                        return false;
+                    }
+                }
+                crate::parser::frames::NotQNameItem::Defined => {
+                    // Reject if this attribute is globally declared
+                    if self.schema_set.lookup_attribute(namespace, name).is_some() {
+                        return false;
+                    }
+                }
+                crate::parser::frames::NotQNameItem::DefinedSibling => {
+                    // Should never appear on attribute wildcards (rejected at parse time)
+                }
+            }
+        }
+        true
     }
 
     /// Collect all attribute uses from resolved attribute groups (recursively).
