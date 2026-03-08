@@ -2095,25 +2095,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Detect ID/IDREF types and collect values for finalization.
+    ///
+    /// Uses the normalized value from `typed_value` (not raw `value_str`)
+    /// for ID and IDREF tracking, so whitespace-collapsed values match
+    /// consistently across ID, IDREF, and IDREFS.
+    ///
+    /// For IDREF list values (both built-in xs:IDREFS and user-defined
+    /// `<xs:list itemType="xs:IDREF">`), each token is tracked individually.
     fn collect_id_idref(&mut self, typed_value: &XmlValue, value_str: &str) {
         match typed_value.type_code {
             XmlTypeCode::Id => {
-                if !self.id_values.insert(value_str.to_string()) {
+                let normalized = typed_value.to_string_value();
+                if self.id_values.contains(&normalized) {
                     self.report_error(
                         "cvc-id.2",
-                        format!("Duplicate ID value '{}'", value_str),
+                        format!("Duplicate ID value '{}'", normalized),
                     );
+                } else {
+                    self.id_values.insert(normalized);
                 }
             }
-            XmlTypeCode::IdRef => {
-                self.pending_idrefs.push((
-                    value_str.to_string(),
-                    self.current_location.clone(),
-                    self.element_path.clone(),
-                ));
-            }
-            XmlTypeCode::IdRefs => {
-                // Prefer extracting from validated list items
+            XmlTypeCode::IdRef | XmlTypeCode::IdRefs => {
+                // Both built-in xs:IDREFS and user-defined <xs:list itemType="xs:IDREF">
+                // produce XmlValueKind::List — decompose into individual IDREF tokens.
                 if let crate::types::value::XmlValueKind::List { items, .. } = &typed_value.value {
                     for item in items {
                         self.pending_idrefs.push((
@@ -2122,8 +2126,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.element_path.clone(),
                         ));
                     }
-                } else {
-                    // Fallback: split lexical text
+                } else if typed_value.type_code == XmlTypeCode::IdRefs {
+                    // Fallback for IdRefs without parsed list: split lexical text
                     for token in value_str.split_whitespace() {
                         self.pending_idrefs.push((
                             token.to_string(),
@@ -2131,6 +2135,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.element_path.clone(),
                         ));
                     }
+                } else {
+                    // Single IdRef value
+                    self.pending_idrefs.push((
+                        typed_value.to_string_value(),
+                        self.current_location.clone(),
+                        self.element_path.clone(),
+                    ));
                 }
             }
             _ => {}
@@ -7249,6 +7260,869 @@ mod tests {
             &schema_set, "http://other.com/ns", TNS,
             "explicit targetNamespace attribute should be valid",
             "attribute with wrong namespace should be rejected",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ID / IDREF / IDREFS correctness proof tests
+    // -----------------------------------------------------------------------
+
+    /// Helper schema for ID/IDREF attribute tests.
+    fn id_idref_attr_schema() -> crate::schema::SchemaSet {
+        load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="link" minOccurs="0" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="ref" type="xs:IDREF" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="multi" minOccurs="0" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="refs" type="xs:IDREFS" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+    }
+
+    /// IDREF valid forward reference — reference appears before the ID definition.
+    #[test]
+    fn test_idref_forward_reference() {
+        // Use xs:choice so link can appear before item
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:choice maxOccurs="unbounded">
+                            <xs:element name="item">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="link">
+                                <xs:complexType>
+                                    <xs:attribute name="ref" type="xs:IDREF" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:choice>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Forward reference: link before item
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "future");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Now define the ID
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "future");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Forward IDREF reference should be valid, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// IDREFS with all tokens valid — no errors expected.
+    #[test]
+    fn test_idrefs_all_valid() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "a1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "a2");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "a1 a2");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "IDREFS with all valid tokens should succeed, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// IDREFS with one missing token and one valid token.
+    #[test]
+    fn test_idrefs_one_missing_one_valid() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "exists");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "exists ghost");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 1,
+            "Expected 1 IDREF error for 'ghost', got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// IDREFS with multiple missing tokens.
+    #[test]
+    fn test_idrefs_multiple_missing() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "only");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "nope1 nope2 nope3");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 3,
+            "Expected 3 IDREF errors for nope1/nope2/nope3, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// IDREFS empty after whitespace collapse is a lexical error.
+    #[test]
+    fn test_idrefs_empty_after_collapse() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "   ");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // Should have a validation error (lexical), no cvc-id.1 errors
+        assert!(
+            !v.sink.errors.is_empty(),
+            "IDREFS with only whitespace should produce an error"
+        );
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Empty IDREFS should not produce cvc-id.1 errors (lexical rejection), got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// ID lexical rejection for invalid NCName.
+    #[test]
+    fn test_id_invalid_ncname() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // "1bad" starts with digit — not a valid NCName
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "1bad");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            !v.sink.errors.is_empty(),
+            "Invalid NCName for ID should produce an error"
+        );
+        // Should NOT appear in ID table (no duplicate detection)
+        let id_dup_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.2")
+            .collect();
+        assert!(
+            id_dup_errors.is_empty(),
+            "Invalid NCName should not produce cvc-id.2, got: {:?}",
+            id_dup_errors
+        );
+    }
+
+    /// IDREF lexical rejection for invalid NCName.
+    #[test]
+    fn test_idref_invalid_ncname() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "bad:name");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            !v.sink.errors.is_empty(),
+            "Invalid NCName for IDREF should produce an error"
+        );
+        // The invalid value should NOT end up in pending_idrefs
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Invalid IDREF should not produce cvc-id.1 (no runtime tracking), got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// IDREFS lexical rejection when one token is invalid NCName.
+    #[test]
+    fn test_idrefs_one_invalid_ncname_token() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Second token "2bad" is invalid NCName
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "good 2bad");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            !v.sink.errors.is_empty(),
+            "IDREFS with one invalid token should produce an error"
+        );
+        // No tokens should be tracked (lexical validation rejects entire value)
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Invalid IDREFS should not produce cvc-id.1 errors, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// Element text typed as xs:ID participates in duplicate detection.
+    #[test]
+    fn test_element_text_id_duplicate() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="id" type="xs:ID" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("id", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("alpha");
+        v.validate_end_element();
+
+        v.validate_element("id", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("alpha"); // duplicate
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+            "Duplicate ID in element text should raise cvc-id.2, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Element text typed as xs:IDREF participates in end-of-document resolution.
+    #[test]
+    fn test_element_text_idref_resolution() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="id" type="xs:ID" maxOccurs="unbounded"/>
+                            <xs:element name="ref" type="xs:IDREF" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("id", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("x1");
+        v.validate_end_element();
+
+        // Valid reference
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("x1");
+        v.validate_end_element();
+
+        // Missing reference
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("missing");
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 1,
+            "Expected 1 cvc-id.1 error for element-text IDREF 'missing', got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// Derived type from xs:ID still contributes to duplicate detection.
+    #[test]
+    fn test_derived_id_duplicate_detection() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="myID">
+                    <xs:restriction base="xs:ID">
+                        <xs:maxLength value="20"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="myID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "dup");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "dup"); // duplicate
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+            "Derived xs:ID should still detect duplicates, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Derived type from xs:IDREF still contributes to reference tracking.
+    #[test]
+    fn test_derived_idref_tracking() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="myIDREF">
+                    <xs:restriction base="xs:IDREF">
+                        <xs:maxLength value="20"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="link" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="ref" type="myIDREF" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "ok");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Valid derived IDREF
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "ok");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Missing derived IDREF
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "nope");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 1,
+            "Derived xs:IDREF should track references, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// Derived type from xs:IDREFS still tracks each token.
+    #[test]
+    fn test_derived_idrefs_tracking() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="myIDREFS">
+                    <xs:restriction base="xs:IDREFS">
+                        <xs:maxLength value="5"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="multi" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="refs" type="myIDREFS" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "x");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // "x" valid, "y" missing — derived IDREFS should track each token
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "x y");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 1,
+            "Derived xs:IDREFS should track each token, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// Valid repeated IDREF values do not raise duplicate-style errors.
+    #[test]
+    fn test_repeated_idref_no_false_duplicate() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "target");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Multiple references to the same ID — all valid
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "target");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "target");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "target target");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Repeated IDREF to same ID should not error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// Invalid lexical ID / IDREF values do not poison runtime tracking state.
+    #[test]
+    fn test_invalid_lexical_does_not_poison_tracking() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Invalid ID (not NCName) — should not be tracked
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "123bad");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // Valid ID
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "good");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // IDREF to the invalid one — should raise cvc-id.1
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "123bad");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // IDREF to the valid one — should be fine
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "good");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // Should have lexical errors for the invalid ID + IDREF,
+        // but the valid ID/IDREF pair should work
+        let dup_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.2")
+            .collect();
+        assert!(
+            dup_errors.is_empty(),
+            "Invalid lexical values should not cause cvc-id.2, got: {:?}",
+            dup_errors
+        );
+        // "good" should resolve, "123bad" IDREF also fails lexically so no cvc-id.1 for it
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Invalid IDREF '123bad' should fail lexically, not produce cvc-id.1, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// User-defined <xs:list itemType="xs:IDREF"> tracks each token individually.
+    ///
+    /// This proves that custom IDREF-list types (not just built-in xs:IDREFS)
+    /// correctly decompose into per-token tracking, even though
+    /// validate_list_type produces type_code==IdRef (the item code).
+    #[test]
+    fn test_custom_idref_list_tracking() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="myRefList">
+                    <xs:list itemType="xs:IDREF"/>
+                </xs:simpleType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:ID" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="refs" minOccurs="0" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="targets" type="myRefList" use="required"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "a1");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // "a1" exists, "missing1" and "missing2" do not
+        v.validate_element("refs", "", None, None, &ns);
+        v.validate_attribute("targets", "", "a1 missing1 missing2");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert_eq!(
+            idref_errors.len(), 2,
+            "Custom IDREF-list should track each token; expected 2 cvc-id.1 errors for missing1/missing2, got: {:?}",
+            idref_errors
+        );
+    }
+
+    /// Whitespace normalization regression: ID and IDREF with surrounding
+    /// whitespace must match after collapse, and IDREFS cross-references
+    /// must resolve against the collapsed ID value.
+    #[test]
+    fn test_whitespace_normalization_id_idref_match() {
+        let schema_set = id_idref_attr_schema();
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // ID with surrounding whitespace — collapsed to "foo"
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "  foo  ");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // IDREF without whitespace — must match the collapsed ID
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "foo");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // IDREF with whitespace — must also match
+        v.validate_element("link", "", None, None, &ns);
+        v.validate_attribute("ref", "", "  foo  ");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        // IDREFS where the token matches the collapsed ID
+        v.validate_element("multi", "", None, None, &ns);
+        v.validate_attribute("refs", "", "  foo  ");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Whitespace-padded ID/IDREF/IDREFS should all resolve after collapse, got: {:?}",
+            idref_errors
+        );
+        let dup_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.2")
+            .collect();
+        assert!(
+            dup_errors.is_empty(),
+            "Single whitespace-padded ID should not produce duplicates, got: {:?}",
+            dup_errors
+        );
+    }
+
+    /// Whitespace normalization regression for element text content:
+    /// ID defined via element text with whitespace must be found by IDREF.
+    #[test]
+    fn test_whitespace_normalization_element_text() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="id" type="xs:ID" maxOccurs="unbounded"/>
+                            <xs:element name="ref" type="xs:IDREF" maxOccurs="unbounded"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // ID element with whitespace text
+        v.validate_element("id", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("  bar  ");
+        v.validate_end_element();
+
+        // IDREF element referencing collapsed value
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("bar");
+        v.validate_end_element();
+
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        let idref_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-id.1")
+            .collect();
+        assert!(
+            idref_errors.is_empty(),
+            "Element-text ID '  bar  ' collapsed to 'bar' should match IDREF 'bar', got: {:?}",
+            idref_errors
         );
     }
 }

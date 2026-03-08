@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey};
+use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
 use crate::namespace::table::well_known;
 use crate::schema::model::{SchemaSet, XsdVersion};
 use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
@@ -422,6 +422,14 @@ impl BuiltinTypes {
         }
         if let Some(key) = datetime_stamp {
             add_to_maps(BuiltInType::DateTimeStamp, key);
+        }
+
+        // Resolve item types for built-in list types so that
+        // validate_list_type can validate each item individually.
+        for (list_key, item_key) in [(nmtokens, nmtoken), (idrefs, idref), (entities, entity)] {
+            if let Some(st) = schema_set.arenas.get_simple_type_mut(list_key) {
+                st.resolved_item_type = Some(TypeKey::Simple(item_key));
+            }
         }
 
         Self {

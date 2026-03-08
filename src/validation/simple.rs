@@ -272,8 +272,15 @@ fn validate_list_type(
         })?;
     }
 
+    // Use the list type's own code (e.g. IdRefs, NmTokens, Entities) when it
+    // has a built-in one, so that downstream consumers like collect_id_idref
+    // can distinguish list types from their item types.
+    let list_type_code = resolve_type_code(sk, schema_set)
+        .filter(|code| code.is_list())
+        .unwrap_or(item_type_code);
+
     let typed_value = XmlValue::with_schema_type(
-        item_type_code,
+        list_type_code,
         sk,
         XmlValueKind::List {
             item_type: item_type_code,
