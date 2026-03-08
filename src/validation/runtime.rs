@@ -6838,5 +6838,216 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Schema-level defaultAttributes tests (XSD 1.1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(feature = "xsd11")]
+    fn test_default_attributes_applied() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         defaultAttributes="commonAttrs">
+                <xs:attributeGroup name="commonAttrs">
+                    <xs:attribute name="lang" type="xs:string"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("lang", "", "en");
+        v.validate_end_of_attributes();
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Default attribute group attribute 'lang' should be accepted, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "xsd11")]
+    fn test_default_attributes_opt_out() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         defaultAttributes="commonAttrs">
+                <xs:attributeGroup name="commonAttrs">
+                    <xs:attribute name="lang" type="xs:string"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType defaultAttributesApply="false">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("lang", "", "en");
+        v.validate_end_of_attributes();
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // 'lang' should be rejected because the type opted out
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint.starts_with("cvc-complex-type.3")),
+            "Attribute 'lang' should be rejected when defaultAttributesApply=false, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "xsd11")]
+    fn test_default_attributes_contributes_defaults() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         defaultAttributes="commonAttrs">
+                <xs:attribute name="lang" type="xs:string" default="en"/>
+                <xs:attributeGroup name="commonAttrs">
+                    <xs:attribute ref="lang"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // get_default_attributes should include 'lang' with value "en"
+        let defaults = v.get_default_attributes();
+        assert!(
+            defaults.iter().any(|d| {
+                let name = schema_set.name_table.resolve(d.local_name);
+                name == "lang" && d.value == "en"
+            }),
+            "Default attributes should include 'lang' with value 'en', got: {:?}",
+            defaults.iter().map(|d| (schema_set.name_table.resolve(d.local_name), &d.value)).collect::<Vec<_>>()
+        );
+
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+    }
+
+    #[test]
+    #[cfg(feature = "xsd11")]
+    fn test_default_attributes_required() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         defaultAttributes="commonAttrs">
+                <xs:attributeGroup name="commonAttrs">
+                    <xs:attribute name="lang" type="xs:string" use="required"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        // Don't provide 'lang' attribute
+        v.validate_end_of_attributes();
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+            "Required attribute from default group should cause cvc-complex-type.4 error, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "xsd11")]
+    fn test_default_attributes_any_attribute() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         defaultAttributes="commonAttrs">
+                <xs:attributeGroup name="commonAttrs">
+                    <xs:anyAttribute processContents="lax"/>
+                </xs:attributeGroup>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("unknown", "", "value");
+        v.validate_end_of_attributes();
+        v.validate_element("a", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "anyAttribute in default group should allow unknown attributes, got: {:?}",
+            v.sink.errors
+        );
+    }
 }
+
 

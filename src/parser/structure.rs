@@ -639,6 +639,7 @@ pub const XSD_1_1_ATTRIBUTES: &[&str] = &[
     "notNamespace",         // on any/anyAttribute
     "notQName",             // on any/anyAttribute
     "inheritable",          // on attribute
+    "defaultAttributes",    // on schema
     "defaultAttributesApply", // on complexType
     "xpathDefaultNamespace", // on schema/type definitions
 ];
@@ -677,6 +678,7 @@ pub fn validate_xsd_version_attribute(
             ("complexType", "xpathDefaultNamespace") => true,
             ("any", "notNamespace") | ("any", "notQName") => true,
             ("anyAttribute", "notNamespace") | ("anyAttribute", "notQName") => true,
+            ("schema", "defaultAttributes") => true,
             ("schema", "xpathDefaultNamespace") => true,
             ("selector", "xpathDefaultNamespace") => true,
             ("field", "xpathDefaultNamespace") => true,
@@ -996,6 +998,18 @@ mod tests {
         let ctx = ValidationContext::new(XsdVersion::V1_0, true);
         let result = validate_xsd_version_attribute("targetNamespace", "schema", &ctx);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xsd_1_0_rejects_default_attributes_on_schema() {
+        let ctx = ValidationContext::new(XsdVersion::V1_0, true);
+        let result = validate_xsd_version_attribute("defaultAttributes", "schema", &ctx);
+        assert!(result.is_err());
+
+        // Allowed in XSD 1.1
+        let ctx11 = ValidationContext::new(XsdVersion::V1_1, true);
+        let result11 = validate_xsd_version_attribute("defaultAttributes", "schema", &ctx11);
+        assert!(result11.is_ok());
     }
 
     #[test]

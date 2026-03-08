@@ -209,16 +209,26 @@ impl<'a> ReferenceResolver<'a> {
 
     /// Format a QName for error messages
     fn format_qname(&self, qname: &QNameRef) -> String {
-        let ns = qname
-            .namespace
-            .map(|id| self.schema_set.name_table.resolve(id))
-            .unwrap_or_default();
-        let local = self.schema_set.name_table.resolve(qname.local_name);
+        format_resolved_qname(&self.schema_set.name_table, qname.namespace, qname.local_name)
+    }
+}
+
+/// Format a resolved QName (namespace + local name) for error messages.
+fn format_resolved_qname(
+    name_table: &crate::namespace::NameTable,
+    namespace: Option<crate::ids::NameId>,
+    local_name: crate::ids::NameId,
+) -> String {
+    let local = name_table.resolve(local_name);
+    if let Some(ns_id) = namespace {
+        let ns = name_table.resolve(ns_id);
         if ns.is_empty() {
             local
         } else {
             format!("{{{}}}{}", ns, local)
         }
+    } else {
+        local
     }
 }
 
@@ -315,7 +325,7 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
     }
 
     // Resolve complex type references
-    for key in complex_type_keys {
+    for &key in &complex_type_keys {
         if let Err(e) = resolve_complex_type_references(schema_set, key, &mut stats) {
             errors.push(e);
             stats.errors += 1;
@@ -349,6 +359,63 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         if let Err(e) = resolve_notation_references(schema_set, key, &mut stats) {
             errors.push(e);
             stats.errors += 1;
+        }
+    }
+
+    // Resolve schema-level defaultAttributes and inject into complex types
+    // Step A: Pre-resolve document-level default attribute groups
+    let mut doc_default_attr_groups: Vec<Option<AttributeGroupKey>> =
+        Vec::with_capacity(schema_set.documents.len());
+    for doc in &schema_set.documents {
+        if let Some(ref qname) = doc.default_attributes {
+            if let Some(key) = schema_set.lookup_attribute_group(
+                qname.namespace_uri,
+                qname.local_name,
+            ) {
+                doc_default_attr_groups.push(Some(key));
+                stats.attribute_groups_resolved += 1;
+            } else {
+                // Step B: Error for unresolvable defaultAttributes
+                let location = doc.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let name_str = format_resolved_qname(
+                    &schema_set.name_table,
+                    qname.namespace_uri,
+                    qname.local_name,
+                );
+                errors.push(SchemaError::structural(
+                    "src-resolve",
+                    format!("Attribute group '{}' not found", name_str),
+                    location,
+                ));
+                stats.errors += 1;
+                doc_default_attr_groups.push(None);
+            }
+        } else {
+            doc_default_attr_groups.push(None);
+        }
+    }
+
+    // Step C: Inject default attribute group into applicable complex types
+    for &key in &complex_type_keys {
+        let doc_id = {
+            let type_def = match schema_set.arenas.complex_types.get(key) {
+                Some(td) => td,
+                None => continue,
+            };
+            if !type_def.default_attributes_apply {
+                continue;
+            }
+            match type_def.source.as_ref() {
+                Some(src) => src.doc_id,
+                None => continue, // synthesized types have no source
+            }
+        };
+        if let Some(Some(group_key)) = doc_default_attr_groups.get(doc_id as usize) {
+            let group_key = *group_key;
+            let type_def = schema_set.arenas.complex_types.get_mut(key).unwrap();
+            if !type_def.resolved_attribute_groups.contains(&group_key) {
+                type_def.resolved_attribute_groups.push(group_key);
+            }
         }
     }
 
@@ -1395,5 +1462,105 @@ mod tests {
                 other
             ),
         }
+    }
+
+    /// Helper: set up a SchemaSet with a default attribute group and a complex type.
+    /// Returns (schema_set, complex_type_key, attribute_group_key).
+    fn setup_default_attrs_test(
+        default_attributes_apply: bool,
+    ) -> (SchemaSet, crate::ids::ComplexTypeKey, crate::ids::AttributeGroupKey) {
+        use crate::arenas::{AttributeGroupData, ComplexTypeDefData};
+        use crate::namespace::QualifiedName;
+        use crate::parser::frames::ComplexContentResult;
+        use crate::parser::location::{SourceRef, SourceSpan};
+        use crate::schema::model::{DerivationSet, SchemaDocument};
+
+        let mut schema_set = SchemaSet::new();
+
+        let group_name = schema_set.name_table.add("commonAttrs");
+        let group_data = AttributeGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+        };
+        let group_key = schema_set.arenas.alloc_attribute_group(group_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_attribute_group(group_name, group_key);
+
+        let doc_id = schema_set.documents.len() as u32;
+        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
+        doc.default_attributes = Some(QualifiedName::local(group_name));
+        schema_set.documents.push(doc);
+
+        let type_name = schema_set.name_table.add("myType");
+        let ct_data = ComplexTypeDefData {
+            name: Some(type_name),
+            target_namespace: None,
+            base_type: None,
+            derivation_method: None,
+            content: ComplexContentResult::Empty,
+            open_content: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            mixed: false,
+            is_abstract: false,
+            final_derivation: DerivationSet::empty(),
+            block: DerivationSet::empty(),
+            default_attributes_apply,
+            id: None,
+            #[cfg(feature = "xsd11")]
+            assertions: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            xpath_default_namespace: None,
+            annotation: None,
+            source: Some(SourceRef::new(doc_id, SourceSpan::new(0, 0))),
+            resolved_base_type: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            resolved_content_particle_types: Vec::new(),
+            resolved_content_particle_elements: Vec::new(),
+        };
+        let ct_key = schema_set.arenas.alloc_complex_type(ct_data);
+
+        (schema_set, ct_key, group_key)
+    }
+
+    #[test]
+    fn test_resolve_default_attributes_injects_group() {
+        let (mut schema_set, ct_key, group_key) = setup_default_attrs_test(true);
+
+        let result = resolve_all_references(&mut schema_set);
+        assert!(result.is_ok(), "Resolution should succeed: {:?}", result);
+
+        let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
+        assert!(
+            ct.resolved_attribute_groups.contains(&group_key),
+            "Default attribute group should be injected into resolved_attribute_groups"
+        );
+    }
+
+    #[test]
+    fn test_resolve_default_attributes_opt_out() {
+        let (mut schema_set, ct_key, _group_key) = setup_default_attrs_test(false);
+
+        let result = resolve_all_references(&mut schema_set);
+        assert!(result.is_ok(), "Resolution should succeed: {:?}", result);
+
+        let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
+        assert!(
+            ct.resolved_attribute_groups.is_empty(),
+            "Default attribute group should NOT be injected when defaultAttributesApply=false"
+        );
     }
 }

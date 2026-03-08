@@ -423,8 +423,9 @@ pub struct ComplexTypeDef {
     /// ID attribute value
     pub id: Option<String>,
 
-    // XSD 1.1: Default attributes apply
-    // TODO: XSD 1.1 - Implement default attributes
+    /// XSD 1.1: Whether schema-level `defaultAttributes` group applies to this type.
+    /// Defaults to `true`; set to `false` via `defaultAttributesApply="false"`.
+    /// The resolver injects the schema-level attribute group into `resolved_attribute_groups`.
     pub default_attributes_apply: bool,
 }
 
