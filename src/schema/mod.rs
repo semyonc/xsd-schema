@@ -89,3 +89,35 @@ pub use redefine::apply_redefine;
 // Re-exports from override_dir
 #[cfg(feature = "xsd11")]
 pub use override_dir::apply_override;
+
+use crate::error::SchemaResult;
+
+/// Apply all redefine and override directives collected from loaded documents.
+///
+/// This must be called after all participating schemas (including redefine/override
+/// targets) have been parsed and loaded into the schema set, but before inline
+/// assembly and reference resolution.
+pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    let redefines: Vec<_> = schema_set
+        .documents
+        .iter()
+        .flat_map(|doc| doc.redefines.iter().cloned())
+        .collect();
+    for redefine in redefines {
+        apply_redefine(schema_set, &redefine)?;
+    }
+
+    #[cfg(feature = "xsd11")]
+    {
+        let overrides: Vec<_> = schema_set
+            .documents
+            .iter()
+            .flat_map(|doc| doc.overrides.iter().cloned())
+            .collect();
+        for override_dir in overrides {
+            apply_override(schema_set, &override_dir)?;
+        }
+    }
+
+    Ok(())
+}

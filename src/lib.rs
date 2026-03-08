@@ -50,7 +50,10 @@
 //!     parse_schema_only(xml.as_bytes(), uri, &mut schema_set).expect("parse failed");
 //! }
 //!
-//! // Phase 2: Process all schemas together (inline assembly + reference resolution)
+//! // Phase 2: Process all schemas together
+//! // (redefine/override application, inline assembly, reference resolution)
+//! // Note: all participating schemas — including redefine/override targets —
+//! // must be parsed before calling this function.
 //! let (inline_stats, resolution_stats) = process_loaded_schemas(&mut schema_set)
 //!     .expect("processing failed");
 //! ```

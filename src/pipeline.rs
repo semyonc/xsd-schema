@@ -4,9 +4,10 @@
 //! all phases of schema processing:
 //!
 //! 1. **Parse Phase**: Parse the primary XSD document
-//! 2. **Directive Resolution Phase**: Process include/import/redefine directives
-//! 3. **Inline Type Assembly Phase**: Materialize inline type definitions
-//! 4. **Reference Resolution Phase**: Resolve QName references to component keys
+//! 2. **Directive Resolution Phase**: Process include/import/redefine/override directives
+//! 3. **Redefine/Override Application Phase**: Apply component replacements
+//! 4. **Inline Type Assembly Phase**: Materialize inline type definitions
+//! 5. **Reference Resolution Phase**: Resolve QName references to component keys
 //!
 //! # Usage
 //!
@@ -43,7 +44,9 @@ pub struct PipelineConfig {
     pub parser: ParserConfig,
     /// Resolver configuration for include/import handling
     pub resolver: ResolverConfig,
-    /// Whether to resolve external directives (include/import/redefine)
+    /// Whether to load external schemas via include/import/redefine/override directives.
+    /// When false, no I/O is performed and redefine/override application is deferred
+    /// (callers should use `process_loaded_schemas` after all schemas are parsed).
     pub resolve_directives: bool,
     /// Whether to assemble inline types
     pub assemble_inline_types: bool,
@@ -123,9 +126,10 @@ impl From<&ResolutionResult> for DirectiveStats {
 /// phases of schema handling:
 ///
 /// 1. **Parse**: Parse the primary XSD document
-/// 2. **Directives**: Load and parse included/imported schemas
-/// 3. **Inline Assembly**: Allocate inline type definitions in arenas
-/// 4. **Reference Resolution**: Resolve QName references to component keys
+/// 2. **Directives**: Load and parse included/imported/redefined/overridden schemas
+/// 3. **Redefine/Override**: Apply component replacements from redefine/override directives
+/// 4. **Inline Assembly**: Allocate inline type definitions in arenas
+/// 5. **Reference Resolution**: Resolve QName references to component keys
 ///
 /// # Arguments
 ///
@@ -212,6 +216,13 @@ pub fn load_and_process_schema(
         }
     }
 
+    // Phase 2.5: Apply redefine/override directives (operates on already-parsed
+    // data, no I/O). Skipped in parse-only mode because not all schemas may be
+    // loaded yet; callers use process_loaded_schemas() to apply later.
+    if config.assemble_inline_types || config.resolve_references {
+        crate::schema::apply_redefine_override(schema_set)?;
+    }
+
     // Phase 3: Assemble inline types (global operation across all documents)
     if config.assemble_inline_types {
         let inline_stats = assemble_inline_types(schema_set)?;
@@ -262,8 +273,14 @@ pub fn parse_schema_only(
 /// Process inline types and references for schemas already loaded
 ///
 /// Call this after manually loading multiple schemas to perform
-/// the inline assembly and reference resolution phases.
+/// the redefine/override application, inline assembly, and reference resolution phases.
+///
+/// **Precondition**: All participating schemas — including redefine/override targets —
+/// must have been parsed and loaded into the schema set before calling this function.
 pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
+    // Apply redefine/override directives before assembly
+    crate::schema::apply_redefine_override(schema_set)?;
+
     let inline_stats = assemble_inline_types(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
     allocate_content_particle_elements(schema_set)?;
@@ -765,6 +782,171 @@ mod tests {
         } else {
             panic!("Expected complex type");
         }
+    }
+
+    // ========================================================================
+    // Redefine / Override Integration Tests
+    // ========================================================================
+
+    #[test]
+    fn test_redefine_via_pipeline() {
+        // Base schema defines a simple type; redefining schema extends it via xs:redefine.
+        // The resolver must load the base schema, then apply_redefine replaces the type.
+        let tmp = std::env::temp_dir().join("xsd_test_redefine");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let base_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="MyString">
+        <xs:restriction base="xs:string"/>
+    </xs:simpleType>
+</xs:schema>"#;
+        let base_path = tmp.join("base.xsd");
+        std::fs::write(&base_path, base_xsd).unwrap();
+
+        let redefine_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:redefine schemaLocation="{}">
+        <xs:simpleType name="MyString">
+            <xs:restriction base="MyString">
+                <xs:maxLength value="100"/>
+            </xs:restriction>
+        </xs:simpleType>
+    </xs:redefine>
+    <xs:element name="root" type="MyString"/>
+</xs:schema>"#,
+            base_path.to_string_lossy()
+        );
+
+        let mut schema_set = SchemaSet::new();
+        let result = load_and_process_schema(
+            redefine_xsd.as_bytes(),
+            &tmp.join("redefine.xsd").to_string_lossy(),
+            &mut schema_set,
+            None,
+        );
+        assert!(result.is_ok(), "Redefine via pipeline should succeed: {:?}", result);
+
+        // Verify the redefined type is in the namespace table
+        let name = schema_set.name_table.get("MyString").unwrap();
+        let type_key = schema_set.lookup_type(None, name);
+        assert!(type_key.is_some(), "Redefined type should be registered");
+        assert!(matches!(type_key.unwrap(), TypeKey::Simple(_)));
+
+        // Verify the element resolves to the redefined type
+        let root_name = schema_set.name_table.get("root").unwrap();
+        let elem_key = schema_set.lookup_element(None, root_name).unwrap();
+        let elem = schema_set.arenas.elements.get(elem_key).unwrap();
+        assert!(elem.resolved_type.is_some(), "Element type should resolve to redefined type");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_override_via_pipeline() {
+        // Override schema replaces a type from the base schema via xs:override.
+        // The resolver must load the override target through process_override
+        // in resolve_all_directives.
+        use crate::schema::model::XsdVersion;
+
+        let tmp = std::env::temp_dir().join("xsd_test_override");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let base_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="CodeType">
+        <xs:restriction base="xs:string"/>
+    </xs:simpleType>
+</xs:schema>"#;
+        let base_path = tmp.join("base.xsd");
+        std::fs::write(&base_path, base_xsd).unwrap();
+
+        let override_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:override schemaLocation="{}">
+        <xs:simpleType name="CodeType">
+            <xs:restriction base="xs:token">
+                <xs:pattern value="[A-Z]{{3}}"/>
+            </xs:restriction>
+        </xs:simpleType>
+    </xs:override>
+    <xs:element name="code" type="CodeType"/>
+</xs:schema>"#,
+            base_path.to_string_lossy()
+        );
+
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let result = load_and_process_schema(
+            override_xsd.as_bytes(),
+            &tmp.join("override.xsd").to_string_lossy(),
+            &mut schema_set,
+            None,
+        );
+        assert!(result.is_ok(), "Override via pipeline should succeed: {:?}", result);
+
+        // Verify the overriding type replaced the original
+        let name = schema_set.name_table.get("CodeType").unwrap();
+        let type_key = schema_set.lookup_type(None, name);
+        assert!(type_key.is_some(), "Overridden type should be registered");
+
+        // Verify element resolves
+        let code_name = schema_set.name_table.get("code").unwrap();
+        let elem_key = schema_set.lookup_element(None, code_name).unwrap();
+        let elem = schema_set.arenas.elements.get(elem_key).unwrap();
+        assert!(elem.resolved_type.is_some(), "Element type should resolve to overridden type");
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_process_loaded_schemas_with_redefine() {
+        // Manually parse base + redefining schemas, then call process_loaded_schemas.
+        // This exercises the multi-schema path and its redefine precondition.
+        let base_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="BaseType">
+        <xs:sequence>
+            <xs:element name="name" type="xs:string"/>
+        </xs:sequence>
+    </xs:complexType>
+</xs:schema>"#;
+
+        let redefine_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:redefine schemaLocation="base.xsd">
+        <xs:complexType name="BaseType">
+            <xs:complexContent>
+                <xs:extension base="BaseType">
+                    <xs:sequence>
+                        <xs:element name="extra" type="xs:int"/>
+                    </xs:sequence>
+                </xs:extension>
+            </xs:complexContent>
+        </xs:complexType>
+    </xs:redefine>
+    <xs:element name="item" type="BaseType"/>
+</xs:schema>"#;
+
+        let mut schema_set = SchemaSet::new();
+
+        // Parse both schemas manually (simulating pre-loading)
+        let _base_id = parse_schema_only(base_xsd.as_bytes(), "base.xsd", &mut schema_set).unwrap();
+        let _redefine_id = parse_schema_only(redefine_xsd.as_bytes(), "redefine.xsd", &mut schema_set).unwrap();
+
+        // process_loaded_schemas applies redefine before assembly
+        let result = process_loaded_schemas(&mut schema_set);
+        assert!(result.is_ok(), "process_loaded_schemas with redefine should succeed: {:?}", result);
+
+        // Verify the redefined type is in the namespace table
+        let name = schema_set.name_table.get("BaseType").unwrap();
+        let type_key = schema_set.lookup_type(None, name);
+        assert!(type_key.is_some(), "Redefined type should be registered");
+        assert!(matches!(type_key.unwrap(), TypeKey::Complex(_)));
     }
 
 }

@@ -216,6 +216,7 @@ impl SchemaSetBuilder {
     /// 2. **Redefine/Override Application** - Apply component replacements
     /// 3. **Inline Type Assembly** - Materialize inline type definitions
     /// 4. **Reference Resolution** - Resolve QName references to component keys
+    /// 5. **Particle Allocation** - Allocate element declarations for content particles
     ///
     /// # Returns
     ///
@@ -234,13 +235,17 @@ impl SchemaSetBuilder {
         }
 
         // Phase 2: Apply redefine/override semantics
-        self.apply_redefine_override()?;
+        crate::schema::apply_redefine_override(&mut self.schema_set)?;
 
         // Phase 3: Inline type assembly
         let inline_stats = assemble_inline_types(&mut self.schema_set)?;
 
         // Phase 4: Reference resolution
         let resolution_stats = resolve_all_references(&mut self.schema_set)?;
+
+        // Phase 5: Allocate arena element declarations for content particles
+        crate::schema::allocate_content_particle_elements(&mut self.schema_set)?;
+        crate::schema::allocate_model_group_particle_elements(&mut self.schema_set)?;
 
         Ok(CompiledSchemaSet {
             schema_set: self.schema_set,
@@ -277,42 +282,6 @@ impl SchemaSetBuilder {
         Ok(())
     }
 
-    /// Apply redefine and override directives to the schema set.
-    fn apply_redefine_override(&mut self) -> SchemaResult<()> {
-        use crate::schema::redefine::apply_redefine;
-
-        // Collect all redefine directives
-        let redefines: Vec<_> = self
-            .schema_set
-            .documents
-            .iter()
-            .flat_map(|doc| doc.redefines.iter().cloned())
-            .collect();
-
-        // Apply redefines
-        for redefine in redefines {
-            apply_redefine(&mut self.schema_set, &redefine)?;
-        }
-
-        // Apply overrides (XSD 1.1 only)
-        #[cfg(feature = "xsd11")]
-        {
-            use crate::schema::override_dir::apply_override;
-
-            let overrides: Vec<_> = self
-                .schema_set
-                .documents
-                .iter()
-                .flat_map(|doc| doc.overrides.iter().cloned())
-                .collect();
-
-            for override_dir in overrides {
-                apply_override(&mut self.schema_set, &override_dir)?;
-            }
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for SchemaSetBuilder {

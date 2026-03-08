@@ -519,14 +519,22 @@ impl SchemaResolver {
         base_uri: &str,
         schema_set: &mut SchemaSet,
     ) -> SchemaResult<Option<DocumentId>> {
-        // Load the schema first
-        let doc_id = self.load_schema(schema_location, base_uri, schema_set)?;
+        // Loading is sufficient here; apply_redefine handles component
+        // replacement later, after all schemas are loaded.
+        self.load_schema(schema_location, base_uri, schema_set)
+    }
 
-        // TODO: Apply redefinitions to the loaded schema
-        // This requires tracking which components are being redefined
-        // and replacing them with the new definitions
-
-        Ok(doc_id)
+    /// Process an override directive (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    pub fn process_override(
+        &mut self,
+        schema_location: &str,
+        base_uri: &str,
+        schema_set: &mut SchemaSet,
+    ) -> SchemaResult<Option<DocumentId>> {
+        // Loading is sufficient here; apply_override handles component
+        // replacement later, after all schemas are loaded.
+        self.load_schema(schema_location, base_uri, schema_set)
     }
 }
 
@@ -658,6 +666,8 @@ pub fn resolve_all_directives(
     let includes: Vec<_> = doc.includes.to_vec();
     let imports: Vec<_> = doc.imports.to_vec();
     let redefines: Vec<_> = doc.redefines.to_vec();
+    #[cfg(feature = "xsd11")]
+    let overrides: Vec<_> = doc.overrides.to_vec();
 
     // Process includes
     for include in includes {
@@ -696,6 +706,20 @@ pub fn resolve_all_directives(
         match resolver.process_redefine(&redefine.schema_location, &base_uri, schema_set) {
             Ok(Some(id)) => result.loaded.push(id),
             Ok(None) => result.skipped.push(redefine.schema_location.clone()),
+            Err(e) => result.errors.push(e),
+        }
+    }
+
+    // Process overrides (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    for override_dir in overrides {
+        match resolver.process_override(
+            &override_dir.schema_location,
+            &base_uri,
+            schema_set,
+        ) {
+            Ok(Some(id)) => result.loaded.push(id),
+            Ok(None) => result.skipped.push(override_dir.schema_location.clone()),
             Err(e) => result.errors.push(e),
         }
     }
