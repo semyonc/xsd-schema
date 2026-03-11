@@ -411,9 +411,10 @@ impl<'a> CompileContext<'a> {
     /// Compile an all-group's particles into an `AllGroupModel`.
     ///
     /// Each particle is resolved to an `AllParticle` with its `NfaTerm`,
-    /// min/max occurs, and source location. Only element and wildcard
-    /// particles are supported; group references inside all-groups are
-    /// rejected (XSD 1.0 forbids them; XSD 1.1 named-group support deferred).
+    /// min/max occurs, and source location. Element and wildcard particles
+    /// are supported directly. In XSD 1.1, group references inside all-groups
+    /// are flattened per cos-all-limited constraints (the referenced group must
+    /// be an all-group with minOccurs=maxOccurs=1). XSD 1.0 rejects group refs.
     fn compile_all_group_model(
         &mut self,
         particles: &[ParticleResult],
@@ -443,9 +444,39 @@ impl<'a> CompileContext<'a> {
                     let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
                     NfaTerm::wildcard_with_not_qnames(ns, pc, not_qnames)
                 }
+                #[cfg(feature = "xsd11")]
+                ParticleTerm::Group(group) => {
+                    // XSD 1.0 forbids group refs inside xs:all even in an xsd11 build
+                    if self.schema_set.xsd_version != XsdVersion::V1_1 {
+                        return Err(NfaCompileError::invalid_all_group(
+                            particle.source.clone().or_else(|| source.cloned()),
+                        ));
+                    }
+                    // cos-all-limited 1.3: minOccurs = maxOccurs = 1
+                    if particle.min_occurs != 1 || particle.max_occurs != Some(1) {
+                        return Err(NfaCompileError::InvalidAllGroupOccurs {
+                            reason: "cos-all-limited.1.3: group reference inside xs:all \
+                                     must have minOccurs = maxOccurs = 1"
+                                .into(),
+                            location: particle.source.clone().or_else(|| source.cloned()),
+                        });
+                    }
+                    // Must be a group reference, not an inline group.
+                    if group.ref_name.is_none() {
+                        return Err(NfaCompileError::invalid_all_group(
+                            particle.source.clone().or_else(|| source.cloned()),
+                        ));
+                    }
+                    // Flatten: resolve group ref, verify compositor, inline particles
+                    self.flatten_all_group_ref_into(
+                        group,
+                        particle.source.as_ref().or(source),
+                        &mut all_particles,
+                    )?;
+                    continue; // particles already added, skip the push below
+                }
+                #[cfg(not(feature = "xsd11"))]
                 ParticleTerm::Group(_) => {
-                    // Group references inside all-groups are not yet supported.
-                    // XSD 1.0 forbids them; XSD 1.1 support is deferred.
                     return Err(NfaCompileError::invalid_all_group(source.cloned()));
                 }
             };
@@ -461,6 +492,151 @@ impl<'a> CompileContext<'a> {
 
         self.current_sibling_elements = saved_siblings;
         Ok(AllGroupModel::new(all_particles))
+    }
+
+    /// Flatten a group reference inside an xs:all group into the parent's
+    /// `all_particles` vector.
+    ///
+    /// **Preconditions** (checked by caller):
+    /// - `group.ref_name` is `Some` (this is a group reference, not inline)
+    /// - The containing particle has `minOccurs = maxOccurs = 1`
+    ///
+    /// This method resolves the group ref, verifies the referenced group's
+    /// compositor is `All` (cos-all-limited rule 2), then recursively compiles
+    /// each inner particle into the parent's `all_particles`.
+    #[cfg(feature = "xsd11")]
+    fn flatten_all_group_ref_into(
+        &mut self,
+        group: &ModelGroupDefResult,
+        source: Option<&SourceRef>,
+        all_particles: &mut Vec<AllParticle>,
+    ) -> NfaCompileResult<()> {
+        // Recursion guard
+        self.check_recursion(source)?;
+        self.depth += 1;
+
+        let ref_name = group.ref_name.as_ref().expect("caller checked ref_name is Some");
+
+        // Resolve the group ref
+        let group_key = self
+            .schema_set
+            .lookup_model_group(ref_name.namespace, ref_name.local_name)
+            .ok_or_else(|| {
+                let name = format!(
+                    "{}:{}",
+                    ref_name
+                        .namespace
+                        .map(|n| format!("{:?}", n))
+                        .unwrap_or_default(),
+                    ref_name.local_name.0
+                );
+                NfaCompileError::unresolved_group(name, source.cloned())
+            })?;
+
+        let group_data = self
+            .schema_set
+            .arenas
+            .get_model_group(group_key)
+            .ok_or_else(|| {
+                NfaCompileError::unresolved_group(
+                    format!("group key {:?}", group_key),
+                    source.cloned(),
+                )
+            })?;
+
+        // cos-all-limited rule 2: compositor must be All
+        let compositor = group_data.compositor.unwrap_or(Compositor::Sequence);
+        if compositor != Compositor::All {
+            self.depth -= 1;
+            return Err(NfaCompileError::InvalidAllGroupContent {
+                location: source.cloned(),
+            });
+        }
+
+        // Save context and set up flat indexing for the referenced group
+        let saved_flat_idx = self.content_flat_idx.take();
+        let saved_particle_elements = std::mem::take(&mut self.resolved_particle_elements);
+        let saved_types = std::mem::take(&mut self.resolved_particle_types);
+        let saved_idx = self.current_particle_idx;
+
+        self.resolved_particle_types = group_data.resolved_particle_types.clone();
+        self.resolved_particle_elements = group_data.resolved_particle_elements.clone();
+        self.content_flat_idx = Some(0);
+
+        // Compile each inner particle
+        let result = self.flatten_all_group_particles(
+            &group_data.particles,
+            source,
+            all_particles,
+        );
+
+        // Restore context
+        self.content_flat_idx = saved_flat_idx;
+        self.resolved_particle_elements = saved_particle_elements;
+        self.resolved_particle_types = saved_types;
+        self.current_particle_idx = saved_idx;
+        self.depth -= 1;
+
+        result
+    }
+
+    /// Compile inner particles of a referenced all-group into the parent's
+    /// `all_particles` vector. Called by `flatten_all_group_ref_into`.
+    #[cfg(feature = "xsd11")]
+    fn flatten_all_group_particles(
+        &mut self,
+        particles: &[ParticleResult],
+        source: Option<&SourceRef>,
+        all_particles: &mut Vec<AllParticle>,
+    ) -> NfaCompileResult<()> {
+        for particle in particles {
+            let term = match &particle.term {
+                ParticleTerm::Element(elem) => {
+                    self.build_element_term(elem, particle.source.as_ref().or(source))?
+                }
+                ParticleTerm::Any(wildcard) => {
+                    let mut ns = self.convert_wildcard_namespace(&wildcard.namespace);
+                    let pc = self.convert_process_contents(wildcard.process_contents);
+                    if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
+                        ns = not_ns;
+                    }
+                    let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
+                    NfaTerm::wildcard_with_not_qnames(ns, pc, not_qnames)
+                }
+                ParticleTerm::Group(inner_group) => {
+                    // Nested group ref inside the referenced all-group — recurse
+                    // cos-all-limited 1.3: minOccurs = maxOccurs = 1
+                    if particle.min_occurs != 1 || particle.max_occurs != Some(1) {
+                        return Err(NfaCompileError::InvalidAllGroupOccurs {
+                            reason: "cos-all-limited.1.3: group reference inside xs:all \
+                                     must have minOccurs = maxOccurs = 1"
+                                .into(),
+                            location: particle.source.clone().or_else(|| source.cloned()),
+                        });
+                    }
+                    if inner_group.ref_name.is_none() {
+                        return Err(NfaCompileError::invalid_all_group(
+                            particle.source.clone().or_else(|| source.cloned()),
+                        ));
+                    }
+                    self.flatten_all_group_ref_into(
+                        inner_group,
+                        particle.source.as_ref().or(source),
+                        all_particles,
+                    )?;
+                    continue;
+                }
+            };
+
+            let max_occurs = MaxOccurs::from_option(particle.max_occurs);
+            all_particles.push(AllParticle::new(
+                term,
+                particle.min_occurs,
+                max_occurs,
+                particle.source.clone().or_else(|| source.cloned()),
+            ));
+        }
+        Ok(())
     }
 
     /// Compile a group reference
@@ -612,27 +788,56 @@ impl<'a> CompileContext<'a> {
 
     /// Collect sibling element QNames from a particle list, using proper
     /// namespace resolution (element refs, form attribute, elementFormDefault).
-    /// Used for ##definedSibling expansion.
+    /// Used for ##definedSibling expansion. Recurses into group refs to
+    /// include elements from referenced groups.
     fn collect_sibling_element_qnames(&self, particles: &[ParticleResult]) -> Vec<(Option<NameId>, NameId)> {
-        particles.iter()
-            .filter_map(|p| {
-                if let ParticleTerm::Element(elem) = &p.term {
+        self.collect_sibling_element_qnames_inner(particles, 0)
+    }
+
+    fn collect_sibling_element_qnames_inner(
+        &self,
+        particles: &[ParticleResult],
+        depth: usize,
+    ) -> Vec<(Option<NameId>, NameId)> {
+        // Defense-in-depth: bail on unreasonably deep nesting
+        if depth >= MAX_RECURSION_DEPTH {
+            return Vec::new();
+        }
+        let mut result = Vec::new();
+        for p in particles {
+            match &p.term {
+                ParticleTerm::Element(elem) => {
                     if let Some(ref_name) = &elem.ref_name {
                         // Element reference — use the ref's resolved QName
-                        Some((ref_name.namespace, ref_name.local_name))
+                        result.push((ref_name.namespace, ref_name.local_name));
                     } else if let Some(name) = elem.name {
                         // Local element — resolve namespace through form/elementFormDefault
                         let source = p.source.as_ref().or(elem.source.as_ref());
                         let ns = self.effective_element_namespace(elem, source);
-                        Some((ns, name))
-                    } else {
-                        None
+                        result.push((ns, name));
                     }
-                } else {
-                    None
                 }
-            })
-            .collect()
+                ParticleTerm::Group(group) => {
+                    if let Some(ref_name) = &group.ref_name {
+                        if let Some(key) = self.schema_set.lookup_model_group(
+                            ref_name.namespace,
+                            ref_name.local_name,
+                        ) {
+                            if let Some(data) = self.schema_set.arenas.get_model_group(key) {
+                                result.extend(
+                                    self.collect_sibling_element_qnames_inner(
+                                        &data.particles,
+                                        depth + 1,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+                ParticleTerm::Any(_) => {}
+            }
+        }
+        result
     }
 }
 
@@ -2386,5 +2591,525 @@ mod tests {
             }
             _ => panic!("expected AllGroup"),
         }
+    }
+
+    // ========================================================================
+    // Group refs inside xs:all — cos-all-limited flattening tests
+    // ========================================================================
+
+    /// Helper: register a named model group in the schema and return its key.
+    /// The group is stored in arenas and registered in namespace lookup.
+    fn register_model_group(
+        schema_set: &mut SchemaSet,
+        name: NameId,
+        ns: Option<NameId>,
+        compositor: Compositor,
+        particles: Vec<ParticleResult>,
+    ) -> crate::ids::ModelGroupKey {
+        let data = ModelGroupData {
+            name: Some(name),
+            target_namespace: ns,
+            ref_name: None,
+            compositor: Some(compositor),
+            particles,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: vec![],
+            resolved_particle_types: vec![],
+            resolved_particle_elements: vec![],
+        };
+        let key = schema_set.arenas.alloc_model_group(data);
+        schema_set
+            .namespaces
+            .entry(ns)
+            .or_default()
+            .model_groups
+            .insert(name, key);
+        key
+    }
+
+    /// Helper: make a group reference particle (xs:group ref="...").
+    fn make_group_ref_particle(
+        ref_ns: Option<NameId>,
+        ref_local: NameId,
+        min: u32,
+        max: Option<u32>,
+    ) -> ParticleResult {
+        ParticleResult {
+            term: ParticleTerm::Group(ModelGroupDefResult {
+                name: None,
+                ref_name: Some(QNameRef {
+                    prefix: None,
+                    local_name: ref_local,
+                    namespace: ref_ns,
+                }),
+                compositor: None,
+                particles: vec![],
+                min_occurs: 1,
+                max_occurs: Some(1),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: min,
+            max_occurs: max,
+            source: None,
+        }
+    }
+
+    /// Helper: make an inline all-group particle with a group ref inside it,
+    /// suitable for use as a complex type's top-level particle.
+    #[cfg(feature = "xsd11")]
+    fn make_all_with_group_ref(
+        direct_particles: Vec<ParticleResult>,
+        group_ref_particles: Vec<ParticleResult>,
+    ) -> ParticleResult {
+        let mut all_children = direct_particles;
+        all_children.extend(group_ref_particles);
+        make_all_particle(all_children)
+    }
+
+    /// Helper: build a complex type def with an all-group particle and compile it.
+    #[cfg(feature = "xsd11")]
+    fn compile_all_type(
+        schema_set: &SchemaSet,
+        all_particle: ParticleResult,
+    ) -> NfaCompileResult<ContentModelMatcher> {
+        use crate::parser::frames::ComplexContentDefResult;
+        let content = ComplexContentResult::Complex(ComplexContentDefResult {
+            particle: Some(all_particle),
+            derivation: DerivationMethod::Restriction,
+            mixed: false,
+            base_type: None,
+            open_content: None,
+            attributes: vec![],
+            attribute_groups: vec![],
+            attribute_wildcard: None,
+            assertions: vec![],
+            id: None,
+            derivation_id: None,
+            source: None,
+        });
+        let type_def = make_complex_type_with_content(content);
+        compile_content_model_matcher(schema_set, &type_def)
+    }
+
+    // --- Valid schemas (XSD 1.1) ---
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_to_all_inside_all() {
+        // Test 1: G = all(a, b), parent all(group-ref-G, c) → flattened to all(a, b, c)
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let b = schema_set.name_table.add("b");
+        let c = schema_set.name_table.add("c");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![
+                make_element_particle(a, 1, Some(1)),
+                make_element_particle(b, 1, Some(1)),
+            ],
+        );
+
+        let all_particle = make_all_with_group_ref(
+            vec![make_element_particle(c, 1, Some(1))],
+            vec![make_group_ref_particle(None, g_name, 1, Some(1))],
+        );
+
+        let matcher = compile_all_type(&schema_set, all_particle).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 3, "should flatten to 3 particles: a, b, c");
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_nested_group_refs_in_all() {
+        // Test 2: G2 = all(b, c), G1 = all(a, group-ref-G2), parent all(group-ref-G1, d)
+        // → flattened to all(a, b, c, d)
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let b = schema_set.name_table.add("b");
+        let c = schema_set.name_table.add("c");
+        let d = schema_set.name_table.add("d");
+        let g1_name = schema_set.name_table.add("G1");
+        let g2_name = schema_set.name_table.add("G2");
+
+        register_model_group(
+            &mut schema_set,
+            g2_name,
+            None,
+            Compositor::All,
+            vec![
+                make_element_particle(b, 1, Some(1)),
+                make_element_particle(c, 1, Some(1)),
+            ],
+        );
+
+        register_model_group(
+            &mut schema_set,
+            g1_name,
+            None,
+            Compositor::All,
+            vec![
+                make_element_particle(a, 1, Some(1)),
+                make_group_ref_particle(None, g2_name, 1, Some(1)),
+            ],
+        );
+
+        let all_particle = make_all_with_group_ref(
+            vec![make_element_particle(d, 1, Some(1))],
+            vec![make_group_ref_particle(None, g1_name, 1, Some(1))],
+        );
+
+        let matcher = compile_all_type(&schema_set, all_particle).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 4, "should flatten to 4 particles: a, b, c, d");
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_with_optional_inner_particles() {
+        // Test 3: G = all(a[1..1], b[0..1]), parent all(group-ref-G, c)
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let b = schema_set.name_table.add("b");
+        let c = schema_set.name_table.add("c");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![
+                make_element_particle(a, 1, Some(1)),
+                make_element_particle(b, 0, Some(1)), // optional
+            ],
+        );
+
+        let all_particle = make_all_with_group_ref(
+            vec![make_element_particle(c, 1, Some(1))],
+            vec![make_group_ref_particle(None, g_name, 1, Some(1))],
+        );
+
+        let matcher = compile_all_type(&schema_set, all_particle).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 3);
+                // Check that inner particle b kept its optional nature
+                let optional_count = model.particles.iter().filter(|p| p.is_optional()).count();
+                assert_eq!(optional_count, 1, "b should remain optional after flattening");
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_alongside_wildcard() {
+        // Test 4: all(group-ref-G, xs:any)
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        let wildcard_particle = ParticleResult {
+            term: ParticleTerm::Any(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: Vec::new(),
+                not_qname: Vec::new(),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 0,
+            max_occurs: Some(1),
+            source: None,
+        };
+
+        let all_particle = make_all_with_group_ref(
+            vec![wildcard_particle],
+            vec![make_group_ref_particle(None, g_name, 1, Some(1))],
+        );
+
+        let matcher = compile_all_type(&schema_set, all_particle).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                assert_eq!(model.particle_count(), 2, "wildcard + flattened element a");
+                // One should be element, one should be wildcard
+                let has_wildcard = model.particles.iter().any(|p| {
+                    matches!(p.term, NfaTerm::Wildcard { .. })
+                });
+                let has_element = model.particles.iter().any(|p| {
+                    matches!(p.term, NfaTerm::Element { .. })
+                });
+                assert!(has_wildcard, "should have wildcard particle");
+                assert!(has_element, "should have element particle from group ref");
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_defined_sibling_includes_group_ref_elements() {
+        // Test 7: ##definedSibling wildcard excludes elements from group refs
+        use NotQNameItem;
+
+        let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
+        let a = schema_set.name_table.add("a");
+        let b = schema_set.name_table.add("b");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![make_element_particle(b, 1, Some(1))],
+        );
+
+        let wildcard_particle = ParticleResult {
+            term: ParticleTerm::Any(WildcardResult {
+                namespace: WildcardNamespace::Any,
+                process_contents: ProcessContents::Lax,
+                not_namespace: Vec::new(),
+                not_qname: vec![NotQNameItem::DefinedSibling],
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 0,
+            max_occurs: Some(1),
+            source: None,
+        };
+
+        let all_particle = make_all_with_group_ref(
+            vec![
+                make_element_particle(a, 1, Some(1)),
+                wildcard_particle,
+            ],
+            vec![make_group_ref_particle(None, g_name, 1, Some(1))],
+        );
+
+        let matcher = compile_all_type(&schema_set, all_particle).unwrap();
+        match &matcher {
+            ContentModelMatcher::AllGroup(model) => {
+                // Find the wildcard particle and verify not_qnames
+                let wc = model.particles.iter().find(|p| {
+                    matches!(p.term, NfaTerm::Wildcard { .. })
+                }).expect("should have wildcard particle");
+                if let NfaTerm::Wildcard { not_qnames, .. } = &wc.term {
+                    assert!(
+                        not_qnames.contains(&(None, a)),
+                        "##definedSibling should exclude element 'a'"
+                    );
+                    assert!(
+                        not_qnames.contains(&(None, b)),
+                        "##definedSibling should exclude element 'b' from group ref"
+                    );
+                }
+            }
+            other => panic!("expected AllGroup, got {:?}", other),
+        }
+    }
+
+    // --- Invalid schemas (compile errors) ---
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_in_all_min_occurs_zero_error() {
+        // Test 8: Group ref with minOccurs=0 → cos-all-limited.1.3 error
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        let all_particle = make_all_particle(vec![
+            make_group_ref_particle(None, g_name, 0, Some(1)), // minOccurs=0 — invalid
+        ]);
+
+        let result = compile_all_type(&schema_set, all_particle);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupOccurs { .. })),
+            "minOccurs=0 should produce InvalidAllGroupOccurs error"
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_in_all_max_occurs_two_error() {
+        // Test 9: Group ref with maxOccurs=2 → cos-all-limited.1.3 error
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        let all_particle = make_all_particle(vec![
+            make_group_ref_particle(None, g_name, 1, Some(2)), // maxOccurs=2 — invalid
+        ]);
+
+        let result = compile_all_type(&schema_set, all_particle);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupOccurs { .. })),
+            "maxOccurs=2 should produce InvalidAllGroupOccurs error"
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_to_sequence_in_all_error() {
+        // Test 10: Group ref to sequence → cos-all-limited.2 error
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::Sequence, // not All — invalid
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        let all_particle = make_all_particle(vec![
+            make_group_ref_particle(None, g_name, 1, Some(1)),
+        ]);
+
+        let result = compile_all_type(&schema_set, all_particle);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupContent { .. })),
+            "sequence group ref should produce InvalidAllGroupContent error"
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_group_ref_to_choice_in_all_error() {
+        // Test 11: Group ref to choice → cos-all-limited.2 error
+        let mut schema_set = SchemaSet::xsd11();
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::Choice, // not All — invalid
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        let all_particle = make_all_particle(vec![
+            make_group_ref_particle(None, g_name, 1, Some(1)),
+        ]);
+
+        let result = compile_all_type(&schema_set, all_particle);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupContent { .. })),
+            "choice group ref should produce InvalidAllGroupContent error"
+        );
+    }
+
+    #[test]
+    fn test_group_ref_in_all_xsd10_error() {
+        // Test 12: XSD 1.0 schema set with group ref in all → InvalidAllGroupContent error
+        // SchemaSet::new() creates XSD 1.0 — must reject group refs regardless of
+        // whether the crate is built with the xsd11 feature.
+        let mut schema_set = SchemaSet::new(); // XSD 1.0
+        let a = schema_set.name_table.add("a");
+        let g_name = schema_set.name_table.add("G");
+
+        register_model_group(
+            &mut schema_set,
+            g_name,
+            None,
+            Compositor::All,
+            vec![make_element_particle(a, 1, Some(1))],
+        );
+
+        // Directly test compile_all_group_model with a group ref particle
+        let particles = vec![make_group_ref_particle(None, g_name, 1, Some(1))];
+        let mut ctx = CompileContext::new(&schema_set, None);
+        ctx.content_flat_idx = Some(0);
+
+        let result = ctx.compile_all_group_model(&particles, None);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupContent { .. })),
+            "XSD 1.0 schema should reject group refs in xs:all even in xsd11 build"
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_inline_group_in_all_error() {
+        // Test 13: Inline group (no ref_name) inside xs:all → InvalidAllGroupContent error
+        let schema_set = SchemaSet::xsd11();
+
+        // Create an inline group particle (compositor=All but no ref_name)
+        let inline_group = ParticleResult {
+            term: ParticleTerm::Group(ModelGroupDefResult {
+                name: None,
+                ref_name: None, // inline, not a reference
+                compositor: Some(Compositor::All),
+                particles: vec![make_element_particle(NameId(1), 1, Some(1))],
+                min_occurs: 1,
+                max_occurs: Some(1),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        };
+
+        let particles = vec![inline_group];
+        let mut ctx = CompileContext::new(&schema_set, None);
+        ctx.content_flat_idx = Some(0);
+        let result = ctx.compile_all_group_model(&particles, None);
+        assert!(
+            matches!(result, Err(NfaCompileError::InvalidAllGroupContent { .. })),
+            "inline group (no ref_name) should be rejected"
+        );
     }
 }

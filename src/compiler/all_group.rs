@@ -222,8 +222,14 @@ impl AllGroupState {
 /// - minOccurs must be 0 or 1
 /// - maxOccurs must be exactly 1
 ///
-/// XSD 1.1 relaxes these constraints to allow wildcards, group references,
-/// and arbitrary occurrence values.
+/// XSD 1.1 relaxes these constraints to allow wildcards and arbitrary
+/// occurrence values. Group references are allowed but must satisfy
+/// cos-all-limited constraints:
+/// - **Rule 1.3**: minOccurs = maxOccurs = 1
+/// - **Rule 2**: referenced group must have compositor = all
+///   (compositor check requires schema resolution, so only the occurrence
+///   constraint is validated here; compositor is checked during compilation)
+/// - Must be a group reference (`ref_name` set), not an inline group
 pub fn validate_all_group_constraints(
     particles: &[ParticleResult],
     xsd_version: XsdVersion,
@@ -231,8 +237,35 @@ pub fn validate_all_group_constraints(
 ) -> NfaCompileResult<()> {
     match xsd_version {
         XsdVersion::V1_0 => validate_all_group_xsd10(particles, source),
-        XsdVersion::V1_1 => Ok(()), // XSD 1.1 allows everything
+        XsdVersion::V1_1 => validate_all_group_xsd11(particles, source),
     }
+}
+
+/// Validate XSD 1.1 all-group constraints (cos-all-limited)
+fn validate_all_group_xsd11(
+    particles: &[ParticleResult],
+    source: Option<SourceRef>,
+) -> NfaCompileResult<()> {
+    for particle in particles {
+        if let ParticleTerm::Group(group) = &particle.term {
+            // cos-all-limited 1.3: group ref must have minOccurs = maxOccurs = 1
+            if particle.min_occurs != 1 || particle.max_occurs != Some(1) {
+                return Err(NfaCompileError::InvalidAllGroupOccurs {
+                    reason: "cos-all-limited.1.3: group reference inside xs:all \
+                             must have minOccurs = maxOccurs = 1"
+                        .into(),
+                    location: particle.source.clone().or(source.clone()),
+                });
+            }
+            // Must be a group reference, not an inline group
+            if group.ref_name.is_none() {
+                return Err(NfaCompileError::InvalidAllGroupContent {
+                    location: particle.source.clone().or(source.clone()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate XSD 1.0 all-group constraints
