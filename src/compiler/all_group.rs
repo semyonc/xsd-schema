@@ -237,11 +237,15 @@ pub fn validate_all_group_constraints(
 ) -> NfaCompileResult<()> {
     match xsd_version {
         XsdVersion::V1_0 => validate_all_group_xsd10(particles, source),
+        #[cfg(feature = "xsd11")]
         XsdVersion::V1_1 => validate_all_group_xsd11(particles, source),
+        #[cfg(not(feature = "xsd11"))]
+        XsdVersion::V1_1 => validate_all_group_xsd10(particles, source),
     }
 }
 
 /// Validate XSD 1.1 all-group constraints (cos-all-limited)
+#[cfg(feature = "xsd11")]
 fn validate_all_group_xsd11(
     particles: &[ParticleResult],
     source: Option<SourceRef>,
