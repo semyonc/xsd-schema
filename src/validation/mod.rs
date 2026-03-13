@@ -29,9 +29,11 @@ pub use errors::{
 
 pub use info::{
     SchemaInfo, SchemaValidity, ContentType, NodeIdentity,
-    ValidationFlags, ContentProcessing,
+    ValidationFlags, ContentProcessing, TypeSource,
     ExpectedElement, ExpectedAttribute, DefaultAttribute,
 };
+#[cfg(feature = "xsd11")]
+pub use info::AssertionOutcome;
 
 pub use content::{ContentValidatorState, ElementMatchInfo};
 

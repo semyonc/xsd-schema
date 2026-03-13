@@ -29,8 +29,10 @@ use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
-    SchemaInfo, SchemaValidity, ValidationFlags,
+    SchemaInfo, SchemaValidity, TypeSource, ValidationFlags,
 };
+#[cfg(feature = "xsd11")]
+use super::info::AssertionOutcome;
 
 #[cfg(feature = "xsd11")]
 use super::assertions::{
@@ -663,10 +665,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(mut type_key) = matched_type {
                     // PATH B1: xsi:type override for local elements with resolved type
+                    let mut b1_type_source = TypeSource::Declaration;
                     if let Some(xsi_type_str) = xsi_type {
                         match self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 type_key = overridden;
+                                b1_type_source = TypeSource::XsiType;
                             }
                             XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
                                 ev_state.validity = SchemaValidity::Invalid;
@@ -677,6 +681,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Local element with resolved type — initialize content model
                     let (content_state, content_type) = self.init_content_model(Some(type_key));
                     ev_state.schema_type = Some(type_key);
+                    ev_state.type_source = Some(b1_type_source);
                     ev_state.content_state = content_state;
                     ev_state.content_type = Some(content_type);
                 } else {
@@ -689,6 +694,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 let (content_state, content_type) =
                                     self.init_content_model(Some(overridden));
                                 ev_state.schema_type = Some(overridden);
+                                ev_state.type_source = Some(TypeSource::XsiType);
                                 ev_state.content_state = content_state;
                                 ev_state.content_type = Some(content_type);
                             }
@@ -727,6 +733,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let schema_type = ev_state.schema_type;
                 let content_type = ev_state.content_type;
                 let validity = ev_state.validity;
+                let type_source = ev_state.type_source;
                 self.push_element(ev_state);
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
@@ -742,6 +749,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     content_type,
                     typed_value: None,
                     deferred_by_cta: false,
+                    type_source,
+                    #[cfg(feature = "xsd11")]
+                    cta_selected: false,
+                    #[cfg(feature = "xsd11")]
+                    assertion_outcome: None,
                 };
             }
 
@@ -812,10 +824,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 6. xsi:type override
         let mut xsi_type_invalid = false;
+        let mut type_source = TypeSource::Declaration;
         if let Some(xsi_type_str) = xsi_type {
             match self.resolve_xsi_type(xsi_type_str, type_key, ns_context) {
                 XsiTypeOutcome::Applied(overridden) => {
                     type_key = Some(overridden);
+                    type_source = TypeSource::XsiType;
                 }
                 XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
                     // Error already reported; keep declared type, mark invalid
@@ -852,6 +866,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut ev_state = ElementValidationState::new(local_name, namespace);
         ev_state.element_decl = Some(elem_key);
         ev_state.schema_type = type_key;
+        ev_state.type_source = Some(type_source);
         ev_state.content_state = content_state;
         ev_state.content_type = Some(content_type);
         ev_state.is_nil = is_nil;
@@ -890,6 +905,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             content_type: Some(content_type),
             typed_value: None,
             deferred_by_cta: false,
+            type_source: Some(type_source),
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome: None,
         }
     }
 
@@ -1053,9 +1073,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .is_some_and(|s| s.has_type_alternatives);
 
         #[cfg(feature = "xsd11")]
-        let (schema_type, cta_switched) = if has_type_alternatives {
+        let (schema_type, cta_switched, cta_selected) = if has_type_alternatives {
             let mut st = schema_type;
             let mut switched = false;
+            let mut selected = false;
             if let Some(ev_state) = self.validation_stack.last() {
                 if let Some(elem_key) = ev_state.element_decl {
                     let new_type = super::alternatives::evaluate_type_alternatives(
@@ -1066,6 +1087,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         self.schema_set,
                     );
                     if let Some(new_type_key) = new_type {
+                        selected = true;
                         if Some(new_type_key) != st {
                             let (content_state, content_type) =
                                 self.init_content_model(Some(new_type_key));
@@ -1080,9 +1102,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                 }
             }
-            (st, switched)
+            // Track CTA selection on ev_state regardless of type change.
+            // Preserve XsiType as the governing source when xsi:type was
+            // applied — per spec xsi:type takes precedence over CTA.
+            if selected {
+                if let Some(ev) = self.validation_stack.last_mut() {
+                    ev.cta_selected = true;
+                    if ev.type_source != Some(TypeSource::XsiType) {
+                        ev.type_source = Some(TypeSource::TypeAlternative);
+                    }
+                }
+            }
+            (st, switched, selected)
         } else {
-            (schema_type, false)
+            (schema_type, false, false)
         };
 
         #[cfg(not(feature = "xsd11"))]
@@ -1122,8 +1155,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         self.current_state = ValidatorState::EndOfAttributes;
 
-        // When CTA switched the type, return updated SchemaInfo so callers
-        // (e.g. typed_builder) can update element bindings. Preserve prior
+        // When CTA switched the type or selected a type, return updated SchemaInfo
+        // so callers (e.g. typed_builder) can update element bindings. Preserve prior
         // invalidity (e.g. from a bad xsi:type).
         if cta_switched {
             let ev = self.validation_stack.last();
@@ -1131,15 +1164,36 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let validity = ev
                 .map(|s| s.validity)
                 .unwrap_or(SchemaValidity::NotKnown);
-            SchemaInfo {
+            return SchemaInfo {
                 schema_type,
                 content_type,
                 validity,
+                type_source: ev.and_then(|s| s.type_source),
+                #[cfg(feature = "xsd11")]
+                cta_selected: ev.map(|s| s.cta_selected).unwrap_or(false),
+                #[cfg(feature = "xsd11")]
+                assertion_outcome: None,
                 ..SchemaInfo::empty()
-            }
-        } else {
-            SchemaInfo::empty()
+            };
         }
+        #[cfg(feature = "xsd11")]
+        if cta_selected {
+            let ev = self.validation_stack.last();
+            let content_type = ev.and_then(|s| s.content_type);
+            let validity = ev
+                .map(|s| s.validity)
+                .unwrap_or(SchemaValidity::NotKnown);
+            return SchemaInfo {
+                schema_type,
+                content_type,
+                validity,
+                type_source: ev.and_then(|s| s.type_source),
+                cta_selected: true,
+                assertion_outcome: None,
+                ..SchemaInfo::empty()
+            };
+        }
+        SchemaInfo::empty()
     }
 
     /// Validate a text content event
@@ -1383,6 +1437,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 2b. Assertion evaluation hook (XSD 1.1)
         #[cfg(feature = "xsd11")]
+        let type_has_assertions = matches!(ev_state.schema_type,
+            Some(TypeKey::Complex(ct_key)) if has_inherited_assertions(ct_key, &self.schema_set.arenas));
+        #[cfg(feature = "xsd11")]
+        let mut assertion_outcome: Option<AssertionOutcome> = None;
+
+        #[cfg(feature = "xsd11")]
         'assertion_eval: {
             debug_assert!(
                 self.flags.contains(ValidationFlags::PROCESS_ASSERTIONS)
@@ -1400,6 +1460,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     if let Some(arena) = self.fragment_arena.as_mut() {
                         arena.reset();
                     }
+                }
+                if type_has_assertions {
+                    assertion_outcome = Some(AssertionOutcome::NotEvaluated);
                 }
                 break 'assertion_eval;
             }
@@ -1468,6 +1531,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 frame.complex_type_key,
                                 self.schema_set,
                             );
+                            if errs.is_empty() {
+                                assertion_outcome = Some(AssertionOutcome::Passed);
+                            } else {
+                                assertion_outcome = Some(AssertionOutcome::Failed);
+                            }
                             self.report_assertion_errors(errs, &mut ev_state);
                         }
                         Err(e) => {
@@ -1483,6 +1551,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 ),
                             );
                             ev_state.validity = SchemaValidity::Invalid;
+                            assertion_outcome = Some(AssertionOutcome::Failed);
                         }
                     }
                     // Reset arena for reuse
@@ -1495,8 +1564,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     deferred.element_path = self.element_path.clone();
                     deferred.location = self.current_location.clone();
                     self.pending_assertion_frames.push(deferred);
+                    assertion_outcome = Some(AssertionOutcome::NotEvaluated);
                 }
             }
+        }
+
+        // Fallback: if assertion_outcome wasn't set but the type has assertions
+        #[cfg(feature = "xsd11")]
+        if assertion_outcome.is_none() && type_has_assertions {
+            assertion_outcome = Some(AssertionOutcome::NotEvaluated);
         }
 
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
@@ -1539,6 +1615,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             content_type: ev_state.content_type,
             typed_value: ev_state.typed_value,
             deferred_by_cta: false,
+            type_source: ev_state.type_source,
+            #[cfg(feature = "xsd11")]
+            cta_selected: ev_state.cta_selected,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome,
         }
     }
 
@@ -2296,6 +2377,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     content_type: None,
                     typed_value,
                     deferred_by_cta: false,
+                    type_source: Some(TypeSource::Declaration),
+                    #[cfg(feature = "xsd11")]
+                    cta_selected: false,
+                    #[cfg(feature = "xsd11")]
+                    assertion_outcome: None,
                 };
                 self.post_process_attribute(local_name, namespace, value, &result);
                 result
@@ -2624,6 +2710,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     content_type: None,
                     typed_value,
                     deferred_by_cta: false,
+                    type_source: Some(TypeSource::Declaration),
+                    #[cfg(feature = "xsd11")]
+                    cta_selected: false,
+                    #[cfg(feature = "xsd11")]
+                    assertion_outcome: None,
                 }
             }
             None => {
@@ -2718,6 +2809,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     content_type: None,
                     typed_value,
                     deferred_by_cta: false,
+                    type_source: Some(TypeSource::Declaration),
+                    #[cfg(feature = "xsd11")]
+                    cta_selected: false,
+                    #[cfg(feature = "xsd11")]
+                    assertion_outcome: None,
                 }
             }
             None => {

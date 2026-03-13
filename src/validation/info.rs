@@ -34,6 +34,35 @@ pub enum ContentType {
     Mixed,
 }
 
+/// How the final `schema_type` was determined
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeSource {
+    /// From the element/attribute declaration's resolved_type
+    Declaration,
+    /// Overridden by xsi:type attribute
+    XsiType,
+    /// Selected by Conditional Type Assignment (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    TypeAlternative,
+}
+
+/// Complex-type assertion evaluation outcome (XSD 1.1)
+///
+/// Covers only the buffered complex-type assertion path. Simple-type
+/// assertion facet failures are reflected in `validity: Invalid` with
+/// `cvc-assertion` constraint through the error sink.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionOutcome {
+    /// All assertions evaluated and passed
+    Passed,
+    /// One or more assertions failed (includes compile/eval/EBV errors)
+    Failed,
+    /// Assertions exist but were not evaluated (PROCESS_ASSERTIONS not set,
+    /// or evaluation deferred to an outer asserted element)
+    NotEvaluated,
+}
+
 /// Stable node identity for cross-phase correlation (e.g., linking Phase 1 results to Phase 2 DOM nodes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeIdentity(pub u64);
@@ -99,6 +128,14 @@ pub struct SchemaInfo {
     pub typed_value: Option<XmlValue>,
     /// Whether this attribute was deferred due to CTA (type alternatives)
     pub deferred_by_cta: bool,
+    /// How the `schema_type` was determined (declaration, xsi:type, or CTA)
+    pub type_source: Option<TypeSource>,
+    /// Whether CTA evaluation selected a type (even if it matches the declared type)
+    #[cfg(feature = "xsd11")]
+    pub cta_selected: bool,
+    /// Complex-type assertion outcome (XSD 1.1, end-element SchemaInfo only)
+    #[cfg(feature = "xsd11")]
+    pub assertion_outcome: Option<AssertionOutcome>,
 }
 
 impl SchemaInfo {
@@ -115,6 +152,11 @@ impl SchemaInfo {
             content_type: None,
             typed_value: None,
             deferred_by_cta: false,
+            type_source: None,
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome: None,
         }
     }
 
@@ -131,6 +173,11 @@ impl SchemaInfo {
             content_type: Some(content_type),
             typed_value: None,
             deferred_by_cta: false,
+            type_source: Some(TypeSource::Declaration),
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome: None,
         }
     }
 
@@ -147,6 +194,11 @@ impl SchemaInfo {
             content_type: None,
             typed_value: None,
             deferred_by_cta: false,
+            type_source: Some(TypeSource::Declaration),
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome: None,
         }
     }
 
@@ -212,6 +264,12 @@ mod tests {
         assert!(!info.is_nil);
         assert!(info.content_type.is_none());
         assert!(info.typed_value.is_none());
+        assert!(info.type_source.is_none());
+        #[cfg(feature = "xsd11")]
+        {
+            assert!(!info.cta_selected);
+            assert!(info.assertion_outcome.is_none());
+        }
     }
 
     #[test]

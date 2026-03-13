@@ -10,7 +10,7 @@ use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
-use super::info::{ContentProcessing, ContentType, SchemaValidity};
+use super::info::{ContentProcessing, ContentType, SchemaValidity, TypeSource};
 
 /// Per-element state pushed onto the validation stack
 ///
@@ -50,6 +50,11 @@ pub struct ElementValidationState {
     pub has_text: bool,
     /// Whether any child element nodes have been seen
     pub has_element_children: bool,
+    /// How the schema_type was determined
+    pub type_source: Option<TypeSource>,
+    /// Whether CTA selected a type (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    pub cta_selected: bool,
     /// Whether this element owns an assertion buffer frame (XSD 1.1)
     #[cfg(feature = "xsd11")]
     pub owns_assertion_buffer: bool,
@@ -85,6 +90,9 @@ impl ElementValidationState {
             text_content: String::new(),
             has_text: false,
             has_element_children: false,
+            type_source: None,
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
             #[cfg(feature = "xsd11")]
             owns_assertion_buffer: false,
             #[cfg(feature = "xsd11")]
@@ -204,6 +212,9 @@ mod tests {
         assert!(state.text_content.is_empty());
         assert!(!state.has_text);
         assert!(!state.has_element_children);
+        assert!(state.type_source.is_none());
+        #[cfg(feature = "xsd11")]
+        assert!(!state.cta_selected);
     }
 
     #[test]

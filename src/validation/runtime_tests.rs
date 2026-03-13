@@ -5777,3 +5777,293 @@ fn test_strict_wildcard_xsi_type_supplies_governing_type() {
         v.sink.errors
     );
 }
+
+// ── PSVI TypeSource / CTA / AssertionOutcome tests ──────────────────
+
+#[test]
+fn test_type_source_declaration() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    let info = v.validate_element("root", "", None, None, &ns);
+    assert_eq!(info.type_source, Some(TypeSource::Declaration));
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.type_source, Some(TypeSource::Declaration));
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_type_source_xsi_type() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:anyType"/>
+            <xs:complexType name="myType">
+                <xs:sequence>
+                    <xs:element name="child" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    let info = v.validate_element("root", "", Some("myType"), None, &ns);
+    assert_eq!(info.type_source, Some(TypeSource::XsiType));
+    v.validate_end_of_attributes();
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.type_source, Some(TypeSource::XsiType));
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_type_source_cta() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="intContent">
+                <xs:sequence>
+                    <xs:element name="val" type="xs:integer"/>
+                </xs:sequence>
+                <xs:attribute name="kind" type="xs:string"/>
+            </xs:complexType>
+            <xs:element name="data">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="val" type="xs:string"/>
+                    </xs:sequence>
+                    <xs:attribute name="kind" type="xs:string"/>
+                </xs:complexType>
+                <xs:alternative test="@kind='int'" type="intContent"/>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    let info = v.validate_element("data", "", None, None, &ns);
+    // Before CTA, type_source is Declaration
+    assert_eq!(info.type_source, Some(TypeSource::Declaration));
+
+    v.validate_attribute("kind", "", "int");
+    let eoa_info = v.validate_end_of_attributes();
+    // CTA switched → TypeAlternative
+    assert_eq!(eoa_info.type_source, Some(TypeSource::TypeAlternative));
+    assert!(eoa_info.cta_selected);
+
+    v.validate_element("val", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    v.validate_end_element();
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.type_source, Some(TypeSource::TypeAlternative));
+    assert!(end_info.cta_selected);
+
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_cta_selected_same_type() {
+    // Schema where a CTA alternative selects the same type as the declared type.
+    // cta_selected should still be true, type_source should be TypeAlternative.
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="baseType">
+                <xs:sequence>
+                    <xs:element name="val" type="xs:string"/>
+                </xs:sequence>
+                <xs:attribute name="kind" type="xs:string"/>
+            </xs:complexType>
+            <xs:element name="data" type="baseType">
+                <xs:alternative test="@kind='same'" type="baseType"/>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("data", "", None, None, &ns);
+    v.validate_attribute("kind", "", "same");
+    let eoa_info = v.validate_end_of_attributes();
+    // CTA selected same type → cta_selected true, type_source TypeAlternative
+    assert!(eoa_info.cta_selected, "cta_selected should be true even when type is unchanged");
+    assert_eq!(eoa_info.type_source, Some(TypeSource::TypeAlternative));
+
+    v.validate_element("val", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_type_source_end_element() {
+    // Verify that end-element carries the type_source from start-element
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:integer"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    let start_info = v.validate_element("root", "", None, None, &ns);
+    assert_eq!(start_info.type_source, Some(TypeSource::Declaration));
+
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.type_source, Some(TypeSource::Declaration));
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_assertion_outcome_passed() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="val" type="xs:integer"/>
+                    <xs:assert test="@val >= 0"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new_fragment_buffer(
+        &schema_set,
+        ValidationFlags::default(),
+    );
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("val", "", "42");
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.assertion_outcome,
+        Some(AssertionOutcome::Passed),
+        "Passing assertion should yield Passed"
+    );
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_assertion_outcome_failed() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="val" type="xs:integer"/>
+                    <xs:assert test="@val >= 0"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new_fragment_buffer(
+        &schema_set,
+        ValidationFlags::default(),
+    );
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("val", "", "-5"); // -5 < 0, assertion fails
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.assertion_outcome,
+        Some(AssertionOutcome::Failed),
+        "Failing assertion should yield Failed"
+    );
+    v.end_validation().ok();
+    assert!(!v.sink.errors.is_empty(), "Should have assertion error");
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_assertion_outcome_not_evaluated() {
+    // Use default flags (no PROCESS_ASSERTIONS) — assertions exist but won't be evaluated
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="val" type="xs:integer"/>
+                    <xs:assert test="@val >= 0"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    // Default validator — no fragment buffer, PROCESS_ASSERTIONS not set
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("val", "", "42");
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.assertion_outcome,
+        Some(AssertionOutcome::NotEvaluated),
+        "Assertions exist but PROCESS_ASSERTIONS not set → NotEvaluated"
+    );
+    v.end_validation().ok();
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_no_assertions_outcome_none() {
+    // Element without assertions → assertion_outcome should be None
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new_fragment_buffer(
+        &schema_set,
+        ValidationFlags::default(),
+    );
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.assertion_outcome,
+        None,
+        "No assertions on type → None"
+    );
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
