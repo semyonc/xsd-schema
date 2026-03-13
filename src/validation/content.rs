@@ -212,17 +212,23 @@ impl ContentValidatorState {
                     );
                     if result == TermMatchResult::Match {
                         if state.accept(model, i) {
-                            let (element_key, resolved_type) = match &particle.term {
+                            let info = match &particle.term {
                                 NfaTerm::Element { element_key, resolved_type, .. } => {
-                                    (*element_key, *resolved_type)
+                                    ElementMatchInfo {
+                                        element_key: *element_key,
+                                        resolved_type: *resolved_type,
+                                        process_contents: None,
+                                    }
                                 }
-                                _ => (None, None),
+                                NfaTerm::Wildcard { process_contents, .. } => {
+                                    ElementMatchInfo {
+                                        element_key: None,
+                                        resolved_type: None,
+                                        process_contents: Some(*process_contents),
+                                    }
+                                }
                             };
-                            return Some(ElementMatchInfo {
-                                element_key,
-                                resolved_type,
-                                process_contents: None,
-                            });
+                            return Some(info);
                         }
                         return None;
                     }
@@ -264,17 +270,23 @@ impl ContentValidatorState {
                             );
                             if result == TermMatchResult::Match {
                                 if state.accept(model, i) {
-                                    let (element_key, resolved_type) = match &particle.term {
+                                    let info = match &particle.term {
                                         NfaTerm::Element { element_key, resolved_type, .. } => {
-                                            (*element_key, *resolved_type)
+                                            ElementMatchInfo {
+                                                element_key: *element_key,
+                                                resolved_type: *resolved_type,
+                                                process_contents: None,
+                                            }
                                         }
-                                        _ => (None, None),
+                                        NfaTerm::Wildcard { process_contents, .. } => {
+                                            ElementMatchInfo {
+                                                element_key: None,
+                                                resolved_type: None,
+                                                process_contents: Some(*process_contents),
+                                            }
+                                        }
                                     };
-                                    return Some(ElementMatchInfo {
-                                        element_key,
-                                        resolved_type,
-                                        process_contents: None,
-                                    });
+                                    return Some(info);
                                 }
                                 return None;
                             }
@@ -625,12 +637,21 @@ fn find_nfa_match_info(
         if let Some(state) = nfa.get_state(state_id) {
             if let Some(ref term) = state.term {
                 if nfa_term_matches(term, name, namespace, target_ns, subst_groups) {
-                    if let NfaTerm::Element { element_key, resolved_type, .. } = term {
-                        return ElementMatchInfo {
-                            element_key: *element_key,
-                            resolved_type: *resolved_type,
-                            process_contents: None,
-                        };
+                    match term {
+                        NfaTerm::Element { element_key, resolved_type, .. } => {
+                            return ElementMatchInfo {
+                                element_key: *element_key,
+                                resolved_type: *resolved_type,
+                                process_contents: None,
+                            };
+                        }
+                        NfaTerm::Wildcard { process_contents, .. } => {
+                            return ElementMatchInfo {
+                                element_key: None,
+                                resolved_type: None,
+                                process_contents: Some(*process_contents),
+                            };
+                        }
                     }
                 }
             }

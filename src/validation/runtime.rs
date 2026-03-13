@@ -75,6 +75,20 @@ enum AttributeLookup {
 }
 
 // ---------------------------------------------------------------------------
+// XsiTypeOutcome — three-state result from resolve_xsi_type
+// ---------------------------------------------------------------------------
+
+/// Result of resolving an `xsi:type` attribute value.
+enum XsiTypeOutcome {
+    /// Successfully resolved and derivation-valid — use this type.
+    Applied(TypeKey),
+    /// QName invalid or type not found (cvc-elt.4.1).
+    Unresolved,
+    /// Type found but does not validly derive from declared type (cvc-elt.4.2).
+    InvalidDerivation,
+}
+
+// ---------------------------------------------------------------------------
 // ValidationRuntime
 // ---------------------------------------------------------------------------
 
@@ -556,7 +570,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut content_model_error = None;
         let mut nil_error: Option<String> = None;
         if let Some(parent) = self.validation_stack.last_mut() {
-            if parent.is_nil {
+            if parent.process_contents == ContentProcessing::Skip {
+                // Skipped element: don't validate content model, push as skip, return
+                parent.has_element_children = true;
+                let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.process_contents = ContentProcessing::Skip;
+                ev_state.content_state = ContentValidatorState::Simple;
+                ev_state.validity = SchemaValidity::NotKnown;
+                self.push_element(ev_state);
+                self.advance_constraints_start_element(local_name, namespace, None);
+                #[cfg(feature = "xsd11")]
+                self.detect_assertions_on_element(None, local_name, namespace);
+                return SchemaInfo::empty();
+            } else if parent.is_nil {
                 let parent_name = self
                     .schema_set
                     .name_table
@@ -627,8 +653,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         if element_key.is_none() {
             if content_model_accepted {
-                // Content model accepted this element (local element in content model)
-                // but no global declaration exists. The element is structurally valid.
+                // Content model accepted this element (wildcard in content model)
+                // but no global declaration exists.
                 let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
                 let mut ev_state = ElementValidationState::new(local_name, namespace);
                 ev_state.validity = SchemaValidity::Valid;
@@ -636,12 +662,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ev_state.is_nil = is_nil;
 
                 if let Some(mut type_key) = matched_type {
-                    // xsi:type override for local elements with resolved type
+                    // PATH B1: xsi:type override for local elements with resolved type
                     if let Some(xsi_type_str) = xsi_type {
-                        if let Some(overridden) =
-                            self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context)
-                        {
-                            type_key = overridden;
+                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context) {
+                            XsiTypeOutcome::Applied(overridden) => {
+                                type_key = overridden;
+                            }
+                            XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
+                                ev_state.validity = SchemaValidity::Invalid;
+                                // keep original type_key
+                            }
                         }
                     }
                     // Local element with resolved type — initialize content model
@@ -650,28 +680,53 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ev_state.content_state = content_state;
                     ev_state.content_type = Some(content_type);
                 } else {
-                    // No type info (inline type or unresolved) — check xsi:type, then fallback
+                    // PATH B2/B3: No declaration and no matched type.
+                    // Try xsi:type first — it can supply a governing type even
+                    // without a declaration.
                     if let Some(xsi_type_str) = xsi_type {
-                        if let Some(overridden) =
-                            self.resolve_xsi_type(xsi_type_str, None, ns_context)
-                        {
-                            let (content_state, content_type) =
-                                self.init_content_model(Some(overridden));
-                            ev_state.schema_type = Some(overridden);
-                            ev_state.content_state = content_state;
-                            ev_state.content_type = Some(content_type);
-                        } else {
-                            ev_state.content_state = ContentValidatorState::Simple;
-                            ev_state.content_type = Some(ContentType::TextOnly);
+                        match self.resolve_xsi_type(xsi_type_str, None, ns_context) {
+                            XsiTypeOutcome::Applied(overridden) => {
+                                let (content_state, content_type) =
+                                    self.init_content_model(Some(overridden));
+                                ev_state.schema_type = Some(overridden);
+                                ev_state.content_state = content_state;
+                                ev_state.content_type = Some(content_type);
+                            }
+                            XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
+                                // No governing type — lax assessment
+                                ev_state.validity = SchemaValidity::Invalid;
+                                let (content_state, content_type) =
+                                    self.lax_assessment_content_model();
+                                ev_state.content_state = content_state;
+                                ev_state.content_type = Some(content_type);
+                                // schema_type stays None (no governing type)
+                            }
                         }
                     } else {
-                        ev_state.content_state = ContentValidatorState::Simple;
-                        ev_state.content_type = Some(ContentType::TextOnly);
+                        // PATH B3: No governing declaration/type — lax assessment via xs:anyType
+                        let (content_state, content_type) = self.lax_assessment_content_model();
+                        ev_state.content_state = content_state;
+                        ev_state.content_type = Some(content_type);
+                        // schema_type stays None
+                    }
+                    // Strict wildcard with no global declaration and no governing
+                    // type from xsi:type → cvc-elt.1.  Checked AFTER xsi:type so
+                    // that a valid xsi:type can still supply assessment.
+                    if process_contents == ContentProcessing::Strict
+                        && ev_state.schema_type.is_none()
+                    {
+                        let elem_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-elt.1",
+                            format!("Element '{}' is not declared", elem_name),
+                        );
+                        ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
 
                 let schema_type = ev_state.schema_type;
                 let content_type = ev_state.content_type;
+                let validity = ev_state.validity;
                 self.push_element(ev_state);
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
@@ -681,7 +736,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     attribute_decl: None,
                     schema_type,
                     member_type: None,
-                    validity: SchemaValidity::Valid,
+                    validity,
                     is_default: false,
                     is_nil,
                     content_type,
@@ -704,10 +759,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     return SchemaInfo::empty();
                 }
                 ContentProcessing::Lax => {
-                    // Lax: skip if not found
+                    // Lax: no declaration found — lax assessment via xs:anyType
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
                     ev_state.process_contents = ContentProcessing::Lax;
-                    ev_state.content_state = ContentValidatorState::Simple;
+                    let (content_state, content_type) = self.lax_assessment_content_model();
+                    ev_state.content_state = content_state;
+                    ev_state.content_type = Some(content_type);
+                    // schema_type stays None — no governing type
                     ev_state.validity = SchemaValidity::NotKnown;
                     self.push_element(ev_state);
                     self.advance_constraints_start_element(local_name, namespace, None);
@@ -723,6 +781,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     );
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
                     ev_state.validity = SchemaValidity::Invalid;
+                    // Lax assessment for content (same PSVI as lax when no declaration found)
+                    let (content_state, content_type) = self.lax_assessment_content_model();
+                    ev_state.content_state = content_state;
+                    ev_state.content_type = Some(content_type);
+                    // schema_type stays None
                     self.push_element(ev_state);
                     self.advance_constraints_start_element(local_name, namespace, None);
                     #[cfg(feature = "xsd11")]
@@ -748,11 +811,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut type_key = elem_data.resolved_type;
 
         // 6. xsi:type override
+        let mut xsi_type_invalid = false;
         if let Some(xsi_type_str) = xsi_type {
-            if let Some(overridden) =
-                self.resolve_xsi_type(xsi_type_str, type_key, ns_context)
-            {
-                type_key = Some(overridden);
+            match self.resolve_xsi_type(xsi_type_str, type_key, ns_context) {
+                XsiTypeOutcome::Applied(overridden) => {
+                    type_key = Some(overridden);
+                }
+                XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
+                    // Error already reported; keep declared type, mark invalid
+                    xsi_type_invalid = true;
+                }
             }
         }
 
@@ -787,7 +855,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.content_state = content_state;
         ev_state.content_type = Some(content_type);
         ev_state.is_nil = is_nil;
-        ev_state.validity = SchemaValidity::Valid;
+        ev_state.validity = if xsi_type_invalid {
+            SchemaValidity::Invalid
+        } else {
+            SchemaValidity::Valid
+        };
         ev_state.process_contents = process_contents;
         #[cfg(feature = "xsd11")]
         {
@@ -802,12 +874,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.detect_assertions_on_element(type_key, local_name, namespace);
 
         // 10. Return SchemaInfo
+        let validity = if xsi_type_invalid {
+            SchemaValidity::Invalid
+        } else {
+            SchemaValidity::Valid
+        };
         SchemaInfo {
             element_decl: Some(elem_key),
             attribute_decl: None,
             schema_type: type_key,
             member_type: None,
-            validity: SchemaValidity::Valid,
+            validity,
             is_default: false,
             is_nil,
             content_type: Some(content_type),
@@ -920,12 +997,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return SchemaInfo { deferred_by_cta: true, ..SchemaInfo::empty() };
         }
 
-        // If the element has no type info, skip detailed attribute validation
+        // Determine effective type for attribute validation.
+        // When schema_type is None (no governing type) and the element is under
+        // lax assessment, use xs:anyType which has anyAttribute processContents=lax.
         let type_key = ev_state.schema_type;
+        let process_contents = ev_state.process_contents;
         let ct_key = match type_key {
             Some(TypeKey::Complex(ct)) => ct,
+            None if process_contents != ContentProcessing::Skip => {
+                // Lax assessment: validate attributes against xs:anyType
+                // (anyAttribute processContents=lax accepts any attribute)
+                self.schema_set.any_type_key()
+            }
             _ => {
-                // Simple type or no type: no attributes expected (except xsi:*)
+                // Simple type or skip: no attributes expected (except xsi:*)
                 // Still run post-processing so IC attribute fields and
                 // ID/IDREF collection are not skipped.
                 self.current_state = ValidatorState::Attribute;
@@ -1038,12 +1123,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.current_state = ValidatorState::EndOfAttributes;
 
         // When CTA switched the type, return updated SchemaInfo so callers
-        // (e.g. typed_builder) can update element bindings.
+        // (e.g. typed_builder) can update element bindings. Preserve prior
+        // invalidity (e.g. from a bad xsi:type).
         if cta_switched {
-            let content_type = self.validation_stack.last().and_then(|s| s.content_type);
+            let ev = self.validation_stack.last();
+            let content_type = ev.and_then(|s| s.content_type);
+            let validity = ev
+                .map(|s| s.validity)
+                .unwrap_or(SchemaValidity::NotKnown);
             SchemaInfo {
                 schema_type,
                 content_type,
+                validity,
                 ..SchemaInfo::empty()
             }
         } else {
@@ -2379,13 +2470,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Resolve an xsi:type QName string to a TypeKey
+    /// Resolve an xsi:type QName string to an [`XsiTypeOutcome`].
     fn resolve_xsi_type(
         &mut self,
         xsi_type_str: &str,
         declared_type: Option<TypeKey>,
         ns_context: &NamespaceContextSnapshot,
-    ) -> Option<TypeKey> {
+    ) -> XsiTypeOutcome {
         // Parse and validate the QName using shared parsing logic
         let qname = match parse_qname_with_snapshot(
             xsi_type_str,
@@ -2402,7 +2493,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     _ => format!("Invalid xsi:type value '{}': {}", xsi_type_str, e),
                 };
                 self.report_error("cvc-elt.4.1", msg);
-                return None;
+                return XsiTypeOutcome::Unresolved;
             }
         };
 
@@ -2431,9 +2522,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 xsi_type_str
                             ),
                         );
+                        return XsiTypeOutcome::InvalidDerivation;
                     }
                 }
-                Some(type_key)
+                XsiTypeOutcome::Applied(type_key)
             }
             None => {
                 self.report_error(
@@ -2443,9 +2535,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         xsi_type_str
                     ),
                 );
-                None
+                XsiTypeOutcome::Unresolved
             }
         }
+    }
+
+    /// Returns xs:anyType's content model for lax assessment.
+    ///
+    /// The caller keeps `schema_type = None` (no governing type) — only the
+    /// content model (Mixed + `(xs:any processContents=lax)*`) is used.
+    fn lax_assessment_content_model(&self) -> (ContentValidatorState, ContentType) {
+        let any_type_key = TypeKey::Complex(self.schema_set.any_type_key());
+        self.init_content_model(Some(any_type_key))
     }
 
     /// Validate an attribute matched by a wildcard with processContents="strict".
@@ -2793,6 +2894,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ) -> Option<WildcardResult> {
         if ct_data.attribute_wildcard.is_some() {
             return ct_data.attribute_wildcard.clone();
+        }
+        // Check the content's attribute wildcard (e.g. xs:anyType stores it
+        // inside ComplexContentDefResult, not at the top-level).
+        if let crate::parser::frames::ComplexContentResult::Complex(ref def) = ct_data.content {
+            if def.attribute_wildcard.is_some() {
+                return def.attribute_wildcard.clone();
+            }
         }
         let mut visited = HashSet::new();
         self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited)
@@ -8123,6 +8231,582 @@ mod tests {
             idref_errors.is_empty(),
             "Element-text ID '  bar  ' collapsed to 'bar' should match IDREF 'bar', got: {:?}",
             idref_errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // xsi:type validation fallback semantics tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_xsi_type_unresolved_on_global_element() {
+        // Global element + unknown xsi:type → Invalid, declared type used
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", Some("noSuchType"), None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+        // schema_type should be the declared type (xs:string), not None
+        assert!(info.schema_type.is_some());
+
+        // Should have cvc-elt.4.1 error
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.1"),
+            "Expected cvc-elt.4.1 error, got: {:?}",
+            v.sink.errors
+        );
+
+        // Text should still validate against the declared type (xs:string)
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        let end_info = v.validate_end_element();
+        // End element should not produce additional type errors
+        let type_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint != "cvc-elt.4.1")
+            .collect();
+        assert!(
+            type_errors.is_empty(),
+            "Expected only cvc-elt.4.1 error, but got additional: {:?}",
+            type_errors
+        );
+        // end_info preserves invalidity from the xsi:type error
+        assert_eq!(end_info.validity, SchemaValidity::Invalid);
+        v.end_validation().ok();
+    }
+
+    #[test]
+    fn test_xsi_type_invalid_derivation_on_global_element() {
+        // Global element + xsi:type that doesn't derive → Invalid, declared type used
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+                <xs:complexType name="unrelatedType">
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        let info = v.validate_element("root", "", Some("unrelatedType"), None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+        // schema_type should be the declared type (xs:string), not unrelatedType
+        assert!(info.schema_type.is_some());
+
+        // Should have cvc-elt.4.2 error
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.2"),
+            "Expected cvc-elt.4.2 error, got: {:?}",
+            v.sink.errors
+        );
+
+        // Assessment uses declared type (xs:string), so text content should be fine
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // No additional errors beyond cvc-elt.4.2
+        let other_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint != "cvc-elt.4.2")
+            .collect();
+        assert!(
+            other_errors.is_empty(),
+            "Expected only cvc-elt.4.2 error, but got additional: {:?}",
+            other_errors
+        );
+    }
+
+    #[test]
+    fn test_xsi_type_unresolved_on_local_element_with_type() {
+        // Local element with type + unknown xsi:type → Invalid, falls back to matched type
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        let info = v.validate_element("item", "", Some("noSuchType"), None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+        // Falls back to matched type (xs:string)
+        assert!(info.schema_type.is_some());
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.1"),
+            "Expected cvc-elt.4.1 error, got: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+    }
+
+    #[test]
+    fn test_xsi_type_unresolved_lax_assessment() {
+        // Local element without type + bad xsi:type → Invalid, lax assessment, children accepted
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any processContents="lax"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Unknown element matched by lax wildcard, with bad xsi:type
+        let info = v.validate_element("unknown", "", Some("noSuchType"), None, &ns);
+        // schema_type stays None (no governing type)
+        assert!(info.schema_type.is_none());
+
+        v.validate_end_of_attributes();
+        // Nested child should be accepted via lax assessment (xs:anyType content model)
+        v.validate_element("nested", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+
+        v.validate_end_element(); // close unknown
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        // Should have cvc-elt.4.1 for the bad xsi:type, but no content model errors
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.1"),
+            "Expected cvc-elt.4.1 error, got: {:?}",
+            v.sink.errors
+        );
+        let content_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-complex-type.2.4")
+            .collect();
+        assert!(
+            content_errors.is_empty(),
+            "Lax assessment should not produce content model errors, got: {:?}",
+            content_errors
+        );
+    }
+
+    #[test]
+    fn test_undeclared_element_lax_allows_children() {
+        // Lax wildcard + nested children → no errors, xs:anyType content model accepts children
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any processContents="lax"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Wildcard matches in content model → content_model_accepted path
+        let info = v.validate_element("unknown", "", None, None, &ns);
+        // Element accepted by content model, no governing type → schema_type = None
+        assert!(info.schema_type.is_none());
+
+        v.validate_end_of_attributes();
+        // Nested children should be accepted via xs:anyType content model
+        v.validate_element("child1", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("text1");
+        v.validate_end_element();
+
+        v.validate_element("child2", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+
+        v.validate_end_element(); // close unknown
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Lax undeclared element should accept children without errors, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_undeclared_element_skip_no_assessment() {
+        // Skip wildcard + nested children → no errors, skip bypass prevents content model errors
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any processContents="skip"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        v.validate_element("anything", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Deeply nested children should be accepted (skip bypass)
+        v.validate_element("nested1", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("nested2", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("deep");
+        v.validate_end_element(); // close nested2
+        v.validate_end_element(); // close nested1
+
+        v.validate_end_element(); // close anything
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Skip wildcard should accept all nested content without errors, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    #[test]
+    fn test_strict_undeclared_same_assessment_as_lax() {
+        // Strict wildcard: element is matched by wildcard in content model with
+        // processContents=strict, but has no global declaration → cvc-elt.1.
+        // Children should still be accepted via lax assessment.
+        //
+        // Use namespace-based wildcard to get strict processContents on
+        // an element that is NOT globally declared.
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://test">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any namespace="http://other" processContents="strict"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "http://test", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        let info = v.validate_element("unknown", "http://other", None, None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+
+        // cvc-elt.1 for undeclared element under strict processing
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.1"),
+            "Expected cvc-elt.1 error, got: {:?}",
+            v.sink.errors
+        );
+
+        v.validate_end_of_attributes();
+        // Children should still be accepted (lax assessment for content)
+        v.validate_element("child", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+
+        v.validate_end_element(); // close unknown
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        // No content model errors on the unknown element's children
+        let content_errors: Vec<_> = v.sink.errors.iter()
+            .filter(|e| e.constraint == "cvc-complex-type.2.4")
+            .collect();
+        assert!(
+            content_errors.is_empty(),
+            "Strict undeclared element should use lax assessment for children, got: {:?}",
+            content_errors
+        );
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_cta_preserves_xsi_type_invalidity() {
+        // CTA switch after bad xsi:type → type switches, validity stays Invalid
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="typeA">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:complexType name="typeB">
+                    <xs:sequence>
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="root" type="typeA">
+                    <xs:alternative test="@kind = 'B'" type="typeB"/>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
+        let validator = SchemaValidator::new(&schema_set, flags);
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        // Bad xsi:type (unrelated to typeA) + CTA trigger attribute
+        let info = v.validate_element("root", "", Some("noSuchType"), None, &ns);
+        assert_eq!(info.validity, SchemaValidity::Invalid);
+
+        // Supply CTA-triggering attribute
+        v.validate_attribute("kind", "", "B");
+        let eoa_info = v.validate_end_of_attributes();
+
+        // CTA should switch to typeB, but validity should stay Invalid
+        assert_eq!(
+            eoa_info.validity, SchemaValidity::Invalid,
+            "CTA switch should preserve prior invalidity from bad xsi:type"
+        );
+
+        // Validate content against typeB
+        v.validate_element("b", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.1"),
+            "Expected cvc-elt.4.1 for bad xsi:type, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Reviewer finding regression tests (P1/P2)
+    // -----------------------------------------------------------------------
+
+    /// P1(a): Lax-assessment elements must assess attributes against xs:anyType's
+    /// anyAttribute wildcard, not skip them entirely.
+    #[test]
+    fn test_lax_assessment_validates_attributes_against_any_type() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any processContents="lax"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Undeclared element matched by lax wildcard → lax assessment, schema_type=None
+        let info = v.validate_element("unknown", "", None, None, &ns);
+        assert!(info.schema_type.is_none());
+
+        // Attributes should be accepted (xs:anyType's anyAttribute lax wildcard)
+        let attr_info = v.validate_attribute("myattr", "", "some-value");
+        assert_ne!(
+            attr_info.validity,
+            SchemaValidity::Invalid,
+            "Lax assessment should accept attributes via xs:anyType's anyAttribute wildcard"
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        // No errors about unexpected attributes
+        let attr_errors: Vec<_> = v
+            .sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint.contains("cvc-complex-type"))
+            .collect();
+        assert!(
+            attr_errors.is_empty(),
+            "Lax assessment should not produce attribute errors, got: {:?}",
+            attr_errors
+        );
+    }
+
+    /// P1(b): Descendants of a skip wildcard must remain unassessed even when
+    /// globally declared.
+    #[test]
+    fn test_skip_descendant_globally_declared_not_validated() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any processContents="skip"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+                <xs:element name="known" type="xs:integer"/>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Enter skipped subtree
+        v.validate_element("wrapper", "", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // "known" is globally declared as xs:integer, but inside a skip subtree
+        // it must remain unassessed — invalid text should NOT produce errors
+        v.validate_element("known", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("not-an-integer");
+        v.validate_end_element();
+
+        v.validate_end_element(); // close wrapper
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "Globally declared element inside skip subtree should not be validated, got: {:?}",
+            v.sink.errors
+        );
+    }
+
+    /// P2: Strict wildcard with valid xsi:type should use that type for
+    /// assessment instead of rejecting with cvc-elt.1.
+    #[test]
+    fn test_strict_wildcard_xsi_type_supplies_governing_type() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                         targetNamespace="http://test">
+                <xs:complexType name="myType">
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:any namespace="http://other" processContents="strict"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        // Need namespace binding for xsi:type resolution
+        let tns_prefix = schema_set.name_table.add("tns");
+        let tns_uri = schema_set.name_table.add("http://test");
+        let ns = NamespaceContextSnapshot {
+            default_ns: None,
+            bindings: vec![(tns_prefix, tns_uri)],
+        };
+
+        v.validate_element("root", "http://test", None, None, &ns);
+        v.validate_end_of_attributes();
+
+        // Element "foo" in http://other is NOT globally declared, matched by
+        // strict wildcard. But xsi:type supplies tns:myType as governing type.
+        let info = v.validate_element("foo", "http://other", Some("tns:myType"), None, &ns);
+        // xsi:type supplied a valid governing type — element should be valid
+        assert!(
+            info.schema_type.is_some(),
+            "xsi:type should supply governing type even without global declaration"
+        );
+
+        // No cvc-elt.1 error — xsi:type provided the governing type
+        let elt1_errors: Vec<_> = v
+            .sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint == "cvc-elt.1")
+            .collect();
+        assert!(
+            elt1_errors.is_empty(),
+            "Strict wildcard should not report cvc-elt.1 when xsi:type supplies a type, got: {:?}",
+            elt1_errors
+        );
+
+        v.validate_end_of_attributes();
+        v.validate_element("child", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        v.validate_end_element();
+        v.validate_end_element(); // close foo
+        v.validate_end_element(); // close root
+        v.end_validation().ok();
+
+        assert!(
+            v.sink.errors.is_empty(),
+            "No errors expected when xsi:type supplies valid governing type, got: {:?}",
+            v.sink.errors
         );
     }
 }
