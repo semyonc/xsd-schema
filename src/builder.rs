@@ -28,8 +28,9 @@ use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
     resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
 };
+use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::XsdVersion;
-use crate::schema::{assemble_inline_types, resolve_all_references, SchemaSet};
+use crate::schema::SchemaSet;
 
 /// Builder for creating compiled schema sets.
 ///
@@ -234,23 +235,15 @@ impl SchemaSetBuilder {
             self.resolve_directives_recursive(doc_id)?;
         }
 
-        // Phase 2: Apply redefine/override semantics
-        crate::schema::apply_redefine_override(&mut self.schema_set)?;
+        // Phases 2-5: Delegate to the pipeline's shared processing function
+        // (redefine/override, inline assembly, reference resolution, particle allocation)
+        let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
 
-        // Phase 3: Inline type assembly
-        let inline_stats = assemble_inline_types(&mut self.schema_set)?;
-
-        // Phase 4: Reference resolution
-        let resolution_stats = resolve_all_references(&mut self.schema_set)?;
-
-        // Phase 5: Allocate arena element declarations for content particles
-        crate::schema::allocate_content_particle_elements(&mut self.schema_set)?;
-        crate::schema::allocate_model_group_particle_elements(&mut self.schema_set)?;
-
+        let documents_loaded = self.schema_set.documents.len();
         Ok(CompiledSchemaSet {
             schema_set: self.schema_set,
             stats: CompilationStats {
-                documents_loaded: 0, // Will be set below
+                documents_loaded,
                 inline_types_assembled: inline_stats.total_inline_types,
                 types_resolved: resolution_stats.types_resolved,
                 elements_resolved: resolution_stats.elements_resolved,
@@ -258,10 +251,6 @@ impl SchemaSetBuilder {
                 groups_resolved: resolution_stats.groups_resolved,
                 attribute_groups_resolved: resolution_stats.attribute_groups_resolved,
             },
-        })
-        .map(|mut compiled| {
-            compiled.stats.documents_loaded = compiled.schema_set.documents.len();
-            compiled
         })
     }
 
