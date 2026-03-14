@@ -44,6 +44,8 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "async")]
+use std::pin::Pin;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
@@ -250,6 +252,12 @@ pub struct SchemaResolver {
     catalog: SchemaCatalog,
     /// Schema loader chain
     loader: Box<dyn SchemaLoader>,
+    /// Optional async loader for non-blocking I/O (HTTP, cloud storage, etc.)
+    ///
+    /// When set, async methods use this loader instead of wrapping the sync
+    /// loader. When `None`, async methods fall back to the sync `loader`.
+    #[cfg(feature = "async")]
+    async_loader: Option<Box<dyn AsyncSchemaLoader>>,
 }
 
 /// Configuration for schema resolution
@@ -346,6 +354,8 @@ impl SchemaResolver {
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
             loader: Box::new(LoaderChain::with_defaults()),
+            #[cfg(feature = "async")]
+            async_loader: None,
         }
     }
 
@@ -358,6 +368,8 @@ impl SchemaResolver {
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
             loader: Box::new(LoaderChain::with_defaults()),
+            #[cfg(feature = "async")]
+            async_loader: None,
         }
     }
 
@@ -376,6 +388,8 @@ impl SchemaResolver {
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
             loader,
+            #[cfg(feature = "async")]
+            async_loader: None,
         }
     }
 
@@ -386,6 +400,38 @@ impl SchemaResolver {
             resolving: HashSet::new(),
             catalog: SchemaCatalog::new(),
             loader,
+            #[cfg(feature = "async")]
+            async_loader: None,
+        }
+    }
+
+    /// Create a resolver with a custom async loader for non-blocking I/O.
+    ///
+    /// The async loader is used by `load_content_async` and `load_schema_async`.
+    /// The default sync loader chain is still used for sync methods.
+    #[cfg(feature = "async")]
+    pub fn with_async_loader(async_loader: Box<dyn AsyncSchemaLoader>) -> Self {
+        Self {
+            config: ResolverConfig::default(),
+            resolving: HashSet::new(),
+            catalog: SchemaCatalog::new(),
+            loader: Box::new(LoaderChain::with_defaults()),
+            async_loader: Some(async_loader),
+        }
+    }
+
+    /// Create a resolver with custom configuration and an async loader.
+    #[cfg(feature = "async")]
+    pub fn with_config_and_async_loader(
+        config: ResolverConfig,
+        async_loader: Box<dyn AsyncSchemaLoader>,
+    ) -> Self {
+        Self {
+            config,
+            resolving: HashSet::new(),
+            catalog: SchemaCatalog::new(),
+            loader: Box::new(LoaderChain::with_defaults()),
+            async_loader: Some(async_loader),
         }
     }
 
@@ -434,19 +480,31 @@ impl SchemaResolver {
             return Ok(None);
         }
 
-        // Mark as being resolved
+        // Mark as being resolved (cycle detection)
         self.resolving.insert(resolved.clone());
 
-        // Load the schema content
-        let content = self.load_content(&resolved)?;
+        // Load the schema content — clean up resolving set on error
+        let content = match self.load_content(&resolved) {
+            Ok(c) => c,
+            Err(e) => {
+                self.resolving.remove(&resolved);
+                return Err(e);
+            }
+        };
 
-        // Parse the schema
-        let doc_id = parse_schema_with_config(
+        // Parse the schema — clean up resolving set on error
+        let doc_id = match parse_schema_with_config(
             content.as_bytes(),
             &resolved,
             schema_set,
             &self.config.parser_config,
-        )?;
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.resolving.remove(&resolved);
+                return Err(e);
+            }
+        };
 
         // Mark as loaded
         schema_set.mark_loaded(resolved.clone(), doc_id);
@@ -542,6 +600,216 @@ impl Default for SchemaResolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ============================================================================
+// Async Schema Loading (feature = "async")
+// ============================================================================
+
+/// Trait for loading schema content asynchronously.
+///
+/// Implementations can provide truly non-blocking I/O for HTTP, cloud storage,
+/// or other async sources. Pass a `Box<dyn AsyncSchemaLoader>` to
+/// [`SchemaResolver::with_async_loader`] to enable async loading.
+///
+/// When no async loader is configured, async resolver methods fall back to the
+/// sync [`SchemaLoader`] (blocking the current task).
+///
+/// The trait is object-safe (`Pin<Box<dyn Future>>`), so it can be stored as
+/// `Box<dyn AsyncSchemaLoader>` without conflicting with sync trait impls.
+#[cfg(feature = "async")]
+pub trait AsyncSchemaLoader: Send + Sync + Debug {
+    /// Load schema content asynchronously from the given location.
+    fn load_async(
+        &self,
+        location: &str,
+    ) -> Pin<Box<dyn std::future::Future<Output = SchemaResult<String>> + Send + '_>>;
+
+    /// Check if this loader can handle the given location.
+    fn can_load(&self, location: &str) -> bool;
+}
+
+#[cfg(feature = "async")]
+impl SchemaResolver {
+    /// Load content asynchronously from a location.
+    ///
+    /// Uses the [`AsyncSchemaLoader`] if one was provided via
+    /// [`with_async_loader`](SchemaResolver::with_async_loader); otherwise
+    /// falls back to the sync [`SchemaLoader`].
+    pub async fn load_content_async(&self, location: &str) -> SchemaResult<String> {
+        // Check network access for HTTP URLs
+        if (location.starts_with("http://") || location.starts_with("https://"))
+            && !self.config.allow_network
+        {
+            return Err(SchemaError::resolution(format!(
+                "Network access not allowed for: {}",
+                location
+            )));
+        }
+
+        // Use the async loader only when it can handle this location;
+        // otherwise fall back to the sync loader chain (embedded, filesystem, etc.)
+        if let Some(ref async_loader) = self.async_loader {
+            if async_loader.can_load(location) {
+                return async_loader.load_async(location).await;
+            }
+        }
+        self.loader.load(location)
+    }
+
+    /// Load and parse a schema asynchronously from a location.
+    ///
+    /// Returns the document ID if the schema was loaded, or None if it was
+    /// already loaded (circular reference).
+    pub async fn load_schema_async(
+        &mut self,
+        location: &str,
+        base_uri: &str,
+        schema_set: &mut SchemaSet,
+    ) -> SchemaResult<Option<DocumentId>> {
+        // Resolve the location
+        let resolved = self.resolve_location(location, base_uri)?;
+
+        // Check if already loaded
+        if schema_set.is_loaded(&resolved) {
+            return Ok(schema_set.loaded_locations.get(&resolved).copied());
+        }
+
+        // Check for circular resolution
+        if self.resolving.contains(&resolved) {
+            return Ok(None);
+        }
+
+        // Mark as being resolved (cycle detection)
+        self.resolving.insert(resolved.clone());
+
+        // Load the schema content asynchronously — clean up on error
+        let content = match self.load_content_async(&resolved).await {
+            Ok(c) => c,
+            Err(e) => {
+                self.resolving.remove(&resolved);
+                return Err(e);
+            }
+        };
+
+        // Parse the schema (sync — CPU-bound) — clean up on error
+        let doc_id = match parse_schema_with_config(
+            content.as_bytes(),
+            &resolved,
+            schema_set,
+            &self.config.parser_config,
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.resolving.remove(&resolved);
+                return Err(e);
+            }
+        };
+
+        // Mark as loaded
+        schema_set.mark_loaded(resolved.clone(), doc_id);
+
+        // Remove from resolving set
+        self.resolving.remove(&resolved);
+
+        Ok(Some(doc_id))
+    }
+}
+
+/// Resolve all directives in a schema document asynchronously.
+///
+/// Same structure as [`resolve_all_directives`] but uses async loading.
+#[cfg(feature = "async")]
+pub async fn resolve_all_directives_async(
+    doc_id: DocumentId,
+    resolver: &mut SchemaResolver,
+    schema_set: &mut SchemaSet,
+) -> ResolutionResult {
+    let mut result = ResolutionResult::default();
+
+    // Get the document
+    let doc = match schema_set.documents.get(doc_id as usize) {
+        Some(d) => d,
+        None => {
+            result.errors.push(SchemaError::internal(format!(
+                "Document {} not found",
+                doc_id
+            )));
+            return result;
+        }
+    };
+
+    let base_uri = doc.base_uri.clone();
+    let _target_namespace = doc.target_namespace;
+
+    // Clone directives to avoid borrow issues
+    let includes: Vec<_> = doc.includes.to_vec();
+    let imports: Vec<_> = doc.imports.to_vec();
+    let redefines: Vec<_> = doc.redefines.to_vec();
+    #[cfg(feature = "xsd11")]
+    let overrides: Vec<_> = doc.overrides.to_vec();
+
+    // Process includes
+    for include in includes {
+        match resolver.load_schema_async(
+            &include.schema_location,
+            &base_uri,
+            schema_set,
+        ).await {
+            Ok(Some(id)) => result.loaded.push(id),
+            Ok(None) => result.skipped.push(include.schema_location.clone()),
+            Err(e) => result.errors.push(e),
+        }
+    }
+
+    // Process imports
+    for import in imports {
+        if let Some(location) = import.schema_location.as_deref() {
+            match resolver.load_schema_async(location, &base_uri, schema_set).await {
+                Ok(Some(id)) => result.loaded.push(id),
+                Ok(None) => result.skipped.push(location.to_string()),
+                Err(e) => result.errors.push(e),
+            }
+        } else if let Some(ns) = import.namespace.as_deref() {
+            if let Some(location) = resolver.catalog.lookup(ns) {
+                let location = location.to_string();
+                match resolver.load_schema_async(&location, &base_uri, schema_set).await {
+                    Ok(Some(id)) => result.loaded.push(id),
+                    Ok(None) => result.skipped.push(location),
+                    Err(e) => result.errors.push(e),
+                }
+            }
+        }
+    }
+
+    // Process redefines
+    for redefine in redefines {
+        match resolver.load_schema_async(
+            &redefine.schema_location,
+            &base_uri,
+            schema_set,
+        ).await {
+            Ok(Some(id)) => result.loaded.push(id),
+            Ok(None) => result.skipped.push(redefine.schema_location.clone()),
+            Err(e) => result.errors.push(e),
+        }
+    }
+
+    // Process overrides (XSD 1.1)
+    #[cfg(feature = "xsd11")]
+    for override_dir in overrides {
+        match resolver.load_schema_async(
+            &override_dir.schema_location,
+            &base_uri,
+            schema_set,
+        ).await {
+            Ok(Some(id)) => result.loaded.push(id),
+            Ok(None) => result.skipped.push(override_dir.schema_location.clone()),
+            Err(e) => result.errors.push(e),
+        }
+    }
+
+    result
 }
 
 /// Check if a URI is absolute (has a scheme)

@@ -31,6 +31,8 @@ use crate::error::SchemaResult;
 use crate::ids::DocumentId;
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
 use crate::parser::resolver::{resolve_all_directives, ResolverConfig, SchemaResolver, ResolutionResult};
+#[cfg(feature = "async")]
+use crate::parser::resolver::resolve_all_directives_async;
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
@@ -286,6 +288,110 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
     Ok((inline_stats, resolution_stats))
+}
+
+// ============================================================================
+// Async Pipeline Functions (feature = "async")
+// ============================================================================
+
+/// Load and fully process an XSD schema document asynchronously.
+///
+/// Async variant of [`load_and_process_schema`]. Only the directive resolution
+/// phase (I/O) is async; all computation phases (parse, assembly, resolution)
+/// remain synchronous.
+///
+/// # Arguments
+///
+/// * `xml` - Raw XML bytes of the schema document
+/// * `base_uri` - Base URI for this document
+/// * `schema_set` - Schema set to add the parsed document to
+/// * `config` - Optional pipeline configuration (uses defaults if None)
+#[cfg(feature = "async")]
+pub async fn load_and_process_schema_async(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: Option<PipelineConfig>,
+) -> SchemaResult<PipelineStats> {
+    let config = config.unwrap_or_default();
+    let mut stats = PipelineStats::default();
+
+    // Phase 1: Parse the primary schema document (sync — CPU-bound)
+    let doc_id = parse_schema_with_config(xml, base_uri, schema_set, &config.parser)?;
+    stats.doc_id = doc_id;
+
+    // Phase 2: Resolve directives asynchronously
+    if config.resolve_directives {
+        let mut resolver = SchemaResolver::with_config(config.resolver.clone());
+
+        let dir_result = resolve_all_directives_async(doc_id, &mut resolver, schema_set).await;
+
+        stats.loaded_docs.extend(dir_result.loaded.iter().copied());
+        stats.directive_result = Some(DirectiveStats::from(&dir_result));
+
+        // Recursively process directives in loaded documents
+        let mut pending_docs = dir_result.loaded.clone();
+        while !pending_docs.is_empty() {
+            let current_batch: Vec<_> = std::mem::take(&mut pending_docs);
+            for loaded_doc_id in current_batch {
+                let nested_result =
+                    resolve_all_directives_async(loaded_doc_id, &mut resolver, schema_set).await;
+                stats.loaded_docs.extend(nested_result.loaded.iter().copied());
+                pending_docs.extend(nested_result.loaded.iter().copied());
+
+                if let Some(ref mut dir_stats) = stats.directive_result {
+                    dir_stats.loaded_count += nested_result.loaded.len();
+                    dir_stats.skipped_count += nested_result.skipped.len();
+                    dir_stats.error_count += nested_result.errors.len();
+                }
+            }
+        }
+
+        if !config.parser.error_recovery {
+            if let Some(ref dir_stats) = stats.directive_result {
+                if dir_stats.error_count > 0 {
+                    // Errors were collected in stats
+                }
+            }
+        }
+    }
+
+    // Phase 2.5: Apply redefine/override directives (sync)
+    if config.assemble_inline_types || config.resolve_references {
+        crate::schema::apply_redefine_override(schema_set)?;
+    }
+
+    // Phase 3: Assemble inline types (sync)
+    if config.assemble_inline_types {
+        let inline_stats = assemble_inline_types(schema_set)?;
+        stats.inline_stats = Some(inline_stats);
+    }
+
+    // Phase 4: Resolve all QName references (sync)
+    if config.resolve_references {
+        let resolution_stats = resolve_all_references(schema_set)?;
+        stats.resolution_stats = Some(resolution_stats);
+    }
+
+    // Phase 5: Allocate arena element declarations (sync)
+    if config.assemble_inline_types && config.resolve_references {
+        allocate_content_particle_elements(schema_set)?;
+        allocate_model_group_particle_elements(schema_set)?;
+    }
+
+    Ok(stats)
+}
+
+/// Load and process a schema asynchronously with full processing (convenience function).
+///
+/// Async variant of [`load_schema`].
+#[cfg(feature = "async")]
+pub async fn load_schema_async(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+) -> SchemaResult<PipelineStats> {
+    load_and_process_schema_async(xml, base_uri, schema_set, Some(PipelineConfig::full())).await
 }
 
 #[cfg(test)]

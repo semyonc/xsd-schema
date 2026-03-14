@@ -32,8 +32,8 @@ num-bigint = "0.4"           # Unbounded integers for xs:integer
 base64 = "0.22"              # Base64 encoding/decoding
 hex = "0.4"                  # Hex encoding/decoding
 
-# Async support
-futures = "0.3"              # For async schema resolution
+# Async support (optional, enabled by "async" feature)
+futures = { version = "0.3", optional = true }
 
 # XPath parser (LALRPOP runtime) - only needed with xsd11
 lalrpop-util = { version = "0.22.2", optional = true }
@@ -61,6 +61,7 @@ criterion = "0.5"            # Benchmarking (optional)
 default = ["unicode-normalization"]
 xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo", "dep:regexml"]
 unicode-normalization = ["dep:unicode-normalization"]
+async = ["dep:futures"]
 
 [lib]
 name = "xsd_schema"

@@ -28,6 +28,8 @@ use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
     resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
 };
+#[cfg(feature = "async")]
+use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
 use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::XsdVersion;
 use crate::schema::SchemaSet;
@@ -118,6 +120,23 @@ impl SchemaSetBuilder {
     /// Create a builder configured for XSD 1.1.
     pub fn xsd11() -> Self {
         Self::with_version(XsdVersion::V1_1)
+    }
+
+    /// Create a builder with a custom async loader for non-blocking I/O.
+    ///
+    /// The async loader is used by [`add_async`](SchemaSetBuilder::add_async)
+    /// and [`compile_async`](SchemaSetBuilder::compile_async).
+    #[cfg(feature = "async")]
+    pub fn with_async_loader(loader: Box<dyn AsyncSchemaLoader>) -> Self {
+        let mut resolver = SchemaResolver::with_async_loader(loader);
+        resolver.catalog_mut().add_xml_catalog();
+
+        Self {
+            schema_set: SchemaSet::new(),
+            resolver,
+            pending_docs: Vec::new(),
+            errors: Vec::new(),
+        }
     }
 
     /// Add a schema by namespace and location.
@@ -271,6 +290,70 @@ impl SchemaSetBuilder {
         Ok(())
     }
 
+    /// Resolve directives recursively using async loading.
+    #[cfg(feature = "async")]
+    async fn resolve_directives_recursive_async(&mut self, doc_id: DocumentId) -> SchemaResult<()> {
+        let result =
+            resolve_all_directives_async(doc_id, &mut self.resolver, &mut self.schema_set).await;
+
+        // Recursively process newly loaded documents
+        for loaded_id in result.loaded {
+            Box::pin(self.resolve_directives_recursive_async(loaded_id)).await?;
+        }
+
+        if !result.errors.is_empty() {
+            self.errors.extend(result.errors);
+        }
+
+        Ok(())
+    }
+
+    /// Add a schema by namespace and location, loading content asynchronously.
+    ///
+    /// Async variant of [`add`](SchemaSetBuilder::add).
+    #[cfg(feature = "async")]
+    pub async fn add_async(mut self, _namespace: &str, location: &str) -> SchemaResult<Self> {
+        let content = self.resolver.load_content_async(location).await?;
+        let doc_id = parse_schema_with_config(
+            content.as_bytes(),
+            location,
+            &mut self.schema_set,
+            &self.resolver.config.parser_config,
+        )?;
+        self.pending_docs.push(doc_id);
+        self.schema_set.mark_loaded(location.to_string(), doc_id);
+        Ok(self)
+    }
+
+    /// Compile all added schemas using async directive resolution.
+    ///
+    /// Async variant of [`compile`](SchemaSetBuilder::compile). Only directive
+    /// resolution (I/O) is async; all computation phases remain synchronous.
+    #[cfg(feature = "async")]
+    pub async fn compile_async(mut self) -> SchemaResult<CompiledSchemaSet> {
+        // Phase 1: Resolve directives asynchronously for all pending documents
+        let pending: Vec<_> = self.pending_docs.drain(..).collect();
+        for doc_id in pending {
+            self.resolve_directives_recursive_async(doc_id).await?;
+        }
+
+        // Phases 2-5: Delegate to the pipeline's shared processing function (sync)
+        let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
+
+        let documents_loaded = self.schema_set.documents.len();
+        Ok(CompiledSchemaSet {
+            schema_set: self.schema_set,
+            stats: CompilationStats {
+                documents_loaded,
+                inline_types_assembled: inline_stats.total_inline_types,
+                types_resolved: resolution_stats.types_resolved,
+                elements_resolved: resolution_stats.elements_resolved,
+                attributes_resolved: resolution_stats.attributes_resolved,
+                groups_resolved: resolution_stats.groups_resolved,
+                attribute_groups_resolved: resolution_stats.attribute_groups_resolved,
+            },
+        })
+    }
 }
 
 impl Default for SchemaSetBuilder {

@@ -174,6 +174,10 @@ pub use pipeline::{
     PipelineConfig, PipelineStats, DirectiveStats,
 };
 
+// Re-export async pipeline functions
+#[cfg(feature = "async")]
+pub use pipeline::{load_and_process_schema_async, load_schema_async};
+
 // Re-export builder types
 pub use builder::{SchemaSetBuilder, CompiledSchemaSet, CompilationStats};
 
@@ -182,6 +186,10 @@ pub use parser::resolver::{
     SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
     SchemaResolver, ResolverConfig, SchemaCatalog,
 };
+
+// Re-export async loader trait
+#[cfg(feature = "async")]
+pub use parser::resolver::AsyncSchemaLoader;
 
 // Re-export embedded assets
 pub use embedded::{XML_XSD, XML_NAMESPACE, get_embedded_schema, has_embedded_schema};
