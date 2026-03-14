@@ -47,6 +47,9 @@ bumpalo = { version = "3", features = ["collections"], optional = true }
 # Unicode normalization (for fn:normalize-unicode)
 unicode-normalization = { version = "0.1", optional = true }
 
+# XML Schema 1.1 regex engine (native XSD/XPath regex with ICU4X Unicode)
+regexml = { version = "0.2", optional = true }
+
 [build-dependencies]
 lalrpop = { version = "0.22.2", optional = true }
 
@@ -56,7 +59,7 @@ criterion = "0.5"            # Benchmarking (optional)
 
 [features]
 default = ["unicode-normalization"]
-xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo"]
+xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo", "dep:regexml"]
 unicode-normalization = ["dep:unicode-normalization"]
 
 [lib]

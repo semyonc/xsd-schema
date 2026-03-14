@@ -22,9 +22,14 @@
 use crate::error::{FacetError, FacetResult};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::location::SourceRef;
+#[cfg(not(feature = "xsd11"))]
 use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
+#[cfg(not(feature = "xsd11"))]
 use regex::Regex;
 use std::collections::HashSet;
+
+#[cfg(feature = "xsd11")]
+use std::sync::Arc;
 
 use super::XmlTypeCode;
 
@@ -82,7 +87,10 @@ pub struct PatternFacet {
     /// The pattern string (XSD regex syntax)
     pub value: String,
     /// Compiled regex for efficient matching
+    #[cfg(not(feature = "xsd11"))]
     compiled: Option<Regex>,
+    #[cfg(feature = "xsd11")]
+    compiled: Option<Arc<regexml::Regex>>,
     pub source: Option<SourceRef>,
 }
 
@@ -91,6 +99,7 @@ impl PatternFacet {
     ///
     /// The pattern is converted from XSD regex syntax to Rust regex syntax
     /// and compiled. Returns an error if the pattern is invalid.
+    #[cfg(not(feature = "xsd11"))]
     pub fn new(value: String, source: Option<SourceRef>) -> FacetResult<Self> {
         let rust_pattern = convert_xml_pattern(&value, ConvertOptions::xsd());
         let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
@@ -100,6 +109,32 @@ impl PatternFacet {
         Ok(Self {
             value,
             compiled: Some(compiled),
+            source,
+        })
+    }
+
+    /// Create a new pattern facet from an XSD pattern string.
+    ///
+    /// Uses `regexml` for native XML Schema 1.1 regex support with full Unicode.
+    /// Validates with XSD regex rules (rejecting XPath-only constructs like `^$`,
+    /// backreferences, `(?:...)`), then compiles with anchoring for full-string match.
+    #[cfg(feature = "xsd11")]
+    pub fn new(value: String, source: Option<SourceRef>) -> FacetResult<Self> {
+        // Validate pattern against XSD regex rules (rejects non-XSD constructs)
+        regexml::Regex::xsd(&value, "").map_err(|e| FacetError::InvalidPattern {
+            pattern: value.clone(),
+            message: format!("{:?}", e),
+        })?;
+        // Compile with explicit anchoring for full-string matching
+        let anchored = format!("^(?:{})$", value);
+        let compiled =
+            regexml::Regex::xpath(&anchored, "").map_err(|e| FacetError::InvalidPattern {
+                pattern: value.clone(),
+                message: format!("{:?}", e),
+            })?;
+        Ok(Self {
+            value,
+            compiled: Some(Arc::new(compiled)),
             source,
         })
     }
@@ -114,6 +149,7 @@ impl PatternFacet {
     }
 
     /// Compile the pattern if not already compiled
+    #[cfg(not(feature = "xsd11"))]
     pub fn compile(&mut self) -> FacetResult<()> {
         if self.compiled.is_none() {
             let rust_pattern = convert_xml_pattern(&self.value, ConvertOptions::xsd());
@@ -126,7 +162,30 @@ impl PatternFacet {
         Ok(())
     }
 
+    /// Compile the pattern if not already compiled
+    #[cfg(feature = "xsd11")]
+    pub fn compile(&mut self) -> FacetResult<()> {
+        if self.compiled.is_none() {
+            // Validate against XSD regex rules first
+            regexml::Regex::xsd(&self.value, "").map_err(|e| FacetError::InvalidPattern {
+                pattern: self.value.clone(),
+                message: format!("{:?}", e),
+            })?;
+            // Compile with explicit anchoring for full-string matching
+            let anchored = format!("^(?:{})$", self.value);
+            let compiled = regexml::Regex::xpath(&anchored, "").map_err(|e| {
+                FacetError::InvalidPattern {
+                    pattern: self.value.clone(),
+                    message: format!("{:?}", e),
+                }
+            })?;
+            self.compiled = Some(Arc::new(compiled));
+        }
+        Ok(())
+    }
+
     /// Test if a value matches this pattern
+    #[cfg(not(feature = "xsd11"))]
     pub fn matches(&self, value: &str) -> bool {
         match &self.compiled {
             Some(regex) => regex.is_match(value),
@@ -134,6 +193,24 @@ impl PatternFacet {
                 // Try to compile on-the-fly (fallback)
                 if let Ok(rust_pattern) = std::panic::catch_unwind(|| convert_xml_pattern(&self.value, ConvertOptions::xsd())) {
                     if let Ok(regex) = Regex::new(&rust_pattern) {
+                        return regex.is_match(value);
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Test if a value matches this pattern
+    #[cfg(feature = "xsd11")]
+    pub fn matches(&self, value: &str) -> bool {
+        match &self.compiled {
+            Some(regex) => regex.is_match(value),
+            None => {
+                // Try to compile on-the-fly (fallback): validate XSD, then anchor
+                if regexml::Regex::xsd(&self.value, "").is_ok() {
+                    let anchored = format!("^(?:{})$", self.value);
+                    if let Ok(regex) = regexml::Regex::xpath(&anchored, "") {
                         return regex.is_match(value);
                     }
                 }
@@ -1972,9 +2049,10 @@ mod tests {
     }
 
     // =========================================================================
-    // XSD pattern to Rust conversion tests
+    // XSD pattern to Rust conversion tests (XSD 1.0 path only)
     // =========================================================================
 
+    #[cfg(not(feature = "xsd11"))]
     #[test]
     fn test_xsd_pattern_anchoring() {
         let rust = convert_xml_pattern("abc", ConvertOptions::xsd());
@@ -1982,12 +2060,14 @@ mod tests {
         assert!(rust.ends_with('$'));
     }
 
+    #[cfg(not(feature = "xsd11"))]
     #[test]
     fn test_xsd_pattern_initial_name_char() {
         let rust = convert_xml_pattern(r"\i", ConvertOptions::xsd());
         assert!(rust.contains("[A-Za-z_:]"));
     }
 
+    #[cfg(not(feature = "xsd11"))]
     #[test]
     fn test_xsd_pattern_name_char() {
         let rust = convert_xml_pattern(r"\c", ConvertOptions::xsd());
@@ -1995,6 +2075,7 @@ mod tests {
         assert!(rust.contains(r"[A-Za-z0-9._:\-]"));
     }
 
+    #[cfg(not(feature = "xsd11"))]
     #[test]
     fn test_xsd_pattern_standard_escapes() {
         let rust = convert_xml_pattern(r"\d+\s*", ConvertOptions::xsd());

@@ -5,11 +5,10 @@
 //! - fn:replace($input, $pattern, $replacement, $flags?) - replace matches
 //! - fn:tokenize($input, $pattern, $flags?) - split string by pattern
 //!
-//! Uses the `regex` crate for pattern matching.
+//! Uses the `regexml` crate for native XML Schema 1.1 regex with full Unicode support.
 
-use regex::{Regex, RegexBuilder};
+use regexml::Regex;
 
-use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
@@ -51,13 +50,7 @@ pub fn matches<N: DomNavigator>(
     // Build the regex
     let regex = build_regex(&pattern, flags_str)?;
 
-    // `^$` with multiline mode should match explicit blank lines, but not a
-    // synthetic empty line that exists only at end-of-input after a trailing LF.
-    let result = if should_use_strict_multiline_empty_line_match(&pattern, flags_str) {
-        matches_empty_line_in_multiline_mode(&input)
-    } else {
-        regex.is_match(&input)
-    };
+    let result = regex.is_match(&input);
 
     Ok(XPathValue::boolean(result))
 }
@@ -95,24 +88,19 @@ pub fn replace<N: DomNavigator>(
     // Get input (first argument)
     let input = atomize_to_string(args.pop().unwrap())?;
 
-    // Validate replacement string syntax
-    validate_replacement_string(&replacement)?;
-
     // Build the regex
     let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
 
-    // Check if pattern matches zero-length string
-    if regex.is_match("") {
-        return Err(XPathError::regex_matches_zero_length(&pattern));
-    }
+    // regexml handles FORX0003 (zero-length match) and FORX0004 (invalid replacement) internally
+    let result = regex.replace_all(&input, &replacement).map_err(|e| match e {
+        regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
+        regexml::Error::InvalidReplacementString(_) => {
+            XPathError::invalid_replacement_string(&replacement)
+        }
+        _ => XPathError::invalid_regex_pattern(&pattern),
+    })?;
 
-    // Convert XPath replacement syntax to Rust regex syntax
-    let rust_replacement = convert_replacement(&replacement);
-
-    // Perform replacement
-    let result = regex.replace_all(&input, rust_replacement.as_str());
-
-    Ok(XPathValue::string(result.into_owned()))
+    Ok(XPathValue::string(result))
 }
 
 /// fn:tokenize($input as xs:string?, $pattern as xs:string, $flags as xs:string?) as xs:string*
@@ -151,20 +139,16 @@ pub fn tokenize<N: DomNavigator>(
     // Build the regex
     let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
 
-    // Check if pattern matches zero-length string
-    if regex.is_match("") {
-        return Err(XPathError::regex_matches_zero_length(&pattern));
-    }
-
-    // Split the input
-    let tokens: Vec<&str> = regex.split(&input).collect();
+    // regexml handles FORX0003 (zero-length match) internally
+    let token_iter = regex.tokenize(&input).map_err(|e| match e {
+        regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
+        _ => XPathError::invalid_regex_pattern(&pattern),
+    })?;
 
     // Convert to XPathValue sequence, filtering out empty tokens
-    // (as per XPath 2.0 spec and C# behavior)
-    let items: Vec<XmlItem<N>> = tokens
-        .into_iter()
+    let items: Vec<XmlItem<N>> = token_iter
         .filter(|s| !s.is_empty())
-        .map(|s| XmlItem::Atomic(XmlValue::string(s)))
+        .map(|s| XmlItem::Atomic(XmlValue::string(&s)))
         .collect();
 
     Ok(XPathValue::from_sequence(items))
@@ -174,313 +158,19 @@ pub fn tokenize<N: DomNavigator>(
 // Helper Functions
 // ============================================================================
 
-/// Build a Regex from an XPath pattern and flags.
+/// Build a Regex from an XPath pattern and flags using regexml.
 ///
-/// Converts XSD/XPath regex pattern syntax to Rust regex, handling XSD-specific
-/// character class escapes like `\i` (initial XML name char) and `\c` (XML name char).
+/// regexml natively handles XML Schema regex syntax including:
+/// - Character class subtraction `[A-Z-[OI]]`
+/// - XSD-specific escapes `\i`, `\c`, `\I`, `\C`
+/// - Unicode categories `\p{Lu}`, `\P{Lu}`
+/// - Flag handling (s, m, i, x)
 fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
-    // Validate flags
-    for c in flags.chars() {
-        if !matches!(c, 's' | 'm' | 'i' | 'x') {
-            return Err(XPathError::invalid_regex_flags(flags));
-        }
-    }
-
-    // Normalize XML Schema-specific constructs not directly accepted by Rust's regex.
-    let normalized_pattern = normalize_xpath_pattern(pattern, flags);
-
-    // Convert XSD/XPath pattern to Rust regex (unanchored for XPath)
-    let rust_pattern = convert_xml_pattern(&normalized_pattern, ConvertOptions::xpath());
-
-    // Build regex with flags
-    let mut builder = RegexBuilder::new(&rust_pattern);
-
-    for c in flags.chars() {
-        match c {
-            's' => { builder.dot_matches_new_line(true); }
-            'm' => { builder.multi_line(true); }
-            'i' => { builder.case_insensitive(true); }
-            'x' => { builder.ignore_whitespace(true); }
-            _ => {} // Already validated above
-        }
-    }
-
-    builder
-        .build()
-        .map_err(|_| XPathError::invalid_regex_pattern(pattern))
-}
-
-fn should_use_strict_multiline_empty_line_match(pattern: &str, flags: &str) -> bool {
-    pattern == "^$" && flags.chars().any(|c| c == 'm')
-}
-
-fn matches_empty_line_in_multiline_mode(input: &str) -> bool {
-    if input.is_empty() || input.starts_with('\n') {
-        return true;
-    }
-    input.as_bytes().windows(2).any(|w| w == b"\n\n")
-}
-
-fn normalize_xpath_pattern(pattern: &str, flags: &str) -> String {
-    let with_subtraction = convert_class_subtraction(pattern);
-    if flags.chars().any(|c| c == 'i') {
-        protect_unicode_categories_from_case_insensitive(&with_subtraction)
-    } else {
-        with_subtraction
-    }
-}
-
-/// Convert XML Schema class subtraction syntax `[A-Z-[OI]]` into Rust's
-/// class set intersection syntax `[A-Z&&[^OI]]`.
-fn convert_class_subtraction(pattern: &str) -> String {
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut out = String::with_capacity(pattern.len());
-    let mut i = 0;
-    let mut escaped = false;
-    let mut class_depth = 0usize;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        if escaped {
-            out.push(ch);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if ch == '\\' {
-            out.push(ch);
-            escaped = true;
-            i += 1;
-            continue;
-        }
-
-        match ch {
-            '[' => {
-                class_depth += 1;
-                out.push(ch);
-                i += 1;
-            }
-            ']' => {
-                class_depth = class_depth.saturating_sub(1);
-                out.push(ch);
-                i += 1;
-            }
-            '-' if class_depth > 0 && i + 1 < chars.len() && chars[i + 1] == '[' => {
-                out.push_str("&&[^");
-                class_depth += 1; // consumed nested `[`
-                i += 2;
-            }
-            _ => {
-                out.push(ch);
-                i += 1;
-            }
-        }
-    }
-
-    out
-}
-
-/// In XPath/XSD regexes, case-insensitive mode should not broaden Unicode
-/// general-category tests like `\p{Lu}` / `\P{Lu}`.
-fn protect_unicode_categories_from_case_insensitive(pattern: &str) -> String {
-    if !pattern.contains(r"\p{") && !pattern.contains(r"\P{") {
-        return pattern.to_string();
-    }
-
-    let chars: Vec<char> = pattern.chars().collect();
-    let mut out = String::with_capacity(pattern.len());
-    let mut i = 0;
-    let mut escaped = false;
-    let mut class_depth = 0usize;
-
-    while i < chars.len() {
-        let ch = chars[i];
-        if escaped {
-            out.push(ch);
-            escaped = false;
-            i += 1;
-            continue;
-        }
-
-        if ch == '\\' {
-            if i + 2 < chars.len()
-                && (chars[i + 1] == 'p' || chars[i + 1] == 'P')
-                && chars[i + 2] == '{'
-            {
-                let mut j = i + 3;
-                while j < chars.len() && chars[j] != '}' {
-                    j += 1;
-                }
-                if j < chars.len() {
-                    if class_depth == 0 {
-                        out.push_str("(?-i:");
-                        for cat_ch in &chars[i..=j] {
-                            out.push(*cat_ch);
-                        }
-                        out.push(')');
-                    } else {
-                        for cat_ch in &chars[i..=j] {
-                            out.push(*cat_ch);
-                        }
-                    }
-                    i = j + 1;
-                    continue;
-                }
-            }
-
-            out.push(ch);
-            escaped = true;
-            i += 1;
-            continue;
-        }
-
-        match ch {
-            '[' => {
-                class_depth += 1;
-                out.push(ch);
-            }
-            ']' => {
-                class_depth = class_depth.saturating_sub(1);
-                out.push(ch);
-            }
-            _ => out.push(ch),
-        }
-        i += 1;
-    }
-
-    out
-}
-
-/// Validate XPath replacement string syntax.
-///
-/// In XPath:
-/// - $0, $1-$9 reference captured groups (must have digits)
-/// - $$ is a literal $
-/// - \\ is a literal \
-/// - \$ is a literal $
-/// - A $ not followed by digit or $ is an error (FORX0004)
-/// - A $ at end of string is an error (FORX0004)
-/// - A \ not followed by \ or $ is an error (FORX0004)
-/// - A \ at end of string is an error (FORX0004)
-fn validate_replacement_string(replacement: &str) -> Result<(), XPathError> {
-    let chars: Vec<char> = replacement.chars().collect();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            '$' => {
-                // Must be followed by digit or $
-                if i + 1 >= chars.len() {
-                    // Trailing $ is invalid
-                    return Err(XPathError::invalid_replacement_string(replacement));
-                }
-                let next = chars[i + 1];
-                if next == '$' {
-                    // $$ - literal $
-                    i += 2;
-                } else if next.is_ascii_digit() {
-                    // $N - group reference, consume all following digits
-                    i += 2;
-                    while i < chars.len() && chars[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                } else {
-                    // $ followed by invalid character
-                    return Err(XPathError::invalid_replacement_string(replacement));
-                }
-            }
-            '\\' => {
-                // Must be followed by \ or $
-                if i + 1 >= chars.len() {
-                    // Trailing \ is invalid
-                    return Err(XPathError::invalid_replacement_string(replacement));
-                }
-                let next = chars[i + 1];
-                if next != '\\' && next != '$' {
-                    return Err(XPathError::invalid_replacement_string(replacement));
-                }
-                i += 2;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Convert XPath replacement syntax to Rust regex replacement syntax.
-///
-/// XPath: $1, $2, etc. for groups; $$ for literal $; \\ for literal \; \$ for literal $
-/// Rust:  $1, ${1}, etc. for groups; $$ for literal $
-fn convert_replacement(replacement: &str) -> String {
-    let chars: Vec<char> = replacement.chars().collect();
-    let mut result = String::new();
-    let mut i = 0;
-
-    while i < chars.len() {
-        match chars[i] {
-            '$' => {
-                if i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    if next.is_ascii_digit() {
-                        // $N -> ${N} so that following literal chars aren't
-                        // misinterpreted as part of the group name by the
-                        // Rust regex crate (e.g. "$1c" → "${1}c")
-                        result.push_str("${");
-                        // Collect all digits for the group number
-                        let mut j = i + 1;
-                        while j < chars.len() && chars[j].is_ascii_digit() {
-                            result.push(chars[j]);
-                            j += 1;
-                        }
-                        result.push('}');
-                        i = j;
-                    } else if next == '$' {
-                        // $$ -> $$ (literal $)
-                        result.push_str("$$");
-                        i += 2;
-                    } else {
-                        // Should not happen if validate_replacement_string was called
-                        result.push(chars[i]);
-                        i += 1;
-                    }
-                } else {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-            }
-            '\\' => {
-                if i + 1 < chars.len() {
-                    let next = chars[i + 1];
-                    if next == '\\' {
-                        // \\ -> \ (literal backslash)
-                        result.push('\\');
-                        i += 2;
-                    } else if next == '$' {
-                        // \$ -> $$ (literal $, escaped in Rust as $$)
-                        result.push_str("$$");
-                        i += 2;
-                    } else {
-                        // Should not happen if validate_replacement_string was called
-                        result.push(chars[i]);
-                        i += 1;
-                    }
-                } else {
-                    result.push(chars[i]);
-                    i += 1;
-                }
-            }
-            _ => {
-                result.push(chars[i]);
-                i += 1;
-            }
-        }
-    }
-
-    result
+    Regex::xpath(pattern, flags).map_err(|e| match e {
+        regexml::Error::InvalidFlags(_) => XPathError::invalid_regex_flags(flags),
+        regexml::Error::Syntax(_) => XPathError::invalid_regex_pattern(pattern),
+        _ => XPathError::invalid_regex_pattern(pattern),
+    })
 }
 
 #[cfg(test)]
@@ -721,7 +411,7 @@ mod tests {
             &mut ctx,
             vec![
                 XPathValue::string("hello world"),
-                XPathValue::string("(\\w+) (\\w+)"),
+                XPathValue::string("([a-z]+) ([a-z]+)"),
                 XPathValue::string("$2 $1"),
             ],
         ).unwrap();
@@ -835,36 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_replacement_valid() {
-        assert!(validate_replacement_string("hello").is_ok());
-        assert!(validate_replacement_string("$1$2").is_ok());
-        assert!(validate_replacement_string("$$").is_ok());
-        assert!(validate_replacement_string("\\\\").is_ok());
-        assert!(validate_replacement_string("\\$").is_ok());
-        assert!(validate_replacement_string("a$1b").is_ok());
-    }
-
-    #[test]
-    fn test_validate_replacement_invalid() {
-        assert!(validate_replacement_string("$").is_err());
-        assert!(validate_replacement_string("$x").is_err());
-        assert!(validate_replacement_string("\\").is_err());
-        assert!(validate_replacement_string("\\x").is_err());
-    }
-
-    #[test]
-    fn test_convert_replacement() {
-        assert_eq!(convert_replacement("hello"), "hello");
-        assert_eq!(convert_replacement("$1"), "${1}");
-        assert_eq!(convert_replacement("$12"), "${12}");
-        assert_eq!(convert_replacement("$$"), "$$");
-        assert_eq!(convert_replacement("\\\\"), "\\");
-        assert_eq!(convert_replacement("\\$"), "$$");
-        assert_eq!(convert_replacement("$1 and $2"), "${1} and ${2}");
-        assert_eq!(convert_replacement("$1c$2"), "${1}c${2}");
-    }
-
-    #[test]
     fn test_tokenize_filters_empty_tokens() {
         // Test that tokenize filters out empty tokens from leading/trailing delimiters
         let names = NameTable::new();
@@ -915,13 +575,6 @@ mod tests {
             }
             _ => panic!("Expected sequence"),
         }
-    }
-
-    #[test]
-    fn test_validate_replacement_trailing_dollar() {
-        // Trailing $ at end of string should be rejected
-        assert!(validate_replacement_string("hello$").is_err());
-        assert!(validate_replacement_string("a$1$").is_err());
     }
 
     // =========================================================================
