@@ -302,11 +302,15 @@ pub fn parse_schema_with_chameleon(
     })?;
     drop(state);
 
+    // Record the declared targetNamespace before chameleon adoption.
+    let declared_target_namespace = root_schema.target_namespace;
+
     // Chameleon pre-processing (§4.2.3 clause 2.3): if the parsed document
     // has no targetNamespace and the includer specifies one, adopt it.
-    let is_chameleon = root_schema.target_namespace.is_none() && chameleon_namespace.is_some();
-    if is_chameleon {
-        root_schema.target_namespace = chameleon_namespace;
+    if root_schema.target_namespace.is_none() {
+        if let Some(ns) = chameleon_namespace {
+            root_schema.target_namespace = Some(ns);
+        }
     }
 
     // Add the source map to storage now that parsing is complete
@@ -315,7 +319,7 @@ pub fn parse_schema_with_chameleon(
     debug_assert_eq!(doc_id, added_id, "Document ID mismatch");
 
     let mut doc = assemble_schema(schema_set, doc_id, base_uri, root_schema)?;
-    doc.is_chameleon = is_chameleon;
+    doc.declared_target_namespace = declared_target_namespace;
     schema_set.documents.push(doc);
 
     Ok(doc_id)

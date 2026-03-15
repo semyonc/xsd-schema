@@ -647,14 +647,16 @@ pub struct SchemaDocument {
     /// Base URI (location) of this document
     pub base_uri: String,
 
-    /// Target namespace (None = chameleon or no namespace)
-    pub target_namespace: Option<NameId>,
+    /// The `targetNamespace` as declared in the `<xs:schema>` element.
+    /// `None` when the schema document omits `targetNamespace`.
+    /// Preserved even after chameleon adoption so the original fact
+    /// "this document had no declared namespace" is never lost.
+    pub declared_target_namespace: Option<NameId>,
 
-    /// Whether this document had no `targetNamespace` and adopted one
-    /// via chameleon include pre-processing (§4.2.3 clause 2.3).
-    /// Used for cache invalidation when the same schema is included
-    /// from multiple different target namespaces.
-    pub is_chameleon: bool,
+    /// Effective target namespace after chameleon pre-processing (§4.2.3).
+    /// Equals `declared_target_namespace` for non-chameleon documents;
+    /// set to the includer's namespace for chameleon-adopted documents.
+    pub target_namespace: Option<NameId>,
 
     /// Schema-level attributes
     pub version: Option<String>,
@@ -693,13 +695,19 @@ pub struct SchemaDocument {
 }
 
 impl SchemaDocument {
+    /// Whether this document had no declared `targetNamespace` and adopted
+    /// one via chameleon include pre-processing (§4.2.3 clause 2.3).
+    pub fn is_chameleon(&self) -> bool {
+        self.declared_target_namespace.is_none() && self.target_namespace.is_some()
+    }
+
     /// Create a new schema document
     pub fn new(id: DocumentId, base_uri: String) -> Self {
         Self {
             id,
             base_uri,
+            declared_target_namespace: None,
             target_namespace: None,
-            is_chameleon: false,
             version: None,
             element_form_default: FormChoice::default(),
             attribute_form_default: FormChoice::default(),

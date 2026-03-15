@@ -1042,7 +1042,7 @@ fn check_loaded_cache(
     // Then check primary cache with reusability check.
     if let Some(&id) = schema_set.loaded_locations.get(resolved) {
         let reusable = schema_set.documents.get(id as usize).is_none_or(|doc| {
-            if doc.is_chameleon {
+            if doc.is_chameleon() {
                 false
             } else if doc.target_namespace.is_some() {
                 true
@@ -1074,7 +1074,7 @@ fn mark_loaded_chameleon_aware(
     let doc_is_chameleon = schema_set
         .documents
         .get(doc_id as usize)
-        .is_some_and(|doc| doc.is_chameleon);
+        .is_some_and(|doc| doc.is_chameleon());
     if doc_is_chameleon {
         if let Some(ns) = chameleon_namespace {
             schema_set
@@ -2191,8 +2191,8 @@ mod tests {
         );
 
         // Both should be flagged as chameleon
-        assert!(schema_set.documents[chameleon_a_id as usize].is_chameleon);
-        assert!(schema_set.documents[chameleon_b_id as usize].is_chameleon);
+        assert!(schema_set.documents[chameleon_a_id as usize].is_chameleon());
+        assert!(schema_set.documents[chameleon_b_id as usize].is_chameleon());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2256,7 +2256,7 @@ mod tests {
         let raw_id = res1.loaded[0];
 
         // The raw load should NOT be chameleon
-        assert!(!schema_set.documents[raw_id as usize].is_chameleon);
+        assert!(!schema_set.documents[raw_id as usize].is_chameleon());
         assert!(schema_set.documents[raw_id as usize].target_namespace.is_none());
 
         // Second: load from namespace-bearing context (chameleon adoption)
@@ -2283,7 +2283,7 @@ mod tests {
             Some(ns_name),
             "Chameleon copy should adopt urn:test namespace"
         );
-        assert!(schema_set.documents[chameleon_id as usize].is_chameleon);
+        assert!(schema_set.documents[chameleon_id as usize].is_chameleon());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
