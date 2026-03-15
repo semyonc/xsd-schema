@@ -14,6 +14,9 @@ use crate::namespace::table::well_known;
 use crate::parser::location::{SourceMapStorage, SourceRef};
 use crate::namespace::QualifiedName;
 use crate::schema::annotation::Annotation;
+use crate::schema::composition::{
+    CompositionEdge, ComponentIdentity, DocumentComponentIndex, EffectiveComponent,
+};
 use crate::schema::wildcard::ElementWildcard;
 use crate::arenas::SchemaArenas;
 use crate::types::{BuiltinTypes, XmlTypeCode};
@@ -114,6 +117,14 @@ pub struct SchemaSet {
     /// Loaded schema locations (for cycle detection)
     pub loaded_locations: HashMap<String, DocumentId>,
 
+    /// Composition graph edges recorded during directive resolution
+    pub composition_edges: Vec<CompositionEdge>,
+
+    /// Effective component map with provenance (populated by composition phase).
+    /// Keyed by `ComponentIdentity` so redefine/override *replaces* the entry
+    /// instead of appending, producing the final visible component set.
+    pub effective_components: HashMap<ComponentIdentity, EffectiveComponent>,
+
     /// Built-in type registry with well-known type IDs
     builtin_types: Option<BuiltinTypes>,
 }
@@ -144,6 +155,8 @@ impl SchemaSet {
             xsd_version: version,
             arenas: SchemaArenas::new(),
             loaded_locations: HashMap::new(),
+            composition_edges: Vec::new(),
+            effective_components: HashMap::new(),
             builtin_types: None,
         };
 
@@ -655,6 +668,11 @@ pub struct SchemaDocument {
     /// Schema-level annotations
     pub annotations: Vec<Annotation>,
 
+    /// Per-document index of top-level components declared in this document.
+    /// Populated during assembly; used for document-scoped lookup in
+    /// `apply_redefine()` and `apply_override()`.
+    pub component_index: DocumentComponentIndex,
+
     /// Source reference for error reporting
     pub source: Option<SourceRef>,
 }
@@ -681,6 +699,7 @@ impl SchemaDocument {
             overrides: Vec::new(),
             default_open_content: None,
             annotations: Vec::new(),
+            component_index: DocumentComponentIndex::new(),
             source: None,
         }
     }
@@ -768,6 +787,7 @@ pub struct ImportDirective {
 pub struct RedefineDirective {
     pub source: Option<SourceRef>,
     pub schema_location: String,
+    pub resolved_doc_id: Option<DocumentId>,
     pub simple_types: Vec<SimpleTypeKey>,
     pub complex_types: Vec<ComplexTypeKey>,
     pub groups: Vec<ModelGroupKey>,
@@ -779,6 +799,7 @@ pub struct RedefineDirective {
 pub struct OverrideDirective {
     pub source: Option<SourceRef>,
     pub schema_location: String,
+    pub resolved_doc_id: Option<DocumentId>,
     pub components: Vec<OverrideComponent>,
 }
 

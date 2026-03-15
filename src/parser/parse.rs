@@ -209,6 +209,21 @@ pub fn parse_schema_with_config(
     schema_set: &mut SchemaSet,
     config: &ParserConfig,
 ) -> SchemaResult<DocumentId> {
+    parse_schema_with_chameleon(xml, base_uri, schema_set, config, None)
+}
+
+/// Parse an XSD schema document with chameleon namespace support.
+///
+/// If `chameleon_namespace` is `Some` and the parsed document has no
+/// `targetNamespace`, the chameleon namespace is adopted per §4.2.3
+/// clause 2.3 (chameleon include pre-processing).
+pub fn parse_schema_with_chameleon(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: &ParserConfig,
+    chameleon_namespace: Option<NameId>,
+) -> SchemaResult<DocumentId> {
     // Override parser version from the single source of truth
     let mut config = config.clone();
     config.xsd_version = schema_set.xsd_version;
@@ -282,10 +297,18 @@ pub fn parse_schema_with_config(
     // If we collected errors but have a result, we still return success
     // The errors are stored in schema_set for later retrieval
 
-    let root_schema = state.root_schema.take().ok_or_else(|| {
+    let mut root_schema = state.root_schema.take().ok_or_else(|| {
         SchemaError::internal("No schema result produced during parsing")
     })?;
     drop(state);
+
+    // Chameleon pre-processing (§4.2.3 clause 2.3): if the parsed document
+    // has no targetNamespace and the includer specifies one, adopt it.
+    if root_schema.target_namespace.is_none() {
+        if let Some(ns) = chameleon_namespace {
+            root_schema.target_namespace = Some(ns);
+        }
+    }
 
     // Add the source map to storage now that parsing is complete
     // Note: We ensured doc_id matches the position where this will be added

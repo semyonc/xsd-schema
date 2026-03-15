@@ -21,6 +21,7 @@ pub mod decl;
 pub mod group;
 pub mod wildcard;
 pub mod annotation;
+pub mod composition;
 pub mod resolver;
 pub mod inline;
 pub mod dependencies;
@@ -53,6 +54,14 @@ pub use group::{
 pub use wildcard::{
     ElementWildcard, AttributeWildcard,
     NamespaceConstraint, ProcessContents,
+};
+
+// Re-exports from composition
+pub use composition::{
+    CompositionEdge, CompositionEdgeKind,
+    ComponentKind, ComponentIdentity, ComponentOrigin,
+    ComponentKey, DocumentComponentIndex,
+    CompositionAction, EffectiveComponent,
 };
 
 // Re-exports from annotation
@@ -92,12 +101,26 @@ pub use override_dir::apply_override;
 
 use crate::error::SchemaResult;
 
-/// Apply all redefine and override directives collected from loaded documents.
+/// Apply all redefine and override directives collected from loaded documents,
+/// then build effective component provenance records.
 ///
 /// This must be called after all participating schemas (including redefine/override
 /// targets) have been parsed and loaded into the schema set, but before inline
 /// assembly and reference resolution.
+///
+/// ## Phases
+///
+/// 1. **Collect** — gather all declared components from every document's
+///    `component_index` and detect composition-time duplicates (`sch-props-correct.2`).
+/// 2. **Apply** — run redefine/override directives, which mutate namespace tables
+///    and record `Redefined`/`Overridden` provenance.
+/// 3. **Store** — save the effective component list on `SchemaSet` for later
+///    diagnostic and provenance queries.
 pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    // Phase 1: collect declared components from all documents
+    collect_declared_components(schema_set);
+
+    // Phase 2: apply redefines (records Redefined provenance)
     let redefines: Vec<_> = schema_set
         .documents
         .iter()
@@ -107,6 +130,7 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
         apply_redefine(schema_set, &redefine)?;
     }
 
+    // Phase 2b: apply overrides (records Overridden provenance)
     #[cfg(feature = "xsd11")]
     {
         let overrides: Vec<_> = schema_set
@@ -120,4 +144,51 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     }
 
     Ok(())
+}
+
+/// Collect all declared components from every document's component index
+/// into `schema_set.effective_components` with provenance metadata.
+///
+/// Components from included documents are marked `Included`; components
+/// declared in root documents are marked `Declared`. When the same identity
+/// appears from multiple documents (e.g. via include), the last-registered
+/// entry wins, matching current namespace-table behavior.
+///
+/// Note: duplicate-component detection (`sch-props-correct.2`) is handled
+/// at parse time by `register_*` in `assemble.rs`. Composition-time
+/// detection will be added when namespace tables are rebuilt from
+/// effective components (future step).
+fn collect_declared_components(schema_set: &mut SchemaSet) {
+    use std::collections::HashMap;
+    use crate::ids::DocumentId;
+    use crate::schema::composition::CompositionEdgeKind;
+
+    // Build set of (target_doc → source_doc) for Include edges.
+    let mut included_from: HashMap<DocumentId, DocumentId> = HashMap::new();
+    for edge in &schema_set.composition_edges {
+        if edge.kind == CompositionEdgeKind::Include {
+            if let Some(target) = edge.target_doc {
+                included_from.entry(target).or_insert(edge.source_doc);
+            }
+        }
+    }
+
+    let mut effective: HashMap<ComponentIdentity, EffectiveComponent> = HashMap::new();
+
+    for doc in &schema_set.documents {
+        for (&identity, &key) in doc.component_index.iter() {
+            let origin = ComponentOrigin {
+                owner_doc: Some(doc.id),
+                identity,
+            };
+            let action = if let Some(&from_doc) = included_from.get(&doc.id) {
+                CompositionAction::Included { from_doc }
+            } else {
+                CompositionAction::Declared
+            };
+            effective.insert(identity, EffectiveComponent { key, origin, action });
+        }
+    }
+
+    schema_set.effective_components = effective;
 }

@@ -63,7 +63,7 @@ pub use structure::{
 // Re-exports from resolver
 pub use resolver::{
     SchemaResolver, ResolverConfig, SchemaCatalog, CatalogEntry,
-    ResolutionResult, resolve_all_directives,
+    ResolutionResult, resolve_all_directives, fixup_composition_edges,
     // Loader trait and implementations
     SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
 };

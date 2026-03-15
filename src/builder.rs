@@ -26,7 +26,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::DocumentId;
 use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
-    resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
+    resolve_all_directives, fixup_composition_edges, ResolverConfig, SchemaLoader, SchemaResolver,
 };
 #[cfg(feature = "async")]
 use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
@@ -254,6 +254,9 @@ impl SchemaSetBuilder {
             self.resolve_directives_recursive(doc_id)?;
         }
 
+        // Fixup cycle edges now that all documents have been loaded
+        fixup_composition_edges(&mut self.schema_set);
+
         // Phases 2-5: Delegate to the pipeline's shared processing function
         // (redefine/override, inline assembly, reference resolution, particle allocation)
         let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
@@ -336,6 +339,9 @@ impl SchemaSetBuilder {
         for doc_id in pending {
             self.resolve_directives_recursive_async(doc_id).await?;
         }
+
+        // Fixup cycle edges now that all documents have been loaded
+        fixup_composition_edges(&mut self.schema_set);
 
         // Phases 2-5: Delegate to the pipeline's shared processing function (sync)
         let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;

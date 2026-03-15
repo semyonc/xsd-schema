@@ -21,6 +21,9 @@ use crate::parser::frames::{
 };
 use crate::parser::location::SourceRef;
 use crate::namespace::QualifiedName;
+use crate::schema::composition::{
+    ComponentIdentity, ComponentKey, ComponentKind, DocumentComponentIndex,
+};
 use crate::schema::model::{
     FormChoice, ImportDirective, IncludeDirective, OverrideComponent, OverrideDirective,
     RedefineDirective, SchemaDocument,
@@ -44,6 +47,8 @@ pub struct SchemaAssembler<'a> {
     /// Identity constraint names seen in this document (for uniqueness checking)
     /// XSD constraint: Identity Constraint Name Uniqueness - names must be unique per schema document
     identity_constraint_names: HashSet<NameId>,
+    /// Per-document component index being built during assembly
+    doc_components: DocumentComponentIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +70,7 @@ impl<'a> SchemaAssembler<'a> {
             block_default,
             final_default,
             identity_constraint_names: HashSet::new(),
+            doc_components: DocumentComponentIndex::new(),
         }
     }
 
@@ -88,6 +94,7 @@ impl<'a> SchemaAssembler<'a> {
             self.assemble_component(component)?;
         }
 
+        doc.component_index = std::mem::take(&mut self.doc_components);
         Ok(doc)
     }
 
@@ -509,7 +516,24 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        let kind = match key {
+            TypeKey::Simple(_) => ComponentKind::SimpleType,
+            TypeKey::Complex(_) => ComponentKind::ComplexType,
+        };
+        self.record_component(kind, name, ComponentKey::Type(key));
         Ok(())
+    }
+
+    /// Record a component in the per-document component index.
+    fn record_component(&mut self, kind: ComponentKind, name: NameId, key: ComponentKey) {
+        self.doc_components.insert(
+            ComponentIdentity {
+                kind,
+                name,
+                namespace: self.target_namespace,
+            },
+            key,
+        );
     }
 
     fn register_element(
@@ -528,6 +552,7 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        self.record_component(ComponentKind::Element, name, ComponentKey::Element(key));
         Ok(())
     }
 
@@ -547,6 +572,7 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        self.record_component(ComponentKind::Attribute, name, ComponentKey::Attribute(key));
         Ok(())
     }
 
@@ -566,6 +592,7 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        self.record_component(ComponentKind::ModelGroup, name, ComponentKey::ModelGroup(key));
         Ok(())
     }
 
@@ -585,6 +612,7 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        self.record_component(ComponentKind::AttributeGroup, name, ComponentKey::AttributeGroup(key));
         Ok(())
     }
 
@@ -604,6 +632,7 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
+        self.record_component(ComponentKind::Notation, name, ComponentKey::Notation(key));
         Ok(())
     }
 }
@@ -736,6 +765,7 @@ pub fn convert_directives(
                 redefines.push(RedefineDirective {
                     source: red.source.clone(),
                     schema_location: red.schema_location.clone(),
+                    resolved_doc_id: None,
                     simple_types,
                     complex_types,
                     groups,
@@ -818,6 +848,7 @@ fn convert_override(
     Ok(OverrideDirective {
         source: override_result.source.clone(),
         schema_location: override_result.schema_location.clone(),
+        resolved_doc_id: None,
         components,
     })
 }

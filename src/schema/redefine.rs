@@ -18,6 +18,9 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
+use crate::schema::composition::{
+    ComponentKey, ComponentKind, record_provenance, redefined_action,
+};
 use crate::schema::model::RedefineDirective;
 use crate::schema::SchemaSet;
 
@@ -25,28 +28,31 @@ use crate::schema::SchemaSet;
 ///
 /// This replaces the original components with the redefined versions,
 /// after validating the redefinition constraints.
+///
+/// Uses document-scoped lookup via `resolved_doc_id` when available,
+/// falling back to global namespace table lookup for backward compatibility.
 pub fn apply_redefine(
     schema_set: &mut SchemaSet,
     redefine: &RedefineDirective,
 ) -> SchemaResult<()> {
-    // Process simple type redefinitions
+    let target_doc_id = redefine.resolved_doc_id;
+    // The redefining document is the one that contains the xs:redefine element
+    let redefining_doc_id = redefine.source.as_ref().map(|s| s.doc_id);
+
     for simple_key in &redefine.simple_types {
-        apply_simple_type_redefine(schema_set, *simple_key)?;
+        apply_simple_type_redefine(schema_set, *simple_key, target_doc_id, redefining_doc_id)?;
     }
 
-    // Process complex type redefinitions
     for complex_key in &redefine.complex_types {
-        apply_complex_type_redefine(schema_set, *complex_key)?;
+        apply_complex_type_redefine(schema_set, *complex_key, target_doc_id, redefining_doc_id)?;
     }
 
-    // Process model group redefinitions
     for group_key in &redefine.groups {
-        apply_model_group_redefine(schema_set, *group_key)?;
+        apply_model_group_redefine(schema_set, *group_key, target_doc_id, redefining_doc_id)?;
     }
 
-    // Process attribute group redefinitions
     for attr_group_key in &redefine.attribute_groups {
-        apply_attribute_group_redefine(schema_set, *attr_group_key)?;
+        apply_attribute_group_redefine(schema_set, *attr_group_key, target_doc_id, redefining_doc_id)?;
     }
 
     Ok(())
@@ -56,6 +62,8 @@ pub fn apply_redefine(
 fn apply_simple_type_redefine(
     schema_set: &mut SchemaSet,
     new_key: SimpleTypeKey,
+    target_doc_id: Option<DocumentId>,
+    redefining_doc_id: Option<DocumentId>,
 ) -> SchemaResult<()> {
     let new_type = schema_set
         .arenas
@@ -72,25 +80,38 @@ fn apply_simple_type_redefine(
     })?;
     let namespace = new_type.target_namespace;
 
-    // Find the original type
-    let original_key = schema_set.lookup_type(namespace, name).ok_or_else(|| {
+    // Kind-specific, document-scoped lookup; global fallback only when
+    // resolved_doc_id is None (pre-loaded schemas without resolution).
+    let _original_key = match target_doc_id {
+        Some(id) => schema_set
+            .documents
+            .get(id as usize)
+            .and_then(|doc| doc.component_index.lookup_simple_type(namespace, name))
+            .map(TypeKey::Simple),
+        None => schema_set.lookup_type(namespace, name),
+    }
+    .ok_or_else(|| {
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original type '{}' not found for redefinition",
+                "Original simple type '{}' not found for redefinition",
                 schema_set.name_table.resolve(name)
             ),
             None,
         )
     })?;
 
-    // Validate: the new type must derive from the original (self-reference)
     validate_self_derivation_simple(schema_set, new_key, name)?;
 
-    // Replace in namespace table
     let ns_table = schema_set.get_or_create_namespace(namespace);
-    let _ = original_key; // Suppress unused warning - we've validated it exists
     ns_table.register_type(name, TypeKey::Simple(new_key));
+
+    record_provenance(
+        &mut schema_set.effective_components,
+        ComponentKey::Type(TypeKey::Simple(new_key)),
+        ComponentKind::SimpleType, namespace, name, redefining_doc_id,
+        redefined_action(redefining_doc_id, ComponentKind::SimpleType, name, namespace, target_doc_id),
+    );
 
     Ok(())
 }
@@ -99,6 +120,8 @@ fn apply_simple_type_redefine(
 fn apply_complex_type_redefine(
     schema_set: &mut SchemaSet,
     new_key: ComplexTypeKey,
+    target_doc_id: Option<DocumentId>,
+    redefining_doc_id: Option<DocumentId>,
 ) -> SchemaResult<()> {
     let new_type = schema_set
         .arenas
@@ -115,24 +138,36 @@ fn apply_complex_type_redefine(
     })?;
     let namespace = new_type.target_namespace;
 
-    // Find and validate original exists
-    let _original_key = schema_set.lookup_type(namespace, name).ok_or_else(|| {
+    let _original_key = match target_doc_id {
+        Some(id) => schema_set
+            .documents
+            .get(id as usize)
+            .and_then(|doc| doc.component_index.lookup_complex_type(namespace, name))
+            .map(TypeKey::Complex),
+        None => schema_set.lookup_type(namespace, name),
+    }
+    .ok_or_else(|| {
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original type '{}' not found for redefinition",
+                "Original complex type '{}' not found for redefinition",
                 schema_set.name_table.resolve(name)
             ),
             None,
         )
     })?;
 
-    // Validate: the new type must derive from the original (self-reference)
     validate_self_derivation_complex(schema_set, new_key, name)?;
 
-    // Replace in namespace table
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_type(name, TypeKey::Complex(new_key));
+
+    record_provenance(
+        &mut schema_set.effective_components,
+        ComponentKey::Type(TypeKey::Complex(new_key)),
+        ComponentKind::ComplexType, namespace, name, redefining_doc_id,
+        redefined_action(redefining_doc_id, ComponentKind::ComplexType, name, namespace, target_doc_id),
+    );
 
     Ok(())
 }
@@ -141,6 +176,8 @@ fn apply_complex_type_redefine(
 fn apply_model_group_redefine(
     schema_set: &mut SchemaSet,
     new_key: ModelGroupKey,
+    target_doc_id: Option<DocumentId>,
+    redefining_doc_id: Option<DocumentId>,
 ) -> SchemaResult<()> {
     let new_group = schema_set
         .arenas
@@ -157,26 +194,35 @@ fn apply_model_group_redefine(
     })?;
     let namespace = new_group.target_namespace;
 
-    // Validate original exists
-    let _original_key = schema_set
-        .lookup_model_group(namespace, name)
-        .ok_or_else(|| {
-            SchemaError::structural(
-                "src-redefine",
-                format!(
-                    "Original group '{}' not found for redefinition",
-                    schema_set.name_table.resolve(name)
-                ),
-                None,
-            )
-        })?;
+    let _original_key = match target_doc_id {
+        Some(id) => schema_set
+            .documents
+            .get(id as usize)
+            .and_then(|doc| doc.component_index.lookup_model_group(namespace, name)),
+        None => schema_set.lookup_model_group(namespace, name),
+    }
+    .ok_or_else(|| {
+        SchemaError::structural(
+            "src-redefine",
+            format!(
+                "Original group '{}' not found for redefinition",
+                schema_set.name_table.resolve(name)
+            ),
+            None,
+        )
+    })?;
 
-    // Validate: group must contain exactly one reference to itself
     validate_self_reference_group(schema_set, new_key, name)?;
 
-    // Replace in namespace table
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_model_group(name, new_key);
+
+    record_provenance(
+        &mut schema_set.effective_components,
+        ComponentKey::ModelGroup(new_key),
+        ComponentKind::ModelGroup, namespace, name, redefining_doc_id,
+        redefined_action(redefining_doc_id, ComponentKind::ModelGroup, name, namespace, target_doc_id),
+    );
 
     Ok(())
 }
@@ -185,6 +231,8 @@ fn apply_model_group_redefine(
 fn apply_attribute_group_redefine(
     schema_set: &mut SchemaSet,
     new_key: AttributeGroupKey,
+    target_doc_id: Option<DocumentId>,
+    redefining_doc_id: Option<DocumentId>,
 ) -> SchemaResult<()> {
     let new_group = schema_set
         .arenas
@@ -201,26 +249,35 @@ fn apply_attribute_group_redefine(
     })?;
     let namespace = new_group.target_namespace;
 
-    // Validate original exists
-    let _original_key = schema_set
-        .lookup_attribute_group(namespace, name)
-        .ok_or_else(|| {
-            SchemaError::structural(
-                "src-redefine",
-                format!(
-                    "Original attribute group '{}' not found for redefinition",
-                    schema_set.name_table.resolve(name)
-                ),
-                None,
-            )
-        })?;
+    let _original_key = match target_doc_id {
+        Some(id) => schema_set
+            .documents
+            .get(id as usize)
+            .and_then(|doc| doc.component_index.lookup_attribute_group(namespace, name)),
+        None => schema_set.lookup_attribute_group(namespace, name),
+    }
+    .ok_or_else(|| {
+        SchemaError::structural(
+            "src-redefine",
+            format!(
+                "Original attribute group '{}' not found for redefinition",
+                schema_set.name_table.resolve(name)
+            ),
+            None,
+        )
+    })?;
 
-    // Validate: attribute group must contain exactly one reference to itself
     validate_self_reference_attribute_group(schema_set, new_key, name)?;
 
-    // Replace in namespace table
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_attribute_group(name, new_key);
+
+    record_provenance(
+        &mut schema_set.effective_components,
+        ComponentKey::AttributeGroup(new_key),
+        ComponentKind::AttributeGroup, namespace, name, redefining_doc_id,
+        redefined_action(redefining_doc_id, ComponentKind::AttributeGroup, name, namespace, target_doc_id),
+    );
 
     Ok(())
 }

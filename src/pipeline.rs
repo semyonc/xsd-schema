@@ -30,7 +30,7 @@
 use crate::error::SchemaResult;
 use crate::ids::DocumentId;
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
-use crate::parser::resolver::{resolve_all_directives, ResolverConfig, SchemaResolver, ResolutionResult};
+use crate::parser::resolver::{resolve_all_directives, fixup_composition_edges, ResolverConfig, SchemaResolver, ResolutionResult};
 #[cfg(feature = "async")]
 use crate::parser::resolver::resolve_all_directives_async;
 use crate::schema::{
@@ -207,6 +207,9 @@ pub fn load_and_process_schema(
             }
         }
 
+        // Fixup cycle edges now that all documents have been loaded
+        fixup_composition_edges(schema_set);
+
         // If there were directive errors and error_recovery is off, return first error
         if !config.parser.error_recovery {
             if let Some(ref dir_stats) = stats.directive_result {
@@ -346,6 +349,9 @@ pub async fn load_and_process_schema_async(
                 }
             }
         }
+
+        // Fixup cycle edges now that all documents have been loaded
+        fixup_composition_edges(schema_set);
 
         if !config.parser.error_recovery {
             if let Some(ref dir_stats) = stats.directive_result {

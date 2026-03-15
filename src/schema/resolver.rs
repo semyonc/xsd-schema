@@ -97,26 +97,34 @@ impl<'a> ReferenceResolver<'a> {
         }
     }
 
+    /// Resolve a component reference by looking up in the schema set's namespace
+    /// tables, returning a `src-resolve` error if not found.
+    fn resolve_ref<K: Copy>(
+        &self,
+        qname: &QNameRef,
+        source: Option<&SourceRef>,
+        kind_label: &str,
+        lookup: impl FnOnce(&SchemaSet, Option<NameId>, NameId) -> Option<K>,
+    ) -> SchemaResult<K> {
+        if let Some(key) = lookup(self.schema_set, qname.namespace, qname.local_name) {
+            return Ok(key);
+        }
+        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
+        let name_str = self.format_qname(qname);
+        Err(SchemaError::structural(
+            "src-resolve",
+            format!("{} '{}' not found", kind_label, name_str),
+            location,
+        ))
+    }
+
     /// Resolve an element reference (QName → ElementKey)
     pub fn resolve_element_ref(
         &self,
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ElementKey> {
-        if let Some(key) = self
-            .schema_set
-            .lookup_element(qname.namespace, qname.local_name)
-        {
-            return Ok(key);
-        }
-
-        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        Err(SchemaError::structural(
-            "src-resolve",
-            format!("Element '{}' not found", name_str),
-            location,
-        ))
+        self.resolve_ref(qname, source, "Element", SchemaSet::lookup_element)
     }
 
     /// Resolve an attribute reference (QName → AttributeKey)
@@ -125,20 +133,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeKey> {
-        if let Some(key) = self
-            .schema_set
-            .lookup_attribute(qname.namespace, qname.local_name)
-        {
-            return Ok(key);
-        }
-
-        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        Err(SchemaError::structural(
-            "src-resolve",
-            format!("Attribute '{}' not found", name_str),
-            location,
-        ))
+        self.resolve_ref(qname, source, "Attribute", SchemaSet::lookup_attribute)
     }
 
     /// Resolve a model group reference (QName → ModelGroupKey)
@@ -147,20 +142,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ModelGroupKey> {
-        if let Some(key) = self
-            .schema_set
-            .lookup_model_group(qname.namespace, qname.local_name)
-        {
-            return Ok(key);
-        }
-
-        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        Err(SchemaError::structural(
-            "src-resolve",
-            format!("Group '{}' not found", name_str),
-            location,
-        ))
+        self.resolve_ref(qname, source, "Group", SchemaSet::lookup_model_group)
     }
 
     /// Resolve an attribute group reference (QName → AttributeGroupKey)
@@ -169,20 +151,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeGroupKey> {
-        if let Some(key) = self
-            .schema_set
-            .lookup_attribute_group(qname.namespace, qname.local_name)
-        {
-            return Ok(key);
-        }
-
-        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        Err(SchemaError::structural(
-            "src-resolve",
-            format!("Attribute group '{}' not found", name_str),
-            location,
-        ))
+        self.resolve_ref(qname, source, "Attribute group", SchemaSet::lookup_attribute_group)
     }
 
     /// Resolve a notation reference (QName → NotationKey)
@@ -191,20 +160,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<NotationKey> {
-        if let Some(key) = self
-            .schema_set
-            .lookup_notation(qname.namespace, qname.local_name)
-        {
-            return Ok(key);
-        }
-
-        let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        Err(SchemaError::structural(
-            "src-resolve",
-            format!("Notation '{}' not found", name_str),
-            location,
-        ))
+        self.resolve_ref(qname, source, "Notation", SchemaSet::lookup_notation)
     }
 
     /// Format a QName for error messages
