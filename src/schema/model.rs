@@ -117,6 +117,12 @@ pub struct SchemaSet {
     /// Loaded schema locations (for cycle detection)
     pub loaded_locations: HashMap<String, DocumentId>,
 
+    /// Secondary cache for chameleon schema variants loaded under different
+    /// target namespaces. Keyed by `(resolved_uri, adopted_namespace)`.
+    /// Allows the same no-namespace schema to be loaded separately for
+    /// each including namespace per §4.2.3.
+    pub chameleon_cache: HashMap<(String, NameId), DocumentId>,
+
     /// Composition graph edges recorded during directive resolution
     pub composition_edges: Vec<CompositionEdge>,
 
@@ -155,6 +161,7 @@ impl SchemaSet {
             xsd_version: version,
             arenas: SchemaArenas::new(),
             loaded_locations: HashMap::new(),
+            chameleon_cache: HashMap::new(),
             composition_edges: Vec::new(),
             effective_components: HashMap::new(),
             builtin_types: None,
@@ -604,7 +611,9 @@ impl SchemaSet {
         if explicit_target_namespace.is_some() {
             return explicit_target_namespace;
         }
-        let doc = source.and_then(|s| self.documents.get(s.doc_id as usize));
+        // Use defaults_doc() so override children read the overridden
+        // document's form defaults per §4.2.5 / F.2 semantics.
+        let doc = source.and_then(|s| self.documents.get(s.defaults_doc() as usize));
         let default_form = doc.map(&form_default).unwrap_or(FormChoice::Unqualified);
         let target_namespace = doc
             .map(|d| d.target_namespace)
@@ -640,6 +649,12 @@ pub struct SchemaDocument {
 
     /// Target namespace (None = chameleon or no namespace)
     pub target_namespace: Option<NameId>,
+
+    /// Whether this document had no `targetNamespace` and adopted one
+    /// via chameleon include pre-processing (§4.2.3 clause 2.3).
+    /// Used for cache invalidation when the same schema is included
+    /// from multiple different target namespaces.
+    pub is_chameleon: bool,
 
     /// Schema-level attributes
     pub version: Option<String>,
@@ -684,6 +699,7 @@ impl SchemaDocument {
             id,
             base_uri,
             target_namespace: None,
+            is_chameleon: false,
             version: None,
             element_form_default: FormChoice::default(),
             attribute_form_default: FormChoice::default(),

@@ -42,11 +42,25 @@ impl SourceSpan {
 pub struct SourceRef {
     pub doc_id: DocumentId,
     pub span: SourceSpan,
+    /// When set, overrides `doc_id` for schema-document-level defaults
+    /// lookup (elementFormDefault, attributeFormDefault, blockDefault,
+    /// finalDefault, defaultAttributes). Used for `xs:override` children
+    /// that are conceptually placed in the overridden document D2 per
+    /// §4.2.5 / F.2 transformation semantics.
+    pub schema_defaults_doc: Option<DocumentId>,
 }
 
 impl SourceRef {
     pub fn new(doc_id: DocumentId, span: SourceSpan) -> Self {
-        Self { doc_id, span }
+        Self { doc_id, span, schema_defaults_doc: None }
+    }
+
+    /// The document ID to use for schema-level defaults lookup.
+    ///
+    /// Returns `schema_defaults_doc` if set (override components),
+    /// otherwise falls back to `doc_id`.
+    pub fn defaults_doc(&self) -> DocumentId {
+        self.schema_defaults_doc.unwrap_or(self.doc_id)
     }
 }
 

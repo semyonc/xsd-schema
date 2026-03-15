@@ -362,7 +362,9 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                 continue;
             }
             match type_def.source.as_ref() {
-                Some(src) => src.doc_id,
+                // Use defaults_doc() so override children read the
+                // overridden document's defaultAttributes per §4.2.5.
+                Some(src) => src.defaults_doc(),
                 None => continue, // synthesized types have no source
             }
         };

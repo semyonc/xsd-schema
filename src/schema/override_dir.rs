@@ -21,11 +21,15 @@ use std::collections::HashSet;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
+use crate::parser::frames::{
+    ComplexContentResult, ComplexTypeResult, ElementFrameResult,
+    ParticleResult, ParticleTerm, TypeFrameResult,
+};
 use crate::schema::composition::{
     CompositionEdgeKind, ComponentKey, ComponentKind,
     record_provenance, overridden_action,
 };
-use crate::schema::model::{OverrideComponent, OverrideDirective};
+use crate::schema::model::{DerivationSet, OverrideComponent, OverrideDirective};
 use crate::schema::SchemaSet;
 
 /// Compute the target set of an override directive per XSD 1.1 §4.2.5.
@@ -81,6 +85,31 @@ pub fn apply_override(
         None => HashSet::new(), // no target doc → unconditional replacement
     };
 
+    // Apply the overridden document's (D2) schema-level defaults to override
+    // children per F.2 semantics.  This covers two categories:
+    //
+    // 1. blockDefault / finalDefault — override children were assembled with
+    //    empty assembler defaults (see convert_override in assemble.rs), so
+    //    empty block/final means "not explicitly specified" and should adopt
+    //    D2's blockDefault/finalDefault.
+    //
+    // 2. All other document-level defaults (elementFormDefault,
+    //    attributeFormDefault, defaultAttributes) — set schema_defaults_doc
+    //    on each component's SourceRef so downstream lookups read D2's
+    //    document, not D1's.
+    let (d2_block_default, d2_final_default) = target_doc_id
+        .and_then(|id| schema_set.documents.get(id as usize))
+        .map(|doc| (doc.block_default, doc.final_default))
+        .unwrap_or((DerivationSet::empty(), DerivationSet::empty()));
+
+    apply_d2_defaults(
+        schema_set,
+        &override_dir.components,
+        d2_block_default,
+        d2_final_default,
+        target_doc_id,
+    );
+
     for component in &override_dir.components {
         match component {
             OverrideComponent::SimpleType(key) => {
@@ -109,6 +138,156 @@ pub fn apply_override(
     Ok(())
 }
 
+
+/// Apply the overridden document's (D2) schema-level defaults to override
+/// children per F.2 transformation semantics.
+///
+/// Handles two categories:
+///
+/// 1. **blockDefault / finalDefault** — override children are assembled with
+///    empty assembler defaults (see `convert_override` in assemble.rs), so
+///    empty block/final means "not explicitly specified" and should adopt
+///    D2's values.
+///
+/// 2. **All other document-level defaults** (elementFormDefault,
+///    attributeFormDefault, defaultAttributes) — sets `schema_defaults_doc`
+///    on each component's `SourceRef` (and on nested content model elements)
+///    so downstream lookups read D2's document settings, not D1's.
+fn apply_d2_defaults(
+    schema_set: &mut SchemaSet,
+    components: &[OverrideComponent],
+    d2_block_default: DerivationSet,
+    d2_final_default: DerivationSet,
+    d2_doc_id: Option<DocumentId>,
+) {
+    for component in components {
+        match component {
+            OverrideComponent::SimpleType(key) => {
+                if let Some(st) = schema_set.arenas.get_simple_type_mut(*key) {
+                    if st.final_derivation.is_empty() {
+                        st.final_derivation = d2_final_default;
+                    }
+                    set_defaults_doc(&mut st.source, d2_doc_id);
+                }
+            }
+            OverrideComponent::ComplexType(key) => {
+                if let Some(ct) = schema_set.arenas.get_complex_type_mut(*key) {
+                    if ct.final_derivation.is_empty() {
+                        ct.final_derivation = d2_final_default;
+                    }
+                    if ct.block.is_empty() {
+                        ct.block = d2_block_default;
+                    }
+                    set_defaults_doc(&mut ct.source, d2_doc_id);
+                    // Walk content model to propagate to nested elements
+                    set_defaults_doc_on_content(&mut ct.content, d2_doc_id);
+                }
+            }
+            OverrideComponent::Element(key) => {
+                if let Some(elem) = schema_set.arenas.get_element_mut(*key) {
+                    if elem.ref_name.is_none() {
+                        if elem.block.is_empty() {
+                            elem.block = d2_block_default;
+                        }
+                        if elem.final_derivation.is_empty() {
+                            elem.final_derivation = d2_final_default;
+                        }
+                    }
+                    set_defaults_doc(&mut elem.source, d2_doc_id);
+                    if let Some(ref mut inline) = elem.inline_type {
+                        set_defaults_doc_on_type_frame(inline, d2_doc_id);
+                    }
+                }
+            }
+            OverrideComponent::Attribute(key) => {
+                if let Some(attr) = schema_set.arenas.get_attribute_mut(*key) {
+                    set_defaults_doc(&mut attr.source, d2_doc_id);
+                }
+            }
+            OverrideComponent::Group(key) => {
+                if let Some(group) = schema_set.arenas.get_model_group_mut(*key) {
+                    set_defaults_doc(&mut group.source, d2_doc_id);
+                    set_defaults_doc_on_particles(&mut group.particles, d2_doc_id);
+                }
+            }
+            OverrideComponent::AttributeGroup(key) => {
+                if let Some(ag) = schema_set.arenas.get_attribute_group_mut(*key) {
+                    set_defaults_doc(&mut ag.source, d2_doc_id);
+                }
+            }
+            OverrideComponent::Notation(key) => {
+                if let Some(n) = schema_set.arenas.get_notation_mut(*key) {
+                    set_defaults_doc(&mut n.source, d2_doc_id);
+                }
+            }
+        }
+    }
+}
+
+/// Set `schema_defaults_doc` on a single source reference.
+fn set_defaults_doc(source: &mut Option<crate::parser::location::SourceRef>, doc_id: Option<DocumentId>) {
+    if let (Some(ref mut src), Some(id)) = (source, doc_id) {
+        src.schema_defaults_doc = Some(id);
+    }
+}
+
+/// Recursively set `schema_defaults_doc` on all element source refs within
+/// a complex type's content model.  No-op when `doc_id` is `None`.
+fn set_defaults_doc_on_content(content: &mut ComplexContentResult, doc_id: Option<DocumentId>) {
+    if doc_id.is_none() {
+        return;
+    }
+    if let ComplexContentResult::Complex(ref mut ccd) = content {
+        if let Some(ref mut particle) = ccd.particle {
+            set_defaults_doc_on_particle(particle, doc_id);
+        }
+    }
+}
+
+fn set_defaults_doc_on_particle(particle: &mut ParticleResult, doc_id: Option<DocumentId>) {
+    match &mut particle.term {
+        ParticleTerm::Element(ref mut elem) => {
+            set_defaults_doc_on_element_frame(elem, doc_id);
+        }
+        ParticleTerm::Group(ref mut group) => {
+            set_defaults_doc_on_particles(&mut group.particles, doc_id);
+        }
+        ParticleTerm::Any(_) => {}
+    }
+}
+
+fn set_defaults_doc_on_particles(particles: &mut [ParticleResult], doc_id: Option<DocumentId>) {
+    for p in particles {
+        set_defaults_doc_on_particle(p, doc_id);
+    }
+}
+
+fn set_defaults_doc_on_element_frame(elem: &mut ElementFrameResult, doc_id: Option<DocumentId>) {
+    set_defaults_doc(&mut elem.source, doc_id);
+    if let Some(ref mut inline) = elem.inline_type {
+        set_defaults_doc_on_type_frame(inline, doc_id);
+    }
+}
+
+fn set_defaults_doc_on_type_frame(type_frame: &mut TypeFrameResult, doc_id: Option<DocumentId>) {
+    match type_frame {
+        TypeFrameResult::Complex(ref mut ct) => {
+            set_defaults_doc_on_complex_type_result(ct, doc_id);
+        }
+        TypeFrameResult::Simple(ref mut st) => {
+            set_defaults_doc(&mut st.source, doc_id);
+        }
+    }
+}
+
+fn set_defaults_doc_on_complex_type_result(ct: &mut ComplexTypeResult, doc_id: Option<DocumentId>) {
+    set_defaults_doc(&mut ct.source, doc_id);
+    if let ComplexContentResult::Complex(ref mut ccd) = ct.content {
+        if let Some(ref mut particle) = ccd.particle {
+            set_defaults_doc_on_particle(particle, doc_id);
+        }
+    }
+}
 
 /// Check whether a component of the given kind exists in any document in
 /// the target set. Returns `true` when the target set is empty (fallback:
@@ -601,6 +780,200 @@ mod tests {
             schema_set.lookup_element(None, my_elem_name).is_some(),
             "MyElem should be in namespace table after transitive override"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Override children must use the overridden document's (D2) blockDefault
+    /// and finalDefault, not the overriding document's (D1).
+    ///
+    /// D1 has blockDefault="#all", D2 has blockDefault="restriction".
+    /// An override child element with no explicit `block` must get
+    /// D2's "restriction", not D1's "#all".
+    #[test]
+    fn test_override_uses_d2_block_default() {
+        use crate::parser::parse::parse_schema;
+        use crate::parser::resolver::{resolve_all_directives, SchemaResolver};
+
+        let tmp = std::env::temp_dir().join("xsd_test_override_d2_block");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // target.xsd (D2): blockDefault="restriction"
+        let target_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           blockDefault="restriction">
+    <xs:element name="Foo" type="xs:string"/>
+</xs:schema>"#;
+        let target_path = tmp.join("ovr_d2_block_target.xsd");
+        std::fs::write(&target_path, target_xsd).unwrap();
+
+        // main.xsd (D1): blockDefault="#all", overrides Foo from target
+        let main_xsd = format!(
+            r##"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           blockDefault="#all">
+    <xs:override schemaLocation="{}">
+        <xs:element name="Foo" type="xs:integer"/>
+    </xs:override>
+</xs:schema>"##,
+            target_path.to_string_lossy()
+        );
+
+        let mut schema_set = SchemaSet::xsd11();
+        let main_path = tmp.join("ovr_d1_block_main.xsd").to_string_lossy().to_string();
+        let doc_id = parse_schema(main_xsd.as_bytes(), &main_path, &mut schema_set).unwrap();
+
+        let mut resolver = SchemaResolver::new();
+        let result = resolve_all_directives(doc_id, &mut resolver, &mut schema_set);
+        assert!(result.is_ok(), "Resolution should succeed");
+        for loaded_id in result.loaded.clone() {
+            let _ = resolve_all_directives(loaded_id, &mut resolver, &mut schema_set);
+        }
+
+        // Apply composition
+        crate::schema::apply_redefine_override(&mut schema_set).unwrap();
+
+        // Look up the resulting Foo element
+        let foo_name = schema_set.name_table.get("Foo").unwrap();
+        let foo_key = schema_set
+            .lookup_element(None, foo_name)
+            .expect("Foo should be in namespace table after override");
+        let foo = schema_set.arenas.elements.get(foo_key).unwrap();
+
+        // The override child had no explicit block, so it must have D2's
+        // blockDefault="restriction", NOT D1's blockDefault="#all".
+        assert!(
+            foo.block.contains(DerivationSet::RESTRICTION),
+            "Override element should have D2's blockDefault (restriction), got {:?}",
+            foo.block
+        );
+        assert!(
+            !foo.block.contains(DerivationSet::EXTENSION),
+            "Override element should NOT have D1's blockDefault (#all which includes extension), got {:?}",
+            foo.block
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Override children must have `schema_defaults_doc` set to D2's doc_id
+    /// so that downstream lookups for elementFormDefault, attributeFormDefault,
+    /// and defaultAttributes read from D2, not D1.
+    #[test]
+    fn test_override_schema_defaults_doc_set_to_d2() {
+        use crate::parser::parse::parse_schema;
+        use crate::parser::resolver::{resolve_all_directives, SchemaResolver};
+
+        let tmp = std::env::temp_dir().join("xsd_test_override_defaults_doc");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // target.xsd (D2): elementFormDefault="qualified"
+        let target_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="qualified">
+    <xs:complexType name="MyType">
+        <xs:sequence>
+            <xs:element name="child" type="xs:string"/>
+        </xs:sequence>
+    </xs:complexType>
+</xs:schema>"#;
+        let target_path = tmp.join("ovr_defaults_target.xsd");
+        std::fs::write(&target_path, target_xsd).unwrap();
+
+        // main.xsd (D1): elementFormDefault="unqualified", overrides MyType
+        let main_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           elementFormDefault="unqualified">
+    <xs:override schemaLocation="{}">
+        <xs:complexType name="MyType">
+            <xs:sequence>
+                <xs:element name="child" type="xs:integer"/>
+            </xs:sequence>
+        </xs:complexType>
+    </xs:override>
+</xs:schema>"#,
+            target_path.to_string_lossy()
+        );
+
+        let mut schema_set = SchemaSet::xsd11();
+        let main_path = tmp.join("ovr_defaults_main.xsd").to_string_lossy().to_string();
+        let doc_id = parse_schema(main_xsd.as_bytes(), &main_path, &mut schema_set).unwrap();
+
+        let mut resolver = SchemaResolver::new();
+        let result = resolve_all_directives(doc_id, &mut resolver, &mut schema_set);
+        assert!(result.is_ok(), "Resolution should succeed");
+        for loaded_id in result.loaded.clone() {
+            let _ = resolve_all_directives(loaded_id, &mut resolver, &mut schema_set);
+        }
+
+        // Get D2's doc_id from the override's resolved_doc_id
+        let main_doc = &schema_set.documents[doc_id as usize];
+        let d2_doc_id = main_doc.overrides[0].resolved_doc_id
+            .expect("Override should have resolved_doc_id");
+
+        // Apply composition
+        crate::schema::apply_redefine_override(&mut schema_set).unwrap();
+
+        // Look up the resulting MyType complex type
+        let my_type_name = schema_set.name_table.get("MyType").unwrap();
+        let type_key = schema_set
+            .lookup_type(None, my_type_name)
+            .expect("MyType should be in namespace table");
+
+        // Get the complex type and verify schema_defaults_doc points to D2
+        if let TypeKey::Complex(ct_key) = type_key {
+            let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
+            let src = ct.source.as_ref().expect("Complex type should have source");
+            assert_eq!(
+                src.schema_defaults_doc, Some(d2_doc_id),
+                "Override complex type's schema_defaults_doc should be D2's doc_id"
+            );
+            assert_eq!(
+                src.defaults_doc(), d2_doc_id,
+                "defaults_doc() should return D2's doc_id"
+            );
+
+            // Verify that D2 has elementFormDefault=qualified
+            let d2 = &schema_set.documents[d2_doc_id as usize];
+            assert_eq!(
+                d2.element_form_default,
+                crate::schema::model::FormChoice::Qualified,
+                "D2 should have elementFormDefault=qualified"
+            );
+
+            // Verify inline child element also has schema_defaults_doc set
+            if let ComplexContentResult::Complex(ref ccd) = ct.content {
+                if let Some(ref particle) = ccd.particle {
+                    match &particle.term {
+                        ParticleTerm::Group(group) => {
+                            // sequence/all/choice wraps elements in a group
+                            for p in &group.particles {
+                                if let ParticleTerm::Element(ref elem) = p.term {
+                                    let elem_src = elem.source.as_ref()
+                                        .expect("Inline element should have source");
+                                    assert_eq!(
+                                        elem_src.schema_defaults_doc, Some(d2_doc_id),
+                                        "Inline element within override complex type should have schema_defaults_doc = D2"
+                                    );
+                                }
+                            }
+                        }
+                        ParticleTerm::Element(ref elem) => {
+                            let elem_src = elem.source.as_ref()
+                                .expect("Inline element should have source");
+                            assert_eq!(
+                                elem_src.schema_defaults_doc, Some(d2_doc_id),
+                                "Inline element within override should have schema_defaults_doc = D2"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            panic!("MyType should be a complex type");
+        }
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

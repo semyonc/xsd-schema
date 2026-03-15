@@ -486,8 +486,8 @@ impl SchemaResolver {
         // Resolve the location
         let resolved = self.resolve_location(location, base_uri)?;
 
-        // Check if already loaded
-        if let Some(&id) = schema_set.loaded_locations.get(&resolved) {
+        // Check if already loaded (chameleon-aware).
+        if let Some(id) = check_loaded_cache(schema_set, &resolved, chameleon_namespace) {
             return Ok(LoadOutcome::AlreadyLoaded(id));
         }
 
@@ -525,8 +525,8 @@ impl SchemaResolver {
             }
         };
 
-        // Mark as loaded
-        schema_set.mark_loaded(resolved.clone(), doc_id);
+        // Mark as loaded (chameleon-aware).
+        mark_loaded_chameleon_aware(schema_set, &resolved, doc_id, chameleon_namespace);
 
         // Remove from resolving set
         self.resolving.remove(&resolved);
@@ -701,8 +701,8 @@ impl SchemaResolver {
         // Resolve the location
         let resolved = self.resolve_location(location, base_uri)?;
 
-        // Check if already loaded
-        if let Some(&id) = schema_set.loaded_locations.get(&resolved) {
+        // Check if already loaded (chameleon-aware).
+        if let Some(id) = check_loaded_cache(schema_set, &resolved, chameleon_namespace) {
             return Ok(LoadOutcome::AlreadyLoaded(id));
         }
 
@@ -739,8 +739,8 @@ impl SchemaResolver {
             }
         };
 
-        // Mark as loaded
-        schema_set.mark_loaded(resolved.clone(), doc_id);
+        // Mark as loaded (chameleon-aware).
+        mark_loaded_chameleon_aware(schema_set, &resolved, doc_id, chameleon_namespace);
 
         // Remove from resolving set
         self.resolving.remove(&resolved);
@@ -1021,6 +1021,70 @@ fn record_edge(
         source: source.cloned(),
         schema_location: schema_location.to_string(),
     });
+}
+
+/// Check the chameleon-aware loaded-location caches for a previously loaded
+/// document.  Returns `Some(doc_id)` when the cached document is compatible
+/// with the requested `chameleon_namespace`, `None` otherwise.
+///
+/// Shared by both `load_schema` (sync) and `load_schema_async`.
+fn check_loaded_cache(
+    schema_set: &SchemaSet,
+    resolved: &str,
+    chameleon_namespace: Option<NameId>,
+) -> Option<DocumentId> {
+    // Check chameleon-specific cache first.
+    if let Some(ns) = chameleon_namespace {
+        if let Some(&id) = schema_set.chameleon_cache.get(&(resolved.to_owned(), ns)) {
+            return Some(id);
+        }
+    }
+    // Then check primary cache with reusability check.
+    if let Some(&id) = schema_set.loaded_locations.get(resolved) {
+        let reusable = schema_set.documents.get(id as usize).is_none_or(|doc| {
+            if doc.is_chameleon {
+                false
+            } else if doc.target_namespace.is_some() {
+                true
+            } else {
+                // Raw no-namespace document — reusable only when no
+                // chameleon adoption is requested (§4.2.3).
+                chameleon_namespace.is_none()
+            }
+        });
+        if reusable {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// Record a freshly loaded document in the appropriate caches.
+///
+/// Chameleon variants are stored in `chameleon_cache`; the primary
+/// `loaded_locations` only gets the first entry per URI.
+///
+/// Shared by both `load_schema` (sync) and `load_schema_async`.
+fn mark_loaded_chameleon_aware(
+    schema_set: &mut SchemaSet,
+    resolved: &str,
+    doc_id: DocumentId,
+    chameleon_namespace: Option<NameId>,
+) {
+    let doc_is_chameleon = schema_set
+        .documents
+        .get(doc_id as usize)
+        .is_some_and(|doc| doc.is_chameleon);
+    if doc_is_chameleon {
+        if let Some(ns) = chameleon_namespace {
+            schema_set
+                .chameleon_cache
+                .insert((resolved.to_owned(), ns), doc_id);
+        }
+    }
+    if !schema_set.loaded_locations.contains_key(resolved) {
+        schema_set.mark_loaded(resolved.to_owned(), doc_id);
+    }
 }
 
 /// Fixup pass: fill in `target_doc` on cycle edges whose target has since
@@ -2029,6 +2093,197 @@ mod tests {
             chameleon_doc.target_namespace, Some(ns),
             "Chameleon redefine target should adopt redefiner's namespace"
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A no-namespace (chameleon) schema included from two schemas with
+    /// different target namespaces must produce two separate document views,
+    /// each adopting the includer's namespace.  Previously the second
+    /// include returned the first document's ID unchanged (§4.2.3 violation).
+    #[test]
+    fn test_chameleon_multi_namespace_creates_separate_views() {
+        use crate::parser::parse::parse_schema;
+        use crate::schema::SchemaSet;
+
+        let tmp = std::env::temp_dir().join("xsd_test_chameleon_multi_ns");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // chameleon.xsd: no targetNamespace
+        let chameleon_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="SharedType">
+        <xs:restriction base="xs:string"/>
+    </xs:simpleType>
+</xs:schema>"#;
+        let chameleon_path = tmp.join("multi_ns_chameleon.xsd");
+        std::fs::write(&chameleon_path, chameleon_xsd).unwrap();
+
+        // ns_a.xsd: targetNamespace="urn:a", includes chameleon
+        let ns_a_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:a">
+    <xs:include schemaLocation="{}"/>
+</xs:schema>"#,
+            chameleon_path.to_string_lossy()
+        );
+        let ns_a_path = tmp.join("multi_ns_a.xsd");
+        std::fs::write(&ns_a_path, &ns_a_xsd).unwrap();
+
+        // ns_b.xsd: targetNamespace="urn:b", includes same chameleon
+        let ns_b_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:b">
+    <xs:include schemaLocation="{}"/>
+</xs:schema>"#,
+            chameleon_path.to_string_lossy()
+        );
+        let ns_b_path = tmp.join("multi_ns_b.xsd");
+        std::fs::write(&ns_b_path, &ns_b_xsd).unwrap();
+
+        let mut schema_set = SchemaSet::new();
+
+        // Parse ns_a and resolve its include (loads chameleon as urn:a)
+        let ns_a_uri = ns_a_path.to_string_lossy().to_string();
+        let doc_a = parse_schema(
+            std::fs::read_to_string(&ns_a_path).unwrap().as_bytes(),
+            &ns_a_uri,
+            &mut schema_set,
+        )
+        .unwrap();
+        let mut resolver = SchemaResolver::new();
+        let res_a = resolve_all_directives(doc_a, &mut resolver, &mut schema_set);
+        assert!(res_a.is_ok(), "ns_a resolution should succeed");
+        let chameleon_a_id = res_a.loaded[0];
+
+        // Parse ns_b and resolve its include (must re-parse chameleon as urn:b)
+        let ns_b_uri = ns_b_path.to_string_lossy().to_string();
+        let doc_b = parse_schema(
+            std::fs::read_to_string(&ns_b_path).unwrap().as_bytes(),
+            &ns_b_uri,
+            &mut schema_set,
+        )
+        .unwrap();
+        let res_b = resolve_all_directives(doc_b, &mut resolver, &mut schema_set);
+        assert!(res_b.is_ok(), "ns_b resolution should succeed");
+        let chameleon_b_id = res_b.loaded[0];
+
+        // The two chameleon loads must produce DIFFERENT document IDs
+        assert_ne!(
+            chameleon_a_id, chameleon_b_id,
+            "Chameleon schema included from different namespaces must produce separate documents"
+        );
+
+        // Each must adopt its includer's namespace
+        let ns_a_name = schema_set.name_table.get("urn:a").unwrap();
+        let ns_b_name = schema_set.name_table.get("urn:b").unwrap();
+        assert_eq!(
+            schema_set.documents[chameleon_a_id as usize].target_namespace,
+            Some(ns_a_name),
+            "First chameleon copy should have urn:a namespace"
+        );
+        assert_eq!(
+            schema_set.documents[chameleon_b_id as usize].target_namespace,
+            Some(ns_b_name),
+            "Second chameleon copy should have urn:b namespace"
+        );
+
+        // Both should be flagged as chameleon
+        assert!(schema_set.documents[chameleon_a_id as usize].is_chameleon);
+        assert!(schema_set.documents[chameleon_b_id as usize].is_chameleon);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A no-namespace schema first loaded without chameleon adoption (from a
+    /// no-namespace context) must NOT be reused when a later include requests
+    /// chameleon adoption into a namespace.  schema(chameleon(tns,D2)) ≠
+    /// schema(D2) per §4.2.3.
+    #[test]
+    fn test_raw_no_namespace_not_reused_for_chameleon() {
+        use crate::parser::parse::parse_schema;
+        use crate::schema::SchemaSet;
+
+        let tmp = std::env::temp_dir().join("xsd_test_raw_no_ns_chameleon");
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // shared.xsd: no targetNamespace
+        let shared_xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:element name="Shared" type="xs:string"/>
+</xs:schema>"#;
+        let shared_path = tmp.join("raw_shared.xsd");
+        std::fs::write(&shared_path, shared_xsd).unwrap();
+
+        // no_ns.xsd: no targetNamespace, includes shared (raw, no adoption)
+        let no_ns_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:include schemaLocation="{}"/>
+</xs:schema>"#,
+            shared_path.to_string_lossy()
+        );
+        let no_ns_path = tmp.join("raw_no_ns.xsd");
+        std::fs::write(&no_ns_path, &no_ns_xsd).unwrap();
+
+        // with_ns.xsd: targetNamespace="urn:test", includes same shared
+        let with_ns_xsd = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:test">
+    <xs:include schemaLocation="{}"/>
+</xs:schema>"#,
+            shared_path.to_string_lossy()
+        );
+        let with_ns_path = tmp.join("raw_with_ns.xsd");
+        std::fs::write(&with_ns_path, &with_ns_xsd).unwrap();
+
+        let mut schema_set = SchemaSet::new();
+        let mut resolver = SchemaResolver::new();
+
+        // First: load from no-namespace context (raw, no chameleon adoption)
+        let no_ns_uri = no_ns_path.to_string_lossy().to_string();
+        let doc_no_ns = parse_schema(
+            std::fs::read_to_string(&no_ns_path).unwrap().as_bytes(),
+            &no_ns_uri,
+            &mut schema_set,
+        )
+        .unwrap();
+        let res1 = resolve_all_directives(doc_no_ns, &mut resolver, &mut schema_set);
+        assert!(res1.is_ok());
+        let raw_id = res1.loaded[0];
+
+        // The raw load should NOT be chameleon
+        assert!(!schema_set.documents[raw_id as usize].is_chameleon);
+        assert!(schema_set.documents[raw_id as usize].target_namespace.is_none());
+
+        // Second: load from namespace-bearing context (chameleon adoption)
+        let with_ns_uri = with_ns_path.to_string_lossy().to_string();
+        let doc_with_ns = parse_schema(
+            std::fs::read_to_string(&with_ns_path).unwrap().as_bytes(),
+            &with_ns_uri,
+            &mut schema_set,
+        )
+        .unwrap();
+        let res2 = resolve_all_directives(doc_with_ns, &mut resolver, &mut schema_set);
+        assert!(res2.is_ok());
+        let chameleon_id = res2.loaded[0];
+
+        // Must be a DIFFERENT document — the raw no-namespace copy must not
+        // leak into the namespace-bearing context.
+        assert_ne!(
+            raw_id, chameleon_id,
+            "Raw no-namespace document must not be reused for chameleon adoption"
+        );
+        let ns_name = schema_set.name_table.get("urn:test").unwrap();
+        assert_eq!(
+            schema_set.documents[chameleon_id as usize].target_namespace,
+            Some(ns_name),
+            "Chameleon copy should adopt urn:test namespace"
+        );
+        assert!(schema_set.documents[chameleon_id as usize].is_chameleon);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

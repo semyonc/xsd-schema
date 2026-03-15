@@ -785,6 +785,34 @@ fn convert_override(
     override_result: OverrideResult,
     assembler: &mut SchemaAssembler<'_>,
 ) -> SchemaResult<OverrideDirective> {
+    // Override children should NOT inherit the overriding document's defaults.
+    // Per F.2, they are conceptually placed into the overridden document D2',
+    // so D2's blockDefault/finalDefault should apply instead. We assemble
+    // with empty defaults here; the correct defaults are applied later in
+    // `apply_override()` once D2 is known.
+    let saved_block = std::mem::replace(
+        &mut assembler.block_default,
+        crate::schema::model::DerivationSet::empty(),
+    );
+    let saved_final = std::mem::replace(
+        &mut assembler.final_default,
+        crate::schema::model::DerivationSet::empty(),
+    );
+
+    let result = convert_override_body(override_result, assembler);
+
+    // Restore the overriding document's defaults for any subsequent
+    // non-override components in the same document.
+    assembler.block_default = saved_block;
+    assembler.final_default = saved_final;
+
+    result
+}
+
+fn convert_override_body(
+    override_result: OverrideResult,
+    assembler: &mut SchemaAssembler<'_>,
+) -> SchemaResult<OverrideDirective> {
     let mut components = Vec::new();
 
     for st in override_result.simple_types {
