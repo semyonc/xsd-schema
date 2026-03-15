@@ -173,6 +173,9 @@ pub struct AttributeGroupData {
     pub resolved_attribute_groups: Vec<AttributeGroupKey>,
     /// Resolved attribute uses (parallel to attributes vec)
     pub resolved_attributes: Vec<ResolvedAttributeUse>,
+
+    /// Original attribute group key before redefine (for self-reference resolution)
+    pub redefine_original: Option<AttributeGroupKey>,
 }
 
 /// Resolved particle term - stores resolved keys for particle references
@@ -214,6 +217,9 @@ pub struct ModelGroupData {
     pub resolved_particle_types: Vec<Option<TypeKey>>,
     /// Flat depth-first indexed resolved element keys for all particles (including nested inline groups)
     pub resolved_particle_elements: Vec<Option<ElementKey>>,
+
+    /// Original model group key before redefine (for self-reference resolution)
+    pub redefine_original: Option<ModelGroupKey>,
 }
 
 /// Placeholder for Notation (defined in schema/decl.rs)

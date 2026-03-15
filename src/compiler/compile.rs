@@ -4,6 +4,7 @@
 //! XSD content model particles into NFAs.
 
 use crate::arenas::{ComplexTypeDefData, ModelGroupData};
+use crate::ids::ModelGroupKey;
 use crate::parser::frames::DerivationMethod;
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::frames::{
@@ -56,6 +57,9 @@ pub struct CompileContext<'a> {
     /// Current sibling element QNames for ##definedSibling expansion in wildcard compilation.
     /// Set before compiling particles in a model group (sequence/choice/all).
     current_sibling_elements: Vec<(Option<NameId>, NameId)>,
+    /// When compiling a redefining group, stores (group_name, group_ns, original_key)
+    /// so self-referencing QName refs are redirected to the original group.
+    redefine_redirect: Option<(NameId, Option<NameId>, ModelGroupKey)>,
 }
 
 impl<'a> CompileContext<'a> {
@@ -71,6 +75,7 @@ impl<'a> CompileContext<'a> {
             content_flat_idx: None,
             resolved_particle_elements: Vec::new(),
             current_sibling_elements: Vec::new(),
+            redefine_redirect: None,
         }
     }
 
@@ -517,10 +522,9 @@ impl<'a> CompileContext<'a> {
 
         let ref_name = group.ref_name.as_ref().expect("caller checked ref_name is Some");
 
-        // Resolve the group ref
+        // Resolve the group ref (redefine-aware)
         let group_key = self
-            .schema_set
-            .lookup_model_group(ref_name.namespace, ref_name.local_name)
+            .resolve_model_group_key(ref_name)
             .ok_or_else(|| {
                 let name = format!(
                     "{}:{}",
@@ -645,10 +649,9 @@ impl<'a> CompileContext<'a> {
         ref_name: &QNameRef,
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
-        // Look up the referenced group
+        // Look up the referenced group (redefine-aware)
         let group_key = self
-            .schema_set
-            .lookup_model_group(ref_name.namespace, ref_name.local_name)
+            .resolve_model_group_key(ref_name)
             .ok_or_else(|| {
                 let name = format!(
                     "{}:{}",
@@ -677,6 +680,18 @@ impl<'a> CompileContext<'a> {
         self.compile_model_group_data(group_data, source)
     }
 
+    /// Resolve a model group reference QName to a key, redirecting self-references
+    /// in redefining groups to the original group to avoid infinite recursion.
+    fn resolve_model_group_key(&self, ref_name: &QNameRef) -> Option<ModelGroupKey> {
+        if let Some((name, ns, original_key)) = self.redefine_redirect {
+            if ref_name.local_name == name && ref_name.namespace == ns {
+                return Some(original_key);
+            }
+        }
+        self.schema_set
+            .lookup_model_group(ref_name.namespace, ref_name.local_name)
+    }
+
     /// Compile from ModelGroupData (arena storage format)
     fn compile_model_group_data(
         &mut self,
@@ -695,6 +710,12 @@ impl<'a> CompileContext<'a> {
         let saved_types = std::mem::take(&mut self.resolved_particle_types);
         let saved_idx = self.current_particle_idx;
 
+        // Set up redefine redirect if this is a redefining group
+        let saved_redirect = self.redefine_redirect.take();
+        if let (Some(original_key), Some(name)) = (group.redefine_original, group.name) {
+            self.redefine_redirect = Some((name, group.target_namespace, original_key));
+        }
+
         // Use flat-indexed fields from ModelGroupData
         self.resolved_particle_types = group.resolved_particle_types.clone();
         self.resolved_particle_elements = group.resolved_particle_elements.clone();
@@ -708,6 +729,7 @@ impl<'a> CompileContext<'a> {
         };
 
         // Restore previous context
+        self.redefine_redirect = saved_redirect;
         self.content_flat_idx = saved_flat_idx;
         self.resolved_particle_elements = saved_particle_elements;
         self.resolved_particle_types = saved_types;
@@ -819,10 +841,7 @@ impl<'a> CompileContext<'a> {
                 }
                 ParticleTerm::Group(group) => {
                     if let Some(ref_name) = &group.ref_name {
-                        if let Some(key) = self.schema_set.lookup_model_group(
-                            ref_name.namespace,
-                            ref_name.local_name,
-                        ) {
+                        if let Some(key) = self.resolve_model_group_key(ref_name) {
                             if let Some(data) = self.schema_set.arenas.get_model_group(key) {
                                 result.extend(
                                     self.collect_sibling_element_qnames_inner(
@@ -983,6 +1002,15 @@ pub fn compile_content_model_matcher(
                     ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
                     ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
                     ctx.content_flat_idx = Some(0);
+                    // Set up redefine redirect so self-references inside the
+                    // all-group resolve to the original group, not back to
+                    // the redefining group.
+                    if let (Some(original_key), Some(name)) =
+                        (group_data.redefine_original, group_data.name)
+                    {
+                        ctx.redefine_redirect =
+                            Some((name, group_data.target_namespace, original_key));
+                    }
                     let model = ctx.compile_all_group_model(
                         &group_data.particles,
                         group_data.source.as_ref(),

@@ -23,6 +23,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
 use crate::parser::frames::{QNameRef, TypeRefResult};
 use crate::parser::location::SourceRef;
+use crate::schema::composition::ComponentKind;
 use crate::schema::SchemaSet;
 
 /// Reference resolver for QName → component ID resolution
@@ -67,12 +68,29 @@ impl<'a> ReferenceResolver<'a> {
             return Ok(type_key);
         }
 
-        // 3. Not found - error
+        // 3. Not found - error with provenance note
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.format_qname(qname);
+        // Try both simple and complex type provenance
+        let note = {
+            let simple_note = self.schema_set.format_provenance_note(
+                ComponentKind::SimpleType,
+                qname.namespace,
+                qname.local_name,
+            );
+            if simple_note.is_empty() {
+                self.schema_set.format_provenance_note(
+                    ComponentKind::ComplexType,
+                    qname.namespace,
+                    qname.local_name,
+                )
+            } else {
+                simple_note
+            }
+        };
         Err(SchemaError::structural(
             "src-resolve",
-            format!("Type '{}' not found", name_str),
+            format!("Type '{}' not found{}", name_str, note),
             location,
         ))
     }
@@ -99,11 +117,16 @@ impl<'a> ReferenceResolver<'a> {
 
     /// Resolve a component reference by looking up in the schema set's namespace
     /// tables, returning a `src-resolve` error if not found.
+    ///
+    /// When a lookup fails the error message is enriched with provenance
+    /// information (e.g. "originally in base.xsd, redefined by main.xsd")
+    /// when available.
     fn resolve_ref<K: Copy>(
         &self,
         qname: &QNameRef,
         source: Option<&SourceRef>,
         kind_label: &str,
+        component_kind: ComponentKind,
         lookup: impl FnOnce(&SchemaSet, Option<NameId>, NameId) -> Option<K>,
     ) -> SchemaResult<K> {
         if let Some(key) = lookup(self.schema_set, qname.namespace, qname.local_name) {
@@ -111,9 +134,14 @@ impl<'a> ReferenceResolver<'a> {
         }
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.format_qname(qname);
+        let note = self.schema_set.format_provenance_note(
+            component_kind,
+            qname.namespace,
+            qname.local_name,
+        );
         Err(SchemaError::structural(
             "src-resolve",
-            format!("{} '{}' not found", kind_label, name_str),
+            format!("{} '{}' not found{}", kind_label, name_str, note),
             location,
         ))
     }
@@ -124,7 +152,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ElementKey> {
-        self.resolve_ref(qname, source, "Element", SchemaSet::lookup_element)
+        self.resolve_ref(qname, source, "Element", ComponentKind::Element, SchemaSet::lookup_element)
     }
 
     /// Resolve an attribute reference (QName → AttributeKey)
@@ -133,7 +161,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeKey> {
-        self.resolve_ref(qname, source, "Attribute", SchemaSet::lookup_attribute)
+        self.resolve_ref(qname, source, "Attribute", ComponentKind::Attribute, SchemaSet::lookup_attribute)
     }
 
     /// Resolve a model group reference (QName → ModelGroupKey)
@@ -142,7 +170,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ModelGroupKey> {
-        self.resolve_ref(qname, source, "Group", SchemaSet::lookup_model_group)
+        self.resolve_ref(qname, source, "Group", ComponentKind::ModelGroup, SchemaSet::lookup_model_group)
     }
 
     /// Resolve an attribute group reference (QName → AttributeGroupKey)
@@ -151,7 +179,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeGroupKey> {
-        self.resolve_ref(qname, source, "Attribute group", SchemaSet::lookup_attribute_group)
+        self.resolve_ref(qname, source, "Attribute group", ComponentKind::AttributeGroup, SchemaSet::lookup_attribute_group)
     }
 
     /// Resolve a notation reference (QName → NotationKey)
@@ -160,7 +188,7 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<NotationKey> {
-        self.resolve_ref(qname, source, "Notation", SchemaSet::lookup_notation)
+        self.resolve_ref(qname, source, "Notation", ComponentKind::Notation, SchemaSet::lookup_notation)
     }
 
     /// Format a QName for error messages
@@ -752,6 +780,11 @@ fn resolve_model_group_references(
     let source = group.source.clone();
     let particles_clone = group.particles.clone();
 
+    // Capture redefine info for self-reference redirection
+    let redefine_original = group.redefine_original;
+    let group_name = group.name;
+    let group_ns = group.target_namespace;
+
     // Read existing resolved_particles BEFORE building new ones,
     // so we can preserve inline-resolved types from Phase 3.
     let existing_resolved: Vec<_> = group.resolved_particles.clone();
@@ -823,9 +856,16 @@ fn resolve_model_group_references(
                 });
             }
             1 => {
-                // Group particle
+                // Group particle — redirect self-references to the original group
                 let resolved_group_ref = if let Some(ref qname) = elem_or_group_ref {
-                    let grp_key = resolver.resolve_group_ref(qname, particle_source.as_ref())?;
+                    let is_self_ref = redefine_original.is_some()
+                        && Some(qname.local_name) == group_name
+                        && qname.namespace == group_ns;
+                    let grp_key = if is_self_ref {
+                        redefine_original.unwrap()
+                    } else {
+                        resolver.resolve_group_ref(qname, particle_source.as_ref())?
+                    };
                     stats.groups_resolved += 1;
                     Some(grp_key)
                 } else {
@@ -937,6 +977,11 @@ fn resolve_attribute_group_references(
     let nested_groups = group.attribute_groups.clone();
     let source = group.source.clone();
 
+    // Capture redefine info for self-reference redirection
+    let redefine_original = group.redefine_original;
+    let group_name = group.name;
+    let group_ns = group.target_namespace;
+
     // Extract attribute use info for resolution
     let attribute_uses: Vec<_> = group.attributes.iter().map(|attr_use| {
         let type_qname = match &attr_use.attribute.type_ref {
@@ -958,10 +1003,17 @@ fn resolve_attribute_group_references(
         None
     };
 
-    // Resolve nested attribute group references
+    // Resolve nested attribute group references — redirect self-references to the original
     let mut resolved_nested = Vec::with_capacity(nested_groups.len());
     for qname in &nested_groups {
-        let group_key = resolver.resolve_attribute_group_ref(qname, source.as_ref())?;
+        let is_self_ref = redefine_original.is_some()
+            && Some(qname.local_name) == group_name
+            && qname.namespace == group_ns;
+        let group_key = if is_self_ref {
+            redefine_original.unwrap()
+        } else {
+            resolver.resolve_attribute_group_ref(qname, source.as_ref())?
+        };
         stats.attribute_groups_resolved += 1;
         resolved_nested.push(group_key);
     }
@@ -1397,6 +1449,7 @@ mod tests {
             }],
             resolved_particle_types: vec![Some(TypeKey::Simple(string_key))],
             resolved_particle_elements: Vec::new(),
+            redefine_original: None,
         };
 
         let group_key = schema_set.arenas.alloc_model_group(group_data);
@@ -1449,6 +1502,7 @@ mod tests {
             resolved_ref: None,
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
+            redefine_original: None,
         };
         let group_key = schema_set.arenas.alloc_attribute_group(group_data);
         schema_set

@@ -15,7 +15,7 @@ use crate::parser::location::{SourceMapStorage, SourceRef};
 use crate::namespace::QualifiedName;
 use crate::schema::annotation::Annotation;
 use crate::schema::composition::{
-    CompositionEdge, ComponentIdentity, DocumentComponentIndex, EffectiveComponent,
+    ComponentKind, CompositionEdge, ComponentIdentity, DocumentComponentIndex, EffectiveComponent,
 };
 use crate::schema::wildcard::ElementWildcard;
 use crate::arenas::SchemaArenas;
@@ -558,6 +558,60 @@ impl SchemaSet {
         }
 
         false
+    }
+
+    /// Format a provenance note for a component (returns empty string if none/declared).
+    ///
+    /// Used to enrich error messages with information about where a component
+    /// originated (e.g., redefined from another schema document).
+    pub fn format_provenance_note(
+        &self,
+        kind: ComponentKind,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> String {
+        use crate::schema::composition::CompositionAction;
+
+        let identity = ComponentIdentity { kind, name, namespace };
+        match self.effective_components.get(&identity) {
+            Some(eff) => match &eff.action {
+                CompositionAction::Redefined { from_doc, replaced } => {
+                    let target_uri = replaced
+                        .owner_doc
+                        .and_then(|id| self.documents.get(id as usize))
+                        .map(|d| d.base_uri.as_str())
+                        .unwrap_or("unknown");
+                    let from_uri = from_doc
+                        .and_then(|id| self.documents.get(id as usize))
+                        .map(|d| d.base_uri.as_str())
+                        .unwrap_or("unknown");
+                    format!(" (originally in {}, redefined by {})", target_uri, from_uri)
+                }
+                #[cfg(feature = "xsd11")]
+                CompositionAction::Overridden { from_doc, replaced } => {
+                    let target_uri = replaced
+                        .owner_doc
+                        .and_then(|id| self.documents.get(id as usize))
+                        .map(|d| d.base_uri.as_str())
+                        .unwrap_or("unknown");
+                    let from_uri = from_doc
+                        .and_then(|id| self.documents.get(id as usize))
+                        .map(|d| d.base_uri.as_str())
+                        .unwrap_or("unknown");
+                    format!(" (originally in {}, overridden by {})", target_uri, from_uri)
+                }
+                CompositionAction::Included { from_doc } => {
+                    let uri = self
+                        .documents
+                        .get(*from_doc as usize)
+                        .map(|d| d.base_uri.as_str())
+                        .unwrap_or("unknown");
+                    format!(" (included by {})", uri)
+                }
+                CompositionAction::Declared => String::new(),
+            },
+            None => String::new(),
+        }
     }
 
     /// Compute the effective namespace for a local element declaration per XSD spec.

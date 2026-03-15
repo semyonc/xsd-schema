@@ -94,8 +94,12 @@ fn apply_simple_type_redefine(
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original simple type '{}' not found for redefinition",
-                schema_set.name_table.resolve(name)
+                "Original simple type '{}' not found for redefinition in {}",
+                schema_set.name_table.resolve(name),
+                target_doc_id
+                    .and_then(|id| schema_set.documents.get(id as usize))
+                    .map(|d| d.base_uri.as_str())
+                    .unwrap_or("schema"),
             ),
             None,
         )
@@ -150,8 +154,12 @@ fn apply_complex_type_redefine(
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original complex type '{}' not found for redefinition",
-                schema_set.name_table.resolve(name)
+                "Original complex type '{}' not found for redefinition in {}",
+                schema_set.name_table.resolve(name),
+                target_doc_id
+                    .and_then(|id| schema_set.documents.get(id as usize))
+                    .map(|d| d.base_uri.as_str())
+                    .unwrap_or("schema"),
             ),
             None,
         )
@@ -194,7 +202,7 @@ fn apply_model_group_redefine(
     })?;
     let namespace = new_group.target_namespace;
 
-    let _original_key = match target_doc_id {
+    let original_key = match target_doc_id {
         Some(id) => schema_set
             .documents
             .get(id as usize)
@@ -205,14 +213,23 @@ fn apply_model_group_redefine(
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original group '{}' not found for redefinition",
-                schema_set.name_table.resolve(name)
+                "Original group '{}' not found for redefinition in {}",
+                schema_set.name_table.resolve(name),
+                target_doc_id
+                    .and_then(|id| schema_set.documents.get(id as usize))
+                    .map(|d| d.base_uri.as_str())
+                    .unwrap_or("schema"),
             ),
             None,
         )
     })?;
 
     validate_self_reference_group(schema_set, new_key, name)?;
+
+    // Store original key so self-references can be redirected during resolution
+    if let Some(group) = schema_set.arenas.model_groups.get_mut(new_key) {
+        group.redefine_original = Some(original_key);
+    }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_model_group(name, new_key);
@@ -249,7 +266,7 @@ fn apply_attribute_group_redefine(
     })?;
     let namespace = new_group.target_namespace;
 
-    let _original_key = match target_doc_id {
+    let original_key = match target_doc_id {
         Some(id) => schema_set
             .documents
             .get(id as usize)
@@ -260,14 +277,23 @@ fn apply_attribute_group_redefine(
         SchemaError::structural(
             "src-redefine",
             format!(
-                "Original attribute group '{}' not found for redefinition",
-                schema_set.name_table.resolve(name)
+                "Original attribute group '{}' not found for redefinition in {}",
+                schema_set.name_table.resolve(name),
+                target_doc_id
+                    .and_then(|id| schema_set.documents.get(id as usize))
+                    .map(|d| d.base_uri.as_str())
+                    .unwrap_or("schema"),
             ),
             None,
         )
     })?;
 
     validate_self_reference_attribute_group(schema_set, new_key, name)?;
+
+    // Store original key so self-references can be redirected during resolution
+    if let Some(group) = schema_set.arenas.attribute_groups.get_mut(new_key) {
+        group.redefine_original = Some(original_key);
+    }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_attribute_group(name, new_key);
@@ -440,6 +466,336 @@ fn validate_self_reference_attribute_group(
 
 #[cfg(test)]
 mod tests {
-    // Note: Integration tests should be in the pipeline or builder module
-    // as they require full schema parsing and assembly
+    use super::*;
+    use crate::arenas::{AttributeGroupData, ModelGroupData};
+    use crate::parser::frames::{
+        Compositor, ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm, QNameRef,
+    };
+    use crate::schema::composition::ComponentKind;
+    use crate::schema::model::{DerivationSet, SchemaDocument};
+
+    /// Helper: set up a schema set with a base document and a named model group.
+    fn setup_model_group_redefine() -> (SchemaSet, ModelGroupKey, ModelGroupKey) {
+        let mut schema_set = SchemaSet::new();
+
+        // Create base document
+        let base_doc_id = schema_set.documents.len() as u32;
+        let base_doc = SchemaDocument::new(base_doc_id, "base.xsd".to_string());
+        schema_set.documents.push(base_doc);
+
+        let group_name = schema_set.name_table.add("personGroup");
+
+        // Create original group with element "name"
+        let name_elem = schema_set.name_table.add("name");
+        let original_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Element(ElementFrameResult {
+                    name: Some(name_elem),
+                    ref_name: None,
+                    target_namespace: None,
+                    type_ref: None,
+                    inline_type: None,
+                    substitution_group: vec![],
+                    default_value: None,
+                    fixed_value: None,
+                    nillable: false,
+                    is_abstract: false,
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    block: DerivationSet::empty(),
+                    final_derivation: DerivationSet::empty(),
+                    form: None,
+                    id: None,
+                    alternatives: vec![],
+                    identity_constraints: vec![],
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+        };
+        let original_key = schema_set.arenas.alloc_model_group(original_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_model_group(group_name, original_key);
+
+        // Create redefining group with self-ref + element "age"
+        let age_elem = schema_set.name_table.add("age");
+        let new_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![
+                // Self-reference
+                ParticleResult {
+                    term: ParticleTerm::Group(ModelGroupDefResult {
+                        name: None,
+                        ref_name: Some(QNameRef {
+                            prefix: None,
+                            local_name: group_name,
+                            namespace: None,
+                        }),
+                        compositor: None,
+                        particles: vec![],
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        id: None,
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    source: None,
+                },
+                // New element
+                ParticleResult {
+                    term: ParticleTerm::Element(ElementFrameResult {
+                        name: Some(age_elem),
+                        ref_name: None,
+                        target_namespace: None,
+                        type_ref: None,
+                        inline_type: None,
+                        substitution_group: vec![],
+                        default_value: None,
+                        fixed_value: None,
+                        nillable: false,
+                        is_abstract: false,
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        block: DerivationSet::empty(),
+                        final_derivation: DerivationSet::empty(),
+                        form: None,
+                        id: None,
+                        alternatives: vec![],
+                        identity_constraints: vec![],
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    source: None,
+                },
+            ],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+        };
+        let new_key = schema_set.arenas.alloc_model_group(new_data);
+
+        (schema_set, original_key, new_key)
+    }
+
+    #[test]
+    fn test_redefine_model_group_self_reference() {
+        let (mut schema_set, original_key, new_key) = setup_model_group_redefine();
+
+        // Apply redefine (no target doc — fallback to global lookup)
+        let result =
+            apply_model_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(result.is_ok(), "apply_model_group_redefine failed: {:?}", result.err());
+
+        // Verify redefine_original is set
+        let group = schema_set.arenas.model_groups.get(new_key).unwrap();
+        assert_eq!(
+            group.redefine_original,
+            Some(original_key),
+            "redefine_original should point to the original group"
+        );
+
+        // Now resolve references and verify self-ref redirects to original
+        let result = crate::schema::resolver::resolve_all_references(&mut schema_set);
+        assert!(result.is_ok(), "resolve_all_references failed: {:?}", result.err());
+
+        let group = schema_set.arenas.model_groups.get(new_key).unwrap();
+        // First particle is the group ref (self-reference → should resolve to original)
+        match &group.resolved_particles[0] {
+            crate::arenas::ResolvedParticleTerm::Group {
+                resolved_ref: Some(key),
+            } => {
+                assert_eq!(
+                    *key, original_key,
+                    "Self-reference should resolve to the original group, not the new one"
+                );
+            }
+            other => panic!("Expected Group particle with resolved_ref, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_redefine_attribute_group_self_reference() {
+        let mut schema_set = SchemaSet::new();
+
+        let group_name = schema_set.name_table.add("commonAttrs");
+
+        // Create original attribute group
+        let original_data = AttributeGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+        };
+        let original_key = schema_set.arenas.alloc_attribute_group(original_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_attribute_group(group_name, original_key);
+
+        // Create redefining group with self-reference
+        let new_data = AttributeGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: vec![QNameRef {
+                prefix: None,
+                local_name: group_name,
+                namespace: None,
+            }],
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+        };
+        let new_key = schema_set.arenas.alloc_attribute_group(new_data);
+
+        // Apply redefine
+        let result =
+            apply_attribute_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(result.is_ok(), "apply_attribute_group_redefine failed: {:?}", result.err());
+
+        // Verify redefine_original
+        let group = schema_set.arenas.attribute_groups.get(new_key).unwrap();
+        assert_eq!(group.redefine_original, Some(original_key));
+
+        // Resolve references
+        let result = crate::schema::resolver::resolve_all_references(&mut schema_set);
+        assert!(result.is_ok(), "resolve_all_references failed: {:?}", result.err());
+
+        // Verify self-ref redirected to original
+        let group = schema_set.arenas.attribute_groups.get(new_key).unwrap();
+        assert_eq!(group.resolved_attribute_groups.len(), 1);
+        assert_eq!(
+            group.resolved_attribute_groups[0], original_key,
+            "Self-reference should resolve to the original attribute group"
+        );
+    }
+
+    #[test]
+    fn test_provenance_note_redefined() {
+        let mut schema_set = SchemaSet::new();
+
+        // Create two documents for provenance tracking
+        let base_doc_id = schema_set.documents.len() as u32;
+        let base_doc = SchemaDocument::new(base_doc_id, "base.xsd".to_string());
+        schema_set.documents.push(base_doc);
+
+        let redefining_doc_id = schema_set.documents.len() as u32;
+        let redefining_doc = SchemaDocument::new(redefining_doc_id, "main.xsd".to_string());
+        schema_set.documents.push(redefining_doc);
+
+        let group_name = schema_set.name_table.add("testGroup");
+
+        // Record provenance as if a redefine occurred
+        crate::schema::composition::record_provenance(
+            &mut schema_set.effective_components,
+            crate::schema::composition::ComponentKey::ModelGroup(
+                // dummy key (not used for lookup)
+                schema_set.arenas.alloc_model_group(ModelGroupData {
+                    name: Some(group_name),
+                    target_namespace: None,
+                    ref_name: None,
+                    compositor: Some(Compositor::Sequence),
+                    particles: Vec::new(),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    id: None,
+                    annotation: None,
+                    source: None,
+                    resolved_ref: None,
+                    resolved_particles: Vec::new(),
+                    resolved_particle_types: Vec::new(),
+                    resolved_particle_elements: Vec::new(),
+                    redefine_original: None,
+                }),
+            ),
+            ComponentKind::ModelGroup,
+            None,
+            group_name,
+            Some(redefining_doc_id),
+            crate::schema::composition::redefined_action(
+                Some(redefining_doc_id),
+                ComponentKind::ModelGroup,
+                group_name,
+                None,
+                Some(base_doc_id),
+            ),
+        );
+
+        let note = schema_set.format_provenance_note(ComponentKind::ModelGroup, None, group_name);
+        assert!(
+            note.contains("base.xsd"),
+            "Provenance note should mention the original document: {}",
+            note
+        );
+        assert!(
+            note.contains("main.xsd"),
+            "Provenance note should mention the redefining document: {}",
+            note
+        );
+        assert!(
+            note.contains("redefined"),
+            "Provenance note should mention 'redefined': {}",
+            note
+        );
+    }
+
+    #[test]
+    fn test_provenance_note_declared() {
+        let schema_set = SchemaSet::new();
+        let name = schema_set.name_table.get("string").unwrap();
+
+        // No provenance recorded → empty string
+        let note = schema_set.format_provenance_note(ComponentKind::SimpleType, None, name);
+        assert!(
+            note.is_empty(),
+            "Provenance note for undeclared component should be empty, got: {}",
+            note
+        );
+    }
 }
