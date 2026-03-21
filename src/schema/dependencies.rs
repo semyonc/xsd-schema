@@ -312,9 +312,11 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
         stats.simple_types += 1;
 
         if let Some(type_def) = schema_set.arenas.simple_types.get(key) {
-            // Add dependency on base type (for restriction)
+            // Add dependency on base type (for restriction).
+            // Skip self-references: xs:redefine creates a legitimate
+            // self-referencing restriction where the old type key is reused.
             if let Some(base_key) = type_def.resolved_base_type {
-                if !is_builtin_type(base_key, builtin_types) {
+                if base_key != type_key && !is_builtin_type(base_key, builtin_types) {
                     graph.add_dependency(type_key, base_key);
                     stats.dependencies += 1;
                 }
@@ -322,7 +324,7 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
 
             // Add dependency on item type (for list)
             if let Some(item_key) = type_def.resolved_item_type {
-                if !is_builtin_type(item_key, builtin_types) {
+                if item_key != type_key && !is_builtin_type(item_key, builtin_types) {
                     graph.add_dependency(type_key, item_key);
                     stats.dependencies += 1;
                 }
@@ -330,7 +332,7 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
 
             // Add dependencies on member types (for union)
             for member_key in &type_def.resolved_member_types {
-                if !is_builtin_type(*member_key, builtin_types) {
+                if *member_key != type_key && !is_builtin_type(*member_key, builtin_types) {
                     graph.add_dependency(type_key, *member_key);
                     stats.dependencies += 1;
                 }
@@ -351,9 +353,10 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
         stats.complex_types += 1;
 
         if let Some(type_def) = schema_set.arenas.complex_types.get(key) {
-            // Add dependency on base type (for extension/restriction)
+            // Add dependency on base type (for extension/restriction).
+            // Skip self-references (xs:redefine).
             if let Some(base_key) = type_def.resolved_base_type {
-                if !is_builtin_type(base_key, builtin_types) {
+                if base_key != type_key && !is_builtin_type(base_key, builtin_types) {
                     graph.add_dependency(type_key, base_key);
                     stats.dependencies += 1;
                 }

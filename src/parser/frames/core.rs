@@ -500,7 +500,7 @@ impl NamespaceToken {
 }
 
 /// Parsed item from notQName attribute (XSD 1.1)
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotQNameItem {
     /// Specific QName that is disallowed
     QName { namespace: Option<NameId>, local_name: NameId },

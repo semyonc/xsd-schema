@@ -36,6 +36,7 @@ use crate::parser::resolver::resolve_all_directives_async;
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
+    build_dependency_graph, validate_all_derivations,
 };
 use crate::SchemaSet;
 
@@ -246,6 +247,12 @@ pub fn load_and_process_schema(
         crate::compiler::validate_all_default_open_content(schema_set)?;
     }
 
+    // Phase 4.6: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
+    if config.resolve_references {
+        let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
+        validate_all_derivations(schema_set, &dep_graph)?;
+    }
+
     // Phase 5: Allocate arena element declarations for local elements in content particles
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
@@ -298,6 +305,11 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // XSD 1.1: Validate default open content declarations
     #[cfg(feature = "xsd11")]
     crate::compiler::validate_all_default_open_content(schema_set)?;
+
+    // Validate type derivation constraints
+    if let Ok((dep_graph, _dep_stats)) = build_dependency_graph(schema_set) {
+        validate_all_derivations(schema_set, &dep_graph)?;
+    }
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
@@ -394,6 +406,12 @@ pub async fn load_and_process_schema_async(
     #[cfg(feature = "xsd11")]
     if config.resolve_references {
         crate::compiler::validate_all_default_open_content(schema_set)?;
+    }
+
+    // Phase 4.6: Validate type derivation constraints
+    if config.resolve_references {
+        let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
+        validate_all_derivations(schema_set, &dep_graph)?;
     }
 
     // Phase 5: Allocate arena element declarations (sync)

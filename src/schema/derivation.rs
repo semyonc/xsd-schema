@@ -28,6 +28,8 @@
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{DerivationMethod, SimpleTypeVariety};
+#[cfg(feature = "xsd11")]
+use crate::parser::frames::{OpenContentMode, OpenContentResult, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceRef;
 use crate::schema::dependencies::DependencyGraph;
 use crate::schema::SchemaSet;
@@ -356,6 +358,10 @@ fn validate_complex_extension(
                         location,
                     ));
                 }
+
+                // XSD 1.1: Validate open-content compatibility
+                #[cfg(feature = "xsd11")]
+                validate_open_content_extension(schema_set, type_def, base_type)?;
             }
         }
     }
@@ -399,6 +405,10 @@ fn validate_complex_restriction(
                         location,
                     ));
                 }
+
+                // XSD 1.1: Validate open-content compatibility
+                #[cfg(feature = "xsd11")]
+                validate_open_content_restriction(schema_set, type_def, base_type)?;
             }
         }
     }
@@ -406,6 +416,349 @@ fn validate_complex_restriction(
     // Note: Full content model restriction validation (particle restriction, attribute
     // subsetting) is complex and requires comparing content models. This will be
     // implemented in Phase 4 (Content Model Compilation).
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// XSD 1.1: Open-content derivation helpers
+// ---------------------------------------------------------------------------
+
+/// Return the effective open content, treating `mode=None` as absent.
+///
+/// `compile.rs::open_content_from_result` collapses `mode=None` to `None`,
+/// so derivation validation must agree: a raw `OpenContentResult` with
+/// `mode=None` is semantically equivalent to no open content.
+#[cfg(feature = "xsd11")]
+fn effective_open_content(oc: Option<&OpenContentResult>) -> Option<&OpenContentResult> {
+    oc.filter(|o| o.mode != OpenContentMode::None)
+}
+
+/// Map processContents to a strictness level (Strict=2, Lax=1, Skip=0).
+#[cfg(feature = "xsd11")]
+fn process_contents_strictness(pc: ProcessContents) -> u8 {
+    match pc {
+        ProcessContents::Strict => 2,
+        ProcessContents::Lax => 1,
+        ProcessContents::Skip => 0,
+    }
+}
+
+/// Compute the exclusion set for `##other` per the spec (§3.10.1):
+/// `namespace="##other"` maps to `not({target namespace}, absent)`.
+/// The result always contains `None` (absent) and, if the target namespace
+/// is present, also contains `Some(target_ns)`.
+#[cfg(feature = "xsd11")]
+fn other_exclusion_set(target_ns: Option<NameId>) -> Vec<Option<NameId>> {
+    match target_ns {
+        Some(ns) => vec![Some(ns), None],
+        None => vec![None],
+    }
+}
+
+/// Resolve a `WildcardNamespace` to a set of effective `Option<NameId>` values
+/// that the wildcard **allows** (positive set).
+///
+/// Returns `None` for unbounded / complement constraints (`Any`, `Other`)
+/// that cannot be represented as a finite positive set — callers must handle
+/// those structurally.
+#[cfg(feature = "xsd11")]
+fn resolve_ns_set(
+    wns: &WildcardNamespace,
+    target_ns: Option<NameId>,
+) -> Option<Vec<Option<NameId>>> {
+    match wns {
+        WildcardNamespace::Any | WildcardNamespace::Other => None,
+        WildcardNamespace::TargetNamespace => Some(vec![target_ns]),
+        WildcardNamespace::Local => Some(vec![None]),
+        WildcardNamespace::List(tokens) => {
+            Some(tokens.iter().map(|t| t.resolve(target_ns)).collect())
+        }
+    }
+}
+
+/// Check whether `derived` namespace constraint is a subset of `base`
+/// (cos-ns-subset, §3.10.6.2).
+///
+/// Both constraints are resolved against their respective target namespaces
+/// so that `##targetNamespace` and an explicit URI equal to the target
+/// namespace are treated as equivalent.
+///
+/// Key spec detail: `##other` maps to `not({target namespace}, absent)`,
+/// i.e. it **always** excludes both the target namespace and the absent
+/// namespace (§3.10.1).
+///
+/// processContents is checked separately by the open-content derivation
+/// validators.
+#[cfg(feature = "xsd11")]
+fn is_namespace_subset(
+    derived: &WildcardNamespace,
+    derived_target_ns: Option<NameId>,
+    base: &WildcardNamespace,
+    base_target_ns: Option<NameId>,
+) -> bool {
+    match base {
+        WildcardNamespace::Any => true,
+
+        WildcardNamespace::Other => {
+            // base = not({base_target_ns, absent}).
+            // Derived ⊆ base iff every namespace derived allows is also
+            // allowed by base, i.e. is not in base's exclusion set.
+            let base_excluded = other_exclusion_set(base_target_ns);
+
+            match derived {
+                WildcardNamespace::Any => false,
+
+                WildcardNamespace::Other => {
+                    // derived = not({derived_target_ns, absent}).
+                    // Derived ⊆ base iff base_excluded ⊆ derived_excluded,
+                    // i.e. derived excludes at least everything base excludes.
+                    let derived_excluded = other_exclusion_set(derived_target_ns);
+                    base_excluded.iter().all(|ns| derived_excluded.contains(ns))
+                }
+
+                _ => {
+                    // Finite positive set — every allowed ns must not be in
+                    // base's exclusion set.
+                    match resolve_ns_set(derived, derived_target_ns) {
+                        Some(resolved) => {
+                            resolved.iter().all(|ns| !base_excluded.contains(ns))
+                        }
+                        None => false,
+                    }
+                }
+            }
+        }
+
+        WildcardNamespace::TargetNamespace | WildcardNamespace::Local
+        | WildcardNamespace::List(_) => {
+            // Base is a finite positive set — resolve both sides and check
+            // set inclusion.
+            let Some(base_set) = resolve_ns_set(base, base_target_ns) else {
+                return false;
+            };
+            match derived {
+                WildcardNamespace::Any | WildcardNamespace::Other => false,
+                _ => {
+                    let Some(derived_set) = resolve_ns_set(derived, derived_target_ns) else {
+                        return false;
+                    };
+                    derived_set.iter().all(|ns| base_set.contains(ns))
+                }
+            }
+        }
+    }
+}
+
+/// Check whether `derived` wildcard's namespace constraint is a subset of
+/// `base` wildcard's, also considering notNamespace and notQName exclusions.
+///
+/// Implements cos-ns-subset (§3.10.6.2) — a pure namespace-constraint
+/// relation.  processContents is NOT checked here; callers handle it
+/// separately for extension vs restriction semantics.
+///
+/// `derived_target_ns` / `base_target_ns` are the effective target namespaces
+/// of the schema documents that contain the derived / base types.
+#[cfg(feature = "xsd11")]
+fn is_wildcard_ns_subset(
+    derived: &WildcardResult,
+    derived_target_ns: Option<NameId>,
+    base: &WildcardResult,
+    base_target_ns: Option<NameId>,
+) -> bool {
+    // Namespace constraint must be a subset
+    if !is_namespace_subset(
+        &derived.namespace, derived_target_ns,
+        &base.namespace, base_target_ns,
+    ) {
+        return false;
+    }
+
+    // notNamespace: derived must exclude at least everything base excludes.
+    // Resolve tokens before comparing so that ##targetNamespace and an
+    // explicit URI are treated as equivalent.
+    for base_excl in &base.not_namespace {
+        let base_ns = base_excl.resolve(base_target_ns);
+        let found = derived.not_namespace.iter().any(|d| d.resolve(derived_target_ns) == base_ns);
+        if !found {
+            return false;
+        }
+    }
+
+    // notQName: derived must exclude at least everything base excludes
+    for item in &base.not_qname {
+        if !derived.not_qname.contains(item) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Validate open-content compatibility for complex type extension (cos-ct-extends).
+///
+/// Rules:
+/// - If base has no OC, derived may freely add OC.
+/// - If base has OC, derived must also have OC.
+/// - Suffix cannot extend interleave.
+/// - Derived wildcard must be a superset of base wildcard.
+#[cfg(feature = "xsd11")]
+fn validate_open_content_extension(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    let base_oc = effective_open_content(base.open_content.as_ref());
+    let derived_oc = effective_open_content(derived.open_content.as_ref());
+
+    // If base has no open content, derived may freely add — OK
+    let Some(base_oc) = base_oc else { return Ok(()); };
+
+    let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+
+    // Derived must also have open content when base has it
+    let Some(derived_oc) = derived_oc else {
+        return Err(SchemaError::structural(
+            "cos-ct-extends",
+            format!(
+                "Complex type '{}' extends '{}' which has open content, \
+                 but derived type has no open content",
+                type_name, base_name
+            ),
+            location,
+        ));
+    };
+
+    // Mode: suffix cannot extend interleave
+    if base_oc.mode == OpenContentMode::Interleave
+        && derived_oc.mode == OpenContentMode::Suffix
+    {
+        return Err(SchemaError::structural(
+            "cos-ct-extends",
+            format!(
+                "Complex type '{}' uses suffix open content mode but base type '{}' \
+                 uses interleave mode — suffix cannot extend interleave",
+                type_name, base_name
+            ),
+            location,
+        ));
+    }
+
+    // Wildcard: derived must be superset of base (i.e. base ns-constraint ⊆ derived)
+    if let (Some(base_wc), Some(derived_wc)) =
+        (base_oc.wildcard.as_ref(), derived_oc.wildcard.as_ref())
+    {
+        if !is_wildcard_ns_subset(
+            base_wc, base.target_namespace,
+            derived_wc, derived.target_namespace,
+        ) {
+            return Err(SchemaError::structural(
+                "cos-ct-extends",
+                format!(
+                    "Open content wildcard of '{}' is not a valid extension \
+                     of base type '{}' wildcard",
+                    type_name, base_name
+                ),
+                location,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate open-content compatibility for complex type restriction (derivation-ok-restriction).
+///
+/// Rules:
+/// - If base has no OC, derived must not add OC.
+/// - If base has OC but derived doesn't — OK (restriction removes it).
+/// - Interleave cannot restrict suffix.
+/// - Derived wildcard must be a subset of base wildcard.
+#[cfg(feature = "xsd11")]
+fn validate_open_content_restriction(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    let base_oc = effective_open_content(base.open_content.as_ref());
+    let derived_oc = effective_open_content(derived.open_content.as_ref());
+
+    // If base has no open content, derived must not add one
+    if base_oc.is_none() && derived_oc.is_some() {
+        let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+        let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+        let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+        return Err(SchemaError::structural(
+            "derivation-ok-restriction",
+            format!(
+                "Complex type '{}' restricts '{}' which has no open content, \
+                 but adds open content — not allowed",
+                type_name, base_name
+            ),
+            location,
+        ));
+    }
+
+    // If base has OC but derived doesn't — OK (restriction removes it)
+    let (Some(base_oc), Some(derived_oc)) = (base_oc, derived_oc) else {
+        return Ok(());
+    };
+
+    let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+
+    // Mode: if base is suffix, derived cannot use interleave
+    if base_oc.mode == OpenContentMode::Suffix
+        && derived_oc.mode == OpenContentMode::Interleave
+    {
+        return Err(SchemaError::structural(
+            "derivation-ok-restriction",
+            format!(
+                "Complex type '{}' uses interleave open content mode but base type '{}' \
+                 uses suffix mode — interleave cannot restrict suffix",
+                type_name, base_name
+            ),
+            location,
+        ));
+    }
+
+    // Wildcard: derived must be subset of base
+    if let (Some(base_wc), Some(derived_wc)) =
+        (base_oc.wildcard.as_ref(), derived_oc.wildcard.as_ref())
+    {
+        if !is_wildcard_ns_subset(
+            derived_wc, derived.target_namespace,
+            base_wc, base.target_namespace,
+        ) {
+            return Err(SchemaError::structural(
+                "derivation-ok-restriction",
+                format!(
+                    "Open content wildcard of '{}' is not a valid restriction \
+                     of base type '{}' wildcard",
+                    type_name, base_name
+                ),
+                location,
+            ));
+        }
+
+        // processContents: restriction must be at least as strict
+        if process_contents_strictness(derived_wc.process_contents)
+            < process_contents_strictness(base_wc.process_contents)
+        {
+            return Err(SchemaError::structural(
+                "derivation-ok-restriction",
+                format!(
+                    "Open content wildcard of '{}' has weaker processContents \
+                     than base type '{}' wildcard",
+                    type_name, base_name
+                ),
+                location,
+            ));
+        }
+    }
 
     Ok(())
 }
@@ -819,5 +1172,338 @@ mod tests {
         let name_id = schema_set.name_table.add("myType");
         let name = format_type_name(&schema_set, Some(name_id), None);
         assert_eq!(name, "myType");
+    }
+
+    // ====================================================================
+    // XSD 1.1: Open-content derivation tests
+    // ====================================================================
+
+    #[cfg(feature = "xsd11")]
+    fn make_open_content(
+        mode: crate::parser::frames::OpenContentMode,
+        namespace: crate::parser::frames::WildcardNamespace,
+        pc: crate::parser::frames::ProcessContents,
+    ) -> crate::parser::frames::OpenContentResult {
+        crate::parser::frames::OpenContentResult {
+            mode,
+            wildcard: Some(crate::parser::frames::WildcardResult {
+                namespace,
+                process_contents: pc,
+                not_namespace: Vec::new(),
+                not_qname: Vec::new(),
+                id: None,
+                annotation: None,
+                source: None,
+            }),
+            id: None,
+            annotation: None,
+            source: None,
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_suffix_cannot_extend_interleave() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Extension);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+            assert_eq!(constraint, "cos-ct-extends");
+        } else {
+            panic!("Expected cos-ct-extends error");
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_interleave_extends_interleave_valid() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Extension);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_base_has_oc_derived_has_none() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Extension);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        // No open_content on derived
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+            assert_eq!(constraint, "cos-ct-extends");
+        } else {
+            panic!("Expected cos-ct-extends error");
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_extension_base_no_oc_derived_adds_oc_valid() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        // Base has no open content
+        let base_data = create_complex_type_data(None);
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Extension);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_restriction_adds_oc_when_base_has_none() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        // Base has no open content
+        let base_data = create_complex_type_data(None);
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Restriction);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        } else {
+            panic!("Expected derivation-ok-restriction error");
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_restriction_removes_oc_valid() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Restriction);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        // No open_content — restriction removes it
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+        assert!(result.is_ok());
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_restriction_interleave_cannot_restrict_suffix() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Restriction);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        } else {
+            panic!("Expected derivation-ok-restriction error");
+        }
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_restriction_suffix_restricts_interleave_valid() {
+        use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
+
+        let mut schema_set = SchemaSet::new();
+
+        let mut base_data = create_complex_type_data(None);
+        base_data.open_content = Some(make_open_content(
+            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let base_key = schema_set.arenas.alloc_complex_type(base_data);
+
+        let mut derived_data = create_complex_type_data(None);
+        derived_data.derivation_method = Some(DerivationMethod::Restriction);
+        derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
+        derived_data.open_content = Some(make_open_content(
+            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+        ));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
+
+        let mut stats = DerivationStats::default();
+        let result = validate_complex_type(&schema_set, derived_key, &mut stats);
+        assert!(result.is_ok());
+    }
+
+    // ====================================================================
+    // cos-ns-subset: ##other exclusion-set tests (§3.10.1, §3.10.6.2)
+    //
+    // ##other maps to not({target namespace}, absent), so it always
+    // excludes both the target namespace AND absent.
+    // ====================================================================
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_ns_subset_local_not_subset_of_other() {
+        // Base ##other with target ns urn:a excludes {Some(urn:a), None}.
+        // Derived ##local allows {None}.
+        // None is in base's exclusion set → NOT a subset.
+        use crate::parser::frames::WildcardNamespace;
+
+        let schema_set = SchemaSet::new();
+        let urn_a = schema_set.name_table.add("urn:a");
+
+        let result = is_namespace_subset(
+            &WildcardNamespace::Local, None,
+            &WildcardNamespace::Other, Some(urn_a),
+        );
+        assert!(!result, "##local must NOT be a subset of ##other (absent is excluded)");
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_ns_subset_other_no_tns_not_subset_of_other_with_tns() {
+        // Base ##other with tns=urn:a excludes {Some(urn:a), None}.
+        // Derived ##other with tns=None excludes {None}.
+        // Derived still allows urn:a, which base excludes → NOT a subset.
+        use crate::parser::frames::WildcardNamespace;
+
+        let schema_set = SchemaSet::new();
+        let urn_a = schema_set.name_table.add("urn:a");
+
+        let result = is_namespace_subset(
+            &WildcardNamespace::Other, None,
+            &WildcardNamespace::Other, Some(urn_a),
+        );
+        assert!(!result, "##other(tns=None) must NOT be a subset of ##other(tns=urn:a)");
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_ns_subset_other_with_tns_is_subset_of_other_no_tns() {
+        // Base ##other with tns=None excludes {None}.
+        // Derived ##other with tns=urn:a excludes {Some(urn:a), None}.
+        // Derived excludes a superset → IS a subset.
+        use crate::parser::frames::WildcardNamespace;
+
+        let schema_set = SchemaSet::new();
+        let urn_a = schema_set.name_table.add("urn:a");
+
+        let result = is_namespace_subset(
+            &WildcardNamespace::Other, Some(urn_a),
+            &WildcardNamespace::Other, None,
+        );
+        assert!(result, "##other(tns=urn:a) MUST be a subset of ##other(tns=None)");
+    }
+
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_ns_subset_list_with_tns_uri_not_subset_of_other() {
+        // Base ##other with tns=urn:a excludes {Some(urn:a), None}.
+        // Derived list contains explicit urn:a URI.
+        // urn:a is in base's exclusion set → NOT a subset.
+        use crate::parser::frames::{NamespaceToken, WildcardNamespace};
+
+        let schema_set = SchemaSet::new();
+        let urn_a = schema_set.name_table.add("urn:a");
+        let urn_b = schema_set.name_table.add("urn:b");
+
+        let result = is_namespace_subset(
+            &WildcardNamespace::List(vec![NamespaceToken::Uri(urn_a), NamespaceToken::Uri(urn_b)]),
+            None,
+            &WildcardNamespace::Other,
+            Some(urn_a),
+        );
+        assert!(!result, "List containing base's target ns must NOT be a subset of ##other");
     }
 }
