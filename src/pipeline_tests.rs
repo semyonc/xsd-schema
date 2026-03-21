@@ -657,3 +657,77 @@ fn test_process_loaded_schemas_with_redefine() {
     assert!(matches!(type_key.unwrap(), TypeKey::Complex(_)));
 }
 
+// ========================================================================
+// Default Open Content Validation Tests (cos-valid-default-oc, §3.4.6.5)
+// ========================================================================
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_default_open_content_interleave_valid() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:defaultOpenContent mode="interleave">
+                <xs:any namespace="##other" processContents="lax"/>
+            </xs:defaultOpenContent>
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Valid defaultOpenContent (interleave) should pass: {:?}", result);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_default_open_content_suffix_valid() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:defaultOpenContent mode="suffix">
+                <xs:any namespace="##other" processContents="skip"/>
+            </xs:defaultOpenContent>
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Valid defaultOpenContent (suffix) should pass: {:?}", result);
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_default_open_content_missing_wildcard() {
+    use crate::error::SchemaError;
+
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:defaultOpenContent mode="interleave"/>
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "defaultOpenContent without wildcard should fail");
+
+    if let Err(SchemaError::StructuralError { constraint, .. }) = result {
+        assert_eq!(constraint, "cos-valid-default-oc");
+    } else {
+        panic!("Expected structural error with cos-valid-default-oc constraint, got: {:?}", result);
+    }
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_default_open_content_applies_to_empty_valid() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:defaultOpenContent mode="suffix" appliesToEmpty="true">
+                <xs:any namespace="##other" processContents="lax"/>
+            </xs:defaultOpenContent>
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Valid defaultOpenContent with appliesToEmpty should pass: {:?}", result);
+}
+

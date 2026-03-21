@@ -240,6 +240,12 @@ pub fn load_and_process_schema(
         stats.resolution_stats = Some(resolution_stats);
     }
 
+    // Phase 4.5 (XSD 1.1): Validate default open content declarations
+    #[cfg(feature = "xsd11")]
+    if config.resolve_references {
+        crate::compiler::validate_all_default_open_content(schema_set)?;
+    }
+
     // Phase 5: Allocate arena element declarations for local elements in content particles
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
@@ -288,6 +294,11 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     let inline_stats = assemble_inline_types(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
+
+    // XSD 1.1: Validate default open content declarations
+    #[cfg(feature = "xsd11")]
+    crate::compiler::validate_all_default_open_content(schema_set)?;
+
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
     Ok((inline_stats, resolution_stats))
@@ -377,6 +388,12 @@ pub async fn load_and_process_schema_async(
     if config.resolve_references {
         let resolution_stats = resolve_all_references(schema_set)?;
         stats.resolution_stats = Some(resolution_stats);
+    }
+
+    // Phase 4.5 (XSD 1.1): Validate default open content declarations
+    #[cfg(feature = "xsd11")]
+    if config.resolve_references {
+        crate::compiler::validate_all_default_open_content(schema_set)?;
     }
 
     // Phase 5: Allocate arena element declarations (sync)

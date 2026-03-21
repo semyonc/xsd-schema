@@ -87,7 +87,4 @@ pub enum ContentModelMatcher {
 }
 
 #[cfg(feature = "xsd11")]
-pub use open_content::{
-    OpenContent, OpenContentMode as CompilerOpenContentMode, validate_interleave,
-    validate_suffix,
-};
+pub use open_content::validate_all_default_open_content;
