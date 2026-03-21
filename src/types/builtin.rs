@@ -245,6 +245,7 @@ impl BuiltinTypes {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            redefine_original: None,
         });
 
         // Helper to create and register a built-in type
@@ -275,6 +276,7 @@ impl BuiltinTypes {
                 resolved_base_type: None,
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
+                redefine_original: None,
             };
 
             schema_set.arenas.alloc_simple_type(data)
@@ -776,6 +778,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         });
         assert!(!builtin.is_builtin(custom_type));
     }

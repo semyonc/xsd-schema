@@ -82,7 +82,7 @@ fn apply_simple_type_redefine(
 
     // Kind-specific, document-scoped lookup; global fallback only when
     // resolved_doc_id is None (pre-loaded schemas without resolution).
-    let _original_key = match target_doc_id {
+    let original_key = match target_doc_id {
         Some(id) => schema_set
             .documents
             .get(id as usize)
@@ -105,7 +105,14 @@ fn apply_simple_type_redefine(
         )
     })?;
 
-    validate_self_derivation_simple(schema_set, new_key, name)?;
+    validate_self_derivation_simple(schema_set, new_key, name, namespace)?;
+
+    // Store original type key for base-type redirection during resolution
+    if let TypeKey::Simple(orig_key) = original_key {
+        if let Some(st) = schema_set.arenas.simple_types.get_mut(new_key) {
+            st.redefine_original = Some(orig_key);
+        }
+    }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_type(name, TypeKey::Simple(new_key));
@@ -142,7 +149,7 @@ fn apply_complex_type_redefine(
     })?;
     let namespace = new_type.target_namespace;
 
-    let _original_key = match target_doc_id {
+    let original_key = match target_doc_id {
         Some(id) => schema_set
             .documents
             .get(id as usize)
@@ -165,7 +172,14 @@ fn apply_complex_type_redefine(
         )
     })?;
 
-    validate_self_derivation_complex(schema_set, new_key, name)?;
+    validate_self_derivation_complex(schema_set, new_key, name, namespace)?;
+
+    // Store original type key for base-type redirection during resolution
+    if let TypeKey::Complex(orig_key) = original_key {
+        if let Some(ct) = schema_set.arenas.complex_types.get_mut(new_key) {
+            ct.redefine_original = Some(orig_key);
+        }
+    }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_type(name, TypeKey::Complex(new_key));
@@ -313,6 +327,7 @@ fn validate_self_derivation_simple(
     schema_set: &SchemaSet,
     type_key: SimpleTypeKey,
     expected_name: NameId,
+    expected_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
     use crate::parser::frames::TypeRefResult;
 
@@ -322,7 +337,9 @@ fn validate_self_derivation_simple(
         .get(type_key)
         .ok_or_else(|| SchemaError::internal("Type not found"))?;
 
-    // Check that base_type references the same name (self-reference)
+    // Check that base_type references the same name and namespace (self-reference).
+    // Unprefixed QNames (namespace == None) are accepted — they resolve to the
+    // target namespace during the reference-resolution phase.
     if let Some(TypeRefResult::QName(ref qname)) = type_def.base_type {
         if qname.local_name != expected_name {
             return Err(SchemaError::structural(
@@ -333,6 +350,19 @@ fn validate_self_derivation_simple(
                     .as_ref()
                     .and_then(|s| schema_set.source_maps.locate(s)),
             ));
+        }
+        // If the reference is explicitly namespace-qualified, it must match
+        if let Some(ref_ns) = qname.namespace {
+            if Some(ref_ns) != expected_namespace {
+                return Err(SchemaError::structural(
+                    "src-redefine",
+                    "Redefined simple type base references a different namespace than the original",
+                    type_def
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s)),
+                ));
+            }
         }
     } else {
         return Err(SchemaError::structural(
@@ -353,6 +383,7 @@ fn validate_self_derivation_complex(
     schema_set: &SchemaSet,
     type_key: ComplexTypeKey,
     expected_name: NameId,
+    expected_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
     use crate::parser::frames::TypeRefResult;
 
@@ -362,7 +393,9 @@ fn validate_self_derivation_complex(
         .get(type_key)
         .ok_or_else(|| SchemaError::internal("Type not found"))?;
 
-    // Check that base_type references the same name (self-reference)
+    // Check that base_type references the same name and namespace (self-reference).
+    // Unprefixed QNames (namespace == None) are accepted — they resolve to the
+    // target namespace during the reference-resolution phase.
     if let Some(TypeRefResult::QName(ref qname)) = type_def.base_type {
         if qname.local_name != expected_name {
             return Err(SchemaError::structural(
@@ -373,6 +406,19 @@ fn validate_self_derivation_complex(
                     .as_ref()
                     .and_then(|s| schema_set.source_maps.locate(s)),
             ));
+        }
+        // If the reference is explicitly namespace-qualified, it must match
+        if let Some(ref_ns) = qname.namespace {
+            if Some(ref_ns) != expected_namespace {
+                return Err(SchemaError::structural(
+                    "src-redefine",
+                    "Redefined complex type base references a different namespace than the original",
+                    type_def
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s)),
+                ));
+            }
         }
     } else {
         return Err(SchemaError::structural(

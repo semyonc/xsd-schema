@@ -307,9 +307,8 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     crate::compiler::validate_all_default_open_content(schema_set)?;
 
     // Validate type derivation constraints
-    if let Ok((dep_graph, _dep_stats)) = build_dependency_graph(schema_set) {
-        validate_all_derivations(schema_set, &dep_graph)?;
-    }
+    let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
+    validate_all_derivations(schema_set, &dep_graph)?;
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;

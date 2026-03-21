@@ -159,6 +159,7 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_base_type: None,
                     resolved_item_type: None,
                     resolved_member_types: Vec::new(),
+                    redefine_original: None,
                 };
                 let key = self.schema_set.arenas.alloc_simple_type(data);
                 let type_key = TypeKey::Simple(key);
@@ -235,6 +236,7 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_attributes: Vec::new(),
                     resolved_content_particle_types: Vec::new(),
                     resolved_content_particle_elements: Vec::new(),
+                    redefine_original: None,
                 };
                 let key = self.schema_set.arenas.alloc_complex_type(data);
                 let type_key = TypeKey::Complex(key);

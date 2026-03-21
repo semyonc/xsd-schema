@@ -192,11 +192,29 @@ fn parse_qname_ref(
         (value, None)
     };
 
-    let local_name = name_table.get(local).ok_or_else(|| SchemaError::structural(
-        "src-resolve",
-        format!("Unknown local name: '{}'", local),
-        None,
-    ))?;
+    // Validate QName lexical form: both prefix and local part must be non-empty
+    // NCNames (no colons allowed in either part).
+    if local.is_empty() || local.contains(':') {
+        return Err(SchemaError::structural(
+            "src-resolve",
+            format!("Invalid QName: '{}'", value),
+            None,
+        ));
+    }
+    if let Some(p) = prefix {
+        if p.is_empty() {
+            return Err(SchemaError::structural(
+                "src-resolve",
+                format!("Invalid QName: '{}'", value),
+                None,
+            ));
+        }
+    }
+
+    // Use add() (intern-or-get) rather than get() so that forward-referenced
+    // names are interned immediately. Resolution of whether the name actually
+    // exists happens later in the reference-resolution phase.
+    let local_name = name_table.add(local);
 
     let prefix_id = prefix.and_then(|p| name_table.get(p));
 

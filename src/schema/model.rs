@@ -1145,6 +1145,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            redefine_original: None,
         });
 
         assert!(set.is_type_derived_from(

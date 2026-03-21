@@ -583,7 +583,7 @@ fn resolve_simple_type_references(
 ) -> SchemaResult<()> {
     // First pass: extract QName references we need to resolve
     // Also get already resolved types from assembly (for inline types)
-    let (base_qname, item_qname, member_qnames, source, already_resolved_base, already_resolved_item, already_resolved_members) = {
+    let (base_qname, item_qname, member_qnames, source, already_resolved_base, already_resolved_item, already_resolved_members, redefine_original, type_name, type_ns) = {
         let type_def = schema_set
             .arenas
             .simple_types
@@ -616,6 +616,9 @@ fn resolve_simple_type_references(
             type_def.resolved_base_type,
             type_def.resolved_item_type,
             type_def.resolved_member_types.clone(),
+            type_def.redefine_original,
+            type_def.name,
+            type_def.target_namespace,
         )
     };
 
@@ -623,12 +626,21 @@ fn resolve_simple_type_references(
     let resolver = ReferenceResolver::new(schema_set);
 
     // Resolve base type reference (for restriction) - if not already resolved
+    // For redefine self-references, redirect to the original type key
     let resolved_base = if already_resolved_base.is_some() {
         already_resolved_base
     } else if let Some(ref qname) = base_qname {
-        let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
-        stats.types_resolved += 1;
-        Some(type_key)
+        let is_redefine_self_ref = redefine_original.is_some()
+            && Some(qname.local_name) == type_name
+            && qname.namespace == type_ns;
+        if is_redefine_self_ref {
+            stats.types_resolved += 1;
+            Some(TypeKey::Simple(redefine_original.unwrap()))
+        } else {
+            let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
+            stats.types_resolved += 1;
+            Some(type_key)
+        }
     } else {
         None
     };
@@ -673,7 +685,7 @@ fn resolve_complex_type_references(
 
     // First pass: extract QName references we need to resolve
     // Also get already resolved base type from assembly (for inline types)
-    let (base_qname, attribute_groups, attribute_uses, source, already_resolved_base) = {
+    let (base_qname, attribute_groups, attribute_uses, source, already_resolved_base, redefine_original, type_name, type_ns) = {
         let type_def = schema_set
             .arenas
             .complex_types
@@ -701,6 +713,9 @@ fn resolve_complex_type_references(
             attribute_uses,
             type_def.source.clone(),
             type_def.resolved_base_type,
+            type_def.redefine_original,
+            type_def.name,
+            type_def.target_namespace,
         )
     };
 
@@ -708,12 +723,21 @@ fn resolve_complex_type_references(
     let resolver = ReferenceResolver::new(schema_set);
 
     // Resolve base type reference - if not already resolved
+    // For redefine self-references, redirect to the original type key
     let resolved_base = if already_resolved_base.is_some() {
         already_resolved_base
     } else if let Some(ref qname) = base_qname {
-        let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
-        stats.types_resolved += 1;
-        Some(type_key)
+        let is_redefine_self_ref = redefine_original.is_some()
+            && Some(qname.local_name) == type_name
+            && qname.namespace == type_ns;
+        if is_redefine_self_ref {
+            stats.types_resolved += 1;
+            Some(TypeKey::Complex(redefine_original.unwrap()))
+        } else {
+            let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
+            stats.types_resolved += 1;
+            Some(type_key)
+        }
     } else {
         None
     };
@@ -1542,6 +1566,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            redefine_original: None,
         };
         let ct_key = schema_set.arenas.alloc_complex_type(ct_data);
 

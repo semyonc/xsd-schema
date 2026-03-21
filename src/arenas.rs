@@ -47,6 +47,9 @@ pub struct SimpleTypeDefData {
     pub resolved_item_type: Option<TypeKey>,
     /// Resolved member type keys (for union types)
     pub resolved_member_types: Vec<TypeKey>,
+
+    /// Original simple type key before redefine (for base-type resolution)
+    pub redefine_original: Option<SimpleTypeKey>,
 }
 
 /// Resolved attribute use - stores resolved keys for attribute use references
@@ -94,6 +97,9 @@ pub struct ComplexTypeDefData {
     pub resolved_content_particle_types: Vec<Option<TypeKey>>,
     /// Resolved element keys for local elements in content particles (flat depth-first element order)
     pub resolved_content_particle_elements: Vec<Option<ElementKey>>,
+
+    /// Original complex type key before redefine (for base-type resolution)
+    pub redefine_original: Option<ComplexTypeKey>,
 }
 
 /// Placeholder for ElementDecl (defined in schema/decl.rs)
@@ -405,6 +411,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         }
     }
 

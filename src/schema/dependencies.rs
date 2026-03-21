@@ -312,11 +312,9 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
         stats.simple_types += 1;
 
         if let Some(type_def) = schema_set.arenas.simple_types.get(key) {
-            // Add dependency on base type (for restriction).
-            // Skip self-references: xs:redefine creates a legitimate
-            // self-referencing restriction where the old type key is reused.
+            // Add dependency on base type (for restriction)
             if let Some(base_key) = type_def.resolved_base_type {
-                if base_key != type_key && !is_builtin_type(base_key, builtin_types) {
+                if !is_builtin_type(base_key, builtin_types) {
                     graph.add_dependency(type_key, base_key);
                     stats.dependencies += 1;
                 }
@@ -324,7 +322,7 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
 
             // Add dependency on item type (for list)
             if let Some(item_key) = type_def.resolved_item_type {
-                if item_key != type_key && !is_builtin_type(item_key, builtin_types) {
+                if !is_builtin_type(item_key, builtin_types) {
                     graph.add_dependency(type_key, item_key);
                     stats.dependencies += 1;
                 }
@@ -332,7 +330,7 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
 
             // Add dependencies on member types (for union)
             for member_key in &type_def.resolved_member_types {
-                if *member_key != type_key && !is_builtin_type(*member_key, builtin_types) {
+                if !is_builtin_type(*member_key, builtin_types) {
                     graph.add_dependency(type_key, *member_key);
                     stats.dependencies += 1;
                 }
@@ -353,10 +351,9 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
         stats.complex_types += 1;
 
         if let Some(type_def) = schema_set.arenas.complex_types.get(key) {
-            // Add dependency on base type (for extension/restriction).
-            // Skip self-references (xs:redefine).
+            // Add dependency on base type (for extension/restriction)
             if let Some(base_key) = type_def.resolved_base_type {
-                if base_key != type_key && !is_builtin_type(base_key, builtin_types) {
+                if !is_builtin_type(base_key, builtin_types) {
                     graph.add_dependency(type_key, base_key);
                     stats.dependencies += 1;
                 }
@@ -771,6 +768,7 @@ mod tests {
             resolved_base_type: Some(TypeKey::Simple(string_key)),
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
 
         let _user_type_key = schema_set.arenas.alloc_simple_type(simple_data);
@@ -817,6 +815,7 @@ mod tests {
             resolved_base_type: Some(TypeKey::Simple(string_key)),
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
         let type1_key = schema_set.arenas.alloc_simple_type(type1_data);
 
@@ -837,6 +836,7 @@ mod tests {
             resolved_base_type: Some(TypeKey::Simple(type1_key)),
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
         let type2_key = schema_set.arenas.alloc_simple_type(type2_data);
 

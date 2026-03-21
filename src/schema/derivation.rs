@@ -852,6 +852,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         }
     }
 
@@ -883,6 +884,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            redefine_original: None,
         }
     }
 

@@ -817,6 +817,7 @@ fn assemble_inline_type(
                 resolved_base_type: None,
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
+                redefine_original: None,
             };
             let key = schema_set.arenas.alloc_simple_type(data);
             Ok(TypeKey::Simple(key))
@@ -860,6 +861,7 @@ fn assemble_inline_type(
                 resolved_attributes: Vec::new(),
                 resolved_content_particle_types: Vec::new(),
                 resolved_content_particle_elements: Vec::new(),
+                redefine_original: None,
             };
             let key = schema_set.arenas.alloc_complex_type(data);
             Ok(TypeKey::Complex(key))
@@ -1164,6 +1166,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
@@ -1205,6 +1208,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
@@ -1245,6 +1249,7 @@ mod tests {
             resolved_base_type: None,
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
+            redefine_original: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
@@ -1427,6 +1432,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            redefine_original: None,
         };
 
         let ct_key = schema_set.arenas.alloc_complex_type(complex_data);

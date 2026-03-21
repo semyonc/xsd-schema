@@ -1860,6 +1860,7 @@ mod tests {
                 resolved_base_type: None,
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
+                redefine_original: None,
             },
         );
 
@@ -1954,6 +1955,7 @@ mod tests {
                 resolved_base_type: None,
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
+                redefine_original: None,
             },
         );
 
