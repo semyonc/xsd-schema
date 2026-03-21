@@ -331,7 +331,7 @@ pub fn term_matches(
             not_qnames,
             ..
         } => {
-            if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
+            if !namespace_constraint.matches(element_namespace, target_namespace) {
                 return false;
             }
             !not_qnames_exclude(not_qnames, element_namespace, element_name)
@@ -431,21 +431,6 @@ pub fn advance_with_priority(
     };
 
     epsilon_closure(nfa, next)
-}
-
-fn wildcard_matches(
-    constraint: &NamespaceConstraint,
-    element_namespace: Option<NameId>,
-    target_namespace: Option<NameId>,
-) -> bool {
-    match constraint {
-        NamespaceConstraint::Any => true,
-        NamespaceConstraint::Other => element_namespace != target_namespace,
-        NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
-        NamespaceConstraint::Local => element_namespace.is_none(),
-        NamespaceConstraint::List(list) => list.contains(&element_namespace),
-        NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
-    }
 }
 
 #[cfg(test)]

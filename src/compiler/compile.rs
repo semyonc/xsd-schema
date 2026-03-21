@@ -1453,15 +1453,9 @@ fn wildcard_ref_from_default(
         }
     }
 
-    let process_contents = match wildcard.process_contents {
-        crate::schema::wildcard::ProcessContents::Strict => TypesProcessContents::Strict,
-        crate::schema::wildcard::ProcessContents::Lax => TypesProcessContents::Lax,
-        crate::schema::wildcard::ProcessContents::Skip => TypesProcessContents::Skip,
-    };
-
     WildcardRef {
         namespace_constraint,
-        process_contents,
+        process_contents: wildcard.process_contents,
         not_qnames,
         has_defined_sibling,
         source: wildcard.source.clone(),

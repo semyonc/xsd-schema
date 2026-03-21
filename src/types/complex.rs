@@ -264,6 +264,23 @@ pub enum NamespaceConstraint {
     Not(Vec<Option<NameId>>),
 }
 
+impl NamespaceConstraint {
+    /// Check whether an element namespace matches this wildcard constraint.
+    pub fn matches(
+        &self,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+    ) -> bool {
+        match self {
+            NamespaceConstraint::Any => true,
+            NamespaceConstraint::Other => element_namespace != target_namespace,
+            NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
+            NamespaceConstraint::Local => element_namespace.is_none(),
+            NamespaceConstraint::List(list) => list.contains(&element_namespace),
+            NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
+        }
+    }
+}
 
 /// Check whether a (namespace, name) pair is excluded by a notQName list.
 pub fn not_qnames_exclude(
@@ -274,17 +291,8 @@ pub fn not_qnames_exclude(
     not_qnames.iter().any(|&(ns, n)| ns == namespace && n == name)
 }
 
-/// Process contents mode for wildcards
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProcessContents {
-    /// Validate against schema if available
-    #[default]
-    Strict,
-    /// Validate if schema available, skip if not
-    Lax,
-    /// Do not validate
-    Skip,
-}
+// Re-export ProcessContents from schema::wildcard to avoid duplication.
+pub use crate::schema::wildcard::ProcessContents;
 
 /// XSD 1.1: Open content specification
 /// TODO: XSD 1.1 - Implement open content

@@ -52,7 +52,7 @@ pub use group::{
 
 // Re-exports from wildcard
 pub use wildcard::{
-    ElementWildcard, AttributeWildcard,
+    ElementWildcard,
     NamespaceConstraint, ProcessContents,
 };
 

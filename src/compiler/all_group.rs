@@ -381,7 +381,7 @@ pub fn term_matches_with_substitution(
             not_qnames,
             ..
         } => {
-            if !wildcard_matches(namespace_constraint, element_namespace, target_namespace) {
+            if !namespace_constraint.matches(element_namespace, target_namespace) {
                 return TermMatchResult::NoMatch;
             }
             if not_qnames_exclude(not_qnames, element_namespace, element_name) {
@@ -389,26 +389,6 @@ pub fn term_matches_with_substitution(
             }
             TermMatchResult::Match
         }
-    }
-}
-
-/// Check if a wildcard namespace constraint matches an element
-pub fn wildcard_matches(
-    constraint: &NamespaceConstraint,
-    element_namespace: Option<NameId>,
-    target_namespace: Option<NameId>,
-) -> bool {
-    match constraint {
-        NamespaceConstraint::Any => true,
-        NamespaceConstraint::Other => element_namespace != target_namespace,
-        NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
-        NamespaceConstraint::Local => element_namespace.is_none(),
-        NamespaceConstraint::List(list) => {
-            // Check if element namespace is in the list
-            // The list contains Option<NameId> where None represents ##local
-            list.contains(&element_namespace)
-        }
-        NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
     }
 }
 

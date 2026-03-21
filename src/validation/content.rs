@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use crate::compiler::{
     AllGroupModel, AllGroupState, OpenContentMode as AllGroupOpenContentMode, TermMatchResult,
-    term_matches_with_substitution, wildcard_matches,
+    term_matches_with_substitution,
     NfaTable, NfaTerm, StateId,
     advance_states, advance_with_priority, epsilon_closure,
     nfa_term_matches,
@@ -619,7 +619,7 @@ fn open_content_allows(
     namespace: Option<NameId>,
     target_ns: Option<NameId>,
 ) -> bool {
-    wildcard_matches(ns_constraint, namespace, target_ns)
+    ns_constraint.matches(namespace, target_ns)
         && !not_qnames_exclude(not_qnames, namespace, name)
 }
 
