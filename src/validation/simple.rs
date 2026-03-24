@@ -21,6 +21,8 @@ pub struct SimpleTypeResult {
     pub typed_value: XmlValue,
     /// For union types: the member type that matched
     pub member_type: Option<TypeKey>,
+    /// The whitespace-normalized value (PSVI `[schema normalized value]`)
+    pub normalized_value: Option<String>,
 }
 
 /// Validate a string value against a simple type.
@@ -78,6 +80,7 @@ fn validate_simple_type_inner(
                 Ok(SimpleTypeResult {
                     typed_value: XmlValue::untyped(value),
                     member_type: None,
+                    normalized_value: None,
                 })
             }
         }
@@ -151,6 +154,7 @@ fn validate_atomic_type(
             return Ok(SimpleTypeResult {
                 typed_value: XmlValue::untyped(value),
                 member_type: None,
+                normalized_value: None,
             });
         }
         _ => {}
@@ -169,6 +173,15 @@ fn validate_atomic_type(
     };
 
     let facets = collect_facets(sk, schema_set);
+
+    // Compute normalized value (PSVI [schema normalized value])
+    let effective_ws = facets
+        .whitespace
+        .as_ref()
+        .map(|w| w.value)
+        .unwrap_or_else(|| validator.whitespace());
+    let normalized = normalize_whitespace(value, effective_ws);
+
     let typed_value = if facets.is_empty() {
         validator.validate(value)
     } else {
@@ -187,6 +200,7 @@ fn validate_atomic_type(
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
+                normalized_value: Some(normalized),
             })
         }
         Err(type_err) => {
@@ -223,6 +237,7 @@ fn validate_list_type(
             return Ok(SimpleTypeResult {
                 typed_value: XmlValue::untyped(value),
                 member_type: None,
+                normalized_value: None,
             });
         }
     };
@@ -298,6 +313,7 @@ fn validate_list_type(
     Ok(SimpleTypeResult {
         typed_value,
         member_type: None,
+        normalized_value: Some(normalized),
     })
 }
 
@@ -352,6 +368,7 @@ fn validate_union_type(
             }
 
             return Ok(SimpleTypeResult {
+                normalized_value: result.normalized_value,
                 typed_value: XmlValue::with_schema_type(
                     inner.type_code,
                     sk,

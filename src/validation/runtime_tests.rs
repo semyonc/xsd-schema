@@ -6507,3 +6507,378 @@ fn test_inheritable_default_shadows_ancestor() {
     v.end_validation().ok();
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
+
+// =========================================================================
+// PSVI Exposure Tests (Phase 4)
+// =========================================================================
+
+#[test]
+fn test_psvi_normalized_value_token() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:token"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("  hello   world  ");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert_eq!(
+        end_info.normalized_value.as_deref(),
+        Some("hello world"),
+        "xs:token should collapse whitespace"
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_normalized_value_string() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("  hello   world  ");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert_eq!(
+        end_info.normalized_value.as_deref(),
+        Some("  hello   world  "),
+        "xs:string should preserve whitespace"
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_normalized_value_attribute() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="val" type="xs:token"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let attr_info = v.validate_attribute("val", "", "  a  b  ");
+    assert_eq!(
+        attr_info.normalized_value.as_deref(),
+        Some("a b"),
+        "xs:token attribute should collapse whitespace"
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_schema_error_codes_invalid_type() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:integer"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("not-a-number");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validity, SchemaValidity::Invalid);
+    assert!(
+        !end_info.schema_error_codes.is_empty(),
+        "invalid element should have error codes"
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_schema_error_codes_valid_element() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.schema_error_codes.is_empty(),
+        "valid element should have no error codes"
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_schema_error_codes_duplicate_attribute() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="a" type="xs:string"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("a", "", "first");
+    let dup_info = v.validate_attribute("a", "", "second");
+    assert_eq!(dup_info.validity, SchemaValidity::Invalid);
+    assert!(
+        dup_info.schema_error_codes.contains(&"cvc-complex-type.3"),
+        "duplicate attribute should have cvc-complex-type.3 error code, got {:?}",
+        dup_info.schema_error_codes
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_validation_attempted_full() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.validation_attempted,
+        crate::validation::ValidationAttempted::Full,
+        "fully validated element should report Full"
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_validation_attempted_attribute_full() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="a" type="xs:string"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let attr_info = v.validate_attribute("a", "", "val");
+    assert_eq!(
+        attr_info.validation_attempted,
+        crate::validation::ValidationAttempted::Full,
+        "declared attribute should report Full"
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_is_simple_complex_type() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="simple" type="xs:string"/>
+            <xs:element name="complex">
+                <xs:complexType>
+                    <xs:sequence/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    // Simple type element
+    let info = v.validate_element("simple", "", None, None, &ns);
+    assert!(info.is_simple_type(), "xs:string element should be simple type");
+    assert!(!info.is_complex_type());
+    v.validate_end_of_attributes();
+    v.validate_text("hi");
+    v.validate_end_element();
+
+    // Complex type element
+    let info = v.validate_element("complex", "", None, None, &ns);
+    assert!(info.is_complex_type(), "complexType element should be complex type");
+    assert!(!info.is_simple_type());
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_identity_constraint_tables() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="id" type="xs:string" use="required"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:unique name="itemId">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@id"/>
+                </xs:unique>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let validator = SchemaValidator::new(&schema_set, flags);
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "a");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "b");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+
+    let tables = v.identity_constraint_tables();
+    assert!(tables.is_some(), "IC tables should be available after validation");
+    let tables = tables.unwrap();
+    assert!(!tables.is_empty(), "should have at least one IC table");
+    // The unique constraint should have 2 sequences (one for each item)
+    let table = tables.values().next().unwrap();
+    assert_eq!(table.sequences.len(), 2, "unique constraint should have 2 key sequences");
+}
+
+#[test]
+fn test_psvi_schema_error_codes_root_xsi_type() {
+    // Root element with invalid xsi:type — error must land on the element, not be lost
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    // xsi:type with a non-existent type on the root element
+    let _start = v.validate_element("root", "", Some("xs:nonExistentType"), None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+
+    let end_info = v.validate_end_element();
+    // The error code must be on the element's schema_error_codes
+    assert!(
+        end_info.schema_error_codes.contains(&"cvc-elt.4.1"),
+        "root xsi:type error should be in element schema_error_codes, got {:?}",
+        end_info.schema_error_codes
+    );
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_schema_error_codes_wildcard_xsi_type() {
+    // Wildcard child element with invalid xsi:type — error must land on the child
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:any processContents="lax"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    let xsi_ns = "http://www.w3.org/2001/XMLSchema-instance";
+    let xs_ns = "http://www.w3.org/2001/XMLSchema";
+    let ns = NamespaceContextSnapshot {
+        default_ns: None,
+        bindings: vec![
+            (v.schema_set.name_table.add("xsi"), v.schema_set.name_table.add(xsi_ns)),
+            (v.schema_set.name_table.add("xs"), v.schema_set.name_table.add(xs_ns)),
+        ],
+    };
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Wildcard child with bad xsi:type
+    v.validate_element("child", "", Some("xs:nonExistentType"), None, &ns);
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+
+    // cvc-elt.4.1 must be on the child element, not the parent
+    assert!(
+        end_info.schema_error_codes.contains(&"cvc-elt.4.1"),
+        "wildcard child xsi:type error should be in child schema_error_codes, got {:?}",
+        end_info.schema_error_codes
+    );
+
+    // Parent should NOT carry the child's xsi:type error
+    let parent_end = v.validate_end_element();
+    assert!(
+        !parent_end.schema_error_codes.contains(&"cvc-elt.4.1"),
+        "parent should not carry child's xsi:type error code, got {:?}",
+        parent_end.schema_error_codes
+    );
+
+    v.end_validation().ok();
+}

@@ -11,7 +11,7 @@ use std::marker::PhantomData;
 use bumpalo::Bump;
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
-use crate::ids::{AttributeGroupKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId, TypeKey, AttributeKey};
+use crate::ids::{AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId, NotationKey, TypeKey};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
@@ -29,7 +29,7 @@ use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
-    SchemaInfo, SchemaValidity, TypeSource, ValidationFlags,
+    SchemaInfo, SchemaValidity, TypeSource, ValidationAttempted, ValidationFlags,
 };
 #[cfg(feature = "xsd11")]
 use super::info::{AssertionOutcome, InheritedAttribute};
@@ -150,6 +150,8 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// Deferred attribute PSVI results from CTA processing (XSD 1.1).
     #[cfg(feature = "xsd11")]
     deferred_attribute_results: Vec<SchemaInfo>,
+    /// Final identity constraint tables after root element close (PSVI exposure).
+    final_ic_tables: Option<HashMap<IdentityConstraintKey, KeyTable>>,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -178,6 +180,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             id_values: HashSet::new(),
             pending_idrefs: Vec::new(),
             ic_scope_tables: Vec::new(),
+            final_ic_tables: None,
             #[cfg(feature = "xsd11")]
             assertion_source,
             #[cfg(feature = "xsd11")]
@@ -202,6 +205,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Clear the current source location
     pub fn clear_location(&mut self) {
         self.current_location = None;
+    }
+
+    /// Returns the final identity constraint tables after validation completes.
+    ///
+    /// Only available after `end_validation()` succeeds. Contains key/unique/keyref
+    /// tables accumulated during the root element's validation scope.
+    pub fn identity_constraint_tables(&self) -> Option<&HashMap<IdentityConstraintKey, KeyTable>> {
+        self.final_ic_tables.as_ref()
     }
 
     /// Returns a reference to the fragment arena, if it has been allocated.
@@ -475,7 +486,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 Some(loc) => err.with_location(loc.clone()),
                 None => err,
             };
-            self.sink.on_error(err);
+            self.emit_error_to(err, &mut ev_state.error_codes);
             ev_state.validity = SchemaValidity::Invalid;
         }
     }
@@ -579,6 +590,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // Skipped element: don't validate content model, push as skip, return
                 parent.has_element_children = true;
                 let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
                 ev_state.process_contents = ContentProcessing::Skip;
                 ev_state.content_state = ContentValidatorState::Simple;
                 ev_state.validity = SchemaValidity::NotKnown;
@@ -662,15 +674,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // but no global declaration exists.
                 let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
                 let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
                 ev_state.validity = SchemaValidity::Valid;
                 ev_state.process_contents = process_contents;
                 ev_state.is_nil = is_nil;
 
+                let mut wildcard_xsi_type_errors = Vec::new();
                 if let Some(mut type_key) = matched_type {
                     // PATH B1: xsi:type override for local elements with resolved type
                     let mut b1_type_source = TypeSource::Declaration;
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context) {
+                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context, &mut wildcard_xsi_type_errors) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 type_key = overridden;
                                 b1_type_source = TypeSource::XsiType;
@@ -692,7 +706,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Try xsi:type first — it can supply a governing type even
                     // without a declaration.
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, None, ns_context) {
+                        match self.resolve_xsi_type(xsi_type_str, None, ns_context, &mut wildcard_xsi_type_errors) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 let (content_state, content_type) =
                                     self.init_content_model(Some(overridden));
@@ -721,23 +735,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Strict wildcard with no global declaration and no governing
                     // type from xsi:type → cvc-elt.1.  Checked AFTER xsi:type so
                     // that a valid xsi:type can still supply assessment.
+                    // Error deferred until after push so it lands on the child.
                     if process_contents == ContentProcessing::Strict
                         && ev_state.schema_type.is_none()
                     {
-                        let elem_name = self.schema_set.name_table.resolve(local_name);
-                        self.report_error(
-                            "cvc-elt.1",
-                            format!("Element '{}' is not declared", elem_name),
-                        );
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
 
+                ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
+                    && ev_state.process_contents != ContentProcessing::Skip;
                 let schema_type = ev_state.schema_type;
                 let content_type = ev_state.content_type;
                 let validity = ev_state.validity;
                 let type_source = ev_state.type_source;
+                let needs_undeclared_error = process_contents == ContentProcessing::Strict
+                    && schema_type.is_none();
                 self.push_element(ev_state);
+                // Emit deferred xsi:type errors now that the child is on the stack
+                self.emit_deferred_xsi_type_errors(wildcard_xsi_type_errors);
+                if needs_undeclared_error {
+                    let elem_name = self.schema_set.name_table.resolve(local_name);
+                    self.report_error(
+                        "cvc-elt.1",
+                        format!("Element '{}' is not declared", elem_name),
+                    );
+                }
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
                 self.detect_assertions_on_element(schema_type, local_name, namespace);
@@ -747,10 +770,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     schema_type,
                     member_type: None,
                     validity,
+                    validation_attempted: ValidationAttempted::None,
                     is_default: false,
                     is_nil,
                     content_type,
                     typed_value: None,
+                    normalized_value: None,
+                    schema_error_codes: Vec::new(),
+                    notation: None,
                     deferred_by_cta: false,
                     type_source,
                     #[cfg(feature = "xsd11")]
@@ -764,6 +791,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ContentProcessing::Skip => {
                     // Skip validation entirely
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Skip;
                     ev_state.content_state = ContentValidatorState::Simple; // accept anything
                     ev_state.validity = SchemaValidity::NotKnown;
@@ -776,6 +804,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ContentProcessing::Lax => {
                     // Lax: no declaration found — lax assessment via xs:anyType
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Lax;
                     let (content_state, content_type) = self.lax_assessment_content_model();
                     ev_state.content_state = content_state;
@@ -789,12 +818,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     return SchemaInfo::empty();
                 }
                 ContentProcessing::Strict => {
-                    let elem_name = self.schema_set.name_table.resolve(local_name);
-                    self.report_error(
-                        "cvc-elt.1",
-                        format!("Element '{}' is not declared", elem_name),
-                    );
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
                     ev_state.validity = SchemaValidity::Invalid;
                     // Lax assessment for content (same PSVI as lax when no declaration found)
                     let (content_state, content_type) = self.lax_assessment_content_model();
@@ -802,6 +827,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ev_state.content_type = Some(content_type);
                     // schema_type stays None
                     self.push_element(ev_state);
+                    // Report error AFTER push so code lands on the child, not parent
+                    let elem_name = self.schema_set.name_table.resolve(local_name);
+                    self.report_error(
+                        "cvc-elt.1",
+                        format!("Element '{}' is not declared", elem_name),
+                    );
                     self.advance_constraints_start_element(local_name, namespace, None);
                     #[cfg(feature = "xsd11")]
                     self.detect_assertions_on_element(None, local_name, namespace);
@@ -813,29 +844,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let elem_key = element_key.unwrap();
         let elem_data = &self.schema_set.arenas.elements[elem_key];
 
-        // Check abstract
-        if elem_data.is_abstract {
-            let elem_name = self.schema_set.name_table.resolve(local_name);
-            self.report_error(
-                "cvc-elt.2",
-                format!("Element '{}' is abstract and cannot appear in instances", elem_name),
-            );
-        }
+        // Check abstract (deferred until after push)
+        let is_abstract = elem_data.is_abstract;
 
         // 5. Resolve type from element declaration
         let mut type_key = elem_data.resolved_type;
 
         // 6. xsi:type override
+        // Errors are deferred and emitted after push so they land on the child element.
+        let mut xsi_type_deferred_errors = Vec::new();
         let mut xsi_type_invalid = false;
         let mut type_source = TypeSource::Declaration;
         if let Some(xsi_type_str) = xsi_type {
-            match self.resolve_xsi_type(xsi_type_str, type_key, ns_context) {
+            match self.resolve_xsi_type(xsi_type_str, type_key, ns_context, &mut xsi_type_deferred_errors) {
                 XsiTypeOutcome::Applied(overridden) => {
                     type_key = Some(overridden);
                     type_source = TypeSource::XsiType;
                 }
                 XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
-                    // Error already reported; keep declared type, mark invalid
                     xsi_type_invalid = true;
                 }
             }
@@ -843,30 +869,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 7. xsi:nil
         let is_nil = if let Some(nil_str) = xsi_nil {
-            if nil_str == "true" || nil_str == "1" {
-                if !elem_data.nillable {
-                    let elem_name = self.schema_set.name_table.resolve(local_name);
-                    self.report_error(
-                        "cvc-elt.3.1",
-                        format!(
-                            "Element '{}' is not nillable but xsi:nil='true' was specified",
-                            elem_name,
-                        ),
-                    );
-                }
-                true
-            } else {
-                false
-            }
+            nil_str == "true" || nil_str == "1"
         } else {
             false
         };
+        let nillable_violation = is_nil && !elem_data.nillable;
 
         // 8. Initialize content model and determine ContentType
         let (content_state, content_type) = self.init_content_model(type_key);
 
         // 9. Push ElementValidationState
         let mut ev_state = ElementValidationState::new(local_name, namespace);
+                ev_state.ns_context = Some(ns_context.clone());
         ev_state.element_decl = Some(elem_key);
         ev_state.schema_type = type_key;
         ev_state.type_source = Some(type_source);
@@ -879,12 +893,38 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             SchemaValidity::Valid
         };
         ev_state.process_contents = process_contents;
+        // Strictly assessed: has governing declaration or type, and not skipped
+        ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
+            && process_contents != ContentProcessing::Skip;
         #[cfg(feature = "xsd11")]
         {
             ev_state.has_type_alternatives = !self.schema_set.arenas.elements[elem_key]
                 .alternatives.is_empty();
         }
         self.push_element(ev_state);
+
+        // Emit deferred xsi:type errors now that the child is on the stack
+        self.emit_deferred_xsi_type_errors(xsi_type_deferred_errors);
+
+        // Report deferred element-start errors AFTER push so codes land on the child
+        if is_abstract {
+            let elem_name = self.schema_set.name_table.resolve(local_name);
+            self.report_error(
+                "cvc-elt.2",
+                format!("Element '{}' is abstract and cannot appear in instances", elem_name),
+            );
+        }
+        if nillable_violation {
+            let elem_name = self.schema_set.name_table.resolve(local_name);
+            self.report_error(
+                "cvc-elt.3.1",
+                format!(
+                    "Element '{}' is not nillable but xsi:nil='true' was specified",
+                    elem_name,
+                ),
+            );
+        }
+
         self.advance_constraints_start_element(local_name, namespace, Some(elem_key));
 
         // 9b. Assertion detection hook (XSD 1.1)
@@ -903,10 +943,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             schema_type: type_key,
             member_type: None,
             validity,
+            validation_attempted: ValidationAttempted::None,
             is_default: false,
             is_nil,
             content_type: Some(content_type),
             typed_value: None,
+            normalized_value: None,
+            schema_error_codes: Vec::new(),
+            notation: None,
             deferred_by_cta: false,
             type_source: Some(type_source),
             #[cfg(feature = "xsd11")]
@@ -1005,7 +1049,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 s.validity = SchemaValidity::Invalid;
             }
             self.current_state = ValidatorState::Attribute;
-            return SchemaInfo::invalid();
+            let mut result = SchemaInfo::invalid();
+            result.schema_error_codes = vec!["cvc-complex-type.3"];
+            return result;
         }
 
         // When type alternatives are active, defer type-dependent attribute
@@ -1044,7 +1090,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         };
 
         self.current_state = ValidatorState::Attribute;
-        self.validate_attribute_against_type(ct_key, local_name, namespace, value)
+        // Snapshot error_codes so we can extract attribute-specific codes
+        let ec_snapshot = self.validation_stack.last().map_or(0, |ev| ev.error_codes.len());
+        let mut result = self.validate_attribute_against_type(ct_key, local_name, namespace, value);
+        // Slice attribute-specific error codes and remove from parent
+        if let Some(ev) = self.validation_stack.last_mut() {
+            if ev.error_codes.len() > ec_snapshot {
+                result.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
+                ev.error_codes.truncate(ec_snapshot);
+            }
+            // Track attribute [validation attempted] on parent element
+            match result.validation_attempted {
+                ValidationAttempted::Full => { ev.any_attr_not_none = true; }
+                ValidationAttempted::None => { ev.any_attr_not_full = true; }
+                ValidationAttempted::Partial => {
+                    ev.any_attr_not_full = true;
+                    ev.any_attr_not_none = true;
+                }
+            }
+        }
+        result
     }
 
     /// Signal end of attributes; checks for missing required attributes
@@ -1384,13 +1449,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     if !ev_state.content_state.is_complete() {
                         let elem_name =
                             self.schema_set.name_table.resolve(ev_state.local_name);
-                        self.report_error(
+                        let err = errors::error(
                             "cvc-complex-type.2.4",
                             format!(
                                 "Element '{}' content model is incomplete: expected more child elements",
                                 elem_name,
                             ),
+                            self.current_location.clone(),
                         );
+                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
+                        self.emit_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1422,6 +1490,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     Ok(result) => {
                         ev_state.member_type = result.member_type;
                         ev_state.typed_value = Some(result.typed_value);
+                        ev_state.normalized_value = result.normalized_value;
                     }
                     Err(err) => {
                         let err = match &self.current_location {
@@ -1433,7 +1502,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         } else {
                             err.with_path(self.element_path.clone())
                         };
-                        self.sink.on_error(err);
+                        self.emit_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1446,13 +1515,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     if ev_state.text_content != *fixed {
                         let elem_name =
                             self.schema_set.name_table.resolve(ev_state.local_name);
-                        self.report_error(
+                        let err = errors::error(
                             "cvc-elt.5.2.2",
                             format!(
                                 "Element '{}' has fixed value '{}' but actual value is '{}'",
                                 elem_name, fixed, ev_state.text_content,
                             ),
+                            self.current_location.clone(),
                         );
+                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
+                        self.emit_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1567,13 +1639,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // nodes in the failed document and must not leak
                             // into the next buffered subtree.
                             self.pending_assertion_frames.clear();
-                            self.report_error(
+                            let err = errors::error(
                                 "cvc-assertion",
                                 format!(
                                     "Failed to finalize assertion fragment: {}",
                                     e
                                 ),
+                                self.current_location.clone(),
                             );
+                            let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
+                            self.emit_error_to(err, &mut ev_state.error_codes);
                             ev_state.validity = SchemaValidity::Invalid;
                             assertion_outcome = Some(AssertionOutcome::Failed);
                         }
@@ -1600,7 +1675,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
-        self.process_constraints_end_element(&ev_state.text_content, ev_state.typed_value.as_ref());
+        self.process_constraints_end_element(&ev_state.text_content, ev_state.typed_value.as_ref(), &mut ev_state.error_codes);
 
         // 3b. Pop scope table and propagate key/unique tables upward to parent
         if let Some(Some(scope_map)) = self.ic_scope_tables.pop() {
@@ -1614,6 +1689,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         })
                         .or_insert(key_table);
                 }
+            } else {
+                // Root element — save for public access via identity_constraint_tables()
+                self.final_ic_tables = Some(scope_map);
             }
         }
 
@@ -1628,16 +1706,43 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let validity = ev_state.validity;
         self.current_state = ValidatorState::EndElement;
 
+        // Compute [validation attempted] per spec §3.3.5.1
+        let all_full = !ev_state.any_child_not_full && !ev_state.any_attr_not_full;
+        let all_none = !ev_state.any_child_not_none && !ev_state.any_attr_not_none;
+        let validation_attempted = if ev_state.strictly_assessed && all_full {
+            ValidationAttempted::Full
+        } else if !ev_state.strictly_assessed && all_none {
+            ValidationAttempted::None
+        } else {
+            ValidationAttempted::Partial
+        };
+
+        // Propagate to parent
+        if let Some(parent) = self.validation_stack.last_mut() {
+            match validation_attempted {
+                ValidationAttempted::Full => { parent.any_child_not_none = true; }
+                ValidationAttempted::None => { parent.any_child_not_full = true; }
+                ValidationAttempted::Partial => {
+                    parent.any_child_not_full = true;
+                    parent.any_child_not_none = true;
+                }
+            }
+        }
+
         SchemaInfo {
             element_decl: ev_state.element_decl,
             attribute_decl: None,
             schema_type: ev_state.schema_type,
             member_type: ev_state.member_type,
             validity,
+            validation_attempted,
             is_default: ev_state.is_default,
             is_nil: ev_state.is_nil,
             content_type: ev_state.content_type,
             typed_value: ev_state.typed_value,
+            normalized_value: ev_state.normalized_value,
+            schema_error_codes: ev_state.error_codes,
+            notation: ev_state.notation,
             deferred_by_cta: false,
             type_source: ev_state.type_source,
             #[cfg(feature = "xsd11")]
@@ -2062,6 +2167,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Emit a validation error: record its constraint code on the current
+    /// element's `error_codes` list and dispatch to the sink.
+    fn emit_error(&mut self, err: ValidationError) {
+        if let Some(ev) = self.validation_stack.last_mut() {
+            ev.error_codes.push(err.constraint);
+        }
+        self.sink.on_error(err);
+    }
+
+    /// Emit a validation error recording the code on an explicit target
+    /// instead of the stack top. Used during `validate_end_element` where
+    /// the element has already been popped.
+    fn emit_error_to(&mut self, err: ValidationError, codes: &mut Vec<&'static str>) {
+        codes.push(err.constraint);
+        self.sink.on_error(err);
+    }
+
     /// Report a validation error through the sink
     fn report_error(&mut self, constraint: &'static str, message: impl Into<String>) {
         let err = errors::error(constraint, message, self.current_location.clone());
@@ -2070,7 +2192,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             err.with_path(self.element_path.clone())
         };
-        self.sink.on_error(err);
+        self.emit_error(err);
     }
 
     /// Enrich an existing `ValidationError` with location/path and report it.
@@ -2084,7 +2206,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             err.with_path(self.element_path.clone())
         };
-        self.sink.on_error(err);
+        self.emit_error(err);
     }
 
     /// Mark the current element as invalid.
@@ -2236,6 +2358,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &mut self,
         text_content: &str,
         typed_value: Option<&XmlValue>,
+        error_codes: &mut Vec<&'static str>,
     ) {
         let name_table = &self.schema_set.name_table;
         let element_path = self.element_path.clone();
@@ -2254,7 +2377,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ic_errors.extend(errs);
         }
         for err in ic_errors {
-            self.sink.on_error(err);
+            self.emit_error_to(err, error_codes);
         }
 
         // 2. Collect deactivated constraints (constraints whose scope element just closed)
@@ -2313,7 +2436,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     Some(target_table) => {
                         let errs = keyref_table.check_keyref_against(target_table, name_table);
                         for err in errs {
-                            self.sink.on_error(err);
+                            self.emit_error_to(err, error_codes);
                         }
                     }
                     None => {
@@ -2334,14 +2457,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 }
                             }))
                             .unwrap_or_else(|| "<unknown>".to_string());
-                        self.sink.on_error(errors::error(
+                        self.emit_error_to(errors::error(
                             "cvc-identity-constraint.4.3",
                             format!(
                                 "Keyref '{}' references unknown constraint '{}'",
                                 keyref_name, refer_display
                             ),
                             location.clone(),
-                        ));
+                        ), error_codes);
                     }
                 }
             }
@@ -2433,12 +2556,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 let mut member_type = None;
                 let mut typed_value = None;
+                let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
+                            normalized_value = result.normalized_value;
                         }
                         Err(err) => {
                             self.report_validation_error(err);
@@ -2472,10 +2597,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     schema_type: attr_type,
                     member_type,
                     validity: attr_validity,
+                    validation_attempted: ValidationAttempted::Full,
                     is_default: false,
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    normalized_value,
+                    schema_error_codes: Vec::new(),
+                    notation: None,
                     deferred_by_cta: false,
                     type_source: Some(TypeSource::Declaration),
                     #[cfg(feature = "xsd11")]
@@ -2586,7 +2715,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         };
 
         for (namespace, local_name, value) in &collected {
-            let info = self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            let ec_snapshot = self.validation_stack.last().map_or(0, |ev| ev.error_codes.len());
+            let mut info = self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            if let Some(ev) = self.validation_stack.last_mut() {
+                if ev.error_codes.len() > ec_snapshot {
+                    info.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
+                    ev.error_codes.truncate(ec_snapshot);
+                }
+                // Track attribute [validation attempted] on parent element
+                match info.validation_attempted {
+                    ValidationAttempted::Full => { ev.any_attr_not_none = true; }
+                    ValidationAttempted::None => { ev.any_attr_not_full = true; }
+                    ValidationAttempted::Partial => {
+                        ev.any_attr_not_full = true;
+                        ev.any_attr_not_none = true;
+                    }
+                }
+            }
             self.deferred_attribute_results.push(info);
         }
     }
@@ -2622,7 +2767,38 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // ID/IDREF collection
         if let Some(ref tv) = result.typed_value {
             self.collect_id_idref(tv, value);
+
+            // NOTATION tracking (§3.14.5): set [notation] on parent element
+            if tv.type_code == XmlTypeCode::Notation {
+                // Resolve before borrowing the stack to avoid borrow conflict
+                let notation = self.validation_stack.last()
+                    .filter(|ev| ev.notation.is_none())
+                    .and_then(|ev| ev.ns_context.as_ref())
+                    .and_then(|ctx| self.resolve_notation_qname(value, ctx));
+                if let (Some(nk), Some(ev)) = (notation, self.validation_stack.last_mut()) {
+                    if ev.notation.is_none() {
+                        ev.notation = Some(nk);
+                    }
+                }
+            }
         }
+    }
+
+    /// Resolve a NOTATION QName value to a NotationKey using the element's
+    /// namespace context. Returns `None` if the QName is malformed or the
+    /// notation is not declared.
+    fn resolve_notation_qname(
+        &self,
+        value: &str,
+        ns_context: &NamespaceContextSnapshot,
+    ) -> Option<NotationKey> {
+        let qn = parse_qname_with_snapshot(
+            value,
+            ns_context,
+            &self.schema_set.name_table,
+            true,
+        ).ok()?;
+        self.schema_set.lookup_notation(qn.namespace_uri, qn.local_name)
     }
 
     /// Initialize content model and ContentType from a TypeKey
@@ -2680,11 +2856,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Resolve an xsi:type QName string to an [`XsiTypeOutcome`].
+    ///
+    /// Errors are collected in `deferred_errors` instead of being emitted
+    /// immediately, so the caller can emit them after the child element is
+    /// pushed onto the validation stack (ensuring correct PSVI attribution).
     fn resolve_xsi_type(
-        &mut self,
+        &self,
         xsi_type_str: &str,
         declared_type: Option<TypeKey>,
         ns_context: &NamespaceContextSnapshot,
+        deferred_errors: &mut Vec<(&'static str, String)>,
     ) -> XsiTypeOutcome {
         // Parse and validate the QName using shared parsing logic
         let qname = match parse_qname_with_snapshot(
@@ -2701,7 +2882,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                     _ => format!("Invalid xsi:type value '{}': {}", xsi_type_str, e),
                 };
-                self.report_error("cvc-elt.4.1", msg);
+                deferred_errors.push(("cvc-elt.4.1", msg));
                 return XsiTypeOutcome::Unresolved;
             }
         };
@@ -2724,28 +2905,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         declared,
                         DerivationSet::empty(),
                     ) {
-                        self.report_error(
+                        deferred_errors.push((
                             "cvc-elt.4.2",
                             format!(
                                 "xsi:type '{}' does not derive from the declared type",
                                 xsi_type_str
                             ),
-                        );
+                        ));
                         return XsiTypeOutcome::InvalidDerivation;
                     }
                 }
                 XsiTypeOutcome::Applied(type_key)
             }
             None => {
-                self.report_error(
+                deferred_errors.push((
                     "cvc-elt.4.1",
                     format!(
                         "Type '{}' specified in xsi:type is not declared",
                         xsi_type_str
                     ),
-                );
+                ));
                 XsiTypeOutcome::Unresolved
             }
+        }
+    }
+
+    /// Emit deferred xsi:type errors (collected by [`resolve_xsi_type`]).
+    fn emit_deferred_xsi_type_errors(&mut self, errors: Vec<(&'static str, String)>) {
+        for (constraint, message) in errors {
+            self.report_error(constraint, message);
         }
     }
 
@@ -2792,6 +2980,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 let mut member_type = None;
                 let mut typed_value = None;
+                let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(
@@ -2802,6 +2991,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         Ok(result) => {
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
+                            normalized_value = result.normalized_value;
                         }
                         Err(err) => {
                             let err = match &self.current_location {
@@ -2813,7 +3003,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             } else {
                                 err.with_path(self.element_path.clone())
                             };
-                            self.sink.on_error(err);
+                            self.emit_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {
                                 s.validity = SchemaValidity::Invalid;
@@ -2828,10 +3018,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     schema_type: attr_type,
                     member_type,
                     validity: attr_validity,
+                    validation_attempted: ValidationAttempted::Full,
                     is_default: false,
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    normalized_value,
+                    schema_error_codes: Vec::new(),
+                    notation: None,
                     deferred_by_cta: false,
                     type_source: Some(TypeSource::Declaration),
                     #[cfg(feature = "xsd11")]
@@ -2891,6 +3085,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 let mut member_type = None;
                 let mut typed_value = None;
+                let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(
@@ -2901,6 +3096,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         Ok(result) => {
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
+                            normalized_value = result.normalized_value;
                         }
                         Err(err) => {
                             let err = match &self.current_location {
@@ -2912,7 +3108,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             } else {
                                 err.with_path(self.element_path.clone())
                             };
-                            self.sink.on_error(err);
+                            self.emit_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {
                                 s.validity = SchemaValidity::Invalid;
@@ -2927,10 +3123,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     schema_type: attr_type,
                     member_type,
                     validity: attr_validity,
+                    validation_attempted: ValidationAttempted::Full,
                     is_default: false,
                     is_nil: false,
                     content_type: None,
                     typed_value,
+                    normalized_value,
+                    schema_error_codes: Vec::new(),
+                    notation: None,
                     deferred_by_cta: false,
                     type_source: Some(TypeSource::Declaration),
                     #[cfg(feature = "xsd11")]

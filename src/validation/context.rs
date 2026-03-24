@@ -56,8 +56,26 @@ pub struct ElementValidationState {
     pub member_type: Option<TypeKey>,
     /// The parsed typed value from simple-type validation
     pub typed_value: Option<XmlValue>,
+    /// The whitespace-normalized value (PSVI `[schema normalized value]`)
+    pub normalized_value: Option<String>,
     /// Current validity status
     pub validity: SchemaValidity,
+    /// Accumulated constraint codes for PSVI `[schema error code]`
+    pub error_codes: Vec<&'static str>,
+    /// True if any child element has `[validation attempted]` != Full
+    pub any_child_not_full: bool,
+    /// True if any child element has `[validation attempted]` != None
+    pub any_child_not_none: bool,
+    /// True if any attribute has `[validation attempted]` != Full
+    pub any_attr_not_full: bool,
+    /// True if any attribute has `[validation attempted]` != None
+    pub any_attr_not_none: bool,
+    /// Whether this element was strictly assessed (§5.2 key-sva)
+    pub strictly_assessed: bool,
+    /// Notation declaration resolved from a NOTATION-typed attribute (§3.14.5)
+    pub notation: Option<crate::ids::NotationKey>,
+    /// Namespace context snapshot for resolving NOTATION QNames during attribute validation
+    pub ns_context: Option<crate::namespace::context::NamespaceContextSnapshot>,
     /// How to process wildcard-matched content
     pub process_contents: ContentProcessing,
     /// Set of (namespace, local_name) pairs for attributes already seen
@@ -121,7 +139,16 @@ impl ElementValidationState {
             is_default: false,
             member_type: None,
             typed_value: None,
+            normalized_value: None,
             validity: SchemaValidity::NotKnown,
+            error_codes: Vec::new(),
+            any_child_not_full: false,
+            any_child_not_none: false,
+            any_attr_not_full: false,
+            any_attr_not_none: false,
+            strictly_assessed: false,
+            notation: None,
+            ns_context: None,
             process_contents: ContentProcessing::Strict,
             seen_attributes: HashSet::new(),
             text_content: String::new(),

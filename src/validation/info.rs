@@ -5,7 +5,7 @@
 
 use bitflags::bitflags;
 
-use crate::ids::{AttributeKey, ElementKey, NameId, TypeKey};
+use crate::ids::{AttributeKey, ElementKey, NameId, NotationKey, TypeKey};
 use crate::types::value::XmlValue;
 
 /// Validity status of a validated node
@@ -18,6 +18,18 @@ pub enum SchemaValidity {
     Valid,
     /// The node is invalid according to the schema
     Invalid,
+}
+
+/// How much validation was attempted on a node (PSVI `[validation attempted]`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ValidationAttempted {
+    /// No validation was attempted
+    #[default]
+    None,
+    /// Some but not all descendants were validated
+    Partial,
+    /// Full validation was performed on this node and all descendants
+    Full,
 }
 
 /// Content type of a complex type, used to determine what children are allowed
@@ -118,6 +130,8 @@ pub struct SchemaInfo {
     pub member_type: Option<TypeKey>,
     /// Validity status
     pub validity: SchemaValidity,
+    /// How much validation was attempted (PSVI `[validation attempted]`)
+    pub validation_attempted: ValidationAttempted,
     /// Whether the value was supplied by a default declaration
     pub is_default: bool,
     /// Whether the element was declared nil via xsi:nil="true"
@@ -126,6 +140,13 @@ pub struct SchemaInfo {
     pub content_type: Option<ContentType>,
     /// The parsed typed value from simple-type validation
     pub typed_value: Option<XmlValue>,
+    /// The whitespace-normalized value (PSVI `[schema normalized value]`)
+    pub normalized_value: Option<String>,
+    /// Constraint codes from validation errors on this node (PSVI `[schema error code]`)
+    pub schema_error_codes: Vec<&'static str>,
+    /// Notation declaration resolved from a NOTATION-typed attribute (PSVI `[notation]`).
+    /// Only meaningful on element-end SchemaInfo; always `None` for attributes.
+    pub notation: Option<NotationKey>,
     /// Whether this attribute was deferred due to CTA (type alternatives)
     pub deferred_by_cta: bool,
     /// How the `schema_type` was determined (declaration, xsi:type, or CTA)
@@ -147,10 +168,14 @@ impl SchemaInfo {
             schema_type: None,
             member_type: None,
             validity: SchemaValidity::NotKnown,
+            validation_attempted: ValidationAttempted::None,
             is_default: false,
             is_nil: false,
             content_type: None,
             typed_value: None,
+            normalized_value: None,
+            schema_error_codes: Vec::new(),
+            notation: None,
             deferred_by_cta: false,
             type_source: None,
             #[cfg(feature = "xsd11")]
@@ -168,10 +193,14 @@ impl SchemaInfo {
             schema_type: Some(schema_type),
             member_type: None,
             validity: SchemaValidity::Valid,
+            validation_attempted: ValidationAttempted::Full,
             is_default: false,
             is_nil: false,
             content_type: Some(content_type),
             typed_value: None,
+            normalized_value: None,
+            schema_error_codes: Vec::new(),
+            notation: None,
             deferred_by_cta: false,
             type_source: Some(TypeSource::Declaration),
             #[cfg(feature = "xsd11")]
@@ -189,10 +218,14 @@ impl SchemaInfo {
             schema_type: Some(schema_type),
             member_type: None,
             validity: SchemaValidity::Valid,
+            validation_attempted: ValidationAttempted::Full,
             is_default: false,
             is_nil: false,
             content_type: None,
             typed_value: None,
+            normalized_value: None,
+            schema_error_codes: Vec::new(),
+            notation: None,
             deferred_by_cta: false,
             type_source: Some(TypeSource::Declaration),
             #[cfg(feature = "xsd11")]
@@ -208,6 +241,16 @@ impl SchemaInfo {
             validity: SchemaValidity::Invalid,
             ..SchemaInfo::empty()
         }
+    }
+
+    /// Returns `true` if the resolved schema type is a simple type.
+    pub fn is_simple_type(&self) -> bool {
+        matches!(self.schema_type, Some(TypeKey::Simple(_)))
+    }
+
+    /// Returns `true` if the resolved schema type is a complex type.
+    pub fn is_complex_type(&self) -> bool {
+        matches!(self.schema_type, Some(TypeKey::Complex(_)))
     }
 }
 
@@ -293,6 +336,32 @@ mod tests {
         let info = SchemaInfo::invalid();
         assert_eq!(info.validity, SchemaValidity::Invalid);
         assert!(info.element_decl.is_none());
+    }
+
+    #[test]
+    fn test_is_simple_type() {
+        let info = SchemaInfo::empty();
+        assert!(!info.is_simple_type());
+        assert!(!info.is_complex_type());
+
+        use slotmap::SlotMap;
+        let mut sm: SlotMap<crate::ids::SimpleTypeKey, ()> = SlotMap::with_key();
+        let sk = sm.insert(());
+        let mut info = SchemaInfo::empty();
+        info.schema_type = Some(TypeKey::Simple(sk));
+        assert!(info.is_simple_type());
+        assert!(!info.is_complex_type());
+    }
+
+    #[test]
+    fn test_is_complex_type() {
+        use slotmap::SlotMap;
+        let mut sm: SlotMap<crate::ids::ComplexTypeKey, ()> = SlotMap::with_key();
+        let ck = sm.insert(());
+        let mut info = SchemaInfo::empty();
+        info.schema_type = Some(TypeKey::Complex(ck));
+        assert!(info.is_complex_type());
+        assert!(!info.is_simple_type());
     }
 
     #[test]

@@ -134,7 +134,7 @@ impl CompiledIdentityConstraint {
 /// - Otherwise, compare `string_value` (string equality).
 /// - Different primitive types are *never* equal (no type promotion for IC equality).
 #[derive(Debug, Clone)]
-pub(crate) struct KeyFieldValue {
+pub struct KeyFieldValue {
     pub string_value: String,
     pub typed_value: Option<XmlValue>,
 }
@@ -167,7 +167,7 @@ impl Eq for KeyFieldValue {}
 /// Each slot corresponds to a `<field>` expression. `None` means the field
 /// did not select a node (missing value).
 #[derive(Debug, Clone)]
-pub(crate) struct KeySequence {
+pub struct KeySequence {
     pub fields: Vec<Option<KeyFieldValue>>,
 }
 
@@ -207,7 +207,7 @@ impl Eq for KeySequence {}
 // ---------------------------------------------------------------------------
 
 /// Collection of key sequences for one constraint activation with duplicate detection.
-pub(crate) struct KeyTable {
+pub struct KeyTable {
     /// Arena key identifying which identity constraint produced this table.
     pub ic_key: IdentityConstraintKey,
     pub constraint_name: NameId,

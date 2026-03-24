@@ -29,7 +29,7 @@ pub use errors::{
 
 pub use info::{
     SchemaInfo, SchemaValidity, ContentType, NodeIdentity,
-    ValidationFlags, ContentProcessing, TypeSource,
+    ValidationFlags, ValidationAttempted, ContentProcessing, TypeSource,
     ExpectedElement, ExpectedAttribute, DefaultAttribute,
 };
 #[cfg(feature = "xsd11")]
@@ -47,3 +47,4 @@ pub use validator::{
     SchemaValidator,
 };
 pub use runtime::ValidationRuntime;
+pub use identity::{KeyTable, KeySequence, KeyFieldValue};
