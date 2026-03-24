@@ -22,9 +22,7 @@ pub enum NamespaceConstraint {
     /// None in the set represents "no namespace" (##local)
     Enumeration(Vec<Option<NameId>>),
 
-    // XSD 1.1: Not constraints
-    // TODO: XSD 1.1 - Implement notNamespace
-    /// Not these namespaces (XSD 1.1)
+    /// Not these namespaces (XSD 1.1 notNamespace)
     Not(Vec<Option<NameId>>),
 }
 
@@ -130,8 +128,7 @@ pub struct ElementWildcard {
     /// ID attribute value
     pub id: Option<String>,
 
-    // XSD 1.1: notQName constraint
-    // TODO: XSD 1.1 - Implement notQName
+    /// XSD 1.1: notQName exclusions (populated by compiler, checked at validation)
     pub not_qnames: Vec<QNameDisallowed>,
 }
 
@@ -196,8 +193,7 @@ pub struct AttributeWildcard {
     /// ID attribute value
     pub id: Option<String>,
 
-    // XSD 1.1: notQName constraint
-    // TODO: XSD 1.1 - Implement notQName for attributes
+    /// XSD 1.1: notQName exclusions (populated by compiler, checked at validation)
     pub not_qnames: Vec<QNameDisallowed>,
 }
 
@@ -232,7 +228,6 @@ impl Default for AttributeWildcard {
 }
 
 /// XSD 1.1: Disallowed QName for notQName constraint
-/// TODO: XSD 1.1 - Full implementation
 #[derive(Debug, Clone)]
 pub enum QNameDisallowed {
     /// Specific QName that is disallowed

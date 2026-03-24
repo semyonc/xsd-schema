@@ -113,8 +113,7 @@ pub struct ComplexContentDef {
     /// Source location
     pub source: Option<SourceRef>,
 
-    // XSD 1.1: Open content
-    // TODO: XSD 1.1 - Implement open content mode
+    /// XSD 1.1: Open content (runtime matching implemented; schema-level validation pending)
     pub open_content: Option<OpenContent>,
 }
 
@@ -295,7 +294,9 @@ pub fn not_qnames_exclude(
 pub use crate::schema::wildcard::ProcessContents;
 
 /// XSD 1.1: Open content specification
-/// TODO: XSD 1.1 - Implement open content
+///
+/// Runtime matching (interleave + suffix modes) is implemented in `validation/content.rs`.
+/// Schema-level validation stubs remain in `compiler/open_content.rs`.
 #[derive(Debug, Clone)]
 pub struct OpenContent {
     /// Open content mode
