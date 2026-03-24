@@ -248,6 +248,22 @@ pub struct DefaultAttribute {
     pub value: String,
 }
 
+/// An inherited attribute from an ancestor element (XSD 1.1 §3.3.5.6).
+///
+/// Represents an entry in the PSVI `[inherited attributes]` property.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone)]
+pub struct InheritedAttribute {
+    /// Local name of the attribute
+    pub local_name: NameId,
+    /// Namespace of the attribute
+    pub namespace: Option<NameId>,
+    /// The governing attribute declaration key, if known
+    pub attribute_key: Option<AttributeKey>,
+    /// The inherited attribute value
+    pub value: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

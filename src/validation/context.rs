@@ -6,11 +6,29 @@
 
 use std::collections::HashSet;
 
+#[cfg(feature = "xsd11")]
+use std::collections::HashMap;
+
 use crate::ids::{ElementKey, NameId, TypeKey};
+#[cfg(feature = "xsd11")]
+use crate::ids::AttributeKey;
 use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
 use super::info::{ContentProcessing, ContentType, SchemaValidity, TypeSource};
+
+/// An inherited attribute value flowing from an ancestor element (XSD 1.1).
+///
+/// Stored in [`ElementValidationState::inherited_attributes`] and propagated
+/// from parent to child on element open. See §3.3.5.6 *Inherited Attributes*.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone)]
+pub struct InheritedAttributeValue {
+    /// The attribute value (string form)
+    pub value: String,
+    /// The governing attribute declaration key, if known
+    pub attribute_key: Option<AttributeKey>,
+}
 
 /// Per-element state pushed onto the validation stack
 ///
@@ -68,6 +86,25 @@ pub struct ElementValidationState {
     /// Saved during `detect_assertions_on_element` for CTA re-detection.
     #[cfg(feature = "xsd11")]
     pub assertion_element_ref: Option<u32>,
+    /// **Incoming** inherited attributes: the PSVI `[inherited attributes]`
+    /// for this element (XSD 1.1 §3.3.5.6, structures.html line 5200).
+    ///
+    /// Snapshot of potentially-inherited attribute values from ancestors,
+    /// frozen at element open. This is what `get_inherited_attributes()`
+    /// returns and what CTA XDM construction reads. Never mutated after
+    /// `push_element()`.
+    #[cfg(feature = "xsd11")]
+    pub incoming_inherited: HashMap<(Option<NameId>, NameId), InheritedAttributeValue>,
+    /// **Outgoing** inherited attributes: the propagation map for this
+    /// element's descendants.
+    ///
+    /// Starts as a clone of `incoming_inherited`, then updated when this
+    /// element has explicit or defaulted inheritable attributes (which
+    /// shadow ancestor values per the nearest-owner rule,
+    /// structures.html line 5205). Children clone this map as their
+    /// `incoming_inherited`.
+    #[cfg(feature = "xsd11")]
+    pub outgoing_inherited: HashMap<(Option<NameId>, NameId), InheritedAttributeValue>,
 }
 
 impl ElementValidationState {
@@ -101,6 +138,10 @@ impl ElementValidationState {
             collected_attributes: Vec::new(),
             #[cfg(feature = "xsd11")]
             assertion_element_ref: None,
+            #[cfg(feature = "xsd11")]
+            incoming_inherited: HashMap::new(),
+            #[cfg(feature = "xsd11")]
+            outgoing_inherited: HashMap::new(),
         }
     }
 }

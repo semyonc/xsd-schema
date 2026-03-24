@@ -335,8 +335,7 @@ pub struct AttributeUse {
     /// Fixed value (mutually exclusive with default)
     pub fixed_value: Option<String>,
 
-    /// Inheritable (XSD 1.1)
-    // TODO: XSD 1.1 - Implement inheritable attribute
+    /// Inheritable (XSD 1.1 §3.2.6, §3.3.5.6)
     pub inheritable: bool,
 
     /// Source location

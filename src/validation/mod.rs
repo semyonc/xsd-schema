@@ -33,7 +33,7 @@ pub use info::{
     ExpectedElement, ExpectedAttribute, DefaultAttribute,
 };
 #[cfg(feature = "xsd11")]
-pub use info::AssertionOutcome;
+pub use info::{AssertionOutcome, InheritedAttribute};
 
 pub use content::{ContentValidatorState, ElementMatchInfo};
 

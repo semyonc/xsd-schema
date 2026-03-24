@@ -6067,3 +6067,443 @@ fn test_no_assertions_outcome_none() {
     v.end_validation().ok();
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
+
+// -----------------------------------------------------------------------
+// Inheritable attribute tests (XSD 1.1 §3.3.5.6)
+// -----------------------------------------------------------------------
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_basic() {
+    // Parent has inheritable="true" attr lang, child inherits the value
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(inherited.len(), 1, "child should inherit 'lang'");
+    let lang = &inherited[0];
+    assert_eq!(
+        v.schema_set.name_table.resolve(lang.local_name),
+        "lang"
+    );
+    assert_eq!(lang.value, "en");
+
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_override() {
+    // Parent lang="en", child overrides lang="fr", grandchild inherits "fr"
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="mid">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="leaf" type="xs:string"/>
+                                </xs:sequence>
+                                <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("mid", "", None, None, &ns);
+
+    // Before providing the override, mid's incoming_inherited has the ancestor value
+    let mid_inherited = v.get_inherited_attributes();
+    assert_eq!(mid_inherited.len(), 1);
+    assert_eq!(
+        mid_inherited[0].value, "en",
+        "overriding element itself should still see ancestor value from incoming_inherited"
+    );
+
+    v.validate_attribute("lang", "", "fr"); // override → updates outgoing_inherited
+    v.validate_end_of_attributes();
+
+    // After attributes, mid's PSVI [inherited attributes] is unchanged (incoming)
+    let mid_inherited_after = v.get_inherited_attributes();
+    assert_eq!(mid_inherited_after[0].value, "en",
+        "PSVI [inherited attributes] is the incoming snapshot, not affected by own attrs");
+
+    v.validate_element("leaf", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(inherited.len(), 1);
+    assert_eq!(inherited[0].value, "fr", "grandchild should see overridden value");
+
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_multi_level() {
+    // Root lang="en" → mid (no lang) → leaf (no lang)
+    // Both mid and leaf inherit lang="en"
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="mid">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="leaf" type="xs:string"/>
+                                </xs:sequence>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("mid", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let mid_inherited = v.get_inherited_attributes();
+    assert_eq!(mid_inherited.len(), 1, "mid should inherit 'lang'");
+    assert_eq!(mid_inherited[0].value, "en");
+
+    v.validate_element("leaf", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let leaf_inherited = v.get_inherited_attributes();
+    assert_eq!(leaf_inherited.len(), 1, "leaf should inherit 'lang'");
+    assert_eq!(leaf_inherited[0].value, "en");
+
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_not_set() {
+    // Attr without inheritable="true" is NOT inherited
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let inherited = v.get_inherited_attributes();
+    assert!(inherited.is_empty(), "non-inheritable attr should NOT be inherited");
+
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_no_child_type_filter() {
+    // Parent has inheritable lang, child type does NOT declare lang.
+    // [inherited attributes] still includes lang (no child-type gate per spec).
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="x" type="xs:string"/>
+                                </xs:sequence>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(
+        inherited.len(),
+        1,
+        "inherited attrs should be present even when child type doesn't declare it"
+    );
+    assert_eq!(inherited[0].value, "en");
+
+    v.validate_element("x", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_cta() {
+    // Parent has inheritable lang="en", child has type alternatives using @lang.
+    // CTA should see inherited lang="en" via §3.12.4 clause 1.1.3.
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="enType">
+                <xs:sequence>
+                    <xs:element name="val" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:element name="item">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="other" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:alternative test="@lang='en'" type="enType"/>
+            </xs:element>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element ref="item"/>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    // child "item" does not have explicit lang, but CTA should see inherited lang="en"
+    v.validate_element("item", "", None, None, &ns);
+    let eoa_info = v.validate_end_of_attributes();
+
+    // CTA should have selected enType (which has <val>)
+    assert!(
+        eoa_info.cta_selected,
+        "CTA should have selected a type using inherited lang"
+    );
+
+    // Validate with enType's content model (has <val>)
+    v.validate_element("val", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(
+        v.sink.errors.is_empty(),
+        "CTA with inherited attr should produce no errors, got: {:?}",
+        v.sink.errors
+    );
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_wildcard() {
+    // Attribute matched via wildcard; global declaration has inheritable="true".
+    // Child should inherit via §3.3.5.6 clause 3.2.
+    // Global inheritable attribute + anyAttribute wildcard.
+    // "lang" matches the wildcard, and the global declaration has
+    // inheritable="true" → §3.3.5.6 clause 3.2 applies.
+    let schema_set = load_schema_xsd11(
+        r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                    <xs:anyAttribute namespace="##any" processContents="lax"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"###,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    // "lang" is not declared in the complex type's attribute uses, but
+    // matches the anyAttribute wildcard. The global declaration has
+    // inheritable="true", so §3.3.5.6 clause 3.2 applies.
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(
+        inherited.len(),
+        1,
+        "wildcard-backed inheritable attr should be inherited"
+    );
+    assert_eq!(inherited[0].value, "en");
+
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+#[cfg(feature = "xsd11")]
+fn test_inheritable_default_shadows_ancestor() {
+    // Root provides explicit lang="en" (inheritable). Mid's type declares
+    // lang with inheritable="true" and default="fr". Mid does NOT provide
+    // lang explicitly, so the default "fr" applies and shadows the ancestor
+    // "en" for mid's descendants. Leaf should see lang="fr".
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="mid">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="leaf" type="xs:string"/>
+                                </xs:sequence>
+                                <xs:attribute name="lang" type="xs:string"
+                                              inheritable="true" default="fr"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("lang", "", "en");
+    v.validate_end_of_attributes();
+
+    // mid: no explicit lang — default "fr" kicks in
+    v.validate_element("mid", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // mid's own PSVI [inherited attributes] is the ancestor's "en"
+    let mid_inherited = v.get_inherited_attributes();
+    assert_eq!(mid_inherited.len(), 1);
+    assert_eq!(
+        mid_inherited[0].value, "en",
+        "mid's incoming inherited should be ancestor's en"
+    );
+
+    // leaf should see "fr" from mid's defaulted inheritable attribute
+    v.validate_element("leaf", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    let leaf_inherited = v.get_inherited_attributes();
+    assert_eq!(leaf_inherited.len(), 1);
+    assert_eq!(
+        leaf_inherited[0].value, "fr",
+        "leaf should see defaulted value fr, not ancestor en"
+    );
+
+    v.validate_text("text");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}

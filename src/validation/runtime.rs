@@ -32,7 +32,7 @@ use super::info::{
     SchemaInfo, SchemaValidity, TypeSource, ValidationFlags,
 };
 #[cfg(feature = "xsd11")]
-use super::info::AssertionOutcome;
+use super::info::{AssertionOutcome, InheritedAttribute};
 
 #[cfg(feature = "xsd11")]
 use super::assertions::{
@@ -60,6 +60,8 @@ struct GroupAttribute {
     attr_key: Option<AttributeKey>,
     fixed_value: Option<String>,
     default_value: Option<String>,
+    #[cfg(feature = "xsd11")]
+    inheritable: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +71,8 @@ struct GroupAttribute {
 /// Result of looking up an attribute in a complex type's attribute list.
 enum AttributeLookup {
     /// Found a matching attribute declaration
-    Found(Option<AttributeKey>, Option<TypeKey>, Option<String>),
+    /// (attr_key, type_key, fixed_value, inheritable)
+    Found(Option<AttributeKey>, Option<TypeKey>, Option<String>, bool),
     /// The attribute is explicitly prohibited
     Prohibited,
     /// No matching attribute found
@@ -1079,11 +1082,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let mut selected = false;
             if let Some(ev_state) = self.validation_stack.last() {
                 if let Some(elem_key) = ev_state.element_decl {
+                    // §3.12.4 clause 1.1.3: include [inherited attributes]
+                    // that do not have the same expanded name as any of
+                    // E's [attributes] when building the CTA XDM instance.
+                    // Use incoming_inherited (the PSVI view) with the
+                    // CTA-specific same-name exclusion.
+                    let mut cta_attrs = ev_state.collected_attributes.clone();
+                    let explicit_names: HashSet<(Option<NameId>, NameId)> = cta_attrs
+                        .iter()
+                        .map(|(ns, name, _)| (*ns, *name))
+                        .collect();
+                    for ((ns, name), val) in &ev_state.incoming_inherited {
+                        if !explicit_names.contains(&(*ns, *name)) {
+                            cta_attrs.push((*ns, *name, val.value.clone()));
+                        }
+                    }
                     let new_type = super::alternatives::evaluate_type_alternatives(
                         elem_key,
                         ev_state.local_name,
                         ev_state.namespace,
-                        &ev_state.collected_attributes,
+                        &cta_attrs,
                         self.schema_set,
                     );
                     if let Some(new_type_key) = new_type {
@@ -1131,6 +1149,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.redetect_assertions_after_cta(schema_type);
             }
             self.validate_deferred_attributes(schema_type);
+        }
+
+        // Record inheritable attributes with default values for propagation (XSD 1.1)
+        #[cfg(feature = "xsd11")]
+        if let Some(TypeKey::Complex(ct_key)) = schema_type {
+            self.record_inheritable_defaults(ct_key);
         }
 
         // Check required attributes (clone seen_attributes to avoid borrow conflict)
@@ -1942,6 +1966,39 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         result
     }
 
+    /// Get the `[inherited attributes]` PSVI property for the current element
+    /// (XSD 1.1 §3.3.5.6, structures.html line 5200).
+    ///
+    /// Returns the frozen `incoming_inherited` snapshot — ancestor-owned
+    /// potentially-inherited attributes with nearest-owner shadowing.
+    /// This is the spec's `[inherited attributes]` property; it is NOT
+    /// filtered by the element's own `[attributes]`.
+    ///
+    /// Returns empty for skipped elements.
+    #[cfg(feature = "xsd11")]
+    pub fn get_inherited_attributes(&self) -> Vec<InheritedAttribute> {
+        let ev_state = match self.validation_stack.last() {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        // §3.3.5.6: [inherited attributes] is only defined for non-skipped elements
+        if ev_state.process_contents == ContentProcessing::Skip {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+        for ((ns, name), val) in &ev_state.incoming_inherited {
+            result.push(InheritedAttribute {
+                local_name: *name,
+                namespace: *ns,
+                attribute_key: val.attribute_key,
+                value: val.value.clone(),
+            });
+        }
+        result
+    }
+
     /// Get the content processing mode for the current element
     pub fn content_processing(&self) -> ContentProcessing {
         self.validation_stack
@@ -1964,6 +2021,31 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         self.validation_stack.push(ev_state);
         self.ic_scope_tables.push(None);
+
+        // Propagate inherited attributes from parent to child (XSD 1.1).
+        // §3.3.5.6: [inherited attributes] only exists when the parent is
+        // strictly/laxly assessed and the child is not attributed to a skip
+        // wildcard.
+        //
+        // Parent's outgoing_inherited becomes the child's incoming_inherited
+        // (frozen PSVI view) and outgoing_inherited (mutable for this
+        // element's own inheritable attrs to shadow).
+        #[cfg(feature = "xsd11")]
+        {
+            let len = self.validation_stack.len();
+            if len >= 2 {
+                let parent_pc = self.validation_stack[len - 2].process_contents;
+                let child_pc = self.validation_stack[len - 1].process_contents;
+                if parent_pc != ContentProcessing::Skip
+                    && child_pc != ContentProcessing::Skip
+                {
+                    let from_parent =
+                        self.validation_stack[len - 2].outgoing_inherited.clone();
+                    self.validation_stack[len - 1].incoming_inherited = from_parent.clone();
+                    self.validation_stack[len - 1].outgoing_inherited = from_parent;
+                }
+            }
+        }
 
         if self.current_state == ValidatorState::None {
             self.current_state = ValidatorState::Start;
@@ -2334,7 +2416,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let found = self.find_attribute_in_type(ct_data, local_name, namespace);
 
         match found {
-            AttributeLookup::Found(attr_key, attr_type, fixed_value) => {
+            AttributeLookup::Found(attr_key, attr_type, fixed_value, inheritable) => {
                 if let Some(fixed) = fixed_value {
                     if value != fixed {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
@@ -2365,6 +2447,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         }
                     }
                 }
+
+                // Record inheritable attribute into outgoing map for descendants
+                // (XSD 1.1 §3.3.5.6). This shadows any ancestor value with the
+                // same expanded name per the nearest-owner rule.
+                #[cfg(feature = "xsd11")]
+                if inheritable {
+                    if let Some(ev) = self.validation_stack.last_mut() {
+                        use super::context::InheritedAttributeValue;
+                        ev.outgoing_inherited.insert(
+                            (namespace, local_name),
+                            InheritedAttributeValue {
+                                value: value.to_string(),
+                                attribute_key: attr_key,
+                            },
+                        );
+                    }
+                }
+                let _ = inheritable;
 
                 let result = SchemaInfo {
                     element_decl: None,
@@ -2414,6 +2514,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 )
                             }
                         };
+                        // Wildcard-backed inheritance (XSD 1.1 §3.3.5.6 clause 3.2):
+                        // If strict/lax resolved a governing declaration with
+                        // {inheritable}=true, record for propagation. Skip has no
+                        // governing declaration (attribute_decl is None).
+                        #[cfg(feature = "xsd11")]
+                        if let Some(attr_key) = result.attribute_decl {
+                            if let Some(decl) =
+                                self.schema_set.arenas.attributes.get(attr_key)
+                            {
+                                if decl.inheritable {
+                                    if let Some(ev) = self.validation_stack.last_mut() {
+                                        use super::context::InheritedAttributeValue;
+                                        ev.outgoing_inherited.insert(
+                                            (namespace, local_name),
+                                            InheritedAttributeValue {
+                                                value: value.to_string(),
+                                                attribute_key: Some(attr_key),
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         self.post_process_attribute(local_name, namespace, value, &result);
                         return result;
                     }
@@ -2936,6 +3059,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 attr_key,
                 fixed_value,
                 default_value,
+                #[cfg(feature = "xsd11")]
+                inheritable: attr_use.attribute.inheritable,
             });
         }
         for &nested_key in &group_data.resolved_attribute_groups {
@@ -3058,7 +3183,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             .and_then(|d| d.fixed_value.clone())
                     });
 
-                return AttributeLookup::Found(attr_key, attr_type, fixed);
+                let inheritable = attr_use.attribute.inheritable;
+                return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
             }
         }
 
@@ -3068,11 +3194,91 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if ga.use_kind == AttributeUseKind::Prohibited {
                     return AttributeLookup::Prohibited;
                 }
-                return AttributeLookup::Found(ga.attr_key, ga.type_key, ga.fixed_value);
+                #[cfg(feature = "xsd11")]
+                let inheritable = ga.inheritable;
+                #[cfg(not(feature = "xsd11"))]
+                let inheritable = false;
+                return AttributeLookup::Found(ga.attr_key, ga.type_key, ga.fixed_value, inheritable);
             }
         }
 
         AttributeLookup::NotFound
+    }
+
+    /// Record inheritable attributes with default/fixed values for propagation
+    /// to descendant elements (XSD 1.1 §3.3.5.6).
+    ///
+    /// Scans both direct attribute uses and attribute group uses. Only records
+    /// defaults for inheritable attributes that were not explicitly provided.
+    #[cfg(feature = "xsd11")]
+    fn record_inheritable_defaults(&mut self, ct_key: ComplexTypeKey) {
+        use super::context::InheritedAttributeValue;
+
+        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+
+        // Collect candidates to avoid borrow conflict with validation_stack
+        let mut candidates: Vec<(Option<NameId>, NameId, String, Option<AttributeKey>)> =
+            Vec::new();
+
+        // 1. Direct attribute uses
+        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+            if attr_use.use_kind == AttributeUseKind::Prohibited || !attr_use.attribute.inheritable
+            {
+                continue;
+            }
+            let resolved = ct_data.resolved_attributes.get(i);
+            let attr_key = resolved.and_then(|r| r.resolved_ref);
+            let (name, ns) =
+                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+            let value = attr_use
+                .attribute
+                .default_value
+                .as_deref()
+                .or(attr_use.attribute.fixed_value.as_deref())
+                .or_else(|| {
+                    attr_key
+                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                        .and_then(|d| {
+                            d.default_value
+                                .as_deref()
+                                .or(d.fixed_value.as_deref())
+                        })
+                });
+            if let Some(val) = value {
+                candidates.push((ns, name, val.to_string(), attr_key));
+            }
+        }
+
+        // 2. Attribute group uses
+        for ga in self.collect_group_attributes(ct_data) {
+            if ga.use_kind == AttributeUseKind::Prohibited || !ga.inheritable {
+                continue;
+            }
+            let value = ga
+                .default_value
+                .as_deref()
+                .or(ga.fixed_value.as_deref());
+            if let Some(val) = value {
+                candidates.push((ga.namespace, ga.name, val.to_string(), ga.attr_key));
+            }
+        }
+
+        // Apply to outgoing_inherited: only for attributes not explicitly
+        // provided. Use insert() (not or_insert) so defaulted values from
+        // this element shadow ancestor values per nearest-owner rule.
+        if let Some(ev) = self.validation_stack.last_mut() {
+            for (ns, name, val, attr_key) in candidates {
+                if !ev.seen_attributes.contains(&(ns, name)) {
+                    ev.outgoing_inherited.insert(
+                        (ns, name),
+                        InheritedAttributeValue {
+                            value: val,
+                            attribute_key: attr_key,
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Check that all required attributes are present

@@ -1030,15 +1030,13 @@ fn test_malformed_qname_rejected() {
 
     let name = schema_set.name_table.get("Bad");
     if let Some(name_id) = name {
-        if let Some(type_key) = schema_set.lookup_type(None, name_id) {
-            if let TypeKey::Simple(sk) = type_key {
-                let td = schema_set.arenas.simple_types.get(sk).unwrap();
-                // base_type should be None — the malformed QName was rejected
-                assert!(
-                    td.base_type.is_none() || matches!(&td.base_type, Some(crate::parser::frames::TypeRefResult::QName(q)) if schema_set.name_table.resolve(q.local_name).is_empty()),
-                    "Malformed QName 'xs:' should not produce a valid base_type"
-                );
-            }
+        if let Some(TypeKey::Simple(sk)) = schema_set.lookup_type(None, name_id) {
+            let td = schema_set.arenas.simple_types.get(sk).unwrap();
+            // base_type should be None — the malformed QName was rejected
+            assert!(
+                td.base_type.is_none() || matches!(&td.base_type, Some(crate::parser::frames::TypeRefResult::QName(q)) if schema_set.name_table.resolve(q.local_name).is_empty()),
+                "Malformed QName 'xs:' should not produce a valid base_type"
+            );
         }
     }
     // If the type didn't even parse, that's also acceptable

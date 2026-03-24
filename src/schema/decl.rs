@@ -220,8 +220,7 @@ pub struct AttributeDecl {
     /// Form (qualified/unqualified) - for local attributes
     pub form: Option<FormKind>,
 
-    // XSD 1.1: Inheritable attribute
-    // TODO: XSD 1.1 - Implement inheritable processing
+    /// XSD 1.1: Inheritable attribute (§3.2.6, §3.3.5.6)
     pub inheritable: bool,
 }
 
