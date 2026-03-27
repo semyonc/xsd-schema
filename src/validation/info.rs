@@ -307,6 +307,33 @@ pub struct InheritedAttribute {
     pub value: String,
 }
 
+/// A schema location hint extracted from `xsi:schemaLocation`.
+///
+/// Pairs a namespace URI with a schema location URI plus the base URI
+/// of the instance document element where the hint was found (needed to
+/// resolve relative location URIs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaLocationHint {
+    /// The namespace URI (first token of each pair in `xsi:schemaLocation`).
+    pub namespace: String,
+    /// The schema location URI (second token of each pair).
+    pub location: String,
+    /// Base URI of the instance document at the point where this hint was
+    /// found. Empty if no base URI was set on the runtime.
+    pub base_uri: String,
+}
+
+/// A no-namespace schema location hint extracted from
+/// `xsi:noNamespaceSchemaLocation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoNamespaceSchemaLocationHint {
+    /// The schema location URI.
+    pub location: String,
+    /// Base URI of the instance document at the point where this hint was
+    /// found. Empty if no base URI was set on the runtime.
+    pub base_uri: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

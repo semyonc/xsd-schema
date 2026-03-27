@@ -29,7 +29,8 @@ use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
-    SchemaInfo, SchemaValidity, TypeSource, ValidationAttempted, ValidationFlags,
+    NoNamespaceSchemaLocationHint, SchemaInfo, SchemaLocationHint, SchemaValidity, TypeSource,
+    ValidationAttempted, ValidationFlags,
 };
 #[cfg(feature = "xsd11")]
 use super::info::{AssertionOutcome, InheritedAttribute};
@@ -152,6 +153,12 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     deferred_attribute_results: Vec<SchemaInfo>,
     /// Final identity constraint tables after root element close (PSVI exposure).
     final_ic_tables: Option<HashMap<IdentityConstraintKey, KeyTable>>,
+    /// Accumulated `xsi:schemaLocation` hints with base URI context.
+    schema_location_hints: Vec<SchemaLocationHint>,
+    /// Accumulated `xsi:noNamespaceSchemaLocation` hints with base URI context.
+    no_namespace_schema_location_hints: Vec<NoNamespaceSchemaLocationHint>,
+    /// Base URI of the instance document (set by caller for relative URI resolution).
+    instance_base_uri: String,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -181,6 +188,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             pending_idrefs: Vec::new(),
             ic_scope_tables: Vec::new(),
             final_ic_tables: None,
+            schema_location_hints: Vec::new(),
+            no_namespace_schema_location_hints: Vec::new(),
+            instance_base_uri: String::new(),
             #[cfg(feature = "xsd11")]
             assertion_source,
             #[cfg(feature = "xsd11")]
@@ -213,6 +223,31 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// tables accumulated during the root element's validation scope.
     pub fn identity_constraint_tables(&self) -> Option<&HashMap<IdentityConstraintKey, KeyTable>> {
         self.final_ic_tables.as_ref()
+    }
+
+    /// Set the base URI of the instance document being validated.
+    ///
+    /// This base URI is attached to every schema-location hint collected
+    /// during validation so that relative URIs can be resolved correctly
+    /// when schemas are loaded later.
+    pub fn set_instance_base_uri(&mut self, base_uri: impl Into<String>) {
+        self.instance_base_uri = base_uri.into();
+    }
+
+    /// Returns accumulated `xsi:schemaLocation` hints.
+    ///
+    /// Each hint contains a namespace/location pair plus the instance base
+    /// URI for resolving relative locations. Complete pairs from every
+    /// `xsi:schemaLocation` attribute are included, even from attributes
+    /// that failed even-token-count enforcement (the complete pairs are
+    /// still valid hints). Any trailing unpaired token is ignored.
+    pub fn schema_location_hints(&self) -> &[SchemaLocationHint] {
+        &self.schema_location_hints
+    }
+
+    /// Returns accumulated `xsi:noNamespaceSchemaLocation` hints.
+    pub fn no_namespace_schema_location_hints(&self) -> &[NoNamespaceSchemaLocationHint] {
+        &self.no_namespace_schema_location_hints
     }
 
     /// Returns a reference to the fragment arena, if it has been allocated.
@@ -1015,6 +1050,34 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        // Detect xml:base unconditionally (regardless of ALLOW_XML_ATTRIBUTES)
+        // and update the current element's base URI for schema-location hints.
+        // xml:base is compositional: relative values resolve against the
+        // inherited base URI (RFC 3986 §5).
+        // Only apply if this is the first xml:base on this element (skip
+        // duplicates so an invalid repeated xml:base doesn't overwrite).
+        let mut xml_base_rebase = None;
+        if namespace == Some(well_known::XML_NAMESPACE)
+            && local_name == self.schema_set.name_table.add("base")
+        {
+            if let Some(ev) = self.validation_stack.last_mut() {
+                if !ev.base_uri_set_by_xml_base {
+                    let xml_base = value.trim();
+                    let base_uri = resolve_base_uri(xml_base, &ev.base_uri);
+                    ev.base_uri = base_uri.clone();
+                    ev.base_uri_set_by_xml_base = true;
+                    xml_base_rebase = Some((
+                        base_uri,
+                        ev.schema_location_hint_start,
+                        ev.no_namespace_schema_location_hint_start,
+                    ));
+                }
+            }
+        }
+        if let Some((base_uri, sl_start, nnsl_start)) = xml_base_rebase {
+            self.rebase_hint_range(sl_start, nnsl_start, &base_uri);
+        }
+
         let ev_state = match self.validation_stack.last_mut() {
             Some(s) => s,
             None => {
@@ -1023,10 +1086,36 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         };
 
-        // Skip xsi:* attributes — they are processed by validate_element
+        // Validate xsi:* built-in attributes with proper type information
         if namespace == Some(well_known::XSI_NAMESPACE) {
             self.current_state = ValidatorState::Attribute;
-            return SchemaInfo::empty();
+            let ec_snapshot = self
+                .validation_stack
+                .last()
+                .map(|ev| ev.error_codes.len())
+                .unwrap_or(0);
+            let mut result = self.validate_xsi_attribute(local_name, value);
+            if let Some(ev) = self.validation_stack.last_mut() {
+                // Extract attribute-specific error codes (mirrors normal attribute path)
+                if ev.error_codes.len() > ec_snapshot {
+                    result.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
+                    ev.error_codes.truncate(ec_snapshot);
+                }
+                // Track attribute [validation attempted] on parent element (§3.3.5.1)
+                match result.validation_attempted {
+                    ValidationAttempted::Full => {
+                        ev.any_attr_not_none = true;
+                    }
+                    ValidationAttempted::None => {
+                        ev.any_attr_not_full = true;
+                    }
+                    ValidationAttempted::Partial => {
+                        ev.any_attr_not_full = true;
+                        ev.any_attr_not_none = true;
+                    }
+                }
+            }
+            return result;
         }
 
         // Skip xml:* attributes when ALLOW_XML_ATTRIBUTES is set
@@ -2117,12 +2206,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     // -----------------------------------------------------------------------
 
     /// Push a new element onto the validation stack and update the element path
-    fn push_element(&mut self, ev_state: ElementValidationState) {
+    fn push_element(&mut self, mut ev_state: ElementValidationState) {
         let local_name = self.schema_set.name_table.resolve(ev_state.local_name);
         if !self.element_path.is_empty() || self.validation_stack.is_empty() {
             self.element_path.push('/');
         }
         self.element_path.push_str(&local_name);
+
+        // Inherit base URI from parent element, or from the document-level
+        // base URI for the root element.
+        ev_state.base_uri = match self.validation_stack.last() {
+            Some(parent) => parent.base_uri.clone(),
+            None => self.instance_base_uri.clone(),
+        };
+        ev_state.schema_location_hint_start = self.schema_location_hints.len();
+        ev_state.no_namespace_schema_location_hint_start =
+            self.no_namespace_schema_location_hints.len();
 
         self.validation_stack.push(ev_state);
         self.ic_scope_tables.push(None);
@@ -2214,6 +2313,212 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if let Some(s) = self.validation_stack.last_mut() {
             s.validity = SchemaValidity::Invalid;
         }
+    }
+
+    /// Get the effective base URI for the current element (or the document
+    /// base URI if no element is on the stack).
+    fn current_element_base_uri(&self) -> String {
+        self.validation_stack
+            .last()
+            .map(|ev| ev.base_uri.clone())
+            .unwrap_or_else(|| self.instance_base_uri.clone())
+    }
+
+    fn rebase_hint_range(&mut self, sl_start: usize, nnsl_start: usize, base_uri: &str) {
+        for hint in &mut self.schema_location_hints[sl_start..] {
+            hint.base_uri = base_uri.to_string();
+        }
+        for hint in &mut self.no_namespace_schema_location_hints[nnsl_start..] {
+            hint.base_uri = base_uri.to_string();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // XSI built-in attribute helpers
+    // -----------------------------------------------------------------------
+
+    /// Dispatch validation for an `xsi:*` attribute.
+    ///
+    /// The four built-in XSI attributes (`type`, `nil`, `schemaLocation`,
+    /// `noNamespaceSchemaLocation`) are validated against their spec-defined
+    /// types. Unknown `xsi:*` attributes fall through to normal
+    /// attribute/wildcard validation.
+    fn validate_xsi_attribute(&mut self, local_name: NameId, value: &str) -> SchemaInfo {
+        let builtin = self.schema_set.builtin_types();
+        if local_name == well_known::XSI_TYPE {
+            // Attribute-level: lexical xs:QName validation only.
+            // Semantic resolution (cvc-elt.4.1) is handled in validate_element_by_id.
+            let type_key = TypeKey::Simple(builtin.qname);
+            let attr_key = builtin.xsi_type_attr;
+            return self.validate_xsi_simple_value(value, type_key, attr_key);
+        }
+        if local_name == well_known::XSI_NIL {
+            let type_key = TypeKey::Simple(builtin.boolean);
+            let attr_key = builtin.xsi_nil_attr;
+            return self.validate_xsi_simple_value(value, type_key, attr_key);
+        }
+        if local_name == well_known::XSI_SCHEMA_LOCATION {
+            return self.validate_xsi_schema_location(value);
+        }
+        if local_name == well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION {
+            return self.validate_xsi_no_ns_schema_location(value);
+        }
+        // Unknown xsi:* — fall through to normal attribute/wildcard validation
+        self.validate_unknown_xsi_attribute(local_name, value)
+    }
+
+    /// Unknown `xsi:*` attributes go through normal wildcard validation.
+    fn validate_unknown_xsi_attribute(
+        &mut self,
+        local_name: NameId,
+        value: &str,
+    ) -> SchemaInfo {
+        let ct_key = match self.validation_stack.last() {
+            Some(ev) => match ev.schema_type {
+                Some(TypeKey::Complex(ct)) => ct,
+                _ => return SchemaInfo::empty(),
+            },
+            None => return SchemaInfo::empty(),
+        };
+        self.validate_attribute_against_type(
+            ct_key,
+            local_name,
+            Some(well_known::XSI_NAMESPACE),
+            value,
+        )
+    }
+
+    /// Validate a value against a built-in simple type and return attribute `SchemaInfo`.
+    fn validate_xsi_simple_value(
+        &mut self,
+        value: &str,
+        type_key: TypeKey,
+        attr_key: AttributeKey,
+    ) -> SchemaInfo {
+        match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+            Ok(result) => SchemaInfo {
+                element_decl: None,
+                attribute_decl: Some(attr_key),
+                schema_type: Some(type_key),
+                member_type: result.member_type,
+                validity: SchemaValidity::Valid,
+                validation_attempted: ValidationAttempted::Full,
+                is_default: false,
+                is_nil: false,
+                content_type: None,
+                typed_value: Some(result.typed_value),
+                normalized_value: result.normalized_value,
+                schema_error_codes: Vec::new(),
+                notation: None,
+                deferred_by_cta: false,
+                type_source: None,
+                #[cfg(feature = "xsd11")]
+                cta_selected: false,
+                #[cfg(feature = "xsd11")]
+                assertion_outcome: None,
+            },
+            Err(err) => {
+                self.report_validation_error(err);
+                SchemaInfo {
+                    attribute_decl: Some(attr_key),
+                    schema_type: Some(type_key),
+                    validity: SchemaValidity::Invalid,
+                    validation_attempted: ValidationAttempted::Full,
+                    ..SchemaInfo::empty()
+                }
+            }
+        }
+    }
+
+    /// Validate `xsi:schemaLocation` as a whitespace-separated list of anyURI
+    /// tokens with even token count.
+    fn validate_xsi_schema_location(&mut self, value: &str) -> SchemaInfo {
+        let builtin = self.schema_set.builtin_types();
+        let any_uri_key = TypeKey::Simple(builtin.any_uri);
+        let list_type_key = TypeKey::Simple(builtin.xsi_schema_location_type);
+        let attr_key = builtin.xsi_schema_location_attr;
+
+        let tokens: Vec<&str> = value.split_whitespace().collect();
+        let mut validity = SchemaValidity::Valid;
+
+        // Even token count check (namespace/location pairs)
+        if !tokens.len().is_multiple_of(2) {
+            self.report_error(
+                "cvc-schema-location",
+                format!(
+                    "xsi:schemaLocation value must contain an even number of URI tokens, \
+                     but found {} tokens",
+                    tokens.len()
+                ),
+            );
+            validity = SchemaValidity::Invalid;
+        }
+
+        // Validate each token as xs:anyURI
+        for token in &tokens {
+            if let Err(err) =
+                super::simple::validate_simple_type(token, any_uri_key, self.schema_set)
+            {
+                self.report_validation_error(err);
+                validity = SchemaValidity::Invalid;
+            }
+        }
+
+        // Accumulate namespace/location pairs (even from invalid attributes —
+        // the complete pairs are still valid hints)
+        let base_uri = self.current_element_base_uri();
+        for pair in tokens.chunks_exact(2) {
+            self.schema_location_hints.push(SchemaLocationHint {
+                namespace: pair[0].to_string(),
+                location: pair[1].to_string(),
+                base_uri: base_uri.clone(),
+            });
+        }
+
+        SchemaInfo {
+            element_decl: None,
+            attribute_decl: Some(attr_key),
+            schema_type: Some(list_type_key),
+            member_type: None,
+            validity,
+            validation_attempted: ValidationAttempted::Full,
+            is_default: false,
+            is_nil: false,
+            content_type: None,
+            typed_value: None,
+            normalized_value: if tokens.is_empty() {
+                None
+            } else {
+                Some(tokens.join(" "))
+            },
+            schema_error_codes: Vec::new(),
+            notation: None,
+            deferred_by_cta: false,
+            type_source: None,
+            #[cfg(feature = "xsd11")]
+            cta_selected: false,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome: None,
+        }
+    }
+
+    /// Validate `xsi:noNamespaceSchemaLocation` as `xs:anyURI`.
+    fn validate_xsi_no_ns_schema_location(&mut self, value: &str) -> SchemaInfo {
+        let builtin = self.schema_set.builtin_types();
+        let any_uri_key = TypeKey::Simple(builtin.any_uri);
+        let attr_key = builtin.xsi_no_namespace_schema_location_attr;
+        let result = self.validate_xsi_simple_value(value, any_uri_key, attr_key);
+
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            self.no_namespace_schema_location_hints
+                .push(NoNamespaceSchemaLocationHint {
+                    location: trimmed.to_string(),
+                    base_uri: self.current_element_base_uri(),
+                });
+        }
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -3523,6 +3828,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         has_missing
+    }
+}
+
+/// Resolve an `xml:base` value against an inherited base URI.
+///
+/// If the value is already absolute (contains `://` or starts with `/`
+/// or is a Windows absolute path), it replaces the inherited base.
+/// Otherwise, it is resolved as a relative URI against the inherited base.
+fn resolve_base_uri(xml_base: &str, inherited: &str) -> String {
+    if xml_base.is_empty() {
+        return inherited.to_string();
+    }
+    // Check for absolute URI
+    if xml_base.contains("://")
+        || xml_base.starts_with('/')
+        || (xml_base.len() >= 2 && xml_base.as_bytes().get(1) == Some(&b':'))
+    {
+        return xml_base.to_string();
+    }
+    if inherited.is_empty() {
+        return xml_base.to_string();
+    }
+    // Resolve relative against inherited base directory.
+    // Find the last path separator (handles both / and \ for Windows paths).
+    let last_sep = inherited
+        .rfind('/')
+        .or_else(|| inherited.rfind('\\'));
+    let base_dir = match last_sep {
+        Some(pos) => &inherited[..=pos],
+        None => "",
+    };
+    if base_dir.is_empty() {
+        xml_base.to_string()
+    } else {
+        format!("{}{}", base_dir, xml_base)
     }
 }
 

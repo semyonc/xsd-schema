@@ -33,6 +33,7 @@ use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
 use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::XsdVersion;
 use crate::schema::SchemaSet;
+use std::path::{Path, PathBuf};
 
 /// Builder for creating compiled schema sets.
 ///
@@ -162,16 +163,44 @@ impl SchemaSetBuilder {
     /// assert_eq!(builder.schema_count(), 1);
     /// ```
     pub fn add(mut self, _namespace: &str, location: &str) -> SchemaResult<Self> {
-        let content = self.resolver.load_content(location)?;
+        self.try_add(location)?;
+        Ok(self)
+    }
+
+    /// Add a schema by location without consuming the builder.
+    ///
+    /// Returns `Ok(true)` if the schema was freshly loaded, `Ok(false)` if
+    /// it was already present (dedup). Returns `Err` on load/parse failure.
+    ///
+    /// The location is first normalized via the resolver so that relative
+    /// and absolute forms of the same path are correctly deduplicated.
+    pub fn try_add(&mut self, location: &str) -> SchemaResult<bool> {
+        let normalized = normalize_loaded_location(&self.resolver, location, "");
+        if self.schema_set.is_loaded(&normalized) {
+            return Ok(false);
+        }
+        let content = self.resolver.load_content(&normalized)?;
         let doc_id = parse_schema_with_config(
             content.as_bytes(),
-            location,
+            &normalized,
             &mut self.schema_set,
             &self.resolver.config.parser_config,
         )?;
         self.pending_docs.push(doc_id);
-        self.schema_set.mark_loaded(location.to_string(), doc_id);
-        Ok(self)
+        self.schema_set.mark_loaded(normalized, doc_id);
+        Ok(true)
+    }
+
+    /// Add a schema by resolving a relative location against a base URI.
+    ///
+    /// Uses the builder's resolver for URI resolution (handles Windows
+    /// paths, URL normalization, etc.). The resolved absolute URI is used
+    /// for loading and dedup tracking.
+    ///
+    /// Returns `Ok(true)` if freshly loaded, `Ok(false)` if already present.
+    pub fn try_add_relative(&mut self, location: &str, base_uri: &str) -> SchemaResult<bool> {
+        let normalized = normalize_loaded_location(&self.resolver, location, base_uri);
+        self.try_add(&normalized)
     }
 
     /// Add a schema from XML source string.
@@ -195,14 +224,15 @@ impl SchemaSetBuilder {
     /// assert_eq!(builder.schema_count(), 1);
     /// ```
     pub fn add_source(mut self, xml: &str, base_uri: &str) -> SchemaResult<Self> {
+        let normalized = normalize_loaded_location(&self.resolver, base_uri, "");
         let doc_id = parse_schema_with_config(
             xml.as_bytes(),
-            base_uri,
+            &normalized,
             &mut self.schema_set,
             &self.resolver.config.parser_config,
         )?;
         self.pending_docs.push(doc_id);
-        self.schema_set.mark_loaded(base_uri.to_string(), doc_id);
+        self.schema_set.mark_loaded(normalized, doc_id);
         Ok(self)
     }
 
@@ -213,20 +243,26 @@ impl SchemaSetBuilder {
     /// * `xml` - The schema XML content as bytes
     /// * `base_uri` - Base URI for resolving relative references
     pub fn add_bytes(mut self, xml: &[u8], base_uri: &str) -> SchemaResult<Self> {
+        let normalized = normalize_loaded_location(&self.resolver, base_uri, "");
         let doc_id = parse_schema_with_config(
             xml,
-            base_uri,
+            &normalized,
             &mut self.schema_set,
             &self.resolver.config.parser_config,
         )?;
         self.pending_docs.push(doc_id);
-        self.schema_set.mark_loaded(base_uri.to_string(), doc_id);
+        self.schema_set.mark_loaded(normalized, doc_id);
         Ok(self)
     }
 
     /// Get the number of schemas added so far.
     pub fn schema_count(&self) -> usize {
         self.pending_docs.len()
+    }
+
+    /// Check if a schema location has already been loaded.
+    pub fn is_loaded(&self, location: &str) -> bool {
+        self.schema_set.is_loaded(location)
     }
 
     /// Compile all added schemas.
@@ -360,6 +396,47 @@ impl SchemaSetBuilder {
             },
         })
     }
+}
+
+fn normalize_loaded_location(resolver: &SchemaResolver, location: &str, base_uri: &str) -> String {
+    let resolved = resolver
+        .resolve_location(location, base_uri)
+        .unwrap_or_else(|_| location.to_string());
+    if is_absolute_location(&resolved) {
+        return resolved;
+    }
+
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return resolved,
+    };
+    normalize_path(&cwd.join(&resolved))
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn is_absolute_location(location: &str) -> bool {
+    location.starts_with("http://")
+        || location.starts_with("https://")
+        || location.starts_with("file://")
+        || Path::new(location).is_absolute()
+        || (location.len() >= 2 && location.as_bytes().get(1) == Some(&b':'))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => result.push(component),
+        }
+    }
+
+    result
 }
 
 impl Default for SchemaSetBuilder {

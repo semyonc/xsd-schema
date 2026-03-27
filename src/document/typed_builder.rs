@@ -373,24 +373,23 @@ fn handle_start_or_empty<S: ValidationSink>(
         let unescaped = attr.unescape_value()?;
         let attr_ref = builder.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
 
-        // Skip validation for xsi:* attributes (handled internally by the validator)
-        if attr_ns_uri != XSI_NAMESPACE {
-            let attr_info = runtime.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
+        // Validate all attributes including xsi:* (built-in XSI attributes
+        // return proper SchemaInfo with type information from the runtime).
+        let attr_info = runtime.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
 
-            #[cfg(feature = "xsd11")]
-            if attr_info.deferred_by_cta {
-                deferred_attr_refs.push(attr_ref);
-            }
+        #[cfg(feature = "xsd11")]
+        if attr_info.deferred_by_cta {
+            deferred_attr_refs.push(attr_ref);
+        }
 
-            if let Some(tk) = attr_info.schema_type {
-                let binding = NodeSchemaBinding {
-                    type_key: tk,
-                    element_decl: None,
-                    attribute_decl: attr_info.attribute_decl,
-                    content_type: None,
-                };
-                builder.set_node_binding(attr_ref, binding)?;
-            }
+        if let Some(tk) = attr_info.schema_type {
+            let binding = NodeSchemaBinding {
+                type_key: tk,
+                element_decl: None,
+                attribute_decl: attr_info.attribute_decl,
+                content_type: None,
+            };
+            builder.set_node_binding(attr_ref, binding)?;
         }
 
         // xml:id detection (mirrors builder.rs:706)

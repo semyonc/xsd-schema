@@ -94,6 +94,12 @@ impl NameTable {
         table.add("xml");
         table.add("xmlns");
 
+        // XSI attribute local names
+        table.add("type");
+        table.add("nil");
+        table.add("schemaLocation");
+        table.add("noNamespaceSchemaLocation");
+
         table
     }
 
@@ -293,6 +299,18 @@ pub mod well_known {
 
     /// "xmlns" prefix
     pub const XMLNS_PREFIX: NameId = NameId(9);
+
+    /// XSI local name "type"
+    pub const XSI_TYPE: NameId = NameId(10);
+
+    /// XSI local name "nil"
+    pub const XSI_NIL: NameId = NameId(11);
+
+    /// XSI local name "schemaLocation"
+    pub const XSI_SCHEMA_LOCATION: NameId = NameId(12);
+
+    /// XSI local name "noNamespaceSchemaLocation"
+    pub const XSI_NO_NAMESPACE_SCHEMA_LOCATION: NameId = NameId(13);
 }
 
 #[cfg(test)]
@@ -357,6 +375,15 @@ mod tests {
         assert_eq!(table.resolve(well_known::XSD_PREFIX), "xsd");
         assert_eq!(table.resolve(well_known::XSI_PREFIX), "xsi");
         assert_eq!(table.resolve(well_known::XML_PREFIX), "xml");
+    }
+
+    #[test]
+    fn test_well_known_xsi_local_names() {
+        let table = NameTable::new();
+        assert_eq!(table.resolve(well_known::XSI_TYPE), "type");
+        assert_eq!(table.resolve(well_known::XSI_NIL), "nil");
+        assert_eq!(table.resolve(well_known::XSI_SCHEMA_LOCATION), "schemaLocation");
+        assert_eq!(table.resolve(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION), "noNamespaceSchemaLocation");
     }
 
     #[test]

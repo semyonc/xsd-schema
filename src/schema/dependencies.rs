@@ -400,6 +400,7 @@ fn is_builtin_simple_type(key: SimpleTypeKey, builtin: &crate::types::builtin::B
         || key == builtin.hex_binary
         || key == builtin.base64_binary
         || key == builtin.any_uri
+        || key == builtin.xsi_schema_location_type
         || key == builtin.qname
         || key == builtin.notation
         || key == builtin.normalized_string

@@ -264,6 +264,55 @@ Useful runtime helpers for editor or tooling scenarios:
 If you need a full namespace-aware `quick-xml` integration that also builds a
 typed in-memory document, `src/document/typed_builder.rs` is a good reference.
 
+### XSI attributes
+
+The four built-in XSI attributes are validated with proper per-attribute
+`SchemaInfo`:
+
+| Attribute | Type | Notes |
+| --- | --- | --- |
+| `xsi:type` | `xs:QName` | Lexical QName validation; semantic resolution is in element validation |
+| `xsi:nil` | `xs:boolean` | |
+| `xsi:schemaLocation` | `list(xs:anyURI)` | Even token count enforced (namespace/location pairs) |
+| `xsi:noNamespaceSchemaLocation` | `xs:anyURI` | |
+
+Schema-location hints are accumulated during a validation run. Each hint
+carries the instance document's base URI for correct relative URI resolution.
+Set the base URI before starting validation:
+
+```rust,ignore
+runtime.set_instance_base_uri("file:///path/to/instance.xml");
+```
+
+Retrieve hints afterwards:
+
+```rust,ignore
+let sl_hints = runtime.schema_location_hints();    // &[SchemaLocationHint]
+let nnsl_hints = runtime.no_namespace_schema_location_hints(); // &[NoNamespaceSchemaLocationHint]
+```
+
+Complete pairs are accumulated from every `xsi:schemaLocation` attribute,
+even from values that failed even-token-count enforcement (the complete
+pairs are still valid hints).
+
+To load schemas from these hints between validation runs, use
+`load_hints_into_builder`. It resolves relative locations against each
+hint's base URI and skips schemas that are already loaded:
+
+```rust,ignore
+use xsd_schema::{SchemaSetBuilder, load_hints_into_builder};
+
+let mut builder = SchemaSetBuilder::new();
+builder.try_add("base.xsd").ok();
+load_hints_into_builder(&mut builder, &sl_hints, &nnsl_hints);
+let compiled = builder.compile()?;
+// Re-validate with compiled.schema_set()
+```
+
+Load failures are non-fatal — the caller can inspect `HintLoadResult::errors`
+for diagnostics. No schemas are loaded during an active validation run; the
+runtime borrows `&SchemaSet` immutably.
+
 ## 3. XPath
 
 The XPath engine is available under the `xsd11` feature, so enable that

@@ -212,3 +212,7 @@ pub use validation::{
     from_value_error, from_facet_error,
     facet_constraint_code, value_error_constraint_code,
 };
+
+// Re-export hint-driven schema loading
+pub use validation::hint_loader::{load_hints_into_builder, HintLoadResult};
+pub use validation::info::{SchemaLocationHint, NoNamespaceSchemaLocationHint};

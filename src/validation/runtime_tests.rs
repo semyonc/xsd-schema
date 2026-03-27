@@ -1,4 +1,5 @@
 use super::*;
+use super::super::info::{NoNamespaceSchemaLocationHint, SchemaLocationHint};
 use super::super::validator::SchemaValidator;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::pipeline::load_and_process_schema;
@@ -6881,4 +6882,557 @@ fn test_psvi_schema_error_codes_wildcard_xsi_type() {
     );
 
     v.end_validation().ok();
+}
+
+// -----------------------------------------------------------------------
+// XSI built-in attribute validation tests
+// -----------------------------------------------------------------------
+
+const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+
+#[test]
+fn test_xsi_no_namespace_schema_location_valid() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let info = v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "schema.xsd");
+
+    assert_eq!(info.validity, SchemaValidity::Valid);
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+    assert_eq!(
+        info.schema_type,
+        Some(TypeKey::Simple(schema_set.builtin_types().any_uri))
+    );
+    assert!(info.typed_value.is_some());
+    assert!(info.attribute_decl.is_some()); // built-in XSI attribute declaration
+
+    assert_eq!(
+        v.no_namespace_schema_location_hints(),
+        &[NoNamespaceSchemaLocationHint {
+            location: "schema.xsd".to_string(),
+            base_uri: String::new(),
+        }]
+    );
+    assert!(v.schema_location_hints().is_empty());
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_xsi_schema_location_valid() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let info = v.validate_attribute(
+        "schemaLocation",
+        XSI_NS,
+        "http://example.com schema.xsd http://other.com other.xsd",
+    );
+
+    assert_eq!(info.validity, SchemaValidity::Valid);
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+    assert_eq!(
+        info.schema_type,
+        Some(TypeKey::Simple(
+            schema_set.builtin_types().xsi_schema_location_type
+        ))
+    );
+
+    assert_eq!(
+        v.schema_location_hints(),
+        &[
+            SchemaLocationHint {
+                namespace: "http://example.com".to_string(),
+                location: "schema.xsd".to_string(),
+                base_uri: String::new(),
+            },
+            SchemaLocationHint {
+                namespace: "http://other.com".to_string(),
+                location: "other.xsd".to_string(),
+                base_uri: String::new(),
+            },
+        ]
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_xsi_schema_location_odd_token_count() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let info = v.validate_attribute(
+        "schemaLocation",
+        XSI_NS,
+        "http://example.com schema.xsd extra",
+    );
+
+    assert_eq!(info.validity, SchemaValidity::Invalid);
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+
+    // Should still have the first complete pair
+    assert_eq!(
+        v.schema_location_hints(),
+        &[SchemaLocationHint {
+            namespace: "http://example.com".to_string(),
+            location: "schema.xsd".to_string(),
+            base_uri: String::new(),
+        }]
+    );
+
+    // Should have the cvc-schema-location error
+    assert!(
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-schema-location"),
+        "expected cvc-schema-location error, got {:?}",
+        v.sink.errors
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_type_attribute_schema_info() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let info = v.validate_attribute("type", XSI_NS, "xs:string");
+
+    // Attribute-level: lexical QName validation — type is xs:QName
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+    assert_eq!(
+        info.schema_type,
+        Some(TypeKey::Simple(schema_set.builtin_types().qname))
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_nil_attribute_schema_info() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string" nillable="true"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, Some("true"), &ns);
+    let info = v.validate_attribute("nil", XSI_NS, "true");
+
+    assert_eq!(info.validity, SchemaValidity::Valid);
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+    assert_eq!(
+        info.schema_type,
+        Some(TypeKey::Simple(schema_set.builtin_types().boolean))
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_xsi_nil_invalid_value() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string" nillable="true"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, Some("maybe"), &ns);
+    let info = v.validate_attribute("nil", XSI_NS, "maybe");
+
+    // "maybe" is not a valid xs:boolean
+    assert_eq!(info.validity, SchemaValidity::Invalid);
+    assert_eq!(info.validation_attempted, ValidationAttempted::Full);
+    assert_eq!(
+        info.schema_type,
+        Some(TypeKey::Simple(schema_set.builtin_types().boolean))
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_attrs_per_attribute_schema_info_returned() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+
+    // All four XSI attributes should return non-None schema_type
+    let info_type = v.validate_attribute("type", XSI_NS, "xs:string");
+    assert!(info_type.schema_type.is_some());
+
+    let info_nil = v.validate_attribute("nil", XSI_NS, "false");
+    assert!(info_nil.schema_type.is_some());
+
+    let info_sl = v.validate_attribute("schemaLocation", XSI_NS, "http://ex.com a.xsd");
+    assert!(info_sl.schema_type.is_some());
+
+    let info_nnsl = v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "local.xsd");
+    assert!(info_nnsl.schema_type.is_some());
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_attrs_update_parent_validation_attempted() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+
+    // Only XSI attributes on this element
+    let attr_info = v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "schema.xsd");
+    assert_eq!(attr_info.validation_attempted, ValidationAttempted::Full);
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+
+    // End-element should reflect Full validation attempted (element is declared,
+    // all attributes fully validated including XSI built-ins).
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validation_attempted, ValidationAttempted::Full);
+
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_unknown_xsi_attribute_goes_through_wildcard() {
+    let schema_set = load_schema(
+        r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:simpleContent>
+                        <xs:extension base="xs:string">
+                            <xs:anyAttribute namespace="##other" processContents="lax"/>
+                        </xs:extension>
+                    </xs:simpleContent>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"###,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+
+    // Unknown xsi:* attribute should go through wildcard, not get blanket-accepted
+    let info = v.validate_attribute("unknownAttr", XSI_NS, "value");
+    // With lax wildcard and no declaration, this should be empty/lax-skipped
+    assert_eq!(info.validation_attempted, ValidationAttempted::None);
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_attribute_decl_returned_for_all_builtins() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+
+    let info_type = v.validate_attribute("type", XSI_NS, "xs:string");
+    assert!(info_type.attribute_decl.is_some(), "xsi:type should have attribute_decl");
+
+    let info_nil = v.validate_attribute("nil", XSI_NS, "false");
+    assert!(info_nil.attribute_decl.is_some(), "xsi:nil should have attribute_decl");
+
+    let info_sl = v.validate_attribute("schemaLocation", XSI_NS, "http://ex.com a.xsd");
+    assert!(info_sl.attribute_decl.is_some(), "xsi:schemaLocation should have attribute_decl");
+
+    let info_nnsl = v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "a.xsd");
+    assert!(info_nnsl.attribute_decl.is_some(), "xsi:noNamespaceSchemaLocation should have attribute_decl");
+
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_xsi_declarations_visible_through_namespace_lookup() {
+    use crate::namespace::table::well_known;
+
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    // All four XSI attributes should be discoverable via lookup_attribute
+    let type_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_TYPE);
+    assert!(type_key.is_some(), "xsi:type should be in namespace table");
+
+    let nil_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_NIL);
+    assert!(nil_key.is_some(), "xsi:nil should be in namespace table");
+
+    let sl_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_SCHEMA_LOCATION);
+    assert!(sl_key.is_some(), "xsi:schemaLocation should be in namespace table");
+
+    let nnsl_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION);
+    assert!(nnsl_key.is_some(), "xsi:noNamespaceSchemaLocation should be in namespace table");
+}
+
+#[test]
+fn test_xsi_schema_location_inherits_per_element_base_uri() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    // Set document-level base URI
+    v.set_instance_base_uri("file:///docs/instance.xml");
+
+    // Root element — should inherit document base URI
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "root.xsd");
+    v.validate_end_of_attributes();
+
+    // Child element with absolute xml:base override
+    v.validate_element("child", "", None, None, &ns);
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://other.com/schemas/");
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "child.xsd");
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let hints = v.no_namespace_schema_location_hints();
+    assert_eq!(hints.len(), 2);
+    // Root hint should have document base URI
+    assert_eq!(hints[0].base_uri, "file:///docs/instance.xml");
+    // Child hint should have xml:base override
+    assert_eq!(hints[1].base_uri, "http://other.com/schemas/");
+}
+
+#[test]
+fn test_xsi_relative_xml_base_resolved_against_parent() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="child" type="xs:string"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.set_instance_base_uri("http://example.com/docs/instance.xml");
+
+    v.validate_element("root", "", None, None, &ns);
+    // Relative xml:base should resolve against inherited base
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "subdir/");
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "sub.xsd");
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", "", None, None, &ns);
+    // Another relative xml:base on child — should compose
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "deeper/");
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "deep.xsd");
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let hints = v.no_namespace_schema_location_hints();
+    assert_eq!(hints.len(), 2);
+    // Root: "subdir/" resolved against "http://example.com/docs/instance.xml"
+    //   -> "http://example.com/docs/subdir/"
+    assert_eq!(hints[0].base_uri, "http://example.com/docs/subdir/");
+    // Child: "deeper/" resolved against "http://example.com/docs/subdir/"
+    //   -> "http://example.com/docs/subdir/deeper/"
+    assert_eq!(hints[1].base_uri, "http://example.com/docs/subdir/deeper/");
+}
+
+#[test]
+fn test_resolve_base_uri_windows_backslash() {
+    // resolve_base_uri should handle Windows-style backslash paths
+    let result = super::resolve_base_uri("sub.xsd", r"C:\docs\instance.xml");
+    assert_eq!(result, r"C:\docs\sub.xsd");
+}
+
+#[test]
+fn test_resolve_base_uri_absolute_replaces() {
+    let result = super::resolve_base_uri("http://new.com/", "http://old.com/docs/");
+    assert_eq!(result, "http://new.com/");
+}
+
+#[test]
+fn test_resolve_base_uri_empty_inherits() {
+    let result = super::resolve_base_uri("", "http://example.com/base/");
+    assert_eq!(result, "http://example.com/base/");
+}
+
+#[test]
+fn test_duplicate_xml_base_does_not_overwrite() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.set_instance_base_uri("http://example.com/docs/instance.xml");
+
+    v.validate_element("root", "", None, None, &ns);
+    // First xml:base — should be applied
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://first.com/");
+    // Duplicate xml:base — should be rejected and NOT overwrite base_uri
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://second.com/");
+    // Hint should use the first (valid) xml:base
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "schema.xsd");
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let hints = v.no_namespace_schema_location_hints();
+    assert_eq!(hints.len(), 1);
+    assert_eq!(hints[0].base_uri, "http://first.com/",
+        "duplicate xml:base should not overwrite the first");
+}
+
+#[test]
+fn test_xml_base_after_xsi_hint_rebases_current_element_hints() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.set_instance_base_uri("http://example.com/docs/instance.xml");
+
+    v.validate_element("root", "", None, None, &ns);
+    // Deliberately validate the XSI hint before xml:base.
+    v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "schema.xsd");
+    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "subdir/");
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let hints = v.no_namespace_schema_location_hints();
+    assert_eq!(hints.len(), 1);
+    assert_eq!(
+        hints[0].base_uri,
+        "http://example.com/docs/subdir/",
+        "xml:base should rebase earlier hints on the same element"
+    );
 }

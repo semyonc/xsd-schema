@@ -180,6 +180,11 @@ impl TestSuiteParser {
         // Current parsing state
         let mut current_group = String::new();
         let mut current_test: Option<TestCase> = None;
+        // Track whether we are inside a schemaTest or instanceTest
+        let mut in_instance_test = false;
+        // Schema files from the current testGroup's schemaTest
+        // (instance tests inherit these)
+        let mut group_schema_files: Vec<PathBuf> = Vec::new();
 
         loop {
             match reader.read_event_into(&mut buf) {
@@ -195,6 +200,7 @@ impl TestSuiteParser {
                                     current_group = String::from_utf8_lossy(&attr.value).to_string();
                                 }
                             }
+                            group_schema_files.clear();
                         }
                         "schemaTest" => {
                             let mut test = TestCase {
@@ -220,6 +226,35 @@ impl TestSuiteParser {
                                 }
                             }
 
+                            in_instance_test = false;
+                            current_test = Some(test);
+                        }
+                        "instanceTest" => {
+                            // Instance tests inherit the schema files from
+                            // the enclosing testGroup's schemaTest.
+                            let mut test = TestCase {
+                                name: String::new(),
+                                schema_files: group_schema_files.clone(),
+                                instance_file: None,
+                                expected: ExpectedOutcome::InstanceValid,
+                                group: current_group.clone(),
+                                version: "1.0".to_string(),
+                                description: None,
+                            };
+
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"name" => {
+                                        test.name = String::from_utf8_lossy(&attr.value).to_string();
+                                    }
+                                    b"version" => {
+                                        test.version = String::from_utf8_lossy(&attr.value).to_string();
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            in_instance_test = true;
                             current_test = Some(test);
                         }
                         "schemaDocument" => {
@@ -233,17 +268,36 @@ impl TestSuiteParser {
                                 }
                             }
                         }
+                        "instanceDocument" => {
+                            if let Some(ref mut test) = current_test {
+                                for attr in e.attributes().flatten() {
+                                    if attr.key.as_ref() == b"xlink:href" || attr.key.as_ref() == b"href" {
+                                        let href = String::from_utf8_lossy(&attr.value);
+                                        let instance_path = self.base_path.join(href.as_ref());
+                                        test.instance_file = Some(instance_path);
+                                    }
+                                }
+                            }
+                        }
                         "expected" => {
                             if let Some(ref mut test) = current_test {
                                 for attr in e.attributes().flatten() {
                                     if attr.key.as_ref() == b"validity" {
                                         let validity = String::from_utf8_lossy(&attr.value);
-                                        test.expected = match validity.as_ref() {
-                                            "valid" => ExpectedOutcome::Valid,
-                                            "invalid" => ExpectedOutcome::Invalid,
-                                            "notKnown" => ExpectedOutcome::Valid, // Treat as valid
-                                            _ => ExpectedOutcome::Valid,
-                                        };
+                                        if in_instance_test {
+                                            test.expected = match validity.as_ref() {
+                                                "valid" => ExpectedOutcome::InstanceValid,
+                                                "invalid" => ExpectedOutcome::InstanceInvalid,
+                                                _ => ExpectedOutcome::InstanceValid,
+                                            };
+                                        } else {
+                                            test.expected = match validity.as_ref() {
+                                                "valid" => ExpectedOutcome::Valid,
+                                                "invalid" => ExpectedOutcome::Invalid,
+                                                "notKnown" => ExpectedOutcome::Valid,
+                                                _ => ExpectedOutcome::Valid,
+                                            };
+                                        }
                                     }
                                 }
                             }
@@ -258,13 +312,25 @@ impl TestSuiteParser {
                     match local_name.as_str() {
                         "testGroup" => {
                             current_group = String::new();
+                            group_schema_files.clear();
                         }
                         "schemaTest" => {
                             if let Some(test) = current_test.take() {
                                 if !test.schema_files.is_empty() {
+                                    // Save schema files for instance tests in same group
+                                    group_schema_files = test.schema_files.clone();
                                     tests.push(test);
                                 }
                             }
+                            in_instance_test = false;
+                        }
+                        "instanceTest" => {
+                            if let Some(test) = current_test.take() {
+                                if test.instance_file.is_some() {
+                                    tests.push(test);
+                                }
+                            }
+                            in_instance_test = false;
                         }
                         _ => {}
                     }
@@ -496,11 +562,62 @@ impl TestRunner {
                 (TestOutcome::Fail, Some("Schema was valid but expected invalid".to_string()))
             }
             (ExpectedOutcome::Invalid, Some(_)) => (TestOutcome::Pass, None),
-            (ExpectedOutcome::InstanceValid, _) => {
-                (TestOutcome::Skip, Some("Instance validation not implemented".to_string()))
-            }
-            (ExpectedOutcome::InstanceInvalid, _) => {
-                (TestOutcome::Skip, Some("Instance validation not implemented".to_string()))
+
+            // Instance validation tests
+            (ExpectedOutcome::InstanceValid, _) | (ExpectedOutcome::InstanceInvalid, _) => {
+                // Schema must compile successfully for instance tests
+                if let Some(ref e) = parse_error {
+                    return TestResult {
+                        name: test.name.clone(),
+                        group: test.group.clone(),
+                        expected: test.expected,
+                        actual: TestOutcome::Error,
+                        duration: start.elapsed(),
+                        error_message: Some(format!("Schema compilation failed: {}", e)),
+                    };
+                }
+
+                let instance_file = match &test.instance_file {
+                    Some(f) if f.exists() => f,
+                    Some(f) => {
+                        return TestResult {
+                            name: test.name.clone(),
+                            group: test.group.clone(),
+                            expected: test.expected,
+                            actual: TestOutcome::Skip,
+                            duration: start.elapsed(),
+                            error_message: Some(format!("Instance file not found: {:?}", f)),
+                        };
+                    }
+                    None => {
+                        return TestResult {
+                            name: test.name.clone(),
+                            group: test.group.clone(),
+                            expected: test.expected,
+                            actual: TestOutcome::Skip,
+                            duration: start.elapsed(),
+                            error_message: Some("No instance file specified".to_string()),
+                        };
+                    }
+                };
+
+                match validate_instance(&schema_set, instance_file) {
+                    Ok(has_errors) => {
+                        let instance_valid = !has_errors;
+                        match (test.expected, instance_valid) {
+                            (ExpectedOutcome::InstanceValid, true) => (TestOutcome::Pass, None),
+                            (ExpectedOutcome::InstanceValid, false) => {
+                                (TestOutcome::Fail, Some("Instance was invalid but expected valid".to_string()))
+                            }
+                            (ExpectedOutcome::InstanceInvalid, false) => (TestOutcome::Pass, None),
+                            (ExpectedOutcome::InstanceInvalid, true) => {
+                                (TestOutcome::Fail, Some("Instance was valid but expected invalid".to_string()))
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    Err(e) => (TestOutcome::Error, Some(e)),
+                }
             }
         };
 
@@ -511,6 +628,302 @@ impl TestRunner {
             actual,
             duration,
             error_message,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Instance document validation
+// ---------------------------------------------------------------------------
+
+const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
+
+/// Validate an instance document against a compiled schema set.
+///
+/// Returns `Ok(true)` if validation errors were found, `Ok(false)` if
+/// the instance is valid. Returns `Err` on I/O or XML parse errors.
+fn validate_instance(
+    schema_set: &xsd_schema::SchemaSet,
+    instance_path: &Path,
+) -> Result<bool, String> {
+    let content = fs::read(instance_path)
+        .map_err(|e| format!("Failed to read instance: {}", e))?;
+
+    let flags = xsd_schema::validation::ValidationFlags::default()
+        | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+
+    let validator = xsd_schema::validation::SchemaValidator::new(schema_set, flags);
+    let mut errors = Vec::new();
+    let mut warnings = Vec::new();
+    let sink = xsd_schema::validation::CollectingValidationSink {
+        errors: &mut errors,
+        warnings: &mut warnings,
+    };
+    let mut runtime = validator.start_run(sink);
+
+    // Set base URI for schema-location hint resolution
+    let base_uri = instance_path.to_string_lossy();
+    runtime.set_instance_base_uri(base_uri.as_ref());
+
+    let mut reader = Reader::from_reader(content.as_slice());
+    reader.trim_text(false);
+    let mut buf = Vec::new();
+
+    // Namespace prefix tracking (stack-based for proper scoping)
+    let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
+    // Per-element scope: prefixes declared on the current element
+    let mut scope_stack: Vec<Vec<Vec<u8>>> = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                let (xsi_type, xsi_nil, ns_ctx) =
+                    process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
+                let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
+
+                runtime.validate_element(
+                    &elem_local,
+                    &elem_ns,
+                    xsi_type.as_deref(),
+                    xsi_nil.as_deref(),
+                    &ns_ctx,
+                );
+
+                // Validate all attributes (including xsi:*)
+                validate_attributes(e, &prefix_map, &mut runtime)?;
+
+                runtime.validate_end_of_attributes();
+            }
+            Ok(Event::Empty(ref e)) => {
+                let (xsi_type, xsi_nil, ns_ctx) =
+                    process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
+                let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
+
+                runtime.validate_element(
+                    &elem_local,
+                    &elem_ns,
+                    xsi_type.as_deref(),
+                    xsi_nil.as_deref(),
+                    &ns_ctx,
+                );
+
+                validate_attributes(e, &prefix_map, &mut runtime)?;
+
+                runtime.validate_end_of_attributes();
+                runtime.validate_end_element();
+
+                // Pop namespace scope
+                pop_ns_scope(&mut prefix_map, &mut scope_stack);
+            }
+            Ok(Event::End(_)) => {
+                runtime.validate_end_element();
+                pop_ns_scope(&mut prefix_map, &mut scope_stack);
+            }
+            Ok(Event::Text(ref e)) => {
+                let text = e.unescape()
+                    .map_err(|err| format!("Text unescape error: {}", err))?;
+                if text.chars().all(|c| c.is_whitespace()) {
+                    runtime.validate_whitespace(&text);
+                } else {
+                    runtime.validate_text(&text);
+                }
+            }
+            Ok(Event::CData(ref e)) => {
+                let text = std::str::from_utf8(e.as_ref())
+                    .map_err(|err| format!("CData UTF-8 error: {}", err))?;
+                runtime.validate_text(text);
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {} // PI, Comment, Decl — skip
+            Err(e) => return Err(format!("XML parse error: {}", e)),
+        }
+        buf.clear();
+    }
+
+    // end_validation checks IDREF resolution; we treat its failure as a
+    // validation error, not a driver error.
+    if let Err(e) = runtime.end_validation() {
+        errors.push(e);
+    }
+
+    Ok(!errors.is_empty())
+}
+
+/// Split a QName into (prefix_bytes, local_bytes).
+/// Returns empty prefix for unprefixed names.
+fn split_prefix_local(qname: &[u8]) -> (&[u8], &[u8]) {
+    match qname.iter().position(|&b| b == b':') {
+        Some(pos) => (&qname[..pos], &qname[pos + 1..]),
+        None => (&[], qname),
+    }
+}
+
+/// Process namespace declarations and scan for xsi:type / xsi:nil on
+/// an element start event. Returns (xsi_type, xsi_nil, ns_context).
+fn process_element_start(
+    e: &quick_xml::events::BytesStart<'_>,
+    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
+    scope_stack: &mut Vec<Vec<Vec<u8>>>,
+    schema_set: &xsd_schema::SchemaSet,
+) -> Result<(Option<String>, Option<String>, xsd_schema::namespace::context::NamespaceContextSnapshot), String> {
+    let mut scope_prefixes: Vec<Vec<u8>> = Vec::new();
+
+    // First pass: collect namespace declarations
+    for attr_result in e.attributes() {
+        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
+        let key = attr.key.as_ref();
+        if key == b"xmlns" {
+            // Default namespace declaration
+            let value = attr.unescape_value()
+                .map_err(|err| format!("Attribute unescape error: {}", err))?;
+            prefix_map.entry(b"".to_vec()).or_default().push(value.to_string());
+            scope_prefixes.push(b"".to_vec());
+        } else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
+            let value = attr.unescape_value()
+                .map_err(|err| format!("Attribute unescape error: {}", err))?;
+            prefix_map.entry(prefix.to_vec()).or_default().push(value.to_string());
+            scope_prefixes.push(prefix.to_vec());
+        }
+    }
+    scope_stack.push(scope_prefixes);
+
+    // Second pass: scan for xsi:type and xsi:nil
+    let mut xsi_type: Option<String> = None;
+    let mut xsi_nil: Option<String> = None;
+
+    for attr_result in e.attributes() {
+        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
+        let key = attr.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            continue;
+        }
+        let (attr_prefix, attr_local) = split_prefix_local(key);
+        if attr_prefix.is_empty() {
+            continue;
+        }
+        // Check if this attribute is in the XSI namespace
+        if let Some(stack) = prefix_map.get(attr_prefix) {
+            if let Some(ns_uri) = stack.last() {
+                if ns_uri == XSI_NAMESPACE {
+                    let local = std::str::from_utf8(attr_local)
+                        .map_err(|err| format!("UTF-8 error: {}", err))?;
+                    let value = attr.unescape_value()
+                        .map_err(|err| format!("Attribute unescape error: {}", err))?;
+                    match local {
+                        "type" => xsi_type = Some(value.to_string()),
+                        "nil" => xsi_nil = Some(value.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Build namespace context snapshot for xsi:type QName resolution
+    let ns_ctx = build_ns_context(prefix_map, schema_set);
+
+    Ok((xsi_type, xsi_nil, ns_ctx))
+}
+
+/// Resolve an element's namespace from its prefix using the current prefix map.
+fn resolve_element_name(
+    e: &quick_xml::events::BytesStart<'_>,
+    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
+) -> Result<(String, String), String> {
+    let name = e.name();
+    let (prefix, local) = split_prefix_local(name.as_ref());
+    let local_name = std::str::from_utf8(local)
+        .map_err(|err| format!("UTF-8 error: {}", err))?
+        .to_string();
+    let namespace = if prefix.is_empty() {
+        // Default namespace
+        prefix_map.get(&b"".to_vec())
+            .and_then(|stack| stack.last())
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        prefix_map.get(prefix)
+            .and_then(|stack| stack.last())
+            .cloned()
+            .unwrap_or_default()
+    };
+    Ok((local_name, namespace))
+}
+
+/// Validate all non-xmlns attributes on an element.
+fn validate_attributes<S: xsd_schema::validation::ValidationSink>(
+    e: &quick_xml::events::BytesStart<'_>,
+    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
+    runtime: &mut xsd_schema::validation::ValidationRuntime<'_, S>,
+) -> Result<(), String> {
+    for attr_result in e.attributes() {
+        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
+        let key = attr.key.as_ref();
+        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+            continue;
+        }
+        let (attr_prefix, attr_local_bytes) = split_prefix_local(key);
+        let attr_local = std::str::from_utf8(attr_local_bytes)
+            .map_err(|err| format!("UTF-8 error: {}", err))?;
+        let attr_ns = if attr_prefix.is_empty() {
+            String::new()
+        } else {
+            prefix_map.get(attr_prefix)
+                .and_then(|stack| stack.last())
+                .cloned()
+                .unwrap_or_default()
+        };
+        let value = attr.unescape_value()
+            .map_err(|err| format!("Attribute unescape error: {}", err))?;
+        runtime.validate_attribute(attr_local, &attr_ns, &value);
+    }
+    Ok(())
+}
+
+/// Build a NamespaceContextSnapshot from the current prefix map.
+/// Uses the schema_set's name_table to intern strings as NameIds.
+fn build_ns_context(
+    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
+    schema_set: &xsd_schema::SchemaSet,
+) -> xsd_schema::namespace::context::NamespaceContextSnapshot {
+    let default_ns = prefix_map.get(&b"".to_vec())
+        .and_then(|stack| stack.last())
+        .filter(|s| !s.is_empty())
+        .map(|s| schema_set.name_table.add(s));
+
+    let mut bindings = Vec::new();
+    for (prefix_bytes, stack) in prefix_map {
+        if prefix_bytes.is_empty() {
+            continue; // default namespace handled above
+        }
+        if let (Ok(prefix), Some(uri)) = (std::str::from_utf8(prefix_bytes), stack.last()) {
+            if !uri.is_empty() {
+                let prefix_id = schema_set.name_table.add(prefix);
+                let uri_id = schema_set.name_table.add(uri);
+                bindings.push((prefix_id, uri_id));
+            }
+        }
+    }
+
+    xsd_schema::namespace::context::NamespaceContextSnapshot {
+        default_ns,
+        bindings,
+    }
+}
+
+/// Pop namespace declarations for the current element scope.
+fn pop_ns_scope(
+    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
+    scope_stack: &mut Vec<Vec<Vec<u8>>>,
+) {
+    if let Some(scope_prefixes) = scope_stack.pop() {
+        for prefix in scope_prefixes {
+            if let Some(stack) = prefix_map.get_mut(&prefix) {
+                stack.pop();
+                if stack.is_empty() {
+                    prefix_map.remove(&prefix);
+                }
+            }
         }
     }
 }
@@ -674,7 +1087,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    
+
 
     #[test]
     fn test_stats_pass_rate() {

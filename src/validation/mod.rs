@@ -14,6 +14,7 @@ pub mod asttree;
 pub mod identity_parser;
 pub mod active_axis;
 pub mod identity;
+pub mod hint_loader;
 pub mod runtime;
 #[cfg(feature = "xsd11")]
 pub mod assertions;
@@ -31,6 +32,7 @@ pub use info::{
     SchemaInfo, SchemaValidity, ContentType, NodeIdentity,
     ValidationFlags, ValidationAttempted, ContentProcessing, TypeSource,
     ExpectedElement, ExpectedAttribute, DefaultAttribute,
+    SchemaLocationHint, NoNamespaceSchemaLocationHint,
 };
 #[cfg(feature = "xsd11")]
 pub use info::{AssertionOutcome, InheritedAttribute};
@@ -48,3 +50,4 @@ pub use validator::{
 };
 pub use runtime::ValidationRuntime;
 pub use identity::{KeyTable, KeySequence, KeyFieldValue};
+pub use hint_loader::{load_hints_into_builder, HintLoadResult};

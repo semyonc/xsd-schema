@@ -922,7 +922,8 @@ mod tests {
         let set = SchemaSet::new();
         assert_eq!(set.xsd_version, XsdVersion::V1_0);
         assert!(set.documents.is_empty());
-        assert!(set.namespaces.is_empty());
+        // XSI namespace is pre-populated with built-in attribute declarations
+        assert!(set.namespaces.contains_key(&Some(crate::namespace::table::well_known::XSI_NAMESPACE)));
     }
 
     #[test]

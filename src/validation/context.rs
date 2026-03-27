@@ -78,6 +78,17 @@ pub struct ElementValidationState {
     pub ns_context: Option<crate::namespace::context::NamespaceContextSnapshot>,
     /// How to process wildcard-matched content
     pub process_contents: ContentProcessing,
+    /// Effective base URI for this element (inherited from parent, possibly
+    /// overridden by `xml:base`). Used to resolve relative schema-location
+    /// hints in `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation`.
+    pub base_uri: String,
+    /// Whether `xml:base` has already been applied on this element.
+    /// Prevents a duplicate `xml:base` attribute from overwriting the valid one.
+    pub base_uri_set_by_xml_base: bool,
+    /// Start index of this element's `xsi:schemaLocation` hints in the runtime buffer.
+    pub schema_location_hint_start: usize,
+    /// Start index of this element's `xsi:noNamespaceSchemaLocation` hints in the runtime buffer.
+    pub no_namespace_schema_location_hint_start: usize,
     /// Set of (namespace, local_name) pairs for attributes already seen
     pub seen_attributes: HashSet<(Option<NameId>, NameId)>,
     /// Accumulated text content for the element
@@ -150,6 +161,10 @@ impl ElementValidationState {
             notation: None,
             ns_context: None,
             process_contents: ContentProcessing::Strict,
+            base_uri: String::new(),
+            base_uri_set_by_xml_base: false,
+            schema_location_hint_start: 0,
+            no_namespace_schema_location_hint_start: 0,
             seen_attributes: HashSet::new(),
             text_content: String::new(),
             has_text: false,
