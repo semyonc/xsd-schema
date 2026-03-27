@@ -119,6 +119,35 @@ impl TestStats {
     }
 }
 
+/// Expected outcome keyed by version
+#[derive(Debug, Clone)]
+pub struct VersionedExpected {
+    /// Version this expected outcome applies to (None = all versions)
+    pub version: Option<String>,
+    /// The expected validity
+    pub outcome: ExpectedOutcome,
+}
+
+/// Recognized XSD versions for SchemaSet selection
+const XSD_VERSIONS: &[&str] = &["1.0", "1.1"];
+
+/// Check if a version string is a recognized XSD version
+fn is_xsd_version(v: &str) -> bool {
+    XSD_VERSIONS.contains(&v)
+}
+
+/// Extract XSD versions from a version attribute value.
+///
+/// The attribute may be a single token like `"1.1"`, a space-separated
+/// list like `"1.0 1.1"`, or a profile label like `"full-xpath-in-CTA"`.
+/// Returns only the recognized XSD version tokens.
+fn extract_xsd_versions(version_attr: &str) -> Vec<&str> {
+    version_attr
+        .split_whitespace()
+        .filter(|tok| is_xsd_version(tok))
+        .collect()
+}
+
 /// Test case from the suite manifest
 #[derive(Debug, Clone)]
 pub struct TestCase {
@@ -128,12 +157,16 @@ pub struct TestCase {
     pub schema_files: Vec<PathBuf>,
     /// Instance document (if any)
     pub instance_file: Option<PathBuf>,
-    /// Expected outcome
+    /// Expected outcome (resolved for the target version)
     pub expected: ExpectedOutcome,
+    /// All versioned expected outcomes from the manifest
+    pub expected_versions: Vec<VersionedExpected>,
     /// Test contributor/group
     pub group: String,
-    /// Test version (1.0 or 1.1)
+    /// XSD version for SchemaSet selection ("1.0" or "1.1")
     pub version: String,
+    /// Raw version attribute from the manifest (may be a profile label)
+    pub version_label: String,
     /// Description
     pub description: Option<String>,
 }
@@ -156,20 +189,32 @@ impl TestSuiteParser {
             // Try alternative manifest names
             let alt_path = self.base_path.join("testSuite.xml");
             if alt_path.exists() {
-                return self.parse_xml_manifest(&alt_path);
+                return self.parse_xml_manifest(&alt_path, None);
             }
             return Err(format!(
                 "Test suite manifest not found at {:?}",
                 manifest_path
             ));
         }
-        self.parse_xml_manifest(&manifest_path)
+        self.parse_xml_manifest(&manifest_path, None)
     }
 
-    /// Parse an XML manifest file
-    fn parse_xml_manifest(&self, path: &Path) -> Result<Vec<TestCase>, String> {
+    /// Parse an XML manifest file.
+    ///
+    /// `inherited_version` is the version inherited from the parent testSet
+    /// or testGroup (if any).
+    fn parse_xml_manifest(
+        &self,
+        path: &Path,
+        inherited_version: Option<&str>,
+    ) -> Result<Vec<TestCase>, String> {
         let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read manifest: {}", e))?;
+            .map_err(|e| format!("Failed to read manifest {:?}: {}", path, e))?;
+
+        // Resolve document paths relative to the manifest file's directory
+        let manifest_dir = path
+            .parent()
+            .ok_or_else(|| format!("Cannot determine parent directory of {:?}", path))?;
 
         let mut reader = Reader::from_str(&content);
         reader.trim_text(true);
@@ -186,6 +231,16 @@ impl TestSuiteParser {
         // (instance tests inherit these)
         let mut group_schema_files: Vec<PathBuf> = Vec::new();
 
+        // Version inheritance chain: testSet → testGroup → schemaTest/instanceTest
+        //
+        // Each level stores the *raw* version attribute (which may be a profile
+        // label like "full-xpath-in-CTA" or a multi-token string like "1.0 1.1").
+        // The XSD version(s) used for SchemaSet selection are derived by walking
+        // the chain and picking the first level whose attribute contains a
+        // recognized XSD version token.
+        let mut testset_version_attr: Option<String> = inherited_version.map(|s| s.to_string());
+        let mut group_version_attr: Option<String> = None;
+
         loop {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
@@ -193,76 +248,126 @@ impl TestSuiteParser {
                     let local_name = String::from_utf8_lossy(name_ref.as_ref()).to_string();
 
                     match local_name.as_str() {
-                        "testGroup" => {
-                            // Extract group name from attributes
+                        "testSuite" | "testSet" => {
+                            // Extract version from testSet if present
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"name" {
-                                    current_group = String::from_utf8_lossy(&attr.value).to_string();
+                                if attr.key.as_ref() == b"version" {
+                                    testset_version_attr =
+                                        Some(String::from_utf8_lossy(&attr.value).to_string());
+                                }
+                            }
+                        }
+                        "testSetRef" => {
+                            // Follow testSetRef links to external manifest files
+                            for attr in e.attributes().flatten() {
+                                let key = attr.key.as_ref();
+                                if key == b"xlink:href" || key == b"href" {
+                                    let href = String::from_utf8_lossy(&attr.value);
+                                    let ref_path = manifest_dir.join(href.as_ref());
+                                    if ref_path.exists() {
+                                        let ver = testset_version_attr.as_deref();
+                                        match self.parse_xml_manifest(&ref_path, ver) {
+                                            Ok(ref_tests) => tests.extend(ref_tests),
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "Warning: Failed to parse referenced testSet {:?}: {}",
+                                                    ref_path, e
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        eprintln!(
+                                            "Warning: Referenced testSet not found: {:?}",
+                                            ref_path
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        "testGroup" => {
+                            // Extract group name and version from attributes
+                            group_version_attr = None;
+                            for attr in e.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"name" => {
+                                        current_group =
+                                            String::from_utf8_lossy(&attr.value).to_string();
+                                    }
+                                    b"version" => {
+                                        group_version_attr =
+                                            Some(String::from_utf8_lossy(&attr.value).to_string());
+                                    }
+                                    _ => {}
                                 }
                             }
                             group_schema_files.clear();
                         }
-                        "schemaTest" => {
-                            let mut test = TestCase {
-                                name: String::new(),
-                                schema_files: Vec::new(),
-                                instance_file: None,
-                                expected: ExpectedOutcome::Valid,
-                                group: current_group.clone(),
-                                version: "1.0".to_string(),
-                                description: None,
-                            };
+                        "schemaTest" | "instanceTest" => {
+                            let is_instance = local_name == "instanceTest";
 
-                            // Extract attributes
+                            // Collect raw version label from the test element
+                            let mut test_version_attr: Option<String> = None;
+                            let mut test_name = String::new();
                             for attr in e.attributes().flatten() {
                                 match attr.key.as_ref() {
                                     b"name" => {
-                                        test.name = String::from_utf8_lossy(&attr.value).to_string();
+                                        test_name =
+                                            String::from_utf8_lossy(&attr.value).to_string();
                                     }
                                     b"version" => {
-                                        test.version = String::from_utf8_lossy(&attr.value).to_string();
+                                        test_version_attr =
+                                            Some(String::from_utf8_lossy(&attr.value).to_string());
                                     }
                                     _ => {}
                                 }
                             }
 
-                            in_instance_test = false;
-                            current_test = Some(test);
-                        }
-                        "instanceTest" => {
-                            // Instance tests inherit the schema files from
-                            // the enclosing testGroup's schemaTest.
-                            let mut test = TestCase {
-                                name: String::new(),
-                                schema_files: group_schema_files.clone(),
+                            // Build the version label chain (most specific first)
+                            let raw_label = test_version_attr
+                                .as_deref()
+                                .or(group_version_attr.as_deref())
+                                .or(testset_version_attr.as_deref())
+                                .unwrap_or("1.0")
+                                .to_string();
+
+                            // Derive XSD version(s): walk the chain to find the
+                            // first level that contains a recognized XSD version.
+                            let xsd_versions = Self::resolve_xsd_versions(
+                                test_version_attr.as_deref(),
+                                group_version_attr.as_deref(),
+                                testset_version_attr.as_deref(),
+                            );
+
+                            let base_test = TestCase {
+                                name: test_name,
+                                schema_files: if is_instance {
+                                    group_schema_files.clone()
+                                } else {
+                                    Vec::new()
+                                },
                                 instance_file: None,
-                                expected: ExpectedOutcome::InstanceValid,
+                                expected: if is_instance {
+                                    ExpectedOutcome::InstanceValid
+                                } else {
+                                    ExpectedOutcome::Valid
+                                },
+                                expected_versions: Vec::new(),
                                 group: current_group.clone(),
-                                version: "1.0".to_string(),
+                                version: xsd_versions[0].to_string(),
+                                version_label: raw_label,
                                 description: None,
                             };
 
-                            for attr in e.attributes().flatten() {
-                                match attr.key.as_ref() {
-                                    b"name" => {
-                                        test.name = String::from_utf8_lossy(&attr.value).to_string();
-                                    }
-                                    b"version" => {
-                                        test.version = String::from_utf8_lossy(&attr.value).to_string();
-                                    }
-                                    _ => {}
-                                }
-                            }
-
-                            in_instance_test = true;
-                            current_test = Some(test);
+                            in_instance_test = is_instance;
+                            current_test = Some(base_test);
                         }
                         "schemaDocument" => {
                             if let Some(ref mut test) = current_test {
                                 for attr in e.attributes().flatten() {
-                                    if attr.key.as_ref() == b"xlink:href" || attr.key.as_ref() == b"href" {
+                                    let key = attr.key.as_ref();
+                                    if key == b"xlink:href" || key == b"href" {
                                         let href = String::from_utf8_lossy(&attr.value);
-                                        let schema_path = self.base_path.join(href.as_ref());
+                                        let schema_path = manifest_dir.join(href.as_ref());
                                         test.schema_files.push(schema_path);
                                     }
                                 }
@@ -271,9 +376,10 @@ impl TestSuiteParser {
                         "instanceDocument" => {
                             if let Some(ref mut test) = current_test {
                                 for attr in e.attributes().flatten() {
-                                    if attr.key.as_ref() == b"xlink:href" || attr.key.as_ref() == b"href" {
+                                    let key = attr.key.as_ref();
+                                    if key == b"xlink:href" || key == b"href" {
                                         let href = String::from_utf8_lossy(&attr.value);
-                                        let instance_path = self.base_path.join(href.as_ref());
+                                        let instance_path = manifest_dir.join(href.as_ref());
                                         test.instance_file = Some(instance_path);
                                     }
                                 }
@@ -281,24 +387,45 @@ impl TestSuiteParser {
                         }
                         "expected" => {
                             if let Some(ref mut test) = current_test {
+                                let mut validity_str = None;
+                                let mut expected_version = None;
+
                                 for attr in e.attributes().flatten() {
-                                    if attr.key.as_ref() == b"validity" {
-                                        let validity = String::from_utf8_lossy(&attr.value);
-                                        if in_instance_test {
-                                            test.expected = match validity.as_ref() {
-                                                "valid" => ExpectedOutcome::InstanceValid,
-                                                "invalid" => ExpectedOutcome::InstanceInvalid,
-                                                _ => ExpectedOutcome::InstanceValid,
-                                            };
-                                        } else {
-                                            test.expected = match validity.as_ref() {
-                                                "valid" => ExpectedOutcome::Valid,
-                                                "invalid" => ExpectedOutcome::Invalid,
-                                                "notKnown" => ExpectedOutcome::Valid,
-                                                _ => ExpectedOutcome::Valid,
-                                            };
+                                    match attr.key.as_ref() {
+                                        b"validity" => {
+                                            validity_str = Some(
+                                                String::from_utf8_lossy(&attr.value).to_string(),
+                                            );
                                         }
+                                        b"version" => {
+                                            expected_version = Some(
+                                                String::from_utf8_lossy(&attr.value).to_string(),
+                                            );
+                                        }
+                                        _ => {}
                                     }
+                                }
+
+                                if let Some(validity) = validity_str {
+                                    let outcome = if in_instance_test {
+                                        match validity.as_str() {
+                                            "valid" => ExpectedOutcome::InstanceValid,
+                                            "invalid" => ExpectedOutcome::InstanceInvalid,
+                                            _ => ExpectedOutcome::InstanceValid,
+                                        }
+                                    } else {
+                                        match validity.as_str() {
+                                            "valid" => ExpectedOutcome::Valid,
+                                            "invalid" => ExpectedOutcome::Invalid,
+                                            "notKnown" => ExpectedOutcome::Valid,
+                                            _ => ExpectedOutcome::Valid,
+                                        }
+                                    };
+
+                                    test.expected_versions.push(VersionedExpected {
+                                        version: expected_version,
+                                        outcome,
+                                    });
                                 }
                             }
                         }
@@ -313,13 +440,14 @@ impl TestSuiteParser {
                         "testGroup" => {
                             current_group = String::new();
                             group_schema_files.clear();
+                            group_version_attr = None;
                         }
                         "schemaTest" => {
                             if let Some(test) = current_test.take() {
                                 if !test.schema_files.is_empty() {
                                     // Save schema files for instance tests in same group
                                     group_schema_files = test.schema_files.clone();
-                                    tests.push(test);
+                                    expand_test_versions(test, &mut tests);
                                 }
                             }
                             in_instance_test = false;
@@ -327,7 +455,7 @@ impl TestSuiteParser {
                         "instanceTest" => {
                             if let Some(test) = current_test.take() {
                                 if test.instance_file.is_some() {
-                                    tests.push(test);
+                                    expand_test_versions(test, &mut tests);
                                 }
                             }
                             in_instance_test = false;
@@ -337,7 +465,7 @@ impl TestSuiteParser {
                 }
                 Ok(Event::Eof) => break,
                 Err(e) => {
-                    return Err(format!("XML parse error: {}", e));
+                    return Err(format!("XML parse error in {:?}: {}", path, e));
                 }
                 _ => {}
             }
@@ -347,7 +475,27 @@ impl TestSuiteParser {
         Ok(tests)
     }
 
+    /// Derive XSD version(s) from the version attribute inheritance chain.
+    ///
+    /// Walks the chain (test → group → testSet) and returns the recognized
+    /// XSD version tokens from the most specific level that contains any.
+    /// If no level has a recognized version, defaults to `["1.0"]`.
+    fn resolve_xsd_versions<'a>(
+        test_attr: Option<&'a str>,
+        group_attr: Option<&'a str>,
+        testset_attr: Option<&'a str>,
+    ) -> Vec<&'a str> {
+        for attr in [test_attr, group_attr, testset_attr].into_iter().flatten() {
+            let versions = extract_xsd_versions(attr);
+            if !versions.is_empty() {
+                return versions;
+            }
+        }
+        vec!["1.0"]
+    }
+
     /// Scan directory for schema files if no manifest is found
+    #[allow(dead_code)]
     pub fn scan_for_tests(&self) -> Result<Vec<TestCase>, String> {
         let mut tests = Vec::new();
         self.scan_directory(&self.base_path, &mut tests)?;
@@ -381,8 +529,10 @@ impl TestSuiteParser {
                     schema_files: vec![path],
                     instance_file: None,
                     expected: ExpectedOutcome::Valid, // Default expectation
+                    expected_versions: Vec::new(),
                     group,
                     version: "1.0".to_string(),
+                    version_label: "1.0".to_string(),
                     description: None,
                 });
             }
@@ -390,6 +540,157 @@ impl TestSuiteParser {
 
         Ok(())
     }
+}
+
+/// A variant to emit: an XSD version paired with an optional profile label.
+struct ExpandedVariant {
+    /// XSD version for SchemaSet selection ("1.0" or "1.1")
+    xsd_version: String,
+    /// Profile label for expected-outcome resolution and --version filtering.
+    /// When set, overrides `version_label` on the emitted TestCase.
+    profile_label: Option<String>,
+}
+
+/// Expand a parsed test into one or more `TestCase` entries in `out`.
+///
+/// A single manifest entry can target multiple variants in three ways:
+///
+/// 1. The version attribute is a space-separated list like `"1.0 1.1"`.
+/// 2. There are multiple `<expected>` elements keyed by XSD version, e.g.
+///    `<expected validity="valid" version="1.0"/>
+///     <expected validity="invalid" version="1.1"/>`.
+/// 3. There are multiple `<expected>` elements keyed by profile label, e.g.
+///    `<expected validity="valid" version="full-xpath-in-CTA"/>
+///     <expected validity="invalid" version="restricted-xpath-in-CTA"/>`.
+///
+/// In all cases we emit one `TestCase` per variant, each with the correct
+/// expected outcome.
+fn expand_test_versions(test: TestCase, out: &mut Vec<TestCase>) {
+    // Determine which XSD versions this test applies to.
+    let version_label = &test.version_label;
+    let mut xsd_versions: Vec<String> = extract_xsd_versions(version_label)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    // If the version label itself didn't contain XSD versions, the parser
+    // already derived the version from the inheritance chain; use that.
+    if xsd_versions.is_empty() {
+        xsd_versions.push(test.version.clone());
+    }
+
+    // Collect profile labels from <expected> entries that are not XSD
+    // versions. These create additional variants that share the same XSD
+    // version but differ in expected outcome and version_label.
+    let mut profile_labels: Vec<String> = Vec::new();
+
+    for ve in &test.expected_versions {
+        if let Some(ref v) = ve.version {
+            if is_xsd_version(v) {
+                // XSD version — add to xsd_versions if not already present
+                if !xsd_versions.contains(v) {
+                    xsd_versions.push(v.clone());
+                }
+            } else {
+                // Profile label — collect for profile variant expansion
+                if !profile_labels.contains(v) {
+                    profile_labels.push(v.clone());
+                }
+            }
+        }
+    }
+
+    // Build the list of variants to emit.
+    let mut variants: Vec<ExpandedVariant> = Vec::new();
+
+    if profile_labels.is_empty() {
+        // No profile-specific expected entries: one variant per XSD version
+        for ver in &xsd_versions {
+            variants.push(ExpandedVariant {
+                xsd_version: ver.clone(),
+                profile_label: None,
+            });
+        }
+    } else {
+        // Profile-specific expected entries exist. For each XSD version,
+        // emit one variant per profile label. The profile label drives
+        // expected-outcome resolution and --version filtering.
+        for ver in &xsd_versions {
+            for label in &profile_labels {
+                variants.push(ExpandedVariant {
+                    xsd_version: ver.clone(),
+                    profile_label: Some(label.clone()),
+                });
+            }
+        }
+    }
+
+    // Sort for determinism
+    variants.sort_by(|a, b| {
+        a.xsd_version
+            .cmp(&b.xsd_version)
+            .then_with(|| a.profile_label.cmp(&b.profile_label))
+    });
+
+    // Emit one TestCase per variant
+    for variant in &variants {
+        let mut copy = test.clone();
+        copy.version = variant.xsd_version.clone();
+        if let Some(ref label) = variant.profile_label {
+            copy.version_label = label.clone();
+        }
+        resolve_expected_for_version(&mut copy);
+        out.push(copy);
+    }
+}
+
+/// Resolve the `expected` field from `expected_versions` for the test's
+/// current `version` and `version_label`.
+///
+/// Tries matching in this order:
+/// 1. XSD version (`test.version`, e.g. `"1.0"` or `"1.1"`)
+/// 2. Profile label (`test.version_label`, e.g. `"full-xpath-in-CTA"`)
+/// 3. Unversioned entry (no `version` attribute on `<expected>`)
+/// 4. First entry as last resort
+fn resolve_expected_for_version(test: &mut TestCase) {
+    if test.expected_versions.is_empty() {
+        return;
+    }
+
+    // 1. Match by XSD version
+    if let Some(ve) = test
+        .expected_versions
+        .iter()
+        .find(|ve| ve.version.as_deref() == Some(test.version.as_str()))
+    {
+        test.expected = ve.outcome;
+        return;
+    }
+
+    // 2. Match by profile label (e.g. "full-xpath-in-CTA")
+    if test.version_label != test.version {
+        if let Some(ve) = test
+            .expected_versions
+            .iter()
+            .find(|ve| ve.version.as_deref() == Some(test.version_label.as_str()))
+        {
+            test.expected = ve.outcome;
+            return;
+        }
+    }
+
+    // 3. Fall back to unversioned entry (version attribute absent)
+    if let Some(ve) = test
+        .expected_versions
+        .iter()
+        .find(|ve| ve.version.is_none())
+    {
+        test.expected = ve.outcome;
+        return;
+    }
+
+    // 4. If only versioned entries exist but none match, use the first one
+    test.expected = test.expected_versions[0].outcome;
 }
 
 /// Conformance test runner
@@ -457,8 +758,18 @@ impl TestRunner {
                     }
                 }
                 if let Some(ref version) = self.version_filter {
-                    if &t.version != version {
-                        return false;
+                    if is_xsd_version(version) {
+                        // XSD version filter: match against the resolved
+                        // XSD version, not the raw label (which may contain
+                        // multiple tokens like "1.0 1.1").
+                        if t.version != *version {
+                            return false;
+                        }
+                    } else {
+                        // Profile label filter: match against version_label
+                        if !t.version_label.split_whitespace().any(|tok| tok == version.as_str()) {
+                            return false;
+                        }
                     }
                 }
                 true
@@ -521,8 +832,12 @@ impl TestRunner {
             }
         }
 
-        // Try to parse the schema(s)
-        let mut schema_set = xsd_schema::SchemaSet::new();
+        // Try to parse the schema(s) – use the correct XSD version
+        let mut schema_set = if test.version == "1.1" {
+            xsd_schema::SchemaSet::xsd11()
+        } else {
+            xsd_schema::SchemaSet::new()
+        };
         let mut parse_error: Option<String> = None;
 
         // Phase 1: Parse all schemas
@@ -673,6 +988,12 @@ fn validate_instance(
     let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
     // Per-element scope: prefixes declared on the current element
     let mut scope_stack: Vec<Vec<Vec<u8>>> = Vec::new();
+
+    // Seed the implicit "xml" namespace binding (always in scope per XML Namespaces §3)
+    prefix_map.insert(
+        b"xml".to_vec(),
+        vec!["http://www.w3.org/XML/1998/namespace".to_string()],
+    );
 
     loop {
         match reader.read_event_into(&mut buf) {
