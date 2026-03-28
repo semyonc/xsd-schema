@@ -18,6 +18,51 @@ mod tests {
         NamespaceContextSnapshot::default()
     }
 
+    fn snapshot_with_default_ns(name_table: &NameTable, ns: &str) -> NamespaceContextSnapshot {
+        NamespaceContextSnapshot {
+            default_ns: Some(name_table.add(ns)),
+            bindings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_parse_qname_ref_with_default_namespace() {
+        let name_table = NameTable::new();
+        let target_ns = "http://example.com/target";
+        let snapshot = snapshot_with_default_ns(&name_table, target_ns);
+        let qname = parse_qname_ref("MyType", &name_table, &snapshot).unwrap();
+        assert_eq!(name_table.resolve(qname.local_name), "MyType");
+        assert!(qname.namespace.is_some());
+        assert_eq!(name_table.resolve(qname.namespace.unwrap()), target_ns);
+    }
+
+    #[test]
+    fn test_parse_qname_ref_without_default_namespace() {
+        let name_table = NameTable::new();
+        let snapshot = empty_snapshot();
+        let qname = parse_qname_ref("MyType", &name_table, &snapshot).unwrap();
+        assert_eq!(name_table.resolve(qname.local_name), "MyType");
+        assert!(qname.namespace.is_none());
+    }
+
+    #[test]
+    fn test_parse_qname_ref_prefixed_ignores_default_ns() {
+        let name_table = NameTable::new();
+        let xs_prefix = name_table.add("xs");
+        let xs_ns = name_table.add("http://www.w3.org/2001/XMLSchema");
+        let snapshot = NamespaceContextSnapshot {
+            default_ns: Some(name_table.add("http://example.com/target")),
+            bindings: vec![(xs_prefix, xs_ns)],
+        };
+        let qname = parse_qname_ref("xs:string", &name_table, &snapshot).unwrap();
+        assert_eq!(name_table.resolve(qname.local_name), "string");
+        assert!(qname.namespace.is_some());
+        assert_eq!(
+            name_table.resolve(qname.namespace.unwrap()),
+            "http://www.w3.org/2001/XMLSchema"
+        );
+    }
+
     #[test]
     fn test_parse_derivation_set_empty() {
         let set = parse_derivation_set(None).unwrap();

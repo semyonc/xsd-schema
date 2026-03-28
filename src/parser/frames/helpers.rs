@@ -223,9 +223,9 @@ fn parse_qname_ref(
         ns_snapshot.resolve_prefix(pid)
     } else {
         // For unprefixed QNames in XSD attribute values (type, ref, base, etc.),
-        // leave namespace as None - they refer to the target namespace or
-        // are resolved based on element/attribute form later
-        None
+        // use the default namespace if one is declared. Per XML namespace rules,
+        // an unprefixed QName resolves using the default namespace in scope.
+        ns_snapshot.default_namespace()
     };
 
     Ok(QNameRef {
@@ -331,8 +331,8 @@ pub(crate) fn parse_not_qname(
                     let prefix_id = name_table.add(p);
                     ns_snapshot.resolve_prefix(prefix_id)
                 } else {
-                    // Unprefixed: no namespace
-                    None
+                    // Unprefixed: use default namespace if declared
+                    ns_snapshot.default_namespace()
                 };
                 items.push(NotQNameItem::QName { namespace, local_name });
             }
