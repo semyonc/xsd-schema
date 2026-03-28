@@ -224,6 +224,15 @@ impl Frame for ElementFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // src-element.1: type and inline type are mutually exclusive
+        if self.type_ref.is_some() && self.inline_type.is_some() {
+            return Err(SchemaError::structural(
+                "src-element",
+                "Element cannot have both 'type' attribute and inline type definition",
+                None,
+            ));
+        }
+
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -251,6 +260,10 @@ impl Frame for ElementFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -391,6 +404,15 @@ impl Frame for AttributeFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // src-attribute.4: type and inline simpleType are mutually exclusive
+        if self.type_ref.is_some() && self.inline_type.is_some() {
+            return Err(SchemaError::structural(
+                "src-attribute",
+                "Attribute cannot have both 'type' attribute and inline simpleType",
+                None,
+            ));
+        }
+
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -411,6 +433,10 @@ impl Frame for AttributeFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

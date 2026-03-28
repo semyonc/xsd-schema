@@ -104,6 +104,10 @@ impl Frame for AlternativeFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -192,6 +196,10 @@ impl Frame for AssertFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

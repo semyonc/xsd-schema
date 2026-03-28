@@ -9,6 +9,8 @@ pub struct ModelGroupFrame {
     max_occurs: Option<u32>,
     id: Option<String>,
     particles: Vec<ParticleResult>,
+    /// True once any non-annotation child has been seen (annotation must come first)
+    past_annotation: bool,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
@@ -36,6 +38,7 @@ impl ModelGroupFrame {
             max_occurs,
             id,
             particles: Vec::new(),
+            past_annotation: false,
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
@@ -45,6 +48,10 @@ impl ModelGroupFrame {
 
 impl Frame for ModelGroupFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // Annotation must come first
+        if local_name == xsd_names::ANNOTATION && self.past_annotation {
+            return false;
+        }
         match self.compositor {
             Compositor::All => matches!(
                 local_name,
@@ -66,7 +73,11 @@ impl Frame for ModelGroupFrame {
         matches!(local_name, "minOccurs" | "maxOccurs" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name != xsd_names::ANNOTATION {
+            self.past_annotation = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -159,6 +170,8 @@ pub struct GroupFrame {
     id: Option<String>,
     compositor: Option<Compositor>,
     particles: Vec<ParticleResult>,
+    /// True once any non-annotation child has been seen (annotation must come first)
+    past_annotation: bool,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
@@ -196,6 +209,7 @@ impl GroupFrame {
             id,
             compositor: None,
             particles: Vec::new(),
+            past_annotation: false,
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
@@ -205,6 +219,10 @@ impl GroupFrame {
 
 impl Frame for GroupFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // Annotation must come first (before compositor)
+        if local_name == xsd_names::ANNOTATION && self.past_annotation {
+            return false;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION | xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL
@@ -218,7 +236,11 @@ impl Frame for GroupFrame {
         )
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name != xsd_names::ANNOTATION {
+            self.past_annotation = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -227,8 +249,19 @@ impl Frame for GroupFrame {
             }
             FrameResult::Particle(ParticleResult {
                 term: ParticleTerm::Group(mg),
+                min_occurs,
+                max_occurs,
                 ..
             }) => {
+                // For named (top-level) group definitions, the compositor child
+                // must not have minOccurs/maxOccurs (cos-all-limited / src-group)
+                if self.name.is_some() && (min_occurs != 1 || max_occurs != Some(1)) {
+                    return Err(SchemaError::structural(
+                        "src-group",
+                        "Compositor in top-level group definition cannot have minOccurs/maxOccurs",
+                        None,
+                    ));
+                }
                 self.compositor = mg.compositor;
                 self.particles = mg.particles;
             }
@@ -278,6 +311,8 @@ pub struct AttributeGroupFrame {
     attributes: Vec<AttributeUseResult>,
     attribute_groups: Vec<QNameRef>,
     attribute_wildcard: Option<WildcardResult>,
+    /// True once any non-annotation child has been seen (annotation must come first)
+    past_annotation: bool,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
@@ -310,6 +345,7 @@ impl AttributeGroupFrame {
             attributes: Vec::new(),
             attribute_groups: Vec::new(),
             attribute_wildcard: None,
+            past_annotation: false,
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
@@ -319,6 +355,10 @@ impl AttributeGroupFrame {
 
 impl Frame for AttributeGroupFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // Annotation must come first
+        if local_name == xsd_names::ANNOTATION && self.past_annotation {
+            return false;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION
@@ -332,7 +372,11 @@ impl Frame for AttributeGroupFrame {
         matches!(local_name, "name" | "ref" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name != xsd_names::ANNOTATION {
+            self.past_annotation = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {

@@ -222,6 +222,12 @@ pub fn load_and_process_schema(
         }
     }
 
+    // Fail early if parsing collected structural errors (error-recovery mode)
+    if !schema_set.parsing_errors.is_empty() {
+        let errors = std::mem::take(&mut schema_set.parsing_errors);
+        return Err(errors.into_iter().next().unwrap());
+    }
+
     // Phase 2.5: Apply redefine/override directives (operates on already-parsed
     // data, no I/O). Skipped in parse-only mode because not all schemas may be
     // loaded yet; callers use process_loaded_schemas() to apply later.
@@ -301,6 +307,12 @@ pub fn parse_schema_only(
 /// **Precondition**: All participating schemas — including redefine/override targets —
 /// must have been parsed and loaded into the schema set before calling this function.
 pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
+    // Fail early if parsing collected structural errors (error-recovery mode)
+    if !schema_set.parsing_errors.is_empty() {
+        let errors = std::mem::take(&mut schema_set.parsing_errors);
+        return Err(errors.into_iter().next().unwrap());
+    }
+
     // Apply redefine/override directives before assembly
     crate::schema::apply_redefine_override(schema_set)?;
 

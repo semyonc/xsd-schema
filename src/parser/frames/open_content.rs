@@ -77,6 +77,10 @@ impl Frame for OpenContentFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -165,6 +169,10 @@ impl Frame for DefaultOpenContentFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

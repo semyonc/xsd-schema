@@ -137,6 +137,10 @@ impl Frame for AnyFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -260,6 +264,10 @@ impl Frame for AnyAttributeFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

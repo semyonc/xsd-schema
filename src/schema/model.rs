@@ -133,6 +133,11 @@ pub struct SchemaSet {
 
     /// Built-in type registry with well-known type IDs
     builtin_types: Option<BuiltinTypes>,
+
+    /// Parsing errors collected during error-recovery mode.
+    /// These are structural errors that make the schema invalid but
+    /// were deferred so parsing could continue for better diagnostics.
+    pub parsing_errors: Vec<crate::error::SchemaError>,
 }
 
 impl SchemaSet {
@@ -165,6 +170,7 @@ impl SchemaSet {
             composition_edges: Vec::new(),
             effective_components: HashMap::new(),
             builtin_types: None,
+            parsing_errors: Vec::new(),
         };
 
         // Initialize built-in types
@@ -172,6 +178,11 @@ impl SchemaSet {
         set.builtin_types = Some(builtin_types);
 
         set
+    }
+
+    /// Returns `true` if any parsing errors were collected during error-recovery parsing.
+    pub fn has_parsing_errors(&self) -> bool {
+        !self.parsing_errors.is_empty()
     }
 
     /// Check if a schema location has already been loaded

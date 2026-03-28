@@ -27,7 +27,7 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
-use crate::parser::frames::{DerivationMethod, SimpleTypeVariety};
+use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::{OpenContentMode, OpenContentResult, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceRef;
@@ -115,6 +115,9 @@ fn validate_simple_type(
 
     stats.simple_types_validated += 1;
 
+    // cos-applicable-facets: Check that facets are applicable to the type variety
+    validate_applicable_facets(schema_set, type_def)?;
+
     match type_def.variety {
         SimpleTypeVariety::Atomic => {
             // Atomic types are derived by restriction
@@ -133,6 +136,108 @@ fn validate_simple_type(
     Ok(())
 }
 
+/// Validate cos-applicable-facets: only certain facets are applicable to certain type varieties
+///
+/// - List types: length, minLength, maxLength, pattern, enumeration, whiteSpace
+/// - Union types (XSD 1.0): pattern, enumeration
+/// - Union types (XSD 1.1): pattern, enumeration, assertions
+fn validate_applicable_facets(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::SimpleTypeDefData,
+) -> SchemaResult<()> {
+    let facets = &type_def.facets;
+
+    match type_def.variety {
+        SimpleTypeVariety::List => {
+            // List types: only length, minLength, maxLength, pattern, enumeration, whiteSpace
+            let has_inapplicable = facets.min_inclusive.is_some()
+                || facets.max_inclusive.is_some()
+                || facets.min_exclusive.is_some()
+                || facets.max_exclusive.is_some()
+                || facets.total_digits.is_some()
+                || facets.fraction_digits.is_some()
+                || facets.explicit_timezone.is_some();
+
+            if has_inapplicable {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let inapplicable = list_inapplicable_facets_for_list(facets);
+                return Err(SchemaError::structural(
+                    "cos-applicable-facets",
+                    format!(
+                        "List type '{}' has inapplicable facet(s): {}",
+                        type_name, inapplicable
+                    ),
+                    location,
+                ));
+            }
+        }
+        SimpleTypeVariety::Union => {
+            // Union types: only pattern, enumeration (and assertions in XSD 1.1)
+            let has_inapplicable = facets.length.is_some()
+                || facets.min_length.is_some()
+                || facets.max_length.is_some()
+                || facets.whitespace.is_some()
+                || facets.min_inclusive.is_some()
+                || facets.max_inclusive.is_some()
+                || facets.min_exclusive.is_some()
+                || facets.max_exclusive.is_some()
+                || facets.total_digits.is_some()
+                || facets.fraction_digits.is_some()
+                || facets.explicit_timezone.is_some();
+
+            if has_inapplicable {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let inapplicable = list_inapplicable_facets_for_union(facets);
+                return Err(SchemaError::structural(
+                    "cos-applicable-facets",
+                    format!(
+                        "Union type '{}' has inapplicable facet(s): {}",
+                        type_name, inapplicable
+                    ),
+                    location,
+                ));
+            }
+        }
+        SimpleTypeVariety::Atomic => {
+            // Atomic types: all facets potentially applicable (depends on base type)
+        }
+    }
+
+    Ok(())
+}
+
+/// List inapplicable facet names for list types
+fn list_inapplicable_facets_for_list(facets: &FacetSet) -> String {
+    let mut names = Vec::new();
+    if facets.min_inclusive.is_some() { names.push("minInclusive"); }
+    if facets.max_inclusive.is_some() { names.push("maxInclusive"); }
+    if facets.min_exclusive.is_some() { names.push("minExclusive"); }
+    if facets.max_exclusive.is_some() { names.push("maxExclusive"); }
+    if facets.total_digits.is_some() { names.push("totalDigits"); }
+    if facets.fraction_digits.is_some() { names.push("fractionDigits"); }
+    if facets.explicit_timezone.is_some() { names.push("explicitTimezone"); }
+    names.join(", ")
+}
+
+/// List inapplicable facet names for union types
+fn list_inapplicable_facets_for_union(facets: &FacetSet) -> String {
+    let mut names = Vec::new();
+    if facets.length.is_some() { names.push("length"); }
+    if facets.min_length.is_some() { names.push("minLength"); }
+    if facets.max_length.is_some() { names.push("maxLength"); }
+    if facets.whitespace.is_some() { names.push("whiteSpace"); }
+    if facets.min_inclusive.is_some() { names.push("minInclusive"); }
+    if facets.max_inclusive.is_some() { names.push("maxInclusive"); }
+    if facets.min_exclusive.is_some() { names.push("minExclusive"); }
+    if facets.max_exclusive.is_some() { names.push("maxExclusive"); }
+    if facets.total_digits.is_some() { names.push("totalDigits"); }
+    if facets.fraction_digits.is_some() { names.push("fractionDigits"); }
+    if facets.explicit_timezone.is_some() { names.push("explicitTimezone"); }
+    names.join(", ")
+}
+
 /// Validate simple type restriction derivation
 ///
 /// Constraint: cos-st-restricts (Derivation Valid - Restriction, Simple)
@@ -148,6 +253,30 @@ fn validate_simple_restriction(
     };
 
     stats.restrictions_validated += 1;
+
+    // Check that base type is not final for restriction
+    if let TypeKey::Simple(base_simple_key) = base_key {
+        if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+            let effective_final = effective_type_final(
+                schema_set,
+                base_type.final_derivation,
+                base_type.source.as_ref(),
+            );
+            if effective_final.contains_restriction() {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                return Err(SchemaError::structural(
+                    "cos-st-restricts",
+                    format!(
+                        "Simple type '{}' cannot restrict '{}' because base type is final for restriction",
+                        type_name, base_name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
 
     // Get base type facets
     let base_facets = get_type_facets(schema_set, base_key)?;
@@ -179,6 +308,54 @@ fn validate_simple_list(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::SimpleTypeDefData,
 ) -> SchemaResult<()> {
+    // Check that the item type is not final for list derivation
+    if let Some(TypeKey::Simple(item_simple_key)) = type_def.resolved_item_type {
+        if let Some(item_type) = schema_set.arenas.simple_types.get(item_simple_key) {
+            let effective_final = effective_type_final(
+                schema_set,
+                item_type.final_derivation,
+                item_type.source.as_ref(),
+            );
+            if effective_final.contains_list() {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let item_name = format_type_name(schema_set, item_type.name, item_type.target_namespace);
+                return Err(SchemaError::structural(
+                    "cos-st-restricts",
+                    format!(
+                        "List type '{}' cannot use '{}' as item type because it is final for list",
+                        type_name, item_name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
+    // Also check the base type's final for restriction (list types restrict xs:anySimpleType)
+    if let Some(TypeKey::Simple(base_simple_key)) = type_def.resolved_base_type {
+        if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+            let effective_final = effective_type_final(
+                schema_set,
+                base_type.final_derivation,
+                base_type.source.as_ref(),
+            );
+            if effective_final.contains_list() {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                return Err(SchemaError::structural(
+                    "cos-st-restricts",
+                    format!(
+                        "List type '{}' cannot derive from '{}' because it is final for list",
+                        type_name, base_name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
     // Get the item type
     let item_key = match type_def.resolved_item_type {
         Some(key) => key,
@@ -266,6 +443,32 @@ fn validate_simple_union(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::SimpleTypeDefData,
 ) -> SchemaResult<()> {
+    // Check that member types are not final for union derivation
+    for member_key in &type_def.resolved_member_types {
+        if let TypeKey::Simple(simple_key) = member_key {
+            if let Some(member_type) = schema_set.arenas.simple_types.get(*simple_key) {
+                let effective_final = effective_type_final(
+                    schema_set,
+                    member_type.final_derivation,
+                    member_type.source.as_ref(),
+                );
+                if effective_final.contains_union() {
+                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                    let member_name = format_type_name(schema_set, member_type.name, member_type.target_namespace);
+                    return Err(SchemaError::structural(
+                        "cos-st-restricts",
+                        format!(
+                            "Union type '{}' cannot use '{}' as member type because it is final for union",
+                            type_name, member_name
+                        ),
+                        location,
+                    ));
+                }
+            }
+        }
+    }
+
     // All member types must be simple types
     for member_key in &type_def.resolved_member_types {
         match member_key {
@@ -336,9 +539,43 @@ fn validate_complex_extension(
 
     // Check that base type exists and is accessible
     match base_key {
-        TypeKey::Simple(_) => {
-            // Extension from simple type is valid (simpleContent)
-            // The derived type must have simpleContent
+        TypeKey::Simple(base_simple_key) => {
+            // Extension from simple type is valid only with simpleContent
+            // complexContent extension from simple type is invalid
+            if matches!(type_def.content, ComplexContentResult::Complex(_)) {
+                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                return Err(SchemaError::structural(
+                    "cos-ct-extends",
+                    format!(
+                        "Complex type '{}' cannot use complexContent extension from a simple type",
+                        type_name,
+                    ),
+                    location,
+                ));
+            }
+
+            // Check that simple base type is not final for extension
+            if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+                let effective_final = effective_type_final(
+                    schema_set,
+                    base_type.final_derivation,
+                    base_type.source.as_ref(),
+                );
+                if effective_final.contains_extension() {
+                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    return Err(SchemaError::structural(
+                        "cos-ct-extends",
+                        format!(
+                            "Complex type '{}' cannot extend simple type '{}' because it is final for extension",
+                            type_name, base_name,
+                        ),
+                        location,
+                    ));
+                }
+            }
         }
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
@@ -357,6 +594,27 @@ fn validate_complex_extension(
                         ),
                         location,
                     ));
+                }
+
+                // cos-ct-extends: Cannot use complexContent extension to add particles
+                // to a base type with simpleContent
+                if matches!(base_type.content, ComplexContentResult::Simple(_)) {
+                    if let ComplexContentResult::Complex(ref complex) = type_def.content {
+                        // Extension adds a content model particle — invalid
+                        if complex.particle.is_some() {
+                            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                            let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                            return Err(SchemaError::structural(
+                                "cos-ct-extends",
+                                format!(
+                                    "Complex type '{}' cannot use complexContent to extend '{}' which has simpleContent with element content",
+                                    type_name, base_name,
+                                ),
+                                location,
+                            ));
+                        }
+                    }
                 }
 
                 // XSD 1.1: Validate open-content compatibility
@@ -383,9 +641,28 @@ fn validate_complex_restriction(
     };
 
     match base_key {
-        TypeKey::Simple(_) => {
-            // Restriction of simple type is not typically valid for complex types
-            // unless using simpleContent
+        TypeKey::Simple(base_simple_key) => {
+            // Check that simple base type is not final for restriction
+            if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+                let effective_final = effective_type_final(
+                    schema_set,
+                    base_type.final_derivation,
+                    base_type.source.as_ref(),
+                );
+                if effective_final.contains_restriction() {
+                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    return Err(SchemaError::structural(
+                        "derivation-ok-restriction",
+                        format!(
+                            "Complex type '{}' cannot restrict simple type '{}' because it is final for restriction",
+                            type_name, base_name,
+                        ),
+                        location,
+                    ));
+                }
+            }
         }
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {

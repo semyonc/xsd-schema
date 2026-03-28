@@ -226,6 +226,10 @@ impl Frame for SchemaFrame {
         }))
     }
 
+    fn children_are_top_level(&self) -> bool {
+        true
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }

@@ -81,6 +81,10 @@ impl Frame for NotationFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }

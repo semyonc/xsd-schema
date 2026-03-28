@@ -866,6 +866,49 @@ impl FacetSet {
             }
         }
 
+        // Check numeric bound consistency (minInclusive vs maxInclusive, etc.)
+        // Uses decimal parsing for numeric comparison
+        if let (Some(min_incl), Some(max_incl)) = (&self.min_inclusive, &self.max_inclusive) {
+            if let Some(cmp) = compare_decimal_strings(&min_incl.value, &max_incl.value) {
+                if cmp == std::cmp::Ordering::Greater {
+                    return Err(FacetError::conflicting(format!(
+                        "minInclusive '{}' is greater than maxInclusive '{}'",
+                        min_incl.value, max_incl.value
+                    )));
+                }
+            }
+        }
+        if let (Some(min_excl), Some(max_excl)) = (&self.min_exclusive, &self.max_exclusive) {
+            if let Some(cmp) = compare_decimal_strings(&min_excl.value, &max_excl.value) {
+                if cmp != std::cmp::Ordering::Less {
+                    return Err(FacetError::conflicting(format!(
+                        "minExclusive '{}' must be less than maxExclusive '{}'",
+                        min_excl.value, max_excl.value
+                    )));
+                }
+            }
+        }
+        if let (Some(min_incl), Some(max_excl)) = (&self.min_inclusive, &self.max_exclusive) {
+            if let Some(cmp) = compare_decimal_strings(&min_incl.value, &max_excl.value) {
+                if cmp != std::cmp::Ordering::Less {
+                    return Err(FacetError::conflicting(format!(
+                        "minInclusive '{}' must be less than maxExclusive '{}'",
+                        min_incl.value, max_excl.value
+                    )));
+                }
+            }
+        }
+        if let (Some(min_excl), Some(max_incl)) = (&self.min_exclusive, &self.max_inclusive) {
+            if let Some(cmp) = compare_decimal_strings(&min_excl.value, &max_incl.value) {
+                if cmp != std::cmp::Ordering::Less {
+                    return Err(FacetError::conflicting(format!(
+                        "minExclusive '{}' must be less than maxInclusive '{}'",
+                        min_excl.value, max_incl.value
+                    )));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -1241,6 +1284,15 @@ fn is_whitespace_more_restrictive(derived: WhitespaceMode, base: WhitespaceMode)
         // Going the other way is less restrictive
         _ => false,
     }
+}
+
+/// Compare two strings as decimal/integer values.
+/// Returns None if either string cannot be parsed as a number.
+fn compare_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    // Try parsing as f64 for general numeric comparison
+    let a_val: f64 = a.trim().parse().ok()?;
+    let b_val: f64 = b.trim().parse().ok()?;
+    a_val.partial_cmp(&b_val)
 }
 
 /// Apply whitespace normalization to a string

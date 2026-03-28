@@ -669,6 +669,18 @@ pub trait Frame {
         false
     }
 
+    /// Returns true if children of this frame are treated as top-level declarations.
+    /// True for schema, redefine, and override frames.
+    fn children_are_top_level(&self) -> bool {
+        false
+    }
+
+    /// Returns true if this frame already has an annotation child.
+    /// Used to reject duplicate annotations per XSD content model.
+    fn has_annotation(&self) -> bool {
+        false
+    }
+
     /// Called when leaving a child element in a skip frame
     /// Returns true if the skip frame is complete (depth reached 0)
     fn on_child_end(&mut self) -> bool {

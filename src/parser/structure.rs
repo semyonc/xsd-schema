@@ -144,7 +144,7 @@ pub fn validate_element_structure(
         // If ref is present, certain attributes are prohibited
         if has_ref {
             let ref_prohibited = [
-                "type", "default", "fixed", "nillable", "block", "final",
+                "type", "default", "fixed", "nillable", "block", "final", "form",
             ];
             for prohibited in &ref_prohibited {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {

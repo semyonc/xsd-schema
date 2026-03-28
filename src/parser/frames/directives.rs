@@ -73,6 +73,10 @@ impl Frame for IncludeFrame {
         })))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -152,6 +156,10 @@ impl Frame for ImportFrame {
             annotation,
             source: self.source,
         })))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -294,6 +302,10 @@ impl Frame for OverrideFrame {
         })))
     }
 
+    fn children_are_top_level(&self) -> bool {
+        true
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -398,6 +410,10 @@ impl Frame for RedefineFrame {
             components: self.components,
             source: self.source,
         })))
+    }
+
+    fn children_are_top_level(&self) -> bool {
+        true
     }
 
     fn source(&self) -> Option<&SourceRef> {

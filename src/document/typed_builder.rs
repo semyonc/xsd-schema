@@ -492,7 +492,7 @@ mod tests {
     use crate::validation::info::ContentType;
 
     fn load_schema(xsd: &str) -> SchemaSet {
-        let mut schema_set = SchemaSet::new();
+        let mut schema_set = SchemaSet::xsd11();
         load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
             .expect("failed to load schema");
         schema_set

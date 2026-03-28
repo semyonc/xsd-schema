@@ -711,7 +711,7 @@ fn resolve_complex_type_references(
 
     // First pass: extract QName references we need to resolve
     // Also get already resolved base type from assembly (for inline types)
-    let (base_qname, attribute_groups, attribute_uses, source, already_resolved_base, redefine_original, type_name, type_ns) = {
+    let (base_qname, attribute_groups, attribute_uses, source, already_resolved_base, redefine_original, type_name, type_ns, already_resolved_attrs) = {
         let type_def = schema_set
             .arenas
             .complex_types
@@ -733,6 +733,9 @@ fn resolve_complex_type_references(
             (attr_use.attribute.ref_name.clone(), type_qname, attr_use.attribute.source.clone())
         }).collect();
 
+        // Preserve resolved_attributes from inline type assembly (Phase 3)
+        let already_resolved_attrs = type_def.resolved_attributes.clone();
+
         (
             base_qname,
             type_def.attribute_groups.clone(),
@@ -742,6 +745,7 @@ fn resolve_complex_type_references(
             type_def.redefine_original,
             type_def.name,
             type_def.target_namespace,
+            already_resolved_attrs,
         )
     };
 
@@ -778,20 +782,22 @@ fn resolve_complex_type_references(
 
     // Resolve attribute use references
     let mut resolved_attrs = Vec::with_capacity(attribute_uses.len());
-    for (ref_name, type_qname, attr_source) in &attribute_uses {
+    for (i, (ref_name, type_qname, attr_source)) in attribute_uses.iter().enumerate() {
         let resolved_type = if let Some(ref qname) = type_qname {
             let type_key = resolver.resolve_type_ref(qname, attr_source.as_ref())?;
             stats.types_resolved += 1;
             Some(type_key)
         } else {
-            None
+            // Preserve type from inline assembly (Phase 3) when no QName ref
+            already_resolved_attrs.get(i).and_then(|r| r.resolved_type)
         };
         let resolved_ref = if let Some(ref qname) = ref_name {
             let attr_key = resolver.resolve_attribute_ref(qname, attr_source.as_ref())?;
             stats.attributes_resolved += 1;
             Some(attr_key)
         } else {
-            None
+            // Preserve ref from inline assembly
+            already_resolved_attrs.get(i).and_then(|r| r.resolved_ref)
         };
         resolved_attrs.push(ResolvedAttributeUse {
             resolved_type,
@@ -1041,6 +1047,9 @@ fn resolve_attribute_group_references(
         (attr_use.attribute.ref_name.clone(), type_qname, attr_use.attribute.source.clone())
     }).collect();
 
+    // Preserve resolved_attributes from inline type assembly (Phase 3)
+    let already_resolved_attrs = group.resolved_attributes.clone();
+
     // Create resolver
     let resolver = ReferenceResolver::new(schema_set);
 
@@ -1070,20 +1079,22 @@ fn resolve_attribute_group_references(
 
     // Resolve attribute use references
     let mut resolved_attrs = Vec::with_capacity(attribute_uses.len());
-    for (ref_name_opt, type_qname, attr_source) in &attribute_uses {
+    for (i, (ref_name_opt, type_qname, attr_source)) in attribute_uses.iter().enumerate() {
         let resolved_type = if let Some(ref qname) = type_qname {
             let type_key = resolver.resolve_type_ref(qname, attr_source.as_ref())?;
             stats.types_resolved += 1;
             Some(type_key)
         } else {
-            None
+            // Preserve type from inline assembly (Phase 3) when no QName ref
+            already_resolved_attrs.get(i).and_then(|r| r.resolved_type)
         };
         let resolved_attr_ref = if let Some(ref qname) = ref_name_opt {
             let attr_key = resolver.resolve_attribute_ref(qname, attr_source.as_ref())?;
             stats.attributes_resolved += 1;
             Some(attr_key)
         } else {
-            None
+            // Preserve ref from inline assembly
+            already_resolved_attrs.get(i).and_then(|r| r.resolved_ref)
         };
         resolved_attrs.push(ResolvedAttributeUse {
             resolved_type,

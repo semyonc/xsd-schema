@@ -149,6 +149,10 @@ impl Frame for SimpleTypeFrame {
         }))))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -163,7 +167,18 @@ impl Frame for SimpleTypeFrame {
 // ============================================================================
 
 /// Frame for xs:restriction
+/// Parsing phase for restriction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestrictionPhase {
+    Annotation,
+    Content,
+    Facets,
+    Attributes,
+    Done,
+}
+
 pub struct RestrictionFrame {
+    phase: RestrictionPhase,
     base_type: Option<TypeRefResult>,
     facets: FacetSet,
     particle: Option<ParticleResult>,
@@ -197,6 +212,7 @@ impl RestrictionFrame {
             .map(String::from);
 
         Ok(Self {
+            phase: RestrictionPhase::Annotation,
             base_type,
             facets: FacetSet::new(),
             particle: None,
@@ -216,22 +232,9 @@ impl RestrictionFrame {
 
 impl Frame for RestrictionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        #[cfg(feature = "xsd11")]
-        let is_xsd11_element = matches!(
+        let is_facet = matches!(
             local_name,
-            xsd_names::OPEN_CONTENT
-                | xsd_names::ASSERT
-                | xsd_names::ASSERTION
-                | xsd_names::EXPLICIT_TIMEZONE
-        );
-        #[cfg(not(feature = "xsd11"))]
-        let is_xsd11_element = false;
-
-        matches!(
-            local_name,
-            xsd_names::ANNOTATION
-                | xsd_names::SIMPLE_TYPE
-                | xsd_names::ENUMERATION
+            xsd_names::ENUMERATION
                 | xsd_names::PATTERN
                 | xsd_names::MIN_INCLUSIVE
                 | xsd_names::MAX_INCLUSIVE
@@ -243,21 +246,97 @@ impl Frame for RestrictionFrame {
                 | xsd_names::TOTAL_DIGITS
                 | xsd_names::FRACTION_DIGITS
                 | xsd_names::WHITE_SPACE
-                | xsd_names::SEQUENCE
-                | xsd_names::CHOICE
-                | xsd_names::ALL
-                | xsd_names::GROUP
-                | xsd_names::ATTRIBUTE
-                | xsd_names::ATTRIBUTE_GROUP
-                | xsd_names::ANY_ATTRIBUTE
-        ) || is_xsd11_element
+        );
+
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_element = matches!(
+            local_name,
+            xsd_names::OPEN_CONTENT
+                | xsd_names::ASSERT
+                | xsd_names::ASSERTION
+                | xsd_names::EXPLICIT_TIMEZONE
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_element = false;
+
+        #[cfg(feature = "xsd11")]
+        let is_xsd11_facet = matches!(
+            local_name,
+            xsd_names::ASSERTION | xsd_names::EXPLICIT_TIMEZONE
+        );
+        #[cfg(not(feature = "xsd11"))]
+        let is_xsd11_facet = false;
+
+        match self.phase {
+            RestrictionPhase::Annotation => matches!(
+                local_name,
+                xsd_names::ANNOTATION
+                    | xsd_names::SIMPLE_TYPE
+                    | xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_facet || is_xsd11_element,
+            RestrictionPhase::Content => matches!(
+                local_name,
+                xsd_names::SIMPLE_TYPE
+                    | xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_facet || is_xsd11_element,
+            RestrictionPhase::Facets => is_facet || is_xsd11_facet || matches!(
+                local_name,
+                xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || matches!(local_name, xsd_names::ASSERT | xsd_names::OPEN_CONTENT if is_xsd11_element),
+            RestrictionPhase::Attributes => matches!(
+                local_name,
+                xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_xsd11_element,
+            RestrictionPhase::Done => false,
+        }
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
         matches!(local_name, "base" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        match local_name {
+            xsd_names::ANNOTATION => {
+                self.phase = RestrictionPhase::Content;
+            }
+            xsd_names::SIMPLE_TYPE => {
+                self.phase = RestrictionPhase::Facets;
+            }
+            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
+                self.phase = RestrictionPhase::Attributes;
+            }
+            xsd_names::ENUMERATION | xsd_names::PATTERN | xsd_names::MIN_INCLUSIVE
+            | xsd_names::MAX_INCLUSIVE | xsd_names::MIN_EXCLUSIVE | xsd_names::MAX_EXCLUSIVE
+            | xsd_names::MIN_LENGTH | xsd_names::MAX_LENGTH | xsd_names::LENGTH
+            | xsd_names::TOTAL_DIGITS | xsd_names::FRACTION_DIGITS | xsd_names::WHITE_SPACE => {
+                self.phase = RestrictionPhase::Facets;
+            }
+            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
+                self.phase = RestrictionPhase::Attributes;
+            }
+            xsd_names::ANY_ATTRIBUTE => {
+                self.phase = RestrictionPhase::Done;
+            }
+            _ => {}
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -345,6 +424,10 @@ impl Frame for RestrictionFrame {
         })))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -359,7 +442,17 @@ impl Frame for RestrictionFrame {
 // ============================================================================
 
 /// Frame for xs:extension
+/// Parsing phase for extension
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExtensionPhase {
+    Annotation,
+    Content,
+    Attributes,
+    Done,
+}
+
 pub struct ExtensionFrame {
+    phase: ExtensionPhase,
     base_type: Option<TypeRefResult>,
     particle: Option<ParticleResult>,
     open_content: Option<OpenContentResult>,
@@ -391,6 +484,7 @@ impl ExtensionFrame {
             .map(String::from);
 
         Ok(Self {
+            phase: ExtensionPhase::Annotation,
             base_type,
             particle: None,
             open_content: None,
@@ -416,24 +510,59 @@ impl Frame for ExtensionFrame {
         #[cfg(not(feature = "xsd11"))]
         let is_xsd11_element = false;
 
-        matches!(
-            local_name,
-            xsd_names::ANNOTATION
-                | xsd_names::SEQUENCE
-                | xsd_names::CHOICE
-                | xsd_names::ALL
-                | xsd_names::GROUP
-                | xsd_names::ATTRIBUTE
-                | xsd_names::ATTRIBUTE_GROUP
-                | xsd_names::ANY_ATTRIBUTE
-        ) || is_xsd11_element
+        match self.phase {
+            ExtensionPhase::Annotation => matches!(
+                local_name,
+                xsd_names::ANNOTATION
+                    | xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_xsd11_element,
+            ExtensionPhase::Content => matches!(
+                local_name,
+                xsd_names::SEQUENCE
+                    | xsd_names::CHOICE
+                    | xsd_names::ALL
+                    | xsd_names::GROUP
+                    | xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_xsd11_element,
+            ExtensionPhase::Attributes => matches!(
+                local_name,
+                xsd_names::ATTRIBUTE
+                    | xsd_names::ATTRIBUTE_GROUP
+                    | xsd_names::ANY_ATTRIBUTE
+            ) || is_xsd11_element,
+            ExtensionPhase::Done => false,
+        }
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
         matches!(local_name, "base" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        match local_name {
+            xsd_names::ANNOTATION => {
+                self.phase = ExtensionPhase::Content;
+            }
+            xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL | xsd_names::GROUP => {
+                self.phase = ExtensionPhase::Attributes;
+            }
+            xsd_names::ATTRIBUTE | xsd_names::ATTRIBUTE_GROUP => {
+                self.phase = ExtensionPhase::Attributes;
+            }
+            xsd_names::ANY_ATTRIBUTE => {
+                self.phase = ExtensionPhase::Done;
+            }
+            _ => {}
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -502,6 +631,10 @@ impl Frame for ExtensionFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -627,6 +760,10 @@ impl Frame for ListFrame {
         }))))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -734,6 +871,10 @@ impl Frame for UnionFrame {
             annotation,
             source: self.source,
         }))))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -862,6 +1003,10 @@ impl Frame for SimpleContentFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -982,6 +1127,10 @@ impl Frame for ComplexContentFrame {
             derivation_id: self.derivation_id,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
@@ -1340,6 +1489,10 @@ impl Frame for ComplexTypeFrame {
             annotation,
             source: self.source,
         }))))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

@@ -166,12 +166,18 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
         SourceRef::new(self.doc_id, span)
     }
 
-    /// Create validation context for structural checks
-    /// Elements are top-level if they're direct children of xs:schema (frame stack depth = 1)
+    /// Create validation context for structural checks.
+    /// Elements are top-level if their parent frame reports `children_are_top_level`
+    /// (schema, redefine, and override frames).
     fn validation_context(&self, source: Option<SourceRef>) -> ValidationContext {
+        let is_top_level = self
+            .frame_stack
+            .last()
+            .map(|f| f.children_are_top_level())
+            .unwrap_or(false);
         ValidationContext {
             xsd_version: self.config.xsd_version,
-            is_top_level: self.frame_stack.len() == 1, // Inside schema frame = top-level
+            is_top_level,
             source,
         }
     }
@@ -294,13 +300,16 @@ pub fn parse_schema_with_chameleon(
         ));
     }
 
-    // If we collected errors but have a result, we still return success
-    // The errors are stored in schema_set for later retrieval
+    // Store any collected parsing errors on the schema set so they can be
+    // surfaced later (e.g. when process_loaded_schemas runs).
+    let parsing_errors = std::mem::take(&mut state.errors);
 
     let mut root_schema = state.root_schema.take().ok_or_else(|| {
         SchemaError::internal("No schema result produced during parsing")
     })?;
     drop(state);
+
+    schema_set.parsing_errors.extend(parsing_errors);
 
     // Record the declared targetNamespace before chameleon adoption.
     let declared_target_namespace = root_schema.target_namespace;
@@ -472,8 +481,13 @@ fn handle_start_element(
     // Check if current frame allows this child and handle skip frames
     let (allows_child, has_frame, in_skip_frame) = {
         if let Some(frame) = state.current_frame() {
+            let mut allowed = frame.allows(local_name, state.ns_context.name_table());
+            // Reject duplicate annotations: each XSD element allows at most one annotation
+            if allowed && local_name == xsd_names::ANNOTATION && frame.has_annotation() {
+                allowed = false;
+            }
             (
-                frame.allows(local_name, state.ns_context.name_table()),
+                allowed,
                 true,
                 frame.is_skip_frame(),
             )

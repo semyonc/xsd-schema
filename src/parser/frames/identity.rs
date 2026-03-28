@@ -86,6 +86,10 @@ impl Frame for SelectorFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -179,6 +183,10 @@ impl Frame for FieldFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -249,9 +257,14 @@ impl IdentityFrame {
 
 impl Frame for IdentityFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // Content model: (annotation?, selector, field+)
+        // Annotation must come before selector/field
+        if local_name == xsd_names::ANNOTATION {
+            return self.selector.is_none() && !self.has_annotation();
+        }
         matches!(
             local_name,
-            xsd_names::ANNOTATION | xsd_names::SELECTOR | xsd_names::FIELD
+            xsd_names::SELECTOR | xsd_names::FIELD
         )
     }
 
@@ -319,6 +332,10 @@ impl Frame for IdentityFrame {
             annotation,
             source: self.source,
         }))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {
