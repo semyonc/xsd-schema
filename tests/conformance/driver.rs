@@ -917,12 +917,17 @@ impl TestRunner {
                 };
 
                 match validate_instance(&schema_set, instance_file) {
-                    Ok(has_errors) => {
+                    Ok((has_errors, error_msgs)) => {
                         let instance_valid = !has_errors;
                         match (test.expected, instance_valid) {
                             (ExpectedOutcome::InstanceValid, true) => (TestOutcome::Pass, None),
                             (ExpectedOutcome::InstanceValid, false) => {
-                                (TestOutcome::Fail, Some("Instance was invalid but expected valid".to_string()))
+                                let detail = if error_msgs.is_empty() {
+                                    "Instance was invalid but expected valid".to_string()
+                                } else {
+                                    format!("Instance was invalid but expected valid: {}", error_msgs.join("; "))
+                                };
+                                (TestOutcome::Fail, Some(detail))
                             }
                             (ExpectedOutcome::InstanceInvalid, false) => (TestOutcome::Pass, None),
                             (ExpectedOutcome::InstanceInvalid, true) => {
@@ -960,7 +965,7 @@ const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 fn validate_instance(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
-) -> Result<bool, String> {
+) -> Result<(bool, Vec<String>), String> {
     let content = fs::read(instance_path)
         .map_err(|e| format!("Failed to read instance: {}", e))?;
 
@@ -995,9 +1000,15 @@ fn validate_instance(
         vec!["http://www.w3.org/XML/1998/namespace".to_string()],
     );
 
+    // Track element depth so we only send content events inside elements.
+    // Whitespace/text outside the root element (e.g. between <?xml?> and
+    // root, or after the root closes) is not significant for validation.
+    let mut depth: usize = 0;
+
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
+                depth += 1;
                 let (xsi_type, xsi_nil, ns_ctx) =
                     process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
                 let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
@@ -1016,6 +1027,7 @@ fn validate_instance(
                 runtime.validate_end_of_attributes();
             }
             Ok(Event::Empty(ref e)) => {
+                depth += 1;
                 let (xsi_type, xsi_nil, ns_ctx) =
                     process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
                 let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
@@ -1032,15 +1044,17 @@ fn validate_instance(
 
                 runtime.validate_end_of_attributes();
                 runtime.validate_end_element();
+                depth -= 1;
 
                 // Pop namespace scope
                 pop_ns_scope(&mut prefix_map, &mut scope_stack);
             }
             Ok(Event::End(_)) => {
                 runtime.validate_end_element();
+                depth -= 1;
                 pop_ns_scope(&mut prefix_map, &mut scope_stack);
             }
-            Ok(Event::Text(ref e)) => {
+            Ok(Event::Text(ref e)) if depth > 0 => {
                 let text = e.unescape()
                     .map_err(|err| format!("Text unescape error: {}", err))?;
                 if text.chars().all(|c| c.is_whitespace()) {
@@ -1049,7 +1063,7 @@ fn validate_instance(
                     runtime.validate_text(&text);
                 }
             }
-            Ok(Event::CData(ref e)) => {
+            Ok(Event::CData(ref e)) if depth > 0 => {
                 let text = std::str::from_utf8(e.as_ref())
                     .map_err(|err| format!("CData UTF-8 error: {}", err))?;
                 runtime.validate_text(text);
@@ -1067,7 +1081,8 @@ fn validate_instance(
         errors.push(e);
     }
 
-    Ok(!errors.is_empty())
+    let error_msgs: Vec<String> = errors.iter().map(|e| format!("{}", e)).collect();
+    Ok((!errors.is_empty(), error_msgs))
 }
 
 /// Split a QName into (prefix_bytes, local_bytes).
