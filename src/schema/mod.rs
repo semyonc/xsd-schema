@@ -99,7 +99,33 @@ pub use redefine::apply_redefine;
 #[cfg(feature = "xsd11")]
 pub use override_dir::apply_override;
 
-use crate::error::SchemaResult;
+use crate::error::{SchemaError, SchemaResult};
+
+/// Compile all deferred pattern facets across every simple type in the schema set.
+///
+/// Patterns added via `add_pattern_unchecked` during parsing are not compiled until
+/// this function runs. Any invalid XSD regex pattern causes a structural error,
+/// making the schema invalid.
+///
+/// Must be called after reference resolution so that all types are fully assembled.
+pub fn compile_all_patterns(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    let keys: Vec<_> = schema_set.arenas.simple_types.keys().collect();
+    for key in keys {
+        let type_def = &mut schema_set.arenas.simple_types[key];
+        if let Err(facet_err) = type_def.facets.compile_patterns() {
+            let source = type_def.source.clone();
+            let location = source.as_ref().and_then(|src| {
+                schema_set.source_maps.locate(src)
+            });
+            return Err(SchemaError::structural(
+                "pattern-valid",
+                facet_err.to_string(),
+                location,
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Apply all redefine and override directives collected from loaded documents,
 /// then build effective component provenance records.

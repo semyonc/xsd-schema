@@ -25,6 +25,7 @@ use crate::parser::frames::{QNameRef, TypeRefResult};
 use crate::parser::location::SourceRef;
 use crate::schema::composition::ComponentKind;
 use crate::schema::SchemaSet;
+use crate::parser::frames::SimpleTypeVariety;
 
 /// Reference resolver for QName → component ID resolution
 ///
@@ -657,19 +658,44 @@ fn resolve_simple_type_references(
     };
 
     // Resolve member type references (for union)
-    // Start with already resolved members (from inline types), then add QName resolved ones
-    let mut resolved_members = already_resolved_members;
+    // Per XSD spec, memberTypes attribute members come first, then inline simpleType children
+    let mut resolved_members = Vec::new();
     for qname in &member_qnames {
         let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
         stats.types_resolved += 1;
         resolved_members.push(type_key);
     }
+    resolved_members.extend(already_resolved_members);
 
     // Store resolved references back
     if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
         type_def.resolved_base_type = resolved_base;
         type_def.resolved_item_type = resolved_item;
         type_def.resolved_member_types = resolved_members;
+    }
+
+    // Inherit variety and structural properties from base type for restriction-derived types.
+    // Parser sets variety=Atomic for all restrictions, but restrictions of union/list types
+    // must inherit the base type's variety and member types / item type.
+    if let Some(TypeKey::Simple(base_sk)) = resolved_base {
+        let (base_variety, base_members, base_item) = {
+            if let Some(base_def) = schema_set.arenas.simple_types.get(base_sk) {
+                (base_def.variety, base_def.resolved_member_types.clone(), base_def.resolved_item_type)
+            } else {
+                (SimpleTypeVariety::Atomic, Vec::new(), None)
+            }
+        };
+        if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
+            if type_def.variety == SimpleTypeVariety::Atomic && base_variety != SimpleTypeVariety::Atomic {
+                type_def.variety = base_variety;
+            }
+            if base_variety == SimpleTypeVariety::Union && type_def.resolved_member_types.is_empty() {
+                type_def.resolved_member_types = base_members;
+            }
+            if base_variety == SimpleTypeVariety::List && type_def.resolved_item_type.is_none() {
+                type_def.resolved_item_type = base_item;
+            }
+        }
     }
 
     Ok(())

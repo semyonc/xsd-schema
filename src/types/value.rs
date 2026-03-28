@@ -537,6 +537,26 @@ pub struct DateTimeValue {
     pub timezone: Option<TimezoneOffset>,
 }
 
+impl DateTimeValue {
+    /// Convert to total seconds from a reference epoch for comparison.
+    /// Uses implicit UTC for timezone-unaware values (XSD 1.0 facet semantics).
+    fn to_comparable_instant(&self) -> Decimal {
+        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let days = date_to_days(self.year, self.month as i32, self.day as i32);
+        Decimal::from(days) * Decimal::from(86400)
+            + Decimal::from(self.hour as i64) * Decimal::from(3600)
+            + Decimal::from(self.minute as i64) * Decimal::from(60)
+            + self.second
+            - Decimal::from(tz_minutes) * Decimal::from(60)
+    }
+}
+
+impl PartialOrd for DateTimeValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_comparable_instant().partial_cmp(&other.to_comparable_instant())
+    }
+}
+
 impl fmt::Display for DateTimeValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         format_year(self.year, f)?;
@@ -560,6 +580,21 @@ pub struct DateValue {
     pub timezone: Option<TimezoneOffset>,
 }
 
+impl DateValue {
+    fn to_comparable_instant(&self) -> Decimal {
+        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let days = date_to_days(self.year, self.month as i32, self.day as i32);
+        Decimal::from(days) * Decimal::from(86400)
+            - Decimal::from(tz_minutes) * Decimal::from(60)
+    }
+}
+
+impl PartialOrd for DateValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_comparable_instant().partial_cmp(&other.to_comparable_instant())
+    }
+}
+
 impl fmt::Display for DateValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         format_year(self.year, f)?;
@@ -578,6 +613,22 @@ pub struct TimeValue {
     pub minute: u8,
     pub second: Decimal,
     pub timezone: Option<TimezoneOffset>,
+}
+
+impl TimeValue {
+    fn to_comparable_seconds(&self) -> Decimal {
+        let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        Decimal::from(self.hour as i64) * Decimal::from(3600)
+            + Decimal::from(self.minute as i64) * Decimal::from(60)
+            + self.second
+            - Decimal::from(tz_minutes) * Decimal::from(60)
+    }
+}
+
+impl PartialOrd for TimeValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_comparable_seconds().partial_cmp(&other.to_comparable_seconds())
+    }
 }
 
 impl fmt::Display for TimeValue {
@@ -601,6 +652,31 @@ pub struct DurationValue {
     pub hours: u32,
     pub minutes: u32,
     pub seconds: Decimal,
+}
+
+impl DurationValue {
+    /// Convert duration to approximate total seconds for comparison.
+    /// Uses average Gregorian month length (365.2425 / 12 = 30.436875 days).
+    /// This provides a total order consistent with the NIST conformance test
+    /// suite expectations. Strict XSD 1.0 §3.2.6.2 uses a partial order via
+    /// 4 reference dates, but most practical implementations use a total order.
+    fn to_approx_total_seconds(&self) -> Decimal {
+        // Average month in seconds: 30.436875 * 86400 = 2629746
+        let month_secs = Decimal::from(2629746i64);
+        let total_months = Decimal::from(self.years as i64) * Decimal::from(12) + Decimal::from(self.months as i64);
+        let day_time_secs = Decimal::from(self.days as i64) * Decimal::from(86400)
+            + Decimal::from(self.hours as i64) * Decimal::from(3600)
+            + Decimal::from(self.minutes as i64) * Decimal::from(60)
+            + self.seconds;
+        let total = total_months * month_secs + day_time_secs;
+        if self.negative { -total } else { total }
+    }
+}
+
+impl PartialOrd for DurationValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.to_approx_total_seconds().partial_cmp(&other.to_approx_total_seconds())
+    }
 }
 
 impl fmt::Display for DurationValue {
@@ -682,6 +758,22 @@ impl fmt::Display for YearMonthDurationValue {
     }
 }
 
+impl PartialOrd for YearMonthDurationValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let self_months = if self.negative {
+            -(self.years as i64 * 12 + self.months as i64)
+        } else {
+            self.years as i64 * 12 + self.months as i64
+        };
+        let other_months = if other.negative {
+            -(other.years as i64 * 12 + other.months as i64)
+        } else {
+            other.years as i64 * 12 + other.months as i64
+        };
+        self_months.partial_cmp(&other_months)
+    }
+}
+
 /// xs:dayTimeDuration (XSD 1.1)
 #[derive(Debug, Clone, PartialEq)]
 pub struct DayTimeDurationValue {
@@ -726,12 +818,42 @@ impl fmt::Display for DayTimeDurationValue {
     }
 }
 
+impl PartialOrd for DayTimeDurationValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let self_secs = {
+            let s = Decimal::from(self.days as i64) * Decimal::from(86400i64)
+                + Decimal::from(self.hours as i64) * Decimal::from(3600i64)
+                + Decimal::from(self.minutes as i64) * Decimal::from(60i64)
+                + self.seconds;
+            if self.negative { -s } else { s }
+        };
+        let other_secs = {
+            let s = Decimal::from(other.days as i64) * Decimal::from(86400i64)
+                + Decimal::from(other.hours as i64) * Decimal::from(3600i64)
+                + Decimal::from(other.minutes as i64) * Decimal::from(60i64)
+                + other.seconds;
+            if other.negative { -s } else { s }
+        };
+        self_secs.partial_cmp(&other_secs)
+    }
+}
+
 /// xs:gYearMonth value
 #[derive(Debug, Clone, PartialEq)]
 pub struct GYearMonthValue {
     pub year: i32,
     pub month: u8,
     pub timezone: Option<TimezoneOffset>,
+}
+
+impl PartialOrd for GYearMonthValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let d1 = date_to_days(self.year, self.month as i32, 1) * 1440 - tz1;
+        let d2 = date_to_days(other.year, other.month as i32, 1) * 1440 - tz2;
+        d1.partial_cmp(&d2)
+    }
 }
 
 impl fmt::Display for GYearMonthValue {
@@ -752,6 +874,16 @@ pub struct GYearValue {
     pub timezone: Option<TimezoneOffset>,
 }
 
+impl PartialOrd for GYearValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let d1 = date_to_days(self.year, 1, 1) * 1440 - tz1;
+        let d2 = date_to_days(other.year, 1, 1) * 1440 - tz2;
+        d1.partial_cmp(&d2)
+    }
+}
+
 impl fmt::Display for GYearValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         format_year(self.year, f)?;
@@ -768,6 +900,17 @@ pub struct GMonthDayValue {
     pub month: u8,
     pub day: u8,
     pub timezone: Option<TimezoneOffset>,
+}
+
+impl PartialOrd for GMonthDayValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
+        // Use reference year 2000 for gMonthDay comparison
+        let d1 = date_to_days(2000, self.month as i32, self.day as i32) * 1440 - tz1;
+        let d2 = date_to_days(2000, other.month as i32, other.day as i32) * 1440 - tz2;
+        d1.partial_cmp(&d2)
+    }
 }
 
 impl fmt::Display for GMonthDayValue {
@@ -787,6 +930,16 @@ pub struct GDayValue {
     pub timezone: Option<TimezoneOffset>,
 }
 
+impl PartialOrd for GDayValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let d1 = (self.day as i64) * 1440 - tz1;
+        let d2 = (other.day as i64) * 1440 - tz2;
+        d1.partial_cmp(&d2)
+    }
+}
+
 impl fmt::Display for GDayValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "---{:02}", self.day)?;
@@ -802,6 +955,16 @@ impl fmt::Display for GDayValue {
 pub struct GMonthValue {
     pub month: u8,
     pub timezone: Option<TimezoneOffset>,
+}
+
+impl PartialOrd for GMonthValue {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
+        let d1 = (self.month as i64) * 1440 - tz1;
+        let d2 = (other.month as i64) * 1440 - tz2;
+        d1.partial_cmp(&d2)
+    }
 }
 
 impl fmt::Display for GMonthValue {
@@ -852,6 +1015,19 @@ impl fmt::Display for TimezoneOffset {
 }
 
 /// Normalize day-time duration components.
+/// Convert a date to total days from a reference epoch (year 1, month 1, day 1).
+/// Used for comparing date/time values.
+fn date_to_days(year: i32, month: i32, day: i32) -> i64 {
+    // Adjust for months < 3 by treating Jan/Feb as months 13/14 of the previous year
+    let (y, m) = if month <= 2 {
+        (year as i64 - 1, month as i64 + 12)
+    } else {
+        (year as i64, month as i64)
+    };
+    // Use a simplified Julian day calculation
+    365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + day as i64 - 307
+}
+
 ///
 /// Carries over whole seconds into minutes, minutes into hours, hours into days.
 /// Only the integer part of seconds is carried; the fractional part stays in seconds.

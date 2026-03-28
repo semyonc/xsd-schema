@@ -651,6 +651,8 @@ impl TypeValidator for DecimalValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -688,6 +690,8 @@ impl TypeValidator for IntegerValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -799,6 +803,66 @@ fn parse_double(s: &str) -> Result<f64, String> {
 }
 
 // ============================================================================
+// ---------------------------------------------------------------------------
+// Date/time bound checking helper
+// ---------------------------------------------------------------------------
+
+/// Validate min/max inclusive/exclusive bounds for types that implement PartialOrd.
+/// The `parse_fn` parses the bound value string using the same parser as the main value.
+fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
+    value: &T,
+    facets: &FacetSet,
+    _type_name: &str,
+    value_str: &str,
+    parse_fn: F,
+) -> ValidationResult<()> {
+    if let Some(ref min) = facets.min_inclusive {
+        if let Some(bound) = parse_fn(&min.value) {
+            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater)
+                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
+            {
+                return Err(ValidationError::FacetViolation(FacetError::MinInclusiveViolation {
+                    value: value_str.to_string(),
+                    min: min.value.clone(),
+                }));
+            }
+        }
+    }
+    if let Some(ref max) = facets.max_inclusive {
+        if let Some(bound) = parse_fn(&max.value) {
+            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less)
+                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
+            {
+                return Err(ValidationError::FacetViolation(FacetError::MaxInclusiveViolation {
+                    value: value_str.to_string(),
+                    max: max.value.clone(),
+                }));
+            }
+        }
+    }
+    if let Some(ref min) = facets.min_exclusive {
+        if let Some(bound) = parse_fn(&min.value) {
+            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater) {
+                return Err(ValidationError::FacetViolation(FacetError::MinExclusiveViolation {
+                    value: value_str.to_string(),
+                    min: min.value.clone(),
+                }));
+            }
+        }
+    }
+    if let Some(ref max) = facets.max_exclusive {
+        if let Some(bound) = parse_fn(&max.value) {
+            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less) {
+                return Err(ValidationError::FacetViolation(FacetError::MaxExclusiveViolation {
+                    value: value_str.to_string(),
+                    max: max.value.clone(),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 // Date/Time Validators
 // ============================================================================
 
@@ -821,6 +885,11 @@ impl TypeValidator for DurationValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        if let XmlValueKind::Atomic(XmlAtomicValue::Duration(ref dur)) = result.value {
+            validate_bounds(dur, facets, "duration", value, |s| {
+                parse_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
+        }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
@@ -852,9 +921,11 @@ impl TypeValidator for DateTimeValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::DateTime(ref dt)) = result.value {
             facets.validate_explicit_timezone(dt.timezone.is_some())?;
+            validate_bounds(dt, facets, "dateTime", value, |s| {
+                parse_datetime(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -887,9 +958,11 @@ impl TypeValidator for DateValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::Date(ref d)) = result.value {
             facets.validate_explicit_timezone(d.timezone.is_some())?;
+            validate_bounds(d, facets, "date", value, |s| {
+                parse_date(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -922,9 +995,11 @@ impl TypeValidator for TimeValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::Time(ref t)) = result.value {
             facets.validate_explicit_timezone(t.timezone.is_some())?;
+            validate_bounds(t, facets, "time", value, |s| {
+                parse_time(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -957,9 +1032,11 @@ impl TypeValidator for GYearMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
+            validate_bounds(v, facets, "gYearMonth", value, |s| {
+                parse_gyearmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -992,9 +1069,11 @@ impl TypeValidator for GYearValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::GYear(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
+            validate_bounds(v, facets, "gYear", value, |s| {
+                parse_gyear(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -1027,9 +1106,11 @@ impl TypeValidator for GMonthDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
+            validate_bounds(v, facets, "gMonthDay", value, |s| {
+                parse_gmonthday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -1062,9 +1143,11 @@ impl TypeValidator for GDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::GDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
+            validate_bounds(v, facets, "gDay", value, |s| {
+                parse_gday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -1097,9 +1180,11 @@ impl TypeValidator for GMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Check explicitTimezone constraint
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
+            validate_bounds(v, facets, "gMonth", value, |s| {
+                parse_gmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
         }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
@@ -1145,6 +1230,8 @@ impl TypeValidator for HexBinaryValidator {
         if let XmlValueKind::Atomic(XmlAtomicValue::HexBinary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1183,6 +1270,8 @@ impl TypeValidator for Base64BinaryValidator {
         if let XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1915,6 +2004,8 @@ impl TypeValidator for LongValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1955,6 +2046,8 @@ impl TypeValidator for IntValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1995,6 +2088,8 @@ impl TypeValidator for ShortValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2035,6 +2130,8 @@ impl TypeValidator for ByteValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2081,6 +2178,8 @@ impl TypeValidator for NonNegativeIntegerValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2127,6 +2226,8 @@ impl TypeValidator for PositiveIntegerValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2173,6 +2274,8 @@ impl TypeValidator for NonPositiveIntegerValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2219,6 +2322,8 @@ impl TypeValidator for NegativeIntegerValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2259,6 +2364,8 @@ impl TypeValidator for UnsignedLongValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2299,6 +2406,8 @@ impl TypeValidator for UnsignedIntValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2339,6 +2448,8 @@ impl TypeValidator for UnsignedShortValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2379,6 +2490,8 @@ impl TypeValidator for UnsignedByteValidator {
         if let Some(d) = result.as_decimal() {
             facets.validate_decimal(&d)?;
         }
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -2702,6 +2815,11 @@ impl TypeValidator for YearMonthDurationValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        if let XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(ref dur)) = result.value {
+            validate_bounds(dur, facets, "yearMonthDuration", value, |s| {
+                parse_year_month_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
+        }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
@@ -2733,6 +2851,11 @@ impl TypeValidator for DayTimeDurationValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        if let XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(ref dur)) = result.value {
+            validate_bounds(dur, facets, "dayTimeDuration", value, |s| {
+                parse_day_time_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
+        }
         facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }

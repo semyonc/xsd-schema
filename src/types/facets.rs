@@ -401,6 +401,14 @@ impl FacetSet {
         self.patterns.push(PatternFacet::new_unchecked(value, source));
     }
 
+    /// Compile all uncompiled patterns. Returns the first error encountered.
+    pub fn compile_patterns(&mut self) -> FacetResult<()> {
+        for pattern in &mut self.patterns {
+            pattern.compile()?;
+        }
+        Ok(())
+    }
+
     /// Add an enumeration value
     pub fn add_enumeration(&mut self, value: String, source: Option<SourceRef>) {
         let enumeration = self.enumeration.get_or_insert_with(|| EnumerationFacet {

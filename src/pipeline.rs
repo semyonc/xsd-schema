@@ -36,7 +36,7 @@ use crate::parser::resolver::resolve_all_directives_async;
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
-    build_dependency_graph, validate_all_derivations,
+    build_dependency_graph, validate_all_derivations, compile_all_patterns,
 };
 use crate::SchemaSet;
 
@@ -241,13 +241,18 @@ pub fn load_and_process_schema(
         stats.resolution_stats = Some(resolution_stats);
     }
 
-    // Phase 4.5 (XSD 1.1): Validate default open content declarations
+    // Phase 4.5: Compile all deferred pattern facets
+    if config.resolve_references {
+        compile_all_patterns(schema_set)?;
+    }
+
+    // Phase 4.6 (XSD 1.1): Validate default open content declarations
     #[cfg(feature = "xsd11")]
     if config.resolve_references {
         crate::compiler::validate_all_default_open_content(schema_set)?;
     }
 
-    // Phase 4.6: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
+    // Phase 4.7: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
     if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
@@ -301,6 +306,9 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     let inline_stats = assemble_inline_types(schema_set)?;
     let resolution_stats = resolve_all_references(schema_set)?;
+
+    // Compile all deferred pattern facets
+    compile_all_patterns(schema_set)?;
 
     // XSD 1.1: Validate default open content declarations
     #[cfg(feature = "xsd11")]
@@ -401,13 +409,18 @@ pub async fn load_and_process_schema_async(
         stats.resolution_stats = Some(resolution_stats);
     }
 
-    // Phase 4.5 (XSD 1.1): Validate default open content declarations
+    // Phase 4.5: Compile all deferred pattern facets (sync)
+    if config.resolve_references {
+        compile_all_patterns(schema_set)?;
+    }
+
+    // Phase 4.6 (XSD 1.1): Validate default open content declarations
     #[cfg(feature = "xsd11")]
     if config.resolve_references {
         crate::compiler::validate_all_default_open_content(schema_set)?;
     }
 
-    // Phase 4.6: Validate type derivation constraints
+    // Phase 4.7: Validate type derivation constraints
     if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
