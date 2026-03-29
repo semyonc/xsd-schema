@@ -90,7 +90,7 @@ fn resolved_element(
     schema_set.arenas.elements.get(key)
 }
 
-fn derivation_exclusions(
+pub(crate) fn derivation_exclusions(
     schema_set: &SchemaSet,
     effective_block: DerivationSet,
     effective_final: DerivationSet,
@@ -125,7 +125,7 @@ fn type_final_derivation(schema_set: &SchemaSet, type_key: TypeKey) -> Derivatio
     }
 }
 
-fn is_substitutable(
+pub(crate) fn is_substitutable(
     schema_set: &SchemaSet,
     head_type: Option<TypeKey>,
     exclude: DerivationSet,
@@ -137,7 +137,7 @@ fn is_substitutable(
     schema_set.is_type_derived_from(member_type, head_type, exclude)
 }
 
-fn effective_element_constraints(
+pub(crate) fn effective_element_constraints(
     schema_set: &SchemaSet,
     element: &crate::arenas::ElementDeclData,
 ) -> (DerivationSet, DerivationSet) {
@@ -158,6 +158,58 @@ fn effective_element_constraints(
     }
 
     (block, final_derivation)
+}
+
+/// Check if `candidate_key` is validly substitutable for `head_key`
+/// per XSD §3.3.6.3 / §3.9.6 NameAndTypeOK.
+pub(crate) fn is_element_substitutable_for(
+    schema_set: &SchemaSet,
+    head_key: ElementKey,
+    candidate_key: ElementKey,
+) -> bool {
+    let Some(head_elem) = schema_set.arenas.elements.get(head_key) else {
+        return false;
+    };
+    let Some(candidate_elem) = schema_set.arenas.elements.get(candidate_key) else {
+        return false;
+    };
+
+    // Check declared substitution group membership (direct or transitive).
+    // Walk candidate's declared heads to find head_key.
+    let mut visited = HashSet::new();
+    let mut stack: Vec<ElementKey> = candidate_elem.resolved_substitution_groups.clone();
+    let mut is_member = false;
+    while let Some(sg_head) = stack.pop() {
+        if !visited.insert(sg_head) {
+            continue;
+        }
+        if sg_head == head_key {
+            is_member = true;
+            break;
+        }
+        if let Some(sg_elem) = schema_set.arenas.elements.get(sg_head) {
+            stack.extend_from_slice(&sg_elem.resolved_substitution_groups);
+        }
+    }
+    if !is_member {
+        return false;
+    }
+
+    // Check block constraints on the head element
+    let (effective_block, effective_final) = effective_element_constraints(schema_set, head_elem);
+    if effective_block.contains_substitution() {
+        return false;
+    }
+
+    // Check type derivation with exclusion mask
+    let exclude =
+        derivation_exclusions(schema_set, effective_block, effective_final, head_elem.resolved_type);
+    is_substitutable(
+        schema_set,
+        head_elem.resolved_type,
+        exclude,
+        candidate_elem.resolved_type,
+    )
 }
 
 #[cfg(test)]

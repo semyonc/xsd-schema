@@ -832,40 +832,45 @@ impl TestRunner {
             }
         }
 
-        // Try to parse the schema(s) – use the correct XSD version
-        let mut schema_set = if test.version == "1.1" {
-            xsd_schema::SchemaSet::xsd11()
+        // Build and compile schema(s) using SchemaSetBuilder (public API).
+        // This automatically resolves xs:import / xs:include directives.
+        let mut builder = if test.version == "1.1" {
+            xsd_schema::SchemaSetBuilder::xsd11()
         } else {
-            xsd_schema::SchemaSet::new()
+            xsd_schema::SchemaSetBuilder::new()
         };
         let mut parse_error: Option<String> = None;
 
-        // Phase 1: Parse all schemas
         for schema_file in &test.schema_files {
-            match fs::read(schema_file) {
-                Ok(content) => {
-                    let uri = schema_file.to_string_lossy();
-                    match xsd_schema::parse_schema_only(&content, &uri, &mut schema_set) {
-                        Ok(_) => {}
-                        Err(e) => {
-                            parse_error = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
+            // Canonicalize to absolute path — try_add's resolver needs
+            // absolute paths to correctly resolve relative imports within schemas.
+            let path = match schema_file.canonicalize() {
+                Ok(abs) => abs.to_string_lossy().into_owned(),
                 Err(e) => {
-                    parse_error = Some(format!("Failed to read file: {}", e));
+                    parse_error = Some(format!("Failed to resolve path {:?}: {}", schema_file, e));
                     break;
                 }
+            };
+            if let Err(e) = builder.try_add(&path) {
+                parse_error = Some(e.to_string());
+                break;
             }
         }
 
-        // Phase 2: Process all loaded schemas (inline assembly + reference resolution)
-        if parse_error.is_none() {
-            if let Err(e) = xsd_schema::process_loaded_schemas(&mut schema_set) {
-                parse_error = Some(e.to_string());
+        // compile() runs the full pipeline: directive resolution, inline assembly,
+        // reference resolution, derivation validation, particle allocation
+        let schema_set = if parse_error.is_none() {
+            match builder.compile() {
+                Ok(compiled) => compiled.into_schema_set(),
+                Err(e) => {
+                    parse_error = Some(e.to_string());
+                    // Fallback — never used: parse_error guards instance validation
+                    xsd_schema::SchemaSet::new()
+                }
             }
-        }
+        } else {
+            xsd_schema::SchemaSet::new()
+        };
 
         let duration = start.elapsed();
 

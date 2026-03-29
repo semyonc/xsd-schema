@@ -33,7 +33,7 @@ mod error;
 mod particle;
 mod all_group;
 mod upa;
-mod substitution;
+pub(crate) mod substitution;
 #[cfg(feature = "xsd11")]
 mod open_content;
 

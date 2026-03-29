@@ -362,16 +362,15 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                 )
             })?;
 
-        match matcher {
-            crate::compiler::ContentModelMatcher::Nfa(nfa) => {
-                crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
-            }
-            crate::compiler::ContentModelMatcher::WithOpenContent { nfa, .. } => {
-                crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
-            }
-            crate::compiler::ContentModelMatcher::AllGroup(_) => {}
+        let nfa = match matcher {
+            crate::compiler::ContentModelMatcher::Nfa(nfa)
+            | crate::compiler::ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),
+            crate::compiler::ContentModelMatcher::AllGroup(_) => None,
             #[cfg(feature = "xsd11")]
-            crate::compiler::ContentModelMatcher::AllGroupExtension { .. } => {}
+            crate::compiler::ContentModelMatcher::AllGroupExtension { .. } => None,
+        };
+        if let Some(nfa) = nfa {
+            crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
         }
     }
 

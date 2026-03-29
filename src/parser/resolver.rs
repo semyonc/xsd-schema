@@ -1139,11 +1139,19 @@ pub fn resolve_all_directives(
             schema_set,
         ) {
             Ok(ref outcome) => {
-                if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
-                    result.loaded.push(*id);
-                    schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
-                } else {
-                    result.skipped.push(include.schema_location.clone());
+                match outcome {
+                    LoadOutcome::Loaded(id) => {
+                        result.loaded.push(*id);
+                        schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
+                    }
+                    LoadOutcome::AlreadyLoaded(id) => {
+                        // Already processed — record doc_id but don't add to loaded
+                        // to avoid re-processing in recursive directive resolution.
+                        schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
+                    }
+                    _ => {
+                        result.skipped.push(include.schema_location.clone());
+                    }
                 }
                 record_edge(
                     schema_set, doc_id, outcome, CompositionEdgeKind::Include,
@@ -1163,11 +1171,20 @@ pub fn resolve_all_directives(
             schema_set,
         ) {
             Ok(Some(ref outcome)) => {
-                if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
-                    result.loaded.push(*id);
-                    schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
-                } else if let Some(loc) = &import.schema_location {
-                    result.skipped.push(loc.clone());
+                match outcome {
+                    LoadOutcome::Loaded(id) => {
+                        result.loaded.push(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                    }
+                    LoadOutcome::AlreadyLoaded(id) => {
+                        // Already processed — record doc_id but don't add to loaded.
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                    }
+                    _ => {
+                        if let Some(loc) = &import.schema_location {
+                            result.skipped.push(loc.clone());
+                        }
+                    }
                 }
                 record_edge(
                     schema_set, doc_id, outcome, CompositionEdgeKind::Import,
@@ -1186,11 +1203,17 @@ pub fn resolve_all_directives(
     for (i, redefine) in redefines.iter().enumerate() {
         match resolver.process_redefine(&redefine.schema_location, &base_uri, target_namespace, schema_set) {
             Ok(ref outcome) => {
-                if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
-                    result.loaded.push(*id);
-                    schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id = Some(*id);
-                } else {
-                    result.skipped.push(redefine.schema_location.clone());
+                match outcome {
+                    LoadOutcome::Loaded(id) => {
+                        result.loaded.push(*id);
+                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id = Some(*id);
+                    }
+                    LoadOutcome::AlreadyLoaded(id) => {
+                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id = Some(*id);
+                    }
+                    _ => {
+                        result.skipped.push(redefine.schema_location.clone());
+                    }
                 }
                 record_edge(
                     schema_set, doc_id, outcome, CompositionEdgeKind::Redefine,
@@ -1211,11 +1234,17 @@ pub fn resolve_all_directives(
             schema_set,
         ) {
             Ok(ref outcome) => {
-                if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
-                    result.loaded.push(*id);
-                    schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id = Some(*id);
-                } else {
-                    result.skipped.push(override_dir.schema_location.clone());
+                match outcome {
+                    LoadOutcome::Loaded(id) => {
+                        result.loaded.push(*id);
+                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id = Some(*id);
+                    }
+                    LoadOutcome::AlreadyLoaded(id) => {
+                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id = Some(*id);
+                    }
+                    _ => {
+                        result.skipped.push(override_dir.schema_location.clone());
+                    }
                 }
                 record_edge(
                     schema_set, doc_id, outcome, CompositionEdgeKind::Override,

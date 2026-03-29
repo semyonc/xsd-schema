@@ -26,7 +26,7 @@
 //! - `derivation-ok-restriction` - Complex Type Derivation OK (Restriction)
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
+use crate::ids::{ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{
     ComplexContentResult, Compositor, DerivationMethod, ElementFrameResult, ModelGroupDefResult,
     ParticleResult, ParticleTerm, ProcessContents, SimpleTypeVariety, WildcardNamespace,
@@ -723,6 +723,8 @@ struct NormalizedElement {
     name: NameId,
     namespace: Option<NameId>,
     type_key: TypeKey,
+    element_key: Option<ElementKey>,
+    block: DerivationSet,
 }
 
 #[derive(Debug, Clone)]
@@ -801,16 +803,34 @@ impl<'a> ParticleNormalizer<'a> {
         source: Option<&SourceRef>,
     ) -> SchemaResult<NormalizedElement> {
         if let Some(ref_name) = &elem.ref_name {
-            let type_key = self
+            let elem_key = self
                 .schema_set
-                .lookup_element(ref_name.namespace, ref_name.local_name)
+                .lookup_element(ref_name.namespace, ref_name.local_name);
+            let (type_key, block) = elem_key
                 .and_then(|key| self.schema_set.arenas.elements.get(key))
-                .and_then(|decl| decl.resolved_type)
-                .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
+                .map(|decl| {
+                    let (eff_block, _) =
+                        crate::compiler::substitution::effective_element_constraints(
+                            self.schema_set,
+                            decl,
+                        );
+                    let tk = decl
+                        .resolved_type
+                        .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
+                    (tk, eff_block)
+                })
+                .unwrap_or_else(|| {
+                    (
+                        TypeKey::Complex(self.schema_set.any_type_key()),
+                        DerivationSet::empty(),
+                    )
+                });
             return Ok(NormalizedElement {
                 name: ref_name.local_name,
                 namespace: ref_name.namespace,
                 type_key,
+                element_key: elem_key,
+                block,
             });
         }
 
@@ -834,10 +854,27 @@ impl<'a> ParticleNormalizer<'a> {
             .or_else(|| resolve_element_type_ref(self.schema_set, elem))
             .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
 
+        // Compute effective block for local element
+        let block = if !elem.block.is_empty() {
+            elem.block
+        } else {
+            source
+                .and_then(|s| {
+                    let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
+                    self.schema_set
+                        .documents
+                        .get(doc_id as usize)
+                        .map(|d| d.block_default)
+                })
+                .unwrap_or_default()
+        };
+
         Ok(NormalizedElement {
             name,
             namespace,
             type_key,
+            element_key: None,
+            block,
         })
     }
 
@@ -964,8 +1001,8 @@ fn validate_content_particle_restriction(
             let wildcard_mode =
                 normalized_particle_contains_wildcard(&derived_particle)
                     || normalized_particle_contains_wildcard(&base_particle);
-            if !supports_particle_restriction_validation(&derived_particle, wildcard_mode)
-                || !supports_particle_restriction_validation(&base_particle, wildcard_mode)
+            if !particle_restriction_shape_supported(&derived_particle, wildcard_mode)
+                || !particle_restriction_shape_supported(&base_particle, wildcard_mode)
             {
                 return Ok(());
             }
@@ -991,13 +1028,6 @@ fn validate_content_particle_restriction(
             }
         }
     }
-}
-
-fn supports_particle_restriction_validation(
-    particle: &NormalizedParticle,
-    wildcard_mode: bool,
-) -> bool {
-    particle_restriction_shape_supported(particle, wildcard_mode)
 }
 
 fn normalized_particle_contains_wildcard(particle: &NormalizedParticle) -> bool {
@@ -1128,7 +1158,94 @@ fn normalize_type_particle(
     );
     let particle = normalizer.normalize_particle(particle)?;
     let particle = remove_pointless_particles(particle);
-    Ok(flatten_same_compositor_groups(particle))
+    let particle = flatten_same_compositor_groups(particle);
+    Ok(expand_bounded_repeated_sequences(particle))
+}
+
+/// Expand bounded repeated sequences into atomic repetition units.
+///
+/// `sequence(a,b){min,max}` becomes:
+/// ```text
+/// sequence {
+///   sequence(a,b){1,1},  // × min  (required copies)
+///   sequence(a,b){0,1},  // × (max - min)  (optional copies)
+/// }
+/// ```
+///
+/// Each copy is a nested sequence with occurs {1,1} or {0,1}, keeping
+/// the repetition unit atomic (you can't take `a` without `b`).
+///
+/// Only expands when `max_occurs` is finite, ≤ 10, and total children
+/// after expansion ≤ 50.
+fn expand_bounded_repeated_sequences(mut particle: NormalizedParticle) -> NormalizedParticle {
+    // First, recurse into children
+    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        group.particles = group
+            .particles
+            .drain(..)
+            .map(expand_bounded_repeated_sequences)
+            .collect();
+    }
+
+    // Then check if this particle itself should be expanded
+    let NormalizedParticleTerm::Group(ref group) = particle.term else {
+        return particle;
+    };
+    if group.compositor != Compositor::Sequence {
+        return particle;
+    }
+    let child_count = group.particles.len();
+    if child_count <= 1 {
+        return particle; // single-child already handled by existing code
+    }
+    let Some(max) = particle.max_occurs else {
+        return particle; // unbounded — can't expand
+    };
+    if max <= 1 {
+        return particle; // not repeated
+    }
+    if max > 10 || (max as usize) * child_count > 50 {
+        return particle; // too large to expand safely
+    }
+
+    let min = particle.min_occurs;
+    let inner_group = match particle.term {
+        NormalizedParticleTerm::Group(g) => g,
+        _ => unreachable!(),
+    };
+    let source = particle.source.clone();
+
+    let mut copies = Vec::with_capacity(max as usize);
+
+    // Required copies (min_occurs=1, max_occurs=1)
+    for _ in 0..min {
+        copies.push(NormalizedParticle {
+            term: NormalizedParticleTerm::Group(inner_group.clone()),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: source.clone(),
+        });
+    }
+
+    // Optional copies (min_occurs=0, max_occurs=1)
+    for _ in min..max {
+        copies.push(NormalizedParticle {
+            term: NormalizedParticleTerm::Group(inner_group.clone()),
+            min_occurs: 0,
+            max_occurs: Some(1),
+            source: source.clone(),
+        });
+    }
+
+    NormalizedParticle {
+        term: NormalizedParticleTerm::Group(NormalizedGroup {
+            compositor: Compositor::Sequence,
+            particles: copies,
+        }),
+        min_occurs: 1,
+        max_occurs: Some(1),
+        source,
+    }
 }
 
 /// Remove "pointless" particles per Section 3.8 normalization:
@@ -1303,13 +1420,24 @@ fn particle_restricts(
             NormalizedParticleTerm::Element(derived_element),
             NormalizedParticleTerm::Element(base_element),
         ) => {
+            let names_match = derived_element.name == base_element.name
+                && derived_element.namespace == base_element.namespace;
+            let subst_match = !names_match
+                && match (derived_element.element_key, base_element.element_key) {
+                    (Some(d_key), Some(b_key)) => {
+                        crate::compiler::substitution::is_element_substitutable_for(
+                            schema_set, b_key, d_key,
+                        )
+                    }
+                    _ => false,
+                };
             occurs_range_is_subset(
                 derived.min_occurs,
                 derived.max_occurs,
                 base.min_occurs,
                 base.max_occurs,
-            ) && derived_element.name == base_element.name
-                && derived_element.namespace == base_element.namespace
+            ) && (names_match || subst_match)
+                && derived_element.block.contains(base_element.block)
                 && schema_set.is_type_derived_from(
                     derived_element.type_key,
                     base_element.type_key,
@@ -1389,7 +1517,8 @@ fn particle_restricts(
         }
         // recurseAsIfGroup: wrap derived element/wildcard in an implicit group{1,1}
         // and check outer occurs before delegating to sequence/all matching.
-        (NormalizedParticleTerm::Element(_), NormalizedParticleTerm::Group(base_group))
+        (NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
+         NormalizedParticleTerm::Group(base_group))
             if base_group.compositor == Compositor::Sequence =>
         {
             occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
@@ -1399,27 +1528,8 @@ fn particle_restricts(
                     &base_group.particles,
                 )
         }
-        (NormalizedParticleTerm::Element(_), NormalizedParticleTerm::Group(base_group))
-            if base_group.compositor == Compositor::All =>
-        {
-            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
-                && all_particles_restrict(
-                    schema_set,
-                    std::slice::from_ref(derived),
-                    &base_group.particles,
-                )
-        }
-        (NormalizedParticleTerm::Wildcard(_), NormalizedParticleTerm::Group(base_group))
-            if base_group.compositor == Compositor::Sequence =>
-        {
-            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
-                && sequence_particles_restrict(
-                    schema_set,
-                    std::slice::from_ref(derived),
-                    &base_group.particles,
-                )
-        }
-        (NormalizedParticleTerm::Wildcard(_), NormalizedParticleTerm::Group(base_group))
+        (NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
+         NormalizedParticleTerm::Group(base_group))
             if base_group.compositor == Compositor::All =>
         {
             occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
