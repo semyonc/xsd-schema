@@ -27,9 +27,13 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
-use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
+use crate::parser::frames::{
+    ComplexContentResult, Compositor, DerivationMethod, ElementFrameResult, ModelGroupDefResult,
+    ParticleResult, ParticleTerm, ProcessContents, SimpleTypeVariety, WildcardNamespace,
+    WildcardResult,
+};
 #[cfg(feature = "xsd11")]
-use crate::parser::frames::{OpenContentMode, OpenContentResult, ProcessContents, WildcardNamespace, WildcardResult};
+use crate::parser::frames::{OpenContentMode, OpenContentResult};
 use crate::parser::location::SourceRef;
 use crate::schema::dependencies::DependencyGraph;
 use crate::schema::SchemaSet;
@@ -683,6 +687,8 @@ fn validate_complex_restriction(
                     ));
                 }
 
+                validate_content_particle_restriction(schema_set, type_def, base_type)?;
+
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
                 validate_open_content_restriction(schema_set, type_def, base_type)?;
@@ -695,6 +701,1023 @@ fn validate_complex_restriction(
     // implemented in Phase 4 (Content Model Compilation).
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedParticle {
+    term: NormalizedParticleTerm,
+    min_occurs: u32,
+    max_occurs: Option<u32>,
+    source: Option<SourceRef>,
+}
+
+#[derive(Debug, Clone)]
+enum NormalizedParticleTerm {
+    Element(NormalizedElement),
+    Wildcard(Box<NormalizedWildcard>),
+    Group(NormalizedGroup),
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedElement {
+    name: NameId,
+    namespace: Option<NameId>,
+    type_key: TypeKey,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedWildcard {
+    wildcard: WildcardResult,
+    target_namespace: Option<NameId>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedGroup {
+    compositor: Compositor,
+    particles: Vec<NormalizedParticle>,
+}
+
+struct ParticleNormalizer<'a> {
+    schema_set: &'a SchemaSet,
+    target_namespace: Option<NameId>,
+    resolved_types: &'a [Option<TypeKey>],
+    flat_index: usize,
+    depth: usize,
+}
+
+const MAX_PARTICLE_RESTRICTION_DEPTH: usize = 100;
+
+impl<'a> ParticleNormalizer<'a> {
+    fn new(
+        schema_set: &'a SchemaSet,
+        target_namespace: Option<NameId>,
+        resolved_types: &'a [Option<TypeKey>],
+    ) -> Self {
+        Self {
+            schema_set,
+            target_namespace,
+            resolved_types,
+            flat_index: 0,
+            depth: 0,
+        }
+    }
+
+    fn normalize_particle(&mut self, particle: &ParticleResult) -> SchemaResult<NormalizedParticle> {
+        if self.depth >= MAX_PARTICLE_RESTRICTION_DEPTH {
+            return Err(SchemaError::internal(
+                "particle restriction normalization exceeded recursion limit",
+            ));
+        }
+
+        self.depth += 1;
+        let term = match &particle.term {
+            ParticleTerm::Element(elem) => {
+                let source = particle.source.as_ref().or(elem.source.as_ref());
+                NormalizedParticleTerm::Element(self.normalize_element(elem, source)?)
+            }
+            ParticleTerm::Any(wildcard) => {
+                NormalizedParticleTerm::Wildcard(Box::new(NormalizedWildcard {
+                    wildcard: wildcard.clone(),
+                    target_namespace: self.target_namespace,
+                }))
+            }
+            ParticleTerm::Group(group) => {
+                NormalizedParticleTerm::Group(self.normalize_group(group)?)
+            }
+        };
+        self.depth -= 1;
+
+        Ok(collapse_single_child_groups(NormalizedParticle {
+            term,
+            min_occurs: particle.min_occurs,
+            max_occurs: particle.max_occurs,
+            source: particle.source.clone(),
+        }))
+    }
+
+    fn normalize_element(
+        &mut self,
+        elem: &ElementFrameResult,
+        source: Option<&SourceRef>,
+    ) -> SchemaResult<NormalizedElement> {
+        if let Some(ref_name) = &elem.ref_name {
+            let type_key = self
+                .schema_set
+                .lookup_element(ref_name.namespace, ref_name.local_name)
+                .and_then(|key| self.schema_set.arenas.elements.get(key))
+                .and_then(|decl| decl.resolved_type)
+                .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
+            return Ok(NormalizedElement {
+                name: ref_name.local_name,
+                namespace: ref_name.namespace,
+                type_key,
+            });
+        }
+
+        let name = elem
+            .name
+            .ok_or_else(|| SchemaError::internal("element particle missing name and ref"))?;
+        let index = self.flat_index;
+        self.flat_index += 1;
+
+        let namespace = self.schema_set.effective_local_element_namespace(
+            elem.target_namespace,
+            elem.form.as_deref(),
+            source,
+            self.target_namespace,
+        );
+        let type_key = self
+            .resolved_types
+            .get(index)
+            .copied()
+            .flatten()
+            .or_else(|| resolve_element_type_ref(self.schema_set, elem))
+            .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
+
+        Ok(NormalizedElement {
+            name,
+            namespace,
+            type_key,
+        })
+    }
+
+    fn normalize_group(&mut self, group: &ModelGroupDefResult) -> SchemaResult<NormalizedGroup> {
+        if let Some(ref_name) = &group.ref_name {
+            let group_key = self
+                .schema_set
+                .lookup_model_group(ref_name.namespace, ref_name.local_name)
+                .ok_or_else(|| SchemaError::internal("model group reference was not resolved"))?;
+            let group_data = self
+                .schema_set
+                .arenas
+                .get_model_group(group_key)
+                .ok_or_else(|| SchemaError::internal("resolved model group not found"))?;
+            let compositor = group_data
+                .compositor
+                .ok_or_else(|| SchemaError::internal("resolved model group missing compositor"))?;
+            let mut nested = ParticleNormalizer::new(
+                self.schema_set,
+                group_data.target_namespace,
+                &group_data.resolved_particle_types,
+            );
+            nested.depth = self.depth;
+            let particles = group_data
+                .particles
+                .iter()
+                .map(|particle| nested.normalize_particle(particle))
+                .collect::<SchemaResult<Vec<_>>>()?;
+            return Ok(NormalizedGroup {
+                compositor,
+                particles,
+            });
+        }
+
+        let compositor = group
+            .compositor
+            .ok_or_else(|| SchemaError::internal("inline model group missing compositor"))?;
+        let particles = group
+            .particles
+            .iter()
+            .map(|particle| self.normalize_particle(particle))
+            .collect::<SchemaResult<Vec<_>>>()?;
+        Ok(NormalizedGroup {
+            compositor,
+            particles,
+        })
+    }
+}
+
+fn resolve_element_type_ref(
+    schema_set: &SchemaSet,
+    elem: &ElementFrameResult,
+) -> Option<TypeKey> {
+    match &elem.type_ref {
+        Some(crate::parser::frames::TypeRefResult::QName(qname)) => schema_set
+            .lookup_type(qname.namespace, qname.local_name)
+            .or_else(|| schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name)),
+        _ => None,
+    }
+}
+
+fn validate_content_particle_restriction(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    let derived_particle = complex_content_particle(&derived.content);
+    // For the base, resolve effective content by walking up extension chain.
+    // An empty extension inherits its base type's content model.
+    let (effective_base, base_particle) = effective_base_content_particle(schema_set, base);
+
+    let location = derived
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.source_maps.locate(s));
+    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+
+    match (derived_particle, base_particle) {
+        (None, None) => Ok(()),
+        (Some(_), None) => Err(SchemaError::structural(
+            "derivation-ok-restriction",
+            format!(
+                "Complex type '{}' adds particle content while restricting '{}' which has empty content",
+                type_name, base_name
+            ),
+            location,
+        )),
+        (None, Some(base_particle)) => {
+            let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
+            if particle_is_emptiable(&base_particle) {
+                Ok(())
+            } else {
+                Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' removes required particle content from base type '{}'",
+                        type_name, base_name
+                    ),
+                    location,
+                ))
+            }
+        }
+        (Some(derived_particle), Some(base_particle)) => {
+            let derived_particle = normalize_type_particle(schema_set, derived, derived_particle)?;
+            let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
+
+            // A top-level particle with maxOccurs=0 is pointless (§3.8) — treat as empty
+            if derived_particle.max_occurs == Some(0) || is_empty_group(&derived_particle) {
+                if particle_is_emptiable(&base_particle) {
+                    return Ok(());
+                } else {
+                    return Err(SchemaError::structural(
+                        "derivation-ok-restriction",
+                        format!(
+                            "Complex type '{}' removes required particle content from base type '{}'",
+                            type_name, base_name
+                        ),
+                        location,
+                    ));
+                }
+            }
+
+            let wildcard_mode =
+                normalized_particle_contains_wildcard(&derived_particle)
+                    || normalized_particle_contains_wildcard(&base_particle);
+            if !supports_particle_restriction_validation(&derived_particle, wildcard_mode)
+                || !supports_particle_restriction_validation(&base_particle, wildcard_mode)
+            {
+                return Ok(());
+            }
+
+            // Per §3.4.6.3, processors MAY provisionally accept restrictions
+            // involving cross-compositor patterns they can't structurally verify.
+            // Skip restriction checking for unsupported compositor combinations.
+            if !restriction_compositor_pair_supported(&derived_particle, &base_particle) {
+                return Ok(());
+            }
+
+            if particle_restricts(schema_set, &derived_particle, &base_particle) {
+                Ok(())
+            } else {
+                Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Content model of '{}' is not a valid restriction of base type '{}'",
+                        type_name, base_name
+                    ),
+                    location,
+                ))
+            }
+        }
+    }
+}
+
+fn supports_particle_restriction_validation(
+    particle: &NormalizedParticle,
+    wildcard_mode: bool,
+) -> bool {
+    particle_restriction_shape_supported(particle, wildcard_mode)
+}
+
+fn normalized_particle_contains_wildcard(particle: &NormalizedParticle) -> bool {
+    match &particle.term {
+        NormalizedParticleTerm::Wildcard(_) => true,
+        NormalizedParticleTerm::Element(_) => false,
+        NormalizedParticleTerm::Group(group) => {
+            group.particles.iter().any(normalized_particle_contains_wildcard)
+        }
+    }
+}
+
+fn particle_restriction_shape_supported(
+    particle: &NormalizedParticle,
+    wildcard_mode: bool,
+) -> bool {
+    match &particle.term {
+        NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => true,
+        NormalizedParticleTerm::Group(group) => {
+            if !wildcard_mode
+                && group.compositor == Compositor::Sequence
+                && (particle.min_occurs != 1 || particle.max_occurs != Some(1))
+                && particle.max_occurs != Some(1)
+                && !repeated_single_child_sequence_supported(group)
+            {
+                return false;
+            }
+
+            // Choice branches are expanded via expand_choice_branches and
+            // handled recursively — no special guard needed beyond the
+            // recursive child check below.
+
+            group.particles.iter().all(|child| {
+                particle_restriction_shape_supported(child, wildcard_mode)
+            })
+        }
+    }
+}
+
+fn repeated_single_child_sequence_supported(group: &NormalizedGroup) -> bool {
+    group.particles.len() == 1
+}
+
+/// Check whether the top-level compositor combination between derived and base
+/// is a pair our restriction algorithm can correctly validate.
+///
+/// Supported: same-compositor, sequence-vs-all (mapAndSum), element/wildcard-vs-group
+/// (recurseAsIfGroup). Cross-compositor pairs like sequence-vs-choice or
+/// choice-vs-sequence are NOT supported and must be skipped (provisionally accepted).
+fn restriction_compositor_pair_supported(
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+) -> bool {
+    let derived_comp = match &derived.term {
+        NormalizedParticleTerm::Group(g) => Some(g.compositor),
+        _ => None,
+    };
+    let base_comp = match &base.term {
+        NormalizedParticleTerm::Group(g) => Some(g.compositor),
+        _ => None,
+    };
+
+    match (derived_comp, base_comp) {
+        // Non-group particles (element, wildcard) are always supported
+        (None, _) | (_, None) => true,
+        // Same compositor
+        (Some(d), Some(b)) if d == b => true,
+        // Sequence restricts All (mapAndSum)
+        (Some(Compositor::Sequence), Some(Compositor::All)) => true,
+        // All other cross-compositor pairs are unsupported
+        _ => false,
+    }
+}
+
+/// Check if a normalized particle is an empty group (all children removed as pointless).
+fn is_empty_group(particle: &NormalizedParticle) -> bool {
+    matches!(&particle.term, NormalizedParticleTerm::Group(group) if group.particles.is_empty())
+}
+
+fn complex_content_particle(content: &ComplexContentResult) -> Option<&ParticleResult> {
+    match content {
+        ComplexContentResult::Complex(def) => def.particle.as_ref(),
+        ComplexContentResult::Empty | ComplexContentResult::Simple(_) => None,
+    }
+}
+
+/// Walk up the extension chain to find the effective content particle.
+/// Empty extensions inherit their base type's content model.
+/// Returns (type_def_owning_particle, particle) so the normalizer uses the
+/// correct target_namespace and resolved_content_particle_types.
+fn effective_base_content_particle<'a>(
+    schema_set: &'a SchemaSet,
+    base: &'a crate::arenas::ComplexTypeDefData,
+) -> (&'a crate::arenas::ComplexTypeDefData, Option<&'a ParticleResult>) {
+    let mut current = base;
+    let mut depth = 0;
+    loop {
+        if let Some(particle) = complex_content_particle(&current.content) {
+            return (current, Some(particle));
+        }
+        // If this type has no content and was derived by extension, check its base
+        if current.derivation_method != Some(DerivationMethod::Extension) {
+            return (current, None);
+        }
+        let Some(TypeKey::Complex(base_key)) = current.resolved_base_type else {
+            return (current, None);
+        };
+        let Some(base_type) = schema_set.arenas.complex_types.get(base_key) else {
+            return (current, None);
+        };
+        depth += 1;
+        if depth > 50 {
+            return (current, None); // safety limit
+        }
+        current = base_type;
+    }
+}
+
+fn normalize_type_particle(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+    particle: &ParticleResult,
+) -> SchemaResult<NormalizedParticle> {
+    let mut normalizer = ParticleNormalizer::new(
+        schema_set,
+        type_def.target_namespace,
+        &type_def.resolved_content_particle_types,
+    );
+    let particle = normalizer.normalize_particle(particle)?;
+    let particle = remove_pointless_particles(particle);
+    Ok(flatten_same_compositor_groups(particle))
+}
+
+/// Remove "pointless" particles per Section 3.8 normalization:
+/// - Particles with maxOccurs=0 are effectively absent
+/// - Groups with no remaining children after removal are also pointless
+fn remove_pointless_particles(mut particle: NormalizedParticle) -> NormalizedParticle {
+    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        group.particles = group
+            .particles
+            .drain(..)
+            .map(remove_pointless_particles)
+            .filter(|p| p.max_occurs != Some(0))
+            .collect();
+    }
+    particle
+}
+
+/// Flatten nested groups with unit occurs and the same compositor into
+/// their parent (Section 3.8 particle normalization).
+/// E.g. sequence(sequence{1,1}(a, b), c) → sequence(a, b, c).
+fn flatten_same_compositor_groups(mut particle: NormalizedParticle) -> NormalizedParticle {
+    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        // First recurse into children
+        group.particles = group
+            .particles
+            .drain(..)
+            .map(flatten_same_compositor_groups)
+            .collect();
+        // Then flatten children that are same-compositor groups with unit occurs
+        let parent_compositor = group.compositor;
+        let mut flattened = Vec::with_capacity(group.particles.len());
+        for child in group.particles.drain(..) {
+            if let NormalizedParticleTerm::Group(ref child_group) = child.term {
+                if child_group.compositor == parent_compositor
+                    && occurs_is_unit(child.min_occurs, child.max_occurs)
+                {
+                    flattened.extend(child_group.particles.iter().cloned());
+                    continue;
+                }
+            }
+            flattened.push(child);
+        }
+        group.particles = flattened;
+    }
+    particle
+}
+
+fn collapse_single_child_groups(mut particle: NormalizedParticle) -> NormalizedParticle {
+    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        group.particles = group
+            .particles
+            .drain(..)
+            .map(collapse_single_child_groups)
+            .collect();
+    }
+
+    loop {
+        let child = match &particle.term {
+            NormalizedParticleTerm::Group(group)
+                if group.particles.len() == 1
+                    && can_collapse_single_child_group(
+                        group.compositor,
+                        particle.min_occurs,
+                        particle.max_occurs,
+                        &group.particles[0],
+                    ) =>
+            {
+                Some(group.particles[0].clone())
+            }
+            _ => None,
+        };
+        let Some(child) = child else {
+            return particle;
+        };
+        let (min_occurs, max_occurs) = multiply_occurs(
+            particle.min_occurs,
+            particle.max_occurs,
+            child.min_occurs,
+            child.max_occurs,
+        );
+        particle = NormalizedParticle {
+            term: child.term,
+            min_occurs,
+            max_occurs,
+            source: particle.source.clone().or(child.source),
+        };
+    }
+}
+
+fn can_collapse_single_child_group(
+    compositor: Compositor,
+    group_min_occurs: u32,
+    group_max_occurs: Option<u32>,
+    child: &NormalizedParticle,
+) -> bool {
+    if compositor == Compositor::Choice {
+        return true;
+    }
+
+    occurs_is_unit(group_min_occurs, group_max_occurs)
+        || child.max_occurs == Some(1)
+}
+
+fn occurs_is_unit(min_occurs: u32, max_occurs: Option<u32>) -> bool {
+    min_occurs == 1 && max_occurs == Some(1)
+}
+
+fn multiply_occurs(
+    left_min: u32,
+    left_max: Option<u32>,
+    right_min: u32,
+    right_max: Option<u32>,
+) -> (u32, Option<u32>) {
+    let min_occurs = left_min.saturating_mul(right_min);
+    let max_occurs = match (left_max, right_max) {
+        (Some(left), Some(right)) => Some(left.saturating_mul(right)),
+        (Some(0), None) | (None, Some(0)) => Some(0),
+        _ => None,
+    };
+    (min_occurs, max_occurs)
+}
+
+fn particle_restricts(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+) -> bool {
+    // XSD 1.0: A non-choice optional particle cannot restrict an optional non-repeated
+    // multi-branch choice. The expand_choice_branches approach merges choice occurs into
+    // branches, which gives wrong results for RecurseLax when max_occurs=1.
+    // For repeated choices (max>1), the spec is ambiguous — provisionally accept.
+    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0
+        && derived.min_occurs == 0
+        && !matches!(
+            &derived.term,
+            NormalizedParticleTerm::Group(group) if group.compositor == Compositor::Choice
+        )
+        && matches!(
+            &base.term,
+            NormalizedParticleTerm::Group(group)
+                if group.compositor == Compositor::Choice
+                    && base.min_occurs == 0
+                    && base.max_occurs == Some(1)
+                    && group.particles.len() > 1
+        )
+    {
+        return false;
+    }
+
+    if let Some(base_branches) = expand_choice_branches(base) {
+        if let Some(derived_branches) = expand_choice_branches(derived) {
+            return derived_branches.iter().all(|branch| {
+                base_branches
+                    .iter()
+                    .any(|candidate| particle_restricts(schema_set, branch, candidate))
+            });
+        }
+
+        return base_branches
+            .iter()
+            .any(|candidate| particle_restricts(schema_set, derived, candidate));
+    }
+
+    if let Some(derived_branches) = expand_choice_branches(derived) {
+        return derived_branches
+            .iter()
+            .all(|branch| particle_restricts(schema_set, branch, base));
+    }
+
+    match (&derived.term, &base.term) {
+        (
+            NormalizedParticleTerm::Element(derived_element),
+            NormalizedParticleTerm::Element(base_element),
+        ) => {
+            occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) && derived_element.name == base_element.name
+                && derived_element.namespace == base_element.namespace
+                && schema_set.is_type_derived_from(
+                    derived_element.type_key,
+                    base_element.type_key,
+                    DerivationSet::extension(),
+                )
+        }
+        (
+            NormalizedParticleTerm::Element(element),
+            NormalizedParticleTerm::Wildcard(base_wildcard),
+        ) => {
+            occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) && wildcard_allows_element(element, base_wildcard)
+        }
+        (
+            NormalizedParticleTerm::Wildcard(derived_wildcard),
+            NormalizedParticleTerm::Wildcard(base_wildcard),
+        ) => {
+            occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) && wildcard_restricts(derived_wildcard, base_wildcard)
+        }
+        (
+            NormalizedParticleTerm::Group(derived_group),
+            NormalizedParticleTerm::Wildcard(base_wildcard),
+        ) => {
+            group_particle_restricts_wildcard(derived, derived_group, base, base_wildcard)
+        }
+        (
+            NormalizedParticleTerm::Group(derived_group),
+            NormalizedParticleTerm::Group(base_group),
+        ) if derived_group.compositor == base_group.compositor =>
+        {
+            if !occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) {
+                return false;
+            }
+            match derived_group.compositor {
+                Compositor::Sequence => {
+                    sequence_particles_restrict(
+                        schema_set,
+                        &derived_group.particles,
+                        &base_group.particles,
+                    )
+                }
+                Compositor::All => {
+                    all_particles_restrict(schema_set, &derived_group.particles, &base_group.particles)
+                }
+                Compositor::Choice => unreachable!("choice particles are handled earlier"),
+            }
+        }
+        (
+            NormalizedParticleTerm::Group(derived_group),
+            NormalizedParticleTerm::Group(base_group),
+        ) if derived_group.compositor == Compositor::Sequence
+            && base_group.compositor == Compositor::All =>
+        {
+            if !occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) {
+                return false;
+            }
+            all_particles_restrict(schema_set, &derived_group.particles, &base_group.particles)
+        }
+        // recurseAsIfGroup: wrap derived element/wildcard in an implicit group{1,1}
+        // and check outer occurs before delegating to sequence/all matching.
+        (NormalizedParticleTerm::Element(_), NormalizedParticleTerm::Group(base_group))
+            if base_group.compositor == Compositor::Sequence =>
+        {
+            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
+                && sequence_particles_restrict(
+                    schema_set,
+                    std::slice::from_ref(derived),
+                    &base_group.particles,
+                )
+        }
+        (NormalizedParticleTerm::Element(_), NormalizedParticleTerm::Group(base_group))
+            if base_group.compositor == Compositor::All =>
+        {
+            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
+                && all_particles_restrict(
+                    schema_set,
+                    std::slice::from_ref(derived),
+                    &base_group.particles,
+                )
+        }
+        (NormalizedParticleTerm::Wildcard(_), NormalizedParticleTerm::Group(base_group))
+            if base_group.compositor == Compositor::Sequence =>
+        {
+            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
+                && sequence_particles_restrict(
+                    schema_set,
+                    std::slice::from_ref(derived),
+                    &base_group.particles,
+                )
+        }
+        (NormalizedParticleTerm::Wildcard(_), NormalizedParticleTerm::Group(base_group))
+            if base_group.compositor == Compositor::All =>
+        {
+            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
+                && all_particles_restrict(
+                    schema_set,
+                    std::slice::from_ref(derived),
+                    &base_group.particles,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn group_particle_restricts_wildcard(
+    derived: &NormalizedParticle,
+    group: &NormalizedGroup,
+    base: &NormalizedParticle,
+    wildcard: &NormalizedWildcard,
+) -> bool {
+    let (derived_min, derived_max) = particle_total_occurrence_range(derived);
+    if !occurs_range_is_subset(derived_min, derived_max, base.min_occurs, base.max_occurs) {
+        return false;
+    }
+
+    group_particles_fit_wildcard(&group.particles, wildcard)
+}
+
+fn occurs_range_is_subset(
+    derived_min: u32,
+    derived_max: Option<u32>,
+    base_min: u32,
+    base_max: Option<u32>,
+) -> bool {
+    if derived_min < base_min {
+        return false;
+    }
+
+    match (derived_max, base_max) {
+        (_, None) => true,
+        (Some(derived), Some(base)) => derived <= base,
+        (None, Some(_)) => false,
+    }
+}
+
+fn expand_choice_branches(particle: &NormalizedParticle) -> Option<Vec<NormalizedParticle>> {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return None;
+    };
+    if group.compositor != Compositor::Choice {
+        return None;
+    }
+
+    Some(
+        group
+            .particles
+            .iter()
+            .map(|child| {
+                let (min_occurs, max_occurs) = multiply_occurs(
+                    particle.min_occurs,
+                    particle.max_occurs,
+                    child.min_occurs,
+                    child.max_occurs,
+                );
+                collapse_single_child_groups(NormalizedParticle {
+                    term: child.term.clone(),
+                    min_occurs,
+                    max_occurs,
+                    source: particle.source.clone().or(child.source.clone()),
+                })
+            })
+            .collect(),
+    )
+}
+
+fn particle_total_occurrence_range(particle: &NormalizedParticle) -> (u32, Option<u32>) {
+    let (term_min, term_max) = match &particle.term {
+        NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => (1, Some(1)),
+        NormalizedParticleTerm::Group(group) => match group.compositor {
+            Compositor::Sequence | Compositor::All => group.particles.iter().fold(
+                (0u32, Some(0u32)),
+                |(acc_min, acc_max), child| {
+                    let (child_min, child_max) = particle_total_occurrence_range(child);
+                    (
+                        acc_min.saturating_add(child_min),
+                        add_optional_occurs(acc_max, child_max),
+                    )
+                },
+            ),
+            Compositor::Choice => {
+                let mut min_total: Option<u32> = None;
+                let mut max_total: Option<Option<u32>> = None;
+                for child in &group.particles {
+                    let (child_min, child_max) = particle_total_occurrence_range(child);
+                    min_total = Some(match min_total {
+                        Some(current) => current.min(child_min),
+                        None => child_min,
+                    });
+                    max_total = Some(match max_total {
+                        Some(current) => max_optional_occurs(current, child_max),
+                        None => child_max,
+                    });
+                }
+                (min_total.unwrap_or(0), max_total.unwrap_or(Some(0)))
+            }
+        },
+    };
+
+    multiply_occurs(particle.min_occurs, particle.max_occurs, term_min, term_max)
+}
+
+fn add_optional_occurs(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+        _ => None,
+    }
+}
+
+fn max_optional_occurs(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        _ => None,
+    }
+}
+
+fn group_particles_fit_wildcard(
+    particles: &[NormalizedParticle],
+    wildcard: &NormalizedWildcard,
+) -> bool {
+    particles
+        .iter()
+        .all(|particle| particle_fits_wildcard(particle, wildcard))
+}
+
+fn particle_fits_wildcard(
+    particle: &NormalizedParticle,
+    wildcard: &NormalizedWildcard,
+) -> bool {
+    if let Some(branches) = expand_choice_branches(particle) {
+        return branches
+            .iter()
+            .all(|branch| particle_fits_wildcard(branch, wildcard));
+    }
+
+    match &particle.term {
+        NormalizedParticleTerm::Element(element) => wildcard_allows_element(element, wildcard),
+        NormalizedParticleTerm::Wildcard(derived_wildcard) => wildcard_restricts(derived_wildcard, wildcard),
+        NormalizedParticleTerm::Group(group) => group_particles_fit_wildcard(&group.particles, wildcard),
+    }
+}
+
+fn sequence_particles_restrict(
+    schema_set: &SchemaSet,
+    derived_particles: &[NormalizedParticle],
+    base_particles: &[NormalizedParticle],
+) -> bool {
+    let mut base_index = 0;
+    for derived in derived_particles {
+        let mut matched = false;
+        while let Some(base) = base_particles.get(base_index) {
+            if particle_restricts(schema_set, derived, base) {
+                matched = true;
+                base_index += 1;
+                break;
+            }
+            if particle_is_emptiable(base) {
+                base_index += 1;
+                continue;
+            }
+            return false;
+        }
+        if !matched {
+            return false;
+        }
+    }
+
+    base_particles[base_index..]
+        .iter()
+        .all(particle_is_emptiable)
+}
+
+fn all_particles_restrict(
+    schema_set: &SchemaSet,
+    derived_particles: &[NormalizedParticle],
+    base_particles: &[NormalizedParticle],
+) -> bool {
+    fn backtrack(
+        schema_set: &SchemaSet,
+        derived_particles: &[NormalizedParticle],
+        base_particles: &[NormalizedParticle],
+        used: &mut [bool],
+        derived_index: usize,
+    ) -> bool {
+        if derived_index == derived_particles.len() {
+            return base_particles
+                .iter()
+                .enumerate()
+                .all(|(index, particle)| used[index] || particle_is_emptiable(particle));
+        }
+
+        for (base_index, base_particle) in base_particles.iter().enumerate() {
+            if used[base_index] || !particle_restricts(schema_set, &derived_particles[derived_index], base_particle) {
+                continue;
+            }
+            used[base_index] = true;
+            if backtrack(schema_set, derived_particles, base_particles, used, derived_index + 1) {
+                return true;
+            }
+            used[base_index] = false;
+        }
+
+        false
+    }
+
+    let mut used = vec![false; base_particles.len()];
+    backtrack(schema_set, derived_particles, base_particles, &mut used, 0)
+}
+
+fn particle_is_emptiable(particle: &NormalizedParticle) -> bool {
+    if particle.min_occurs == 0 {
+        return true;
+    }
+
+    match &particle.term {
+        NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => false,
+        NormalizedParticleTerm::Group(group) => match group.compositor {
+            Compositor::Sequence | Compositor::All => {
+                group.particles.iter().all(particle_is_emptiable)
+            }
+            Compositor::Choice => group.particles.iter().any(particle_is_emptiable),
+        },
+    }
+}
+
+fn wildcard_restricts(derived: &NormalizedWildcard, base: &NormalizedWildcard) -> bool {
+    is_wildcard_ns_subset(
+        &derived.wildcard,
+        derived.target_namespace,
+        &base.wildcard,
+        base.target_namespace,
+    ) && process_contents_strictness(derived.wildcard.process_contents)
+        >= process_contents_strictness(base.wildcard.process_contents)
+}
+
+fn wildcard_allows_element(
+    element: &NormalizedElement,
+    wildcard: &NormalizedWildcard,
+) -> bool {
+    if !wildcard_namespace_matches(
+        &wildcard.wildcard.namespace,
+        element.namespace,
+        wildcard.target_namespace,
+    ) {
+        return false;
+    }
+
+    let excluded_namespace = wildcard
+        .wildcard
+        .not_namespace
+        .iter()
+        .map(|token| token.resolve(wildcard.target_namespace))
+        .any(|namespace| namespace == element.namespace);
+    if excluded_namespace {
+        return false;
+    }
+
+    !wildcard_not_qname_excludes(&wildcard.wildcard.not_qname, element.namespace, element.name)
+}
+
+fn wildcard_namespace_matches(
+    namespace: &WildcardNamespace,
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+) -> bool {
+    match namespace {
+        WildcardNamespace::Any => true,
+        WildcardNamespace::Other => !other_exclusion_set(target_namespace).contains(&element_namespace),
+        WildcardNamespace::TargetNamespace => element_namespace == target_namespace,
+        WildcardNamespace::Local => element_namespace.is_none(),
+        WildcardNamespace::List(tokens) => tokens
+            .iter()
+            .map(|token| token.resolve(target_namespace))
+            .any(|resolved| resolved == element_namespace),
+    }
+}
+
+fn wildcard_not_qname_excludes(
+    not_qname: &[crate::parser::frames::NotQNameItem],
+    namespace: Option<NameId>,
+    local_name: NameId,
+) -> bool {
+    not_qname.iter().any(|item| match item {
+        crate::parser::frames::NotQNameItem::QName {
+            namespace: excluded_ns,
+            local_name: excluded_name,
+        } => *excluded_ns == namespace && *excluded_name == local_name,
+        crate::parser::frames::NotQNameItem::Defined => true,
+        crate::parser::frames::NotQNameItem::DefinedSibling => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -712,7 +1735,6 @@ fn effective_open_content(oc: Option<&OpenContentResult>) -> Option<&OpenContent
 }
 
 /// Map processContents to a strictness level (Strict=2, Lax=1, Skip=0).
-#[cfg(feature = "xsd11")]
 fn process_contents_strictness(pc: ProcessContents) -> u8 {
     match pc {
         ProcessContents::Strict => 2,
@@ -725,7 +1747,6 @@ fn process_contents_strictness(pc: ProcessContents) -> u8 {
 /// `namespace="##other"` maps to `not({target namespace}, absent)`.
 /// The result always contains `None` (absent) and, if the target namespace
 /// is present, also contains `Some(target_ns)`.
-#[cfg(feature = "xsd11")]
 fn other_exclusion_set(target_ns: Option<NameId>) -> Vec<Option<NameId>> {
     match target_ns {
         Some(ns) => vec![Some(ns), None],
@@ -739,7 +1760,6 @@ fn other_exclusion_set(target_ns: Option<NameId>) -> Vec<Option<NameId>> {
 /// Returns `None` for unbounded / complement constraints (`Any`, `Other`)
 /// that cannot be represented as a finite positive set — callers must handle
 /// those structurally.
-#[cfg(feature = "xsd11")]
 fn resolve_ns_set(
     wns: &WildcardNamespace,
     target_ns: Option<NameId>,
@@ -767,7 +1787,6 @@ fn resolve_ns_set(
 ///
 /// processContents is checked separately by the open-content derivation
 /// validators.
-#[cfg(feature = "xsd11")]
 fn is_namespace_subset(
     derived: &WildcardNamespace,
     derived_target_ns: Option<NameId>,
@@ -836,7 +1855,6 @@ fn is_namespace_subset(
 ///
 /// `derived_target_ns` / `base_target_ns` are the effective target namespaces
 /// of the schema documents that contain the derived / base types.
-#[cfg(feature = "xsd11")]
 fn is_wildcard_ns_subset(
     derived: &WildcardResult,
     derived_target_ns: Option<NameId>,
@@ -1785,4 +2803,5 @@ mod tests {
         );
         assert!(!result, "List containing base's target ns must NOT be a subset of ##other");
     }
+
 }

@@ -268,6 +268,7 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
+        validate_all_upa_constraints(schema_set)?;
     }
 
     Ok(stats)
@@ -332,7 +333,72 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
+    validate_all_upa_constraints(schema_set)?;
     Ok((inline_stats, resolution_stats))
+}
+
+fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    for (_, type_def) in schema_set.arenas.complex_types.iter() {
+        let Some(particle) = (match &type_def.content {
+            crate::parser::frames::ComplexContentResult::Complex(content) => content.particle.as_ref(),
+            crate::parser::frames::ComplexContentResult::Empty
+            | crate::parser::frames::ComplexContentResult::Simple(_) => None,
+        }) else {
+            continue;
+        };
+        if !supports_simple_upa_validation(particle) {
+            continue;
+        }
+
+        let matcher = crate::compiler::compile_content_model_matcher(schema_set, type_def)
+            .map_err(|error| {
+                let location = error
+                    .location()
+                    .and_then(|source| schema_set.source_maps.locate(source));
+                crate::error::SchemaError::structural(
+                    "cos-nonambig",
+                    format!("Failed to compile content model for UPA checking: {}", error),
+                    location,
+                )
+            })?;
+
+        match matcher {
+            crate::compiler::ContentModelMatcher::Nfa(nfa) => {
+                crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
+            }
+            crate::compiler::ContentModelMatcher::WithOpenContent { nfa, .. } => {
+                crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
+            }
+            crate::compiler::ContentModelMatcher::AllGroup(_) => {}
+            #[cfg(feature = "xsd11")]
+            crate::compiler::ContentModelMatcher::AllGroupExtension { .. } => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn supports_simple_upa_validation(
+    particle: &crate::parser::frames::ParticleResult,
+) -> bool {
+    if particle.max_occurs != Some(1) {
+        return false;
+    }
+
+    match &particle.term {
+        crate::parser::frames::ParticleTerm::Element(_)
+        | crate::parser::frames::ParticleTerm::Any(_) => true,
+        crate::parser::frames::ParticleTerm::Group(group) => {
+            if group.ref_name.is_some() {
+                return false;
+            }
+
+            group
+                .particles
+                .iter()
+                .all(supports_simple_upa_validation)
+        }
+    }
 }
 
 // ============================================================================

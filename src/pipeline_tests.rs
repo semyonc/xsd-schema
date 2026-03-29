@@ -100,6 +100,484 @@ fn test_load_and_process_inline_simple_type() {
 }
 
 #[test]
+fn test_load_and_process_rejects_invalid_particle_wildcard_restriction() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="urn:test"
+                   xmlns:t="urn:test">
+            <xs:complexType name="Base">
+                <xs:choice>
+                    <xs:any namespace="##any"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="t:Base">
+                        <xs:choice>
+                            <xs:any processContents="lax"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_load_and_process_rejects_upa_conflict() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Ambiguous">
+                <xs:choice>
+                    <xs:element name="a"/>
+                    <xs:element name="a"/>
+                </xs:choice>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "cos-nonambig");
+        }
+        other => panic!("Expected cos-nonambig, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_load_and_process_accepts_sequence_restriction_of_all_group() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:all>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:all>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "all-group restriction should be valid: {:?}", result);
+}
+
+#[test]
+fn test_load_and_process_xsd10_rejects_optional_element_restricting_optional_choice() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence>
+                    <xs:choice minOccurs="0">
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:choice>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err());
+
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_load_and_process_xsd11_allows_optional_element_restricting_optional_choice() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence>
+                    <xs:choice minOccurs="0">
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:choice>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1 optional-choice restriction should be valid: {:?}",
+        result
+    );
+}
+
+// ========================================================================
+// Particle restriction & normalization tests (Phase 3 stabilization)
+// ========================================================================
+
+/// Repeated sequence with non-unit child occurs: sequence{1,2}(b{2,2}).
+/// The guard must let this through so the restriction check can reject it.
+/// (particlesHa147)
+#[test]
+fn test_reject_repeated_sequence_occurs_mismatch() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="base">
+                <xs:choice>
+                    <xs:sequence minOccurs="1" maxOccurs="2">
+                        <xs:element name="b" minOccurs="2" maxOccurs="2"/>
+                    </xs:sequence>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="derived">
+                <xs:complexContent>
+                    <xs:restriction base="base">
+                        <xs:choice>
+                            <xs:element name="b" minOccurs="3" maxOccurs="3"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "b{{3,3}} cannot restrict sequence{{1,2}}(b{{2,2}})");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
+/// Choice branches with non-unit occurs: choice(c1{2,2}, c2).
+/// The restriction check must run and detect that c1{3,3} > c1{2,2}.
+/// (particlesL004)
+#[test]
+fn test_reject_choice_branch_occurs_mismatch() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B">
+                <xs:sequence>
+                    <xs:choice>
+                        <xs:element name="c1" minOccurs="2" maxOccurs="2"/>
+                        <xs:element name="c2"/>
+                    </xs:choice>
+                    <xs:choice minOccurs="1" maxOccurs="3">
+                        <xs:element name="d1"/>
+                        <xs:element name="d2"/>
+                    </xs:choice>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="B">
+                        <xs:sequence>
+                            <xs:element name="c1" minOccurs="3" maxOccurs="3"/>
+                            <xs:element name="d1"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "c1{{3,3}} cannot restrict choice branch c1{{2,2}}");
+}
+
+/// Section 3.8 normalization: flatten nested same-compositor groups with
+/// unit occurs. Base has group-ref creating sequence(sequence{1,1}(r1, r2), ...)
+/// which must be flattened for sequence matching to work. (groupB003)
+#[test]
+fn test_accept_group_ref_restriction_with_flatten() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:group name="g1">
+                <xs:sequence>
+                    <xs:element name="r1"/>
+                    <xs:element name="r2"/>
+                </xs:sequence>
+            </xs:group>
+            <xs:group name="g2">
+                <xs:sequence>
+                    <xs:element name="r3"/>
+                    <xs:element name="r4"/>
+                </xs:sequence>
+            </xs:group>
+            <xs:complexType name="A">
+                <xs:sequence>
+                    <xs:group ref="g1"/>
+                    <xs:group ref="g2" minOccurs="0"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:element name="elem">
+                <xs:complexType>
+                    <xs:complexContent>
+                        <xs:restriction base="A">
+                            <xs:sequence>
+                                <xs:group ref="g1"/>
+                            </xs:sequence>
+                        </xs:restriction>
+                    </xs:complexContent>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "group ref restriction should be valid after flattening: {:?}", result);
+}
+
+/// Pointless particles (maxOccurs=0) must be removed during normalization.
+/// A choice whose branches all have maxOccurs=0 effectively restricts to
+/// empty, which is valid when the base is optional. (mgH014)
+#[test]
+fn test_accept_restriction_with_zero_max_occurs_branch() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="bar">
+                <xs:choice>
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="foo">
+                <xs:complexContent>
+                    <xs:restriction base="bar">
+                        <xs:choice>
+                            <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+                            <xs:element name="e2"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "restriction with maxOccurs=0 branch should be valid: {:?}", result);
+}
+
+/// Restriction where derived is entirely pointless (all maxOccurs=0) against
+/// an optional base wildcard. (particlesJq010)
+#[test]
+fn test_accept_all_zero_restriction_of_optional_wildcard() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:sequence>
+                    <xs:any namespace="##targetNamespace" minOccurs="0"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "all-zero restriction of optional wildcard should be valid: {:?}", result);
+}
+
+/// Empty extension inherits base content. Restricting such a type must see
+/// the inherited content, not just the empty extension body. (Sun combined)
+#[test]
+fn test_accept_restriction_of_empty_extension() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B">
+                <xs:sequence>
+                    <xs:element name="foo" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="De">
+                <xs:complexContent>
+                    <xs:extension base="B"/>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Der">
+                <xs:complexContent>
+                    <xs:restriction base="De">
+                        <xs:sequence>
+                            <xs:element name="foo" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "restriction of empty extension should see inherited content: {:?}", result);
+}
+
+/// Cross-compositor restriction: sequence restricts repeated choice.
+/// The algorithm can't verify this structurally so it must be provisionally
+/// accepted (§3.4.6.3). (particlesV004)
+#[test]
+fn test_accept_sequence_restricting_repeated_choice() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B">
+                <xs:choice minOccurs="0" maxOccurs="2">
+                    <xs:element name="e1" maxOccurs="3"/>
+                    <xs:element name="e2" maxOccurs="3"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="B">
+                        <xs:sequence maxOccurs="1">
+                            <xs:element name="e1" maxOccurs="3"/>
+                            <xs:element name="e2" maxOccurs="3"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "cross-compositor restriction should be provisionally accepted: {:?}", result);
+}
+
+/// Choice-vs-choice restriction where both are optional.  The derived
+/// restricts each branch to maxOccurs=0 — effectively empty.
+/// (particlesIe001)
+#[test]
+fn test_accept_choice_restriction_all_branches_zero() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                   elementFormDefault="qualified">
+            <xs:complexType name="base">
+                <xs:choice minOccurs="0">
+                    <xs:element name="e1" minOccurs="0" maxOccurs="unbounded"/>
+                    <xs:element name="e2" minOccurs="0" maxOccurs="unbounded"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="testing">
+                <xs:complexContent>
+                    <xs:restriction base="x:base">
+                        <xs:choice minOccurs="0">
+                            <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+                            <xs:element name="e2" minOccurs="0" maxOccurs="0"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "choice restriction with all-zero branches should be valid: {:?}", result);
+}
+
+/// recurseAsIfGroup: element restricts base group.  The implicit wrapper
+/// has occurs {1,1} which must satisfy the base group's occurs. This tests
+/// that the outer occurs check is in place.
+#[test]
+fn test_reject_element_restricting_group_with_required_repetition() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="base">
+                <xs:sequence minOccurs="2" maxOccurs="2">
+                    <xs:element name="a"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="derived">
+                <xs:complexContent>
+                    <xs:restriction base="base">
+                        <xs:sequence>
+                            <xs:element name="a"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "derived sequence{{1,1}} cannot restrict base sequence{{2,2}}");
+}
+
+/// Valid same-compositor restriction: sequence restricts sequence with
+/// the derived dropping an optional tail. Basic sanity check.
+#[test]
+fn test_accept_sequence_restriction_dropping_optional() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="base">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="derived">
+                <xs:complexContent>
+                    <xs:restriction base="base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "dropping optional tail should be valid: {:?}", result);
+}
+
+#[test]
 fn test_load_and_process_attribute_with_inline_type() {
     let mut schema_set = SchemaSet::new();
     let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
