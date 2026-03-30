@@ -1501,11 +1501,28 @@ fn find_match_info_in_states(
             if let Some(ref term) = state.term {
                 if term_matches(term, name, namespace, target_ns, subst_groups) {
                     return match term {
-                        NfaTerm::Element { element_key, resolved_type, .. } => MatchInfo {
-                            element_key: *element_key,
-                            resolved_type: *resolved_type,
-                            process_contents: None,
-                        },
+                        NfaTerm::Element {
+                            name: term_name,
+                            namespace: term_ns,
+                            element_key,
+                            resolved_type,
+                        } => {
+                            if *term_name == name && *term_ns == namespace {
+                                // Direct match — return term's declaration info
+                                MatchInfo {
+                                    element_key: *element_key,
+                                    resolved_type: *resolved_type,
+                                    process_contents: None,
+                                }
+                            } else {
+                                // Substitution match — let runtime resolve the actual member
+                                MatchInfo {
+                                    element_key: None,
+                                    resolved_type: None,
+                                    process_contents: None,
+                                }
+                            }
+                        }
                         NfaTerm::Wildcard { process_contents, .. } => MatchInfo {
                             element_key: None,
                             resolved_type: None,
@@ -1710,6 +1727,102 @@ mod tests {
             None,
             Some(&map)
         ));
+    }
+
+    #[test]
+    fn test_find_match_info_substitution_returns_none_for_head_key() {
+        // When a member matches via substitution group, find_match_info should
+        // return element_key: None (not the head's key) so the runtime resolves
+        // the actual member declaration via lookup_element.
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        let mut head_data = element_data(head_name);
+        head_data.is_abstract = true;
+        let head_key = schema_set.arenas.alloc_element(head_data);
+        let member_key = schema_set.arenas.alloc_element(element_data(member_name));
+
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let map = build_substitution_group_map(&schema_set);
+
+        // Build a simple NFA: start --[head]--> accept
+        let builder = crate::compiler::fragment::FragmentBuilder::new();
+        let frag = builder.single_term(
+            NfaTerm::element(head_name, None, Some(head_key)),
+            None,
+        );
+        let nfa = crate::compiler::fragment::fragment_to_table(frag);
+        let active = ActiveStates::from_nfa(&nfa);
+
+        // Match with member name — should return element_key: None
+        let mi = active.find_match_info(&nfa, member_name, None, None, Some(&map));
+        assert!(
+            mi.element_key.is_none(),
+            "substitution match should not return head's element_key"
+        );
+        assert!(mi.resolved_type.is_none());
+
+        // Abstract head's own name doesn't match (excluded from subst map,
+        // and subst map lookup short-circuits before direct name comparison)
+        let mi_head = active.find_match_info(&nfa, head_name, None, None, Some(&map));
+        assert!(
+            mi_head.element_key.is_none(),
+            "abstract head should not match its own name via subst map"
+        );
+    }
+
+    #[test]
+    fn test_find_match_info_direct_match_returns_element_key() {
+        // When a non-abstract head matches directly, find_match_info should
+        // return the term's element_key.
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let member_name = schema_set.name_table.add("member");
+
+        // Non-abstract head
+        let head_key = schema_set.arenas.alloc_element(element_data(head_name));
+        let member_key = schema_set.arenas.alloc_element(element_data(member_name));
+
+        schema_set
+            .arenas
+            .elements
+            .get_mut(member_key)
+            .unwrap()
+            .resolved_substitution_groups
+            .push(head_key);
+
+        let map = build_substitution_group_map(&schema_set);
+
+        let builder = crate::compiler::fragment::FragmentBuilder::new();
+        let frag = builder.single_term(
+            NfaTerm::element(head_name, None, Some(head_key)),
+            None,
+        );
+        let nfa = crate::compiler::fragment::fragment_to_table(frag);
+        let active = ActiveStates::from_nfa(&nfa);
+
+        // Direct match with head name — should return head's element_key
+        let mi = active.find_match_info(&nfa, head_name, None, None, Some(&map));
+        assert_eq!(
+            mi.element_key,
+            Some(head_key),
+            "direct match should return the term's element_key"
+        );
+
+        // Substitution match with member name — should return None
+        let mi_member = active.find_match_info(&nfa, member_name, None, None, Some(&map));
+        assert!(
+            mi_member.element_key.is_none(),
+            "substitution match should not return head's element_key"
+        );
     }
 
     // -----------------------------------------------------------------------

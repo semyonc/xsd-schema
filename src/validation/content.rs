@@ -205,11 +205,26 @@ impl ContentValidatorState {
                     if result == TermMatchResult::Match {
                         if state.accept(model, i) {
                             let info = match &particle.term {
-                                NfaTerm::Element { element_key, resolved_type, .. } => {
-                                    ElementMatchInfo {
-                                        element_key: *element_key,
-                                        resolved_type: *resolved_type,
-                                        process_contents: None,
+                                NfaTerm::Element {
+                                    name: term_name,
+                                    namespace: term_ns,
+                                    element_key,
+                                    resolved_type,
+                                } => {
+                                    if *term_name == name && *term_ns == namespace {
+                                        // Direct match
+                                        ElementMatchInfo {
+                                            element_key: *element_key,
+                                            resolved_type: *resolved_type,
+                                            process_contents: None,
+                                        }
+                                    } else {
+                                        // Substitution match — let runtime resolve
+                                        ElementMatchInfo {
+                                            element_key: None,
+                                            resolved_type: None,
+                                            process_contents: None,
+                                        }
                                     }
                                 }
                                 NfaTerm::Wildcard { process_contents, .. } => {
@@ -263,11 +278,25 @@ impl ContentValidatorState {
                             if result == TermMatchResult::Match {
                                 if state.accept(model, i) {
                                     let info = match &particle.term {
-                                        NfaTerm::Element { element_key, resolved_type, .. } => {
-                                            ElementMatchInfo {
-                                                element_key: *element_key,
-                                                resolved_type: *resolved_type,
-                                                process_contents: None,
+                                        NfaTerm::Element {
+                                            name: term_name,
+                                            namespace: term_ns,
+                                            element_key,
+                                            resolved_type,
+                                        } => {
+                                            if *term_name == name && *term_ns == namespace {
+                                                ElementMatchInfo {
+                                                    element_key: *element_key,
+                                                    resolved_type: *resolved_type,
+                                                    process_contents: None,
+                                                }
+                                            } else {
+                                                // Substitution match — let runtime resolve
+                                                ElementMatchInfo {
+                                                    element_key: None,
+                                                    resolved_type: None,
+                                                    process_contents: None,
+                                                }
                                             }
                                         }
                                         NfaTerm::Wildcard { process_contents, .. } => {

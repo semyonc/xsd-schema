@@ -7436,3 +7436,51 @@ fn test_xml_base_after_xsi_hint_rebases_current_element_hints() {
         "xml:base should rebase earlier hints on the same element"
     );
 }
+
+#[test]
+fn test_substitution_group_abstract_head_no_cvc_elt_2() {
+    // An abstract head element with a concrete substitution group member.
+    // Validating the member should NOT raise cvc-elt.2.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element ref="head"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+            <xs:element name="head" abstract="true" type="xs:string"/>
+            <xs:element name="member" substitutionGroup="head" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    v.validate_element("root", "", None, None, &empty_ns_context());
+    v.validate_end_of_attributes();
+    v.validate_element("member", "", None, None, &empty_ns_context());
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let cvc_elt_2_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
+        .filter(|e| e.constraint == "cvc-elt.2")
+        .collect();
+    assert!(
+        cvc_elt_2_errors.is_empty(),
+        "substitution group member should not trigger cvc-elt.2, got: {:?}",
+        cvc_elt_2_errors
+    );
+    assert!(
+        v.sink.errors.is_empty(),
+        "expected no validation errors, got: {:?}",
+        v.sink.errors
+    );
+}
