@@ -4,15 +4,12 @@
 //! providing a common interface for advancing the content model
 //! and checking completion.
 
-use std::collections::HashSet;
-
 use crate::compiler::{
     AllGroupModel, AllGroupState, OpenContentMode as AllGroupOpenContentMode, TermMatchResult,
     term_matches_with_substitution,
-    NfaTable, NfaTerm, StateId,
-    advance_states, advance_with_priority, epsilon_closure,
-    nfa_term_matches,
+    NfaTable, NfaTerm,
     SubstitutionGroupMap, ContentModelMatcher,
+    ActiveStates,
 };
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::schema::model::XsdVersion;
@@ -52,7 +49,7 @@ pub enum AllGroupExtPhase {
     /// Validating the all-group part (base type particles).
     AllGroup,
     /// Transitioned to the NFA extension part.
-    Nfa(HashSet<StateId>),
+    Nfa(ActiveStates),
 }
 
 /// Unified content model validation state
@@ -65,7 +62,7 @@ pub enum ContentValidatorState {
     /// NFA-based content model (sequence, choice, etc.)
     Nfa {
         nfa: NfaTable,
-        active_states: HashSet<StateId>,
+        active_states: ActiveStates,
         open_content: Option<OpenContentInfo>,
     },
     /// All-group content model (unordered particles)
@@ -100,7 +97,7 @@ impl ContentValidatorState {
                     process_contents: w.process_contents,
                     not_qnames: w.not_qnames,
                 });
-                let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+                let initial = ActiveStates::from_nfa(&nfa);
                 Self::Nfa { nfa, active_states: initial, open_content: oc }
             }
             #[cfg(feature = "xsd11")]
@@ -120,7 +117,7 @@ impl ContentValidatorState {
     ///
     /// Computes the initial epsilon closure from the start state.
     pub fn from_nfa(nfa: NfaTable) -> Self {
-        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let initial = ActiveStates::from_nfa(&nfa);
         ContentValidatorState::Nfa {
             nfa,
             active_states: initial,
@@ -150,26 +147,21 @@ impl ContentValidatorState {
         match self {
             ContentValidatorState::Nfa { nfa, active_states, open_content } => {
                 // First, find the matching element info before advancing
-                let match_info = find_nfa_match_info(
-                    nfa, active_states, name, namespace, target_ns, subst_groups,
+                let mi = active_states.find_match_info(
+                    nfa, name, namespace, target_ns, subst_groups,
                 );
+                let match_info = ElementMatchInfo {
+                    element_key: mi.element_key,
+                    resolved_type: mi.resolved_type,
+                    process_contents: mi.process_contents,
+                };
 
                 let next = match xsd_version {
-                    XsdVersion::V1_0 => advance_states(
-                        nfa,
-                        active_states.iter().copied(),
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
+                    XsdVersion::V1_0 => active_states.clone().advance(
+                        nfa, name, namespace, target_ns, subst_groups,
                     ),
-                    XsdVersion::V1_1 => advance_with_priority(
-                        nfa,
-                        active_states.iter().copied(),
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
+                    XsdVersion::V1_1 => active_states.clone().advance_with_priority(
+                        nfa, name, namespace, target_ns, subst_groups,
                     ),
                 };
                 if next.is_empty() {
@@ -178,7 +170,7 @@ impl ContentValidatorState {
                         let allow = match oc.mode {
                             TypesOpenContentMode::Interleave => true,
                             TypesOpenContentMode::Suffix => {
-                                active_states.iter().any(|&s| nfa.is_accept(s))
+                                active_states.contains_accept(nfa)
                             }
                             TypesOpenContentMode::None => false,
                         };
@@ -295,20 +287,17 @@ impl ContentValidatorState {
                         // No all-group particle matched — if all-group is satisfied,
                         // try transitioning to the extension NFA
                         if state.is_satisfied(model) {
-                            let initial = epsilon_closure(
-                                extension_nfa,
-                                std::iter::once(extension_nfa.start_state),
+                            let initial = ActiveStates::from_nfa(extension_nfa);
+                            let mi = initial.find_match_info(
+                                extension_nfa, name, namespace, target_ns, subst_groups,
                             );
-                            let match_info = find_nfa_match_info(
-                                extension_nfa, &initial, name, namespace, target_ns, subst_groups,
-                            );
-                            let next = advance_with_priority(
-                                extension_nfa,
-                                initial.iter().copied(),
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
+                            let match_info = ElementMatchInfo {
+                                element_key: mi.element_key,
+                                resolved_type: mi.resolved_type,
+                                process_contents: mi.process_contents,
+                            };
+                            let next = initial.advance_with_priority(
+                                extension_nfa, name, namespace, target_ns, subst_groups,
                             );
                             if !next.is_empty() {
                                 *phase = AllGroupExtPhase::Nfa(next);
@@ -343,16 +332,16 @@ impl ContentValidatorState {
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA advancement in extension phase
-                        let match_info = find_nfa_match_info(
-                            extension_nfa, active_states, name, namespace, target_ns, subst_groups,
+                        let mi = active_states.find_match_info(
+                            extension_nfa, name, namespace, target_ns, subst_groups,
                         );
-                        let next = advance_with_priority(
-                            extension_nfa,
-                            active_states.iter().copied(),
-                            name,
-                            namespace,
-                            target_ns,
-                            subst_groups,
+                        let match_info = ElementMatchInfo {
+                            element_key: mi.element_key,
+                            resolved_type: mi.resolved_type,
+                            process_contents: mi.process_contents,
+                        };
+                        let next = active_states.clone().advance_with_priority(
+                            extension_nfa, name, namespace, target_ns, subst_groups,
                         );
                         if next.is_empty() {
                             // Try open content wildcard fallback
@@ -360,7 +349,7 @@ impl ContentValidatorState {
                                 let allow = match oc.mode {
                                     AllGroupOpenContentMode::Interleave => true,
                                     AllGroupOpenContentMode::Suffix => {
-                                        active_states.iter().any(|&s| extension_nfa.is_accept(s))
+                                        active_states.contains_accept(extension_nfa)
                                     }
                                     AllGroupOpenContentMode::None => false,
                                 };
@@ -401,7 +390,7 @@ impl ContentValidatorState {
     pub fn is_complete(&self) -> bool {
         match self {
             ContentValidatorState::Nfa { nfa, active_states, .. } => {
-                active_states.iter().any(|&s| nfa.is_accept(s))
+                active_states.contains_accept(nfa)
             }
             ContentValidatorState::AllGroup { model, state } => {
                 state.is_satisfied(model)
@@ -415,14 +404,11 @@ impl ContentValidatorState {
                 match phase {
                     AllGroupExtPhase::AllGroup => {
                         // Still in all-group phase — extension NFA must accept empty
-                        let initial = epsilon_closure(
-                            extension_nfa,
-                            std::iter::once(extension_nfa.start_state),
-                        );
-                        initial.iter().any(|&s| extension_nfa.is_accept(s))
+                        let initial = ActiveStates::from_nfa(extension_nfa);
+                        initial.contains_accept(extension_nfa)
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
-                        active_states.iter().any(|&s| extension_nfa.is_accept(s))
+                        active_states.contains_accept(extension_nfa)
                     }
                 }
             }
@@ -444,21 +430,11 @@ impl ContentValidatorState {
         match self {
             ContentValidatorState::Nfa { nfa, active_states, open_content } => {
                 let next = match xsd_version {
-                    XsdVersion::V1_0 => advance_states(
-                        nfa,
-                        active_states.iter().copied(),
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
+                    XsdVersion::V1_0 => active_states.clone().advance(
+                        nfa, name, namespace, target_ns, subst_groups,
                     ),
-                    XsdVersion::V1_1 => advance_with_priority(
-                        nfa,
-                        active_states.iter().copied(),
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
+                    XsdVersion::V1_1 => active_states.clone().advance_with_priority(
+                        nfa, name, namespace, target_ns, subst_groups,
                     ),
                 };
                 if !next.is_empty() {
@@ -469,7 +445,7 @@ impl ContentValidatorState {
                     let allow = match oc.mode {
                         TypesOpenContentMode::Interleave => true,
                         TypesOpenContentMode::Suffix => {
-                            active_states.iter().any(|&s| nfa.is_accept(s))
+                            active_states.contains_accept(nfa)
                         }
                         TypesOpenContentMode::None => false,
                     };
@@ -530,17 +506,9 @@ impl ContentValidatorState {
                         }
                         // If all-group is satisfied, check extension NFA start
                         if state.is_satisfied(model) {
-                            let initial = epsilon_closure(
-                                extension_nfa,
-                                std::iter::once(extension_nfa.start_state),
-                            );
-                            let next = advance_with_priority(
-                                extension_nfa,
-                                initial.iter().copied(),
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
+                            let initial = ActiveStates::from_nfa(extension_nfa);
+                            let next = initial.advance_with_priority(
+                                extension_nfa, name, namespace, target_ns, subst_groups,
                             );
                             if !next.is_empty() {
                                 return true;
@@ -569,13 +537,8 @@ impl ContentValidatorState {
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA lookahead
-                        let next = advance_with_priority(
-                            extension_nfa,
-                            active_states.iter().copied(),
-                            name,
-                            namespace,
-                            target_ns,
-                            subst_groups,
+                        let next = active_states.clone().advance_with_priority(
+                            extension_nfa, name, namespace, target_ns, subst_groups,
                         );
                         if !next.is_empty() {
                             return true;
@@ -585,7 +548,7 @@ impl ContentValidatorState {
                             let allow = match oc.mode {
                                 AllGroupOpenContentMode::Interleave => true,
                                 AllGroupOpenContentMode::Suffix => {
-                                    active_states.iter().any(|&s| extension_nfa.is_accept(s))
+                                    active_states.contains_accept(extension_nfa)
                                 }
                                 AllGroupOpenContentMode::None => false,
                             };
@@ -623,46 +586,6 @@ fn open_content_allows(
         && !not_qnames_exclude(not_qnames, namespace, name)
 }
 
-/// Find the ElementMatchInfo from the NFA term that matches the given element
-fn find_nfa_match_info(
-    nfa: &NfaTable,
-    active_states: &HashSet<StateId>,
-    name: NameId,
-    namespace: Option<NameId>,
-    target_ns: Option<NameId>,
-    subst_groups: Option<&SubstitutionGroupMap>,
-) -> ElementMatchInfo {
-    let closure = epsilon_closure(nfa, active_states.iter().copied());
-    for state_id in closure {
-        if let Some(state) = nfa.get_state(state_id) {
-            if let Some(ref term) = state.term {
-                if nfa_term_matches(term, name, namespace, target_ns, subst_groups) {
-                    match term {
-                        NfaTerm::Element { element_key, resolved_type, .. } => {
-                            return ElementMatchInfo {
-                                element_key: *element_key,
-                                resolved_type: *resolved_type,
-                                process_contents: None,
-                            };
-                        }
-                        NfaTerm::Wildcard { process_contents, .. } => {
-                            return ElementMatchInfo {
-                                element_key: None,
-                                resolved_type: None,
-                                process_contents: Some(*process_contents),
-                            };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    ElementMatchInfo {
-        element_key: None,
-        resolved_type: None,
-        process_contents: None,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -932,7 +855,7 @@ mod tests {
             process_contents: ProcessContents::Lax,
             not_qnames: Vec::new(),
         };
-        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
             nfa,
             active_states: initial,
@@ -960,7 +883,7 @@ mod tests {
             process_contents: ProcessContents::Lax,
             not_qnames: Vec::new(),
         };
-        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
             nfa,
             active_states: initial,
@@ -1036,7 +959,7 @@ mod tests {
             process_contents: ProcessContents::Lax,
             not_qnames: Vec::new(),
         };
-        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let initial = ActiveStates::from_nfa(&nfa);
         let state = ContentValidatorState::Nfa {
             nfa,
             active_states: initial,
@@ -1253,7 +1176,7 @@ mod tests {
             process_contents: ProcessContents::Lax,
             not_qnames: vec![(None, excluded)],
         };
-        let initial = epsilon_closure(&nfa, std::iter::once(nfa.start_state));
+        let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
             nfa,
             active_states: initial,

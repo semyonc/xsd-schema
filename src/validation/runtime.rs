@@ -1915,27 +1915,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         match &ev_state.content_state {
             ContentValidatorState::Nfa { nfa, active_states, .. } => {
-                let mut result = Vec::new();
-                let closure =
-                    crate::compiler::epsilon_closure(nfa, active_states.iter().copied());
-                for state_id in closure {
-                    if let Some(state) = nfa.get_state(state_id) {
-                        if let Some(crate::compiler::NfaTerm::Element {
-                            ref name,
-                            ref namespace,
-                            ref element_key,
-                            ..
-                        }) = state.term
-                        {
-                            result.push(ExpectedElement {
-                                local_name: *name,
-                                namespace: *namespace,
-                                element_key: *element_key,
-                            });
-                        }
-                    }
-                }
-                result
+                active_states.expected_element_terms(nfa)
+                    .into_iter()
+                    .map(|(name, namespace, element_key)| ExpectedElement {
+                        local_name: name,
+                        namespace,
+                        element_key,
+                    })
+                    .collect()
             }
             ContentValidatorState::AllGroup { model, state } => {
                 let mut result = Vec::new();
@@ -1987,50 +1974,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         }
                         // If all-group is satisfied, also include extension NFA elements
                         if state.is_satisfied(model) {
-                            let initial = crate::compiler::epsilon_closure(
-                                extension_nfa,
-                                std::iter::once(extension_nfa.start_state),
-                            );
-                            for state_id in initial {
-                                if let Some(nfa_state) = extension_nfa.get_state(state_id) {
-                                    if let Some(crate::compiler::NfaTerm::Element {
-                                        ref name,
-                                        ref namespace,
-                                        ref element_key,
-                                        ..
-                                    }) = nfa_state.term
-                                    {
-                                        result.push(ExpectedElement {
-                                            local_name: *name,
-                                            namespace: *namespace,
-                                            element_key: *element_key,
-                                        });
-                                    }
-                                }
+                            let initial = crate::compiler::ActiveStates::from_nfa(extension_nfa);
+                            for (name, namespace, element_key) in initial.expected_element_terms(extension_nfa) {
+                                result.push(ExpectedElement {
+                                    local_name: name,
+                                    namespace,
+                                    element_key,
+                                });
                             }
                         }
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
-                        let closure = crate::compiler::epsilon_closure(
-                            extension_nfa,
-                            active_states.iter().copied(),
-                        );
-                        for state_id in closure {
-                            if let Some(nfa_state) = extension_nfa.get_state(state_id) {
-                                if let Some(crate::compiler::NfaTerm::Element {
-                                    ref name,
-                                    ref namespace,
-                                    ref element_key,
-                                    ..
-                                }) = nfa_state.term
-                                {
-                                    result.push(ExpectedElement {
-                                        local_name: *name,
-                                        namespace: *namespace,
-                                        element_key: *element_key,
-                                    });
-                                }
-                            }
+                        for (name, namespace, element_key) in active_states.expected_element_terms(extension_nfa) {
+                            result.push(ExpectedElement {
+                                local_name: name,
+                                namespace,
+                                element_key,
+                            });
                         }
                     }
                 }

@@ -739,8 +739,8 @@ impl<'a> CompileContext<'a> {
 
     /// Apply occurrence constraints to a fragment
     ///
-    /// Uses threshold optimization: maxOccurs values > MAX_OCCURS_LIMIT
-    /// are treated as unbounded to avoid NFA state explosion.
+    /// Small maxOccurs are unrolled; large values use counted NFA transitions;
+    /// very large values (> MAX_COUNTED_OCCURS) fall back to unbounded.
     fn apply_occurrences(
         &mut self,
         fragment: NfaFragment,

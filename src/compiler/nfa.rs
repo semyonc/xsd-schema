@@ -13,6 +13,25 @@ use super::substitution::SubstitutionGroupMap;
 /// Unique identifier for NFA states within a table
 pub type StateId = u32;
 
+/// Unique identifier for a counter within an NFA.
+///
+/// u16 is intentional: keeps `TransitionKind` at 4 bytes (vs 8 with u32),
+/// halving transition growth. 65K counters is far beyond any real schema.
+pub type CounterId = u16;
+
+/// Definition of a counter used by counted NFA loops.
+///
+/// Each counter tracks how many times a loop body has been completed.
+/// `min` is the minimum iterations for the exit guard; `max` is the
+/// maximum iterations for the loop guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterDef {
+    /// Minimum completed iterations required to exit
+    pub min: u32,
+    /// Maximum iterations allowed before loop must exit
+    pub max: u32,
+}
+
 /// Complete NFA table for a content model
 ///
 /// Represents a compiled content model as a state machine. The NFA can be used
@@ -25,16 +44,39 @@ pub struct NfaTable {
     pub start_state: StateId,
     /// Accepting state ID (single accept state per Thompson's construction)
     pub accept_state: StateId,
+    /// Counter definitions for counted loops (empty if no counted repeats)
+    pub counter_defs: Vec<CounterDef>,
 }
 
 impl NfaTable {
-    /// Create a new NFA table with the given states
+    /// Create a new NFA table with the given states (no counters)
     pub fn new(states: Vec<NfaState>, start_state: StateId, accept_state: StateId) -> Self {
         Self {
             states,
             start_state,
             accept_state,
+            counter_defs: Vec::new(),
         }
+    }
+
+    /// Create a new NFA table with counters
+    pub fn with_counters(
+        states: Vec<NfaState>,
+        start_state: StateId,
+        accept_state: StateId,
+        counter_defs: Vec<CounterDef>,
+    ) -> Self {
+        Self {
+            states,
+            start_state,
+            accept_state,
+            counter_defs,
+        }
+    }
+
+    /// Check if this NFA has any counted loops
+    pub fn has_counters(&self) -> bool {
+        !self.counter_defs.is_empty()
     }
 
     /// Get a state by ID
@@ -59,19 +101,23 @@ impl NfaTable {
 
     /// Concatenate two NFA tables: self followed by other.
     /// Creates an epsilon transition from self's accept state to other's start state.
+    /// Offsets both state IDs and counter IDs in the second table.
     pub fn concat(mut self, mut other: NfaTable) -> NfaTable {
-        let offset = self.states.len() as StateId;
+        let state_offset = self.states.len() as StateId;
+        let counter_offset = self.counter_defs.len() as CounterId;
         for state in &mut other.states {
-            state.id += offset;
+            state.id += state_offset;
             for trans in &mut state.transitions {
-                trans.target += offset;
+                trans.target += state_offset;
+                trans.kind = trans.kind.offset_counter(counter_offset);
             }
         }
-        let other_start = other.start_state + offset;
+        let other_start = other.start_state + state_offset;
         self.states[self.accept_state as usize].add_epsilon(other_start);
-        let new_accept = other.accept_state + offset;
+        let new_accept = other.accept_state + state_offset;
         self.states.extend(other.states);
-        NfaTable::new(self.states, self.start_state, new_accept)
+        self.counter_defs.extend(other.counter_defs);
+        NfaTable::with_counters(self.states, self.start_state, new_accept, self.counter_defs)
     }
 
     /// Get all transitions from a given state
@@ -278,13 +324,49 @@ pub enum TransitionKind {
     Epsilon,
     /// Consuming transition (requires matching the target state's term)
     Consume,
+    /// Reset a counter to 0 (entering a counted region)
+    CounterReset(CounterId),
+    /// Increment a counter by 1 (completed one loop iteration)
+    CounterIncrement(CounterId),
+    /// Guard: pass only if counter < def.max (loop back)
+    CounterMaxGuard(CounterId),
+    /// Guard: pass only if counter >= def.min (exit loop)
+    CounterMinGuard(CounterId),
+}
+
+impl TransitionKind {
+    /// Check if this transition is epsilon-like (does not consume input).
+    /// All counter transitions are epsilon-like; only `Consume` is not.
+    pub fn is_epsilon_like(&self) -> bool {
+        !matches!(self, TransitionKind::Consume)
+    }
+
+    /// Offset counter IDs by the given amount (for fragment/table composition).
+    /// Returns self unchanged for non-counter transitions.
+    pub fn offset_counter(self, offset: CounterId) -> Self {
+        if offset == 0 {
+            return self;
+        }
+        match self {
+            TransitionKind::CounterReset(c) => TransitionKind::CounterReset(c + offset),
+            TransitionKind::CounterIncrement(c) => TransitionKind::CounterIncrement(c + offset),
+            TransitionKind::CounterMaxGuard(c) => TransitionKind::CounterMaxGuard(c + offset),
+            TransitionKind::CounterMinGuard(c) => TransitionKind::CounterMinGuard(c + offset),
+            other => other,
+        }
+    }
 }
 
 /// Compute the epsilon closure for a set of start states.
+///
+/// Only follows `TransitionKind::Epsilon` transitions. For NFAs with counter
+/// transitions, use `ActiveStates` methods instead — this function will miss
+/// states reachable via counter transitions.
 pub fn epsilon_closure(
     nfa: &NfaTable,
     start_states: impl IntoIterator<Item = StateId>,
 ) -> HashSet<StateId> {
+    debug_assert!(!nfa.has_counters(), "epsilon_closure called on counted NFA; use ActiveStates instead");
     let mut closure = HashSet::new();
     let mut stack: Vec<StateId> = start_states.into_iter().collect();
 
@@ -340,6 +422,9 @@ pub fn term_matches(
 }
 
 /// Advance NFA states by matching an element and applying epsilon closure.
+///
+/// Only handles plain epsilon transitions. For NFAs with counter transitions,
+/// use `ActiveStates::advance` instead.
 pub fn advance_states(
     nfa: &NfaTable,
     start_states: impl IntoIterator<Item = StateId>,
@@ -378,6 +463,9 @@ pub fn advance_states(
 }
 
 /// Advance NFA states with element-over-wildcard priority (XSD 1.1).
+///
+/// Only handles plain epsilon transitions. For NFAs with counter transitions,
+/// use `ActiveStates::advance_with_priority` instead.
 pub fn advance_with_priority(
     nfa: &NfaTable,
     start_states: impl IntoIterator<Item = StateId>,
@@ -431,6 +519,350 @@ pub fn advance_with_priority(
     };
 
     epsilon_closure(nfa, next)
+}
+
+// ---------------------------------------------------------------------------
+// Counter-aware runtime types
+// ---------------------------------------------------------------------------
+
+/// A single NFA configuration with counter values.
+///
+/// Represents one "thread" in the NFA simulation where each counter
+/// has a specific value. Two configs at the same state but different
+/// counter values are distinct.
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct ActiveConfig {
+    pub state_id: StateId,
+    pub counters: Box<[u32]>,
+}
+
+impl ActiveConfig {
+    /// Create an initial config at the given state with all counters at 0.
+    pub fn initial(state_id: StateId, num_counters: usize) -> Self {
+        Self {
+            state_id,
+            counters: vec![0; num_counters].into_boxed_slice(),
+        }
+    }
+
+    /// Clone this config with a different state ID.
+    fn with_state(&self, new_state: StateId) -> Self {
+        Self {
+            state_id: new_state,
+            counters: self.counters.clone(),
+        }
+    }
+
+    /// Clone this config with a different state ID and a modified counter.
+    fn with_counter_set(&self, new_state: StateId, counter_id: CounterId, value: u32) -> Self {
+        let mut new = self.with_state(new_state);
+        new.counters[counter_id as usize] = value;
+        new
+    }
+}
+
+/// Dual-path active state set for NFA simulation.
+///
+/// **Invariant**: values are always closure-closed (epsilon closure has been
+/// applied). All constructors and advance methods enforce this.
+///
+/// - `Simple`: counter-free NFA — delegates to existing `HashSet<StateId>` functions.
+/// - `Counted`: NFA with counters — tracks `HashSet<ActiveConfig>`.
+#[derive(Debug, Clone)]
+pub enum ActiveStates {
+    /// Fast path: no counters in this NFA (bit-identical to old code)
+    Simple(HashSet<StateId>),
+    /// Counted path: configurations carry counter values
+    Counted {
+        configs: HashSet<ActiveConfig>,
+        num_counters: usize,
+    },
+}
+
+impl ActiveStates {
+    /// Create initial active states from an NFA, picking the right variant.
+    pub fn from_nfa(nfa: &NfaTable) -> Self {
+        if nfa.has_counters() {
+            let initial = ActiveConfig::initial(nfa.start_state, nfa.counter_defs.len());
+            let mut configs = HashSet::new();
+            configs.insert(initial);
+            let result = ActiveStates::Counted {
+                configs,
+                num_counters: nfa.counter_defs.len(),
+            };
+            result.epsilon_closure(nfa)
+        } else {
+            let simple = epsilon_closure(nfa, std::iter::once(nfa.start_state));
+            ActiveStates::Simple(simple)
+        }
+    }
+
+    /// Check if the active set is empty (no reachable states).
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ActiveStates::Simple(s) => s.is_empty(),
+            ActiveStates::Counted { configs, .. } => configs.is_empty(),
+        }
+    }
+
+    /// Check if any active state is the NFA accept state.
+    pub fn contains_accept(&self, nfa: &NfaTable) -> bool {
+        match self {
+            ActiveStates::Simple(s) => s.iter().any(|&id| nfa.is_accept(id)),
+            ActiveStates::Counted { configs, .. } => {
+                configs.iter().any(|c| nfa.is_accept(c.state_id))
+            }
+        }
+    }
+
+    /// Compute epsilon closure (including counter transitions for Counted path).
+    pub fn epsilon_closure(self, nfa: &NfaTable) -> Self {
+        match self {
+            ActiveStates::Simple(states) => {
+                ActiveStates::Simple(epsilon_closure(nfa, states))
+            }
+            ActiveStates::Counted { configs, num_counters } => {
+                let mut result: HashSet<ActiveConfig> = HashSet::new();
+                let mut stack: Vec<ActiveConfig> = configs.into_iter().collect();
+
+                while let Some(config) = stack.pop() {
+                    if !result.insert(config.clone()) {
+                        continue;
+                    }
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        for trans in &state.transitions {
+                            let next = match trans.kind {
+                                TransitionKind::Epsilon => {
+                                    Some(config.with_state(trans.target))
+                                }
+                                TransitionKind::CounterReset(c) => {
+                                    Some(config.with_counter_set(trans.target, c, 0))
+                                }
+                                TransitionKind::CounterIncrement(c) => {
+                                    let val = config.counters[c as usize] + 1;
+                                    Some(config.with_counter_set(trans.target, c, val))
+                                }
+                                TransitionKind::CounterMaxGuard(c) => {
+                                    if config.counters[c as usize] < nfa.counter_defs[c as usize].max {
+                                        Some(config.with_state(trans.target))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                TransitionKind::CounterMinGuard(c) => {
+                                    if config.counters[c as usize] >= nfa.counter_defs[c as usize].min {
+                                        // Canonicalize: zero out counter on exit to collapse
+                                        // configs that left the loop at different counter values.
+                                        Some(config.with_counter_set(trans.target, c, 0))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                TransitionKind::Consume => None,
+                            };
+                            if let Some(next_config) = next {
+                                if !result.contains(&next_config) {
+                                    stack.push(next_config);
+                                }
+                            }
+                        }
+                    }
+                }
+                ActiveStates::Counted { configs: result, num_counters }
+            }
+        }
+    }
+
+    /// Advance NFA states by matching an element (XSD 1.0 — no priority).
+    pub fn advance(
+        self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+    ) -> Self {
+        match self {
+            ActiveStates::Simple(states) => {
+                ActiveStates::Simple(advance_states(
+                    nfa, states, element_name, element_namespace,
+                    target_namespace, substitution_groups,
+                ))
+            }
+            ActiveStates::Counted { configs, num_counters } => {
+                // Configs are already closure-closed (invariant).
+                // Find matching terms and follow Consume transitions.
+                let mut next_configs = HashSet::new();
+                for config in &configs {
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(term_val, element_name, element_namespace,
+                                target_namespace, substitution_groups) {
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        next_configs.insert(config.with_state(trans.target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = ActiveStates::Counted { configs: next_configs, num_counters };
+                result.epsilon_closure(nfa)
+            }
+        }
+    }
+
+    /// Advance NFA states with element-over-wildcard priority (XSD 1.1).
+    pub fn advance_with_priority(
+        self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+    ) -> Self {
+        match self {
+            ActiveStates::Simple(states) => {
+                ActiveStates::Simple(advance_with_priority(
+                    nfa, states, element_name, element_namespace,
+                    target_namespace, substitution_groups,
+                ))
+            }
+            ActiveStates::Counted { configs, num_counters } => {
+                let mut element_configs = HashSet::new();
+                let mut wildcard_configs = HashSet::new();
+
+                for config in &configs {
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(term_val, element_name, element_namespace,
+                                target_namespace, substitution_groups) {
+                                let target_set = match term_val {
+                                    NfaTerm::Element { .. } => &mut element_configs,
+                                    NfaTerm::Wildcard { .. } => &mut wildcard_configs,
+                                };
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        target_set.insert(config.with_state(trans.target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next = if !element_configs.is_empty() {
+                    element_configs
+                } else {
+                    wildcard_configs
+                };
+
+                let result = ActiveStates::Counted { configs: next, num_counters };
+                result.epsilon_closure(nfa)
+            }
+        }
+    }
+
+    /// Find the matching term info from active states (for content validation).
+    ///
+    /// Returns the element key and resolved type of the first matching term.
+    /// Since ActiveStates is closure-closed, all reachable term states are
+    /// already present — no additional epsilon closure needed for Counted path.
+    pub fn find_match_info(
+        &self,
+        nfa: &NfaTable,
+        name: NameId,
+        namespace: Option<NameId>,
+        target_ns: Option<NameId>,
+        subst_groups: Option<&SubstitutionGroupMap>,
+    ) -> MatchInfo {
+        match self {
+            ActiveStates::Simple(states) => {
+                // Delegate to existing function (it does epsilon_closure internally,
+                // which is redundant but harmless since states are already closed)
+                let closure = epsilon_closure(nfa, states.iter().copied());
+                find_match_info_in_states(nfa, closure.iter().copied(), name, namespace, target_ns, subst_groups)
+            }
+            ActiveStates::Counted { configs, .. } => {
+                // Configs are closure-closed — iterate directly
+                find_match_info_in_states(nfa, configs.iter().map(|c| c.state_id), name, namespace, target_ns, subst_groups)
+            }
+        }
+    }
+
+    /// Collect expected element terms from reachable states (for error messages).
+    ///
+    /// Returns (local_name, namespace, element_key) for each reachable Element term.
+    pub fn expected_element_terms(&self, nfa: &NfaTable) -> Vec<(NameId, Option<NameId>, Option<ElementKey>)> {
+        let mut result = Vec::new();
+        match self {
+            ActiveStates::Simple(states) => {
+                let closure = epsilon_closure(nfa, states.iter().copied());
+                for state_id in closure {
+                    if let Some(state) = nfa.get_state(state_id) {
+                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                            result.push((*name, *namespace, *element_key));
+                        }
+                    }
+                }
+            }
+            ActiveStates::Counted { configs, .. } => {
+                let mut seen = HashSet::new();
+                for config in configs {
+                    if !seen.insert(config.state_id) {
+                        continue; // Skip duplicate state IDs
+                    }
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                            result.push((*name, *namespace, *element_key));
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+/// Match info returned from term lookup in active states.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MatchInfo {
+    pub element_key: Option<ElementKey>,
+    pub resolved_type: Option<TypeKey>,
+    pub process_contents: Option<ProcessContents>,
+}
+
+/// Find match info from an iterator of state IDs.
+fn find_match_info_in_states(
+    nfa: &NfaTable,
+    state_ids: impl Iterator<Item = StateId>,
+    name: NameId,
+    namespace: Option<NameId>,
+    target_ns: Option<NameId>,
+    subst_groups: Option<&SubstitutionGroupMap>,
+) -> MatchInfo {
+    for state_id in state_ids {
+        if let Some(state) = nfa.get_state(state_id) {
+            if let Some(ref term) = state.term {
+                if term_matches(term, name, namespace, target_ns, subst_groups) {
+                    return match term {
+                        NfaTerm::Element { element_key, resolved_type, .. } => MatchInfo {
+                            element_key: *element_key,
+                            resolved_type: *resolved_type,
+                            process_contents: None,
+                        },
+                        NfaTerm::Wildcard { process_contents, .. } => MatchInfo {
+                            element_key: None,
+                            resolved_type: None,
+                            process_contents: Some(*process_contents),
+                        },
+                    };
+                }
+            }
+        }
+    }
+    MatchInfo::default()
 }
 
 #[cfg(test)]
@@ -624,5 +1056,248 @@ mod tests {
             None,
             Some(&map)
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Counted NFA tests
+    // -----------------------------------------------------------------------
+
+    use crate::compiler::fragment::{FragmentBuilder, fragment_to_table};
+
+    /// Build a counted NFA for element `a{min,max}` and return (nfa, name_id).
+    fn make_counted_element_nfa(min: u32, max: u32) -> (NfaTable, NameId) {
+        let name = NameId(100);
+        let mut builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(name, None, None), None);
+        let counted = frag.repeat_counted(min, max);
+        let nfa = fragment_to_table(counted);
+        (nfa, name)
+    }
+
+    fn advance_n(active: ActiveStates, nfa: &NfaTable, name: NameId, n: usize) -> ActiveStates {
+        let mut state = active;
+        for _ in 0..n {
+            state = state.advance(nfa, name, None, None, None);
+        }
+        state
+    }
+
+    #[test]
+    fn test_counted_nfa_has_counters() {
+        let (nfa, _) = make_counted_element_nfa(2, 5);
+        assert!(nfa.has_counters());
+        assert_eq!(nfa.counter_defs.len(), 1);
+        assert_eq!(nfa.counter_defs[0].min, 2);
+        assert_eq!(nfa.counter_defs[0].max, 5);
+        // Counted NFA: body(2 states) + entry + guard + exit = 5 states
+        assert_eq!(nfa.state_count(), 5);
+    }
+
+    #[test]
+    fn test_counted_nfa_compact_state_count() {
+        // Large maxOccurs should NOT create many states
+        let (nfa, _) = make_counted_element_nfa(0, 1000);
+        assert_eq!(nfa.state_count(), 5); // Still just 5 states
+    }
+
+    #[test]
+    fn test_counted_active_states_is_counted_variant() {
+        let (nfa, _) = make_counted_element_nfa(2, 5);
+        let active = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(active, ActiveStates::Counted { .. }));
+    }
+
+    #[test]
+    fn test_counted_element_a_3_5() {
+        let (nfa, a) = make_counted_element_nfa(3, 5);
+
+        // 2 occurrences: not complete, would accept more
+        let s2 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 2);
+        assert!(!s2.is_empty());
+        assert!(!s2.contains_accept(&nfa));
+
+        // 3 occurrences: complete (min satisfied)
+        let s3 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 3);
+        assert!(s3.contains_accept(&nfa));
+
+        // 4 occurrences: still complete
+        let s4 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 4);
+        assert!(s4.contains_accept(&nfa));
+
+        // 5 occurrences: complete (max)
+        let s5 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 5);
+        assert!(s5.contains_accept(&nfa));
+
+        // 6 occurrences: rejected (past max)
+        let s6 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 6);
+        assert!(s6.is_empty());
+    }
+
+    #[test]
+    fn test_counted_element_a_0_100() {
+        let (nfa, a) = make_counted_element_nfa(0, 100);
+
+        // 0 occurrences: complete (min=0)
+        let s0 = ActiveStates::from_nfa(&nfa);
+        assert!(s0.contains_accept(&nfa));
+
+        // 100 occurrences: complete (max)
+        let s100 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 100);
+        assert!(s100.contains_accept(&nfa));
+
+        // 101 occurrences: rejected
+        let s101 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 101);
+        assert!(s101.is_empty());
+    }
+
+    #[test]
+    fn test_counted_element_exact_17() {
+        let (nfa, a) = make_counted_element_nfa(17, 17);
+
+        // 16: not complete
+        let s16 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 16);
+        assert!(!s16.contains_accept(&nfa));
+
+        // 17: complete
+        let s17 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 17);
+        assert!(s17.contains_accept(&nfa));
+
+        // 18: rejected
+        let s18 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 18);
+        assert!(s18.is_empty());
+    }
+
+    #[test]
+    fn test_counted_sequence_a_b() {
+        // Build a{2,50} followed by b
+        let a = NameId(100);
+        let b = NameId(200);
+        let mut builder = FragmentBuilder::new();
+
+        let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
+        let counted_a = frag_a.repeat_counted(2, 50);
+
+        let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
+        let seq = counted_a.concat(frag_b);
+        let nfa = fragment_to_table(seq);
+
+        assert!(nfa.has_counters());
+
+        // 1 a + b: should fail (min=2 not satisfied)
+        let s = ActiveStates::from_nfa(&nfa);
+        let s = s.advance(&nfa, a, None, None, None); // 1 a
+        let s = s.advance(&nfa, b, None, None, None); // b
+        assert!(!s.contains_accept(&nfa)); // min not satisfied
+
+        // 2 a + b: should succeed
+        let s = ActiveStates::from_nfa(&nfa);
+        let s = advance_n(s, &nfa, a, 2);
+        let s = s.advance(&nfa, b, None, None, None);
+        assert!(s.contains_accept(&nfa));
+
+        // 50 a + b: should succeed
+        let s = ActiveStates::from_nfa(&nfa);
+        let s = advance_n(s, &nfa, a, 50);
+        let s = s.advance(&nfa, b, None, None, None);
+        assert!(s.contains_accept(&nfa));
+
+        // 51 a: should be rejected
+        let s = ActiveStates::from_nfa(&nfa);
+        let s = advance_n(s, &nfa, a, 51);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn test_dead_counter_collapse() {
+        // (a?){0,200} followed by b
+        // After the nullable loop exits, all configs should collapse at b.
+        let a = NameId(100);
+        let b = NameId(200);
+        let mut builder = FragmentBuilder::new();
+
+        // Build a? (optional element)
+        let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
+        let opt_a = frag_a.optional();
+
+        // Counted loop: (a?){0,200}
+        let counted = opt_a.repeat_counted(0, 200);
+
+        // Followed by b
+        let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
+        let seq = counted.concat(frag_b);
+        let nfa = fragment_to_table(seq);
+
+        // Initial state should be complete (min=0 loop can be skipped)
+        let initial = ActiveStates::from_nfa(&nfa);
+
+        // After advancing with b (skipping the loop entirely), should accept
+        let after_b = initial.clone().advance(&nfa, b, None, None, None);
+        assert!(after_b.contains_accept(&nfa));
+
+        // Check that configs at b are O(1), not O(200).
+        // The counter canonicalization on exit should collapse them.
+        if let ActiveStates::Counted { configs, .. } = &after_b {
+            // After accepting b, we should have very few configs
+            // (typically 1 — at the accept state with zeroed counters)
+            assert!(
+                configs.len() <= 5,
+                "Expected collapsed configs after loop exit, got {}",
+                configs.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_counted_exact_prefix_plus_star() {
+        // a{17,unbounded}: counted exact(17) + star
+        // Built via apply_occurs to test the dispatch
+        use crate::compiler::particle::{apply_occurs, MaxOccurs};
+
+        let a = NameId(100);
+        let mut builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(a, None, None), None);
+        let result = apply_occurs(frag, 17, MaxOccurs::Unbounded);
+        let nfa = fragment_to_table(result);
+
+        // Should use counted path (has counters for the prefix)
+        assert!(nfa.has_counters());
+        // Should be compact — NOT 17*2 = 34 states from unrolling
+        assert!(nfa.state_count() < 15, "expected compact NFA, got {} states", nfa.state_count());
+
+        // 16 occurrences: not complete (min=17)
+        let s16 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 16);
+        assert!(!s16.contains_accept(&nfa));
+
+        // 17 occurrences: complete
+        let s17 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 17);
+        assert!(s17.contains_accept(&nfa));
+
+        // 100 occurrences: still complete (unbounded)
+        let s100 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 100);
+        assert!(s100.contains_accept(&nfa));
+    }
+
+    #[test]
+    fn test_is_epsilon_like() {
+        assert!(TransitionKind::Epsilon.is_epsilon_like());
+        assert!(!TransitionKind::Consume.is_epsilon_like());
+        assert!(TransitionKind::CounterReset(0).is_epsilon_like());
+        assert!(TransitionKind::CounterIncrement(0).is_epsilon_like());
+        assert!(TransitionKind::CounterMaxGuard(0).is_epsilon_like());
+        assert!(TransitionKind::CounterMinGuard(0).is_epsilon_like());
+    }
+
+    #[test]
+    fn test_offset_counter() {
+        assert_eq!(
+            TransitionKind::CounterReset(0).offset_counter(3),
+            TransitionKind::CounterReset(3)
+        );
+        assert_eq!(
+            TransitionKind::CounterIncrement(2).offset_counter(5),
+            TransitionKind::CounterIncrement(7)
+        );
+        assert_eq!(TransitionKind::Epsilon.offset_counter(10), TransitionKind::Epsilon);
+        assert_eq!(TransitionKind::Consume.offset_counter(10), TransitionKind::Consume);
     }
 }

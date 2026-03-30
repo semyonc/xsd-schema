@@ -3,18 +3,25 @@
 //! This module implements occurrence constraint handling for XSD particles
 //! (minOccurs/maxOccurs) with optimization for large maxOccurs values.
 //!
-//! Following the Delphi implementation, maxOccurs values greater than
-//! MAX_OCCURS_LIMIT are treated as unbounded to avoid NFA state explosion.
+//! For small maxOccurs (≤ COUNTED_THRESHOLD), NFA fragments are unrolled
+//! (cloned). For larger values (up to MAX_COUNTED_OCCURS), counted NFA
+//! transitions are used for O(1) state overhead. Values above
+//! MAX_COUNTED_OCCURS are treated as unbounded.
 
 use super::fragment::NfaFragment;
-use super::nfa::NfaTerm;
+
+/// Threshold above which counted NFA is used instead of unrolling.
+///
+/// Values ≤ this threshold are unrolled (cloned fragments).
+/// Values above use counted transitions with O(1) extra states.
+pub const COUNTED_THRESHOLD: u32 = 16;
 
 /// Maximum maxOccurs value before treating as unbounded.
 ///
-/// Matches the Delphi implementation threshold (MaxOccursLimit = 100).
-/// For maxOccurs > 100, the NFA compilation treats it as unbounded
-/// to avoid creating excessive states.
-pub const MAX_OCCURS_LIMIT: u32 = 100;
+/// Values above this cap fall back to unbounded treatment to bound the
+/// O(maxOccurs) cost of epsilon closure for nullable loop bodies.
+/// Raises the correctness ceiling from the old limit of 100 to 10000.
+pub const MAX_COUNTED_OCCURS: u32 = 10_000;
 
 /// MaxOccurs value representation
 ///
@@ -49,13 +56,14 @@ impl MaxOccurs {
     ///
     /// Returns true if:
     /// - The value is explicitly Unbounded, or
-    /// - The bounded value exceeds MAX_OCCURS_LIMIT
+    /// - The bounded value exceeds MAX_COUNTED_OCCURS
     ///
-    /// This optimization prevents NFA state explosion for large maxOccurs.
+    /// Values up to MAX_COUNTED_OCCURS are handled exactly by counted NFA.
+    /// Values above fall back to unbounded to bound runtime cost.
     pub fn is_effectively_unbounded(&self) -> bool {
         match self {
             MaxOccurs::Unbounded => true,
-            MaxOccurs::Bounded(n) => *n > MAX_OCCURS_LIMIT,
+            MaxOccurs::Bounded(n) => *n > MAX_COUNTED_OCCURS,
         }
     }
 
@@ -71,20 +79,11 @@ impl Default for MaxOccurs {
     }
 }
 
-/// Apply occurrence constraints with threshold optimization.
+/// Apply occurrence constraints with threshold-based dispatch.
 ///
-/// For maxOccurs > MAX_OCCURS_LIMIT, treats as unbounded to avoid state explosion.
-/// This matches the Delphi implementation behavior.
-///
-/// # Arguments
-///
-/// * `frag` - The NFA fragment to apply occurrence constraints to
-/// * `min` - Minimum occurrences (minOccurs)
-/// * `max` - Maximum occurrences (maxOccurs)
-///
-/// # Returns
-///
-/// A new NfaFragment with occurrence constraints applied
+/// - Small bounded (≤ COUNTED_THRESHOLD): unroll via repeat_range
+/// - Large bounded (≤ MAX_COUNTED_OCCURS): counted NFA via repeat_counted
+/// - Unbounded or > MAX_COUNTED_OCCURS: Kleene star via repeat_range
 pub fn apply_occurs(frag: NfaFragment, min: u32, max: MaxOccurs) -> NfaFragment {
     let effective_max = if max.is_effectively_unbounded() {
         None // Treat as unbounded
@@ -92,76 +91,27 @@ pub fn apply_occurs(frag: NfaFragment, min: u32, max: MaxOccurs) -> NfaFragment 
         max.to_option()
     };
 
-    frag.repeat_range(min, effective_max)
-}
-
-/// Counter-based particle matcher for validation.
-///
-/// Used during validation to track occurrence counts, especially for
-/// particles where maxOccurs was treated as unbounded during NFA compilation
-/// but strict enforcement is still needed.
-///
-/// This struct is prepared for Task 4.7 (NFA Validation Helpers).
-#[derive(Debug, Clone)]
-pub struct CountedParticle {
-    /// The term being matched
-    pub term: NfaTerm,
-    /// Minimum required occurrences
-    pub min_occurs: u32,
-    /// Maximum allowed occurrences
-    pub max_occurs: MaxOccurs,
-    /// Current occurrence count
-    current_count: u32,
-}
-
-impl CountedParticle {
-    /// Create a new counted particle
-    pub fn new(term: NfaTerm, min_occurs: u32, max_occurs: MaxOccurs) -> Self {
-        Self {
-            term,
-            min_occurs,
-            max_occurs,
-            current_count: 0,
+    match effective_max {
+        // Unbounded with large min → counted exact prefix + star tail
+        None if min > COUNTED_THRESHOLD => {
+            frag.clone().repeat_counted(min, min).concat(frag.repeat_star())
         }
-    }
-
-    /// Check if the particle can accept another occurrence.
-    ///
-    /// Returns true if we haven't reached the maximum yet.
-    pub fn can_accept(&self) -> bool {
-        match self.max_occurs {
-            MaxOccurs::Unbounded => true,
-            MaxOccurs::Bounded(max) => self.current_count < max,
+        // Unbounded with small min → existing unroll via repeat_range (star/plus)
+        None => frag.repeat_range(min, None),
+        // Small bounded → existing unroll via repeat_range
+        Some(m) if m <= COUNTED_THRESHOLD => frag.repeat_range(min, Some(m)),
+        // Large bounded → counted construction
+        Some(m) if min == 0 => frag.repeat_counted(0, m),
+        Some(m) if min <= COUNTED_THRESHOLD => {
+            frag.clone().repeat_exact(min).concat(frag.repeat_counted(0, m - min))
         }
-    }
-
-    /// Check if the minimum occurrence requirement is satisfied.
-    ///
-    /// Returns true if we've matched at least minOccurs times.
-    pub fn is_satisfied(&self) -> bool {
-        self.current_count >= self.min_occurs
-    }
-
-    /// Accept one occurrence, incrementing the counter.
-    pub fn accept(&mut self) {
-        self.current_count += 1;
-    }
-
-    /// Get the current occurrence count.
-    pub fn count(&self) -> u32 {
-        self.current_count
-    }
-
-    /// Reset the counter for a new validation run.
-    pub fn reset(&mut self) {
-        self.current_count = 0;
+        Some(m) => frag.repeat_counted(min, m),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::NameId;
 
     #[test]
     fn test_max_occurs_from_option() {
@@ -177,13 +127,14 @@ mod tests {
 
     #[test]
     fn test_max_occurs_effectively_unbounded() {
-        // Below threshold - NOT effectively unbounded
+        // Below MAX_COUNTED_OCCURS - NOT effectively unbounded
         assert!(!MaxOccurs::Bounded(50).is_effectively_unbounded());
         assert!(!MaxOccurs::Bounded(100).is_effectively_unbounded());
+        assert!(!MaxOccurs::Bounded(1000).is_effectively_unbounded());
+        assert!(!MaxOccurs::Bounded(MAX_COUNTED_OCCURS).is_effectively_unbounded());
 
-        // Above threshold - effectively unbounded
-        assert!(MaxOccurs::Bounded(101).is_effectively_unbounded());
-        assert!(MaxOccurs::Bounded(1000).is_effectively_unbounded());
+        // Above MAX_COUNTED_OCCURS - effectively unbounded
+        assert!(MaxOccurs::Bounded(MAX_COUNTED_OCCURS + 1).is_effectively_unbounded());
 
         // Explicitly unbounded
         assert!(MaxOccurs::Unbounded.is_effectively_unbounded());
@@ -192,69 +143,5 @@ mod tests {
     #[test]
     fn test_max_occurs_default() {
         assert_eq!(MaxOccurs::default(), MaxOccurs::Bounded(1));
-    }
-
-    #[test]
-    fn test_counted_particle_new() {
-        let term = NfaTerm::element(NameId(1), None, None);
-        let cp = CountedParticle::new(term, 2, MaxOccurs::Bounded(5));
-
-        assert_eq!(cp.min_occurs, 2);
-        assert_eq!(cp.max_occurs, MaxOccurs::Bounded(5));
-        assert_eq!(cp.count(), 0);
-    }
-
-    #[test]
-    fn test_counted_particle_can_accept() {
-        let term = NfaTerm::element(NameId(1), None, None);
-        let mut cp = CountedParticle::new(term, 1, MaxOccurs::Bounded(3));
-
-        assert!(cp.can_accept()); // 0 < 3
-        cp.accept();
-        assert!(cp.can_accept()); // 1 < 3
-        cp.accept();
-        assert!(cp.can_accept()); // 2 < 3
-        cp.accept();
-        assert!(!cp.can_accept()); // 3 >= 3
-    }
-
-    #[test]
-    fn test_counted_particle_unbounded_always_accepts() {
-        let term = NfaTerm::element(NameId(1), None, None);
-        let mut cp = CountedParticle::new(term, 1, MaxOccurs::Unbounded);
-
-        for _ in 0..1000 {
-            assert!(cp.can_accept());
-            cp.accept();
-        }
-        assert!(cp.can_accept()); // Still accepting
-    }
-
-    #[test]
-    fn test_counted_particle_is_satisfied() {
-        let term = NfaTerm::element(NameId(1), None, None);
-        let mut cp = CountedParticle::new(term, 2, MaxOccurs::Bounded(5));
-
-        assert!(!cp.is_satisfied()); // 0 < 2
-        cp.accept();
-        assert!(!cp.is_satisfied()); // 1 < 2
-        cp.accept();
-        assert!(cp.is_satisfied()); // 2 >= 2
-        cp.accept();
-        assert!(cp.is_satisfied()); // 3 >= 2
-    }
-
-    #[test]
-    fn test_counted_particle_reset() {
-        let term = NfaTerm::element(NameId(1), None, None);
-        let mut cp = CountedParticle::new(term, 2, MaxOccurs::Bounded(5));
-
-        cp.accept();
-        cp.accept();
-        assert_eq!(cp.count(), 2);
-
-        cp.reset();
-        assert_eq!(cp.count(), 0);
-        assert!(!cp.is_satisfied());
     }
 }

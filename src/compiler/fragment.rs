@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::parser::location::SourceRef;
 
-use super::nfa::{NfaState, NfaTable, NfaTerm, StateId};
+use super::nfa::{CounterDef, CounterId, NfaState, NfaTable, NfaTerm, StateId, TransitionKind};
 
 /// A composable NFA fragment with single entry and exit points
 ///
@@ -23,14 +23,28 @@ pub struct NfaFragment {
     pub start: usize,
     /// Exit point state index (into states vector)
     pub end: usize,
+    /// Counter definitions for counted loops within this fragment
+    pub counter_defs: Vec<CounterDef>,
 }
 
 impl NfaFragment {
-    /// Create a new fragment from states with specified start/end
+    /// Create a new fragment from states with specified start/end (no counters)
     pub fn new(states: Vec<NfaState>, start: usize, end: usize) -> Self {
         debug_assert!(start < states.len(), "start index out of bounds");
         debug_assert!(end < states.len(), "end index out of bounds");
-        Self { states, start, end }
+        Self { states, start, end, counter_defs: Vec::new() }
+    }
+
+    /// Create a new fragment with counter definitions
+    pub fn with_counters(
+        states: Vec<NfaState>,
+        start: usize,
+        end: usize,
+        counter_defs: Vec<CounterDef>,
+    ) -> Self {
+        debug_assert!(start < states.len(), "start index out of bounds");
+        debug_assert!(end < states.len(), "end index out of bounds");
+        Self { states, start, end, counter_defs }
     }
 
     /// Normalize state IDs so that each state's ID matches its position in
@@ -82,29 +96,28 @@ impl NfaFragment {
         self.normalize_ids();
         other.normalize_ids();
 
-        let offset = self.states.len();
+        let state_offset = self.states.len();
+        let counter_offset = self.counter_defs.len() as CounterId;
 
-        // Offset all state IDs in other fragment
+        // Offset all state IDs and counter IDs in other fragment
         for state in &mut other.states {
-            state.id += offset as StateId;
+            state.id += state_offset as StateId;
             for trans in &mut state.transitions {
-                trans.target += offset as StateId;
+                trans.target += state_offset as StateId;
+                trans.kind = trans.kind.offset_counter(counter_offset);
             }
         }
 
         // Add epsilon transition from self.end to other.start
-        let other_start = other.start + offset;
+        let other_start = other.start + state_offset;
         self.states[self.end].add_epsilon(other_start as StateId);
 
-        // Merge states
-        let new_end = other.end + offset;
+        // Merge states and counter defs
+        let new_end = other.end + state_offset;
         self.states.extend(other.states);
+        self.counter_defs.extend(other.counter_defs);
 
-        NfaFragment {
-            states: self.states,
-            start: self.start,
-            end: new_end,
-        }
+        NfaFragment::with_counters(self.states, self.start, new_end, self.counter_defs)
     }
 
     /// Alternate two fragments: self | other
@@ -123,34 +136,35 @@ impl NfaFragment {
         let mut new_start = NfaState::epsilon(new_start_id, None);
         let new_end = NfaState::epsilon(new_end_id, None);
 
-        // Offset other fragment's state IDs
-        let other_offset = self.states.len();
+        // Offset other fragment's state IDs and counter IDs
+        let other_state_offset = self.states.len();
+        let counter_offset = self.counter_defs.len() as CounterId;
         for state in &mut other.states {
-            state.id += other_offset as StateId;
+            state.id += other_state_offset as StateId;
             for trans in &mut state.transitions {
-                trans.target += other_offset as StateId;
+                trans.target += other_state_offset as StateId;
+                trans.kind = trans.kind.offset_counter(counter_offset);
             }
         }
 
         // Add epsilon from new start to both fragment starts
         new_start.add_epsilon(self.start as StateId);
-        new_start.add_epsilon((other.start + other_offset) as StateId);
+        new_start.add_epsilon((other.start + other_state_offset) as StateId);
 
         // Add epsilon from both fragment ends to new end
         self.states[self.end].add_epsilon(new_end_id);
         other.states[other.end].add_epsilon(new_end_id);
 
-        // Merge all states
+        // Merge all states and counter defs
         let mut states = self.states;
         states.extend(other.states);
         states.push(new_start);
         states.push(new_end);
 
-        NfaFragment {
-            states,
-            start: new_start_id as usize,
-            end: new_end_id as usize,
-        }
+        let mut counter_defs = self.counter_defs;
+        counter_defs.extend(other.counter_defs);
+
+        NfaFragment::with_counters(states, new_start_id as usize, new_end_id as usize, counter_defs)
     }
 
     /// Make fragment optional: self?
@@ -207,6 +221,69 @@ impl NfaFragment {
             result = result.concat(self.clone());
         }
         result
+    }
+
+    /// Counted repeat: uses counter transitions for self{min,max}.
+    ///
+    /// Produces a compact loop structure with 3 extra states (entry, guard, exit)
+    /// regardless of min/max values. Counter tracks completed iterations.
+    ///
+    /// Structure:
+    /// ```text
+    /// entry --CounterReset(c)--> body_start
+    /// body_end --CounterIncrement(c)--> guard
+    /// guard --CounterMaxGuard(c)--> body_start   [loop if count < max]
+    /// guard --CounterMinGuard(c)--> exit          [exit if count >= min]
+    /// [if min == 0: entry --Epsilon--> exit]      [bypass]
+    /// ```
+    pub fn repeat_counted(mut self, min: u32, max: u32) -> NfaFragment {
+        debug_assert!(min <= max, "repeat_counted: min ({min}) > max ({max})");
+        self.normalize_ids();
+
+        // Allocate counter
+        let counter_id = self.counter_defs.len() as CounterId;
+        self.counter_defs.push(CounterDef { min, max });
+
+        // Allocate new states: entry, guard, exit
+        let entry_idx = self.states.len();
+        let guard_idx = entry_idx + 1;
+        let exit_idx = entry_idx + 2;
+
+        let entry_id = entry_idx as StateId;
+        let guard_id = guard_idx as StateId;
+        let exit_id = exit_idx as StateId;
+        let body_start_id = self.start as StateId;
+
+        // entry → CounterReset → body_start
+        let mut entry = NfaState::epsilon(entry_id, None);
+        entry.add_transition(body_start_id, TransitionKind::CounterReset(counter_id));
+
+        // Optional bypass: entry → exit (if min == 0)
+        if min == 0 {
+            entry.add_epsilon(exit_id);
+        }
+
+        // body_end → CounterIncrement → guard
+        self.states[self.end].add_transition(guard_id, TransitionKind::CounterIncrement(counter_id));
+
+        // guard → CounterMaxGuard → body_start (loop back)
+        // guard → CounterMinGuard → exit (exit loop)
+        let mut guard = NfaState::epsilon(guard_id, None);
+        guard.add_transition(body_start_id, TransitionKind::CounterMaxGuard(counter_id));
+        guard.add_transition(exit_id, TransitionKind::CounterMinGuard(counter_id));
+
+        let exit = NfaState::epsilon(exit_id, None);
+
+        self.states.push(entry);
+        self.states.push(guard);
+        self.states.push(exit);
+
+        NfaFragment::with_counters(
+            self.states,
+            entry_idx,
+            exit_idx,
+            self.counter_defs,
+        )
     }
 
     /// Repeat between min and max times: self{min,max}
@@ -283,11 +360,7 @@ impl FragmentBuilder {
         // Add consuming transition from term state to exit
         term_state.add_consume(exit_state.id);
 
-        NfaFragment {
-            states: vec![term_state, exit_state],
-            start: 0,
-            end: 1,
-        }
+        NfaFragment::new(vec![term_state, exit_state], 0, 1)
     }
 
     /// Build an epsilon-only fragment
@@ -296,11 +369,7 @@ impl FragmentBuilder {
     /// Used for optional content and as base case for empty sequences.
     pub fn epsilon_fragment(&mut self) -> NfaFragment {
         let state = self.epsilon_state(None);
-        NfaFragment {
-            states: vec![state],
-            start: 0,
-            end: 0, // Same state is both start and end
-        }
+        NfaFragment::new(vec![state], 0, 0)
     }
 }
 
@@ -321,7 +390,7 @@ pub fn fragment_to_table(mut fragment: NfaFragment) -> NfaTable {
     let start_state = fragment.start as StateId;
     let accept_state = fragment.end as StateId;
 
-    NfaTable::new(fragment.states, start_state, accept_state)
+    NfaTable::with_counters(fragment.states, start_state, accept_state, fragment.counter_defs)
 }
 
 #[cfg(test)]

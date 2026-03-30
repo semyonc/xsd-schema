@@ -48,13 +48,18 @@ pub use nfa::{
     NfaTransition,
     TransitionKind,
     StateId,
+    CounterId,
+    CounterDef,
+    ActiveConfig,
+    ActiveStates,
+    MatchInfo,
 };
 pub use fragment::{NfaFragment, FragmentBuilder, fragment_to_table};
 pub use compile::{
     CompileContext, compile_content_model_matcher, compile_model_group, compile_particle,
 };
 pub use error::{NfaCompileError, NfaCompileResult};
-pub use particle::{MaxOccurs, CountedParticle, apply_occurs, MAX_OCCURS_LIMIT};
+pub use particle::{MaxOccurs, apply_occurs};
 pub use all_group::{
     AllGroupModel, AllParticle, AllGroupState, OpenContentWildcard, OpenContentMode,
     validate_all_group_constraints, term_matches, term_matches_with_substitution, TermMatchResult,
