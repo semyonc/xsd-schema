@@ -998,21 +998,10 @@ fn validate_content_particle_restriction(
                 }
             }
 
-            let wildcard_mode =
-                normalized_particle_contains_wildcard(&derived_particle)
-                    || normalized_particle_contains_wildcard(&base_particle);
-            if !particle_restriction_shape_supported(&derived_particle, wildcard_mode)
-                || !particle_restriction_shape_supported(&base_particle, wildcard_mode)
-            {
-                return Ok(());
-            }
-
-            // Per §3.4.6.3, processors MAY provisionally accept restrictions
-            // involving cross-compositor patterns they can't structurally verify.
-            // Skip restriction checking for unsupported compositor combinations.
-            if !restriction_compositor_pair_supported(&derived_particle, &base_particle) {
-                return Ok(());
-            }
+            // All compositor combinations are now handled by
+            // particle_restricts: same-compositor, sequence→choice,
+            // sequence→all, choice expansion, and the catch-all rejection
+            // for structurally forbidden pairs like all→choice.
 
             if particle_restricts(schema_set, &derived_particle, &base_particle) {
                 Ok(())
@@ -1030,77 +1019,6 @@ fn validate_content_particle_restriction(
     }
 }
 
-fn normalized_particle_contains_wildcard(particle: &NormalizedParticle) -> bool {
-    match &particle.term {
-        NormalizedParticleTerm::Wildcard(_) => true,
-        NormalizedParticleTerm::Element(_) => false,
-        NormalizedParticleTerm::Group(group) => {
-            group.particles.iter().any(normalized_particle_contains_wildcard)
-        }
-    }
-}
-
-fn particle_restriction_shape_supported(
-    particle: &NormalizedParticle,
-    wildcard_mode: bool,
-) -> bool {
-    match &particle.term {
-        NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => true,
-        NormalizedParticleTerm::Group(group) => {
-            if !wildcard_mode
-                && group.compositor == Compositor::Sequence
-                && (particle.min_occurs != 1 || particle.max_occurs != Some(1))
-                && particle.max_occurs != Some(1)
-                && !repeated_single_child_sequence_supported(group)
-            {
-                return false;
-            }
-
-            // Choice branches are expanded via expand_choice_branches and
-            // handled recursively — no special guard needed beyond the
-            // recursive child check below.
-
-            group.particles.iter().all(|child| {
-                particle_restriction_shape_supported(child, wildcard_mode)
-            })
-        }
-    }
-}
-
-fn repeated_single_child_sequence_supported(group: &NormalizedGroup) -> bool {
-    group.particles.len() == 1
-}
-
-/// Check whether the top-level compositor combination between derived and base
-/// is a pair our restriction algorithm can correctly validate.
-///
-/// Supported: same-compositor, sequence-vs-all (mapAndSum), element/wildcard-vs-group
-/// (recurseAsIfGroup). Cross-compositor pairs like sequence-vs-choice or
-/// choice-vs-sequence are NOT supported and must be skipped (provisionally accepted).
-fn restriction_compositor_pair_supported(
-    derived: &NormalizedParticle,
-    base: &NormalizedParticle,
-) -> bool {
-    let derived_comp = match &derived.term {
-        NormalizedParticleTerm::Group(g) => Some(g.compositor),
-        _ => None,
-    };
-    let base_comp = match &base.term {
-        NormalizedParticleTerm::Group(g) => Some(g.compositor),
-        _ => None,
-    };
-
-    match (derived_comp, base_comp) {
-        // Non-group particles (element, wildcard) are always supported
-        (None, _) | (_, None) => true,
-        // Same compositor
-        (Some(d), Some(b)) if d == b => true,
-        // Sequence restricts All (mapAndSum)
-        (Some(Compositor::Sequence), Some(Compositor::All)) => true,
-        // All other cross-compositor pairs are unsupported
-        _ => false,
-    }
-}
 
 /// Check if a normalized particle is an empty group (all children removed as pointless).
 fn is_empty_group(particle: &NormalizedParticle) -> bool {
@@ -1404,6 +1322,22 @@ fn particle_restricts(
             });
         }
 
+        // Sequence-vs-choice: dedicated handler instead of "any branch" check.
+        if let NormalizedParticleTerm::Group(derived_group) = &derived.term {
+            if derived_group.compositor == Compositor::Sequence {
+                let NormalizedParticleTerm::Group(base_group) = &base.term else {
+                    unreachable!()
+                };
+                return sequence_restricts_choice(
+                    schema_set,
+                    derived,
+                    derived_group,
+                    base,
+                    base_group,
+                );
+            }
+        }
+
         return base_branches
             .iter()
             .any(|candidate| particle_restricts(schema_set, derived, candidate));
@@ -1680,26 +1614,119 @@ fn particle_fits_wildcard(
     }
 }
 
+/// Check whether a derived sequence restricts a base choice.
+///
+/// Two conditions are verified:
+///
+/// 1. **Per-particle match** — every child of the derived sequence must
+///    restrict at least one *raw* base choice branch (name, type, and
+///    per-iteration occurs).
+///
+/// 2. **Iteration budget** — each non-empty derived particle consumes at
+///    least one choice iteration.  The total iterations across all sequence
+///    repetitions must fit within the base choice's occurs range.
+fn sequence_restricts_choice(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    derived_group: &NormalizedGroup,
+    base: &NormalizedParticle,
+    base_group: &NormalizedGroup,
+) -> bool {
+    let base_branches = &base_group.particles;
+
+    let mut required_per_iter: u32 = 0;
+    let mut total_per_iter: u32 = 0;
+
+    for derived_child in &derived_group.particles {
+        // Each derived child must restrict at least one raw base branch.
+        let found = base_branches
+            .iter()
+            .any(|branch| particle_restricts(schema_set, derived_child, branch));
+        if !found {
+            return false;
+        }
+
+        // Count choice-iteration demand per sequence iteration.
+        if derived_child.min_occurs > 0 {
+            required_per_iter += 1;
+        }
+        if derived_child.max_occurs != Some(0) {
+            total_per_iter += 1;
+        }
+    }
+
+    // The total choice iterations across all sequence repetitions must fit
+    // within the base choice's occurs range.
+    let min_demand = derived.min_occurs.saturating_mul(required_per_iter);
+    let max_demand = match derived.max_occurs {
+        Some(m) => Some(m.saturating_mul(total_per_iter)),
+        None => {
+            if total_per_iter == 0 {
+                Some(0)
+            } else {
+                None
+            }
+        }
+    };
+
+    occurs_range_is_subset(min_demand, max_demand, base.min_occurs, base.max_occurs)
+}
+
 fn sequence_particles_restrict(
     schema_set: &SchemaSet,
     derived_particles: &[NormalizedParticle],
     base_particles: &[NormalizedParticle],
 ) -> bool {
     let mut base_index = 0;
-    for derived in derived_particles {
+    let mut derived_index = 0;
+
+    while derived_index < derived_particles.len() {
         let mut matched = false;
+
         while let Some(base) = base_particles.get(base_index) {
-            if particle_restricts(schema_set, derived, base) {
+            // 1. Direct particle-vs-particle match (the normal greedy step).
+            if particle_restricts(schema_set, &derived_particles[derived_index], base) {
                 matched = true;
                 base_index += 1;
+                derived_index += 1;
                 break;
             }
+
+            // 2. Atomic sequence-unit match: when the base particle is a
+            //    sequence group (e.g. an expanded repetition unit), try to
+            //    match a contiguous slice of derived particles against the
+            //    unit's children.  This keeps the unit atomic — either the
+            //    full slice matches or we fall through.
+            if let NormalizedParticleTerm::Group(base_group) = &base.term {
+                if base_group.compositor == Compositor::Sequence
+                    && !base_group.particles.is_empty()
+                {
+                    let unit_len = base_group.particles.len();
+                    let remaining = derived_particles.len() - derived_index;
+                    if remaining >= unit_len
+                        && sequence_particles_restrict(
+                            schema_set,
+                            &derived_particles[derived_index..derived_index + unit_len],
+                            &base_group.particles,
+                        )
+                    {
+                        matched = true;
+                        base_index += 1;
+                        derived_index += unit_len;
+                        break;
+                    }
+                }
+            }
+
+            // 3. Skip emptiable base particles.
             if particle_is_emptiable(base) {
                 base_index += 1;
                 continue;
             }
+
             return false;
         }
+
         if !matched {
             return false;
         }

@@ -701,6 +701,8 @@ pub struct TestRunner {
     group_filter: Option<String>,
     /// Filter by test version
     version_filter: Option<String>,
+    /// Filter by test name (substring match, any must match)
+    name_filters: Vec<String>,
     /// Maximum tests to run (0 = unlimited)
     max_tests: usize,
     /// Verbose output
@@ -714,6 +716,7 @@ impl TestRunner {
             tests,
             group_filter: None,
             version_filter: None,
+            name_filters: Vec::new(),
             max_tests: 0,
             verbose: false,
         }
@@ -728,6 +731,12 @@ impl TestRunner {
     /// Filter tests by version
     pub fn with_version_filter(mut self, version: Option<String>) -> Self {
         self.version_filter = version;
+        self
+    }
+
+    /// Filter tests by name (substring match; if multiple, any must match)
+    pub fn with_name_filters(mut self, names: Vec<String>) -> Self {
+        self.name_filters = names;
         self
     }
 
@@ -771,6 +780,11 @@ impl TestRunner {
                             return false;
                         }
                     }
+                }
+                if !self.name_filters.is_empty()
+                    && !self.name_filters.iter().any(|n| t.name.contains(n.as_str()))
+                {
+                    return false;
                 }
                 true
             })
@@ -1314,8 +1328,10 @@ fn main() {
     let mut test_suite_path: Option<PathBuf> = None;
     let mut group_filter: Option<String> = None;
     let mut version_filter: Option<String> = None;
+    let mut name_filters: Vec<String> = Vec::new();
     let mut max_tests: usize = 0;
     let mut verbose = false;
+    let mut expect_pass = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -1338,6 +1354,12 @@ fn main() {
                     i += 1;
                 }
             }
+            "--name" | "-n" => {
+                if i + 1 < args.len() {
+                    name_filters.push(args[i + 1].clone());
+                    i += 1;
+                }
+            }
             "--max" | "-m" => {
                 if i + 1 < args.len() {
                     max_tests = args[i + 1].parse().unwrap_or(0);
@@ -1347,6 +1369,9 @@ fn main() {
             "--verbose" | "-v" => {
                 verbose = true;
             }
+            "--expect-pass" => {
+                expect_pass = true;
+            }
             "--help" | "-h" => {
                 println!("XSD Conformance Test Driver");
                 println!();
@@ -1355,9 +1380,11 @@ fn main() {
                 println!("Options:");
                 println!("  -s, --test-suite PATH   Path to W3C test suite directory");
                 println!("  -g, --group NAME        Filter by test group name");
+                println!("  -n, --name PATTERN      Filter by test name (substring, repeatable)");
                 println!("  -V, --version VER       Filter by XSD version (1.0 or 1.1)");
                 println!("  -m, --max NUM           Maximum number of tests to run");
                 println!("  -v, --verbose           Enable verbose output");
+                println!("  --expect-pass           Exit non-zero if any test fails or errors");
                 println!("  -h, --help              Show this help message");
                 return;
             }
@@ -1417,6 +1444,7 @@ fn main() {
     let runner = TestRunner::new(tests)
         .with_group_filter(group_filter)
         .with_version_filter(version_filter)
+        .with_name_filters(name_filters)
         .with_max_tests(max_tests)
         .with_verbose(verbose);
 
@@ -1424,6 +1452,13 @@ fn main() {
 
     // Print summary
     print_summary(&stats_by_group);
+
+    if expect_pass {
+        let total_failed: usize = stats_by_group.values().map(|s| s.failed + s.errors).sum();
+        if total_failed > 0 {
+            std::process::exit(1);
+        }
+    }
 }
 
 #[cfg(test)]

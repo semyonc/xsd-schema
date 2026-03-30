@@ -489,6 +489,412 @@ fn test_accept_sequence_restricting_repeated_choice() {
     assert!(result.is_ok(), "cross-compositor restriction should be provisionally accepted: {:?}", result);
 }
 
+// ── Step 2 regression targets ───────────────────────────────────────────
+// These tests pin the expected outcome for each W3C particle-restriction
+// test case so that changes to the restriction algorithm are caught
+// immediately without running the full conformance suite.
+//
+// All are #[ignore] until the restriction algorithm handles them.
+// Remove #[ignore] one-by-one as fixes land.  Run ignored tests with:
+//   cargo test --lib pipeline::tests -- --ignored --features xsd11
+
+/// Valid: repeated-sequence restriction — derived sequence{1,1} narrows
+/// base sequence{1,9} while keeping the same children. (particlesW011)
+#[test]
+fn test_accept_repeated_sequence_restriction_w011() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:sequence minOccurs="1" maxOccurs="9">
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                    <xs:element name="e3"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1"/>
+                            <xs:element name="e2"/>
+                            <xs:element name="e3"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "sequence{{1,1}} validly restricts sequence{{1,9}}: {:?}", result);
+}
+
+/// Valid: repeated-sequence restriction with element type narrowing.
+/// Derived element e1 has type ct3 (restriction of ct1). (particlesW016)
+#[test]
+fn test_accept_repeated_sequence_restriction_type_narrowing_w016() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="ct1">
+                <xs:sequence>
+                    <xs:element name="foo" minOccurs="2" maxOccurs="5"/>
+                    <xs:element name="bar" form="qualified"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="ct3">
+                <xs:complexContent>
+                    <xs:restriction base="x:ct1">
+                        <xs:sequence>
+                            <xs:element name="foo" minOccurs="3" maxOccurs="3"/>
+                            <xs:element name="bar" form="qualified"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="B">
+                <xs:sequence minOccurs="1" maxOccurs="9">
+                    <xs:element name="e1" type="x:ct1"/>
+                    <xs:element name="e2"/>
+                    <xs:element name="e3"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1" type="x:ct3"/>
+                            <xs:element name="e2"/>
+                            <xs:element name="e3"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "type-narrowed sequence restriction should be valid: {:?}", result);
+}
+
+/// Invalid: sequence-vs-choice where derived e3 minOccurs=2 is less than
+/// base choice branch e3 minOccurs=3. (particlesV002)
+#[test]
+fn test_reject_sequence_vs_choice_min_violation_v002() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:choice minOccurs="1" maxOccurs="99">
+                    <xs:element name="e1" minOccurs="1" maxOccurs="10"/>
+                    <xs:element name="e2" minOccurs="2" maxOccurs="10"/>
+                    <xs:element name="e3" minOccurs="3" maxOccurs="10"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence minOccurs="1" maxOccurs="99">
+                            <xs:element name="e1" minOccurs="1" maxOccurs="10"/>
+                            <xs:element name="e2" minOccurs="2" maxOccurs="10"/>
+                            <xs:element name="e3" minOccurs="2" maxOccurs="10"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "sequence-vs-choice: e3 min=2 violates base choice branch min=3");
+}
+
+/// Invalid: sequence-vs-choice where derived sequence{0,2}(e1{0,2},e2{0,2})
+/// is not a valid restriction of choice{0,2}(e1{0,3},e2{0,3}).
+/// A sequence forces both elements present on each repetition, which is
+/// not expressible in the base choice. (particlesV005)
+#[test]
+fn test_reject_sequence_vs_choice_not_expressible_v005() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:choice minOccurs="0" maxOccurs="2">
+                    <xs:element name="e1" maxOccurs="3"/>
+                    <xs:element name="e2" maxOccurs="3"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence maxOccurs="2">
+                            <xs:element name="e1" maxOccurs="2"/>
+                            <xs:element name="e2" maxOccurs="2"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "sequence-vs-choice with both elements required per repetition is invalid");
+}
+
+/// Invalid: sequence-vs-choice where derived sequence introduces e4 which
+/// has no counterpart in the base choice. (particlesV016)
+#[test]
+fn test_reject_sequence_vs_choice_extra_element_v016() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:choice maxOccurs="unbounded">
+                    <xs:element name="e1" maxOccurs="3"/>
+                    <xs:element name="e2" minOccurs="0" maxOccurs="3"/>
+                    <xs:element name="e3" minOccurs="0" maxOccurs="3"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1"/>
+                            <xs:element name="e2" minOccurs="0"/>
+                            <xs:element name="e3" minOccurs="0"/>
+                            <xs:element name="e4" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "sequence-vs-choice: e4 has no base counterpart");
+}
+
+/// Invalid: sequence-vs-choice where derived element e1 has type ct2
+/// which is NOT derived from base element e1's type ct1. (particlesV018)
+#[test]
+fn test_reject_sequence_vs_choice_type_mismatch_v018() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="ct1">
+                <xs:sequence>
+                    <xs:element name="foo" minOccurs="2" maxOccurs="5"/>
+                    <xs:element name="bar" form="qualified"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="ct2">
+                <xs:sequence>
+                    <xs:element name="foo"/>
+                    <xs:element name="bar"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="B">
+                <xs:choice maxOccurs="4">
+                    <xs:element name="e1" type="x:ct1"/>
+                    <xs:element name="e2"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1" type="x:ct2"/>
+                            <xs:element name="e2"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "sequence-vs-choice: ct2 is not derived from ct1");
+}
+
+/// Invalid: all-from-choice — derived `all` restricts base `choice`.
+/// Cross-compositor all↔choice is not allowed. (particlesHb006)
+#[test]
+fn test_reject_all_restricting_choice_hb006() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                   elementFormDefault="qualified">
+            <xs:complexType name="B">
+                <xs:choice minOccurs="1" maxOccurs="99">
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="base">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:choice minOccurs="3" maxOccurs="9">
+                            <xs:element name="e1"/>
+                            <xs:element name="e2"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:base">
+                        <xs:all>
+                            <xs:element name="e1"/>
+                            <xs:element name="e2"/>
+                        </xs:all>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "all-from-choice restriction is forbidden");
+}
+
+/// Invalid: all-from-sequence via group refs — derived `all` group
+/// restricts base `sequence` group. (particlesHb007)
+#[test]
+fn test_reject_all_restricting_sequence_hb007() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                   elementFormDefault="qualified">
+            <xs:group name="Gb">
+                <xs:sequence>
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                </xs:sequence>
+            </xs:group>
+            <xs:group name="Gr">
+                <xs:all>
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                </xs:all>
+            </xs:group>
+            <xs:complexType name="base">
+                <xs:group ref="x:Gb"/>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:base">
+                        <xs:group ref="x:Gr"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "all-from-sequence restriction via group refs is forbidden");
+}
+
+/// Invalid: choice-from-all — derived `choice` restricts base `all`.
+/// (particlesHb009)
+#[test]
+fn test_reject_choice_restricting_all_hb009() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                   elementFormDefault="qualified">
+            <xs:complexType name="base">
+                <xs:all>
+                    <xs:element name="e1"/>
+                    <xs:element name="e2"/>
+                </xs:all>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:base">
+                        <xs:choice>
+                            <xs:element name="e1"/>
+                            <xs:element name="e2"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "choice-from-all restriction is forbidden");
+}
+
+/// Invalid: choice restriction where derived branch d2 cannot match
+/// base branch sequence(d1,d2). A single element is not a valid
+/// restriction of a multi-child sequence. (particlesM033)
+#[test]
+fn test_reject_choice_branch_element_vs_sequence_m033() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:choice>
+                    <xs:element name="c1" minOccurs="2" maxOccurs="2"/>
+                    <xs:sequence minOccurs="1" maxOccurs="unbounded">
+                        <xs:element name="d1" minOccurs="1" maxOccurs="1"/>
+                        <xs:element name="d2" minOccurs="1" maxOccurs="1"/>
+                    </xs:sequence>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:choice>
+                            <xs:element name="c1" minOccurs="2" maxOccurs="2"/>
+                            <xs:element name="d2" minOccurs="1" maxOccurs="unbounded"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "choice branch d2 cannot restrict base sequence(d1,d2)");
+}
+
+/// Invalid: choice restriction where derived branch d1 cannot match
+/// either base sequence branch. (particlesM034)
+#[test]
+fn test_reject_choice_branch_vs_multi_child_sequences_m034() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:choice>
+                    <xs:sequence minOccurs="0" maxOccurs="unbounded">
+                        <xs:element name="c1" minOccurs="2" maxOccurs="2"/>
+                        <xs:element name="c2" minOccurs="0" maxOccurs="1"/>
+                    </xs:sequence>
+                    <xs:sequence minOccurs="1" maxOccurs="unbounded">
+                        <xs:element name="d1" minOccurs="0" maxOccurs="unbounded"/>
+                        <xs:element name="d2" minOccurs="1" maxOccurs="unbounded"/>
+                    </xs:sequence>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:choice>
+                            <xs:element name="d1" minOccurs="1" maxOccurs="unbounded"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "choice branch d1 cannot restrict either base sequence branch");
+}
+
 /// Choice-vs-choice restriction where both are optional.  The derived
 /// restricts each branch to maxOccurs=0 — effectively empty.
 /// (particlesIe001)
