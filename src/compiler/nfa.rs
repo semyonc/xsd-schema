@@ -3,7 +3,7 @@
 //! This module defines the core NFA (Nondeterministic Finite Automaton) structures
 //! used to represent compiled XSD content models.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
@@ -19,6 +19,76 @@ pub type StateId = u32;
 /// halving transition growth. 65K counters is far beyond any real schema.
 pub type CounterId = u16;
 
+/// An inclusive range of counter values `[lo, hi]`.
+///
+/// Used by the `RangedSingle` optimized path to represent a set of
+/// possible counter values at a single NFA state, avoiding the O(N)
+/// enumeration that scalar counters require for nullable loop bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CounterRange {
+    pub lo: u32,
+    pub hi: u32,
+}
+
+impl CounterRange {
+    /// Create a range containing a single value.
+    pub fn single(v: u32) -> Self {
+        Self { lo: v, hi: v }
+    }
+
+    /// Create a range `[lo, hi]`. Panics in debug if `lo > hi`.
+    pub fn new(lo: u32, hi: u32) -> Self {
+        debug_assert!(lo <= hi, "CounterRange::new({lo}, {hi}): lo > hi");
+        Self { lo, hi }
+    }
+
+    /// True if this range contains no values (`lo > hi`).
+    pub fn is_empty(self) -> bool {
+        self.lo > self.hi
+    }
+
+    /// True if `self` fully contains `other`.
+    pub fn subsumes(self, other: Self) -> bool {
+        self.lo <= other.lo && self.hi >= other.hi
+    }
+
+    /// Widen to include all values in both ranges.
+    /// The caller must ensure the ranges are contiguous (adjacent or overlapping).
+    pub fn union(self, other: Self) -> Self {
+        let result = Self {
+            lo: self.lo.min(other.lo),
+            hi: self.hi.max(other.hi),
+        };
+        debug_assert!(result.lo <= result.hi);
+        result
+    }
+
+    /// Intersect with `[0, max_exclusive - 1]`.  Returns an empty range if
+    /// `lo >= max_exclusive`.
+    pub fn intersect_below(self, max_exclusive: u32) -> Self {
+        if max_exclusive == 0 || self.lo >= max_exclusive {
+            // Use lo > hi to signal empty
+            return Self { lo: 1, hi: 0 };
+        }
+        Self {
+            lo: self.lo,
+            hi: self.hi.min(max_exclusive - 1),
+        }
+    }
+
+    /// Intersect with `[min_inclusive, u32::MAX]`.  Returns an empty range if
+    /// `hi < min_inclusive`.
+    pub fn intersect_above(self, min_inclusive: u32) -> Self {
+        if self.hi < min_inclusive {
+            return Self { lo: 1, hi: 0 };
+        }
+        Self {
+            lo: self.lo.max(min_inclusive),
+            hi: self.hi,
+        }
+    }
+}
+
 /// Definition of a counter used by counted NFA loops.
 ///
 /// Each counter tracks how many times a loop body has been completed.
@@ -30,6 +100,10 @@ pub struct CounterDef {
     pub min: u32,
     /// Maximum iterations allowed before loop must exit
     pub max: u32,
+    /// Whether the loop body can be traversed without consuming any input.
+    /// When true and `num_counters == 1`, the `RangedSingle` fast-forward
+    /// path is used in epsilon closure.
+    pub body_nullable: bool,
 }
 
 /// Complete NFA table for a content model
@@ -561,21 +635,105 @@ impl ActiveConfig {
     }
 }
 
-/// Dual-path active state set for NFA simulation.
+/// Ranged epsilon closure for single-counter NFAs with nullable body.
+///
+/// Uses a `HashMap<StateId, CounterRange>` merge-map where each state has
+/// exactly one contiguous counter range.  On `CounterIncrement`, the fast-
+/// forward sets `hi = counter_def.max`, so the closure converges in O(states)
+/// worklist iterations instead of O(max).
+///
+/// **Contiguity invariant**: every counter range at a state is a single
+/// contiguous interval.  Reset→[0,0], increment shifts +1, guards clip one
+/// side, fast-forward extends hi — all preserve contiguity.  Ranges arriving
+/// at the same state from different paths are always adjacent or overlapping
+/// (because the counter increments by exactly 1 per iteration), so union
+/// preserves contiguity.
+fn ranged_single_epsilon_closure(
+    nfa: &NfaTable,
+    seeds: HashMap<StateId, CounterRange>,
+    counter_def: CounterDef,
+) -> ActiveStates {
+    let mut map: HashMap<StateId, CounterRange> = HashMap::new();
+    let mut worklist: VecDeque<(StateId, CounterRange)> = seeds.into_iter().collect();
+
+    while let Some((state_id, range)) = worklist.pop_front() {
+        // Check subsumption: if existing range already covers this one, skip.
+        if let Some(&existing) = map.get(&state_id) {
+            if existing.subsumes(range) {
+                continue;
+            }
+            // Merge (union) — contiguity invariant guarantees this is safe.
+            let merged = existing.union(range);
+            debug_assert!(merged.lo <= merged.hi, "contiguity invariant violated at state {state_id}");
+            map.insert(state_id, merged);
+        } else {
+            map.insert(state_id, range);
+        }
+
+        // Process transitions from this state.
+        if let Some(state) = nfa.get_state(state_id) {
+            for trans in &state.transitions {
+                let next = match trans.kind {
+                    TransitionKind::Epsilon => Some(range),
+                    TransitionKind::CounterReset(_) => Some(CounterRange::single(0)),
+                    TransitionKind::CounterIncrement(_) => {
+                        // Fast-forward: body is nullable, so the counter can
+                        // reach max via repeated empty body traversals.
+                        Some(CounterRange::new(range.lo + 1, counter_def.max))
+                    }
+                    TransitionKind::CounterMaxGuard(_) => {
+                        let clamped = range.intersect_below(counter_def.max);
+                        if clamped.is_empty() { None } else { Some(clamped) }
+                    }
+                    TransitionKind::CounterMinGuard(_) => {
+                        let passed = range.intersect_above(counter_def.min);
+                        if passed.is_empty() {
+                            None
+                        } else {
+                            // Canonicalize: counter is dead after exit.
+                            Some(CounterRange::single(0))
+                        }
+                    }
+                    TransitionKind::Consume => None,
+                };
+                if let Some(next_range) = next {
+                    // Only push if not already subsumed by existing map entry.
+                    let dominated = map.get(&trans.target)
+                        .is_some_and(|r| r.subsumes(next_range));
+                    if !dominated {
+                        worklist.push_back((trans.target, next_range));
+                    }
+                }
+            }
+        }
+    }
+
+    ActiveStates::RangedSingle { state_ranges: map, counter_def }
+}
+
+/// Tri-path active state set for NFA simulation.
 ///
 /// **Invariant**: values are always closure-closed (epsilon closure has been
 /// applied). All constructors and advance methods enforce this.
 ///
 /// - `Simple`: counter-free NFA — delegates to existing `HashSet<StateId>` functions.
-/// - `Counted`: NFA with counters — tracks `HashSet<ActiveConfig>`.
+/// - `Counted`: NFA with multiple counters — tracks `HashSet<ActiveConfig>` (scalar).
+/// - `RangedSingle`: single counter with nullable body — stores one `CounterRange`
+///   per reachable state, converging epsilon closure in O(states) instead of O(N).
 #[derive(Debug, Clone)]
 pub enum ActiveStates {
     /// Fast path: no counters in this NFA (bit-identical to old code)
     Simple(HashSet<StateId>),
-    /// Counted path: configurations carry counter values
+    /// Scalar counted path: configurations carry individual counter values
     Counted {
         configs: HashSet<ActiveConfig>,
         num_counters: usize,
+    },
+    /// Optimized path for single-counter NFAs with nullable loop body.
+    /// Each reachable state maps to one `CounterRange` (contiguity invariant).
+    RangedSingle {
+        state_ranges: HashMap<StateId, CounterRange>,
+        counter_def: CounterDef,
     },
 }
 
@@ -583,6 +741,16 @@ impl ActiveStates {
     /// Create initial active states from an NFA, picking the right variant.
     pub fn from_nfa(nfa: &NfaTable) -> Self {
         if nfa.has_counters() {
+            // Single counter with nullable body → optimized ranged path
+            if nfa.counter_defs.len() == 1 && nfa.counter_defs[0].body_nullable {
+                let mut state_ranges = HashMap::new();
+                state_ranges.insert(nfa.start_state, CounterRange::single(0));
+                let result = ActiveStates::RangedSingle {
+                    state_ranges,
+                    counter_def: nfa.counter_defs[0],
+                };
+                return result.epsilon_closure(nfa);
+            }
             let initial = ActiveConfig::initial(nfa.start_state, nfa.counter_defs.len());
             let mut configs = HashSet::new();
             configs.insert(initial);
@@ -602,6 +770,7 @@ impl ActiveStates {
         match self {
             ActiveStates::Simple(s) => s.is_empty(),
             ActiveStates::Counted { configs, .. } => configs.is_empty(),
+            ActiveStates::RangedSingle { state_ranges, .. } => state_ranges.is_empty(),
         }
     }
 
@@ -611,6 +780,9 @@ impl ActiveStates {
             ActiveStates::Simple(s) => s.iter().any(|&id| nfa.is_accept(id)),
             ActiveStates::Counted { configs, .. } => {
                 configs.iter().any(|c| nfa.is_accept(c.state_id))
+            }
+            ActiveStates::RangedSingle { state_ranges, .. } => {
+                state_ranges.contains_key(&nfa.accept_state)
             }
         }
     }
@@ -670,6 +842,9 @@ impl ActiveStates {
                 }
                 ActiveStates::Counted { configs: result, num_counters }
             }
+            ActiveStates::RangedSingle { state_ranges, counter_def } => {
+                ranged_single_epsilon_closure(nfa, state_ranges, counter_def)
+            }
         }
     }
 
@@ -708,6 +883,27 @@ impl ActiveStates {
                     }
                 }
                 let result = ActiveStates::Counted { configs: next_configs, num_counters };
+                result.epsilon_closure(nfa)
+            }
+            ActiveStates::RangedSingle { state_ranges, counter_def } => {
+                let mut next_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+                for (&state_id, &range) in &state_ranges {
+                    if let Some(state) = nfa.get_state(state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(term_val, element_name, element_namespace,
+                                target_namespace, substitution_groups) {
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        next_seeds.entry(trans.target)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = ActiveStates::RangedSingle { state_ranges: next_seeds, counter_def };
                 result.epsilon_closure(nfa)
             }
         }
@@ -761,6 +957,40 @@ impl ActiveStates {
                 let result = ActiveStates::Counted { configs: next, num_counters };
                 result.epsilon_closure(nfa)
             }
+            ActiveStates::RangedSingle { state_ranges, counter_def } => {
+                let mut element_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+                let mut wildcard_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+
+                for (&state_id, &range) in &state_ranges {
+                    if let Some(state) = nfa.get_state(state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(term_val, element_name, element_namespace,
+                                target_namespace, substitution_groups) {
+                                let target_map = match term_val {
+                                    NfaTerm::Element { .. } => &mut element_seeds,
+                                    NfaTerm::Wildcard { .. } => &mut wildcard_seeds,
+                                };
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        target_map.entry(trans.target)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next = if !element_seeds.is_empty() {
+                    element_seeds
+                } else {
+                    wildcard_seeds
+                };
+
+                let result = ActiveStates::RangedSingle { state_ranges: next, counter_def };
+                result.epsilon_closure(nfa)
+            }
         }
     }
 
@@ -788,6 +1018,9 @@ impl ActiveStates {
                 // Configs are closure-closed — iterate directly
                 find_match_info_in_states(nfa, configs.iter().map(|c| c.state_id), name, namespace, target_ns, subst_groups)
             }
+            ActiveStates::RangedSingle { state_ranges, .. } => {
+                find_match_info_in_states(nfa, state_ranges.keys().copied(), name, namespace, target_ns, subst_groups)
+            }
         }
     }
 
@@ -814,6 +1047,15 @@ impl ActiveStates {
                         continue; // Skip duplicate state IDs
                     }
                     if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                            result.push((*name, *namespace, *element_key));
+                        }
+                    }
+                }
+            }
+            ActiveStates::RangedSingle { state_ranges, .. } => {
+                for &state_id in state_ranges.keys() {
+                    if let Some(state) = nfa.get_state(state_id) {
                         if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
                             result.push((*name, *namespace, *element_key));
                         }
@@ -1227,22 +1469,22 @@ mod tests {
         let seq = counted.concat(frag_b);
         let nfa = fragment_to_table(seq);
 
-        // Initial state should be complete (min=0 loop can be skipped)
+        // Single counter + nullable body → should use RangedSingle
         let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }),
+            "Expected RangedSingle for nullable body counted NFA");
 
+        // Initial state should be complete (min=0 loop can be skipped)
         // After advancing with b (skipping the loop entirely), should accept
         let after_b = initial.clone().advance(&nfa, b, None, None, None);
         assert!(after_b.contains_accept(&nfa));
 
-        // Check that configs at b are O(1), not O(200).
-        // The counter canonicalization on exit should collapse them.
-        if let ActiveStates::Counted { configs, .. } = &after_b {
-            // After accepting b, we should have very few configs
-            // (typically 1 — at the accept state with zeroed counters)
+        // With RangedSingle, the state map has O(states) entries, not O(200).
+        if let ActiveStates::RangedSingle { state_ranges, .. } = &after_b {
             assert!(
-                configs.len() <= 5,
-                "Expected collapsed configs after loop exit, got {}",
-                configs.len()
+                state_ranges.len() <= 5,
+                "Expected O(1) ranged entries after loop exit, got {}",
+                state_ranges.len()
             );
         }
     }
@@ -1299,5 +1541,227 @@ mod tests {
         );
         assert_eq!(TransitionKind::Epsilon.offset_counter(10), TransitionKind::Epsilon);
         assert_eq!(TransitionKind::Consume.offset_counter(10), TransitionKind::Consume);
+    }
+
+    // -----------------------------------------------------------------------
+    // CounterRange unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_counter_range_operations() {
+        let r = CounterRange::single(5);
+        assert_eq!(r.lo, 5);
+        assert_eq!(r.hi, 5);
+        assert!(!r.is_empty());
+        assert!(r.subsumes(r));
+
+        let r2 = CounterRange::new(3, 7);
+        assert!(r2.subsumes(r));
+        assert!(!r.subsumes(r2));
+
+        // Union
+        let u = CounterRange::single(2).union(CounterRange::new(3, 5));
+        assert_eq!(u, CounterRange::new(2, 5));
+
+        // intersect_below
+        assert_eq!(CounterRange::new(1, 5).intersect_below(4), CounterRange::new(1, 3));
+        assert!(CounterRange::new(5, 8).intersect_below(5).is_empty());
+        assert!(CounterRange::new(0, 10).intersect_below(0).is_empty());
+
+        // intersect_above
+        assert_eq!(CounterRange::new(1, 5).intersect_above(3), CounterRange::new(3, 5));
+        assert!(CounterRange::new(1, 3).intersect_above(5).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // RangedSingle tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ranged_closure_convergence() {
+        // (a?){0,10000} — must use RangedSingle and converge in O(states)
+        let a = NameId(100);
+        let mut builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(a, None, None), None);
+        let opt = frag.optional();
+        let counted = opt.repeat_counted(0, 10_000);
+        let nfa = fragment_to_table(counted);
+
+        assert!(nfa.has_counters());
+        assert!(nfa.counter_defs[0].body_nullable);
+
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }));
+
+        // Should have O(states) entries, not O(10000)
+        if let ActiveStates::RangedSingle { state_ranges, .. } = &initial {
+            assert!(
+                state_ranges.len() <= 10,
+                "Expected O(states) entries, got {}",
+                state_ranges.len()
+            );
+        }
+
+        // Should be accepting (min=0)
+        assert!(initial.contains_accept(&nfa));
+
+        // Advance with 'a' 5 times — should still be accepting
+        let s5 = advance_n(initial, &nfa, a, 5);
+        assert!(s5.contains_accept(&nfa));
+
+        // Still RangedSingle throughout
+        assert!(matches!(&s5, ActiveStates::RangedSingle { .. }));
+    }
+
+    #[test]
+    fn test_nullable_body_accepts_range() {
+        // (a?){3,5}: accepts "", "a", "aa", "aaa", "aaaa", "aaaaa", rejects "aaaaaa"
+        let a = NameId(100);
+        let mut builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(a, None, None), None);
+        let opt = frag.optional();
+        let counted = opt.repeat_counted(3, 5);
+        let nfa = fragment_to_table(counted);
+
+        assert!(nfa.counter_defs[0].body_nullable);
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }));
+
+        // "" — accepted (body nullable, 3 empty iterations satisfy min)
+        assert!(initial.contains_accept(&nfa));
+
+        // "a" through "aaaaa" — all accepted
+        for n in 1..=5 {
+            let s = advance_n(initial.clone(), &nfa, a, n);
+            assert!(s.contains_accept(&nfa), "Expected accepting after {n} a's");
+        }
+
+        // "aaaaaa" — rejected (max=5 iterations, each consuming at most 1 a)
+        let s6 = advance_n(initial, &nfa, a, 6);
+        assert!(s6.is_empty(), "Expected rejection after 6 a's");
+    }
+
+    #[test]
+    fn test_choice_body_nullable() {
+        // (a|b?){0,1000} — body is nullable (b? branch), should use RangedSingle
+        let a = NameId(100);
+        let b = NameId(200);
+        let mut builder = FragmentBuilder::new();
+        let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
+        let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
+        let choice = frag_a.alternate(frag_b.optional());
+        let counted = choice.repeat_counted(0, 1000);
+        let nfa = fragment_to_table(counted);
+
+        assert!(nfa.counter_defs[0].body_nullable);
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }));
+
+        if let ActiveStates::RangedSingle { state_ranges, .. } = &initial {
+            assert!(state_ranges.len() <= 15,
+                "Expected O(states) entries, got {}", state_ranges.len());
+        }
+
+        // Accepts "a", "b", "ab", ""
+        assert!(initial.contains_accept(&nfa));
+        let s_a = initial.clone().advance(&nfa, a, None, None, None);
+        assert!(s_a.contains_accept(&nfa));
+        let s_b = initial.clone().advance(&nfa, b, None, None, None);
+        assert!(s_b.contains_accept(&nfa));
+    }
+
+    #[test]
+    fn test_non_nullable_body_stays_counted() {
+        // (a){0,5} — body is NOT nullable, should use Counted (not RangedSingle)
+        let (nfa, a) = make_counted_element_nfa(0, 5);
+        assert!(!nfa.counter_defs[0].body_nullable);
+
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::Counted { .. }));
+
+        // Still correct: accepts 0..5 a's
+        assert!(initial.contains_accept(&nfa)); // min=0
+        for n in 1..=5 {
+            let s = advance_n(initial.clone(), &nfa, a, n);
+            assert!(s.contains_accept(&nfa), "Expected accepting after {n} a's");
+        }
+        let s6 = advance_n(initial, &nfa, a, 6);
+        assert!(s6.is_empty());
+    }
+
+    #[test]
+    fn test_multi_counter_stays_counted() {
+        // a{0,100} followed by b{0,100} — 2 counters, should use Counted
+        let a = NameId(100);
+        let b = NameId(200);
+        let mut builder = FragmentBuilder::new();
+        let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
+        let counted_a = frag_a.repeat_counted(0, 100);
+        let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
+        let counted_b = frag_b.repeat_counted(0, 100);
+        let seq = counted_a.concat(counted_b);
+        let nfa = fragment_to_table(seq);
+
+        assert_eq!(nfa.counter_defs.len(), 2);
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::Counted { .. }),
+            "Multi-counter NFA should use Counted, not RangedSingle");
+    }
+
+    #[test]
+    fn test_nested_nullable_counted_stays_counted() {
+        // ((a?){0,50}){0,50} — 2 counters (nested), should use Counted
+        let a = NameId(100);
+        let mut builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(a, None, None), None);
+        let inner = frag.optional().repeat_counted(0, 50);
+        let outer = inner.repeat_counted(0, 50);
+        let nfa = fragment_to_table(outer);
+
+        assert_eq!(nfa.counter_defs.len(), 2);
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::Counted { .. }),
+            "Nested counted NFA should use Counted, not RangedSingle");
+    }
+
+    #[test]
+    fn test_xsd11_priority_ranged() {
+        // Nullable counted body containing element 'a' + wildcard *.
+        // advance_with_priority should prefer element over wildcard.
+        use crate::types::complex::NamespaceConstraint;
+        let a = NameId(100);
+        let b = NameId(200);
+        let mut builder = FragmentBuilder::new();
+
+        // Element term for 'a' (mandatory)
+        let elem = builder.single_term(NfaTerm::element(a, None, None), None);
+        // Wildcard term matching anything (optional → makes body nullable)
+        let wc = builder.single_term(
+            NfaTerm::Wildcard {
+                namespace_constraint: NamespaceConstraint::Any,
+                process_contents: ProcessContents::Lax,
+                not_qnames: Vec::new(),
+            },
+            None,
+        );
+        // (a | *?){0,100} — nullable body via the *? branch
+        let choice = elem.alternate(wc.optional());
+        let counted = choice.repeat_counted(0, 100);
+        let nfa = fragment_to_table(counted);
+
+        assert!(nfa.counter_defs[0].body_nullable);
+        let initial = ActiveStates::from_nfa(&nfa);
+        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }));
+
+        // advance_with_priority for 'a': element branch exists, so wildcard
+        // should not be chosen.  The result should be non-empty.
+        let next = initial.clone().advance_with_priority(&nfa, a, None, None, None);
+        assert!(!next.is_empty());
+        assert!(next.contains_accept(&nfa));
+
+        // advance_with_priority for 'b': only wildcard matches, should work
+        let next_b = initial.advance_with_priority(&nfa, b, None, None, None);
+        assert!(!next_b.is_empty());
+        assert!(next_b.contains_accept(&nfa));
     }
 }

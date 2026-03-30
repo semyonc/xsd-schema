@@ -25,14 +25,18 @@ pub struct NfaFragment {
     pub end: usize,
     /// Counter definitions for counted loops within this fragment
     pub counter_defs: Vec<CounterDef>,
+    /// Whether this fragment can match the empty string (end reachable from
+    /// start without consuming any input).  Tracked incrementally through
+    /// all composition operations and used to set `CounterDef::body_nullable`.
+    pub nullable: bool,
 }
 
 impl NfaFragment {
-    /// Create a new fragment from states with specified start/end (no counters)
+    /// Create a new fragment from states with specified start/end (no counters, not nullable)
     pub fn new(states: Vec<NfaState>, start: usize, end: usize) -> Self {
         debug_assert!(start < states.len(), "start index out of bounds");
         debug_assert!(end < states.len(), "end index out of bounds");
-        Self { states, start, end, counter_defs: Vec::new() }
+        Self { states, start, end, counter_defs: Vec::new(), nullable: false }
     }
 
     /// Create a new fragment with counter definitions
@@ -41,10 +45,11 @@ impl NfaFragment {
         start: usize,
         end: usize,
         counter_defs: Vec<CounterDef>,
+        nullable: bool,
     ) -> Self {
         debug_assert!(start < states.len(), "start index out of bounds");
         debug_assert!(end < states.len(), "end index out of bounds");
-        Self { states, start, end, counter_defs }
+        Self { states, start, end, counter_defs, nullable }
     }
 
     /// Normalize state IDs so that each state's ID matches its position in
@@ -92,6 +97,8 @@ impl NfaFragment {
     /// Creates an epsilon transition from self's end state to other's start state.
     /// The resulting fragment starts at self's start and ends at other's end.
     pub fn concat(mut self, mut other: NfaFragment) -> NfaFragment {
+        let nullable = self.nullable && other.nullable;
+
         // Normalize IDs to match positions before composing
         self.normalize_ids();
         other.normalize_ids();
@@ -117,7 +124,7 @@ impl NfaFragment {
         self.states.extend(other.states);
         self.counter_defs.extend(other.counter_defs);
 
-        NfaFragment::with_counters(self.states, self.start, new_end, self.counter_defs)
+        NfaFragment::with_counters(self.states, self.start, new_end, self.counter_defs, nullable)
     }
 
     /// Alternate two fragments: self | other
@@ -125,6 +132,8 @@ impl NfaFragment {
     /// Creates a new start state with epsilon transitions to both fragments,
     /// and a new end state that both fragments converge to.
     pub fn alternate(mut self, mut other: NfaFragment) -> NfaFragment {
+        let nullable = self.nullable || other.nullable;
+
         // Normalize IDs to match positions before composing
         self.normalize_ids();
         other.normalize_ids();
@@ -164,7 +173,7 @@ impl NfaFragment {
         let mut counter_defs = self.counter_defs;
         counter_defs.extend(other.counter_defs);
 
-        NfaFragment::with_counters(states, new_start_id as usize, new_end_id as usize, counter_defs)
+        NfaFragment::with_counters(states, new_start_id as usize, new_end_id as usize, counter_defs, nullable)
     }
 
     /// Make fragment optional: self?
@@ -176,6 +185,7 @@ impl NfaFragment {
         // Add epsilon from start to end
         let end_id = self.end as StateId;
         self.states[self.start].add_epsilon(end_id);
+        self.nullable = true;
         self
     }
 
@@ -192,6 +202,7 @@ impl NfaFragment {
         // Make optional (zero occurrences allowed) — already normalized
         let end_id = self.end as StateId;
         self.states[self.start].add_epsilon(end_id);
+        self.nullable = true;
         self
     }
 
@@ -204,6 +215,8 @@ impl NfaFragment {
         // Add epsilon loop from end back to start
         let start_id = self.start as StateId;
         self.states[self.end].add_epsilon(start_id);
+        // nullable iff one occurrence can match empty
+        // (self.nullable is already set from the body)
         self
     }
 
@@ -216,6 +229,8 @@ impl NfaFragment {
             return FragmentBuilder::new().epsilon_fragment();
         }
 
+        // nullable: all n copies must be nullable → self.nullable
+        // (concat propagates: a.nullable && b.nullable)
         let mut result = self.clone();
         for _ in 1..n {
             result = result.concat(self.clone());
@@ -238,11 +253,15 @@ impl NfaFragment {
     /// ```
     pub fn repeat_counted(mut self, min: u32, max: u32) -> NfaFragment {
         debug_assert!(min <= max, "repeat_counted: min ({min}) > max ({max})");
+
+        // Capture body nullability *before* adding counter infrastructure.
+        let body_nullable = self.nullable;
+
         self.normalize_ids();
 
         // Allocate counter
         let counter_id = self.counter_defs.len() as CounterId;
-        self.counter_defs.push(CounterDef { min, max });
+        self.counter_defs.push(CounterDef { min, max, body_nullable });
 
         // Allocate new states: entry, guard, exit
         let entry_idx = self.states.len();
@@ -278,11 +297,16 @@ impl NfaFragment {
         self.states.push(guard);
         self.states.push(exit);
 
+        // The counted loop is nullable if min==0 (bypass edge) or body is nullable
+        // (all min iterations can complete without consuming input).
+        let nullable = min == 0 || body_nullable;
+
         NfaFragment::with_counters(
             self.states,
             entry_idx,
             exit_idx,
             self.counter_defs,
+            nullable,
         )
     }
 
@@ -369,7 +393,9 @@ impl FragmentBuilder {
     /// Used for optional content and as base case for empty sequences.
     pub fn epsilon_fragment(&mut self) -> NfaFragment {
         let state = self.epsilon_state(None);
-        NfaFragment::new(vec![state], 0, 0)
+        let mut frag = NfaFragment::new(vec![state], 0, 0);
+        frag.nullable = true;
+        frag
     }
 }
 

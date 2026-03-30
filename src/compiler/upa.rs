@@ -117,11 +117,15 @@ struct ReachableTerms {
     wildcards: Vec<ReachableTerm>,
 }
 
-/// Compute epsilon closure and collect all reachable terms from a start state
+/// Compute epsilon closure and collect all reachable terms from a start state.
 ///
-/// Uses DFS traversal following epsilon transitions. Terms are collected from
-/// states in the closure that have a term (these are the states where input
-/// can be consumed to make progress).
+/// Uses DFS traversal following **only** `TransitionKind::Epsilon` transitions.
+/// Counter transitions (`CounterReset`, `CounterIncrement`, `CounterMaxGuard`,
+/// `CounterMinGuard`) are intentionally ignored — UPA checking is currently
+/// applied only to simple (counter-free) NFAs, gated by the pipeline dispatch
+/// in `pipeline.rs`.  If counted NFAs are ever passed to UPA, this function
+/// will need counter-aware traversal (e.g. via `ActiveStates`) to reach terms
+/// hidden behind counter transitions.
 fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> ReachableTerms {
     let mut result = ReachableTerms::default();
     let mut closure = HashSet::new();
