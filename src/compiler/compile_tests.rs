@@ -375,6 +375,29 @@ fn make_all_particle(particles: Vec<ParticleResult>) -> ParticleResult {
     }
 }
 
+fn make_all_particle_with_occurs(
+    particles: Vec<ParticleResult>,
+    min_occurs: u32,
+    max_occurs: Option<u32>,
+) -> ParticleResult {
+    ParticleResult {
+        term: ParticleTerm::Group(ModelGroupDefResult {
+            name: None,
+            ref_name: None,
+            compositor: Some(Compositor::All),
+            particles,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+        }),
+        min_occurs,
+        max_occurs,
+        source: None,
+    }
+}
+
 fn make_complex_type_with_content(
     content: ComplexContentResult,
 ) -> ComplexTypeDefData {
@@ -1669,4 +1692,195 @@ fn test_inline_group_in_all_error() {
         matches!(result, Err(NfaCompileError::InvalidAllGroupContent { .. })),
         "inline group (no ref_name) should be rejected"
     );
+}
+
+// --- Outer all-group occurrence constraint tests (Ea022-Ea025) ---
+
+#[test]
+fn test_all_group_outer_min_occurs_2_rejected() {
+    // Ea023 analog: inline all with minOccurs=2 should be rejected in XSD 1.0
+    use crate::parser::frames::ComplexContentDefResult;
+
+    let schema_set = SchemaSet::new();
+    let all_particle = make_all_particle_with_occurs(
+        vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ],
+        2, // minOccurs=2
+        Some(1),
+    );
+
+    let content = ComplexContentResult::Complex(ComplexContentDefResult {
+        particle: Some(all_particle),
+        derivation: DerivationMethod::Restriction,
+        mixed: false,
+        base_type: None,
+        open_content: None,
+        attributes: vec![],
+        attribute_groups: vec![],
+        attribute_wildcard: None,
+        assertions: vec![],
+        id: None,
+        derivation_id: None,
+        source: None,
+    });
+    let type_def = make_complex_type_with_content(content);
+    let result = compile_content_model_matcher(&schema_set, &type_def);
+    assert!(
+        matches!(result, Err(NfaCompileError::InvalidAllGroupOccurs { .. })),
+        "minOccurs=2 on all-group should be rejected: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_all_group_outer_min_gt_max_rejected() {
+    // Ea024 analog: minOccurs=1 maxOccurs=0 should be rejected
+    use crate::parser::frames::ComplexContentDefResult;
+
+    let schema_set = SchemaSet::new();
+    let all_particle = make_all_particle_with_occurs(
+        vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ],
+        1, // minOccurs=1
+        Some(0), // maxOccurs=0
+    );
+
+    let content = ComplexContentResult::Complex(ComplexContentDefResult {
+        particle: Some(all_particle),
+        derivation: DerivationMethod::Restriction,
+        mixed: false,
+        base_type: None,
+        open_content: None,
+        attributes: vec![],
+        attribute_groups: vec![],
+        attribute_wildcard: None,
+        assertions: vec![],
+        id: None,
+        derivation_id: None,
+        source: None,
+    });
+    let type_def = make_complex_type_with_content(content);
+    let result = compile_content_model_matcher(&schema_set, &type_def);
+    assert!(
+        matches!(result, Err(NfaCompileError::InvalidAllGroupOccurs { .. })),
+        "minOccurs=1 maxOccurs=0 on all-group should be rejected: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_all_group_outer_max_occurs_2_rejected() {
+    // Ea025 analog: maxOccurs=2 should be rejected in XSD 1.0
+    use crate::parser::frames::ComplexContentDefResult;
+
+    let schema_set = SchemaSet::new();
+    let all_particle = make_all_particle_with_occurs(
+        vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ],
+        1,
+        Some(2), // maxOccurs=2
+    );
+
+    let content = ComplexContentResult::Complex(ComplexContentDefResult {
+        particle: Some(all_particle),
+        derivation: DerivationMethod::Restriction,
+        mixed: false,
+        base_type: None,
+        open_content: None,
+        attributes: vec![],
+        attribute_groups: vec![],
+        attribute_wildcard: None,
+        assertions: vec![],
+        id: None,
+        derivation_id: None,
+        source: None,
+    });
+    let type_def = make_complex_type_with_content(content);
+    let result = compile_content_model_matcher(&schema_set, &type_def);
+    assert!(
+        matches!(result, Err(NfaCompileError::InvalidAllGroupOccurs { .. })),
+        "maxOccurs=2 on all-group should be rejected: {:?}",
+        result
+    );
+}
+
+#[test]
+fn test_all_group_outer_optional_accepted() {
+    // Ea022 analog: minOccurs=0 should be valid and set outer_optional
+    use crate::parser::frames::ComplexContentDefResult;
+
+    let schema_set = SchemaSet::new();
+    let all_particle = make_all_particle_with_occurs(
+        vec![
+            make_element_particle(NameId(1), 1, Some(1)),
+            make_element_particle(NameId(2), 1, Some(1)),
+        ],
+        0, // minOccurs=0
+        Some(1),
+    );
+
+    let content = ComplexContentResult::Complex(ComplexContentDefResult {
+        particle: Some(all_particle),
+        derivation: DerivationMethod::Restriction,
+        mixed: false,
+        base_type: None,
+        open_content: None,
+        attributes: vec![],
+        attribute_groups: vec![],
+        attribute_wildcard: None,
+        assertions: vec![],
+        id: None,
+        derivation_id: None,
+        source: None,
+    });
+    let type_def = make_complex_type_with_content(content);
+    let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
+    match &matcher {
+        ContentModelMatcher::AllGroup(model) => {
+            assert!(model.outer_optional, "minOccurs=0 should set outer_optional");
+            assert_eq!(model.particle_count(), 2);
+        }
+        other => panic!("expected AllGroup, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_all_group_default_not_outer_optional() {
+    // minOccurs=1 maxOccurs=1 should NOT set outer_optional
+    use crate::parser::frames::ComplexContentDefResult;
+
+    let schema_set = SchemaSet::new();
+    let all_particle = make_all_particle(vec![
+        make_element_particle(NameId(1), 1, Some(1)),
+        make_element_particle(NameId(2), 0, Some(1)),
+    ]);
+
+    let content = ComplexContentResult::Complex(ComplexContentDefResult {
+        particle: Some(all_particle),
+        derivation: DerivationMethod::Restriction,
+        mixed: false,
+        base_type: None,
+        open_content: None,
+        attributes: vec![],
+        attribute_groups: vec![],
+        attribute_wildcard: None,
+        assertions: vec![],
+        id: None,
+        derivation_id: None,
+        source: None,
+    });
+    let type_def = make_complex_type_with_content(content);
+    let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
+    match &matcher {
+        ContentModelMatcher::AllGroup(model) => {
+            assert!(!model.outer_optional, "default should not be outer_optional");
+        }
+        other => panic!("expected AllGroup, got {:?}", other),
+    }
 }

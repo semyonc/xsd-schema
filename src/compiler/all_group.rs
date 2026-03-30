@@ -37,6 +37,9 @@ pub struct AllGroupModel {
     pub particles: Vec<AllParticle>,
     /// Open content wildcard (XSD 1.1 only)
     pub open_content: Option<OpenContentWildcard>,
+    /// Whether the outer particle has minOccurs=0, making the entire group optional.
+    /// When true, the content model is satisfied even if no children are consumed.
+    pub outer_optional: bool,
 }
 
 /// A particle within an all-group
@@ -92,6 +95,7 @@ impl AllGroupModel {
         Self {
             particles,
             open_content: None,
+            outer_optional: false,
         }
     }
 
@@ -100,6 +104,7 @@ impl AllGroupModel {
         Self {
             particles,
             open_content: Some(open_content),
+            outer_optional: false,
         }
     }
 
@@ -201,6 +206,11 @@ impl AllGroupState {
             }
         }
         true
+    }
+
+    /// Check if any particle has been consumed at all
+    pub fn has_any_consumed(&self) -> bool {
+        self.consumed.iter().any(|&c| c > 0)
     }
 
     /// Get indices of particles that have not satisfied their minOccurs

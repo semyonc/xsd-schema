@@ -885,7 +885,7 @@ pub fn compile_model_group(
 /// Returns the all-group's particles and source if the particle's term is a
 /// group with `compositor == All` and no `ref_name` (i.e., an inline definition,
 /// not a named model group reference).
-fn is_top_level_all_group(particle: &ParticleResult) -> Option<(&[ParticleResult], Option<&SourceRef>)> {
+pub(crate) fn is_top_level_all_group(particle: &ParticleResult) -> Option<(&[ParticleResult], Option<&SourceRef>)> {
     if let ParticleTerm::Group(group) = &particle.term {
         if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
             return Some((&group.particles, group.source.as_ref()));
@@ -900,7 +900,7 @@ fn is_top_level_all_group(particle: &ParticleResult) -> Option<(&[ParticleResult
 /// Returns the resolved [`ModelGroupData`] when the particle's term is a
 /// group with a `ref_name` and the referenced definition has
 /// `compositor == All`.
-fn resolve_top_level_all_group_ref<'a>(
+pub(crate) fn resolve_top_level_all_group_ref<'a>(
     particle: &ParticleResult,
     schema_set: &'a SchemaSet,
 ) -> Option<&'a ModelGroupData> {
@@ -913,6 +913,63 @@ fn resolve_top_level_all_group_ref<'a>(
         }
     }
     None
+}
+
+/// Validate the outer occurrence constraints on a particle whose term is an all-group.
+///
+/// XSD 1.0 (cos-all-limited.2): minOccurs must be 0 or 1, maxOccurs must be 1.
+/// XSD 1.1: more relaxed, but minOccurs > maxOccurs is always invalid.
+pub(crate) fn validate_outer_all_group_occurs(
+    particle: &ParticleResult,
+    xsd_version: XsdVersion,
+) -> NfaCompileResult<()> {
+    let min = particle.min_occurs;
+    let max = particle.max_occurs; // Option<u32>, None means unbounded
+
+    // XSD 1.0 specific constraints (check first for more specific error messages)
+    if xsd_version == XsdVersion::V1_0 {
+        if min > 1 {
+            return Err(NfaCompileError::InvalidAllGroupOccurs {
+                reason: format!(
+                    "cos-all-limited.2: minOccurs must be 0 or 1 for xs:all group, found {}",
+                    min
+                ),
+                location: particle.source.clone(),
+            });
+        }
+        match max {
+            Some(1) => {} // OK
+            Some(n) => {
+                return Err(NfaCompileError::InvalidAllGroupOccurs {
+                    reason: format!(
+                        "cos-all-limited.2: maxOccurs must be 1 for xs:all group, found {}",
+                        n
+                    ),
+                    location: particle.source.clone(),
+                });
+            }
+            None => {
+                return Err(NfaCompileError::InvalidAllGroupOccurs {
+                    reason: "cos-all-limited.2: maxOccurs='unbounded' not allowed for xs:all group"
+                        .to_string(),
+                    location: particle.source.clone(),
+                });
+            }
+        }
+    }
+
+    // Universal: minOccurs > maxOccurs is always invalid
+    if let Some(max_val) = max {
+        if min > max_val {
+            return Err(NfaCompileError::InvalidOccurrence {
+                min,
+                max: max_val,
+                location: particle.source.clone(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Compile the base type's all-group model for an extension type.
@@ -979,12 +1036,16 @@ pub fn compile_content_model_matcher(
         if let ComplexContentResult::Complex(def) = &type_def.content {
             if let Some(particle) = &def.particle {
                 if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
+                    validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
                     ctx.resolved_particle_types =
                         type_def.resolved_content_particle_types.to_vec();
                     ctx.resolved_particle_elements =
                         type_def.resolved_content_particle_elements.to_vec();
                     ctx.content_flat_idx = Some(0);
-                    let model = ctx.compile_all_group_model(all_particles, all_source)?;
+                    let mut model = ctx.compile_all_group_model(all_particles, all_source)?;
+                    if particle.min_occurs == 0 {
+                        model.outer_optional = true;
+                    }
                     let base_matcher = ContentModelMatcher::AllGroup(model);
 
                     let open_content = resolve_open_content(
@@ -999,6 +1060,7 @@ pub fn compile_content_model_matcher(
 
                 // Named group ref resolving to all-group
                 if let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) {
+                    validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
                     ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
                     ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
                     ctx.content_flat_idx = Some(0);
@@ -1011,10 +1073,13 @@ pub fn compile_content_model_matcher(
                         ctx.redefine_redirect =
                             Some((name, group_data.target_namespace, original_key));
                     }
-                    let model = ctx.compile_all_group_model(
+                    let mut model = ctx.compile_all_group_model(
                         &group_data.particles,
                         group_data.source.as_ref(),
                     )?;
+                    if particle.min_occurs == 0 {
+                        model.outer_optional = true;
+                    }
                     let base_matcher = ContentModelMatcher::AllGroup(model);
 
                     let open_content = resolve_open_content(

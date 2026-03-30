@@ -422,12 +422,22 @@ impl ContentValidatorState {
                 active_states.contains_accept(nfa)
             }
             ContentValidatorState::AllGroup { model, state } => {
+                // If the outer particle is optional (minOccurs=0) and no children
+                // have been consumed, the entire group was skipped — trivially satisfied.
+                if model.outer_optional && !state.has_any_consumed() {
+                    return true;
+                }
                 state.is_satisfied(model)
             }
             #[cfg(feature = "xsd11")]
             ContentValidatorState::AllGroupExtension { model, state, extension_nfa, phase } => {
-                // All-group must be satisfied
-                if !state.is_satisfied(model) {
+                // All-group must be satisfied (or skipped if outer-optional)
+                let all_satisfied = if model.outer_optional && !state.has_any_consumed() {
+                    true
+                } else {
+                    state.is_satisfied(model)
+                };
+                if !all_satisfied {
                     return false;
                 }
                 match phase {

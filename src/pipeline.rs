@@ -333,8 +333,50 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
+    validate_all_group_outer_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
     Ok((inline_stats, resolution_stats))
+}
+
+/// Validate outer occurrence constraints on top-level all-groups.
+///
+/// XSD 1.0 (cos-all-limited.2): a particle whose term is an all-group must
+/// have minOccurs in {0, 1} and maxOccurs = 1. This check runs on every
+/// complex type independently of UPA validation.
+fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::compiler::{
+        is_top_level_all_group, resolve_top_level_all_group_ref,
+        validate_outer_all_group_occurs,
+    };
+
+    for (_, type_def) in schema_set.arenas.complex_types.iter() {
+        let Some(particle) = (match &type_def.content {
+            crate::parser::frames::ComplexContentResult::Complex(content) => content.particle.as_ref(),
+            crate::parser::frames::ComplexContentResult::Empty
+            | crate::parser::frames::ComplexContentResult::Simple(_) => None,
+        }) else {
+            continue;
+        };
+
+        let is_all = is_top_level_all_group(particle).is_some()
+            || resolve_top_level_all_group_ref(particle, schema_set).is_some();
+        if !is_all {
+            continue;
+        }
+
+        validate_outer_all_group_occurs(particle, schema_set.xsd_version).map_err(|error| {
+            let location = error
+                .location()
+                .and_then(|source| schema_set.source_maps.locate(source));
+            crate::error::SchemaError::structural(
+                "cos-all-limited",
+                format!("{}", error),
+                location,
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
