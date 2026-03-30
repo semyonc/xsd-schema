@@ -4,8 +4,6 @@
 //! from content model particles. Fragments are composable building blocks that
 //! can be concatenated, alternated, or repeated.
 
-use std::collections::HashMap;
-
 use crate::parser::location::SourceRef;
 
 use super::nfa::{CounterDef, CounterId, NfaState, NfaTable, NfaTerm, StateId, TransitionKind};
@@ -52,28 +50,21 @@ impl NfaFragment {
         Self { states, start, end, counter_defs, nullable }
     }
 
-    /// Normalize state IDs so that each state's ID matches its position in
-    /// the `states` vector.
+    /// Verifies the position-based ID invariant: `state.id == index` for all states.
     ///
-    /// `FragmentBuilder` allocates globally unique IDs, but composition
-    /// methods (`concat`, `alternate`, etc.) assume position-based IDs.
-    /// Calling this before composition ensures all transition targets are
-    /// consistent.
-    fn normalize_ids(&mut self) {
-        let id_map: HashMap<StateId, StateId> = self
-            .states
-            .iter()
-            .enumerate()
-            .map(|(pos, state)| (state.id, pos as StateId))
-            .collect();
-
-        for (pos, state) in self.states.iter_mut().enumerate() {
-            state.id = pos as StateId;
-            for trans in &mut state.transitions {
-                if let Some(&new_target) = id_map.get(&trans.target) {
-                    trans.target = new_target;
-                }
-            }
+    /// This invariant is critical for correctness of all composition operations
+    /// (`concat`, `alternate`, etc.) which use position-based offset arithmetic.
+    /// `FragmentBuilder` guarantees it at construction; combinators preserve it.
+    /// Any new fragment creation path MUST maintain this invariant.
+    fn assert_ids_normalized(&self) {
+        for (pos, state) in self.states.iter().enumerate() {
+            debug_assert_eq!(
+                state.id,
+                pos as StateId,
+                "Fragment ID invariant violated: state at position {} has id {}",
+                pos,
+                state.id
+            );
         }
     }
 
@@ -99,9 +90,8 @@ impl NfaFragment {
     pub fn concat(mut self, mut other: NfaFragment) -> NfaFragment {
         let nullable = self.nullable && other.nullable;
 
-        // Normalize IDs to match positions before composing
-        self.normalize_ids();
-        other.normalize_ids();
+        self.assert_ids_normalized();
+        other.assert_ids_normalized();
 
         let state_offset = self.states.len();
         let counter_offset = self.counter_defs.len() as CounterId;
@@ -134,9 +124,8 @@ impl NfaFragment {
     pub fn alternate(mut self, mut other: NfaFragment) -> NfaFragment {
         let nullable = self.nullable || other.nullable;
 
-        // Normalize IDs to match positions before composing
-        self.normalize_ids();
-        other.normalize_ids();
+        self.assert_ids_normalized();
+        other.assert_ids_normalized();
 
         // Create new start and end states
         let new_start_id = (self.states.len() + other.states.len()) as StateId;
@@ -181,7 +170,7 @@ impl NfaFragment {
     /// Adds an epsilon transition from start to end, allowing the fragment
     /// to be skipped entirely.
     pub fn optional(mut self) -> NfaFragment {
-        self.normalize_ids();
+        self.assert_ids_normalized();
         // Add epsilon from start to end
         let end_id = self.end as StateId;
         self.states[self.start].add_epsilon(end_id);
@@ -194,7 +183,7 @@ impl NfaFragment {
     /// Allows zero or more repetitions of the fragment.
     /// Adds loop back from end to start, plus makes it optional.
     pub fn repeat_star(mut self) -> NfaFragment {
-        self.normalize_ids();
+        self.assert_ids_normalized();
         // Add epsilon loop from end back to start
         let start_id = self.start as StateId;
         self.states[self.end].add_epsilon(start_id);
@@ -211,7 +200,7 @@ impl NfaFragment {
     /// Requires at least one occurrence, then allows more.
     /// Adds loop back from end to start (no optional bypass).
     pub fn repeat_plus(mut self) -> NfaFragment {
-        self.normalize_ids();
+        self.assert_ids_normalized();
         // Add epsilon loop from end back to start
         let start_id = self.start as StateId;
         self.states[self.end].add_epsilon(start_id);
@@ -257,7 +246,7 @@ impl NfaFragment {
         // Capture body nullability *before* adding counter infrastructure.
         let body_nullable = self.nullable;
 
-        self.normalize_ids();
+        self.assert_ids_normalized();
 
         // Allocate counter
         let counter_id = self.counter_defs.len() as CounterId;
@@ -339,50 +328,30 @@ impl NfaFragment {
     }
 }
 
-/// Builder for constructing NFA fragments incrementally
+/// Builder for constructing NFA fragments with fragment-local state IDs.
 ///
-/// The builder maintains state allocation and provides helper methods
-/// for creating different types of fragments.
+/// Fragments are created with position-based IDs (`state.id == index`),
+/// which is the invariant required by all composition operations.
+/// The builder is stateless — each fragment starts with IDs from 0.
 #[derive(Debug)]
-pub struct FragmentBuilder {
-    next_id: StateId,
-}
+pub struct FragmentBuilder;
 
 impl FragmentBuilder {
     /// Create a new fragment builder
     pub fn new() -> Self {
-        Self { next_id: 0 }
-    }
-
-    /// Allocate a new state ID
-    fn alloc_id(&mut self) -> StateId {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
-
-    /// Create an epsilon state (no term)
-    pub fn epsilon_state(&mut self, origin: Option<SourceRef>) -> NfaState {
-        let id = self.alloc_id();
-        NfaState::epsilon(id, origin)
-    }
-
-    /// Create a state with a term
-    pub fn term_state(&mut self, term: NfaTerm, origin: Option<SourceRef>) -> NfaState {
-        let id = self.alloc_id();
-        NfaState::with_term(id, term, origin)
+        Self
     }
 
     /// Build a single-term fragment
     ///
-    /// Creates a fragment with one term state and one epsilon exit state.
-    /// The term state has a consuming transition to the exit state.
-    pub fn single_term(&mut self, term: NfaTerm, origin: Option<SourceRef>) -> NfaFragment {
-        let mut term_state = self.term_state(term, origin);
-        let exit_state = self.epsilon_state(None);
+    /// Creates a fragment with one term state (id=0) and one epsilon exit
+    /// state (id=1). The term state has a consuming transition to the exit.
+    pub fn single_term(&self, term: NfaTerm, origin: Option<SourceRef>) -> NfaFragment {
+        let mut term_state = NfaState::with_term(0, term, origin);
+        let exit_state = NfaState::epsilon(1, None);
 
         // Add consuming transition from term state to exit
-        term_state.add_consume(exit_state.id);
+        term_state.add_consume(1);
 
         NfaFragment::new(vec![term_state, exit_state], 0, 1)
     }
@@ -391,8 +360,8 @@ impl FragmentBuilder {
     ///
     /// Creates a minimal fragment that matches nothing (empty string).
     /// Used for optional content and as base case for empty sequences.
-    pub fn epsilon_fragment(&mut self) -> NfaFragment {
-        let state = self.epsilon_state(None);
+    pub fn epsilon_fragment(&self) -> NfaFragment {
+        let state = NfaState::epsilon(0, None);
         let mut frag = NfaFragment::new(vec![state], 0, 0);
         frag.nullable = true;
         frag
@@ -405,13 +374,13 @@ impl Default for FragmentBuilder {
     }
 }
 
-/// Convert a fragment to a complete NFA table
+/// Convert a fragment to a complete NFA table.
 ///
-/// Renumbers all state IDs to be contiguous starting from 0,
-/// and identifies the start and accept states.
-pub fn fragment_to_table(mut fragment: NfaFragment) -> NfaTable {
-    // Ensure all state IDs match their vector positions
-    fragment.normalize_ids();
+/// Asserts the fragment's ID invariant (`state.id == position`) and
+/// wraps the states into an `NfaTable` with the fragment's start/end
+/// as start/accept states.
+pub fn fragment_to_table(fragment: NfaFragment) -> NfaTable {
+    fragment.assert_ids_normalized();
 
     let start_state = fragment.start as StateId;
     let accept_state = fragment.end as StateId;
@@ -430,7 +399,7 @@ mod tests {
 
     #[test]
     fn test_single_term_fragment() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
 
         assert_eq!(frag.states.len(), 2);
@@ -442,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_epsilon_fragment() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.epsilon_fragment();
 
         assert_eq!(frag.states.len(), 1);
@@ -453,7 +422,7 @@ mod tests {
 
     #[test]
     fn test_concat() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let a = builder.single_term(make_element_term(1), None);
         let b = builder.single_term(make_element_term(2), None);
 
@@ -471,7 +440,7 @@ mod tests {
 
     #[test]
     fn test_alternate() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let a = builder.single_term(make_element_term(1), None);
         let b = builder.single_term(make_element_term(2), None);
 
@@ -490,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_optional() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
         let opt = frag.optional();
 
@@ -501,7 +470,7 @@ mod tests {
 
     #[test]
     fn test_repeat_star() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
         let star = frag.repeat_star();
 
@@ -516,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_repeat_plus() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
         let plus = frag.repeat_plus();
 
@@ -531,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_repeat_exact() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
         let exact = frag.repeat_exact(3);
 
@@ -541,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_repeat_range() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
 
         // {0,1} = optional
         let frag1 = builder.single_term(make_element_term(1), None);
@@ -558,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_fragment_to_table() {
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(make_element_term(1), None);
         let table = fragment_to_table(frag);
 

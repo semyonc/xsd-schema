@@ -18,7 +18,7 @@
 //! use xsd_schema::{SchemaSet, NameId};
 //!
 //! // Build a simple NFA for a single element
-//! let mut builder = FragmentBuilder::new();
+//! let builder = FragmentBuilder::new();
 //! let term = NfaTerm::element(NameId(1), None, None);
 //! let fragment = builder.single_term(term, None);
 //! let nfa = fragment_to_table(fragment);

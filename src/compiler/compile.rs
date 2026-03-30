@@ -41,7 +41,7 @@ pub struct CompileContext<'a> {
     pub schema_set: &'a SchemaSet,
     /// Target namespace for the content model being compiled
     pub target_namespace: Option<NameId>,
-    /// Fragment builder for allocating states
+    /// Fragment builder for constructing NFA fragments
     builder: FragmentBuilder,
     /// Current recursion depth
     depth: usize,
@@ -940,7 +940,7 @@ fn compile_base_all_group(
 /// extension content. Each particle becomes a choice alternative wrapped
 /// in repeat(0, max_occurs).
 fn all_group_to_nfa(model: &AllGroupModel) -> NfaTable {
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     if model.particles.is_empty() {
         return fragment_to_table(builder.epsilon_fragment());
     }
@@ -1164,7 +1164,7 @@ pub fn compile_content_model_matcher(
 }
 
 fn empty_nfa() -> NfaTable {
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     fragment_to_table(builder.epsilon_fragment())
 }
 

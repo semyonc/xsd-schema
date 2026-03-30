@@ -1721,7 +1721,7 @@ mod tests {
     /// Build a counted NFA for element `a{min,max}` and return (nfa, name_id).
     fn make_counted_element_nfa(min: u32, max: u32) -> (NfaTable, NameId) {
         let name = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(name, None, None), None);
         let counted = frag.repeat_counted(min, max);
         let nfa = fragment_to_table(counted);
@@ -1826,7 +1826,7 @@ mod tests {
         // Build a{2,50} followed by b
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
 
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.repeat_counted(2, 50);
@@ -1867,7 +1867,7 @@ mod tests {
         // After the nullable loop exits, all configs should collapse at b.
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
 
         // Build a? (optional element)
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
@@ -1908,7 +1908,7 @@ mod tests {
         use crate::compiler::particle::{apply_occurs, MaxOccurs};
 
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let result = apply_occurs(frag, 17, MaxOccurs::Unbounded);
         let nfa = fragment_to_table(result);
@@ -1993,7 +1993,7 @@ mod tests {
     fn test_ranged_closure_convergence() {
         // (a?){0,10000} — must use RangedSingle and converge in O(states)
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let opt = frag.optional();
         let counted = opt.repeat_counted(0, 10_000);
@@ -2029,7 +2029,7 @@ mod tests {
     fn test_nullable_body_accepts_range() {
         // (a?){3,5}: accepts "", "a", "aa", "aaa", "aaaa", "aaaaa", rejects "aaaaaa"
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let opt = frag.optional();
         let counted = opt.repeat_counted(3, 5);
@@ -2058,7 +2058,7 @@ mod tests {
         // (a|b?){0,1000} — body is nullable (b? branch), should use RangedSingle
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
         let choice = frag_a.alternate(frag_b.optional());
@@ -2106,7 +2106,7 @@ mod tests {
         // a{0,100} followed by b{0,100} — 2 counters, should use Counted
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.repeat_counted(0, 100);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2124,7 +2124,7 @@ mod tests {
     fn test_nested_nullable_uses_hybrid() {
         // ((a?){0,50}){0,50} — 2 nullable counters → Hybrid
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let inner = frag.optional().repeat_counted(0, 50);
         let outer = inner.repeat_counted(0, 50);
@@ -2145,7 +2145,7 @@ mod tests {
     fn test_nested_nullable_hybrid_correctness() {
         // ((a?){0,100}){0,50}: inner up to 100 per outer iteration, outer up to 50
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let inner = frag.optional().repeat_counted(0, 100);
         let outer = inner.repeat_counted(0, 50);
@@ -2175,7 +2175,7 @@ mod tests {
     fn test_hybrid_convergence() {
         // ((a?){0,100}){0,50}: verify configs are O(states * outer_max), not O(M*N*states)
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let inner = frag.optional().repeat_counted(0, 100);
         let outer = inner.repeat_counted(0, 50);
@@ -2201,7 +2201,7 @@ mod tests {
         // (a?){0,1000} followed by (b?){0,1000}
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2243,7 +2243,7 @@ mod tests {
         // (a?){0,500} followed by b{0,500}: one nullable, one not
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 500);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2283,7 +2283,7 @@ mod tests {
         // choosing whichever counter it picks, by testing boundary conditions
         // that exercise both counters.
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let inner = frag.optional().repeat_counted(0, 100);
         let outer = inner.repeat_counted(0, 50);
@@ -2312,7 +2312,7 @@ mod tests {
         // (a?){0,10} followed by (b?){0,1000}: should range counter 1 (max=1000)
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 10);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2346,7 +2346,7 @@ mod tests {
         // (a?){0,5} followed by (b?){0,5}: both nullable but max ≤ COUNTED_THRESHOLD → Counted
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 5);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2368,7 +2368,7 @@ mod tests {
         use crate::types::complex::NamespaceConstraint;
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
 
         // Element term for 'a' (mandatory)
         let elem = builder.single_term(NfaTerm::element(a, None, None), None);
@@ -2411,7 +2411,7 @@ mod tests {
         // (a?){0,1000} followed by (b?){0,1000}: equal max → should range counter 0
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2434,7 +2434,7 @@ mod tests {
         // After feeding a's and then b, the ranged counter should switch.
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2473,7 +2473,7 @@ mod tests {
         let a = NameId(100);
         let b = NameId(200);
         let c = NameId(300);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 500);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2517,7 +2517,7 @@ mod tests {
         // After 5 a's, ranged counter is still active — no switch.
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2538,7 +2538,7 @@ mod tests {
         // (a?){0,1000} followed by b{0,1000}: second counter is NOT nullable
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2564,7 +2564,7 @@ mod tests {
         // ((a?){0,100}){0,50}: inner counter should not cause a switch
         // while it still has active ranges.
         let a = NameId(100);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag = builder.single_term(NfaTerm::element(a, None, None), None);
         let inner = frag.optional().repeat_counted(0, 100);
         let outer = inner.repeat_counted(0, 50);
@@ -2589,7 +2589,7 @@ mod tests {
         // After first 'b', config count should be small.
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 1000);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);
@@ -2617,7 +2617,7 @@ mod tests {
         // Compare accept/reject decisions at every step.
         let a = NameId(100);
         let b = NameId(200);
-        let mut builder = FragmentBuilder::new();
+        let builder = FragmentBuilder::new();
         let frag_a = builder.single_term(NfaTerm::element(a, None, None), None);
         let counted_a = frag_a.optional().repeat_counted(0, 100);
         let frag_b = builder.single_term(NfaTerm::element(b, None, None), None);

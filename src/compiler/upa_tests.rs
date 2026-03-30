@@ -59,7 +59,7 @@ fn test_element_element_same_name_conflict() {
     let name_a = schema_set.name_table.add("a");
 
     // Build a choice between two elements with the same name
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::element(name_a, None, None);
     let frag1 = builder.single_term(term1, None);
@@ -80,7 +80,7 @@ fn test_element_element_different_namespace_no_conflict() {
     let ns2 = schema_set.name_table.add("http://ns2.example.com");
 
     // Build a choice between two elements with same name but different namespaces
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, Some(ns1), None);
     let term2 = NfaTerm::element(name_a, Some(ns2), None);
     let frag1 = builder.single_term(term1, None);
@@ -98,7 +98,7 @@ fn test_element_element_sequence_no_conflict() {
     let name_a = schema_set.name_table.add("a");
 
     // Build a sequence of two elements with the same name (no conflict in sequence)
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::element(name_a, None, None);
     let frag1 = builder.single_term(term1, None);
@@ -117,7 +117,7 @@ fn test_element_element_different_names_no_conflict() {
     let name_b = schema_set.name_table.add("b");
 
     // Build a choice between two elements with different names
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::element(name_b, None, None);
     let frag1 = builder.single_term(term1, None);
@@ -139,7 +139,7 @@ fn test_element_wildcard_any_conflict_xsd10() {
     let name_a = schema_set.name_table.add("a");
 
     // Build a choice between an element and a ##any wildcard
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
     let frag1 = builder.single_term(term1, None);
@@ -158,7 +158,7 @@ fn test_element_wildcard_any_allowed_xsd11() {
     let name_a = schema_set.name_table.add("a");
 
     // Build a choice between an element and a ##any wildcard
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
     let frag1 = builder.single_term(term1, None);
@@ -178,7 +178,7 @@ fn test_element_wildcard_other_with_target_no_overlap() {
     let target_ns = schema_set.name_table.add("http://target.example.com");
 
     // Build a choice between an element in target ns and ##other wildcard
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, Some(target_ns), None);
     let term2 = NfaTerm::wildcard(NamespaceConstraint::Other, ProcessContents::Lax);
     let frag1 = builder.single_term(term1, None);
@@ -200,7 +200,7 @@ fn test_wildcard_wildcard_any_any_conflict() {
     let schema_set = create_test_schema_set();
 
     // Build a choice between two ##any wildcards
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
     let term2 = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Strict);
     let frag1 = builder.single_term(term1, None);
@@ -219,7 +219,7 @@ fn test_wildcard_wildcard_target_vs_other_no_conflict() {
     let target_ns = schema_set.name_table.add("http://target.example.com");
 
     // Build a choice between ##targetNamespace and ##other wildcards
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::wildcard(NamespaceConstraint::TargetNamespace, ProcessContents::Lax);
     let term2 = NfaTerm::wildcard(NamespaceConstraint::Other, ProcessContents::Lax);
     let frag1 = builder.single_term(term1, None);
@@ -239,7 +239,7 @@ fn test_wildcard_wildcard_list_overlap() {
     let ns2 = schema_set.name_table.add("http://ns2.example.com");
 
     // Build a choice between two list wildcards with overlapping namespaces
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::wildcard(
         NamespaceConstraint::List(vec![Some(ns1), Some(ns2)]),
         ProcessContents::Lax,
@@ -265,7 +265,7 @@ fn test_wildcard_wildcard_list_no_overlap() {
     let ns2 = schema_set.name_table.add("http://ns2.example.com");
 
     // Build a choice between two list wildcards with non-overlapping namespaces
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::wildcard(
         NamespaceConstraint::List(vec![Some(ns1)]),
         ProcessContents::Lax,
@@ -294,7 +294,7 @@ fn test_nested_choice_with_conflict() {
     let name_b = schema_set.name_table.add("b");
 
     // Build nested choice: (a | (a | b))
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term_a1 = NfaTerm::element(name_a, None, None);
     let term_a2 = NfaTerm::element(name_a, None, None);
     let term_b = NfaTerm::element(name_b, None, None);
@@ -318,7 +318,7 @@ fn test_optional_element_before_same_element() {
 
     // Build: a? a (optional a followed by required a)
     // This creates ambiguity: given input "a", could be (empty, a) or (a, ???)
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     let term2 = NfaTerm::element(name_a, None, None);
 
@@ -391,7 +391,7 @@ fn test_substitution_group_head_member_conflict() {
         .resolved_substitution_groups
         .push(head_key);
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
     let term2 = NfaTerm::element(member_name, None, Some(member_key));
     let frag1 = builder.single_term(term1, None);
@@ -436,7 +436,7 @@ fn test_substitution_group_transitive_conflict() {
         .resolved_substitution_groups
         .push(mid_key);
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
     let term2 = NfaTerm::element(leaf_name, None, Some(leaf_key));
     let frag1 = builder.single_term(term1, None);
@@ -475,7 +475,7 @@ fn test_substitution_group_blocked_no_conflict() {
         .unwrap()
         .block = DerivationSet::SUBSTITUTION;
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
     let term2 = NfaTerm::element(member_name, None, Some(member_key));
     let frag1 = builder.single_term(term1, None);
@@ -749,7 +749,7 @@ fn test_element_wildcard_no_overlap_via_not_qnames() {
     let schema_set = create_test_schema_set();
     let name_a = schema_set.name_table.add("a");
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(name_a, None, None);
     // Wildcard that explicitly excludes element "a" (absent ns)
     let term2 = NfaTerm::wildcard_with_not_qnames(
@@ -793,7 +793,7 @@ fn test_element_wildcard_subst_member_namespace_conflict() {
         .resolved_substitution_groups
         .push(head_key);
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     // Element in target namespace with substitution group
     let term1 = NfaTerm::element(head_name, Some(target_ns), Some(head_key));
     // ##other wildcard — matches other_ns but not target_ns
@@ -833,7 +833,7 @@ fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
         .resolved_substitution_groups
         .push(head_key);
 
-    let mut builder = FragmentBuilder::new();
+    let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
     // Wildcard excludes head but NOT member
     let term2 = NfaTerm::wildcard_with_not_qnames(
