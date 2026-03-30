@@ -42,6 +42,9 @@ bitflags! {
         /// All derivation methods blocked
         const ALL = Self::EXTENSION.bits() | Self::RESTRICTION.bits() |
                    Self::LIST.bits() | Self::UNION.bits() | Self::SUBSTITUTION.bits();
+
+        /// Element-relevant block bits (LIST and UNION are not meaningful for elements)
+        const ELEMENT_BLOCK = Self::EXTENSION.bits() | Self::RESTRICTION.bits() | Self::SUBSTITUTION.bits();
     }
 }
 
@@ -79,6 +82,14 @@ impl DerivationSet {
     /// Check if substitution is blocked
     pub fn contains_substitution(&self) -> bool {
         self.contains(Self::SUBSTITUTION)
+    }
+
+    /// Mask to only element-relevant block bits (extension, restriction, substitution).
+    /// LIST and UNION are simple-type derivation methods and have no meaning in element
+    /// block attributes. Per the spec, element `block="#all"` means `{extension, restriction,
+    /// substitution}` only.
+    pub fn element_block_mask(self) -> Self {
+        self & Self::ELEMENT_BLOCK
     }
 }
 

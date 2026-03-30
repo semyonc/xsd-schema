@@ -725,6 +725,8 @@ struct NormalizedElement {
     type_key: TypeKey,
     element_key: Option<ElementKey>,
     block: DerivationSet,
+    nillable: bool,
+    fixed_value: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -806,7 +808,7 @@ impl<'a> ParticleNormalizer<'a> {
             let elem_key = self
                 .schema_set
                 .lookup_element(ref_name.namespace, ref_name.local_name);
-            let (type_key, block) = elem_key
+            let (type_key, block, nillable, fixed_value) = elem_key
                 .and_then(|key| self.schema_set.arenas.elements.get(key))
                 .map(|decl| {
                     let (eff_block, _) =
@@ -817,12 +819,14 @@ impl<'a> ParticleNormalizer<'a> {
                     let tk = decl
                         .resolved_type
                         .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
-                    (tk, eff_block)
+                    (tk, eff_block, decl.nillable, decl.fixed_value.clone())
                 })
                 .unwrap_or_else(|| {
                     (
                         TypeKey::Complex(self.schema_set.any_type_key()),
                         DerivationSet::empty(),
+                        false,
+                        None,
                     )
                 });
             return Ok(NormalizedElement {
@@ -831,6 +835,8 @@ impl<'a> ParticleNormalizer<'a> {
                 type_key,
                 element_key: elem_key,
                 block,
+                nillable,
+                fixed_value,
             });
         }
 
@@ -875,6 +881,8 @@ impl<'a> ParticleNormalizer<'a> {
             type_key,
             element_key: None,
             block,
+            nillable: elem.nillable,
+            fixed_value: elem.fixed_value.clone(),
         })
     }
 
@@ -1365,18 +1373,33 @@ fn particle_restricts(
                     }
                     _ => false,
                 };
-            occurs_range_is_subset(
+            // NameAndTypeOK (§3.9.6):
+            // 1. Names match or substitution group
+            (names_match || subst_match)
+            // 2. Occurrence range subset
+            && occurs_range_is_subset(
                 derived.min_occurs,
                 derived.max_occurs,
                 base.min_occurs,
                 base.max_occurs,
-            ) && (names_match || subst_match)
-                && derived_element.block.contains(base_element.block)
-                && schema_set.is_type_derived_from(
-                    derived_element.type_key,
-                    base_element.type_key,
-                    DerivationSet::extension(),
-                )
+            )
+            // 3. nillable: derived nillable only if base nillable
+            && (base_element.nillable || !derived_element.nillable)
+            // 4. fixed value: if base is fixed, derived must be fixed with same value
+            && match &base_element.fixed_value {
+                None => true,
+                Some(base_fixed) => derived_element.fixed_value.as_ref() == Some(base_fixed),
+            }
+            // TODO: 5. identity-constraint definitions subset (not yet implemented)
+            // 6. block superset (masked to element-relevant bits)
+            && derived_element.block.element_block_mask()
+                .contains(base_element.block.element_block_mask())
+            // 7. type derivation
+            && schema_set.is_type_derived_from(
+                derived_element.type_key,
+                base_element.type_key,
+                DerivationSet::extension(),
+            )
         }
         (
             NormalizedParticleTerm::Element(element),
