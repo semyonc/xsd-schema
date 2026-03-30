@@ -221,14 +221,25 @@ pub fn parse_boolean(value: &str) -> Result<bool, String> {
 }
 
 /// Parse an occurrence count (minOccurs/maxOccurs)
+///
+/// XSD `nonNegativeInteger` has no upper bound, so values larger than `u32::MAX`
+/// are valid. We clamp them to `u32::MAX`; the compiler treats anything above
+/// `MAX_COUNTED_OCCURS` (10 000) as effectively unbounded.
 pub fn parse_occurs(value: &str) -> Result<Option<u32>, String> {
     if value == "unbounded" {
         Ok(None)
     } else {
-        value
-            .parse::<u32>()
-            .map(Some)
-            .map_err(|_| format!("Invalid occurrence value: '{}'", value))
+        match value.parse::<u32>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => {
+                // Accept valid non-negative integers that overflow u32
+                if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+                    Ok(Some(u32::MAX))
+                } else {
+                    Err(format!("Invalid occurrence value: '{}'", value))
+                }
+            }
+        }
     }
 }
 
