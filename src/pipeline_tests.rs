@@ -2074,6 +2074,50 @@ fn test_substitution_group_final_extension_allows_restriction_member() {
 }
 
 // ======================================================================
+// Fix 1b: NameAndTypeOK — shorthand complex type restricts anyType
+// ======================================================================
+
+#[test]
+fn test_element_restriction_shorthand_type_restricts_anytype() {
+    // particlesIj014: base element c1 has type=anyType, derived c1 has type=foo
+    // where foo is a shorthand complex type (implicitly restricts anyType).
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test"
+                    elementFormDefault="qualified">
+        <xsd:complexType name="foo">
+            <xsd:choice>
+                <xsd:element name="f1" maxOccurs="5"/>
+                <xsd:element name="f2"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="B">
+            <xsd:choice>
+                <xsd:element name="c1" type="xsd:anyType"/>
+                <xsd:element name="c2"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:choice>
+                        <xsd:element name="c1" type="t:foo"/>
+                        <xsd:element name="c2"/>
+                    </xsd:choice>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "Schema should be valid: foo (shorthand complex type) restricts anyType: {:?}",
+        result
+    );
+}
+
+// ======================================================================
 // Fix 2: All:All order-preserving in XSD 1.0
 // ======================================================================
 

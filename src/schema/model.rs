@@ -572,6 +572,11 @@ impl SchemaSet {
                     current = complex_base;
                     continue;
                 }
+
+                // resolved_base_type is None (shorthand complex type) or
+                // Some(TypeKey::Simple(_)) (simpleContent). Both ultimately
+                // derive from xs:anyType — check if that is the target.
+                return base == self.any_type_key();
             }
 
             break;
