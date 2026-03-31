@@ -281,7 +281,7 @@ carries the instance document's base URI for correct relative URI resolution.
 Set the base URI before starting validation:
 
 ```rust,ignore
-runtime.set_instance_base_uri("file:///path/to/instance.xml");
+runtime.set_instance_base_uri("/absolute/path/to/instance.xml");
 ```
 
 Retrieve hints afterwards:
@@ -295,15 +295,45 @@ Complete pairs are accumulated from every `xsi:schemaLocation` attribute,
 even from values that failed even-token-count enforcement (the complete
 pairs are still valid hints).
 
-To load schemas from these hints between validation runs, use
-`load_hints_into_builder`. It resolves relative locations against each
-hint's base URI and skips schemas that are already loaded:
+### Hint-driven schema enrichment (two-pass validation)
+
+The XSD spec says processors SHOULD attempt to locate schemas from
+`xsi:schemaLocation` hints. Because `ValidationRuntime` borrows `&SchemaSet`
+immutably, schema loading cannot happen mid-validation. Instead, hints are
+collected during the first pass, then used to build an enriched schema set
+for a second pass.
+
+The simplest approach is `enrich_schema_set`, which re-loads the original
+schemas and adds the hinted ones in a single call:
+
+```rust,ignore
+use xsd_schema::enrich_schema_set;
+
+// First pass: validate and collect hints
+let sl = runtime.schema_location_hints().to_vec();
+let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
+
+// Build enriched schema set (returns None if no hints or compile fails)
+if let Some(enriched) = enrich_schema_set(&schema_set, &sl, &nnsl) {
+    // Second pass: re-validate with enriched schema set
+    let validator2 = SchemaValidator::new(&enriched, flags);
+    let mut runtime2 = validator2.start_run(sink2);
+    // ... drive the same XML events again ...
+}
+```
+
+`enrich_schema_set` internally uses `SchemaSetBuilder::add_from()` to
+re-load all schemas from the original set's recorded locations, then
+adds the hinted schemas and compiles. You do not need to track the
+original schema file paths yourself.
+
+For more control, use the builder directly:
 
 ```rust,ignore
 use xsd_schema::{SchemaSetBuilder, load_hints_into_builder};
 
 let mut builder = SchemaSetBuilder::new();
-builder.try_add("base.xsd").ok();
+builder.add_from(&schema_set);       // re-load original schemas
 load_hints_into_builder(&mut builder, &sl_hints, &nnsl_hints);
 let compiled = builder.compile()?;
 // Re-validate with compiled.schema_set()
@@ -312,6 +342,11 @@ let compiled = builder.compile()?;
 Load failures are non-fatal — the caller can inspect `HintLoadResult::errors`
 for diagnostics. No schemas are loaded during an active validation run; the
 runtime borrows `&SchemaSet` immutably.
+
+**Base URI note:** Use an absolute (canonicalized) path for
+`set_instance_base_uri`. Relative paths with `..` components can cause
+hint resolution to fail because the resolver joins the hint location
+against the base URI's directory.
 
 ## 3. XPath
 

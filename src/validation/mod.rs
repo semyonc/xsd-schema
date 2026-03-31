@@ -50,4 +50,4 @@ pub use validator::{
 };
 pub use runtime::ValidationRuntime;
 pub use identity::{KeyTable, KeySequence, KeyFieldValue};
-pub use hint_loader::{load_hints_into_builder, HintLoadResult};
+pub use hint_loader::{enrich_schema_set, load_hints_into_builder, HintLoadResult};

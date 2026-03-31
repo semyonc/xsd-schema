@@ -214,5 +214,5 @@ pub use validation::{
 };
 
 // Re-export hint-driven schema loading
-pub use validation::hint_loader::{load_hints_into_builder, HintLoadResult};
+pub use validation::hint_loader::{enrich_schema_set, load_hints_into_builder, HintLoadResult};
 pub use validation::info::{SchemaLocationHint, NoNamespaceSchemaLocationHint};

@@ -100,6 +100,45 @@ fn try_load_hint(
     }
 }
 
+/// Build an enriched [`SchemaSet`] by re-loading the original schemas and
+/// adding any `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hints
+/// collected during a validation run.
+///
+/// Returns `Some(enriched_set)` if hints were present and compilation
+/// succeeded, `None` if there were no hints or compilation failed.
+///
+/// This is the recommended way to handle schema-location hints without
+/// manually tracking original schema file paths:
+///
+/// ```rust,ignore
+/// // After first validation pass:
+/// let sl = runtime.schema_location_hints().to_vec();
+/// let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
+///
+/// if let Some(enriched) = enrich_schema_set(&schema_set, &sl, &nnsl) {
+///     // Re-validate with enriched schema set
+/// }
+/// ```
+pub fn enrich_schema_set(
+    original: &crate::schema::SchemaSet,
+    schema_location_hints: &[SchemaLocationHint],
+    no_namespace_hints: &[NoNamespaceSchemaLocationHint],
+) -> Option<crate::schema::SchemaSet> {
+    if schema_location_hints.is_empty() && no_namespace_hints.is_empty() {
+        return None;
+    }
+
+    let mut builder = if original.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+        SchemaSetBuilder::xsd11()
+    } else {
+        SchemaSetBuilder::new()
+    };
+
+    builder.add_from(original);
+    load_hints_into_builder(&mut builder, schema_location_hints, no_namespace_hints);
+    builder.compile().ok().map(|c| c.into_schema_set())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

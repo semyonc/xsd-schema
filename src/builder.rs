@@ -140,6 +140,32 @@ impl SchemaSetBuilder {
         }
     }
 
+    /// Re-load all schemas from an existing compiled schema set.
+    ///
+    /// Iterates the loaded locations in `schema_set` and adds each one to
+    /// this builder. This lets you seed a new builder from a previously
+    /// compiled set without manually tracking the original file paths —
+    /// useful for enriching with `xsi:schemaLocation` hints.
+    ///
+    /// Locations that fail to load (e.g. inline sources without a file
+    /// path) are silently skipped. Already-loaded locations are
+    /// deduplicated.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut builder = SchemaSetBuilder::new();
+    /// builder.add_from(&original_schema_set);
+    /// load_hints_into_builder(&mut builder, &sl_hints, &nnsl_hints);
+    /// let enriched = builder.compile()?;
+    /// ```
+    pub fn add_from(&mut self, schema_set: &SchemaSet) -> &mut Self {
+        for location in schema_set.loaded_schema_locations() {
+            let _ = self.try_add(location);
+        }
+        self
+    }
+
     /// Add a schema by namespace and location.
     ///
     /// Matches the C# `XmlSchemaSet.Add(namespace, location)` pattern.

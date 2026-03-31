@@ -935,7 +935,7 @@ impl TestRunner {
                     }
                 };
 
-                match validate_instance(&schema_set, instance_file, &test.schema_files, &test.version) {
+                match validate_instance(&schema_set, instance_file) {
                     Ok((has_errors, error_msgs)) => {
                         let instance_valid = !has_errors;
                         match (test.expected, instance_valid) {
@@ -984,13 +984,12 @@ const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 /// Validate an instance document against a compiled schema set.
 ///
 /// If the first validation pass collects `xsi:schemaLocation` or
-/// `xsi:noNamespaceSchemaLocation` hints, the driver enriches the schema
-/// set with the hinted schemas and re-validates (two-pass approach).
+/// `xsi:noNamespaceSchemaLocation` hints, the driver uses the library's
+/// [`enrich_schema_set`] API to build an enriched schema set and
+/// re-validates (two-pass approach).
 fn validate_instance(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
-    schema_files: &[PathBuf],
-    xsd_version: &str,
 ) -> Result<(bool, Vec<String>), String> {
     let content = fs::read(instance_path)
         .map_err(|e| format!("Failed to read instance: {}", e))?;
@@ -1002,30 +1001,14 @@ fn validate_instance(
     let (has_errors, error_msgs, sl_hints, nnsl_hints) =
         validate_instance_pass(schema_set, &canonical_path, &content)?;
 
-    // Two-pass: if hints were collected, build an enriched schema set
-    // and re-validate. This handles xsi:schemaLocation-driven discovery
-    // (e.g. B013 where a wildcard-matched element's schema is hinted,
-    // or Z025 where ALL schemas come from instance hints).
-    if !sl_hints.is_empty() || !nnsl_hints.is_empty() {
-        let mut builder = if xsd_version == "1.1" {
-            xsd_schema::SchemaSetBuilder::xsd11()
-        } else {
-            xsd_schema::SchemaSetBuilder::new()
-        };
-        for schema_file in schema_files {
-            if let Ok(abs) = schema_file.canonicalize() {
-                let _ = builder.try_add(&abs.to_string_lossy());
-            }
-        }
-        xsd_schema::validation::hint_loader::load_hints_into_builder(
-            &mut builder, &sl_hints, &nnsl_hints,
-        );
-        if let Ok(compiled) = builder.compile() {
-            let enriched = compiled.into_schema_set();
-            let (has_errors2, error_msgs2, _, _) =
-                validate_instance_pass(&enriched, &canonical_path, &content)?;
-            return Ok((has_errors2, error_msgs2));
-        }
+    // Two-pass: if hints were collected, use the library's enrich_schema_set()
+    // to build an enriched schema set and re-validate.
+    if let Some(enriched) =
+        xsd_schema::enrich_schema_set(schema_set, &sl_hints, &nnsl_hints)
+    {
+        let (has_errors2, error_msgs2, _, _) =
+            validate_instance_pass(&enriched, &canonical_path, &content)?;
+        return Ok((has_errors2, error_msgs2));
     }
 
     Ok((has_errors, error_msgs))

@@ -196,6 +196,14 @@ impl SchemaSet {
         !self.parsing_errors.is_empty()
     }
 
+    /// Iterate the normalized locations of all loaded schema documents.
+    ///
+    /// Useful for seeding a new [`SchemaSetBuilder`] with the same schemas
+    /// when enriching with `xsi:schemaLocation` hints.
+    pub fn loaded_schema_locations(&self) -> impl Iterator<Item = &str> {
+        self.loaded_locations.keys().map(|s| s.as_str())
+    }
+
     /// Check if a schema location has already been loaded
     pub fn is_loaded(&self, location: &str) -> bool {
         self.loaded_locations.contains_key(location)
