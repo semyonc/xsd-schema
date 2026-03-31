@@ -439,6 +439,10 @@ impl SchemaSet {
     }
 
     /// Check if simple type `derived` is derived from simple type `base` with method filtering.
+    ///
+    /// Implements XSD spec §3.16.6.3 "Type Derivation OK (Simple)":
+    /// - Clause 2.2.1/2.2.2: walks the `resolved_base_type` chain
+    /// - Clause 2.2.4: if `base` is a union, checks transitive member types
     fn is_simple_type_derived_from(
         &self,
         derived: SimpleTypeKey,
@@ -447,11 +451,12 @@ impl SchemaSet {
     ) -> bool {
         use crate::parser::frames::SimpleTypeVariety;
 
-        // Same type
+        // Clause 1: Same type
         if derived == base {
             return true;
         }
 
+        // Clause 2.2.1/2.2.2: Walk the base type chain
         let builtin = self.builtin_types();
         let mut current = derived;
         let mut visited = std::collections::HashSet::new();
@@ -468,7 +473,7 @@ impl SchemaSet {
 
                 // If this derivation method is excluded, stop traversal
                 if exclude_methods.contains(method_flag) {
-                    return false;
+                    break;
                 }
 
                 // Check resolved base type
@@ -485,7 +490,7 @@ impl SchemaSet {
             if builtin.is_builtin(current) {
                 // For built-in types, derivation is always by restriction
                 if exclude_methods.contains(DerivationSet::RESTRICTION) {
-                    return false;
+                    break;
                 }
                 if let Some(parent) = builtin.get_base_type(current) {
                     if parent == base {
@@ -497,6 +502,20 @@ impl SchemaSet {
             }
 
             break;
+        }
+
+        // Clause 2.2.4: If base is a union with no facets, check whether
+        // derived is derived from a transitive member type.
+        if let Some(base_def) = self.arenas.simple_types.get(base) {
+            if base_def.variety == SimpleTypeVariety::Union && base_def.facets.is_empty() {
+                for &member_type_key in &base_def.resolved_member_types {
+                    if let TypeKey::Simple(member_key) = member_type_key {
+                        if self.is_simple_type_derived_from(derived, member_key, exclude_methods) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
 
         false

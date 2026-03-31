@@ -646,10 +646,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ));
             } else {
                 parent.has_element_children = true;
+                // Derive wildcard target namespace from the parent's schema
+                // type, not the instance element namespace. For unqualified
+                // local elements parent.namespace may be None while the
+                // wildcard's ##targetNamespace should resolve to the schema
+                // document's target namespace (XSD spec §3.10.4).
+                let wildcard_target_ns = match parent.schema_type {
+                    Some(TypeKey::Complex(ct_key)) => {
+                        self.schema_set.arenas.complex_types[ct_key].target_namespace
+                    }
+                    _ => parent.namespace,
+                };
                 match parent.content_state.advance_element(
                     local_name,
                     namespace,
-                    parent.namespace, // parent's target_namespace for wildcard matching
+                    wildcard_target_ns,
                     self.schema_set.xsd_version,
                     self.subst_groups.as_ref(),
                 ) {
@@ -3589,7 +3600,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
         let mut visited = HashSet::new();
-        self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited)
+        let result = self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited);
+        if result.is_some() {
+            return result;
+        }
+        // Walk base type chain for inherited anyAttribute (XSD spec §3.4.2.4)
+        if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
+            if base_ct_key != self.schema_set.any_type_key() {
+                let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
+                return self.find_effective_wildcard(base_data);
+            }
+        }
+        None
     }
 
     fn find_group_wildcard_recursive(
@@ -3664,6 +3686,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 #[cfg(not(feature = "xsd11"))]
                 let inheritable = false;
                 return AttributeLookup::Found(ga.attr_key, ga.type_key, ga.fixed_value, inheritable);
+            }
+        }
+
+        // Walk base type chain for inherited attributes (XSD spec §3.4.2.4)
+        if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
+            if base_ct_key != self.schema_set.any_type_key() {
+                let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
+                return self.find_attribute_in_type(base_data, local_name, namespace);
             }
         }
 
@@ -3746,22 +3776,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Check that all required attributes are present
+    /// Check that all required attributes are present.
+    ///
+    /// Walks the base type chain to find inherited required attributes
+    /// (XSD spec §3.4.2.4). Attributes already declared or prohibited in
+    /// derived types are skipped via `checked_names`.
     fn check_required_attributes(
         &mut self,
         ct_data: &ComplexTypeDefData,
         seen: &HashSet<(Option<NameId>, NameId)>,
     ) -> bool {
         let mut has_missing = false;
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            if attr_use.use_kind != AttributeUseKind::Required {
-                continue;
-            }
+        let mut checked_names: HashSet<(Option<NameId>, NameId)> = HashSet::new();
 
+        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
             let resolved = ct_data.resolved_attributes.get(i);
             let (attr_name, attr_ns) =
                 self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+            checked_names.insert((attr_ns, attr_name));
 
+            if attr_use.use_kind != AttributeUseKind::Required {
+                continue;
+            }
             if !seen.contains(&(attr_ns, attr_name)) {
                 let name_str = self.schema_set.name_table.resolve(attr_name);
                 self.report_error(
@@ -3774,6 +3810,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // Check required attributes from attribute groups
         for ga in self.collect_group_attributes(ct_data) {
+            checked_names.insert((ga.namespace, ga.name));
             if ga.use_kind != AttributeUseKind::Required {
                 continue;
             }
@@ -3785,6 +3822,55 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 );
                 has_missing = true;
             }
+        }
+
+        // Walk base type chain for inherited required attributes
+        let any_type = self.schema_set.any_type_key();
+        let mut base_type = ct_data.resolved_base_type;
+        while let Some(TypeKey::Complex(base_ct_key)) = base_type {
+            if base_ct_key == any_type {
+                break;
+            }
+            let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
+
+            for (i, attr_use) in base_data.attributes.iter().enumerate() {
+                let resolved = base_data.resolved_attributes.get(i);
+                let (attr_name, attr_ns) =
+                    self.resolve_attr_use_name_ns(attr_use, resolved, base_data.target_namespace);
+                if !checked_names.insert((attr_ns, attr_name)) {
+                    continue; // already handled by derived type
+                }
+                if attr_use.use_kind != AttributeUseKind::Required {
+                    continue;
+                }
+                if !seen.contains(&(attr_ns, attr_name)) {
+                    let name_str = self.schema_set.name_table.resolve(attr_name);
+                    self.report_error(
+                        "cvc-complex-type.4",
+                        format!("Required attribute '{}' is missing", name_str),
+                    );
+                    has_missing = true;
+                }
+            }
+
+            for ga in self.collect_group_attributes(base_data) {
+                if !checked_names.insert((ga.namespace, ga.name)) {
+                    continue;
+                }
+                if ga.use_kind != AttributeUseKind::Required {
+                    continue;
+                }
+                if !seen.contains(&(ga.namespace, ga.name)) {
+                    let name_str = self.schema_set.name_table.resolve(ga.name);
+                    self.report_error(
+                        "cvc-complex-type.4",
+                        format!("Required attribute '{}' is missing", name_str),
+                    );
+                    has_missing = true;
+                }
+            }
+
+            base_type = base_data.resolved_base_type;
         }
 
         has_missing
