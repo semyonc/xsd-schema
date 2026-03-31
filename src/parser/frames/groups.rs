@@ -223,6 +223,15 @@ impl Frame for GroupFrame {
         if local_name == xsd_names::ANNOTATION && self.past_annotation {
             return false;
         }
+        // xs:group content model: (annotation?, (all | choice | sequence)?) — at most one compositor
+        if self.compositor.is_some()
+            && matches!(
+                local_name,
+                xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL
+            )
+        {
+            return false;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION | xsd_names::SEQUENCE | xsd_names::CHOICE | xsd_names::ALL
@@ -255,6 +264,16 @@ impl Frame for GroupFrame {
             }) => {
                 // For named (top-level) group definitions, the compositor child
                 // must not have minOccurs/maxOccurs (cos-all-limited / src-group)
+                // Safety net: reject if a compositor was already attached
+                if self.compositor.is_some() {
+                    return Err(SchemaError::structural(
+                        "src-group",
+                        "Group definition must have exactly one compositor child (sequence, choice, or all)",
+                        None,
+                    ));
+                }
+                // For named (top-level) group definitions, the compositor child
+                // must not have minOccurs/maxOccurs (cos-all-limited / src-group)
                 if self.name.is_some() && (min_occurs != 1 || max_occurs != Some(1)) {
                     return Err(SchemaError::structural(
                         "src-group",
@@ -272,6 +291,14 @@ impl Frame for GroupFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // Named group definitions must have exactly one compositor child
+        if self.name.is_some() && self.ref_name.is_none() && self.compositor.is_none() {
+            return Err(SchemaError::structural(
+                "src-group",
+                "Named group definition must contain a compositor (sequence, choice, or all)",
+                None,
+            ));
+        }
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,

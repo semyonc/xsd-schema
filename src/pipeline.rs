@@ -268,6 +268,7 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
+        validate_all_particle_occurs(schema_set)?;
         validate_all_upa_constraints(schema_set)?;
     }
 
@@ -334,6 +335,7 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
+    validate_all_particle_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
     Ok((inline_stats, resolution_stats))
 }
@@ -376,6 +378,52 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
         })?;
     }
 
+    Ok(())
+}
+
+/// Validate occurrence constraints (p-props-correct clause 2.1):
+/// minOccurs must not exceed maxOccurs for all particles.
+fn validate_all_particle_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
+    for (_, type_def) in schema_set.arenas.complex_types.iter() {
+        if let crate::parser::frames::ComplexContentResult::Complex(content) = &type_def.content {
+            if let Some(particle) = content.particle.as_ref() {
+                validate_particle_occurs_recursive(particle, schema_set)?;
+            }
+        }
+    }
+    for (_, mg) in schema_set.arenas.model_groups.iter() {
+        for particle in &mg.particles {
+            validate_particle_occurs_recursive(particle, schema_set)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_particle_occurs_recursive(
+    particle: &crate::parser::frames::ParticleResult,
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    if let Some(max) = particle.max_occurs {
+        if particle.min_occurs > max {
+            let location = particle
+                .source
+                .as_ref()
+                .and_then(|s| schema_set.source_maps.locate(s));
+            return Err(crate::error::SchemaError::structural(
+                "p-props-correct",
+                format!(
+                    "minOccurs ({}) exceeds maxOccurs ({})",
+                    particle.min_occurs, max
+                ),
+                location,
+            ));
+        }
+    }
+    if let crate::parser::frames::ParticleTerm::Group(ref mg) = particle.term {
+        for child in &mg.particles {
+            validate_particle_occurs_recursive(child, schema_set)?;
+        }
+    }
     Ok(())
 }
 

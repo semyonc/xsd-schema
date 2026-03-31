@@ -147,6 +147,10 @@ pub enum ComplexContentResult {
 #[derive(Debug, Clone)]
 pub struct SimpleContentDefResult {
     pub base_type: Option<TypeRefResult>,
+    /// Inline simpleType from simpleContent/restriction (B in spec 3.4.2.2 clause 1.1).
+    /// When present alongside base_type, the base_type names the complex type being restricted
+    /// and this field holds the content type restriction.
+    pub content_type: Option<Box<SimpleTypeResult>>,
     pub derivation: DerivationMethod,
     pub facets: FacetSet,
     pub attributes: Vec<AttributeUseResult>,

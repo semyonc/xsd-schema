@@ -112,6 +112,15 @@ impl Frame for SimpleTypeFrame {
                 self.derivation_id = st.derivation_id;
             }
             FrameResult::Restriction(res) => {
+                // src-restriction-base-or-simpleType: in simpleType/restriction,
+                // cannot have both 'base' attribute and inline simpleType child
+                if res.base_type.is_some() && res.inline_type.is_some() {
+                    return Err(SchemaError::structural(
+                        "src-restriction-base-or-simpleType",
+                        "Simple type restriction cannot have both 'base' attribute and inline type",
+                        None,
+                    ));
+                }
                 let base = if let Some(inline) = res.inline_type.clone() {
                     Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
                 } else {
@@ -394,14 +403,10 @@ impl Frame for RestrictionFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        // Validate restriction structure: base XOR inline type (can't have both)
-        if self.base_type.is_some() && self.inline_type.is_some() {
-            return Err(SchemaError::structural(
-                "src-restriction-base-or-simpleType",
-                "Restriction cannot have both 'base' attribute and inline type",
-                None,
-            ));
-        }
+        // Note: The "base XOR inline simpleType" constraint (src-restriction-base-or-simpleType)
+        // only applies to simpleType/restriction, not to simpleContent/restriction where both
+        // are valid (base names the complex type, inline simpleType restricts its content).
+        // The parent frame (SimpleTypeFrame vs SimpleContentFrame) enforces this contextually.
 
         let annotation = merge_foreign_attributes(
             self.annotation,
@@ -894,6 +899,7 @@ impl Frame for UnionFrame {
 pub struct SimpleContentFrame {
     id: Option<String>,
     base_type: Option<TypeRefResult>,
+    content_type: Option<Box<SimpleTypeResult>>,
     derivation: Option<DerivationMethod>,
     facets: FacetSet,
     attributes: Vec<AttributeUseResult>,
@@ -919,6 +925,7 @@ impl SimpleContentFrame {
         Ok(Self {
             id,
             base_type: None,
+            content_type: None,
             derivation: None,
             facets: FacetSet::new(),
             attributes: Vec::new(),
@@ -953,14 +960,23 @@ impl Frame for SimpleContentFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Restriction(res) => {
-                let base = if let Some(inline) = res.inline_type.clone() {
-                    Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
+                if res.base_type.is_some() && res.inline_type.is_some() {
+                    // simpleContent/restriction with both base and inline simpleType:
+                    // base names the complex type being restricted,
+                    // inline simpleType = B (content type restriction per spec 3.4.2.2 clause 1.1)
+                    self.base_type = res.base_type.clone();
+                    self.content_type = res.inline_type.map(Box::new);
+                    self.facets = res.facets.clone();
                 } else {
-                    res.base_type.clone()
-                };
-                self.base_type = base;
+                    let base = if let Some(inline) = res.inline_type.clone() {
+                        Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
+                    } else {
+                        res.base_type.clone()
+                    };
+                    self.base_type = base;
+                    self.facets = res.facets.clone();
+                }
                 self.derivation = Some(DerivationMethod::Restriction);
-                self.facets = res.facets.clone();
                 self.attributes = res.attributes.clone();
                 self.attribute_groups = res.attribute_groups.clone();
                 self.attribute_wildcard = res.attribute_wildcard.clone();
@@ -991,6 +1007,7 @@ impl Frame for SimpleContentFrame {
 
         Ok(FrameResult::SimpleContent(SimpleContentDefResult {
             base_type: Some(base_type),
+            content_type: self.content_type,
             derivation: self.derivation.unwrap_or(DerivationMethod::Restriction),
             facets: self.facets,
             attributes: self.attributes,

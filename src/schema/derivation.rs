@@ -646,27 +646,24 @@ fn validate_complex_restriction(
 
     match base_key {
         TypeKey::Simple(base_simple_key) => {
-            // Check that simple base type is not final for restriction
-            if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
-                let effective_final = effective_type_final(
-                    schema_set,
-                    base_type.final_derivation,
-                    base_type.source.as_ref(),
-                );
-                if effective_final.contains_restriction() {
-                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
-                    return Err(SchemaError::structural(
-                        "derivation-ok-restriction",
-                        format!(
-                            "Complex type '{}' cannot restrict simple type '{}' because it is final for restriction",
-                            type_name, base_name,
-                        ),
-                        location,
-                    ));
-                }
-            }
+            // ct-props-correct.2: If the base type is a simple type definition,
+            // the derivation method must be extension (not restriction).
+            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            let base_name = if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+                format_type_name(schema_set, base_type.name, base_type.target_namespace)
+            } else {
+                "(unknown)".to_string()
+            };
+            return Err(SchemaError::structural(
+                "ct-props-correct",
+                format!(
+                    "Complex type '{}' cannot restrict simple type '{}'; \
+                     derivation from a simple type must use extension",
+                    type_name, base_name,
+                ),
+                location,
+            ));
         }
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
