@@ -730,7 +730,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // PATH B1: xsi:type override for local elements with resolved type
                     let mut b1_type_source = TypeSource::Declaration;
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), ns_context, &mut wildcard_xsi_type_errors) {
+                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), DerivationSet::empty(), ns_context, &mut wildcard_xsi_type_errors) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 type_key = overridden;
                                 b1_type_source = TypeSource::XsiType;
@@ -752,7 +752,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Try xsi:type first — it can supply a governing type even
                     // without a declaration.
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, None, ns_context, &mut wildcard_xsi_type_errors) {
+                        match self.resolve_xsi_type(xsi_type_str, None, DerivationSet::empty(), ns_context, &mut wildcard_xsi_type_errors) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 let (content_state, content_type) =
                                     self.init_content_model(Some(overridden));
@@ -898,11 +898,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 6. xsi:type override
         // Errors are deferred and emitted after push so they land on the child element.
+        let (effective_block, _) =
+            crate::compiler::substitution::effective_element_constraints(self.schema_set, elem_data);
+        // Mask to element-relevant bits only (extension, restriction, substitution)
+        // to avoid spuriously blocking list/union derivation steps.
+        let effective_block = effective_block.element_block_mask();
         let mut xsi_type_deferred_errors = Vec::new();
         let mut xsi_type_invalid = false;
         let mut type_source = TypeSource::Declaration;
         if let Some(xsi_type_str) = xsi_type {
-            match self.resolve_xsi_type(xsi_type_str, type_key, ns_context, &mut xsi_type_deferred_errors) {
+            // Default to anyType when no explicit type is declared (cvc-elt.4.3 still applies)
+            let declared_for_xsi = type_key.or(Some(TypeKey::Complex(self.schema_set.any_type_key())));
+            match self.resolve_xsi_type(xsi_type_str, declared_for_xsi, effective_block, ns_context, &mut xsi_type_deferred_errors) {
                 XsiTypeOutcome::Applied(overridden) => {
                     type_key = Some(overridden);
                     type_source = TypeSource::XsiType;
@@ -3140,6 +3147,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &self,
         xsi_type_str: &str,
         declared_type: Option<TypeKey>,
+        block: DerivationSet,
         ns_context: &NamespaceContextSnapshot,
         deferred_errors: &mut Vec<(&'static str, String)>,
     ) -> XsiTypeOutcome {
@@ -3176,6 +3184,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             Some(type_key) => {
                 // Validate derivation: the xsi:type must derive from the declared type
                 if let Some(declared) = declared_type {
+                    // cvc-elt.4.2: basic derivation check (no block keywords)
                     if !self.schema_set.is_type_derived_from(
                         type_key,
                         declared,
@@ -3185,6 +3194,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             "cvc-elt.4.2",
                             format!(
                                 "xsi:type '{}' does not derive from the declared type",
+                                xsi_type_str
+                            ),
+                        ));
+                        return XsiTypeOutcome::InvalidDerivation;
+                    }
+                    // cvc-elt.4.3: validly substitutable (with element's block keywords)
+                    if !block.is_empty()
+                        && !self
+                            .schema_set
+                            .is_type_derived_from(type_key, declared, block)
+                    {
+                        deferred_errors.push((
+                            "cvc-elt.4.3",
+                            format!(
+                                "xsi:type '{}' is not validly substitutable for the declared type \
+                                 (blocked by element's 'block' attribute)",
                                 xsi_type_str
                             ),
                         ));

@@ -1,4 +1,5 @@
 use super::*;
+use crate::error::SchemaError;
 use crate::ids::TypeKey;
 
 #[test]
@@ -1998,5 +1999,277 @@ fn test_default_open_content_applies_to_empty_valid() {
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
     assert!(result.is_ok(), "Valid defaultOpenContent with appliesToEmpty should pass: {:?}", result);
+}
+
+// ======================================================================
+// Fix 1: Substitution group validation (e-props-correct.4)
+// ======================================================================
+
+#[test]
+fn test_substitution_group_final_restriction_blocks_member() {
+    // particlesIh001: head e1 has final="restriction", member e2 type derived by restriction
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test"
+                    elementFormDefault="qualified">
+        <xsd:complexType name="foo">
+            <xsd:choice>
+                <xsd:element name="c1" minOccurs="0" maxOccurs="2"/>
+                <xsd:element name="c2"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="bar">
+            <xsd:complexContent>
+                <xsd:restriction base="t:foo">
+                    <xsd:choice>
+                        <xsd:element name="c1"/>
+                        <xsd:element name="c2"/>
+                    </xsd:choice>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+        <xsd:element name="e1" type="t:foo" final="restriction"/>
+        <xsd:element name="e2" type="t:bar" substitutionGroup="t:e1"/>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "Schema should be invalid: final='restriction' blocks member");
+    match result.unwrap_err() {
+        SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "e-props-correct.4");
+        }
+        other => panic!("Expected e-props-correct.4, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_substitution_group_final_extension_allows_restriction_member() {
+    // Same schema but final="extension" should allow restriction-derived member
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test"
+                    elementFormDefault="qualified">
+        <xsd:complexType name="foo">
+            <xsd:choice>
+                <xsd:element name="c1" minOccurs="0" maxOccurs="2"/>
+                <xsd:element name="c2"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="bar">
+            <xsd:complexContent>
+                <xsd:restriction base="t:foo">
+                    <xsd:choice>
+                        <xsd:element name="c1"/>
+                        <xsd:element name="c2"/>
+                    </xsd:choice>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+        <xsd:element name="e1" type="t:foo" final="extension"/>
+        <xsd:element name="e2" type="t:bar" substitutionGroup="t:e1"/>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "final='extension' should not block restriction-derived member: {:?}", result);
+}
+
+// ======================================================================
+// Fix 2: All:All order-preserving in XSD 1.0
+// ======================================================================
+
+#[test]
+fn test_all_all_reorder_invalid_xsd10() {
+    // particlesS002: B has all(e1,e2,e3), R has all(e2,e1,e3) — invalid in 1.0
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+                <xsd:element name="e3"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:all>
+                        <xsd:element name="e2"/>
+                        <xsd:element name="e1"/>
+                        <xsd:element name="e3"/>
+                    </xsd:all>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "All:All reordering should be invalid in XSD 1.0");
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_all_all_reorder_valid_xsd11() {
+    // Same schema valid in XSD 1.1 (RecurseUnordered)
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+                <xsd:element name="e3"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:all>
+                        <xsd:element name="e2"/>
+                        <xsd:element name="e1"/>
+                        <xsd:element name="e3"/>
+                    </xsd:all>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "All:All reordering should be valid in XSD 1.1: {:?}", result);
+}
+
+#[test]
+fn test_all_all_same_order_valid_xsd10() {
+    // Same order should be valid in 1.0
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:all>
+                        <xsd:element name="e1"/>
+                        <xsd:element name="e2"/>
+                    </xsd:all>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "All:All same order should be valid in XSD 1.0: {:?}", result);
+}
+
+// ======================================================================
+// Fix 3: Choice:Choice order-preserving in XSD 1.0
+// ======================================================================
+
+#[test]
+fn test_choice_choice_reorder_invalid_xsd10() {
+    // particlesT002: B has choice(c1,c2), R has choice(c2,c1) — invalid in 1.0
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:sequence>
+                <xsd:choice>
+                    <xsd:element name="c1"/>
+                    <xsd:element name="c2"/>
+                </xsd:choice>
+                <xsd:element name="foo"/>
+            </xsd:sequence>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:choice>
+                            <xsd:element name="c2"/>
+                            <xsd:element name="c1"/>
+                        </xsd:choice>
+                        <xsd:element name="foo"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "Choice:Choice reordering should be invalid in XSD 1.0");
+}
+
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_choice_choice_reorder_valid_xsd11() {
+    // Same schema valid in XSD 1.1
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:sequence>
+                <xsd:choice>
+                    <xsd:element name="c1"/>
+                    <xsd:element name="c2"/>
+                </xsd:choice>
+                <xsd:element name="foo"/>
+            </xsd:sequence>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:choice>
+                            <xsd:element name="c2"/>
+                            <xsd:element name="c1"/>
+                        </xsd:choice>
+                        <xsd:element name="foo"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Choice:Choice reordering should be valid in XSD 1.1: {:?}", result);
+}
+
+#[test]
+fn test_choice_choice_same_order_valid_xsd10() {
+    // Same order should be valid in 1.0
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:sequence>
+                <xsd:choice>
+                    <xsd:element name="c1"/>
+                    <xsd:element name="c2"/>
+                </xsd:choice>
+                <xsd:element name="foo"/>
+            </xsd:sequence>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:choice>
+                            <xsd:element name="c1"/>
+                            <xsd:element name="c2"/>
+                        </xsd:choice>
+                        <xsd:element name="foo"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Choice:Choice same order should be valid in XSD 1.0: {:?}", result);
 }
 

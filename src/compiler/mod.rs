@@ -68,7 +68,7 @@ pub use all_group::{
     validate_all_group_constraints, term_matches, term_matches_with_substitution, TermMatchResult,
 };
 pub use upa::check_upa;
-pub use substitution::{build_substitution_group_map, SubstitutionGroupMap};
+pub use substitution::{build_substitution_group_map, validate_all_substitution_groups, SubstitutionGroupMap};
 
 use crate::types::complex::{OpenContentMode as TypesOpenContentMode, WildcardRef};
 

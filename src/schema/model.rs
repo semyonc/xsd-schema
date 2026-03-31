@@ -417,7 +417,13 @@ impl SchemaSet {
             return true;
         }
 
-        if self.is_any_type(base) {
+        // Everything derives from anyType. For Complex→Complex with non-empty
+        // exclusions we must walk the chain to verify no step uses a blocked
+        // method (§3.4.6.5). Other combinations (Simple→Complex, etc.) never
+        // use extension in their chain to anyType, so the fast path is safe.
+        if self.is_any_type(base)
+            && (exclude_methods.is_empty() || !matches!(derived, TypeKey::Complex(_)))
+        {
             return true;
         }
 
@@ -550,12 +556,11 @@ impl SchemaSet {
                 // Determine derivation method flag
                 let method_flag = match type_def.derivation_method {
                     Some(DerivationMethod::Extension) => DerivationSet::EXTENSION,
-                    Some(DerivationMethod::Restriction) => DerivationSet::RESTRICTION,
-                    None => DerivationSet::empty(), // Implicit restriction from anyType
+                    Some(DerivationMethod::Restriction) | None => DerivationSet::RESTRICTION,
                 };
 
                 // If this derivation method is excluded, stop traversal
-                if !method_flag.is_empty() && exclude_methods.contains(method_flag) {
+                if exclude_methods.contains(method_flag) {
                     return false;
                 }
 
@@ -588,11 +593,10 @@ impl SchemaSet {
             // Check derivation method
             let method_flag = match type_def.derivation_method {
                 Some(DerivationMethod::Extension) => DerivationSet::EXTENSION,
-                Some(DerivationMethod::Restriction) => DerivationSet::RESTRICTION,
-                None => DerivationSet::empty(),
+                Some(DerivationMethod::Restriction) | None => DerivationSet::RESTRICTION,
             };
 
-            if !method_flag.is_empty() && exclude_methods.contains(method_flag) {
+            if exclude_methods.contains(method_flag) {
                 return false;
             }
 

@@ -1320,6 +1320,15 @@ fn particle_restricts(
 
     if let Some(base_branches) = expand_choice_branches(base) {
         if let Some(derived_branches) = expand_choice_branches(derived) {
+            // XSD 1.0 RecurseLax: order-preserving mapping required.
+            // XSD 1.1: unordered set-based matching.
+            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+                return choice_branches_restrict_ordered(
+                    schema_set,
+                    &derived_branches,
+                    &base_branches,
+                );
+            }
             return derived_branches.iter().all(|branch| {
                 base_branches
                     .iter()
@@ -1692,6 +1701,32 @@ fn sequence_restricts_choice(
     occurs_range_is_subset(min_demand, max_demand, base.min_occurs, base.max_occurs)
 }
 
+/// XSD 1.0 RecurseLax: order-preserving matching of choice branches.
+/// Each derived branch must map to a base branch at or after the previous match.
+/// Unmatched base branches are implicitly skipped (lax, not strict).
+fn choice_branches_restrict_ordered(
+    schema_set: &SchemaSet,
+    derived_branches: &[NormalizedParticle],
+    base_branches: &[NormalizedParticle],
+) -> bool {
+    let mut base_index = 0;
+    for derived in derived_branches {
+        let mut found = false;
+        while base_index < base_branches.len() {
+            if particle_restricts(schema_set, derived, &base_branches[base_index]) {
+                base_index += 1;
+                found = true;
+                break;
+            }
+            base_index += 1;
+        }
+        if !found {
+            return false;
+        }
+    }
+    true
+}
+
 fn sequence_particles_restrict(
     schema_set: &SchemaSet,
     derived_particles: &[NormalizedParticle],
@@ -1762,6 +1797,12 @@ fn all_particles_restrict(
     derived_particles: &[NormalizedParticle],
     base_particles: &[NormalizedParticle],
 ) -> bool {
+    // XSD 1.0: All:All uses order-preserving Recurse (same as Sequence:Sequence).
+    // XSD 1.1: RecurseUnordered allows reordering via backtracking.
+    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+        return sequence_particles_restrict(schema_set, derived_particles, base_particles);
+    }
+
     fn backtrack(
         schema_set: &SchemaSet,
         derived_particles: &[NormalizedParticle],

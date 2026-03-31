@@ -7710,3 +7710,202 @@ fn test_substitution_group_union_member_type() {
         v.sink.errors
     );
 }
+
+// ======================================================================
+// Fix 5: xsi:type block checking (cvc-elt.4.3)
+// ======================================================================
+
+#[test]
+fn test_xsi_type_blocked_by_element_block_restriction() {
+    // particlesIg003.v: element e2 has block="restriction", xsi:type="ext"
+    // where ext extends base which (implicitly) restricts anyType.
+    // The restriction step should be blocked.
+    let schema_set = load_schema(
+        r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                      targetNamespace="http://test" xmlns:t="http://test"
+                      elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice>
+                    <xsd:element name="e1" block="restriction"/>
+                    <xsd:element name="e2" block="restriction"/>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:complexType name="testing">
+                <xsd:complexContent>
+                    <xsd:restriction base="t:base">
+                        <xsd:choice>
+                            <xsd:element name="e1" block="restriction"/>
+                            <xsd:element name="e2" block="restriction"/>
+                        </xsd:choice>
+                    </xsd:restriction>
+                </xsd:complexContent>
+            </xsd:complexType>
+            <xsd:element name="doc" type="t:testing"/>
+            <xsd:complexType name="ext">
+                <xsd:complexContent>
+                    <xsd:extension base="t:base"/>
+                </xsd:complexContent>
+            </xsd:complexType>
+        </xsd:schema>"###,
+    );
+
+    let tns = "http://test";
+    let tns_id = schema_set.name_table.get(tns).unwrap();
+    let a_prefix = schema_set.name_table.add("a");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_id),
+        bindings: vec![(a_prefix, tns_id)],
+    };
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    // <a:doc>
+    v.validate_element("doc", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // <a:e2 xsi:type="a:ext">
+    v.validate_element("e2", tns, Some("a:ext"), None, &ns);
+    v.validate_end_of_attributes();
+
+    // <a:e1/>
+    v.validate_element("e1", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    // </a:e2>
+    v.validate_end_element();
+    // </a:doc>
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.3"),
+        "xsi:type should be rejected by element block='restriction': errors={:?}",
+        v.sink.errors
+    );
+}
+
+#[test]
+fn test_xsi_type_allowed_when_no_block() {
+    // Same schema but without block="restriction" — xsi:type should be accepted
+    let schema_set = load_schema(
+        r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                      targetNamespace="http://test" xmlns:t="http://test"
+                      elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice>
+                    <xsd:element name="e1"/>
+                    <xsd:element name="e2"/>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:complexType name="testing">
+                <xsd:complexContent>
+                    <xsd:restriction base="t:base">
+                        <xsd:choice>
+                            <xsd:element name="e1"/>
+                            <xsd:element name="e2"/>
+                        </xsd:choice>
+                    </xsd:restriction>
+                </xsd:complexContent>
+            </xsd:complexType>
+            <xsd:element name="doc" type="t:testing"/>
+            <xsd:complexType name="ext">
+                <xsd:complexContent>
+                    <xsd:extension base="t:base"/>
+                </xsd:complexContent>
+            </xsd:complexType>
+        </xsd:schema>"###,
+    );
+
+    let tns = "http://test";
+    let tns_id = schema_set.name_table.get(tns).unwrap();
+    let a_prefix = schema_set.name_table.add("a");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_id),
+        bindings: vec![(a_prefix, tns_id)],
+    };
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    v.validate_element("doc", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("e2", tns, Some("a:ext"), None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("e1", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        !v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.3"),
+        "xsi:type should be accepted without block: errors={:?}",
+        v.sink.errors
+    );
+}
+
+// ======================================================================
+// Fix 5 Part A+B: is_type_derived_from with exclusion + anyType
+// ======================================================================
+
+#[test]
+fn test_xsi_type_blocked_when_declared_type_is_anytype() {
+    // Element with no explicit type (implicit anyType) and block="restriction".
+    // xsi:type specifying a type derived by restriction should be blocked.
+    let schema_set = load_schema(
+        r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                      targetNamespace="http://test" xmlns:t="http://test"
+                      elementFormDefault="qualified">
+            <xsd:complexType name="myType">
+                <xsd:sequence>
+                    <xsd:element name="child"/>
+                </xsd:sequence>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:sequence>
+                        <xsd:element name="item" block="restriction"/>
+                    </xsd:sequence>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###,
+    );
+
+    let tns = "http://test";
+    let tns_id = schema_set.name_table.get(tns).unwrap();
+    let t_prefix = schema_set.name_table.add("t");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_id),
+        bindings: vec![(t_prefix, tns_id)],
+    };
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    v.validate_element("doc", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // <item xsi:type="t:myType"> — myType restricts anyType, should be blocked
+    v.validate_element("item", tns, Some("t:myType"), None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("child", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.4.3"),
+        "xsi:type with implicit anyType + block='restriction' should fail: errors={:?}",
+        v.sink.errors
+    );
+}

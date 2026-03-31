@@ -212,6 +212,71 @@ pub(crate) fn is_element_substitutable_for(
     )
 }
 
+/// Check e-props-correct.4: member type must be validly substitutable for
+/// head type subject to the head's `{substitution group exclusions}` (= `final`).
+///
+/// Unlike `is_element_substitutable_for`, this does NOT check `block` because
+/// `block` controls instance-time substitution, not affiliation legality.
+fn check_substitution_group_affiliation(
+    schema_set: &SchemaSet,
+    head_key: ElementKey,
+    member_key: ElementKey,
+) -> bool {
+    let Some(head_elem) = schema_set.arenas.elements.get(head_key) else {
+        return false;
+    };
+    let Some(member_elem) = schema_set.arenas.elements.get(member_key) else {
+        return false;
+    };
+    let (_, effective_final) = effective_element_constraints(schema_set, head_elem);
+    let exclude = derivation_exclusions(schema_set, DerivationSet::empty(), effective_final, head_elem.resolved_type);
+    is_substitutable(schema_set, head_elem.resolved_type, exclude, member_elem.resolved_type)
+}
+
+/// Validate all declared substitution group memberships.
+///
+/// Reports `e-props-correct.4` if a member element's type is not validly
+/// substitutable for its head element's type (respecting `final` constraints).
+///
+/// Note: This uses only the head's `{substitution group exclusions}` (= `final`),
+/// NOT the head's `block` attribute. The `block` attribute controls instance-time
+/// substitution, not schema-level affiliation legality.
+pub fn validate_all_substitution_groups(
+    schema_set: &SchemaSet,
+) -> crate::SchemaResult<()> {
+    for (member_key, elem) in schema_set.arenas.elements.iter() {
+        for &head_key in &elem.resolved_substitution_groups {
+            if !check_substitution_group_affiliation(schema_set, head_key, member_key) {
+                let member_name = elem
+                    .name
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                let head_name = schema_set
+                    .arenas
+                    .elements
+                    .get(head_key)
+                    .and_then(|h| h.name)
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_else(|| "<anonymous>".to_string());
+                let location = elem
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                return Err(crate::error::SchemaError::structural(
+                    "e-props-correct.4",
+                    format!(
+                        "Element '{}' is not a valid member of the substitution group \
+                         headed by '{}': type derivation is blocked by 'final' constraint",
+                        member_name, head_name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

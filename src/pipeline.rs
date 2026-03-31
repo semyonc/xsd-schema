@@ -264,6 +264,11 @@ pub fn load_and_process_schema(
         validate_all_derivations(schema_set, &dep_graph)?;
     }
 
+    // Phase 4.8: Validate substitution group membership constraints (e-props-correct.4)
+    if config.resolve_references {
+        crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
+    }
+
     // Phase 5: Allocate arena element declarations for local elements in content particles
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
@@ -331,6 +336,9 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // Validate type derivation constraints
     let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
     validate_all_derivations(schema_set, &dep_graph)?;
+
+    // Validate substitution group membership constraints (e-props-correct.4)
+    crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
