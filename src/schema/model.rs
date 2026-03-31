@@ -1244,4 +1244,88 @@ mod tests {
             DerivationSet::LIST
         ));
     }
+
+    /// Clause 2.2.4: D is derived from union B if D is derived from a
+    /// transitive member of B and B has no facets.
+    #[test]
+    fn test_union_member_derivation_clause_2_2_4() {
+        use crate::pipeline::load_and_process_schema;
+
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="myUnion">
+                <xs:union memberTypes="xs:float xs:integer"/>
+            </xs:simpleType>
+        </xs:schema>"#;
+
+        let mut set = SchemaSet::new();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut set, None)
+            .expect("schema should parse");
+
+        let integer_key = TypeKey::Simple(set.builtin_types().integer);
+        let float_key = TypeKey::Simple(set.builtin_types().float);
+
+        // Find myUnion by name
+        let union_name = set.name_table.add("myUnion");
+        let union_key = set.namespaces.get(&None).unwrap()
+            .types.get(&union_name).copied()
+            .expect("myUnion should exist");
+
+        // xs:integer is a member of myUnion → should be "derived" via 2.2.4
+        assert!(
+            set.is_type_derived_from(integer_key, union_key, DerivationSet::empty()),
+            "xs:integer should be derived from union(float, integer) via clause 2.2.4"
+        );
+
+        // xs:float is also a member
+        assert!(
+            set.is_type_derived_from(float_key, union_key, DerivationSet::empty()),
+            "xs:float should be derived from union(float, integer) via clause 2.2.4"
+        );
+
+        // xs:string is NOT a member
+        let string_key = TypeKey::Simple(set.builtin_types().string);
+        assert!(
+            !set.is_type_derived_from(string_key, union_key, DerivationSet::empty()),
+            "xs:string should NOT be derived from union(float, integer)"
+        );
+    }
+
+    /// Clause 2.2.4 with nested unions: D derived from a member of
+    /// a union that is itself a member of B.
+    #[test]
+    fn test_union_member_derivation_transitive() {
+        use crate::pipeline::load_and_process_schema;
+
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="innerUnion">
+                <xs:union memberTypes="xs:boolean xs:date"/>
+            </xs:simpleType>
+            <xs:simpleType name="outerUnion">
+                <xs:union memberTypes="xs:integer innerUnion"/>
+            </xs:simpleType>
+        </xs:schema>"#;
+
+        let mut set = SchemaSet::new();
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut set, None)
+            .expect("schema should parse");
+
+        let outer_name = set.name_table.add("outerUnion");
+        let outer_key = set.namespaces.get(&None).unwrap()
+            .types.get(&outer_name).copied()
+            .expect("outerUnion should exist");
+
+        // xs:boolean is in innerUnion which is in outerUnion → transitive
+        let bool_key = TypeKey::Simple(set.builtin_types().boolean);
+        assert!(
+            set.is_type_derived_from(bool_key, outer_key, DerivationSet::empty()),
+            "xs:boolean should be transitively derived from outerUnion via innerUnion"
+        );
+
+        // xs:integer is a direct member
+        let int_key = TypeKey::Simple(set.builtin_types().integer);
+        assert!(
+            set.is_type_derived_from(int_key, outer_key, DerivationSet::empty()),
+            "xs:integer should be derived from outerUnion as direct member"
+        );
+    }
 }

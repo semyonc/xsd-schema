@@ -7484,3 +7484,229 @@ fn test_substitution_group_abstract_head_no_cvc_elt_2() {
         v.sink.errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// Step 7 stabilisation tests
+// ---------------------------------------------------------------------------
+
+/// Wildcard ##targetNamespace resolves from the schema type, not the
+/// instance element namespace. An unqualified local element with a
+/// wildcard `namespace="##targetNamespace"` must accept children in the
+/// schema's target namespace even when the parent has no namespace.
+#[test]
+fn test_wildcard_target_ns_from_schema_type() {
+    let xsd = concat!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema""#,
+        r#" targetNamespace="http://example.com/ns""#,
+        r#" xmlns:tns="http://example.com/ns">"#,
+        r#"<xs:element name="doc"><xs:complexType><xs:sequence>"#,
+        r#"<xs:element name="wrapper"><xs:complexType><xs:sequence>"#,
+        r#"<xs:any namespace='##targetNamespace'/>"#,
+        r#"</xs:sequence></xs:complexType></xs:element>"#,
+        r#"</xs:sequence></xs:complexType></xs:element>"#,
+        r#"<xs:element name="child" type="xs:string"/>"#,
+        r#"</xs:schema>"#,
+    );
+    let schema_set = load_schema(xsd);
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    let mut ns = empty_ns_context();
+    // Bind "tns" to the target namespace for the root element.
+    let tns_id = schema_set.name_table.add("http://example.com/ns");
+    ns.default_ns = Some(tns_id);
+
+    // <tns:doc>
+    v.validate_element("doc", "http://example.com/ns", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // <wrapper> — unqualified local element (namespace = "")
+    let plain_ns = empty_ns_context();
+    v.validate_element("wrapper", "", None, None, &plain_ns);
+    v.validate_end_of_attributes();
+
+    // <tns:child/> — should be accepted by ##targetNamespace wildcard
+    v.validate_element("child", "http://example.com/ns", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element(); // </tns:child>
+
+    v.validate_end_element(); // </wrapper>
+    v.validate_end_element(); // </tns:doc>
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.is_empty(),
+        "##targetNamespace wildcard should accept element in schema target ns, errors: {:?}",
+        v.sink.errors
+    );
+}
+
+/// Base-type attribute inheritance: a derived type by restriction that
+/// does not redeclare an attribute should still inherit it from the base.
+#[test]
+fn test_inherited_attribute_from_base_type() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:attribute name="inherited" type="xs:string"/>
+            </xs:complexType>
+            <xs:complexType name="Derived">
+                <xs:complexContent>
+                    <xs:restriction base="Base"/>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:element name="root" type="Derived"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("inherited", "", "hello");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.is_empty(),
+        "attribute 'inherited' from base type should be accepted, errors: {:?}",
+        v.sink.errors
+    );
+}
+
+/// Base-type attribute inheritance across multi-level extension chain.
+#[test]
+fn test_inherited_attribute_through_extension_chain() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="A">
+                <xs:attribute name="fromA" type="xs:string" use="required"/>
+            </xs:complexType>
+            <xs:complexType name="B">
+                <xs:complexContent>
+                    <xs:extension base="A">
+                        <xs:attribute name="fromB" type="xs:int"/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="C">
+                <xs:complexContent>
+                    <xs:extension base="B">
+                        <xs:attribute name="fromC" type="xs:boolean"/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:element name="root" type="C"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("fromA", "", "base");
+    v.validate_attribute("fromB", "", "42");
+    v.validate_attribute("fromC", "", "true");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.is_empty(),
+        "all inherited attributes should be accepted, errors: {:?}",
+        v.sink.errors
+    );
+}
+
+/// Prohibited attribute in derived type must not leak inherited base attr.
+#[test]
+fn test_prohibited_attribute_overrides_base() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:attribute name="forbidden" type="xs:string"/>
+                <xs:attribute name="allowed" type="xs:string"/>
+            </xs:complexType>
+            <xs:complexType name="Derived">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:attribute name="forbidden" use="prohibited"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:element name="root" type="Derived"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    // "allowed" should be inherited and accepted
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("allowed", "", "ok");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    let _ = v.end_validation();
+    assert!(v.sink.errors.is_empty(), "inherited 'allowed' should be accepted");
+
+    // "forbidden" should be rejected
+    let mut v2 = validator.start_run(TestSink::new());
+    v2.validate_element("root", "", None, None, &ns);
+    v2.validate_attribute("forbidden", "", "nope");
+    v2.validate_end_of_attributes();
+    v2.validate_end_element();
+    let _ = v2.end_validation();
+    assert!(
+        !v2.sink.errors.is_empty(),
+        "prohibited 'forbidden' should be rejected"
+    );
+}
+
+/// Substitution group member with a type that is a union member type
+/// of the head element's type should be accepted in a content model.
+#[test]
+fn test_substitution_group_union_member_type() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="myUnion">
+                <xs:union memberTypes="xs:integer xs:boolean"/>
+            </xs:simpleType>
+            <xs:element name="head" type="myUnion"/>
+            <xs:element name="member" substitutionGroup="head" type="xs:integer"/>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element ref="head"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // <member> substitutes for <head> — integer derives from union via 2.2.4
+    v.validate_element("member", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    v.validate_end_element();
+
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.is_empty(),
+        "substitution group member with union-member type should be accepted, errors: {:?}",
+        v.sink.errors
+    );
+}

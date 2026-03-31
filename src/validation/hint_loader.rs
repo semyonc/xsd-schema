@@ -232,4 +232,105 @@ mod tests {
             "hint resolving to already-loaded URI should not reload");
         assert_eq!(result.skipped_count, 1);
     }
+
+    #[test]
+    fn test_enrich_schema_set_returns_none_without_hints() {
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#;
+        let compiled = SchemaSetBuilder::new()
+            .add_source(xsd, "test.xsd").unwrap()
+            .compile().unwrap();
+
+        let result = enrich_schema_set(compiled.schema_set(), &[], &[]);
+        assert!(result.is_none(), "should return None when no hints");
+    }
+
+    #[test]
+    fn test_enrich_schema_set_preserves_original_elements() {
+        // Write a temp schema file so add_from can re-load from disk.
+        let dir = std::env::temp_dir().join("xsd_hint_test_enrich");
+        let _ = std::fs::create_dir_all(&dir);
+        let schema_path = dir.join("base.xsd");
+        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#).unwrap();
+
+        let compiled = SchemaSetBuilder::new()
+            .add("", &schema_path.to_string_lossy()).unwrap()
+            .compile().unwrap();
+        let original = compiled.schema_set();
+
+        // Provide a hint that fails to load — enrichment should still
+        // succeed because add_from re-loaded the original schema.
+        let hints = vec![SchemaLocationHint {
+            namespace: "urn:test".to_string(),
+            location: "nonexistent_42.xsd".to_string(),
+            base_uri: String::new(),
+        }];
+
+        let enriched = enrich_schema_set(original, &hints, &[]);
+        assert!(enriched.is_some(), "should return Some even if hint fails");
+
+        let enriched = enriched.unwrap();
+        let name = enriched.name_table.add("root");
+        assert!(
+            enriched.lookup_element(None, name).is_some(),
+            "original element 'root' should still be present after enrichment"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_enrich_schema_set_preserves_xsd_version() {
+        let dir = std::env::temp_dir().join("xsd_hint_test_version");
+        let _ = std::fs::create_dir_all(&dir);
+        let schema_path = dir.join("test.xsd");
+        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#).unwrap();
+
+        let compiled = SchemaSetBuilder::xsd11()
+            .add("", &schema_path.to_string_lossy()).unwrap()
+            .compile().unwrap();
+        let original = compiled.schema_set();
+        assert_eq!(original.xsd_version, crate::schema::model::XsdVersion::V1_1);
+
+        let hints = vec![SchemaLocationHint {
+            namespace: "urn:test".to_string(),
+            location: "nonexistent_42.xsd".to_string(),
+            base_uri: String::new(),
+        }];
+        let enriched = enrich_schema_set(original, &hints, &[]).unwrap();
+        assert_eq!(
+            enriched.xsd_version,
+            crate::schema::model::XsdVersion::V1_1,
+            "enriched set should preserve XSD 1.1 version"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_add_from_seeds_builder_with_loaded_locations() {
+        let dir = std::env::temp_dir().join("xsd_hint_test_add_from");
+        let _ = std::fs::create_dir_all(&dir);
+        let schema_path = dir.join("original.xsd");
+        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#).unwrap();
+
+        let compiled = SchemaSetBuilder::new()
+            .add("", &schema_path.to_string_lossy()).unwrap()
+            .compile().unwrap();
+
+        let mut builder = SchemaSetBuilder::new();
+        builder.add_from(compiled.schema_set());
+
+        // Verify the builder loaded the schema (has at least one document)
+        assert!(builder.schema_count() > 0, "add_from should load schemas");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
