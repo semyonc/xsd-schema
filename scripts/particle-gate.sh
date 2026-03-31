@@ -116,6 +116,14 @@ if [ -d "$TEST_SUITE" ]; then
             --name particlesOb005 --name particlesOb032 --name particlesOb056 \
             --verbose
 
+    # Step 9: Z033 counted UPA (cap-and-check)
+    run_info "Step 9: Z033 counted UPA" \
+        cargo test --test conformance --features xsd11 -- \
+            --test-suite "$TEST_SUITE" --version 1.0 \
+            --name particlesZ033_c --name particlesZ033_e \
+            --name particlesZ033_f --name particlesZ033_g \
+            --verbose
+
     # ── 4. Full particle catalog (INFO) ──────────────────────────────────
 
     run_info "Conformance: full particle catalog (1343/1411 baseline)" \

@@ -437,18 +437,23 @@ fn validate_particle_occurs_recursive(
 
 fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
-        let Some(particle) = (match &type_def.content {
+        // Skip built-in types (xs:anyType etc.) — they have no source location
+        // and are valid by construction.
+        if type_def.source.is_none() {
+            continue;
+        }
+
+        let Some(_particle) = (match &type_def.content {
             crate::parser::frames::ComplexContentResult::Complex(content) => content.particle.as_ref(),
             crate::parser::frames::ComplexContentResult::Empty
             | crate::parser::frames::ComplexContentResult::Simple(_) => None,
         }) else {
             continue;
         };
-        if !supports_simple_upa_validation(particle) {
-            continue;
-        }
 
-        let matcher = crate::compiler::compile_content_model_matcher(schema_set, type_def)
+        // Compile with capped occurrence bounds for UPA checking.
+        // All maxOccurs values are reduced to <=2, producing a counter-free NFA.
+        let matcher = crate::compiler::compile_content_model_for_upa(schema_set, type_def)
             .map_err(|error| {
                 let location = error
                     .location()
@@ -473,29 +478,6 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
     }
 
     Ok(())
-}
-
-fn supports_simple_upa_validation(
-    particle: &crate::parser::frames::ParticleResult,
-) -> bool {
-    if particle.max_occurs != Some(1) {
-        return false;
-    }
-
-    match &particle.term {
-        crate::parser::frames::ParticleTerm::Element(_)
-        | crate::parser::frames::ParticleTerm::Any(_) => true,
-        crate::parser::frames::ParticleTerm::Group(group) => {
-            if group.ref_name.is_some() {
-                return false;
-            }
-
-            group
-                .particles
-                .iter()
-                .all(supports_simple_upa_validation)
-        }
-    }
 }
 
 // ============================================================================

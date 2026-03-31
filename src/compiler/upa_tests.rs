@@ -1,5 +1,7 @@
 use super::*;
 use crate::compiler::{FragmentBuilder, NfaTerm, fragment_to_table};
+use crate::compiler::compile::cap_for_upa;
+use crate::parser::location::{SourceRef, SourceSpan};
 use crate::types::complex::ProcessContents;
 use crate::error::SchemaError;
 use crate::schema::model::DerivationSet;
@@ -851,4 +853,121 @@ fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
     let result = check_upa(&nfa, &schema_set, None);
     assert!(result.is_err(), "should detect conflict: member not excluded by notQName");
     assert_cos_nonambig(result.unwrap_err());
+}
+
+// ========================================================================
+// Occurrence-bound capping tests (cap_for_upa)
+// ========================================================================
+
+#[test]
+fn test_cap_for_upa_simple_unchanged() {
+    assert_eq!(cap_for_upa(0, Some(1)), (0, Some(1)));
+    assert_eq!(cap_for_upa(1, Some(1)), (1, Some(1)));
+}
+
+#[test]
+fn test_cap_for_upa_exact_repeat() {
+    assert_eq!(cap_for_upa(5, Some(5)), (2, Some(2)));
+    assert_eq!(cap_for_upa(2, Some(2)), (2, Some(2)));
+    assert_eq!(cap_for_upa(100, Some(100)), (2, Some(2)));
+}
+
+#[test]
+fn test_cap_for_upa_optional_with_repetition() {
+    assert_eq!(cap_for_upa(0, Some(5000)), (0, Some(2)));
+    assert_eq!(cap_for_upa(0, None), (0, Some(2)));
+    assert_eq!(cap_for_upa(0, Some(2)), (0, Some(2)));
+}
+
+#[test]
+fn test_cap_for_upa_required_with_repetition() {
+    assert_eq!(cap_for_upa(1, Some(5000)), (1, Some(2)));
+    assert_eq!(cap_for_upa(3, Some(5000)), (1, Some(2)));
+    assert_eq!(cap_for_upa(1, None), (1, Some(2)));
+    assert_eq!(cap_for_upa(10, None), (1, Some(2)));
+}
+
+// ========================================================================
+// Counted ambiguity detection tests
+// ========================================================================
+
+#[test]
+fn test_counted_element_trailing_sibling_conflict() {
+    // sequence(a{1,2}, a) — UPA violation: iteration boundary ambiguity
+    // Simulates capped a{1,5000} followed by a
+    let schema_set = create_test_schema_set();
+    let name_a = schema_set.name_table.add("a");
+
+    let builder = FragmentBuilder::new();
+    let term1 = NfaTerm::element(name_a, None, None);
+    let term2 = NfaTerm::element(name_a, None, None);
+    let frag1 = builder.single_term(term1, None);
+    let repeated = frag1.repeat_range(1, Some(2));
+    let frag2 = builder.single_term(term2, None);
+    let sequence = repeated.concat(frag2);
+    let nfa = fragment_to_table(sequence);
+
+    let result = check_upa(&nfa, &schema_set, None);
+    assert!(result.is_err(), "should detect UPA violation for a{{1,2}} followed by a");
+    assert_cos_nonambig(result.unwrap_err());
+}
+
+#[test]
+fn test_nullable_counted_trailing_sibling_conflict() {
+    // sequence(a{0,2}, a) — UPA violation: nullable iteration boundary
+    let schema_set = create_test_schema_set();
+    let name_a = schema_set.name_table.add("a");
+
+    let builder = FragmentBuilder::new();
+    let term1 = NfaTerm::element(name_a, None, None);
+    let term2 = NfaTerm::element(name_a, None, None);
+    let frag1 = builder.single_term(term1, None);
+    let repeated = frag1.repeat_range(0, Some(2));
+    let frag2 = builder.single_term(term2, None);
+    let sequence = repeated.concat(frag2);
+    let nfa = fragment_to_table(sequence);
+
+    let result = check_upa(&nfa, &schema_set, None);
+    assert!(result.is_err(), "should detect UPA violation for a{{0,2}} followed by a");
+    assert_cos_nonambig(result.unwrap_err());
+}
+
+#[test]
+fn test_counted_different_elements_no_conflict() {
+    // sequence(a{1,2}, b{1,2}) — no UPA violation
+    let schema_set = create_test_schema_set();
+    let name_a = schema_set.name_table.add("a");
+    let name_b = schema_set.name_table.add("b");
+
+    let builder = FragmentBuilder::new();
+    let term_a = NfaTerm::element(name_a, None, None);
+    let term_b = NfaTerm::element(name_b, None, None);
+    let frag_a = builder.single_term(term_a, None);
+    let frag_b = builder.single_term(term_b, None);
+    let repeated_a = frag_a.repeat_range(1, Some(2));
+    let repeated_b = frag_b.repeat_range(1, Some(2));
+    let sequence = repeated_a.concat(repeated_b);
+    let nfa = fragment_to_table(sequence);
+
+    let result = check_upa(&nfa, &schema_set, None);
+    assert!(result.is_ok(), "sequence(a{{1,2}}, b{{1,2}}) should not violate UPA");
+}
+
+#[test]
+fn test_single_repeated_element_no_conflict() {
+    // a{0,2} alone — no UPA violation (same particle, not two different ones).
+    // Uses a shared source origin so same_particle_origin identifies the
+    // unrolled copies as the same particle, matching real compiled NFAs.
+    let schema_set = create_test_schema_set();
+    let name_a = schema_set.name_table.add("a");
+    let origin = Some(SourceRef::new(0, SourceSpan::new(0, 10)));
+
+    let builder = FragmentBuilder::new();
+    let term = NfaTerm::element(name_a, None, None);
+    let frag = builder.single_term(term, origin);
+    let repeated = frag.repeat_range(0, Some(2));
+    let nfa = fragment_to_table(repeated);
+
+    let result = check_upa(&nfa, &schema_set, None);
+    assert!(result.is_ok(), "single repeated element should not violate UPA");
 }

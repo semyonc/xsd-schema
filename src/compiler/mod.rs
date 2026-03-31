@@ -56,7 +56,8 @@ pub use nfa::{
 };
 pub use fragment::{NfaFragment, FragmentBuilder, fragment_to_table};
 pub use compile::{
-    CompileContext, compile_content_model_matcher, compile_model_group, compile_particle,
+    CompileContext, compile_content_model_matcher, compile_content_model_for_upa,
+    compile_model_group, compile_particle,
 };
 pub(crate) use compile::{
     is_top_level_all_group, resolve_top_level_all_group_ref, validate_outer_all_group_occurs,

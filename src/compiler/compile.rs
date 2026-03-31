@@ -60,6 +60,9 @@ pub struct CompileContext<'a> {
     /// When compiling a redefining group, stores (group_name, group_ns, original_key)
     /// so self-referencing QName refs are redirected to the original group.
     redefine_redirect: Option<(NameId, Option<NameId>, ModelGroupKey)>,
+    /// When true, occurrence bounds are capped for UPA checking.
+    /// Produces counter-free NFAs suitable for epsilon-closure-based UPA analysis.
+    upa_mode: bool,
 }
 
 impl<'a> CompileContext<'a> {
@@ -76,6 +79,15 @@ impl<'a> CompileContext<'a> {
             resolved_particle_elements: Vec::new(),
             current_sibling_elements: Vec::new(),
             redefine_redirect: None,
+            upa_mode: false,
+        }
+    }
+
+    /// Create a compilation context with UPA occurrence-bound capping enabled.
+    pub fn new_for_upa(schema_set: &'a SchemaSet, target_namespace: Option<NameId>) -> Self {
+        Self {
+            upa_mode: true,
+            ..Self::new(schema_set, target_namespace)
         }
     }
 
@@ -741,14 +753,22 @@ impl<'a> CompileContext<'a> {
     ///
     /// Small maxOccurs are unrolled; large values use counted NFA transitions;
     /// very large values (> MAX_COUNTED_OCCURS) fall back to unbounded.
+    ///
+    /// When `upa_mode` is true, bounds are capped to small values first,
+    /// producing a counter-free NFA suitable for UPA analysis.
     fn apply_occurrences(
         &mut self,
         fragment: NfaFragment,
         min: u32,
         max: Option<u32>,
     ) -> NfaFragment {
-        let max_occurs = MaxOccurs::from_option(max);
-        apply_occurs(fragment, min, max_occurs)
+        let (eff_min, eff_max) = if self.upa_mode {
+            cap_for_upa(min, max)
+        } else {
+            (min, max)
+        };
+        let max_occurs = MaxOccurs::from_option(eff_max);
+        apply_occurs(fragment, eff_min, max_occurs)
     }
 
     /// Check recursion depth
@@ -857,6 +877,28 @@ impl<'a> CompileContext<'a> {
             }
         }
         result
+    }
+}
+
+/// Cap occurrence bounds for UPA checking.
+///
+/// UPA ambiguity is structural: it arises at iteration boundaries.
+/// `maxOccurs=2` is sufficient to expose any boundary ambiguity.
+/// This follows the approach used by Xerces-J, Saxon, and .NET.
+///
+/// See Sperberg-McQueen (2005): for determinism testing, `F{n,m}` can be
+/// replaced with `F{min(n,1), min(m,2)}` without affecting the result.
+#[cfg_attr(test, allow(dead_code))]
+pub(super) fn cap_for_upa(min: u32, max: Option<u32>) -> (u32, Option<u32>) {
+    match (min, max) {
+        // Already simple: no capping needed
+        (m, Some(1)) if m <= 1 => (m, Some(1)),
+        // Exact repeat (min == max > 1): cap to {2, 2}
+        (m, Some(mx)) if m == mx && m > 1 => (2, Some(2)),
+        // Optional with repetition: preserve optionality + iteration boundary
+        (0, _) => (0, Some(2)),
+        // Required with repetition: cap to {1, 2}
+        (_, _) => (min.min(1), Some(2)),
     }
 }
 
@@ -1027,8 +1069,32 @@ pub fn compile_content_model_matcher(
     schema_set: &SchemaSet,
     type_def: &ComplexTypeDefData,
 ) -> NfaCompileResult<ContentModelMatcher> {
+    compile_content_model_matcher_impl(schema_set, type_def, false)
+}
+
+/// Compile a content model with capped occurrence bounds for UPA checking.
+///
+/// All `maxOccurs` values are reduced to at most 2 before NFA construction,
+/// producing a counter-free NFA suitable for epsilon-closure-based UPA analysis.
+/// This is the standard approach used by Xerces-J, Saxon, and .NET.
+pub fn compile_content_model_for_upa(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+) -> NfaCompileResult<ContentModelMatcher> {
+    compile_content_model_matcher_impl(schema_set, type_def, true)
+}
+
+fn compile_content_model_matcher_impl(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    upa_mode: bool,
+) -> NfaCompileResult<ContentModelMatcher> {
     let target_namespace = type_def.target_namespace;
-    let mut ctx = CompileContext::new(schema_set, target_namespace);
+    let mut ctx = if upa_mode {
+        CompileContext::new_for_upa(schema_set, target_namespace)
+    } else {
+        CompileContext::new(schema_set, target_namespace)
+    };
     let is_extension = matches!(type_def.derivation_method, Some(DerivationMethod::Extension));
 
     // Try the all-group path for non-extension types with an inline xs:all
@@ -1123,7 +1189,11 @@ pub fn compile_content_model_matcher(
                     // Check if extension's own particle is an inline all-group
                     if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
                         // Merge: base all-group + extension all-group → single AllGroup
-                        let mut ctx = CompileContext::new(schema_set, type_def.target_namespace);
+                        let mut ctx = if upa_mode {
+                            CompileContext::new_for_upa(schema_set, type_def.target_namespace)
+                        } else {
+                            CompileContext::new(schema_set, type_def.target_namespace)
+                        };
                         ctx.resolved_particle_types =
                             type_def.resolved_content_particle_types.to_vec();
                         ctx.resolved_particle_elements =
@@ -1139,7 +1209,11 @@ pub fn compile_content_model_matcher(
                     }
 
                     // Extension is sequence/choice — compile as NFA, return composite
-                    let mut ctx = CompileContext::new(schema_set, type_def.target_namespace);
+                    let mut ctx = if upa_mode {
+                        CompileContext::new_for_upa(schema_set, type_def.target_namespace)
+                    } else {
+                        CompileContext::new(schema_set, type_def.target_namespace)
+                    };
                     ctx.resolved_particle_types =
                         type_def.resolved_content_particle_types.to_vec();
                     ctx.resolved_particle_elements =
@@ -1177,7 +1251,7 @@ pub fn compile_content_model_matcher(
     let base_nfa = if is_extension {
         if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
             let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
-            let base_matcher = compile_content_model_matcher(schema_set, base_type_def)?;
+            let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
             match base_matcher {
                 ContentModelMatcher::Nfa(nfa) => Some(nfa),
                 ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),

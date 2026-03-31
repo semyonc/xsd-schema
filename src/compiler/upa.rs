@@ -110,6 +110,19 @@ struct ReachableTerm {
     origin: Option<SourceRef>,
 }
 
+/// Check if two reachable terms originate from the same particle.
+///
+/// When occurrence bounds are unrolled (e.g., `a{1,2}` → two NFA copies of `a`),
+/// the copies share the same source location. Conflicts between copies of the
+/// same particle are not UPA violations — the validator extends the count of
+/// the current particle rather than choosing between distinct particles.
+fn same_particle_origin(a: &Option<SourceRef>, b: &Option<SourceRef>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.doc_id == b.doc_id && a.span == b.span,
+        _ => false,
+    }
+}
+
 /// Collection of reachable terms categorized by type
 #[derive(Debug, Default)]
 struct ReachableTerms {
@@ -120,12 +133,10 @@ struct ReachableTerms {
 /// Compute epsilon closure and collect all reachable terms from a start state.
 ///
 /// Uses DFS traversal following **only** `TransitionKind::Epsilon` transitions.
-/// Counter transitions (`CounterReset`, `CounterIncrement`, `CounterMaxGuard`,
-/// `CounterMinGuard`) are intentionally ignored — UPA checking is currently
-/// applied only to simple (counter-free) NFAs, gated by the pipeline dispatch
-/// in `pipeline.rs`.  If counted NFAs are ever passed to UPA, this function
-/// will need counter-aware traversal (e.g. via `ActiveStates`) to reach terms
-/// hidden behind counter transitions.
+/// Counter transitions are not followed — the pipeline compiles a separate
+/// counter-free NFA for UPA checking by capping occurrence bounds to at most 2
+/// (via `compile_content_model_for_upa`), so all transitions in the UPA NFA
+/// are epsilon transitions.
 fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> ReachableTerms {
     let mut result = ReachableTerms::default();
     let mut closure = HashSet::new();
@@ -361,6 +372,11 @@ fn check_element_element_conflicts(
             let elem1 = &elements[i];
             let elem2 = &elements[j];
 
+            // Skip copies of the same particle from occurrence unrolling
+            if same_particle_origin(&elem1.origin, &elem2.origin) {
+                continue;
+            }
+
             if let (
                 NfaTerm::Element {
                     name: name1,
@@ -426,6 +442,11 @@ fn check_element_wildcard_conflicts(
             let matchable_names = element_substitutable_names(&elem.term, substitution_sets);
 
             for wc in wildcards {
+                // Skip copies of the same particle from occurrence unrolling
+                if same_particle_origin(&elem.origin, &wc.origin) {
+                    continue;
+                }
+
                 if let NfaTerm::Wildcard {
                     namespace_constraint,
                     not_qnames,
@@ -481,6 +502,11 @@ fn check_wildcard_wildcard_conflicts(
         for j in (i + 1)..wildcards.len() {
             let wc1 = &wildcards[i];
             let wc2 = &wildcards[j];
+
+            // Skip copies of the same particle from occurrence unrolling
+            if same_particle_origin(&wc1.origin, &wc2.origin) {
+                continue;
+            }
 
             if let (
                 NfaTerm::Wildcard {
