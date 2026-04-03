@@ -1082,93 +1082,7 @@ fn normalize_type_particle(
     let particle = normalizer.normalize_particle(particle)?;
     let particle = remove_pointless_particles(particle);
     let particle = flatten_same_compositor_groups(particle);
-    Ok(expand_bounded_repeated_sequences(particle))
-}
-
-/// Expand bounded repeated sequences into atomic repetition units.
-///
-/// `sequence(a,b){min,max}` becomes:
-/// ```text
-/// sequence {
-///   sequence(a,b){1,1},  // × min  (required copies)
-///   sequence(a,b){0,1},  // × (max - min)  (optional copies)
-/// }
-/// ```
-///
-/// Each copy is a nested sequence with occurs {1,1} or {0,1}, keeping
-/// the repetition unit atomic (you can't take `a` without `b`).
-///
-/// Only expands when `max_occurs` is finite, ≤ 10, and total children
-/// after expansion ≤ 50.
-fn expand_bounded_repeated_sequences(mut particle: NormalizedParticle) -> NormalizedParticle {
-    // First, recurse into children
-    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
-        group.particles = group
-            .particles
-            .drain(..)
-            .map(expand_bounded_repeated_sequences)
-            .collect();
-    }
-
-    // Then check if this particle itself should be expanded
-    let NormalizedParticleTerm::Group(ref group) = particle.term else {
-        return particle;
-    };
-    if group.compositor != Compositor::Sequence {
-        return particle;
-    }
-    let child_count = group.particles.len();
-    if child_count <= 1 {
-        return particle; // single-child already handled by existing code
-    }
-    let Some(max) = particle.max_occurs else {
-        return particle; // unbounded — can't expand
-    };
-    if max <= 1 {
-        return particle; // not repeated
-    }
-    if max > 10 || (max as usize) * child_count > 50 {
-        return particle; // too large to expand safely
-    }
-
-    let min = particle.min_occurs;
-    let inner_group = match particle.term {
-        NormalizedParticleTerm::Group(g) => g,
-        _ => unreachable!(),
-    };
-    let source = particle.source.clone();
-
-    let mut copies = Vec::with_capacity(max as usize);
-
-    // Required copies (min_occurs=1, max_occurs=1)
-    for _ in 0..min {
-        copies.push(NormalizedParticle {
-            term: NormalizedParticleTerm::Group(inner_group.clone()),
-            min_occurs: 1,
-            max_occurs: Some(1),
-            source: source.clone(),
-        });
-    }
-
-    // Optional copies (min_occurs=0, max_occurs=1)
-    for _ in min..max {
-        copies.push(NormalizedParticle {
-            term: NormalizedParticleTerm::Group(inner_group.clone()),
-            min_occurs: 0,
-            max_occurs: Some(1),
-            source: source.clone(),
-        });
-    }
-
-    NormalizedParticle {
-        term: NormalizedParticleTerm::Group(NormalizedGroup {
-            compositor: Compositor::Sequence,
-            particles: copies,
-        }),
-        min_occurs: 1,
-        max_occurs: Some(1),
-        source,
-    }
+    Ok(particle)
 }
 
 /// Remove "pointless" particles per Section 3.8 normalization:
@@ -1462,6 +1376,9 @@ fn particle_restricts(
                 Compositor::Choice => unreachable!("choice particles are handled earlier"),
             }
         }
+        // Sequence:All — RecurseUnordered (§3.9.6): unordered bipartite
+        // matching regardless of XSD version.  The XSD 1.0 ordered fallback
+        // in all_particles_restrict is only correct for All:All (Recurse).
         (
             NormalizedParticleTerm::Group(derived_group),
             NormalizedParticleTerm::Group(base_group),
@@ -1476,7 +1393,7 @@ fn particle_restricts(
             ) {
                 return false;
             }
-            all_particles_restrict(schema_set, &derived_group.particles, &base_group.particles)
+            recurse_unordered(schema_set, &derived_group.particles, &base_group.particles)
         }
         // recurseAsIfGroup: wrap derived element/wildcard in an implicit group{1,1}
         // and check outer occurs before delegating to sequence/all matching.
@@ -1792,17 +1709,14 @@ fn sequence_particles_restrict(
         .all(particle_is_emptiable)
 }
 
-fn all_particles_restrict(
+/// RecurseUnordered: order-independent bipartite matching of particles.
+/// Each derived particle must match some base particle (one-to-one),
+/// and unmatched base particles must be emptiable.
+fn recurse_unordered(
     schema_set: &SchemaSet,
     derived_particles: &[NormalizedParticle],
     base_particles: &[NormalizedParticle],
 ) -> bool {
-    // XSD 1.0: All:All uses order-preserving Recurse (same as Sequence:Sequence).
-    // XSD 1.1: RecurseUnordered allows reordering via backtracking.
-    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
-        return sequence_particles_restrict(schema_set, derived_particles, base_particles);
-    }
-
     fn backtrack(
         schema_set: &SchemaSet,
         derived_particles: &[NormalizedParticle],
@@ -1833,6 +1747,19 @@ fn all_particles_restrict(
 
     let mut used = vec![false; base_particles.len()];
     backtrack(schema_set, derived_particles, base_particles, &mut used, 0)
+}
+
+fn all_particles_restrict(
+    schema_set: &SchemaSet,
+    derived_particles: &[NormalizedParticle],
+    base_particles: &[NormalizedParticle],
+) -> bool {
+    // XSD 1.0: All:All uses order-preserving Recurse (same as Sequence:Sequence).
+    // XSD 1.1: RecurseUnordered allows reordering via backtracking.
+    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+        return sequence_particles_restrict(schema_set, derived_particles, base_particles);
+    }
+    recurse_unordered(schema_set, derived_particles, base_particles)
 }
 
 fn particle_is_emptiable(particle: &NormalizedParticle) -> bool {

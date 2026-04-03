@@ -2211,6 +2211,166 @@ fn test_all_all_same_order_valid_xsd10() {
 }
 
 // ======================================================================
+// Fix 10a: Sequence:All — RecurseUnordered (U family)
+// ======================================================================
+
+/// Valid: derived sequence reorders elements from base all group.
+/// RecurseUnordered allows any order. (particlesU003)
+#[test]
+fn test_accept_sequence_restricts_all_reordered_u003() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:element name="e2"/>
+                        <xsd:element name="e1"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Sequence:All reordering should be valid (RecurseUnordered): {:?}", result);
+}
+
+/// Valid: derived sequence omits optional element from base all group.
+/// (particlesU004)
+#[test]
+fn test_accept_sequence_restricts_all_omit_optional_u004() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+                <xsd:element name="e3" minOccurs="0"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:element name="e2"/>
+                        <xsd:element name="e1"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Sequence:All reorder + omit optional should be valid: {:?}", result);
+}
+
+/// Valid: derived sequence fully reorders 4-element base all group,
+/// promoting optional e4 to required. (particlesU007)
+#[test]
+fn test_accept_sequence_restricts_all_full_reorder_u007() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:all>
+                <xsd:element name="e1"/>
+                <xsd:element name="e2" minOccurs="0"/>
+                <xsd:element name="e3"/>
+                <xsd:element name="e4" minOccurs="0"/>
+            </xsd:all>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence>
+                        <xsd:element name="e4"/>
+                        <xsd:element name="e2" minOccurs="0"/>
+                        <xsd:element name="e3"/>
+                        <xsd:element name="e1"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Sequence:All full reorder with promoted optional should be valid: {:?}", result);
+}
+
+// ======================================================================
+// Fix 10b: Sequence:Choice — MapAndSum (V family)
+// ======================================================================
+
+/// Valid: repeated sequence restricts repeated choice — all children
+/// match choice branches and iteration budget fits. (particlesV001)
+#[test]
+fn test_accept_repeated_sequence_restricts_choice_v001() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:choice minOccurs="1" maxOccurs="10">
+                <xsd:element name="e1" minOccurs="1" maxOccurs="10"/>
+                <xsd:element name="e2" minOccurs="2" maxOccurs="10"/>
+                <xsd:element name="e3" minOccurs="3" maxOccurs="10"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence minOccurs="1" maxOccurs="3">
+                        <xsd:element name="e1" minOccurs="1" maxOccurs="10"/>
+                        <xsd:element name="e2" minOccurs="2" maxOccurs="10"/>
+                        <xsd:element name="e3" minOccurs="3" maxOccurs="10"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Repeated sequence should validly restrict repeated choice (MapAndSum): {:?}", result);
+}
+
+/// Valid: repeated sequence{2,4} restricts choice{3,9} — iteration budget
+/// [4,8] fits within [3,9]. (particlesV003)
+#[test]
+fn test_accept_repeated_sequence_restricts_choice_v003() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test" xmlns:t="http://test">
+        <xsd:complexType name="B">
+            <xsd:choice minOccurs="3" maxOccurs="9">
+                <xsd:element name="e1"/>
+                <xsd:element name="e2"/>
+            </xsd:choice>
+        </xsd:complexType>
+        <xsd:complexType name="R">
+            <xsd:complexContent>
+                <xsd:restriction base="t:B">
+                    <xsd:sequence minOccurs="2" maxOccurs="4">
+                        <xsd:element name="e1"/>
+                        <xsd:element name="e2"/>
+                    </xsd:sequence>
+                </xsd:restriction>
+            </xsd:complexContent>
+        </xsd:complexType>
+    </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "Repeated sequence{{2,4}} should validly restrict choice{{3,9}}: {:?}", result);
+}
+
+// ======================================================================
 // Fix 3: Choice:Choice order-preserving in XSD 1.0
 // ======================================================================
 
