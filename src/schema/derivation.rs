@@ -26,11 +26,11 @@
 //! - `derivation-ok-restriction` - Complex Type Derivation OK (Restriction)
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::ids::{ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
+use crate::ids::{AttributeGroupKey, ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{
-    ComplexContentResult, Compositor, DerivationMethod, ElementFrameResult, ModelGroupDefResult,
-    ParticleResult, ParticleTerm, ProcessContents, SimpleTypeVariety, WildcardNamespace,
-    WildcardResult,
+    AttributeUseKind, ComplexContentResult, Compositor, DerivationMethod,
+    ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm, ProcessContents,
+    SimpleTypeVariety, WildcardNamespace, WildcardResult,
 };
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::{OpenContentMode, OpenContentResult};
@@ -621,6 +621,70 @@ fn validate_complex_extension(
                     }
                 }
 
+                // cos-ct-extends / cos-particle-extend: Cannot extend non-empty
+                // non-all content with an all compositor.  The effective content
+                // type of an extension is sequence(base, extension) per §3.4.2.3.3.
+                // cos-particle-extend §3.9.6.2 only allows: (1) same particle,
+                // (2) E is a sequence wrapping B, or (3) both are all groups.
+                // An all group nested inside a sequence also violates
+                // cos-all-limited.1 (placement constraint).
+                //
+                // Exception: XSD 1.1 allows all-over-all extensions (clause 3 of
+                // cos-particle-extend). If both base and extension are all groups,
+                // skip this check.
+                if let ComplexContentResult::Complex(ref base_complex) = base_type.content {
+                    if let Some(ref base_particle) = base_complex.particle {
+                        if let ComplexContentResult::Complex(ref derived_complex) = type_def.content {
+                            if let Some(ref ext_particle) = derived_complex.particle {
+                                let ext_is_all = matches!(
+                                    ext_particle.term,
+                                    ParticleTerm::Group(ModelGroupDefResult {
+                                        compositor: Some(Compositor::All),
+                                        ..
+                                    })
+                                );
+                                let base_is_all = matches!(
+                                    base_particle.term,
+                                    ParticleTerm::Group(ModelGroupDefResult {
+                                        compositor: Some(Compositor::All),
+                                        ..
+                                    })
+                                );
+
+                                // XSD 1.1 allows all-over-all; XSD 1.0 forbids all
+                                // compositors in extensions over non-empty base
+                                if ext_is_all && !(base_is_all && schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1) {
+                                    let location = type_def
+                                        .source
+                                        .as_ref()
+                                        .and_then(|s| schema_set.source_maps.locate(s));
+                                    let type_name = format_type_name(
+                                        schema_set,
+                                        type_def.name,
+                                        type_def.target_namespace,
+                                    );
+                                    let base_name = format_type_name(
+                                        schema_set,
+                                        base_type.name,
+                                        base_type.target_namespace,
+                                    );
+                                    return Err(SchemaError::structural(
+                                        "cos-ct-extends",
+                                        format!(
+                                            "Complex type '{}' cannot extend '{}' with an xs:all \
+                                             compositor because the base type has non-empty content; \
+                                             the resulting content model would violate \
+                                             cos-all-limited placement constraints",
+                                            type_name, base_name,
+                                        ),
+                                        location,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
                 validate_open_content_extension(schema_set, type_def, base_type)?;
@@ -689,13 +753,16 @@ fn validate_complex_restriction(
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
                 validate_open_content_restriction(schema_set, type_def, base_type)?;
+
+                // Validate attribute restriction (derivation-ok-restriction clause 3)
+                validate_attribute_restriction(schema_set, type_def, base_type)?;
+
+                // Validate simpleContent inline type restriction
+                // (derivation-ok-restriction clause 2.2.2.1)
+                validate_simple_content_restriction(schema_set, type_def, base_type)?;
             }
         }
     }
-
-    // Note: Full content model restriction validation (particle restriction, attribute
-    // subsetting) is complex and requires comparing content models. This will be
-    // implemented in Phase 4 (Content Model Compilation).
 
     Ok(())
 }
@@ -2244,6 +2311,306 @@ fn effective_type_final(
         .get(source.doc_id as usize)
         .map(|doc| doc.final_default)
         .unwrap_or(final_derivation)
+}
+
+/// Resolved effective attribute use for comparison during restriction validation.
+struct EffectiveAttributeUse {
+    name: NameId,
+    use_kind: AttributeUseKind,
+    resolved_type: Option<TypeKey>,
+}
+
+/// Resolve a single attribute use + its parallel resolved data into an
+/// `EffectiveAttributeUse`.  Returns `None` when the attribute name
+/// cannot be determined (malformed data).
+fn resolve_single_attribute_use(
+    schema_set: &SchemaSet,
+    attr_use: &crate::parser::frames::AttributeUseResult,
+    resolved: Option<&crate::arenas::ResolvedAttributeUse>,
+) -> Option<EffectiveAttributeUse> {
+    let name = if let Some(ref_name) = &attr_use.attribute.ref_name {
+        if let Some(resolved_attr) = resolved.and_then(|r| r.resolved_ref) {
+            schema_set.arenas.attributes.get(resolved_attr).and_then(|d| d.name)
+        } else {
+            Some(ref_name.local_name)
+        }
+    } else {
+        attr_use.attribute.name
+    }?;
+
+    // Prefer the use's resolved_type; fall back to the global declaration's type.
+    let resolved_type = resolved.and_then(|r| r.resolved_type)
+        .or_else(|| {
+            resolved
+                .and_then(|r| r.resolved_ref)
+                .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
+                .and_then(|decl| decl.resolved_type)
+        });
+
+    Some(EffectiveAttributeUse {
+        name,
+        use_kind: attr_use.use_kind,
+        resolved_type,
+    })
+}
+
+/// Collect effective attribute uses from a complex type definition.
+///
+/// Resolves attribute refs and expands attribute groups into a flat list.
+/// Attributes are always on `type_def.attributes` (moved from sc/cc at parse time).
+fn collect_effective_attribute_uses(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+) -> Vec<EffectiveAttributeUse> {
+    let mut result = Vec::new();
+
+    for (i, attr_use) in type_def.attributes.iter().enumerate() {
+        let resolved = type_def.resolved_attributes.get(i);
+        if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+            result.push(eau);
+        }
+    }
+
+    for &ag_key in &type_def.resolved_attribute_groups {
+        collect_attribute_group_uses(schema_set, ag_key, &mut result, 0);
+    }
+
+    result
+}
+
+/// Recursively expand an attribute group into effective attribute uses.
+fn collect_attribute_group_uses(
+    schema_set: &SchemaSet,
+    ag_key: AttributeGroupKey,
+    result: &mut Vec<EffectiveAttributeUse>,
+    depth: usize,
+) {
+    if depth > 20 {
+        return;
+    }
+
+    let Some(ag) = schema_set.arenas.attribute_groups.get(ag_key) else {
+        return;
+    };
+
+    if let Some(ref_key) = ag.resolved_ref {
+        collect_attribute_group_uses(schema_set, ref_key, result, depth + 1);
+        return;
+    }
+
+    for (i, attr_use) in ag.attributes.iter().enumerate() {
+        let resolved = ag.resolved_attributes.get(i);
+        if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+            result.push(eau);
+        }
+    }
+
+    for &nested_key in &ag.resolved_attribute_groups {
+        collect_attribute_group_uses(schema_set, nested_key, result, depth + 1);
+    }
+}
+
+/// Delegate to `SchemaSet::is_type_derived_from` with no method exclusions.
+fn is_type_derived_from(
+    schema_set: &SchemaSet,
+    derived_key: TypeKey,
+    base_key: TypeKey,
+) -> bool {
+    schema_set.is_type_derived_from(derived_key, base_key, DerivationSet::empty())
+}
+
+/// Validate attribute uses in a complex type restriction.
+///
+/// derivation-ok-restriction clause 3 (§3.4.6.3): If E's attributes satisfy
+/// T's attribute constraints, they must also satisfy B's.  This means:
+/// - Required attributes in the base must remain required in the derived type
+///
+/// derivation-ok-restriction clause 4: Attribute types in T must be validly
+/// substitutable for those in B.
+fn validate_attribute_restriction(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    let derived_attrs = collect_effective_attribute_uses(schema_set, derived);
+    let base_attrs = collect_effective_attribute_uses(schema_set, base);
+
+    let location = derived
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.source_maps.locate(s));
+    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+
+    // Check clause 3: required base attributes must remain required
+    for base_attr in &base_attrs {
+        if base_attr.use_kind != AttributeUseKind::Required {
+            continue;
+        }
+
+        let attr_name_str = schema_set.name_table.resolve(base_attr.name);
+
+        // Find matching derived attribute
+        let derived_attr = derived_attrs.iter().find(|a| a.name == base_attr.name);
+
+        match derived_attr {
+            Some(da) if da.use_kind == AttributeUseKind::Required => {
+                // OK: required stays required
+            }
+            _ => {
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': base type requires attribute '{}' \
+                         but the derived type does not declare it as required",
+                        type_name, base_name, attr_name_str,
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
+    // Check clause 4: attribute type derivation
+    for derived_attr in &derived_attrs {
+        let Some(derived_type_key) = derived_attr.resolved_type else { continue };
+
+        let base_attr = base_attrs.iter().find(|a| a.name == derived_attr.name);
+        let Some(base_attr) = base_attr else { continue };
+        let Some(base_type_key) = base_attr.resolved_type else { continue };
+
+        if derived_type_key == base_type_key {
+            continue;
+        }
+
+        if !is_type_derived_from(schema_set, derived_type_key, base_type_key) {
+            let attr_name_str = schema_set.name_table.resolve(derived_attr.name);
+            return Err(SchemaError::structural(
+                "derivation-ok-restriction",
+                format!(
+                    "Complex type '{}' restricting '{}': attribute '{}' has a type \
+                     that is not validly derived from the base attribute type",
+                    type_name, base_name, attr_name_str,
+                ),
+                location,
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Walk the complex type extension chain to find the effective simple content
+/// type key. Returns `None` if there is no simple content type in the chain.
+fn effective_simple_content_type_key(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+) -> Option<TypeKey> {
+    let mut current_base = type_def.resolved_base_type?;
+    for _ in 0..50 {
+        match current_base {
+            TypeKey::Simple(sk) => return Some(TypeKey::Simple(sk)),
+            TypeKey::Complex(ck) => {
+                let ct = schema_set.arenas.complex_types.get(ck)?;
+                current_base = ct.resolved_base_type?;
+            }
+        }
+    }
+    None
+}
+
+/// Validate simpleContent restriction inline simpleType.
+///
+/// derivation-ok-restriction clause 2.2.2.1 (§3.4.6.3): let S_B = B's content
+/// type simple type definition and S_T = T's content type simple type definition.
+/// S_T must be validly derived from S_B.
+fn validate_simple_content_restriction(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    // Only applies when derived has simpleContent with an inline simpleType
+    let ComplexContentResult::Simple(ref sc) = derived.content else {
+        return Ok(());
+    };
+
+    let Some(ref inline_st) = sc.content_type else {
+        return Ok(());
+    };
+
+    // Find the base type's effective simple content type
+    let Some(base_simple_key) = effective_simple_content_type_key(schema_set, base) else {
+        return Ok(());
+    };
+
+    // Get the base simple type's variety
+    let base_variety = match base_simple_key {
+        TypeKey::Simple(sk) => {
+            schema_set.arenas.simple_types.get(sk).map(|st| st.variety)
+        }
+        TypeKey::Complex(_) => None,
+    };
+
+    let Some(base_variety) = base_variety else {
+        return Ok(());
+    };
+
+    // Check variety compatibility:
+    // A list type cannot restrict an atomic type.
+    // A union type cannot restrict an atomic type (unless it's a restriction of
+    // the base union/atomic via resolved_base_type chain).
+    let derived_variety = inline_st.variety;
+
+    if derived_variety != base_variety {
+        // Different varieties — check if the inline type's base chain leads to
+        // the base simple type (which would mean it's a valid restriction despite
+        // variety difference, e.g. restriction of a union member).
+        // For the common case (list restricting atomic, union restricting atomic),
+        // this chain walk will NOT find the base type.
+        if let Some(inline_resolved_base) = resolve_inline_simple_type_base(schema_set, inline_st) {
+            if is_type_derived_from(schema_set, inline_resolved_base, base_simple_key) {
+                return Ok(());
+            }
+        }
+
+        let location = derived
+            .source
+            .as_ref()
+            .and_then(|s| schema_set.source_maps.locate(s));
+        let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+        let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+        return Err(SchemaError::structural(
+            "derivation-ok-restriction",
+            format!(
+                "Complex type '{}' restricting '{}': simpleContent inline type \
+                 has variety {:?} which is not a valid restriction of the base \
+                 type's simple content (variety {:?})",
+                type_name, base_name, derived_variety, base_variety,
+            ),
+            location,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Try to resolve the base type key of an inline SimpleTypeResult.
+/// The inline type may have a base_type as a QName that has been resolved,
+/// or it may reference a known type directly.
+fn resolve_inline_simple_type_base(
+    schema_set: &SchemaSet,
+    inline_st: &crate::parser::frames::SimpleTypeResult,
+) -> Option<TypeKey> {
+    // For inline types used in simpleContent/restriction, the base_type
+    // is the type the restriction derives from. If it was resolved during
+    // assembly, it would be in the arena. We can try to find it by matching
+    // the QName if present.
+    match &inline_st.base_type {
+        Some(crate::parser::frames::TypeRefResult::QName(qname)) => {
+            schema_set.lookup_type(qname.namespace, qname.local_name)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

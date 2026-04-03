@@ -273,6 +273,8 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
+        validate_all_group_outer_occurs(schema_set)?;
+        validate_all_group_content(schema_set)?;
         validate_all_particle_occurs(schema_set)?;
         validate_all_upa_constraints(schema_set)?;
     }
@@ -343,6 +345,7 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
+    validate_all_group_content(schema_set)?;
     validate_all_particle_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
     Ok((inline_stats, resolution_stats))
@@ -386,6 +389,75 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
         })?;
     }
 
+    Ok(())
+}
+
+/// Validate all-group content constraints.
+///
+/// XSD 1.0: all groups may only contain element declarations (the schema-for-schemas
+/// `allModel` group is `(annotation?, element*)`). Wildcards (`xs:any`) are forbidden.
+/// XSD 1.1 relaxes this to allow `xs:any` and group references in all groups.
+fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::parser::frames::{Compositor, ComplexContentResult};
+    use crate::schema::model::XsdVersion;
+
+    if schema_set.xsd_version != XsdVersion::V1_0 {
+        return Ok(());
+    }
+
+    // Check named model groups
+    for (_, mg) in schema_set.arenas.model_groups.iter() {
+        if mg.compositor == Some(Compositor::All) {
+            check_all_group_no_wildcards(&mg.particles, schema_set)?;
+        }
+    }
+
+    // Check content particles in complex types
+    for (_, type_def) in schema_set.arenas.complex_types.iter() {
+        if let ComplexContentResult::Complex(content) = &type_def.content {
+            if let Some(particle) = content.particle.as_ref() {
+                check_particle_all_group_wildcards(particle, schema_set)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_all_group_no_wildcards(
+    particles: &[crate::parser::frames::ParticleResult],
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::parser::frames::ParticleTerm;
+
+    for particle in particles {
+        if let ParticleTerm::Any(wc) = &particle.term {
+            let location = wc.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+            return Err(crate::error::SchemaError::structural(
+                "src-model-group",
+                "In XSD 1.0, xs:any (wildcard) is not allowed inside an xs:all group".to_string(),
+                location,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn check_particle_all_group_wildcards(
+    particle: &crate::parser::frames::ParticleResult,
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::parser::frames::{Compositor, ParticleTerm};
+
+    if let ParticleTerm::Group(mg) = &particle.term {
+        if mg.compositor == Some(Compositor::All) {
+            check_all_group_no_wildcards(&mg.particles, schema_set)?;
+        }
+        // Recurse into child particles regardless of compositor
+        for child in &mg.particles {
+            check_particle_all_group_wildcards(child, schema_set)?;
+        }
+    }
     Ok(())
 }
 

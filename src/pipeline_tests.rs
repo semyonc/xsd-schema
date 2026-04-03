@@ -2539,3 +2539,203 @@ fn test_accept_dead_imported_element_restriction_jf005() {
     assert!(result.is_ok(), "dead imported-element restriction (Jf005 shape) should be valid: {:?}", result);
 }
 
+// ── Step 13 canary tests ──────────────────────────────────────────────
+
+/// particles00104m1: xs:any inside xs:all is invalid in XSD 1.0
+#[test]
+fn test_reject_all_group_with_wildcard_xsd10() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    xmlns="particles" targetNamespace="particles">
+            <xsd:group name="G1">
+                <xsd:all>
+                    <xsd:any/>
+                </xsd:all>
+            </xsd:group>
+            <xsd:element name="a" type="xsd:string"/>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "xs:any in xs:all must be rejected in XSD 1.0");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "src-model-group");
+        }
+        other => panic!("Expected src-model-group, got {:?}", other),
+    }
+}
+
+/// XSD 1.1 allows xs:any inside xs:all
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_all_group_with_wildcard_xsd11() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    xmlns="particles" targetNamespace="particles">
+            <xsd:group name="G1">
+                <xsd:all>
+                    <xsd:any/>
+                </xsd:all>
+            </xsd:group>
+            <xsd:element name="a" type="xsd:string"/>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "xs:any in xs:all should be accepted in XSD 1.1: {:?}", result);
+}
+
+/// particlesFb002: extending choice content with all compositor is invalid
+#[test]
+fn test_reject_extension_with_all_over_choice() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice>
+                    <xsd:element name="c1"/>
+                    <xsd:element name="c2"/>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:extension base="x:base">
+                            <xsd:all>
+                                <xsd:element name="a1"/>
+                                <xsd:element name="a2"/>
+                            </xsd:all>
+                        </xsd:extension>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "extending choice with all must be rejected");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "cos-ct-extends");
+        }
+        other => panic!("Expected cos-ct-extends, got {:?}", other),
+    }
+}
+
+/// particlesZ013: attribute type not validly derived in restriction
+#[test]
+fn test_reject_attribute_type_not_derived_in_restriction() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:t="http://xsdtesting"
+                    attributeFormDefault="qualified" elementFormDefault="qualified">
+            <xsd:simpleType name="myType10">
+                <xsd:union memberTypes="xsd:float xsd:integer">
+                    <xsd:simpleType>
+                        <xsd:restriction base="xsd:boolean"/>
+                    </xsd:simpleType>
+                    <xsd:simpleType>
+                        <xsd:restriction base="xsd:string">
+                            <xsd:enumeration value="x"/>
+                            <xsd:enumeration value="y"/>
+                        </xsd:restriction>
+                    </xsd:simpleType>
+                </xsd:union>
+            </xsd:simpleType>
+            <xsd:complexType name="CT1">
+                <xsd:attribute name="att1" type="xsd:integer"/>
+            </xsd:complexType>
+            <xsd:complexType name="CT2">
+                <xsd:complexContent>
+                    <xsd:restriction base="t:CT1">
+                        <xsd:attribute name="att1" type="t:myType10"/>
+                    </xsd:restriction>
+                </xsd:complexContent>
+            </xsd:complexType>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "attribute type not derived from base must be rejected");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
+/// particlesZ017: required attribute becomes optional in restriction
+#[test]
+fn test_reject_required_attribute_becomes_optional() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="XML-Deviant">
+                <xs:sequence>
+                    <xs:element name="e1" type="xs:integer" minOccurs="0"/>
+                    <xs:element name="e2" type="xs:string" nillable="true"/>
+                </xs:sequence>
+                <xs:attribute name="a1" type="xs:date" use="required"/>
+                <xs:attribute name="a2" type="xs:string"/>
+            </xs:complexType>
+            <xs:complexType name="DareObasanjo">
+                <xs:complexContent>
+                    <xs:restriction base="XML-Deviant">
+                        <xs:sequence>
+                            <xs:element name="e1" type="xs:integer" minOccurs="1"/>
+                            <xs:element name="e2" type="xs:string" nillable="false"/>
+                        </xs:sequence>
+                        <xs:attribute name="a1" type="xs:date" use="optional"/>
+                        <xs:attribute name="a2" type="xs:string" fixed="Microsoft Outlook"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "required->optional attribute must be rejected");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
+/// particlesZ018: simpleContent restriction with list type over atomic base
+#[test]
+fn test_reject_simple_content_restriction_with_list_over_atomic() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B1">
+                <xs:simpleContent>
+                    <xs:extension base="xs:decimal">
+                        <xs:attribute name="foo"/>
+                    </xs:extension>
+                </xs:simpleContent>
+            </xs:complexType>
+            <xs:complexType name="C2">
+                <xs:simpleContent>
+                    <xs:restriction base="B1">
+                        <xs:simpleType>
+                            <xs:list itemType="xs:int"/>
+                        </xs:simpleType>
+                    </xs:restriction>
+                </xs:simpleContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_err(), "list type restricting atomic simple content must be rejected");
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
