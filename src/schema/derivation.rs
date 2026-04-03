@@ -601,19 +601,25 @@ fn validate_complex_extension(
                 }
 
                 // cos-ct-extends: Cannot use complexContent extension to add particles
-                // to a base type with simpleContent
+                // to a base type with simpleContent.
+                // XSD 1.0: only rejected when a particle is actually added.
+                // XSD 1.1 cos-ct-extends clause 1.4: content variety must match;
+                //   simpleContent base + complexContent derived is always invalid.
                 if matches!(base_type.content, ComplexContentResult::Simple(_)) {
                     if let ComplexContentResult::Complex(ref complex) = type_def.content {
-                        // Extension adds a content model particle — invalid
-                        if complex.particle.is_some() {
+                        if complex.particle.is_some()
+                            || schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1
+                        {
                             let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
                             let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
                             let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                             return Err(SchemaError::structural(
                                 "cos-ct-extends",
                                 format!(
-                                    "Complex type '{}' cannot use complexContent to extend '{}' which has simpleContent with element content",
+                                    "Complex type '{}' cannot use complexContent to extend '{}' which has simpleContent{}",
                                     type_name, base_name,
+                                    if complex.particle.is_some() { " with element content" }
+                                    else { " (XSD 1.1 cos-ct-extends clause 1.4)" },
                                 ),
                                 location,
                             ));
@@ -663,6 +669,15 @@ fn validate_complex_extension(
                                                 == crate::schema::model::XsdVersion::V1_1 =>
                                     {
                                         // OK: XSD 1.1 all-over-all
+                                    }
+                                    Some(Compositor::Choice)
+                                        if schema_set.xsd_version
+                                            == crate::schema::model::XsdVersion::V1_1 =>
+                                    {
+                                        // XSD 1.1: choice extension is structurally valid.
+                                        // cos-particle-extend clause 2 is satisfied by the
+                                        // sequence(base, extension) effective content type.
+                                        // UPA relaxation for wildcard/element overlap applies.
                                     }
                                     Some(compositor @ Compositor::All)
                                     | Some(compositor @ Compositor::Choice) => {
@@ -722,6 +737,48 @@ fn validate_complex_extension(
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
                 validate_open_content_extension(schema_set, type_def, base_type)?;
+
+                // XSD 1.1 ct-props-correct.4: No two distinct members of the
+                // effective {attribute uses} may have the same expanded name.
+                // This catches cases where extension adds an attribute that
+                // conflicts with an inherited one (e.g. same name, different
+                // fixed value).
+                if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+                    let all_attrs =
+                        collect_all_effective_attribute_uses(schema_set, type_def, 0);
+                    let location = type_def
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    let type_name = format_type_name(
+                        schema_set,
+                        type_def.name,
+                        type_def.target_namespace,
+                    );
+                    for (i, attr) in all_attrs.iter().enumerate() {
+                        for other in &all_attrs[i + 1..] {
+                            if attr.name == other.name
+                                && attr.target_namespace == other.target_namespace
+                                && (attr.fixed_value != other.fixed_value
+                                    || attr.use_kind != other.use_kind
+                                    || attr.resolved_type != other.resolved_type)
+                            {
+                                let attr_name_str =
+                                    schema_set.name_table.resolve(attr.name);
+                                return Err(SchemaError::structural(
+                                    "ct-props-correct",
+                                    format!(
+                                        "Complex type '{}': duplicate attribute use \
+                                         '{}' with conflicting properties \
+                                         (ct-props-correct clause 4)",
+                                        type_name, attr_name_str,
+                                    ),
+                                    location,
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1182,7 +1239,13 @@ fn normalize_type_particle(
     );
     let particle = normalizer.normalize_particle(particle)?;
     let particle = remove_pointless_particles(particle);
-    let particle = flatten_same_compositor_groups(particle);
+    // XSD 1.1: skip flattening to preserve structural grouping needed for
+    // intensional restriction (e.g. a single-branch choice whose collapsed
+    // sequence must match against a multi-branch choice in the base).
+    if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+        let particle = flatten_same_compositor_groups(particle);
+        return Ok(particle);
+    }
     Ok(particle)
 }
 
@@ -1306,11 +1369,47 @@ fn multiply_occurs(
     (min_occurs, max_occurs)
 }
 
+/// XSD 1.1: fold a single-child sequence/all group by multiplying occurs.
+/// sequence{M,N}(e{m,n}) ≡ e{M*m, N*n}
+fn fold_single_child_group(particle: &NormalizedParticle) -> Option<NormalizedParticle> {
+    if let NormalizedParticleTerm::Group(group) = &particle.term {
+        if group.particles.len() == 1
+            && matches!(group.compositor, Compositor::Sequence | Compositor::All)
+        {
+            let child = &group.particles[0];
+            let (min_occurs, max_occurs) = multiply_occurs(
+                particle.min_occurs,
+                particle.max_occurs,
+                child.min_occurs,
+                child.max_occurs,
+            );
+            return Some(NormalizedParticle {
+                term: child.term.clone(),
+                min_occurs,
+                max_occurs,
+                source: particle.source.clone().or(child.source.clone()),
+            });
+        }
+    }
+    None
+}
+
 fn particle_restricts(
     schema_set: &SchemaSet,
     derived: &NormalizedParticle,
     base: &NormalizedParticle,
 ) -> bool {
+    // XSD 1.1 intensional restriction: fold single-child sequence/all groups
+    // symmetrically on both sides so they are compared in the same normal form.
+    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+        if let Some(folded) = fold_single_child_group(derived) {
+            return particle_restricts(schema_set, &folded, base);
+        }
+        if let Some(folded_base) = fold_single_child_group(base) {
+            return particle_restricts(schema_set, derived, &folded_base);
+        }
+    }
+
     // XSD 1.0: A non-choice optional particle cannot restrict an optional non-repeated
     // multi-branch choice. The expand_choice_branches approach merges choice occurs into
     // branches, which gives wrong results for RecurseLax when max_occurs=1.
@@ -1354,6 +1453,17 @@ fn particle_restricts(
         // Sequence-vs-choice: dedicated handler instead of "any branch" check.
         if let NormalizedParticleTerm::Group(derived_group) = &derived.term {
             if derived_group.compositor == Compositor::Sequence {
+                // XSD 1.1: try "restricts any single branch" first.
+                // Sound because if derived restricts one branch, it restricts
+                // a subset of the choice's language.
+                if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+                    let any_branch = base_branches
+                        .iter()
+                        .any(|candidate| particle_restricts(schema_set, derived, candidate));
+                    if any_branch {
+                        return true;
+                    }
+                }
                 let NormalizedParticleTerm::Group(base_group) = &base.term else {
                     unreachable!()
                 };
@@ -1791,7 +1901,57 @@ fn sequence_particles_restrict(
                 }
             }
 
-            // 3. Skip emptiable base particles.
+            // 3. XSD 1.1: expand choice in derived sequence.
+            //    Each branch must independently work from the current base position
+            //    for the entire remaining derived + base suffix.
+            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+                if let Some(branches) =
+                    expand_choice_branches(&derived_particles[derived_index])
+                {
+                    let all_ok = branches.iter().all(|branch| {
+                        let mut remaining = vec![branch.clone()];
+                        remaining.extend_from_slice(&derived_particles[derived_index + 1..]);
+                        sequence_particles_restrict(
+                            schema_set,
+                            &remaining,
+                            &base_particles[base_index..],
+                        )
+                    });
+                    if all_ok {
+                        return true;
+                    }
+                }
+            }
+
+            // 3a. XSD 1.1: inline unit-occurs derived sequence group.
+            //    Compensates for the disabled flatten_same_compositor_groups.
+            //    sequence{1,1}(a, b, c, ...) at derived can be inlined into
+            //    the parent sequence and matched element-by-element against base.
+            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+                if let NormalizedParticleTerm::Group(dg) =
+                    &derived_particles[derived_index].term
+                {
+                    if dg.compositor == Compositor::Sequence
+                        && occurs_is_unit(
+                            derived_particles[derived_index].min_occurs,
+                            derived_particles[derived_index].max_occurs,
+                        )
+                        && !dg.particles.is_empty()
+                    {
+                        let mut inlined = dg.particles.clone();
+                        inlined.extend_from_slice(&derived_particles[derived_index + 1..]);
+                        if sequence_particles_restrict(
+                            schema_set,
+                            &inlined,
+                            &base_particles[base_index..],
+                        ) {
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 4. Skip emptiable base particles.
             if particle_is_emptiable(base) {
                 base_index += 1;
                 continue;
@@ -2354,6 +2514,7 @@ struct EffectiveAttributeUse {
     target_namespace: Option<NameId>,
     use_kind: AttributeUseKind,
     resolved_type: Option<TypeKey>,
+    fixed_value: Option<String>,
 }
 
 /// Resolve a single attribute use + its parallel resolved data into an
@@ -2393,11 +2554,20 @@ fn resolve_single_attribute_use(
                 .and_then(|decl| decl.resolved_type)
         });
 
+    // For fixed_value: use the inline fixed, or the resolved global decl's fixed.
+    let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
+        resolved
+            .and_then(|r| r.resolved_ref)
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
+            .and_then(|decl| decl.fixed_value.clone())
+    });
+
     Some(EffectiveAttributeUse {
         name,
         target_namespace,
         use_kind: attr_use.use_kind,
         resolved_type,
+        fixed_value,
     })
 }
 
@@ -2422,6 +2592,37 @@ fn collect_effective_attribute_uses(
         collect_attribute_group_uses(schema_set, ag_key, &mut result, 0);
     }
 
+    result
+}
+
+/// Collect ALL effective attribute uses for a complex type including inherited
+/// ones from extension base types (for ct-props-correct.4 duplicate detection).
+/// Does NOT deduplicate — duplicates are exactly what ct-props-correct.4 flags.
+fn collect_all_effective_attribute_uses(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+    depth: usize,
+) -> Vec<EffectiveAttributeUse> {
+    if depth > 50 {
+        return vec![];
+    }
+    let mut result = collect_effective_attribute_uses(schema_set, type_def);
+
+    // Walk up the extension chain to collect inherited attributes too.
+    // We do NOT deduplicate: if derived re-declares an attribute that is also
+    // in the base, both entries appear, and the ct-props-correct.4 check
+    // below will catch any conflict.
+    if type_def.derivation_method == Some(DerivationMethod::Extension) {
+        if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
+            if let Some(base) = schema_set.arenas.complex_types.get(base_key) {
+                result.extend(collect_all_effective_attribute_uses(
+                    schema_set,
+                    base,
+                    depth + 1,
+                ));
+            }
+        }
+    }
     result
 }
 

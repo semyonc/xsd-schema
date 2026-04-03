@@ -124,9 +124,15 @@ if [ -d "$TEST_SUITE" ]; then
             --name particlesZ033_f --name particlesZ033_g \
             --verbose
 
-    # ── 4. Full particle catalog (INFO) ──────────────────────────────────
+    # ── 4. XSD 1.1 particle catalog (GATED at 100%) ──────────────────────
 
-    run_info "Conformance: full particle catalog (1343/1411 baseline)" \
+    run_gated "Conformance: XSD 1.1 particles (100% required)" \
+        cargo test --test conformance --features xsd11 -- \
+            --test-suite "$TEST_SUITE" --version 1.1 --group particles --expect-pass
+
+    # ── 5. Full XSD 1.0 particle catalog (INFO) ──────────────────────────
+
+    run_info "Conformance: full particle catalog (1407/1411 baseline)" \
         cargo test --test conformance --features xsd11 -- \
             --test-suite "$TEST_SUITE" --version 1.0 --group particles
 else

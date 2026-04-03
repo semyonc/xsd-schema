@@ -2917,3 +2917,351 @@ fn test_accept_simple_content_union_over_any_simple_type() {
     );
 }
 
+// ── XSD 1.1 particle conformance regression tests ────────────────────────────
+
+/// particlesFb003: XSD 1.1 allows choice extension over non-empty base content
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_choice_extension() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice>
+                    <xsd:any namespace="##local ##targetNamespace foo" maxOccurs="3"/>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:extension base="x:base">
+                            <xsd:choice>
+                                <xsd:element name="c1"/>
+                                <xsd:element name="c2"/>
+                            </xsd:choice>
+                        </xsd:extension>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: choice extension over non-empty base should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesZ031: XSD 1.1 rejects complexContent extension over simpleContent base
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_reject_xsd11_complexcontent_over_simplecontent() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns="http://schema1" xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://schema1">
+            <xs:complexType name="Type1">
+                <xs:simpleContent>
+                    <xs:extension base="xs:string">
+                        <xs:attribute name="Field1" type="xs:string"/>
+                    </xs:extension>
+                </xs:simpleContent>
+            </xs:complexType>
+            <xs:complexType name="Type2">
+                <xs:complexContent>
+                    <xs:extension base="Type1">
+                        <xs:attribute name="Field2" type="xs:string"/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_err(),
+        "XSD 1.1: complexContent extension over simpleContent must be rejected"
+    );
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "cos-ct-extends");
+        }
+        other => panic!("Expected cos-ct-extends, got {:?}", other),
+    }
+}
+
+/// particlesZ031: XSD 1.0 accepts complexContent extension over simpleContent base
+/// (only rejected when a particle is added; attribute-only extension is fine)
+#[test]
+fn test_accept_xsd10_complexcontent_over_simplecontent() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns="http://schema1" xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://schema1">
+            <xs:complexType name="Type1">
+                <xs:simpleContent>
+                    <xs:extension base="xs:string">
+                        <xs:attribute name="Field1" type="xs:string"/>
+                    </xs:extension>
+                </xs:simpleContent>
+            </xs:complexType>
+            <xs:complexType name="Type2">
+                <xs:complexContent>
+                    <xs:extension base="Type1">
+                        <xs:attribute name="Field2" type="xs:string"/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.0: attribute-only complexContent extension over simpleContent should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesHb008: XSD 1.1 accepts choice-in-derived-sequence restriction
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_intensional_restriction_hb008() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice>
+                    <xsd:element name="e1" minOccurs="1" maxOccurs="3"/>
+                    <xsd:sequence maxOccurs="2">
+                        <xsd:element name="e2" minOccurs="1" maxOccurs="3"/>
+                        <xsd:element name="e3" minOccurs="0" maxOccurs="3"/>
+                        <xsd:element name="e4" minOccurs="0" maxOccurs="3"/>
+                    </xsd:sequence>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:restriction base="x:base">
+                            <xsd:choice>
+                                <xsd:element name="e1" minOccurs="1" maxOccurs="2"/>
+                                <xsd:sequence maxOccurs="2">
+                                    <xsd:element name="e2"/>
+                                    <xsd:choice>
+                                        <xsd:element name="e3" minOccurs="2" maxOccurs="3"/>
+                                        <xsd:element name="e4" minOccurs="1" maxOccurs="3"/>
+                                    </xsd:choice>
+                                </xsd:sequence>
+                            </xsd:choice>
+                        </xsd:restriction>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: choice-in-derived-sequence restriction (Hb008) should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesHb011: XSD 1.1 accepts single-child sequence folding in restriction
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_intensional_restriction_hb011() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:choice minOccurs="2" maxOccurs="unbounded">
+                    <xsd:element name="e1" minOccurs="0" maxOccurs="10"/>
+                    <xsd:element name="e2" minOccurs="0"/>
+                    <xsd:element name="e3" minOccurs="0"/>
+                </xsd:choice>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:restriction base="x:base">
+                            <xsd:choice minOccurs="2" maxOccurs="unbounded">
+                                <xsd:sequence maxOccurs="2">
+                                    <xsd:element name="e1" maxOccurs="2"/>
+                                </xsd:sequence>
+                                <xsd:element name="e2"/>
+                                <xsd:element name="e3" minOccurs="1"/>
+                            </xsd:choice>
+                        </xsd:restriction>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: single-child sequence folding (Hb011) should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesZ023: XSD 1.1 accepts single-branch choice restricting multi-branch choice
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_intensional_restriction_z023() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema targetNamespace="http://myuri" xmlns="http://myuri"
+                    xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+            <xsd:element name="A" type="xsd:string"/>
+            <xsd:element name="B" type="xsd:string"/>
+            <xsd:complexType name="eleType">
+                <xsd:sequence>
+                    <xsd:element ref="A"/>
+                    <xsd:element ref="B"/>
+                    <xsd:choice>
+                        <xsd:sequence>
+                            <xsd:element name="AAA" minOccurs="0" maxOccurs="unbounded"/>
+                            <xsd:element name="BBB" minOccurs="0" maxOccurs="unbounded"/>
+                            <xsd:element name="CCC" minOccurs="0" maxOccurs="unbounded"/>
+                        </xsd:sequence>
+                        <xsd:sequence>
+                            <xsd:element name="AAAA" minOccurs="0" maxOccurs="unbounded"/>
+                            <xsd:element name="BBBB" minOccurs="0" maxOccurs="unbounded"/>
+                            <xsd:element name="CCCC" minOccurs="0" maxOccurs="unbounded"/>
+                        </xsd:sequence>
+                    </xsd:choice>
+                </xsd:sequence>
+            </xsd:complexType>
+            <xsd:complexType name="eleType2">
+                <xsd:complexContent>
+                    <xsd:restriction base="eleType">
+                        <xsd:sequence>
+                            <xsd:element ref="A"/>
+                            <xsd:element ref="B"/>
+                            <xsd:choice>
+                                <xsd:sequence>
+                                    <xsd:element name="AAA" minOccurs="0" maxOccurs="unbounded"/>
+                                    <xsd:element name="BBB" minOccurs="0" maxOccurs="unbounded"/>
+                                    <xsd:element name="CCC" minOccurs="0" maxOccurs="unbounded"/>
+                                </xsd:sequence>
+                            </xsd:choice>
+                        </xsd:sequence>
+                    </xsd:restriction>
+                </xsd:complexContent>
+            </xsd:complexType>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: single-branch choice restriction (Z023) should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesZ024: XSD 1.1 accepts single group-ref choice restricting multi-branch choice
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_intensional_restriction_z024() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema targetNamespace="http://myuri" xmlns="http://myuri"
+                    xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+            <xsd:element name="A" type="xsd:string"/>
+            <xsd:element name="B" type="xsd:string"/>
+            <xsd:group name="G1">
+                <xsd:sequence>
+                    <xsd:element name="AA" minOccurs="0" maxOccurs="unbounded"/>
+                    <xsd:element name="BB" minOccurs="0" maxOccurs="unbounded"/>
+                </xsd:sequence>
+            </xsd:group>
+            <xsd:group name="G2">
+                <xsd:sequence>
+                    <xsd:element name="AAA" minOccurs="0" maxOccurs="unbounded"/>
+                    <xsd:element name="BBB" minOccurs="0" maxOccurs="unbounded"/>
+                </xsd:sequence>
+            </xsd:group>
+            <xsd:complexType name="eleType">
+                <xsd:sequence>
+                    <xsd:element ref="A"/>
+                    <xsd:element ref="B"/>
+                    <xsd:choice>
+                        <xsd:group ref="G1" minOccurs="0" maxOccurs="unbounded"/>
+                        <xsd:group ref="G2" minOccurs="0" maxOccurs="unbounded"/>
+                    </xsd:choice>
+                </xsd:sequence>
+            </xsd:complexType>
+            <xsd:complexType name="eleType2">
+                <xsd:complexContent>
+                    <xsd:restriction base="eleType">
+                        <xsd:sequence>
+                            <xsd:element ref="A"/>
+                            <xsd:element ref="B"/>
+                            <xsd:choice>
+                                <xsd:group ref="G1" minOccurs="0"/>
+                            </xsd:choice>
+                        </xsd:sequence>
+                    </xsd:restriction>
+                </xsd:complexContent>
+            </xsd:complexType>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: single group-ref choice restriction (Z024) should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesZ028: XSD 1.1 accepts substitution group in sequence restriction
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_intensional_restriction_z028() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element abstract="true" name="aba" type="xs:string"/>
+            <xs:element name="a" substitutionGroup="aba" type="xs:string"/>
+            <xs:element name="d" type="xs:anyURI"/>
+            <xs:group name="abs">
+                <xs:choice>
+                    <xs:element ref="aba"/>
+                </xs:choice>
+            </xs:group>
+            <xs:complexType name="test">
+                <xs:sequence>
+                    <xs:group maxOccurs="unbounded" minOccurs="0" ref="abs"/>
+                    <xs:element minOccurs="0" ref="d"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="test4">
+                <xs:complexContent>
+                    <xs:restriction base="test">
+                        <xs:sequence>
+                            <xs:sequence minOccurs="1" maxOccurs="1">
+                                <xs:element ref="a"/>
+                            </xs:sequence>
+                            <xs:element ref="d"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1: substitution group sequence restriction (Z028) should be accepted: {:?}",
+        result
+    );
+}
+
