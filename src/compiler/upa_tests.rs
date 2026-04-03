@@ -866,6 +866,30 @@ fn test_cap_for_upa_simple_unchanged() {
 }
 
 #[test]
+fn test_cap_for_upa_dead_particle() {
+    // Dead particle (maxOccurs=0) must be preserved, not resurrected
+    assert_eq!(cap_for_upa(0, Some(0)), (0, Some(0)));
+}
+
+#[test]
+fn test_dead_wildcard_no_upa_conflict() {
+    // sequence(any{0,0}, e1) — dead wildcard should not conflict with e1
+    let schema_set = create_test_schema_set();
+    let name_e1 = schema_set.name_table.add("e1");
+
+    let builder = FragmentBuilder::new();
+    let wc = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
+    let elem = NfaTerm::element(name_e1, None, None);
+    let frag_wc = builder.single_term(wc, None).repeat_range(0, Some(0));
+    let frag_elem = builder.single_term(elem, None);
+    let sequence = frag_wc.concat(frag_elem);
+    let nfa = fragment_to_table(sequence);
+
+    let result = check_upa(&nfa, &schema_set, None);
+    assert!(result.is_ok(), "dead wildcard (maxOccurs=0) should not cause UPA conflict");
+}
+
+#[test]
 fn test_cap_for_upa_exact_repeat() {
     assert_eq!(cap_for_upa(5, Some(5)), (2, Some(2)));
     assert_eq!(cap_for_upa(2, Some(2)), (2, Some(2)));

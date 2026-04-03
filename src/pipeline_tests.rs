@@ -2477,3 +2477,65 @@ fn test_choice_choice_same_order_valid_xsd10() {
     assert!(result.is_ok(), "Choice:Choice same order should be valid in XSD 1.0: {:?}", result);
 }
 
+// ── Step 11 regression targets ─────────────────────────────────────────
+// Dead particles (maxOccurs=0) must not trigger spurious cos-nonambig.
+
+/// particlesJd005: base wildcard{0,0} + derived element{0,0} in restriction.
+/// The dead particles should vanish during UPA compile, not trigger cos-nonambig.
+#[test]
+fn test_accept_dead_wildcard_restriction_jd005() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:a="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:sequence>
+                    <xs:any namespace="##any" minOccurs="0" maxOccurs="0"/>
+                    <xs:element name="e2"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="a:B">
+                        <xs:sequence>
+                            <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+                            <xs:element name="e2"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "dead wildcard restriction (Jd005 shape) should be valid: {:?}", result);
+}
+
+/// particlesJf005: same shape but with imported element ref in the dead slot.
+#[test]
+fn test_accept_dead_imported_element_restriction_jf005() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting">
+            <xs:complexType name="B">
+                <xs:sequence>
+                    <xs:any namespace="##any" minOccurs="0" maxOccurs="0"/>
+                    <xs:element name="e1"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="R">
+                <xs:complexContent>
+                    <xs:restriction base="x:B">
+                        <xs:sequence>
+                            <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+                            <xs:element name="e1"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(result.is_ok(), "dead imported-element restriction (Jf005 shape) should be valid: {:?}", result);
+}
+

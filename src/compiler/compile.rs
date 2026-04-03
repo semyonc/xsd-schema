@@ -891,6 +891,8 @@ impl<'a> CompileContext<'a> {
 #[cfg_attr(test, allow(dead_code))]
 pub(super) fn cap_for_upa(min: u32, max: Option<u32>) -> (u32, Option<u32>) {
     match (min, max) {
+        // Dead particle: maxOccurs=0 means the particle is absent
+        (0, Some(0)) => (0, Some(0)),
         // Already simple: no capping needed
         (m, Some(1)) if m <= 1 => (m, Some(1)),
         // Exact repeat (min == max > 1): cap to {2, 2}
