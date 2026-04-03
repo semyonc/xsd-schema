@@ -148,7 +148,7 @@ impl ContentValidatorState {
             ContentValidatorState::Nfa { nfa, active_states, open_content } => {
                 // First, find the matching element info before advancing
                 let mi = active_states.find_match_info(
-                    nfa, name, namespace, target_ns, subst_groups,
+                    nfa, name, namespace, target_ns, subst_groups, xsd_version,
                 );
                 let match_info = ElementMatchInfo {
                     element_key: mi.element_key,
@@ -158,10 +158,10 @@ impl ContentValidatorState {
 
                 let next = match xsd_version {
                     XsdVersion::V1_0 => active_states.clone().advance(
-                        nfa, name, namespace, target_ns, subst_groups,
+                        nfa, name, namespace, target_ns, subst_groups, xsd_version,
                     ),
                     XsdVersion::V1_1 => active_states.clone().advance_with_priority(
-                        nfa, name, namespace, target_ns, subst_groups,
+                        nfa, name, namespace, target_ns, subst_groups, xsd_version,
                     ),
                 };
                 if next.is_empty() {
@@ -201,6 +201,7 @@ impl ContentValidatorState {
                         namespace,
                         target_ns,
                         subst_groups,
+                        xsd_version,
                     );
                     if result == TermMatchResult::Match {
                         if state.accept(model, i) {
@@ -274,6 +275,7 @@ impl ContentValidatorState {
                                 namespace,
                                 target_ns,
                                 subst_groups,
+                                xsd_version,
                             );
                             if result == TermMatchResult::Match {
                                 if state.accept(model, i) {
@@ -318,7 +320,7 @@ impl ContentValidatorState {
                         if state.is_satisfied(model) {
                             let initial = ActiveStates::from_nfa(extension_nfa);
                             let mi = initial.find_match_info(
-                                extension_nfa, name, namespace, target_ns, subst_groups,
+                                extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                             );
                             let match_info = ElementMatchInfo {
                                 element_key: mi.element_key,
@@ -326,7 +328,7 @@ impl ContentValidatorState {
                                 process_contents: mi.process_contents,
                             };
                             let next = initial.advance_with_priority(
-                                extension_nfa, name, namespace, target_ns, subst_groups,
+                                extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                             );
                             if !next.is_empty() {
                                 *phase = AllGroupExtPhase::Nfa(next);
@@ -362,7 +364,7 @@ impl ContentValidatorState {
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA advancement in extension phase
                         let mi = active_states.find_match_info(
-                            extension_nfa, name, namespace, target_ns, subst_groups,
+                            extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                         );
                         let match_info = ElementMatchInfo {
                             element_key: mi.element_key,
@@ -370,7 +372,7 @@ impl ContentValidatorState {
                             process_contents: mi.process_contents,
                         };
                         let next = active_states.clone().advance_with_priority(
-                            extension_nfa, name, namespace, target_ns, subst_groups,
+                            extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                         );
                         if next.is_empty() {
                             // Try open content wildcard fallback
@@ -470,10 +472,10 @@ impl ContentValidatorState {
             ContentValidatorState::Nfa { nfa, active_states, open_content } => {
                 let next = match xsd_version {
                     XsdVersion::V1_0 => active_states.clone().advance(
-                        nfa, name, namespace, target_ns, subst_groups,
+                        nfa, name, namespace, target_ns, subst_groups, xsd_version,
                     ),
                     XsdVersion::V1_1 => active_states.clone().advance_with_priority(
-                        nfa, name, namespace, target_ns, subst_groups,
+                        nfa, name, namespace, target_ns, subst_groups, xsd_version,
                     ),
                 };
                 if !next.is_empty() {
@@ -505,6 +507,7 @@ impl ContentValidatorState {
                         namespace,
                         target_ns,
                         subst_groups,
+                        xsd_version,
                     );
                     if result == TermMatchResult::Match {
                         return true;
@@ -538,6 +541,7 @@ impl ContentValidatorState {
                                 namespace,
                                 target_ns,
                                 subst_groups,
+                                xsd_version,
                             );
                             if result == TermMatchResult::Match {
                                 return true;
@@ -547,7 +551,7 @@ impl ContentValidatorState {
                         if state.is_satisfied(model) {
                             let initial = ActiveStates::from_nfa(extension_nfa);
                             let next = initial.advance_with_priority(
-                                extension_nfa, name, namespace, target_ns, subst_groups,
+                                extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                             );
                             if !next.is_empty() {
                                 return true;
@@ -577,7 +581,7 @@ impl ContentValidatorState {
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA lookahead
                         let next = active_states.clone().advance_with_priority(
-                            extension_nfa, name, namespace, target_ns, subst_groups,
+                            extension_nfa, name, namespace, target_ns, subst_groups, xsd_version,
                         );
                         if !next.is_empty() {
                             return true;
@@ -614,6 +618,7 @@ impl ContentValidatorState {
 
 /// Check if an open content wildcard allows the given element.
 /// Combines namespace matching with notQName exclusion checking.
+/// Open content is an XSD 1.1 feature, so V1_1 semantics always apply.
 fn open_content_allows(
     ns_constraint: &NamespaceConstraint,
     not_qnames: &[(Option<NameId>, NameId)],
@@ -621,7 +626,7 @@ fn open_content_allows(
     namespace: Option<NameId>,
     target_ns: Option<NameId>,
 ) -> bool {
-    ns_constraint.matches(namespace, target_ns)
+    ns_constraint.matches(namespace, target_ns, XsdVersion::V1_1)
         && !not_qnames_exclude(not_qnames, namespace, name)
 }
 

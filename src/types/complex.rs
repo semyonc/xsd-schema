@@ -8,7 +8,7 @@ use crate::ids::{
     AttributeGroupKey, ModelGroupKey,
 };
 use crate::parser::location::SourceRef;
-use crate::schema::model::DerivationSet;
+use crate::schema::model::{DerivationSet, XsdVersion};
 
 /// Complex type content kind
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,16 +269,37 @@ impl NamespaceConstraint {
         &self,
         element_namespace: Option<NameId>,
         target_namespace: Option<NameId>,
+        xsd_version: XsdVersion,
     ) -> bool {
         match self {
             NamespaceConstraint::Any => true,
-            NamespaceConstraint::Other => element_namespace != target_namespace,
+            NamespaceConstraint::Other => {
+                other_matches_namespace(element_namespace, target_namespace, xsd_version)
+            }
             NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
             NamespaceConstraint::Local => element_namespace.is_none(),
             NamespaceConstraint::List(list) => list.contains(&element_namespace),
             NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
         }
     }
+}
+
+/// XSD-version-aware `##other` namespace predicate.
+///
+/// In XSD 1.0, `##other` excludes both the target namespace AND absent namespace.
+/// In XSD 1.1, `##other` excludes only the target namespace.
+pub fn other_matches_namespace(
+    element_namespace: Option<NameId>,
+    target_namespace: Option<NameId>,
+    xsd_version: XsdVersion,
+) -> bool {
+    if element_namespace == target_namespace {
+        return false;
+    }
+    if element_namespace.is_none() && xsd_version == XsdVersion::V1_0 {
+        return false;
+    }
+    true
 }
 
 /// Check whether a (namespace, name) pair is excluded by a notQName list.

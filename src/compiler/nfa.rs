@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
+use crate::schema::model::XsdVersion;
 use crate::types::complex::{NamespaceConstraint, ProcessContents, not_qnames_exclude};
 use super::substitution::SubstitutionGroupMap;
 
@@ -467,6 +468,7 @@ pub fn term_matches(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
+    xsd_version: XsdVersion,
 ) -> bool {
     match term {
         NfaTerm::Element {
@@ -487,7 +489,7 @@ pub fn term_matches(
             not_qnames,
             ..
         } => {
-            if !namespace_constraint.matches(element_namespace, target_namespace) {
+            if !namespace_constraint.matches(element_namespace, target_namespace, xsd_version) {
                 return false;
             }
             !not_qnames_exclude(not_qnames, element_namespace, element_name)
@@ -506,6 +508,7 @@ pub fn advance_states(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
+    xsd_version: XsdVersion,
 ) -> HashSet<StateId> {
     let closure = epsilon_closure(nfa, start_states);
     let mut next = HashSet::new();
@@ -526,6 +529,7 @@ pub fn advance_states(
             element_namespace,
             target_namespace,
             substitution_groups,
+            xsd_version,
         ) {
             for target in state.consuming_transitions() {
                 next.insert(target);
@@ -547,6 +551,7 @@ pub fn advance_with_priority(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
+    xsd_version: XsdVersion,
 ) -> HashSet<StateId> {
     let closure = epsilon_closure(nfa, start_states);
     let mut element_targets = HashSet::new();
@@ -568,6 +573,7 @@ pub fn advance_with_priority(
             element_namespace,
             target_namespace,
             substitution_groups,
+            xsd_version,
         ) {
             continue;
         }
@@ -1191,12 +1197,13 @@ impl ActiveStates {
         element_namespace: Option<NameId>,
         target_namespace: Option<NameId>,
         substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
     ) -> Self {
         match self {
             ActiveStates::Simple(states) => {
                 ActiveStates::Simple(advance_states(
                     nfa, states, element_name, element_namespace,
-                    target_namespace, substitution_groups,
+                    target_namespace, substitution_groups, xsd_version,
                 ))
             }
             ActiveStates::Counted { configs, num_counters } => {
@@ -1207,7 +1214,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(config.state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         next_configs.insert(config.with_state(trans.target));
@@ -1226,7 +1233,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         next_seeds.entry(trans.target)
@@ -1247,7 +1254,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(key.state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         let new_key = key.with_state(trans.target);
@@ -1276,12 +1283,13 @@ impl ActiveStates {
         element_namespace: Option<NameId>,
         target_namespace: Option<NameId>,
         substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
     ) -> Self {
         match self {
             ActiveStates::Simple(states) => {
                 ActiveStates::Simple(advance_with_priority(
                     nfa, states, element_name, element_namespace,
-                    target_namespace, substitution_groups,
+                    target_namespace, substitution_groups, xsd_version,
                 ))
             }
             ActiveStates::Counted { configs, num_counters } => {
@@ -1292,7 +1300,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(config.state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 let target_set = match term_val {
                                     NfaTerm::Element { .. } => &mut element_configs,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_configs,
@@ -1324,7 +1332,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 let target_map = match term_val {
                                     NfaTerm::Element { .. } => &mut element_seeds,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_seeds,
@@ -1358,7 +1366,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(key.state_id) {
                         if let Some(ref term_val) = state.term {
                             if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups) {
+                                target_namespace, substitution_groups, xsd_version) {
                                 let target_map = match term_val {
                                     NfaTerm::Element { .. } => &mut element_configs,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_configs,
@@ -1402,23 +1410,24 @@ impl ActiveStates {
         namespace: Option<NameId>,
         target_ns: Option<NameId>,
         subst_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
     ) -> MatchInfo {
         match self {
             ActiveStates::Simple(states) => {
                 // Delegate to existing function (it does epsilon_closure internally,
                 // which is redundant but harmless since states are already closed)
                 let closure = epsilon_closure(nfa, states.iter().copied());
-                find_match_info_in_states(nfa, closure.iter().copied(), name, namespace, target_ns, subst_groups)
+                find_match_info_in_states(nfa, closure.iter().copied(), name, namespace, target_ns, subst_groups, xsd_version)
             }
             ActiveStates::Counted { configs, .. } => {
                 // Configs are closure-closed — iterate directly
-                find_match_info_in_states(nfa, configs.iter().map(|c| c.state_id), name, namespace, target_ns, subst_groups)
+                find_match_info_in_states(nfa, configs.iter().map(|c| c.state_id), name, namespace, target_ns, subst_groups, xsd_version)
             }
             ActiveStates::RangedSingle { state_ranges, .. } => {
-                find_match_info_in_states(nfa, state_ranges.keys().copied(), name, namespace, target_ns, subst_groups)
+                find_match_info_in_states(nfa, state_ranges.keys().copied(), name, namespace, target_ns, subst_groups, xsd_version)
             }
             ActiveStates::Hybrid { configs, .. } => {
-                find_match_info_in_states(nfa, configs.keys().map(|k| k.state_id), name, namespace, target_ns, subst_groups)
+                find_match_info_in_states(nfa, configs.keys().map(|k| k.state_id), name, namespace, target_ns, subst_groups, xsd_version)
             }
         }
     }
@@ -1495,11 +1504,12 @@ fn find_match_info_in_states(
     namespace: Option<NameId>,
     target_ns: Option<NameId>,
     subst_groups: Option<&SubstitutionGroupMap>,
+    xsd_version: XsdVersion,
 ) -> MatchInfo {
     for state_id in state_ids {
         if let Some(state) = nfa.get_state(state_id) {
             if let Some(ref term) = state.term {
-                if term_matches(term, name, namespace, target_ns, subst_groups) {
+                if term_matches(term, name, namespace, target_ns, subst_groups, xsd_version) {
                     return match term {
                         NfaTerm::Element {
                             name: term_name,
@@ -1683,20 +1693,20 @@ mod tests {
     #[test]
     fn test_advance_states_matches_element_and_wildcard() {
         let nfa = make_priority_nfa();
-        let next = advance_states(&nfa, [0], NameId(1), None, None, None);
+        let next = advance_states(&nfa, [0], NameId(1), None, None, None, XsdVersion::V1_0);
         assert_eq!(next, make_set(&[3, 4]));
 
-        let next = advance_states(&nfa, [0], NameId(2), None, None, None);
+        let next = advance_states(&nfa, [0], NameId(2), None, None, None, XsdVersion::V1_0);
         assert_eq!(next, make_set(&[4]));
     }
 
     #[test]
     fn test_advance_with_priority_prefers_element() {
         let nfa = make_priority_nfa();
-        let next = advance_with_priority(&nfa, [0], NameId(1), None, None, None);
+        let next = advance_with_priority(&nfa, [0], NameId(1), None, None, None, XsdVersion::V1_1);
         assert_eq!(next, make_set(&[3]));
 
-        let next = advance_with_priority(&nfa, [0], NameId(2), None, None, None);
+        let next = advance_with_priority(&nfa, [0], NameId(2), None, None, None, XsdVersion::V1_1);
         assert_eq!(next, make_set(&[4]));
     }
 
@@ -1725,7 +1735,8 @@ mod tests {
             member_name,
             None,
             None,
-            Some(&map)
+            Some(&map),
+            XsdVersion::V1_0,
         ));
     }
 
@@ -1763,7 +1774,7 @@ mod tests {
         let active = ActiveStates::from_nfa(&nfa);
 
         // Match with member name — should return element_key: None
-        let mi = active.find_match_info(&nfa, member_name, None, None, Some(&map));
+        let mi = active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi.element_key.is_none(),
             "substitution match should not return head's element_key"
@@ -1772,7 +1783,7 @@ mod tests {
 
         // Abstract head's own name doesn't match (excluded from subst map,
         // and subst map lookup short-circuits before direct name comparison)
-        let mi_head = active.find_match_info(&nfa, head_name, None, None, Some(&map));
+        let mi_head = active.find_match_info(&nfa, head_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi_head.element_key.is_none(),
             "abstract head should not match its own name via subst map"
@@ -1810,7 +1821,7 @@ mod tests {
         let active = ActiveStates::from_nfa(&nfa);
 
         // Direct match with head name — should return head's element_key
-        let mi = active.find_match_info(&nfa, head_name, None, None, Some(&map));
+        let mi = active.find_match_info(&nfa, head_name, None, None, Some(&map), XsdVersion::V1_0);
         assert_eq!(
             mi.element_key,
             Some(head_key),
@@ -1818,7 +1829,7 @@ mod tests {
         );
 
         // Substitution match with member name — should return None
-        let mi_member = active.find_match_info(&nfa, member_name, None, None, Some(&map));
+        let mi_member = active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi_member.element_key.is_none(),
             "substitution match should not return head's element_key"
@@ -1844,7 +1855,7 @@ mod tests {
     fn advance_n(active: ActiveStates, nfa: &NfaTable, name: NameId, n: usize) -> ActiveStates {
         let mut state = active;
         for _ in 0..n {
-            state = state.advance(nfa, name, None, None, None);
+            state = state.advance(nfa, name, None, None, None, XsdVersion::V1_0);
         }
         state
     }
@@ -1952,20 +1963,20 @@ mod tests {
 
         // 1 a + b: should fail (min=2 not satisfied)
         let s = ActiveStates::from_nfa(&nfa);
-        let s = s.advance(&nfa, a, None, None, None); // 1 a
-        let s = s.advance(&nfa, b, None, None, None); // b
+        let s = s.advance(&nfa, a, None, None, None, XsdVersion::V1_0); // 1 a
+        let s = s.advance(&nfa, b, None, None, None, XsdVersion::V1_0); // b
         assert!(!s.contains_accept(&nfa)); // min not satisfied
 
         // 2 a + b: should succeed
         let s = ActiveStates::from_nfa(&nfa);
         let s = advance_n(s, &nfa, a, 2);
-        let s = s.advance(&nfa, b, None, None, None);
+        let s = s.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // 50 a + b: should succeed
         let s = ActiveStates::from_nfa(&nfa);
         let s = advance_n(s, &nfa, a, 50);
-        let s = s.advance(&nfa, b, None, None, None);
+        let s = s.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // 51 a: should be rejected
@@ -2001,7 +2012,7 @@ mod tests {
 
         // Initial state should be complete (min=0 loop can be skipped)
         // After advancing with b (skipping the loop entirely), should accept
-        let after_b = initial.clone().advance(&nfa, b, None, None, None);
+        let after_b = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(after_b.contains_accept(&nfa));
 
         // With RangedSingle, the state map has O(states) entries, not O(200).
@@ -2189,9 +2200,9 @@ mod tests {
 
         // Accepts "a", "b", "ab", ""
         assert!(initial.contains_accept(&nfa));
-        let s_a = initial.clone().advance(&nfa, a, None, None, None);
+        let s_a = initial.clone().advance(&nfa, a, None, None, None, XsdVersion::V1_0);
         assert!(s_a.contains_accept(&nfa));
-        let s_b = initial.clone().advance(&nfa, b, None, None, None);
+        let s_b = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s_b.contains_accept(&nfa));
     }
 
@@ -2333,11 +2344,11 @@ mod tests {
         assert!(initial.contains_accept(&nfa));
 
         // "a": accepted
-        let s = initial.clone().advance(&nfa, a, None, None, None);
+        let s = initial.clone().advance(&nfa, a, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // "b": accepted
-        let s = initial.clone().advance(&nfa, b, None, None, None);
+        let s = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // "a"*1000 + "b"*1000: accepted
@@ -2505,12 +2516,12 @@ mod tests {
 
         // advance_with_priority for 'a': element branch exists, so wildcard
         // should not be chosen.  The result should be non-empty.
-        let next = initial.clone().advance_with_priority(&nfa, a, None, None, None);
+        let next = initial.clone().advance_with_priority(&nfa, a, None, None, None, XsdVersion::V1_1);
         assert!(!next.is_empty());
         assert!(next.contains_accept(&nfa));
 
         // advance_with_priority for 'b': only wildcard matches, should work
-        let next_b = initial.advance_with_priority(&nfa, b, None, None, None);
+        let next_b = initial.advance_with_priority(&nfa, b, None, None, None, XsdVersion::V1_1);
         assert!(!next_b.is_empty());
         assert!(next_b.contains_accept(&nfa));
     }
@@ -2558,7 +2569,7 @@ mod tests {
         let initial = ActiveStates::from_nfa(&nfa);
         // Feed 1000 a's then 1 b to move fully into second loop
         let after_a = advance_n(initial, &nfa, a, 1000);
-        let after_b = after_a.advance(&nfa, b, None, None, None);
+        let after_b = after_a.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
 
         if let ActiveStates::Hybrid { ranged_counter_idx, configs, .. } = &after_b {
             assert_eq!(*ranged_counter_idx, 1,
@@ -2602,7 +2613,7 @@ mod tests {
         // After 500 a's + 1 b → switch to counter 1
         let after_a = advance_n(initial, &nfa, a, 500);
         assert!(after_a.contains_accept(&nfa));
-        let after_b1 = after_a.advance(&nfa, b, None, None, None);
+        let after_b1 = after_a.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_b1 {
             assert_eq!(*ranged_counter_idx, 1,
                 "Should switch to counter 1 after first loop exits");
@@ -2611,7 +2622,7 @@ mod tests {
         // After 500 b's + 1 c → switch to counter 2
         let after_b = advance_n(after_b1, &nfa, b, 499);
         assert!(after_b.contains_accept(&nfa));
-        let after_c1 = after_b.advance(&nfa, c, None, None, None);
+        let after_c1 = after_b.advance(&nfa, c, None, None, None, XsdVersion::V1_0);
         if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_c1 {
             assert_eq!(*ranged_counter_idx, 2,
                 "Should switch to counter 2 after second loop exits");
@@ -2712,7 +2723,7 @@ mod tests {
 
         let initial = ActiveStates::from_nfa(&nfa);
         // Feed one 'b': exits first loop, enters second loop
-        let after_b = initial.advance(&nfa, b, None, None, None);
+        let after_b = initial.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         if let ActiveStates::Hybrid { configs, ranged_counter_idx, .. } = &after_b {
             assert_eq!(*ranged_counter_idx, 1,
                 "Should switch to counter 1 after 'b'");
@@ -2754,16 +2765,16 @@ mod tests {
         let mut h = hybrid;
         let mut c = counted;
         for _ in 0..50 {
-            h = h.advance(&nfa, a, None, None, None);
-            c = c.advance(&nfa, a, None, None, None);
+            h = h.advance(&nfa, a, None, None, None, XsdVersion::V1_0);
+            c = c.advance(&nfa, a, None, None, None, XsdVersion::V1_0);
             assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa),
                 "Hybrid/Counted disagree on accept during a-feeding");
             assert_eq!(h.is_empty(), c.is_empty(),
                 "Hybrid/Counted disagree on empty during a-feeding");
         }
         for _ in 0..50 {
-            h = h.advance(&nfa, b, None, None, None);
-            c = c.advance(&nfa, b, None, None, None);
+            h = h.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
+            c = c.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
             assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa),
                 "Hybrid/Counted disagree on accept during b-feeding");
             assert_eq!(h.is_empty(), c.is_empty(),
@@ -2774,8 +2785,8 @@ mod tests {
         assert!(c.contains_accept(&nfa));
 
         // Feed one more b — still accepted (total b=51 ≤ 100)
-        h = h.advance(&nfa, b, None, None, None);
-        c = c.advance(&nfa, b, None, None, None);
+        h = h.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
+        c = c.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa));
     }
 }

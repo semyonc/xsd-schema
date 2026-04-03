@@ -19,7 +19,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::NameId;
 use crate::parser::location::SourceRef;
 use crate::schema::model::{SchemaSet, XsdVersion};
-use crate::types::complex::{NamespaceConstraint, not_qnames_exclude};
+use crate::types::complex::{NamespaceConstraint, not_qnames_exclude, other_matches_namespace};
 
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{build_substitution_group_map, SubstitutionGroupMap};
@@ -257,22 +257,6 @@ fn element_wildcard_overlap(
 
         NamespaceConstraint::Not(excluded) => !excluded.contains(&element_namespace),
     }
-}
-
-fn other_matches_namespace(
-    element_namespace: Option<NameId>,
-    target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
-) -> bool {
-    if element_namespace == target_namespace {
-        return false;
-    }
-
-    if element_namespace.is_none() && xsd_version == XsdVersion::V1_0 {
-        return false;
-    }
-
-    true
 }
 
 /// Check if two wildcard constraints can match overlapping namespaces

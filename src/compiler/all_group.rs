@@ -345,6 +345,7 @@ pub fn term_matches(
     element_name: NameId,
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
+    xsd_version: XsdVersion,
 ) -> TermMatchResult {
     term_matches_with_substitution(
         term,
@@ -352,6 +353,7 @@ pub fn term_matches(
         element_namespace,
         target_namespace,
         None,
+        xsd_version,
     )
 }
 
@@ -362,6 +364,7 @@ pub fn term_matches_with_substitution(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
+    xsd_version: XsdVersion,
 ) -> TermMatchResult {
     match term {
         NfaTerm::Element {
@@ -391,7 +394,7 @@ pub fn term_matches_with_substitution(
             not_qnames,
             ..
         } => {
-            if !namespace_constraint.matches(element_namespace, target_namespace) {
+            if !namespace_constraint.matches(element_namespace, target_namespace, xsd_version) {
                 return TermMatchResult::NoMatch;
             }
             if not_qnames_exclude(not_qnames, element_namespace, element_name) {
@@ -566,15 +569,15 @@ mod tests {
         let term = NfaTerm::element(NameId(1), Some(NameId(100)), None);
 
         assert_eq!(
-            term_matches(&term, NameId(1), Some(NameId(100)), None),
+            term_matches(&term, NameId(1), Some(NameId(100)), None, XsdVersion::V1_0),
             TermMatchResult::Match
         );
         assert_eq!(
-            term_matches(&term, NameId(2), Some(NameId(100)), None),
+            term_matches(&term, NameId(2), Some(NameId(100)), None, XsdVersion::V1_0),
             TermMatchResult::NoMatch
         );
         assert_eq!(
-            term_matches(&term, NameId(1), Some(NameId(200)), None),
+            term_matches(&term, NameId(1), Some(NameId(200)), None, XsdVersion::V1_0),
             TermMatchResult::NoMatch
         );
     }
@@ -584,11 +587,11 @@ mod tests {
         let term = NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
 
         assert_eq!(
-            term_matches(&term, NameId(1), Some(NameId(100)), None),
+            term_matches(&term, NameId(1), Some(NameId(100)), None, XsdVersion::V1_0),
             TermMatchResult::Match
         );
         assert_eq!(
-            term_matches(&term, NameId(999), None, None),
+            term_matches(&term, NameId(999), None, None, XsdVersion::V1_0),
             TermMatchResult::Match
         );
     }
@@ -599,11 +602,11 @@ mod tests {
         let target_ns = Some(NameId(100));
 
         assert_eq!(
-            term_matches(&term, NameId(1), Some(NameId(200)), target_ns),
+            term_matches(&term, NameId(1), Some(NameId(200)), target_ns, XsdVersion::V1_0),
             TermMatchResult::Match
         );
         assert_eq!(
-            term_matches(&term, NameId(1), target_ns, target_ns),
+            term_matches(&term, NameId(1), target_ns, target_ns, XsdVersion::V1_0),
             TermMatchResult::NoMatch
         );
     }
@@ -633,7 +636,7 @@ mod tests {
         let term = NfaTerm::element(head_name, None, Some(head_key));
 
         assert_eq!(
-            term_matches_with_substitution(&term, member_name, None, None, Some(&map)),
+            term_matches_with_substitution(&term, member_name, None, None, Some(&map), XsdVersion::V1_0),
             TermMatchResult::Match
         );
     }
@@ -662,11 +665,11 @@ mod tests {
         let term = NfaTerm::element(head_name, None, Some(head_key));
 
         assert_eq!(
-            term_matches_with_substitution(&term, head_name, None, None, Some(&map)),
+            term_matches_with_substitution(&term, head_name, None, None, Some(&map), XsdVersion::V1_0),
             TermMatchResult::NoMatch
         );
         assert_eq!(
-            term_matches_with_substitution(&term, member_name, None, None, Some(&map)),
+            term_matches_with_substitution(&term, member_name, None, None, Some(&map), XsdVersion::V1_0),
             TermMatchResult::Match
         );
     }

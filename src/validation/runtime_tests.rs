@@ -7909,3 +7909,146 @@ fn test_xsi_type_blocked_when_declared_type_is_anytype() {
         v.sink.errors
     );
 }
+
+// ---------------------------------------------------------------------------
+// Step 12 regressions: ##other wildcard + fixed-value synthesis
+// ---------------------------------------------------------------------------
+
+/// XSD 1.0: ##other must reject unqualified (absent-namespace) children
+/// even when target namespace is present. (particlesC009/C010 regression)
+#[test]
+fn test_other_wildcard_rejects_unqualified_child_xsd10() {
+    let schema_set = load_schema(
+        r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test"
+                    xmlns:t="http://test"
+                    elementFormDefault="qualified">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:any namespace="##other" processContents="lax"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"###,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    let tns = "http://test";
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(schema_set.name_table.get(tns).unwrap()),
+        bindings: Vec::new(),
+    };
+
+    v.validate_element("root", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Unqualified child <a/> — no namespace, should be rejected by ##other in XSD 1.0
+    let empty_ns = empty_ns_context();
+    v.validate_element("a", "", None, None, &empty_ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        !v.sink.errors.is_empty(),
+        "##other in XSD 1.0 should reject unqualified (absent-namespace) child, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// XSD 1.0: ##other must accept a child from a genuinely other namespace.
+#[test]
+fn test_other_wildcard_accepts_other_namespace_child_xsd10() {
+    let schema_set = load_schema(
+        r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://test"
+                    xmlns:t="http://test"
+                    elementFormDefault="qualified">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:any namespace="##other" processContents="lax"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"###,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+
+    let tns = "http://test";
+    let other = "http://other";
+    let tns_id = schema_set.name_table.get(tns).unwrap();
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_id),
+        bindings: Vec::new(),
+    };
+
+    v.validate_element("root", tns, None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Child from http://other — genuinely other, should be accepted
+    let empty_ns = empty_ns_context();
+    v.validate_element("a", other, None, None, &empty_ns);
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    let _ = v.end_validation();
+
+    assert!(
+        v.sink.errors.is_empty(),
+        "##other should accept child from a different namespace, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// Empty element with fixed value should have the fixed value synthesized.
+/// (particlesZ040 regression)
+#[test]
+fn test_empty_element_fixed_value_synthesis() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="e" type="xs:string" fixed="hello"/>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Empty <e/> — should synthesize fixed value "hello"
+    v.validate_element("e", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+
+    assert_eq!(
+        end_info.validity,
+        SchemaValidity::Valid,
+        "empty element with fixed='hello' should be valid, errors={:?}",
+        v.sink.errors,
+    );
+    assert!(
+        v.sink.errors.is_empty(),
+        "no cvc-elt.5.2.2 for empty element with fixed value, errors={:?}",
+        v.sink.errors,
+    );
+}

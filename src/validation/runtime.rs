@@ -23,7 +23,7 @@ use crate::types::XmlTypeCode;
 use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
-use crate::types::complex::ProcessContents as TypesProcessContents;
+use crate::types::complex::{ProcessContents as TypesProcessContents, other_matches_namespace};
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
@@ -1584,6 +1584,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     if let Some(default_value) = &elem_data.default_value {
                         ev_state.is_default = true;
                         ev_state.text_content = default_value.clone();
+                    } else if let Some(fixed_value) = &elem_data.fixed_value {
+                        // XSD spec §3.3.4.3: "If fixed is specified, then the
+                        // element's content must either be empty, in which case
+                        // fixed behaves as default, or match fixed."
+                        ev_state.text_content = fixed_value.clone();
                     }
                 }
             }
@@ -3457,7 +3462,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Positive namespace check
         let ns_ok = match &wildcard.namespace {
             WildcardNamespace::Any => true,
-            WildcardNamespace::Other => namespace != target_namespace,
+            WildcardNamespace::Other => {
+                other_matches_namespace(namespace, target_namespace, self.schema_set.xsd_version)
+            }
             WildcardNamespace::TargetNamespace => namespace == target_namespace,
             WildcardNamespace::Local => namespace.is_none(),
             WildcardNamespace::List(ns_list) => {
