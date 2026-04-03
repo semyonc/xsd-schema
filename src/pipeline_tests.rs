@@ -2624,6 +2624,81 @@ fn test_reject_extension_with_all_over_choice() {
     }
 }
 
+/// particlesFb003: extending sequence content with choice compositor is invalid
+#[test]
+fn test_reject_extension_with_choice_over_sequence() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:sequence>
+                    <xsd:element name="s1" type="xsd:string"/>
+                </xsd:sequence>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:extension base="x:base">
+                            <xsd:choice>
+                                <xsd:element name="c1" type="xsd:string"/>
+                                <xsd:element name="c2" type="xsd:string"/>
+                            </xsd:choice>
+                        </xsd:extension>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_err(),
+        "extending sequence with choice must be rejected"
+    );
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "cos-ct-extends");
+        }
+        other => panic!("Expected cos-ct-extends, got {:?}", other),
+    }
+}
+
+/// particlesFb004: XSD 1.1 all-over-all extension is valid
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_accept_xsd11_all_over_all_extension() {
+    let mut schema_set = SchemaSet::xsd11();
+    let xsd = r###"<?xml version="1.0"?>
+        <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
+                    targetNamespace="http://xsdtesting" xmlns:x="http://xsdtesting"
+                    elementFormDefault="qualified">
+            <xsd:complexType name="base">
+                <xsd:all>
+                    <xsd:element name="a1" type="xsd:string"/>
+                </xsd:all>
+            </xsd:complexType>
+            <xsd:element name="doc">
+                <xsd:complexType>
+                    <xsd:complexContent>
+                        <xsd:extension base="x:base">
+                            <xsd:all>
+                                <xsd:element name="a2" type="xsd:string"/>
+                            </xsd:all>
+                        </xsd:extension>
+                    </xsd:complexContent>
+                </xsd:complexType>
+            </xsd:element>
+        </xsd:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "XSD 1.1 all-over-all extension should be accepted: {:?}",
+        result
+    );
+}
+
 /// particlesZ013: attribute type not validly derived in restriction
 #[test]
 fn test_reject_attribute_type_not_derived_in_restriction() {
@@ -2705,6 +2780,45 @@ fn test_reject_required_attribute_becomes_optional() {
     }
 }
 
+/// particlesZ017b: namespace-aware attribute matching — derived omits
+/// required base attribute (different namespace, same local name)
+#[test]
+fn test_reject_restriction_conflated_namespace_attribute() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                   targetNamespace="http://ns1" xmlns:ns1="http://ns1">
+            <xs:attribute name="id" type="xs:string"/>
+            <xs:complexType name="Base">
+                <xs:sequence>
+                    <xs:element name="e" type="xs:string"/>
+                </xs:sequence>
+                <xs:attribute ref="ns1:id" use="required"/>
+            </xs:complexType>
+            <xs:complexType name="Derived">
+                <xs:complexContent>
+                    <xs:restriction base="ns1:Base">
+                        <xs:sequence>
+                            <xs:element name="e" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_err(),
+        "derived type missing required ns1:id attribute must be rejected"
+    );
+    match result.unwrap_err() {
+        crate::error::SchemaError::StructuralError { constraint, .. } => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
+    }
+}
+
 /// particlesZ018: simpleContent restriction with list type over atomic base
 #[test]
 fn test_reject_simple_content_restriction_with_list_over_atomic() {
@@ -2737,5 +2851,69 @@ fn test_reject_simple_content_restriction_with_list_over_atomic() {
         }
         other => panic!("Expected derivation-ok-restriction, got {:?}", other),
     }
+}
+
+/// particlesZ019: simpleContent list restriction over anySimpleType is valid
+#[test]
+fn test_accept_simple_content_list_over_any_simple_type() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B1">
+                <xs:simpleContent>
+                    <xs:extension base="xs:anySimpleType">
+                        <xs:attribute name="foo"/>
+                    </xs:extension>
+                </xs:simpleContent>
+            </xs:complexType>
+            <xs:complexType name="C2">
+                <xs:simpleContent>
+                    <xs:restriction base="B1">
+                        <xs:simpleType>
+                            <xs:list itemType="xs:int"/>
+                        </xs:simpleType>
+                    </xs:restriction>
+                </xs:simpleContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "list restricting anySimpleType should be accepted: {:?}",
+        result
+    );
+}
+
+/// particlesZ020: simpleContent union restriction over anySimpleType is valid
+#[test]
+fn test_accept_simple_content_union_over_any_simple_type() {
+    let mut schema_set = SchemaSet::new();
+    let xsd = r###"<?xml version="1.0"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B1">
+                <xs:simpleContent>
+                    <xs:extension base="xs:anySimpleType">
+                        <xs:attribute name="foo"/>
+                    </xs:extension>
+                </xs:simpleContent>
+            </xs:complexType>
+            <xs:complexType name="C2">
+                <xs:simpleContent>
+                    <xs:restriction base="B1">
+                        <xs:simpleType>
+                            <xs:union memberTypes="xs:int xs:string"/>
+                        </xs:simpleType>
+                    </xs:restriction>
+                </xs:simpleContent>
+            </xs:complexType>
+        </xs:schema>"###;
+
+    let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
+    assert!(
+        result.is_ok(),
+        "union restricting anySimpleType should be accepted: {:?}",
+        result
+    );
 }
 

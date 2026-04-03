@@ -695,15 +695,21 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
         let value_str = self.value();
 
-        // Default-aware value resolution (cvc-elt.5.2):
-        // Substitute element default only when there is no text content AND
-        // no child elements (matching validator.rs:1013 semantics).
+        // Default/fixed-aware value resolution (cvc-elt.5.2):
+        // Substitute element default or fixed only when there is no text
+        // content AND no child elements (matching runtime.rs semantics).
+        // XSD spec forbids both default and fixed on the same element,
+        // so at most one will be Some.  Priority matches runtime.rs.
         let effective_value = if value_str.is_empty() && !self.has_element_children() {
             if let Some(elem_key) = binding.element_decl {
                 let elem_data = &schema_set.arenas.elements[elem_key];
-                match &elem_data.default_value {
-                    Some(default_val) => default_val.clone(),
-                    None => value_str,
+                if let Some(default_val) = &elem_data.default_value {
+                    default_val.clone()
+                } else if let Some(fixed_val) = &elem_data.fixed_value {
+                    // §3.3.4.3: fixed behaves as default when element is empty
+                    fixed_val.clone()
+                } else {
+                    value_str
                 }
             } else {
                 value_str

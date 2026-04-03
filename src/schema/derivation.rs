@@ -636,13 +636,10 @@ fn validate_complex_extension(
                     if let Some(ref base_particle) = base_complex.particle {
                         if let ComplexContentResult::Complex(ref derived_complex) = type_def.content {
                             if let Some(ref ext_particle) = derived_complex.particle {
-                                let ext_is_all = matches!(
-                                    ext_particle.term,
-                                    ParticleTerm::Group(ModelGroupDefResult {
-                                        compositor: Some(Compositor::All),
-                                        ..
-                                    })
-                                );
+                                let ext_compositor = match &ext_particle.term {
+                                    ParticleTerm::Group(mg) => mg.compositor,
+                                    _ => None,
+                                };
                                 let base_is_all = matches!(
                                     base_particle.term,
                                     ParticleTerm::Group(ModelGroupDefResult {
@@ -651,34 +648,71 @@ fn validate_complex_extension(
                                     })
                                 );
 
-                                // XSD 1.1 allows all-over-all; XSD 1.0 forbids all
-                                // compositors in extensions over non-empty base
-                                if ext_is_all && !(base_is_all && schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1) {
-                                    let location = type_def
-                                        .source
-                                        .as_ref()
-                                        .and_then(|s| schema_set.source_maps.locate(s));
-                                    let type_name = format_type_name(
-                                        schema_set,
-                                        type_def.name,
-                                        type_def.target_namespace,
-                                    );
-                                    let base_name = format_type_name(
-                                        schema_set,
-                                        base_type.name,
-                                        base_type.target_namespace,
-                                    );
-                                    return Err(SchemaError::structural(
-                                        "cos-ct-extends",
-                                        format!(
-                                            "Complex type '{}' cannot extend '{}' with an xs:all \
-                                             compositor because the base type has non-empty content; \
-                                             the resulting content model would violate \
-                                             cos-all-limited placement constraints",
-                                            type_name, base_name,
-                                        ),
-                                        location,
-                                    ));
+                                // cos-particle-extend §3.9.6.2: over a non-empty base,
+                                // the only valid extension shapes are:
+                                // (1) No extension particle  (handled by outer if-let)
+                                // (2) Extension particle is a sequence
+                                // (3) XSD 1.1: all-over-all
+                                match ext_compositor {
+                                    Some(Compositor::Sequence) => {
+                                        // OK: sequence extension is always valid
+                                    }
+                                    Some(Compositor::All)
+                                        if base_is_all
+                                            && schema_set.xsd_version
+                                                == crate::schema::model::XsdVersion::V1_1 =>
+                                    {
+                                        // OK: XSD 1.1 all-over-all
+                                    }
+                                    Some(compositor @ Compositor::All)
+                                    | Some(compositor @ Compositor::Choice) => {
+                                        let location = type_def
+                                            .source
+                                            .as_ref()
+                                            .and_then(|s| schema_set.source_maps.locate(s));
+                                        let type_name = format_type_name(
+                                            schema_set,
+                                            type_def.name,
+                                            type_def.target_namespace,
+                                        );
+                                        let base_name = format_type_name(
+                                            schema_set,
+                                            base_type.name,
+                                            base_type.target_namespace,
+                                        );
+                                        let (comp_name, reason) = match compositor {
+                                            Compositor::All => (
+                                                "all",
+                                                "the resulting content model would violate \
+                                                 cos-all-limited placement constraints",
+                                            ),
+                                            Compositor::Choice => (
+                                                "choice",
+                                                "cos-particle-extend only allows sequence \
+                                                 extensions (or XSD 1.1 all-over-all)",
+                                            ),
+                                            Compositor::Sequence => unreachable!(),
+                                        };
+                                        return Err(SchemaError::structural(
+                                            "cos-ct-extends",
+                                            format!(
+                                                "Complex type '{}' cannot extend '{}' with \
+                                                 an xs:{} compositor because the base type \
+                                                 has non-empty content; {}",
+                                                type_name,
+                                                base_name,
+                                                comp_name,
+                                                reason,
+                                            ),
+                                            location,
+                                        ));
+                                    }
+                                    None => {
+                                        // Bare element or wildcard term (no model group
+                                        // wrapper).  The effective content type mapping
+                                        // wraps it in a sequence with the base, so this
+                                        // is equivalent to a sequence extension — OK.
+                                    }
                                 }
                             }
                         }
@@ -2314,8 +2348,10 @@ fn effective_type_final(
 }
 
 /// Resolved effective attribute use for comparison during restriction validation.
+/// Attribute identity is (target_namespace, name) per §3.2.6.
 struct EffectiveAttributeUse {
     name: NameId,
+    target_namespace: Option<NameId>,
     use_kind: AttributeUseKind,
     resolved_type: Option<TypeKey>,
 }
@@ -2328,15 +2364,25 @@ fn resolve_single_attribute_use(
     attr_use: &crate::parser::frames::AttributeUseResult,
     resolved: Option<&crate::arenas::ResolvedAttributeUse>,
 ) -> Option<EffectiveAttributeUse> {
-    let name = if let Some(ref_name) = &attr_use.attribute.ref_name {
+    let (name, target_namespace) = if let Some(ref_name) = &attr_use.attribute.ref_name {
         if let Some(resolved_attr) = resolved.and_then(|r| r.resolved_ref) {
-            schema_set.arenas.attributes.get(resolved_attr).and_then(|d| d.name)
+            let decl = schema_set.arenas.attributes.get(resolved_attr);
+            (decl.and_then(|d| d.name)?, decl.and_then(|d| d.target_namespace))
         } else {
-            Some(ref_name.local_name)
+            (ref_name.local_name, ref_name.namespace)
         }
     } else {
-        attr_use.attribute.name
-    }?;
+        let n = attr_use.attribute.name?;
+        // For inline (non-ref) attributes, compute effective namespace
+        // using form + attributeFormDefault per §3.2.2.
+        let ns = schema_set.effective_local_attribute_namespace(
+            attr_use.attribute.target_namespace,
+            attr_use.attribute.form.as_deref(),
+            attr_use.attribute.source.as_ref(),
+            None,
+        );
+        (n, ns)
+    };
 
     // Prefer the use's resolved_type; fall back to the global declaration's type.
     let resolved_type = resolved.and_then(|r| r.resolved_type)
@@ -2349,6 +2395,7 @@ fn resolve_single_attribute_use(
 
     Some(EffectiveAttributeUse {
         name,
+        target_namespace,
         use_kind: attr_use.use_kind,
         resolved_type,
     })
@@ -2450,8 +2497,10 @@ fn validate_attribute_restriction(
 
         let attr_name_str = schema_set.name_table.resolve(base_attr.name);
 
-        // Find matching derived attribute
-        let derived_attr = derived_attrs.iter().find(|a| a.name == base_attr.name);
+        // Find matching derived attribute by expanded name (namespace + local)
+        let derived_attr = derived_attrs
+            .iter()
+            .find(|a| a.name == base_attr.name && a.target_namespace == base_attr.target_namespace);
 
         match derived_attr {
             Some(da) if da.use_kind == AttributeUseKind::Required => {
@@ -2475,7 +2524,9 @@ fn validate_attribute_restriction(
     for derived_attr in &derived_attrs {
         let Some(derived_type_key) = derived_attr.resolved_type else { continue };
 
-        let base_attr = base_attrs.iter().find(|a| a.name == derived_attr.name);
+        let base_attr = base_attrs
+            .iter()
+            .find(|a| a.name == derived_attr.name && a.target_namespace == derived_attr.target_namespace);
         let Some(base_attr) = base_attr else { continue };
         let Some(base_type_key) = base_attr.resolved_type else { continue };
 
@@ -2542,6 +2593,17 @@ fn validate_simple_content_restriction(
     let Some(base_simple_key) = effective_simple_content_type_key(schema_set, base) else {
         return Ok(());
     };
+
+    // anySimpleType is the ur-type of all simple types — any variety
+    // is a valid restriction.  Per §3.14.6 clause 2, inline list/union
+    // types automatically derive from anySimpleType.  This function
+    // only checks variety compatibility, not facets, so the early
+    // return is safe.
+    if let TypeKey::Simple(sk) = base_simple_key {
+        if sk == schema_set.builtin_types().any_simple_type {
+            return Ok(());
+        }
+    }
 
     // Get the base simple type's variety
     let base_variety = match base_simple_key {

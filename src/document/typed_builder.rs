@@ -786,6 +786,29 @@ mod tests {
         );
     }
 
+    // ── Test 11b: fixed value on element → typed_value uses fixed ──
+
+    #[test]
+    fn fixed_value_on_empty_element() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:integer" fixed="42"/>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        // Empty element — no text content, should use fixed "42"
+        let doc = build_doc("<root/>", &arena, &schema_set);
+
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child()); // root element
+        let tv = nav.typed_value();
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "empty element with fixed value should produce typed value, got: {:?}",
+            tv
+        );
+    }
+
     // ── Test 12: source span tracking works ───────────────────────────
 
     #[test]
