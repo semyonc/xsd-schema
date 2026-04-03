@@ -661,6 +661,10 @@ impl<'a> CompileContext<'a> {
         ref_name: &QNameRef,
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
+        // Check recursion depth to detect circular group references
+        self.check_recursion(source)?;
+        self.depth += 1;
+
         // Look up the referenced group (redefine-aware)
         let group_key = self
             .resolve_model_group_key(ref_name)
@@ -689,7 +693,9 @@ impl<'a> CompileContext<'a> {
             })?;
 
         // Convert ModelGroupData particles to fragments
-        self.compile_model_group_data(group_data, source)
+        let result = self.compile_model_group_data(group_data, source);
+        self.depth -= 1;
+        result
     }
 
     /// Resolve a model group reference QName to a key, redirecting self-references
