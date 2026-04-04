@@ -10,7 +10,7 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{NameId, TypeKey};
-use crate::namespace::NameTable;
+use crate::namespace::{NameTable, is_ncname};
 use crate::parser::attrs::{parse_boolean, parse_form, parse_occurs, parse_use, AttributeMap};
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::{

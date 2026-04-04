@@ -353,25 +353,47 @@ impl<'a> IdXPathParser<'a> {
                 Ok(NameTest::Wildcard)
             }
             Some(IdXPathToken::NCName(_)) => {
-                let (start, tok, _) = self.advance().unwrap();
+                let (start, tok, ncname_end) = self.advance().unwrap();
                 let first_name = match tok {
                     IdXPathToken::NCName(n) => n,
                     _ => unreachable!(),
                 };
 
                 // Check for ':' (namespace separator)
+                // Reject whitespace between NCName and ':' (e.g., "ns :*" is invalid)
                 if self.peek() == Some(&IdXPathToken::Colon) {
+                    let (colon_start, _, colon_end) = self.tokens[self.pos];
+                    if colon_start != ncname_end {
+                        return Err(IdentityXPathError::Parse {
+                            message: "whitespace is not allowed between namespace prefix and `:`".into(),
+                            position: ncname_end,
+                        });
+                    }
                     self.advance(); // consume ':'
 
                     match self.peek() {
                         Some(IdXPathToken::Star) => {
                             // ns:*
+                            let (star_start, _, _) = self.tokens[self.pos];
+                            if star_start != colon_end {
+                                return Err(IdentityXPathError::Parse {
+                                    message: "whitespace is not allowed between `:` and `*`".into(),
+                                    position: colon_end,
+                                });
+                            }
                             self.advance();
                             let ns_id = self.resolve_prefix(first_name, start)?;
                             Ok(NameTest::NamespaceWildcard(ns_id))
                         }
                         Some(IdXPathToken::NCName(_)) => {
                             // ns:local
+                            let (local_start, _, _) = self.tokens[self.pos];
+                            if local_start != colon_end {
+                                return Err(IdentityXPathError::Parse {
+                                    message: "whitespace is not allowed between `:` and local name".into(),
+                                    position: colon_end,
+                                });
+                            }
                             let (_, tok2, _) = self.advance().unwrap();
                             let local = match tok2 {
                                 IdXPathToken::NCName(n) => n,

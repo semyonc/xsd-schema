@@ -16,8 +16,9 @@ use crate::ids::{
 };
 use crate::parser::frames::{
     AttributeFrameResult, AttributeGroupDefResult, ComplexContentResult, ComplexTypeResult,
-    DirectiveResult, FrameResult, GroupFrameResult, ModelGroupDefResult, NotationResult,
-    OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult, TypeFrameResult,
+    DirectiveResult, FrameResult, GroupFrameResult, IdentityKind, ModelGroupDefResult,
+    NotationResult, OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult,
+    TypeFrameResult,
 };
 use crate::parser::location::SourceRef;
 use crate::namespace::QualifiedName;
@@ -29,6 +30,7 @@ use crate::schema::model::{
     RedefineDirective, SchemaDocument,
 };
 use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint, ProcessContents as SchemaProcessContents};
+use crate::validation::asttree::Asttree;
 use crate::SchemaSet;
 
 /// Result type for convert_directives function
@@ -297,6 +299,112 @@ impl<'a> SchemaAssembler<'a> {
                     format!("Duplicate identity constraint name '{}' in schema document", name_str),
                     location,
                 ));
+            }
+        }
+
+        // Validate identity constraint XPath expressions at schema time (§3.11.4)
+        for ic in &identity_constraints {
+            let xsd_version = self.schema_set.xsd_version;
+            // Validate selector XPath
+            if let Err(e) = Asttree::compile_selector(
+                &ic.selector.xpath,
+                &ic.selector.ns_snapshot,
+                &self.schema_set.name_table,
+                ic.selector.xpath_default_namespace.as_deref(),
+                None, // schema-level xpathDefaultNamespace resolved later
+                self.target_namespace,
+                xsd_version,
+            ) {
+                let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
+                let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    format!("Identity constraint '{}': invalid selector XPath '{}': {}", ic_name, ic.selector.xpath, e),
+                    location,
+                ));
+            }
+            // Validate field XPath expressions
+            for field in &ic.fields {
+                if let Err(e) = Asttree::compile_field(
+                    &field.xpath,
+                    &field.ns_snapshot,
+                    &self.schema_set.name_table,
+                    field.xpath_default_namespace.as_deref(),
+                    None,
+                    self.target_namespace,
+                    xsd_version,
+                ) {
+                    let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
+                    let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                    return Err(SchemaError::structural(
+                        "src-identity-constraint",
+                        format!("Identity constraint '{}': invalid field XPath '{}': {}", ic_name, field.xpath, e),
+                        location,
+                    ));
+                }
+            }
+        }
+
+        // Validate keyref constraints: refer must resolve to a key/unique
+        // with matching field count (§3.11.4, §3.11.6)
+        for ic in &identity_constraints {
+            if ic.kind != IdentityKind::Keyref {
+                continue;
+            }
+            if let Some(refer) = &ic.refer {
+                let refer_name = refer.local_name;
+                let refer_ns = refer.namespace;
+                // Find the referenced constraint on the same element
+                let target = identity_constraints.iter().find(|other| {
+                    other.name == refer_name
+                        && (refer_ns.is_none()
+                            || refer_ns == self.target_namespace)
+                });
+                match target {
+                    None => {
+                        let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
+                        let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
+                        let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                        return Err(SchemaError::structural(
+                            "src-identity-constraint",
+                            format!(
+                                "Keyref '{}': refer target '{}' not found among identity constraints on this element",
+                                ic_name, refer_name_str
+                            ),
+                            location,
+                        ));
+                    }
+                    Some(target_ic) => {
+                        // Keyref cannot refer to another keyref
+                        if target_ic.kind == IdentityKind::Keyref {
+                            let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
+                            let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
+                            let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                            return Err(SchemaError::structural(
+                                "src-identity-constraint",
+                                format!(
+                                    "Keyref '{}': refer target '{}' is a keyref, not a key or unique",
+                                    ic_name, refer_name_str
+                                ),
+                                location,
+                            ));
+                        }
+                        // Field count must match
+                        if ic.fields.len() != target_ic.fields.len() {
+                            let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
+                            let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
+                            let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                            return Err(SchemaError::structural(
+                                "src-identity-constraint",
+                                format!(
+                                    "Keyref '{}': has {} field(s) but refer target '{}' has {} field(s)",
+                                    ic_name, ic.fields.len(), refer_name_str, target_ic.fields.len()
+                                ),
+                                location,
+                            ));
+                        }
+                    }
+                }
             }
         }
 

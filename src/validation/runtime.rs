@@ -1341,6 +1341,52 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        // Process default/fixed attribute values for identity constraint field matching.
+        // Schema-defined defaults that were not explicitly provided in the instance
+        // must participate in IC evaluation (§3.11.4 cvc-identity-constraint).
+        if !self.active_constraints.is_empty() {
+            if let Some(TypeKey::Complex(ct_key)) = schema_type {
+                let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+                let empty_seen = HashSet::new();
+                let seen = self.validation_stack.last()
+                    .map(|s| &s.seen_attributes)
+                    .unwrap_or(&empty_seen);
+                // Collect (name, ns, value) for absent attrs with default/fixed
+                let mut ic_defaults: Vec<(NameId, NameId, String)> = Vec::new();
+                for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+                    if attr_use.use_kind == AttributeUseKind::Prohibited {
+                        continue;
+                    }
+                    let resolved = ct_data.resolved_attributes.get(i);
+                    let (attr_name, attr_ns) =
+                        self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+                    if seen.contains(&(attr_ns, attr_name)) {
+                        continue;
+                    }
+                    let attr_key = resolved.and_then(|r| r.resolved_ref);
+                    // Check default value
+                    let value = attr_use.attribute.default_value.as_deref()
+                        .or(attr_use.attribute.fixed_value.as_deref())
+                        .or_else(|| {
+                            attr_key
+                                .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                                .and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
+                        });
+                    if let Some(v) = value {
+                        ic_defaults.push((attr_name, attr_ns.unwrap_or(NameId(0)), v.to_string()));
+                    }
+                }
+                for (name, ns, value) in ic_defaults {
+                    for cs in &mut self.active_constraints {
+                        let matches = cs.matching_fields(name, ns);
+                        for field_idx in matches {
+                            cs.set_field_value(field_idx, value.clone(), None);
+                        }
+                    }
+                }
+            }
+        }
+
         // Forward to assertion fragment builder (XSD 1.1)
         #[cfg(feature = "xsd11")]
         if self.is_buffering_assertions() {

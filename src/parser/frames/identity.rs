@@ -2,6 +2,20 @@
 // Identity Constraint Frames
 // ============================================================================
 
+/// Validate that an `id` attribute value is a valid xs:ID (NCName).
+fn validate_id_attribute(id: &Option<String>, element: &str) -> SchemaResult<()> {
+    if let Some(id_val) = id {
+        if !is_ncname(id_val) {
+            return Err(SchemaError::structural(
+                "s4s-att-invalid-value",
+                format!("'{}' attribute 'id' has invalid value '{}': not a valid xs:ID", element, id_val),
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Frame for xs:selector
 pub struct SelectorFrame {
     xpath: String,
@@ -71,6 +85,7 @@ impl Frame for SelectorFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        validate_id_attribute(&self.id, "selector")?;
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -168,6 +183,7 @@ impl Frame for FieldFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        validate_id_attribute(&self.id, "field")?;
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -200,6 +216,7 @@ impl Frame for FieldFrame {
 pub struct IdentityFrame {
     kind: IdentityKind,
     name: Option<NameId>,
+    raw_name: Option<String>,
     ref_name: Option<QNameRef>,
     refer: Option<QNameRef>,
     id: Option<String>,
@@ -218,8 +235,10 @@ impl IdentityFrame {
         source: Option<SourceRef>,
         ns_snapshot: &NamespaceContextSnapshot,
     ) -> SchemaResult<Self> {
-        let name = attrs
+        let raw_name = attrs
             .get_value_by_name(name_table, "name")
+            .map(String::from);
+        let name = raw_name.as_deref()
             .and_then(|s| name_table.get(s));
 
         let ref_name = attrs
@@ -243,6 +262,7 @@ impl IdentityFrame {
         Ok(Self {
             kind,
             name,
+            raw_name,
             ref_name,
             refer,
             id,
@@ -258,18 +278,27 @@ impl IdentityFrame {
 impl Frame for IdentityFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
         // Content model: (annotation?, selector, field+)
-        // Annotation must come before selector/field
         if local_name == xsd_names::ANNOTATION {
-            return self.selector.is_none() && !self.has_annotation();
+            // Annotation must come before selector/field
+            return self.selector.is_none() && self.fields.is_empty() && !self.has_annotation();
         }
-        matches!(
-            local_name,
-            xsd_names::SELECTOR | xsd_names::FIELD
-        )
+        if local_name == xsd_names::SELECTOR {
+            // Exactly one selector, must come before any field
+            return self.selector.is_none() && self.fields.is_empty();
+        }
+        if local_name == xsd_names::FIELD {
+            // Fields must come after selector
+            return self.selector.is_some();
+        }
+        false
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        matches!(local_name, "name" | "ref" | "refer" | "id")
+        if local_name == "refer" {
+            // Only keyref has a 'refer' attribute
+            return self.kind == IdentityKind::Keyref;
+        }
+        matches!(local_name, "name" | "ref" | "id")
     }
 
     fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
@@ -292,13 +321,31 @@ impl Frame for IdentityFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        let name = self.name.ok_or_else(|| {
-            SchemaError::structural(
-                "src-identity-constraint",
-                "Identity constraint requires 'name' attribute",
-                None,
-            )
-        })?;
+        let kind_name = match self.kind {
+            IdentityKind::Unique => "unique",
+            IdentityKind::Key => "key",
+            IdentityKind::Keyref => "keyref",
+        };
+        validate_id_attribute(&self.id, kind_name)?;
+
+        // Validate that name is present and is a valid NCName
+        let name = match (&self.name, &self.raw_name) {
+            (Some(id), Some(raw)) if is_ncname(raw) => *id,
+            (_, Some(raw)) => {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    format!("Identity constraint 'name' attribute value '{}' is not a valid NCName", raw),
+                    None,
+                ));
+            }
+            _ => {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint",
+                    "Identity constraint requires 'name' attribute",
+                    None,
+                ));
+            }
+        };
 
         let selector = self.selector.ok_or_else(|| {
             SchemaError::structural(
