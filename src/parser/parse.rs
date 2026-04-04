@@ -166,6 +166,16 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
         self.errors.push(error);
     }
 
+    /// In error-recovery mode, collect the error and continue; otherwise fail.
+    fn recover_or_fail(&mut self, error: SchemaError) -> SchemaResult<()> {
+        if self.config.error_recovery {
+            self.add_error(error);
+            Ok(())
+        } else {
+            Err(error)
+        }
+    }
+
     /// Create a source reference for the given span
     fn source_ref(&self, span: SourceSpan) -> SourceRef {
         SourceRef::new(self.doc_id, span)
@@ -560,12 +570,7 @@ fn handle_start_element(
 
     // Perform element-specific structural validation
     if let Err(e) = validate_element_attributes(local_name, &attr_map, state.ns_context.name_table(), &validation_ctx) {
-        if state.config.error_recovery {
-            state.add_error(e);
-            // Continue with frame creation - the element structure may still be usable
-        } else {
-            return Err(e);
-        }
+        state.recover_or_fail(e)?;
     }
 
     // Validate XSD version for individual attributes
@@ -573,11 +578,7 @@ fn handle_start_element(
         for attr_name_id in attr_map.names() {
             let attr_name = state.ns_context.name_table().resolve(attr_name_id);
             if let Err(e) = validate_xsd_version_attribute(&attr_name, local_name, &validation_ctx) {
-                if state.config.error_recovery {
-                    state.add_error(e);
-                } else {
-                    return Err(e);
-                }
+                state.recover_or_fail(e)?;
             }
         }
     }
@@ -587,33 +588,23 @@ fn handle_start_element(
     if !matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
         if let Some(id_val) = attr_map.get_value_by_name(state.ns_context.name_table(), "id") {
             if !is_ncname(id_val) {
-                let err = SchemaError::structural(
+                state.recover_or_fail(SchemaError::structural(
                     "s4s-att-invalid-value",
                     format!(
                         "'{}' attribute 'id' has invalid value '{}': not a valid xs:ID",
                         local_name, id_val
                     ),
                     source_ref.as_ref().map(|s| s.to_location(state.source_map)),
-                );
-                if state.config.error_recovery {
-                    state.add_error(err);
-                } else {
-                    return Err(err);
-                }
+                ))?;
             } else if !state.id_values.insert(id_val.to_string()) {
-                let err = SchemaError::structural(
+                state.recover_or_fail(SchemaError::structural(
                     "s4s-att-invalid-value",
                     format!(
                         "Duplicate xs:ID value '{}' on element '{}'",
                         id_val, local_name
                     ),
                     source_ref.as_ref().map(|s| s.to_location(state.source_map)),
-                );
-                if state.config.error_recovery {
-                    state.add_error(err);
-                } else {
-                    return Err(err);
-                }
+                ))?;
             }
         }
     }
