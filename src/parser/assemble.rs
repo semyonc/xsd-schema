@@ -16,7 +16,7 @@ use crate::ids::{
 };
 use crate::parser::frames::{
     AttributeFrameResult, AttributeGroupDefResult, ComplexContentResult, ComplexTypeResult,
-    DirectiveResult, FrameResult, GroupFrameResult, IdentityKind, ModelGroupDefResult,
+    DirectiveResult, FrameResult, GroupFrameResult, ModelGroupDefResult,
     NotationResult, OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult,
     TypeFrameResult,
 };
@@ -347,66 +347,12 @@ impl<'a> SchemaAssembler<'a> {
 
         // Validate keyref constraints: refer must resolve to a key/unique
         // with matching field count (§3.11.4, §3.11.6)
-        for ic in &identity_constraints {
-            if ic.kind != IdentityKind::Keyref {
-                continue;
-            }
-            if let Some(refer) = &ic.refer {
-                let refer_name = refer.local_name;
-                let refer_ns = refer.namespace;
-                // Find the referenced constraint on the same element
-                let target = identity_constraints.iter().find(|other| {
-                    other.name == refer_name
-                        && (refer_ns.is_none()
-                            || refer_ns == self.target_namespace)
-                });
-                match target {
-                    None => {
-                        let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
-                        let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
-                        let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
-                        return Err(SchemaError::structural(
-                            "src-identity-constraint",
-                            format!(
-                                "Keyref '{}': refer target '{}' not found among identity constraints on this element",
-                                ic_name, refer_name_str
-                            ),
-                            location,
-                        ));
-                    }
-                    Some(target_ic) => {
-                        // Keyref cannot refer to another keyref
-                        if target_ic.kind == IdentityKind::Keyref {
-                            let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
-                            let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
-                            let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
-                            return Err(SchemaError::structural(
-                                "src-identity-constraint",
-                                format!(
-                                    "Keyref '{}': refer target '{}' is a keyref, not a key or unique",
-                                    ic_name, refer_name_str
-                                ),
-                                location,
-                            ));
-                        }
-                        // Field count must match
-                        if ic.fields.len() != target_ic.fields.len() {
-                            let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
-                            let refer_name_str = self.schema_set.name_table.resolve_ref(refer_name);
-                            let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
-                            return Err(SchemaError::structural(
-                                "src-identity-constraint",
-                                format!(
-                                    "Keyref '{}': has {} field(s) but refer target '{}' has {} field(s)",
-                                    ic_name, ic.fields.len(), refer_name_str, target_ic.fields.len()
-                                ),
-                                location,
-                            ));
-                        }
-                    }
-                }
-            }
-        }
+        crate::schema::inline::validate_keyref_refers(
+            &identity_constraints,
+            self.target_namespace,
+            &self.schema_set.name_table,
+            &self.schema_set.source_maps,
+        )?;
 
         // Allocate identity constraints into the arena
         let identity_constraint_keys: Vec<IdentityConstraintKey> = identity_constraints

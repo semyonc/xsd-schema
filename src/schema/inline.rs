@@ -30,10 +30,12 @@ use std::collections::{HashMap, HashSet};
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
+use crate::namespace::NameTable;
 use crate::parser::frames::{
-    ComplexContentResult, ElementFrameResult, ParticleResult, ParticleTerm, TypeFrameResult,
-    TypeRefResult,
+    ComplexContentResult, ElementFrameResult, IdentityKind, IdentityResult, ParticleResult,
+    ParticleTerm, TypeFrameResult, TypeRefResult,
 };
+use crate::parser::location::SourceMapStorage;
 use crate::schema::SchemaSet;
 
 /// Statistics from the inline type assembly pass
@@ -478,6 +480,79 @@ fn collect_content_particle_elements_recursive(
     }
 }
 
+/// Validate keyref constraints: refer must resolve to a key/unique on the same
+/// element with matching field count (§3.11.4, §3.11.6).
+pub(crate) fn validate_keyref_refers(
+    identity_constraints: &[IdentityResult],
+    target_namespace: Option<NameId>,
+    name_table: &NameTable,
+    source_maps: &SourceMapStorage,
+) -> SchemaResult<()> {
+    for ic in identity_constraints {
+        if ic.kind != IdentityKind::Keyref {
+            continue;
+        }
+        if let Some(refer) = &ic.refer {
+            let refer_name = refer.local_name;
+            let refer_ns = refer.namespace;
+            // Find the referenced constraint on the same element
+            let target = identity_constraints.iter().find(|other| {
+                other.name == refer_name
+                    && (refer_ns.is_none() || refer_ns == target_namespace)
+            });
+            match target {
+                None => {
+                    let ic_name = name_table.resolve_ref(ic.name);
+                    let refer_name_str = name_table.resolve_ref(refer_name);
+                    let location =
+                        ic.source.as_ref().and_then(|s| source_maps.locate(s));
+                    return Err(SchemaError::structural(
+                        "src-identity-constraint",
+                        format!(
+                            "Keyref '{}': refer target '{}' not found among identity constraints on this element",
+                            ic_name, refer_name_str
+                        ),
+                        location,
+                    ));
+                }
+                Some(target_ic) => {
+                    // Keyref cannot refer to another keyref
+                    if target_ic.kind == IdentityKind::Keyref {
+                        let ic_name = name_table.resolve_ref(ic.name);
+                        let refer_name_str = name_table.resolve_ref(refer_name);
+                        let location =
+                            ic.source.as_ref().and_then(|s| source_maps.locate(s));
+                        return Err(SchemaError::structural(
+                            "src-identity-constraint",
+                            format!(
+                                "Keyref '{}': refer target '{}' is a keyref, not a key or unique",
+                                ic_name, refer_name_str
+                            ),
+                            location,
+                        ));
+                    }
+                    // Field count must match
+                    if ic.fields.len() != target_ic.fields.len() {
+                        let ic_name = name_table.resolve_ref(ic.name);
+                        let refer_name_str = name_table.resolve_ref(refer_name);
+                        let location =
+                            ic.source.as_ref().and_then(|s| source_maps.locate(s));
+                        return Err(SchemaError::structural(
+                            "src-identity-constraint",
+                            format!(
+                                "Keyref '{}': has {} field(s) but refer target '{}' has {} field(s)",
+                                ic_name, ic.fields.len(), refer_name_str, target_ic.fields.len()
+                            ),
+                            location,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Allocate arena element declarations for local elements in content particles.
 ///
 /// This enables the validator to look up nillable, fixed_value, default_value
@@ -545,6 +620,12 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             job.elem.source.as_ref(),
             job.target_namespace,
         );
+        validate_keyref_refers(
+            &job.elem.identity_constraints,
+            job.target_namespace,
+            &schema_set.name_table,
+            &schema_set.source_maps,
+        )?;
         let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
         for ic in job.elem.identity_constraints {
             // Check per-document uniqueness using the IC's source document
@@ -683,6 +764,12 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             job.elem.source.as_ref(),
             job.target_namespace,
         );
+        validate_keyref_refers(
+            &job.elem.identity_constraints,
+            job.target_namespace,
+            &schema_set.name_table,
+            &schema_set.source_maps,
+        )?;
         let mut identity_constraint_keys = Vec::with_capacity(job.elem.identity_constraints.len());
         for ic in job.elem.identity_constraints {
             // Check per-document uniqueness using the IC's source document
