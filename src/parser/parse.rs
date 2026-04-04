@@ -28,11 +28,13 @@
 //! assert_eq!(doc_id, 0);
 //! ```
 
+use std::collections::HashSet;
+
 use quick_xml::events::Event;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
-use crate::namespace::{NamespaceContext, NameTable, XS_NAMESPACE};
+use crate::namespace::{NamespaceContext, NameTable, XS_NAMESPACE, is_ncname};
 use crate::parser::attrs::{parse_attributes, categorize_attributes, AttributeMap};
 use crate::parser::assemble::assemble_schema;
 use crate::parser::frames::{
@@ -97,6 +99,8 @@ struct ParserState<'a, 'b, 'c> {
     source_map: &'c SourceMap,
     /// Completed root schema result (set when root frame finishes)
     root_schema: Option<SchemaFrameResult>,
+    /// Collected xs:ID values for document-level uniqueness checking
+    id_values: HashSet<String>,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -116,6 +120,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             xsd_ns_id: None,
             source_map,
             root_schema: None,
+            id_values: HashSet::new(),
         }
     }
 
@@ -577,6 +582,42 @@ fn handle_start_element(
         }
     }
 
+    // Validate xs:ID attribute (NCName format + document-level uniqueness).
+    // Skip xs:appinfo and xs:documentation — they don't define `id` in the XSD spec.
+    if !matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
+        if let Some(id_val) = attr_map.get_value_by_name(state.ns_context.name_table(), "id") {
+            if !is_ncname(id_val) {
+                let err = SchemaError::structural(
+                    "s4s-att-invalid-value",
+                    format!(
+                        "'{}' attribute 'id' has invalid value '{}': not a valid xs:ID",
+                        local_name, id_val
+                    ),
+                    source_ref.as_ref().map(|s| s.to_location(state.source_map)),
+                );
+                if state.config.error_recovery {
+                    state.add_error(err);
+                } else {
+                    return Err(err);
+                }
+            } else if !state.id_values.insert(id_val.to_string()) {
+                let err = SchemaError::structural(
+                    "s4s-att-invalid-value",
+                    format!(
+                        "Duplicate xs:ID value '{}' on element '{}'",
+                        id_val, local_name
+                    ),
+                    source_ref.as_ref().map(|s| s.to_location(state.source_map)),
+                );
+                if state.config.error_recovery {
+                    state.add_error(err);
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     // Intern attribute values that are represented as NameId in frame results
     if is_in_xsd_ns {
         intern_attribute_values(local_name, &attr_map, state.ns_context.name_table_mut());
@@ -1015,5 +1056,44 @@ mod tests {
             }
             _ => panic!("expected simple type for Simple"),
         }
+    }
+
+    #[test]
+    fn test_duplicate_id_detected() {
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element id="foo123" name="a" type="xs:string"/>
+            <xs:element id="foo123" name="b" type="xs:string"/>
+        </xs:schema>"#;
+        let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
+        assert!(result.is_ok());
+        assert!(schema_set.parsing_errors.iter().any(|e| {
+            e.to_string().contains("Duplicate xs:ID value 'foo123'")
+        }));
+    }
+
+    #[test]
+    fn test_unique_ids_valid() {
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element id="id1" name="a" type="xs:string"/>
+            <xs:element id="id2" name="b" type="xs:string"/>
+        </xs:schema>"#;
+        let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
+        assert!(result.is_ok());
+        assert!(schema_set.parsing_errors.is_empty());
+    }
+
+    #[test]
+    fn test_invalid_id_format() {
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element id="123bad" name="a" type="xs:string"/>
+        </xs:schema>"#;
+        let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
+        assert!(result.is_ok());
+        assert!(schema_set.parsing_errors.iter().any(|e| {
+            e.to_string().contains("not a valid xs:ID")
+        }));
     }
 }

@@ -2,20 +2,6 @@
 // Identity Constraint Frames
 // ============================================================================
 
-/// Validate that an `id` attribute value is a valid xs:ID (NCName).
-fn validate_id_attribute(id: &Option<String>, element: &str) -> SchemaResult<()> {
-    if let Some(id_val) = id {
-        if !is_ncname(id_val) {
-            return Err(SchemaError::structural(
-                "s4s-att-invalid-value",
-                format!("'{}' attribute 'id' has invalid value '{}': not a valid xs:ID", element, id_val),
-                None,
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Frame for xs:selector
 pub struct SelectorFrame {
     xpath: String,
@@ -85,7 +71,6 @@ impl Frame for SelectorFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        validate_id_attribute(&self.id, "selector")?;
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -183,7 +168,6 @@ impl Frame for FieldFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        validate_id_attribute(&self.id, "field")?;
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -321,13 +305,6 @@ impl Frame for IdentityFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        let kind_name = match self.kind {
-            IdentityKind::Unique => "unique",
-            IdentityKind::Key => "key",
-            IdentityKind::Keyref => "keyref",
-        };
-        validate_id_attribute(&self.id, kind_name)?;
-
         // Validate that name is present and is a valid NCName
         let name = match (&self.name, &self.raw_name) {
             (Some(id), Some(raw)) if is_ncname(raw) => *id,
