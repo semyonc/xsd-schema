@@ -1497,6 +1497,11 @@ pub struct MatchInfo {
 }
 
 /// Find match info from an iterator of state IDs.
+///
+/// Uses element-over-wildcard priority: if any Element term matches, its info
+/// is returned immediately; a Wildcard match is kept as a fallback and only
+/// returned when no Element matches.  This mirrors the priority rule in
+/// `advance_with_priority`.
 fn find_match_info_in_states(
     nfa: &NfaTable,
     state_ids: impl Iterator<Item = StateId>,
@@ -1506,18 +1511,21 @@ fn find_match_info_in_states(
     subst_groups: Option<&SubstitutionGroupMap>,
     xsd_version: XsdVersion,
 ) -> MatchInfo {
+    let mut wildcard_info: Option<MatchInfo> = None;
+
     for state_id in state_ids {
         if let Some(state) = nfa.get_state(state_id) {
             if let Some(ref term) = state.term {
                 if term_matches(term, name, namespace, target_ns, subst_groups, xsd_version) {
-                    return match term {
+                    match term {
                         NfaTerm::Element {
                             name: term_name,
                             namespace: term_ns,
                             element_key,
                             resolved_type,
                         } => {
-                            if *term_name == name && *term_ns == namespace {
+                            // Element match — highest priority, return immediately
+                            return if *term_name == name && *term_ns == namespace {
                                 // Direct match — return term's declaration info
                                 MatchInfo {
                                     element_key: *element_key,
@@ -1531,19 +1539,25 @@ fn find_match_info_in_states(
                                     resolved_type: None,
                                     process_contents: None,
                                 }
+                            };
+                        }
+                        NfaTerm::Wildcard { process_contents, .. } => {
+                            // Keep first wildcard as fallback
+                            if wildcard_info.is_none() {
+                                wildcard_info = Some(MatchInfo {
+                                    element_key: None,
+                                    resolved_type: None,
+                                    process_contents: Some(*process_contents),
+                                });
                             }
                         }
-                        NfaTerm::Wildcard { process_contents, .. } => MatchInfo {
-                            element_key: None,
-                            resolved_type: None,
-                            process_contents: Some(*process_contents),
-                        },
-                    };
+                    }
                 }
             }
         }
     }
-    MatchInfo::default()
+
+    wildcard_info.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1708,6 +1722,30 @@ mod tests {
 
         let next = advance_with_priority(&nfa, [0], NameId(2), None, None, None, XsdVersion::V1_1);
         assert_eq!(next, make_set(&[4]));
+    }
+
+    #[test]
+    fn test_find_match_info_prefers_element_over_wildcard() {
+        // make_priority_nfa has element(NameId(1)) at state 1 and wildcard at state 2,
+        // both reachable from state 0.  Regardless of HashSet iteration order,
+        // find_match_info should prefer the element match.
+        let nfa = make_priority_nfa();
+        let active = ActiveStates::Simple(epsilon_closure(&nfa, [0]));
+
+        // NameId(1) matches both element and wildcard — element should win
+        let mi = active.find_match_info(&nfa, NameId(1), None, None, None, XsdVersion::V1_1);
+        assert!(
+            mi.process_contents.is_none(),
+            "element match should not have process_contents, got {:?}",
+            mi.process_contents,
+        );
+
+        // NameId(2) matches only the wildcard
+        let mi2 = active.find_match_info(&nfa, NameId(2), None, None, None, XsdVersion::V1_1);
+        assert!(
+            mi2.process_contents.is_some(),
+            "wildcard-only match should have process_contents",
+        );
     }
 
     #[test]
