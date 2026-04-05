@@ -2876,6 +2876,107 @@ fn resolve_inline_simple_type_base(
     }
 }
 
+/// XSD 1.0 §3.2.6 constraint 2 (`cos-attribute-decl`): if an attribute's type
+/// is or derives from xs:ID, it must not have a value constraint (default or
+/// fixed). XSD 1.1 relaxes this restriction. Called from the pipeline after
+/// reference resolution.
+pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::schema::model::XsdVersion;
+    use crate::types::XmlTypeCode;
+
+    if schema_set.xsd_version != XsdVersion::V1_0 {
+        return Ok(());
+    }
+
+    let id_key = match schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id) {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+
+    for (_key, attr_data) in schema_set.arenas.attributes.iter() {
+        if attr_data.default_value.is_none() && attr_data.fixed_value.is_none() {
+            continue;
+        }
+        if let Some(TypeKey::Simple(st_key)) = attr_data.resolved_type {
+            if schema_set.derives_from(st_key, id_key) {
+                let attr_name = attr_data
+                    .name
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_else(|| "(anonymous)".to_string());
+                let constraint = if attr_data.default_value.is_some() { "default" } else { "fixed" };
+                return Err(SchemaError::structural(
+                    "cos-attribute-decl",
+                    format!(
+                        "Attribute '{}' has type xs:ID (or derived) and must not have a {} value constraint",
+                        attr_name, constraint
+                    ),
+                    attr_data.source.as_ref().and_then(|s| schema_set.source_maps.locate(s)),
+                ));
+            }
+        }
+    }
+
+    for (_key, ct_data) in schema_set.arenas.complex_types.iter() {
+        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+            if attr_use.use_kind == AttributeUseKind::Prohibited {
+                continue;
+            }
+            let resolved = ct_data.resolved_attributes.get(i);
+            let ref_decl = resolved
+                .and_then(|r| r.resolved_ref)
+                .and_then(|k| schema_set.arenas.attributes.get(k));
+
+            let has_constraint = attr_use.attribute.default_value.is_some()
+                || attr_use.attribute.fixed_value.is_some()
+                || ref_decl.is_some_and(|d| d.default_value.is_some() || d.fixed_value.is_some());
+            if !has_constraint {
+                continue;
+            }
+
+            let attr_type = resolved
+                .and_then(|r| r.resolved_type)
+                .or_else(|| ref_decl.and_then(|d| d.resolved_type));
+            if let Some(TypeKey::Simple(st_key)) = attr_type {
+                if schema_set.derives_from(st_key, id_key) {
+                    let attr_name = attr_use
+                        .attribute
+                        .name
+                        .map(|n| schema_set.name_table.resolve(n).to_string())
+                        .or_else(|| {
+                            ref_decl
+                                .and_then(|d| d.name)
+                                .map(|n| schema_set.name_table.resolve(n).to_string())
+                        })
+                        .unwrap_or_else(|| "(anonymous)".to_string());
+                    let constraint = if attr_use.attribute.default_value.is_some()
+                        || ref_decl.and_then(|d| d.default_value.as_ref()).is_some()
+                    {
+                        "default"
+                    } else {
+                        "fixed"
+                    };
+                    let location = attr_use
+                        .attribute
+                        .source
+                        .as_ref()
+                        .or(ct_data.source.as_ref())
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    return Err(SchemaError::structural(
+                        "cos-attribute-decl",
+                        format!(
+                            "Attribute '{}' has type xs:ID (or derived) and must not have a {} value constraint",
+                            attr_name, constraint
+                        ),
+                        location,
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

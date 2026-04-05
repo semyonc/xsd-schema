@@ -36,7 +36,8 @@ use crate::parser::resolver::resolve_all_directives_async;
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
-    build_dependency_graph, validate_all_derivations, compile_all_patterns,
+    build_dependency_graph, validate_all_derivations, validate_attribute_id_constraints,
+    compile_all_patterns,
 };
 use crate::SchemaSet;
 
@@ -268,6 +269,11 @@ pub fn load_and_process_schema(
         validate_all_derivations(schema_set, &dep_graph)?;
     }
 
+    // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
+    if config.resolve_references {
+        validate_attribute_id_constraints(schema_set)?;
+    }
+
     // Phase 4.8: Validate substitution group membership constraints (e-props-correct.4)
     if config.resolve_references {
         crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
@@ -342,6 +348,9 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // Validate type derivation constraints
     let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
     validate_all_derivations(schema_set, &dep_graph)?;
+
+    // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
+    validate_attribute_id_constraints(schema_set)?;
 
     // Validate substitution group membership constraints (e-props-correct.4)
     crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
@@ -662,6 +671,11 @@ pub async fn load_and_process_schema_async(
     if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
+    }
+
+    // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
+    if config.resolve_references {
+        validate_attribute_id_constraints(schema_set)?;
     }
 
     // Phase 5: Allocate arena element declarations (sync)

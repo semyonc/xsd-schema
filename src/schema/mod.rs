@@ -89,7 +89,8 @@ pub use dependencies::{
 
 // Re-exports from derivation
 pub use derivation::{
-    validate_all_derivations, DerivationStats as DerivationValidationStats,
+    validate_all_derivations, validate_attribute_id_constraints,
+    DerivationStats as DerivationValidationStats,
 };
 
 // Re-exports from redefine
