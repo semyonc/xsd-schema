@@ -59,7 +59,10 @@ pub struct SchemaSetBuilder {
     schema_set: SchemaSet,
     resolver: SchemaResolver,
     pending_docs: Vec<DocumentId>,
+    /// Errors from mandatory directives (include/redefine/override)
     errors: Vec<SchemaError>,
+    /// Errors from xs:import directives
+    import_errors: Vec<SchemaError>,
 }
 
 impl SchemaSetBuilder {
@@ -76,6 +79,7 @@ impl SchemaSetBuilder {
             resolver,
             pending_docs: Vec::new(),
             errors: Vec::new(),
+            import_errors: Vec::new(),
         }
     }
 
@@ -89,6 +93,7 @@ impl SchemaSetBuilder {
             resolver,
             pending_docs: Vec::new(),
             errors: Vec::new(),
+            import_errors: Vec::new(),
         }
     }
 
@@ -102,6 +107,7 @@ impl SchemaSetBuilder {
             resolver,
             pending_docs: Vec::new(),
             errors: Vec::new(),
+            import_errors: Vec::new(),
         }
     }
 
@@ -115,6 +121,7 @@ impl SchemaSetBuilder {
             resolver,
             pending_docs: Vec::new(),
             errors: Vec::new(),
+            import_errors: Vec::new(),
         }
     }
 
@@ -137,6 +144,7 @@ impl SchemaSetBuilder {
             resolver,
             pending_docs: Vec::new(),
             errors: Vec::new(),
+            import_errors: Vec::new(),
         }
     }
 
@@ -319,6 +327,18 @@ impl SchemaSetBuilder {
         // Fixup cycle edges now that all documents have been loaded
         fixup_composition_edges(&mut self.schema_set);
 
+        // Propagate schema-content errors from directive resolution.
+        // Resolution/IO errors (file not found, network denied) are non-fatal
+        // for all directive types — the target may be unavailable.
+        // Schema-content errors (structural, XML parse, namespace) mean the
+        // target was found but is invalid — those are always fatal.
+        if let Some(err) = self.errors.into_iter()
+            .chain(self.import_errors)
+            .find(|e| e.is_schema_content_error())
+        {
+            return Err(err);
+        }
+
         // Phases 2-5: Delegate to the pipeline's shared processing function
         // (redefine/override, inline assembly, reference resolution, particle allocation)
         let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
@@ -348,9 +368,8 @@ impl SchemaSetBuilder {
         }
 
         // Collect errors (but don't fail immediately - continue processing)
-        if !result.errors.is_empty() {
-            self.errors.extend(result.errors);
-        }
+        self.errors.extend(result.errors);
+        self.import_errors.extend(result.import_errors);
 
         Ok(())
     }
@@ -366,9 +385,8 @@ impl SchemaSetBuilder {
             Box::pin(self.resolve_directives_recursive_async(loaded_id)).await?;
         }
 
-        if !result.errors.is_empty() {
-            self.errors.extend(result.errors);
-        }
+        self.errors.extend(result.errors);
+        self.import_errors.extend(result.import_errors);
 
         Ok(())
     }
@@ -404,6 +422,14 @@ impl SchemaSetBuilder {
 
         // Fixup cycle edges now that all documents have been loaded
         fixup_composition_edges(&mut self.schema_set);
+
+        // Propagate schema-content errors from directive resolution
+        if let Some(err) = self.errors.into_iter()
+            .chain(self.import_errors)
+            .find(|e| e.is_schema_content_error())
+        {
+            return Err(err);
+        }
 
         // Phases 2-5: Delegate to the pipeline's shared processing function (sync)
         let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;

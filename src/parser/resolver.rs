@@ -583,11 +583,22 @@ impl SchemaResolver {
             return Ok(Some(self.load_schema(location, base_uri, schema_set, None)?));
         }
 
-        // Otherwise, try catalog lookup
+        // Otherwise, try catalog lookup.
+        // Guard: skip if the catalog URL was already loaded (prevents duplicate
+        // declarations when a prior explicit import loaded the same file via a
+        // different path). We do NOT guard on namespace presence — that would
+        // break multi-document namespaces where several files share the same
+        // targetNamespace.
         if let Some(ns) = namespace {
             if let Some(location) = self.catalog.lookup(ns) {
                 let location = location.to_string();
-                return Ok(Some(self.load_schema(&location, base_uri, schema_set, None)?));
+                let catalog_already_loaded = self
+                    .resolve_location(&location, base_uri)
+                    .ok()
+                    .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
+                if !catalog_already_loaded {
+                    return Ok(Some(self.load_schema(&location, base_uri, schema_set, None)?));
+                }
             }
         }
 
@@ -822,11 +833,22 @@ pub async fn resolve_all_directives_async(
                         import.source.as_ref(), location,
                     );
                 }
-                Err(e) => result.errors.push(e),
+                Err(e) => result.import_errors.push(e),
             }
         } else if let Some(ns) = import.namespace.as_deref() {
             if let Some(location) = resolver.catalog.lookup(ns) {
                 let location = location.to_string();
+                // Same guard as the sync path: skip if the catalog URL was
+                // already loaded to prevent duplicate-declaration errors when
+                // the catalog and a prior explicit import resolve to different
+                // URLs pointing at the same namespace content.
+                let catalog_already_loaded = resolver
+                    .resolve_location(&location, &base_uri)
+                    .ok()
+                    .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
+                if catalog_already_loaded {
+                    continue;
+                }
                 match resolver.load_schema_async(&location, &base_uri, schema_set, None).await {
                     Ok(ref outcome) => {
                         if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
@@ -840,7 +862,7 @@ pub async fn resolve_all_directives_async(
                             import.source.as_ref(), &location,
                         );
                     }
-                    Err(e) => result.errors.push(e),
+                    Err(e) => result.import_errors.push(e),
                 }
             }
         }
@@ -904,6 +926,7 @@ fn is_absolute_uri(uri: &str) -> bool {
     uri.starts_with("http://")
         || uri.starts_with("https://")
         || uri.starts_with("file://")
+        || uri.starts_with("embedded://")
         || (cfg!(windows) && uri.len() >= 2 && &uri[1..2] == ":")
         || uri.starts_with('/')
 }
@@ -975,8 +998,10 @@ fn normalize_path(path: &Path) -> PathBuf {
 pub struct ResolutionResult {
     /// Document IDs of successfully loaded schemas
     pub loaded: Vec<DocumentId>,
-    /// Errors encountered during resolution
+    /// Errors from include/redefine/override directives
     pub errors: Vec<SchemaError>,
+    /// Errors from xs:import directives
+    pub import_errors: Vec<SchemaError>,
     /// Schemas that were already loaded (circular references)
     pub skipped: Vec<String>,
 }
@@ -984,7 +1009,7 @@ pub struct ResolutionResult {
 impl ResolutionResult {
     /// Check if resolution was fully successful
     pub fn is_ok(&self) -> bool {
-        self.errors.is_empty()
+        self.errors.is_empty() && self.import_errors.is_empty()
     }
 
     /// Check if any schemas were loaded
@@ -1195,7 +1220,7 @@ pub fn resolve_all_directives(
             Ok(None) => {
                 // No schemaLocation and no catalog match — no edge to record
             }
-            Err(e) => result.errors.push(e),
+            Err(e) => result.import_errors.push(e),
         }
     }
 

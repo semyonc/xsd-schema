@@ -118,7 +118,7 @@ impl From<&ResolutionResult> for DirectiveStats {
         Self {
             loaded_count: result.loaded.len(),
             skipped_count: result.skipped.len(),
-            error_count: result.errors.len(),
+            error_count: result.errors.len() + result.import_errors.len(),
         }
     }
 }
@@ -186,9 +186,11 @@ pub fn load_and_process_schema(
         // Process directives for the primary document
         let dir_result = resolve_all_directives(doc_id, &mut resolver, schema_set);
 
-        // Collect loaded document IDs
+        // Collect loaded document IDs and errors
         stats.loaded_docs.extend(dir_result.loaded.iter().copied());
         stats.directive_result = Some(DirectiveStats::from(&dir_result));
+        let mut directive_errors: Vec<crate::error::SchemaError> = dir_result.errors;
+        let mut import_errors: Vec<crate::error::SchemaError> = dir_result.import_errors;
 
         // Recursively process directives in loaded documents
         let mut pending_docs = dir_result.loaded.clone();
@@ -203,22 +205,24 @@ pub fn load_and_process_schema(
                 if let Some(ref mut dir_stats) = stats.directive_result {
                     dir_stats.loaded_count += nested_result.loaded.len();
                     dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count += nested_result.errors.len();
+                    dir_stats.error_count += nested_result.errors.len()
+                        + nested_result.import_errors.len();
                 }
+                directive_errors.extend(nested_result.errors);
+                import_errors.extend(nested_result.import_errors);
             }
         }
 
         // Fixup cycle edges now that all documents have been loaded
         fixup_composition_edges(schema_set);
 
-        // If there were directive errors and error_recovery is off, return first error
-        if !config.parser.error_recovery {
-            if let Some(ref dir_stats) = stats.directive_result {
-                if dir_stats.error_count > 0 {
-                    // We already collected stats; the error details were logged
-                    // In strict mode we could return an error here
-                }
-            }
+        // Propagate schema-content errors from directive resolution.
+        // Resolution/IO errors are non-fatal for all directive types.
+        if let Some(err) = directive_errors.into_iter()
+            .chain(import_errors)
+            .find(|e| e.is_schema_content_error())
+        {
+            return Err(err);
         }
     }
 
@@ -590,6 +594,8 @@ pub async fn load_and_process_schema_async(
 
         stats.loaded_docs.extend(dir_result.loaded.iter().copied());
         stats.directive_result = Some(DirectiveStats::from(&dir_result));
+        let mut directive_errors: Vec<crate::error::SchemaError> = dir_result.errors;
+        let mut import_errors: Vec<crate::error::SchemaError> = dir_result.import_errors;
 
         // Recursively process directives in loaded documents
         let mut pending_docs = dir_result.loaded.clone();
@@ -604,20 +610,23 @@ pub async fn load_and_process_schema_async(
                 if let Some(ref mut dir_stats) = stats.directive_result {
                     dir_stats.loaded_count += nested_result.loaded.len();
                     dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count += nested_result.errors.len();
+                    dir_stats.error_count += nested_result.errors.len()
+                        + nested_result.import_errors.len();
                 }
+                directive_errors.extend(nested_result.errors);
+                import_errors.extend(nested_result.import_errors);
             }
         }
 
         // Fixup cycle edges now that all documents have been loaded
         fixup_composition_edges(schema_set);
 
-        if !config.parser.error_recovery {
-            if let Some(ref dir_stats) = stats.directive_result {
-                if dir_stats.error_count > 0 {
-                    // Errors were collected in stats
-                }
-            }
+        // Propagate schema-content errors from directive resolution
+        if let Some(err) = directive_errors.into_iter()
+            .chain(import_errors)
+            .find(|e| e.is_schema_content_error())
+        {
+            return Err(err);
         }
     }
 

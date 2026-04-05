@@ -252,6 +252,22 @@ impl SchemaError {
             other => other,
         }
     }
+
+    /// Returns `true` for errors that indicate the schema *content* is invalid
+    /// (structural, namespace, XML parse, feature-gate errors).
+    ///
+    /// Returns `false` for resolution/IO errors, which mean the schema could
+    /// not be *located* — these are non-fatal during import processing because
+    /// `xs:import` schema locations are hints, not requirements.
+    pub fn is_schema_content_error(&self) -> bool {
+        matches!(
+            self,
+            SchemaError::StructuralError { .. }
+                | SchemaError::NamespaceError { .. }
+                | SchemaError::XmlError { .. }
+                | SchemaError::FeatureError { .. }
+        )
+    }
 }
 
 /// Conversion from quick-xml errors
