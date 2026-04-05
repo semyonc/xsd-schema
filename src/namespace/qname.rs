@@ -15,7 +15,7 @@ use std::fmt;
 /// - Optional prefix (e.g., "xs" in "xs:string")
 /// - Local name (e.g., "string" in "xs:string")
 /// - Resolved namespace URI (e.g., XSD namespace)
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub struct QualifiedName {
     /// Namespace URI (None = no namespace)
     pub namespace_uri: Option<NameId>,
@@ -23,6 +23,23 @@ pub struct QualifiedName {
     pub local_name: NameId,
     /// Original prefix (None = unprefixed)
     pub prefix: Option<NameId>,
+}
+
+/// QName equality is defined by namespace URI + local name only (per XML Namespaces).
+/// The prefix is a syntactic artifact and does not affect identity.
+impl PartialEq for QualifiedName {
+    fn eq(&self, other: &Self) -> bool {
+        self.namespace_uri == other.namespace_uri && self.local_name == other.local_name
+    }
+}
+
+impl Eq for QualifiedName {}
+
+impl std::hash::Hash for QualifiedName {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.namespace_uri.hash(state);
+        self.local_name.hash(state);
+    }
 }
 
 impl QualifiedName {

@@ -18,6 +18,7 @@ use crate::namespace::table::well_known;
 use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::DerivationSet;
+use crate::schema::resolver::format_resolved_qname;
 use crate::schema::SchemaSet;
 use crate::types::XmlTypeCode;
 use crate::types::value::XmlValue;
@@ -130,6 +131,9 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     pending_idrefs: Vec<(String, Option<SourceLocation>, String)>,
     /// Per-element scope stack of key/unique tables
     ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
+    /// Keyrefs whose refer target was not yet available when they deactivated.
+    /// Carried upward and retried after each scope propagation.
+    deferred_keyrefs: Vec<(KeyTable, Option<IdentityConstraintKey>)>,
     /// Which assertion evaluation path is active (XSD 1.1 only)
     #[cfg(feature = "xsd11")]
     pub(crate) assertion_source: AssertionSource,
@@ -187,6 +191,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             id_values: HashSet::new(),
             pending_idrefs: Vec::new(),
             ic_scope_tables: Vec::new(),
+            deferred_keyrefs: Vec::new(),
             final_ic_tables: None,
             schema_location_hints: Vec::new(),
             no_namespace_schema_location_hints: Vec::new(),
@@ -1880,9 +1885,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ev_state.content_type,
             Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
         );
+        // Resolve QName/NOTATION typed values for IC comparison (namespace-aware).
+        // Use a separate copy to preserve the original PSVI typed_value.
+        let ic_typed_value = Self::resolve_ic_qname_value(
+            &ev_state.typed_value,
+            &ev_state.text_content,
+            ev_state.ns_context.as_ref(),
+            &self.schema_set.name_table,
+        );
+        let ic_ref = ic_typed_value.as_ref().or(ev_state.typed_value.as_ref());
         self.process_constraints_end_element(
             &ev_state.text_content,
-            ev_state.typed_value.as_ref(),
+            ic_ref,
             ev_state.is_nil,
             is_complex_content,
             &mut ev_state.error_codes,
@@ -1903,6 +1917,68 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             } else {
                 // Root element — save for public access via identity_constraint_tables()
                 self.final_ic_tables = Some(scope_map);
+            }
+        }
+
+        // 3c. Retry deferred keyrefs against enriched parent scope
+        if !self.deferred_keyrefs.is_empty() {
+            let pending = std::mem::take(&mut self.deferred_keyrefs);
+            let name_table = &self.schema_set.name_table;
+            let scope_empty = self.ic_scope_tables.is_empty();
+            let mut still_deferred = Vec::new();
+            let mut deferred_errors = Vec::new();
+            for (keyref_table, refer_key) in pending {
+                let target = refer_key.and_then(|rk| {
+                    self.ic_scope_tables
+                        .last()
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|map| map.get(&rk))
+                });
+                match target {
+                    Some(target_table) => {
+                        let errs =
+                            keyref_table.check_keyref_against(target_table, name_table);
+                        deferred_errors.extend(errs);
+                    }
+                    None => {
+                        if scope_empty {
+                            // Root element closed — no more ancestors to try
+                            let keyref_name =
+                                name_table.resolve(keyref_table.constraint_name);
+                            let refer_display = self
+                                .compiled_constraints
+                                .get(&keyref_table.ic_key)
+                                .and_then(|opt| opt.as_ref())
+                                .and_then(|compiled| {
+                                    compiled.refer.as_ref().map(|refer| {
+                                        let refer_ns =
+                                            refer.namespace.or(compiled.target_namespace);
+                                        format_resolved_qname(
+                                            name_table, refer_ns, refer.local_name,
+                                        )
+                                    })
+                                })
+                                .unwrap_or_else(|| "<unknown>".to_string());
+                            deferred_errors.push(errors::error(
+                                "cvc-identity-constraint.4.3",
+                                format!(
+                                    "Keyref '{}' references unknown constraint '{}'",
+                                    keyref_name, refer_display
+                                ),
+                                None,
+                            ));
+                        } else {
+                            still_deferred.push((keyref_table, refer_key));
+                        }
+                    }
+                }
+            }
+            self.deferred_keyrefs = still_deferred;
+            // Emit deferred errors directly through the sink (not emit_error) because
+            // the original keyref element has already been popped from validation_stack.
+            // Using emit_error() would misattribute the error to the current ancestor.
+            for err in deferred_errors {
+                self.sink.on_error(err);
             }
         }
 
@@ -2666,18 +2742,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.resolve_refer_key(refer.local_name, refer_ns);
                         if compiled.refer_key.is_none() {
                             let name = self.schema_set.name_table.resolve(ic_name);
-                            let refer_display = match refer_ns {
-                                Some(ns) => format!(
-                                    "{{{}}}{}",
-                                    self.schema_set.name_table.resolve(ns),
-                                    self.schema_set.name_table.resolve(refer.local_name)
-                                ),
-                                None => self
-                                    .schema_set
-                                    .name_table
-                                    .resolve(refer.local_name)
-                                    .to_string(),
-                            };
+                            let refer_display = format_resolved_qname(
+                                &self.schema_set.name_table,
+                                refer_ns,
+                                refer.local_name,
+                            );
                             self.sink.on_warning(ValidationWarning {
                                 code: "cvc-identity-constraint",
                                 message: format!(
@@ -2815,8 +2884,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
             // Cross-reference each keyref against key/unique tables in current scope.
             // The scope map already contains child-propagated tables.
+            // If the target isn't in scope yet (ancestor key), defer to parent.
             let name_table = &self.schema_set.name_table;
-            for (keyref_table, refer_key) in &scope_keyrefs {
+            for (keyref_table, refer_key) in scope_keyrefs {
                 let target = refer_key.and_then(|rk| {
                     self.ic_scope_tables
                         .last()
@@ -2831,31 +2901,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         }
                     }
                     None => {
-                        let keyref_name = name_table.resolve(keyref_table.constraint_name);
-                        let refer_display = self
-                            .compiled_constraints
-                            .get(&keyref_table.ic_key)
-                            .and_then(|opt| opt.as_ref())
-                            .and_then(|compiled| compiled.refer.as_ref().map(|refer| {
-                                let refer_ns = refer.namespace.or(compiled.target_namespace);
-                                match refer_ns {
-                                    Some(ns) => format!(
-                                        "{{{}}}{}",
-                                        name_table.resolve(ns),
-                                        name_table.resolve(refer.local_name)
-                                    ),
-                                    None => name_table.resolve(refer.local_name).to_string(),
-                                }
-                            }))
-                            .unwrap_or_else(|| "<unknown>".to_string());
-                        self.emit_error_to(errors::error(
-                            "cvc-identity-constraint.4.3",
-                            format!(
-                                "Keyref '{}' references unknown constraint '{}'",
-                                keyref_name, refer_display
-                            ),
-                            location.clone(),
-                        ), error_codes);
+                        // Target not yet in scope — defer to ancestor element end
+                        self.deferred_keyrefs.push((keyref_table, refer_key));
                     }
                 }
             }
@@ -3176,12 +3223,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let ns = namespace.unwrap_or(NameId(0));
 
         // Identity constraint: check field attribute matches
+        let ns_ctx = self.validation_stack.last().and_then(|ev| ev.ns_context.as_ref());
+        let ic_typed_value = Self::resolve_ic_qname_value(
+            &result.typed_value, value, ns_ctx, &self.schema_set.name_table,
+        ).or_else(|| result.typed_value.clone());
         let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
         for cs in &mut self.active_constraints {
             let matches = cs.matching_fields(local_name, ns);
             for field_idx in matches {
                 let already_matched =
-                    cs.set_field_value(field_idx, value.to_string(), result.typed_value.clone());
+                    cs.set_field_value(field_idx, value.to_string(), ic_typed_value.clone());
                 if already_matched {
                     multi_node_ic.push((cs.key_table.constraint_name, field_idx));
                 }
@@ -3236,6 +3287,37 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.schema_set.lookup_notation(qn.namespace_uri, qn.local_name)
     }
 
+    /// Resolve a QName/NOTATION-typed value for IC purposes.
+    ///
+    /// QName values from simple type validation are stored as `XmlAtomicValue::String`
+    /// because namespace context wasn't available at validation time. For IC field
+    /// value comparison, we need namespace-aware QNames. Returns a new resolved
+    /// copy (does NOT mutate the original, preserving PSVI integrity).
+    fn resolve_ic_qname_value(
+        typed_value: &Option<XmlValue>,
+        string_value: &str,
+        ns_context: Option<&NamespaceContextSnapshot>,
+        name_table: &crate::namespace::table::NameTable,
+    ) -> Option<XmlValue> {
+        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        let val = typed_value.as_ref()?;
+        if val.type_code != XmlTypeCode::QName && val.type_code != XmlTypeCode::Notation {
+            return None;
+        }
+        let ctx = ns_context?;
+        let qn = parse_qname_with_snapshot(string_value, ctx, name_table, true).ok()?;
+        let atom = if val.type_code == XmlTypeCode::Notation {
+            XmlAtomicValue::Notation(qn)
+        } else {
+            XmlAtomicValue::QName(qn)
+        };
+        Some(XmlValue {
+            type_code: val.type_code,
+            schema_type: val.schema_type,
+            value: XmlValueKind::Atomic(atom),
+        })
+    }
+
     /// Initialize content model and ContentType from a TypeKey
     fn init_content_model(&self, type_key: Option<TypeKey>) -> (ContentValidatorState, ContentType) {
         match type_key {
@@ -3269,7 +3351,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         use crate::parser::frames::ComplexContentResult;
         use crate::parser::frames::DerivationMethod;
         match &ct_data.content {
-            ComplexContentResult::Empty => ContentType::Empty,
+            ComplexContentResult::Empty => {
+                if ct_data.mixed {
+                    ContentType::Mixed
+                } else {
+                    ContentType::Empty
+                }
+            }
             ComplexContentResult::Simple(_) => ContentType::TextOnly,
             ComplexContentResult::Complex(def) => {
                 if def.particle.is_none() && !ct_data.mixed {

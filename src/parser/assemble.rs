@@ -352,6 +352,8 @@ impl<'a> SchemaAssembler<'a> {
             self.target_namespace,
             &self.schema_set.name_table,
             &self.schema_set.source_maps,
+            &self.schema_set.arenas.identity_constraints,
+            &self.schema_set.documents,
         )?;
 
         // Allocate identity constraints into the arena

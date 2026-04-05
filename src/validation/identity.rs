@@ -24,6 +24,15 @@ use super::errors::{error, error_with_path, ValidationError};
 use crate::arenas::IdentityConstraintData;
 use crate::ids::IdentityConstraintKey;
 
+/// IC value-space equality: compare type_code + value, ignoring schema_type.
+///
+/// XSD identity constraints compare values in value-space, not by schema type
+/// identity. Two identical primitive values from different anonymous type
+/// restrictions must be considered equal.
+fn xml_value_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
+    a.type_code == b.type_code && a.value == b.value
+}
+
 // ---------------------------------------------------------------------------
 // CompiledIdentityConstraint
 // ---------------------------------------------------------------------------
@@ -159,10 +168,10 @@ impl PartialEq for KeyFieldValue {
                         if pa == PrimitiveTypeCode::Decimal {
                             match (a.as_decimal(), b.as_decimal()) {
                                 (Some(da), Some(db)) => da == db,
-                                _ => a == b,
+                                _ => xml_value_ic_eq(a, b),
                             }
                         } else {
-                            a == b
+                            xml_value_ic_eq(a, b)
                         }
                     }
                     (Some(_), Some(_)) => false, // different primitive types → never equal

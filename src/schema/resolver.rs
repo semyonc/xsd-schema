@@ -199,7 +199,7 @@ impl<'a> ReferenceResolver<'a> {
 }
 
 /// Format a resolved QName (namespace + local name) for error messages.
-fn format_resolved_qname(
+pub(crate) fn format_resolved_qname(
     name_table: &crate::namespace::NameTable,
     namespace: Option<crate::ids::NameId>,
     local_name: crate::ids::NameId,
