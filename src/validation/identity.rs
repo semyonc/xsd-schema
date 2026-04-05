@@ -15,6 +15,7 @@ use crate::parser::frames::{IdentityKind, QNameRef};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::XsdVersion;
 use crate::types::value::XmlValue;
+use crate::types::PrimitiveTypeCode;
 
 use super::active_axis::ActiveAxis;
 use super::asttree::{Asttree, IdentityXPathError};
@@ -129,10 +130,14 @@ impl CompiledIdentityConstraint {
 /// Per-field extracted value for key sequence equality.
 ///
 /// Equality semantics follow the XSD spec:
-/// - If both have `typed_value` with the same `PrimitiveTypeCode`, compare via
-///   `XmlValue::PartialEq` (structural comparison of `XmlValueKind`).
-/// - Otherwise, compare `string_value` (string equality).
+/// - If both have `typed_value` with the same `PrimitiveTypeCode`, compare in
+///   value space.  For the `Decimal` primitive type (which covers `xs:decimal`,
+///   `xs:integer`, and all integer-derived types), comparison is performed
+///   numerically so that, e.g., `xs:decimal "1"` equals `xs:unsignedByte "1"`.
+/// - For all other primitive types with the same `PrimitiveTypeCode`, compare
+///   via `XmlValue::PartialEq` (structural comparison of `XmlValueKind`).
 /// - Different primitive types are *never* equal (no type promotion for IC equality).
+/// - If either value is untyped, compare `string_value` (string equality).
 #[derive(Debug, Clone)]
 pub struct KeyFieldValue {
     pub string_value: String,
@@ -146,7 +151,20 @@ impl PartialEq for KeyFieldValue {
                 let prim_a = a.primitive_type();
                 let prim_b = b.primitive_type();
                 match (prim_a, prim_b) {
-                    (Some(pa), Some(pb)) if pa == pb => a == b,
+                    (Some(pa), Some(pb)) if pa == pb => {
+                        // XSD value-space equality: for the decimal hierarchy
+                        // (xs:decimal, xs:integer, and all derived integer types)
+                        // different storage variants (Decimal vs Integer) must be
+                        // compared numerically, not structurally.
+                        if pa == PrimitiveTypeCode::Decimal {
+                            match (a.as_decimal(), b.as_decimal()) {
+                                (Some(da), Some(db)) => da == db,
+                                _ => a == b,
+                            }
+                        } else {
+                            a == b
+                        }
+                    }
                     (Some(_), Some(_)) => false, // different primitive types → never equal
                     _ => self.string_value == other.string_value,
                 }
@@ -350,6 +368,9 @@ struct FieldCollectionFrame {
     fields: Vec<ActiveAxis>,
     /// Current key sequence being collected (one slot per field).
     current_key_sequence: Vec<Option<KeyFieldValue>>,
+    /// How many times each field slot has been matched so far.
+    /// Used to detect multi-node field violations (§3.11.4 cvc-identity-constraint.4.2.1).
+    field_match_count: Vec<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -460,20 +481,48 @@ impl ConstraintStruct {
     }
 
     /// Store a field value at the given index in the topmost collection frame.
+    ///
+    /// Returns `true` if this is a second (or later) match for the same field slot
+    /// in the current selector-bound element — the caller should report
+    /// `cvc-identity-constraint.4.2.1`.
     pub fn set_field_value(
         &mut self,
         field_idx: usize,
         string_value: String,
         typed_value: Option<XmlValue>,
-    ) {
+    ) -> bool {
         if let Some(frame) = self.collection_stack.last_mut() {
             if field_idx < frame.current_key_sequence.len() {
+                let already_matched = frame.field_match_count[field_idx] > 0;
+                frame.field_match_count[field_idx] =
+                    frame.field_match_count[field_idx].saturating_add(1);
                 frame.current_key_sequence[field_idx] = Some(KeyFieldValue {
                     string_value,
                     typed_value,
                 });
+                return already_matched;
             }
         }
+        false
+    }
+
+    /// Increment the field match count without storing a value.
+    ///
+    /// Used for skip-processed wildcard attributes: the attribute is selected by
+    /// the field XPath (counts toward multi-node detection) but cannot contribute
+    /// a typed value, so the field slot stays absent.
+    ///
+    /// Returns `true` if this is a second (or later) match for the same field slot.
+    pub fn increment_field_match_count(&mut self, field_idx: usize) -> bool {
+        if let Some(frame) = self.collection_stack.last_mut() {
+            if field_idx < frame.field_match_count.len() {
+                let already_matched = frame.field_match_count[field_idx] > 0;
+                frame.field_match_count[field_idx] =
+                    frame.field_match_count[field_idx].saturating_add(1);
+                return already_matched;
+            }
+        }
+        false
     }
 
     /// Handle an element end event with text content for element-field matching.
@@ -481,10 +530,24 @@ impl ConstraintStruct {
     /// Advances field axes in ALL frames FIRST (to detect `exited_match` and
     /// set values from text content), THEN advances the selector.
     /// On selector exit, pops the topmost frame and finalizes its key sequence.
+    ///
+    /// `is_nil` indicates that the element carries `xsi:nil="true"`.  Nilled
+    /// elements have no typed value but ARE selected by field XPaths; they
+    /// contribute an empty-string field value (with no type information) so
+    /// that two nil sibling elements are detected as duplicates under
+    /// `xs:unique` / `xs:key`.
+    ///
+    /// `is_complex_content` must be `true` when the closing element has element-only
+    /// or mixed content type.  Per XSD §3.11.4 (cvc-identity-constraint.4), a field
+    /// that selects such an element cannot yield a valid typed value; the constraint
+    /// is violated for every identity-constraint kind (key *and* unique).
+    #[allow(clippy::too_many_arguments)]
     pub fn end_element_with_text(
         &mut self,
         text_content: &str,
         typed_value: Option<&XmlValue>,
+        is_nil: bool,
+        is_complex_content: bool,
         name_table: &NameTable,
         element_path: &str,
         location: Option<SourceLocation>,
@@ -495,16 +558,62 @@ impl ConstraintStruct {
         for frame in &mut self.collection_stack {
             for (field_idx, field) in frame.fields.iter_mut().enumerate() {
                 field.end_element();
-                if field.exited_match() && frame.current_key_sequence[field_idx].is_none() {
-                    // Guard: only set field value when the element has a valid simple
-                    // typed_value.  For Mixed/ElementOnly/Empty content types and for
-                    // nilled elements, typed_value is None — the element cannot contribute
-                    // a meaningful IC field value, so the slot stays None (absent).
-                    if typed_value.is_some() {
-                        frame.current_key_sequence[field_idx] = Some(KeyFieldValue {
-                            string_value: text_content.to_string(),
-                            typed_value: typed_value.cloned(),
-                        });
+                if field.exited_match() {
+                    if frame.field_match_count[field_idx] > 0 {
+                        // §3.11.4 cvc-identity-constraint.4.2.1: field evaluates to
+                        // a node-set with more than one member.
+                        let name = name_table.resolve(self.key_table.constraint_name);
+                        errors.push(error_with_path(
+                            "cvc-identity-constraint.4.2.1",
+                            format!(
+                                "Identity constraint '{}': field {} matches more than one node",
+                                name,
+                                field_idx + 1
+                            ),
+                            location.clone(),
+                            element_path,
+                        ));
+                    } else if frame.current_key_sequence[field_idx].is_none() {
+                        // First match — set the field value (or report complex content error).
+                        frame.field_match_count[field_idx] =
+                            frame.field_match_count[field_idx].saturating_add(1);
+                        if is_complex_content {
+                            // XSD §3.11.4 cvc-identity-constraint.4: a field that selects an
+                            // element with element-only or mixed content type cannot contribute
+                            // a typed value.  This is a constraint violation for both xs:key
+                            // and xs:unique (not merely "absent"), because the node IS present
+                            // but its type precludes a meaningful field value.
+                            let constraint_name =
+                                name_table.resolve(self.key_table.constraint_name);
+                            errors.push(error_with_path(
+                                "cvc-identity-constraint.4",
+                                format!(
+                                    "Identity constraint '{}': field matched an element with \
+                                     complex content type (element-only or mixed); \
+                                     typed field values must be simple-typed",
+                                    constraint_name
+                                ),
+                                location.clone(),
+                                element_path,
+                            ));
+                        } else if typed_value.is_some() {
+                            // Normal case: element has a simple typed value.
+                            frame.current_key_sequence[field_idx] = Some(KeyFieldValue {
+                                string_value: text_content.to_string(),
+                                typed_value: typed_value.cloned(),
+                            });
+                        } else if is_nil {
+                            // Nilled element (xsi:nil="true"): the typed value is absent
+                            // but the element node IS selected.  Contribute an empty-string
+                            // binding (no type) so that two nil siblings compare equal and
+                            // trigger a duplicate violation under xs:unique / xs:key.
+                            frame.current_key_sequence[field_idx] = Some(KeyFieldValue {
+                                string_value: String::new(),
+                                typed_value: None,
+                            });
+                        }
+                        // For empty-content elements that are neither typed nor nilled,
+                        // the slot stays None (absent).
                     }
                 }
             }
@@ -551,6 +660,7 @@ impl ConstraintStruct {
         self.collection_stack.push(FieldCollectionFrame {
             fields,
             current_key_sequence: vec![None; self.field_count],
+            field_match_count: vec![0; self.field_count],
         });
     }
 }
@@ -996,7 +1106,7 @@ mod tests {
         cs.set_field_value(0, "val1".to_string(), None);
 
         // End element — should finalize key sequence
-        let errors = cs.end_element_with_text("", None, &nt, "/root/item[1]", None);
+        let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item[1]", None);
         assert!(errors.is_empty());
 
         // Key table should have one sequence
@@ -1052,7 +1162,7 @@ mod tests {
         cs.set_field_value(0, "inner".to_string(), None);
 
         // End inner </item> — finalizes inner sequence
-        let errors = cs.end_element_with_text("", None, &nt, "/root/item/item", None);
+        let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item/item", None);
         assert!(errors.is_empty());
         assert_eq!(cs.key_table.sequences.len(), 1);
         assert_eq!(
@@ -1067,7 +1177,7 @@ mod tests {
         assert!(cs.collecting_fields());
 
         // End outer </item> — finalizes outer sequence
-        let errors = cs.end_element_with_text("", None, &nt, "/root/item", None);
+        let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item", None);
         assert!(errors.is_empty());
         assert_eq!(cs.key_table.sequences.len(), 2);
         assert_eq!(
@@ -1115,7 +1225,7 @@ mod tests {
         cs.set_field_value(0, "v".to_string(), None);
         cs.set_field_value(1, "v".to_string(), None);
 
-        let errors = cs.end_element_with_text("", None, &nt, "/root/item", None);
+        let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item", None);
         assert!(errors.is_empty());
         assert!(cs.key_table.sequences[0].is_complete());
     }

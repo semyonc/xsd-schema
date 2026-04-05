@@ -1133,6 +1133,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                 }
             }
+            // XSD IC field XPaths (e.g. @*) match all attributes including xsi:*.
+            // Feed xsi: attributes to IC field matching so that a field selecting
+            // @* on an element with both schema and xsi: attributes correctly
+            // detects the multi-node condition (cvc-identity-constraint.4.2.1).
+            self.post_process_attribute(local_name, namespace, value, &result);
             return result;
         }
 
@@ -1394,13 +1399,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
             // Feed IC field matches (borrow-split: active_constraints borrows &mut self)
+            let mut multi_node_defaults: Vec<(NameId, usize)> = Vec::new();
             for (name, ns, value) in ic_defaults {
                 for cs in &mut self.active_constraints {
                     let matches = cs.matching_fields(name, ns);
                     for field_idx in matches {
-                        cs.set_field_value(field_idx, value.clone(), None);
+                        let already_matched = cs.set_field_value(field_idx, value.clone(), None);
+                        if already_matched {
+                            multi_node_defaults.push((cs.key_table.constraint_name, field_idx));
+                        }
                     }
                 }
+            }
+            for (constraint_name, field_idx) in multi_node_defaults {
+                let cname = self.schema_set.name_table.resolve(constraint_name).to_string();
+                self.report_error(
+                    "cvc-identity-constraint.4.2.1",
+                    format!(
+                        "Identity constraint '{}': field {} matches more than one node",
+                        cname,
+                        field_idx + 1
+                    ),
+                );
             }
             // Validate and collect ID/IDREF values from absent defaults
             for (value, type_key) in id_defaults {
@@ -1856,7 +1876,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
-        self.process_constraints_end_element(&ev_state.text_content, ev_state.typed_value.as_ref(), &mut ev_state.error_codes);
+        let is_complex_content = matches!(
+            ev_state.content_type,
+            Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
+        );
+        self.process_constraints_end_element(
+            &ev_state.text_content,
+            ev_state.typed_value.as_ref(),
+            ev_state.is_nil,
+            is_complex_content,
+            &mut ev_state.error_codes,
+        );
 
         // 3b. Pop scope table and propagate key/unique tables upward to parent
         if let Some(Some(scope_map)) = self.ic_scope_tables.pop() {
@@ -2715,6 +2745,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         &mut self,
         text_content: &str,
         typed_value: Option<&XmlValue>,
+        is_nil: bool,
+        is_complex_content: bool,
         error_codes: &mut Vec<&'static str>,
     ) {
         let name_table = &self.schema_set.name_table;
@@ -2727,6 +2759,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let errs = cs.end_element_with_text(
                 text_content,
                 typed_value,
+                is_nil,
+                is_complex_content,
                 name_table,
                 &element_path,
                 location.clone(),
@@ -3023,7 +3057,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 }
                             }
                         }
-                        self.post_process_attribute(local_name, namespace, value, &result);
+                        if wildcard.process_contents == ProcessContents::Skip {
+                            // Skip-processed attributes cannot contribute a typed value to
+                            // an IC field (§3.11.4), so the field slot stays absent — xs:key
+                            // will report a missing-field violation.  However, the attribute
+                            // IS still selected by the field XPath, so it must count toward
+                            // multi-node detection (cvc-identity-constraint.4.2.1).
+                            let ns = namespace.unwrap_or(NameId(0));
+                            let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
+                            for cs in &mut self.active_constraints {
+                                let matches = cs.matching_fields(local_name, ns);
+                                for field_idx in matches {
+                                    if cs.increment_field_match_count(field_idx) {
+                                        multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                                    }
+                                }
+                            }
+                            for (constraint_name, field_idx) in multi_node_ic {
+                                let name = self.schema_set.name_table.resolve(constraint_name).to_string();
+                                self.report_error(
+                                    "cvc-identity-constraint.4.2.1",
+                                    format!(
+                                        "Identity constraint '{}': field {} matches more than one node",
+                                        name, field_idx + 1
+                                    ),
+                                );
+                            }
+                        } else {
+                            self.post_process_attribute(local_name, namespace, value, &result);
+                        }
                         return result;
                     }
                 }
@@ -3114,11 +3176,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let ns = namespace.unwrap_or(NameId(0));
 
         // Identity constraint: check field attribute matches
+        let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
         for cs in &mut self.active_constraints {
             let matches = cs.matching_fields(local_name, ns);
             for field_idx in matches {
-                cs.set_field_value(field_idx, value.to_string(), result.typed_value.clone());
+                let already_matched =
+                    cs.set_field_value(field_idx, value.to_string(), result.typed_value.clone());
+                if already_matched {
+                    multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                }
             }
+        }
+        for (constraint_name, field_idx) in multi_node_ic {
+            let name = self.schema_set.name_table.resolve(constraint_name).to_string();
+            self.report_error(
+                "cvc-identity-constraint.4.2.1",
+                format!(
+                    "Identity constraint '{}': field {} matches more than one node",
+                    name,
+                    field_idx + 1
+                ),
+            );
         }
 
         // ID/IDREF collection
