@@ -1,5 +1,7 @@
 # CLAUDE.md - xsd-schema build instructions
 
+The standard: https://www.w3.org/TR/xmlschema11-1/
+
 ## Build Workflow
 
 After making code changes, always run clippy and tests for **both** feature configurations:
