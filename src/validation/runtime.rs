@@ -17,7 +17,7 @@ use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
 use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
-use crate::schema::model::DerivationSet;
+use crate::schema::model::{DerivationSet, XsdVersion};
 use crate::schema::resolver::format_resolved_qname;
 use crate::schema::SchemaSet;
 use crate::types::XmlTypeCode;
@@ -125,10 +125,16 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     compiled_constraints: HashMap<IdentityConstraintKey, Option<CompiledIdentityConstraint>>,
     /// Active constraint state instances
     active_constraints: Vec<ConstraintStruct>,
-    /// Collected ID values (for cvc-id.2 duplicate check and cvc-id.1 IDREF validation)
-    id_values: HashSet<String>,
+    /// Collected ID values mapped to the owner element serial.
+    /// XSD 1.1 §3.17.5.2: same ID on the same owner element is allowed.
+    id_values: HashMap<String, u64>,
+    /// Monotonically increasing element serial counter for ID binding.
+    next_element_serial: u64,
     /// Pending IDREF values: (value, location, element_path)
     pending_idrefs: Vec<(String, Option<SourceLocation>, String)>,
+    /// Declared unparsed entity names from the document's DTD.
+    /// When set, ENTITY/ENTITIES values are checked against this set (§3.16.4).
+    unparsed_entities: Option<HashSet<String>>,
     /// Per-element scope stack of key/unique tables
     ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
     /// Keyrefs whose refer target was not yet available when they deactivated.
@@ -188,8 +194,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             element_path: String::new(),
             compiled_constraints: HashMap::new(),
             active_constraints: Vec::new(),
-            id_values: HashSet::new(),
+            id_values: HashMap::new(),
+            next_element_serial: 0,
             pending_idrefs: Vec::new(),
+            unparsed_entities: None,
             ic_scope_tables: Vec::new(),
             deferred_keyrefs: Vec::new(),
             final_ic_tables: None,
@@ -228,6 +236,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// tables accumulated during the root element's validation scope.
     pub fn identity_constraint_tables(&self) -> Option<&HashMap<IdentityConstraintKey, KeyTable>> {
         self.final_ic_tables.as_ref()
+    }
+
+    /// Set the declared unparsed entity names from the document's DTD.
+    ///
+    /// When set, ENTITY/ENTITIES values are validated against this set per
+    /// §3.16.4 String Valid clause 3: "Every ENTITY value in V is a declared
+    /// entity name."
+    pub fn set_unparsed_entities(&mut self, entities: HashSet<String>) {
+        self.unparsed_entities = Some(entities);
     }
 
     /// Set the base URI of the instance document being validated.
@@ -1365,6 +1382,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let id_key = builtin.get_by_type_code(XmlTypeCode::Id);
             let idref_key = builtin.get_by_type_code(XmlTypeCode::IdRef);
             let idrefs_key = builtin.get_by_type_code(XmlTypeCode::IdRefs);
+            let entity_key = builtin.get_by_type_code(XmlTypeCode::Entity);
+            let entities_key = builtin.get_by_type_code(XmlTypeCode::Entities);
             let mut ic_defaults: Vec<(NameId, NameId, String)> = Vec::new();
             let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
             for (i, attr_use) in ct_data.attributes.iter().enumerate() {
@@ -1389,15 +1408,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if has_ic {
                     ic_defaults.push((attr_name, attr_ns.unwrap_or(NameId(0)), v.to_string()));
                 }
-                // Check if this attribute's type is ID/IDREF/IDREFS (O(1) key comparison).
+                // Check if this attribute's type is ID/IDREF/IDREFS/ENTITY/ENTITIES
+                // (need to validate defaults for these types).
                 let attr_type = resolved.and_then(|r| r.resolved_type)
                     .or_else(|| ref_decl.and_then(|d| d.resolved_type));
-                let is_id_family = match attr_type {
+                let needs_default_validation = match attr_type {
                     Some(TypeKey::Simple(sk)) =>
-                        id_key == Some(sk) || idref_key == Some(sk) || idrefs_key == Some(sk),
+                        id_key == Some(sk) || idref_key == Some(sk) || idrefs_key == Some(sk)
+                        || entity_key == Some(sk) || entities_key == Some(sk),
                     _ => false,
                 };
-                if is_id_family {
+                if needs_default_validation {
                     if let Some(tk) = attr_type {
                         id_defaults.push((v.to_string(), tk));
                     }
@@ -1427,10 +1448,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ),
                 );
             }
-            // Validate and collect ID/IDREF values from absent defaults
+            // Validate and collect ID/IDREF values from absent defaults.
+            // Owner is the current element (attributes bind to their element).
+            let default_owner = self.validation_stack.last()
+                .map(|e| e.element_serial).unwrap_or(0);
             for (value, type_key) in id_defaults {
                 if let Ok(result) = super::simple::validate_simple_type(&value, type_key, self.schema_set) {
-                    self.collect_id_idref(&result.typed_value, &value);
+                    self.collect_id_idref(&result.typed_value, &value, default_owner);
+                    self.check_entity_declared(&result.typed_value);
                 }
             }
         }
@@ -1982,9 +2007,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
-        // 4. ID/IDREF collection from element text content
+        // 4. ID/IDREF collection from element text content.
+        // Owner is the parent element per §3.17.5.2: the binding is to the
+        // element that has the ID-typed child in its [children].
+        // ev_state is the popped child; the parent is now the stack top.
         if let Some(ref tv) = ev_state.typed_value {
-            self.collect_id_idref(tv, &ev_state.text_content);
+            let parent_serial = self.validation_stack.last()
+                .map(|e| e.element_serial)
+                .unwrap_or(ev_state.element_serial); // root: no parent, use self
+            self.collect_id_idref(tv, &ev_state.text_content, parent_serial);
+            self.check_entity_declared(tv);
         }
 
         // 5. Update element path
@@ -2067,7 +2099,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // IDREF validation (cvc-id.1): check all pending IDREFs resolve
         for (idref_value, location, element_path) in &self.pending_idrefs {
-            if !self.id_values.contains(idref_value) {
+            if !self.id_values.contains_key(idref_value) {
                 self.sink.on_error(errors::error_with_path(
                     "cvc-id.1",
                     format!(
@@ -2365,6 +2397,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Push a new element onto the validation stack and update the element path
     fn push_element(&mut self, mut ev_state: ElementValidationState) {
+        // Assign a unique serial for ID/IDREF owner-element binding (§3.17.5.2)
+        ev_state.element_serial = self.next_element_serial;
+        self.next_element_serial += 1;
+
         let local_name = self.schema_set.name_table.resolve(ev_state.local_name);
         if !self.element_path.is_empty() || self.validation_stack.is_empty() {
             self.element_path.push('/');
@@ -2909,31 +2945,159 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Check if a type (possibly a union) transitively contains xs:ID or xs:IDREF
+    /// as a member type. Used for list(union(ID, ...)) detection.
+    fn union_has_id_idref(&self, type_key: TypeKey) -> bool {
+        let sk = match type_key {
+            TypeKey::Simple(sk) => sk,
+            _ => return false,
+        };
+        // Direct check: is this type itself ID or IDREF?
+        if let Some(code) = self.schema_set.get_type_code(sk) {
+            if matches!(code, XmlTypeCode::Id | XmlTypeCode::IdRef) {
+                return true;
+            }
+        }
+        // Check union members
+        if let Some(st) = self.schema_set.arenas.simple_types.get(sk) {
+            for &member_key in &st.resolved_member_types {
+                if self.union_has_id_idref(member_key) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Check if an ENTITY/ENTITIES value names declared unparsed entities.
+    ///
+    /// §3.16.4 String Valid clause 3: "Every ENTITY value in V is a declared
+    /// entity name." Only checked when `unparsed_entities` is set.
+    fn check_entity_declared(&mut self, typed_value: &XmlValue) {
+        use crate::types::value::XmlValueKind;
+        let entities = match &self.unparsed_entities {
+            Some(e) => e,
+            None => return,
+        };
+        // Collect undeclared names first to avoid borrow conflict with report_error
+        let mut undeclared: Vec<String> = Vec::new();
+
+        // Check list values first — handles both built-in xs:ENTITIES and
+        // custom <xs:list itemType="xs:ENTITY"> which has type_code=Entity
+        // but XmlValueKind::List.
+        if let XmlValueKind::List { item_type, items } = &typed_value.value {
+            if *item_type == XmlTypeCode::Entity
+                || typed_value.type_code == XmlTypeCode::Entities
+            {
+                for item in items {
+                    let name = item.to_string();
+                    if !entities.contains(&name) {
+                        undeclared.push(name);
+                    }
+                }
+            }
+        } else if typed_value.type_code == XmlTypeCode::Entity {
+            let name = typed_value.to_string_value();
+            if !entities.contains(&name) {
+                undeclared.push(name);
+            }
+        }
+
+        for name in undeclared {
+            self.report_error(
+                "cvc-datatype-valid.1.2.1",
+                format!("ENTITY '{}' is not declared as an unparsed entity", name),
+            );
+        }
+    }
+
+    /// Register an ID value with its owner element serial.
+    ///
+    /// XSD 1.1 §3.17.5.2: the [binding] is a set of elements. Same ID on the
+    /// same owner element is allowed (set size stays 1); same ID on different
+    /// elements is cvc-id.2.
+    fn register_id_value(&mut self, value: String, owner_serial: u64) {
+        match self.id_values.get(&value) {
+            Some(&existing_serial) => {
+                if !(self.schema_set.xsd_version == XsdVersion::V1_1
+                    && existing_serial == owner_serial)
+                {
+                    self.report_error(
+                        "cvc-id.2",
+                        format!("Duplicate ID value '{}'", value),
+                    );
+                }
+            }
+            None => {
+                self.id_values.insert(value, owner_serial);
+            }
+        }
+    }
+
     /// Detect ID/IDREF types and collect values for finalization.
     ///
     /// Uses the normalized value from `typed_value` (not raw `value_str`)
     /// for ID and IDREF tracking, so whitespace-collapsed values match
     /// consistently across ID, IDREF, and IDREFS.
     ///
-    /// For IDREF list values (both built-in xs:IDREFS and user-defined
-    /// `<xs:list itemType="xs:IDREF">`), each token is tracked individually.
-    fn collect_id_idref(&mut self, typed_value: &XmlValue, value_str: &str) {
-        match typed_value.type_code {
-            XmlTypeCode::Id => {
-                let normalized = typed_value.to_string_value();
-                if self.id_values.contains(&normalized) {
-                    self.report_error(
-                        "cvc-id.2",
-                        format!("Duplicate ID value '{}'", normalized),
-                    );
-                } else {
-                    self.id_values.insert(normalized);
+    /// `owner_serial` identifies the element that owns the ID binding per
+    /// §3.17.5.2: for attributes it is the element carrying the attribute;
+    /// for element text content it is the parent element.
+    ///
+    /// Handles both built-in types and user-defined list/union types
+    /// containing ID/IDREF (§3.17.5.2: eligible items include types
+    /// "derived or constructed directly or indirectly from" ID/IDREF).
+    fn collect_id_idref(&mut self, typed_value: &XmlValue, value_str: &str, owner_serial: u64) {
+        use crate::types::value::XmlValueKind;
+
+        // Unwrap union recursively to get the effective value
+        let mut effective = typed_value;
+        while let XmlValueKind::Union(inner) = &effective.value {
+            effective = inner.as_ref();
+        }
+
+        // Check list values — handles custom list-of-ID, list-of-IDREF,
+        // and list-of-union(ID/IDREF, ...) types.
+        if let XmlValueKind::List { item_type, items } = &effective.value {
+            // First check: is the list's item type a union containing ID/IDREF?
+            // If so, per-item type codes vary; re-validate each token individually
+            // to identify which items are ID vs IDREF vs other (§3.17.5.2).
+            let union_resolved = effective
+                .schema_type
+                .and_then(|sk| self.schema_set.arenas.simple_types.get(sk))
+                .and_then(|st| st.resolved_item_type)
+                .filter(|item_tk| self.union_has_id_idref(*item_tk));
+            if let Some(item_type_key) = union_resolved {
+                for token in value_str.split_whitespace() {
+                    if let Ok(result) = super::simple::validate_simple_type(
+                        token, item_type_key, self.schema_set,
+                    ) {
+                        match result.typed_value.type_code {
+                            XmlTypeCode::Id => {
+                                self.register_id_value(token.to_string(), owner_serial);
+                            }
+                            XmlTypeCode::IdRef => {
+                                self.pending_idrefs.push((
+                                    token.to_string(),
+                                    self.current_location.clone(),
+                                    self.element_path.clone(),
+                                ));
+                            }
+                            _ => {} // e.g. integer — not ID/IDREF
+                        }
+                    }
                 }
+                return;
             }
-            XmlTypeCode::IdRef | XmlTypeCode::IdRefs => {
-                // Both built-in xs:IDREFS and user-defined <xs:list itemType="xs:IDREF">
-                // produce XmlValueKind::List — decompose into individual IDREF tokens.
-                if let crate::types::value::XmlValueKind::List { items, .. } = &typed_value.value {
+            // Simple case: all items have the same type (non-union item type)
+            match *item_type {
+                XmlTypeCode::Id => {
+                    for item in items {
+                        self.register_id_value(item.to_string(), owner_serial);
+                    }
+                    return;
+                }
+                XmlTypeCode::IdRef => {
                     for item in items {
                         self.pending_idrefs.push((
                             item.to_string(),
@@ -2941,7 +3105,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.element_path.clone(),
                         ));
                     }
-                } else if typed_value.type_code == XmlTypeCode::IdRefs {
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Fall back to type_code-based dispatch for atomic values and
+        // built-in list types (IdRefs, Entities).
+        match effective.type_code {
+            XmlTypeCode::Id => {
+                let normalized = effective.to_string_value();
+                self.register_id_value(normalized, owner_serial);
+            }
+            XmlTypeCode::IdRef | XmlTypeCode::IdRefs => {
+                if let XmlValueKind::List { items, .. } = &effective.value {
+                    for item in items {
+                        self.pending_idrefs.push((
+                            item.to_string(),
+                            self.current_location.clone(),
+                            self.element_path.clone(),
+                        ));
+                    }
+                } else if effective.type_code == XmlTypeCode::IdRefs {
                     // Fallback for IdRefs without parsed list: split lexical text
                     for token in value_str.split_whitespace() {
                         self.pending_idrefs.push((
@@ -2953,7 +3139,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 } else {
                     // Single IdRef value
                     self.pending_idrefs.push((
-                        typed_value.to_string_value(),
+                        effective.to_string_value(),
                         self.current_location.clone(),
                         self.element_path.clone(),
                     ));
@@ -3250,9 +3436,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             );
         }
 
-        // ID/IDREF collection
+        // ID/IDREF/ENTITY collection — owner is current element (attribute binding)
         if let Some(ref tv) = result.typed_value {
-            self.collect_id_idref(tv, value);
+            let owner = self.validation_stack.last()
+                .map(|e| e.element_serial).unwrap_or(0);
+            self.collect_id_idref(tv, value, owner);
+            self.check_entity_declared(tv);
 
             // NOTATION tracking (§3.14.5): set [notation] on parent element
             if tv.type_code == XmlTypeCode::Notation {
@@ -3924,7 +4113,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
 
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
-                let attr_type = resolved.and_then(|r| r.resolved_type);
+                let attr_type = resolved
+                    .and_then(|r| r.resolved_type)
+                    .or_else(|| {
+                        attr_key
+                            .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                            .and_then(|d| d.resolved_type)
+                    });
 
                 // Get fixed value from the attribute use or from the attribute declaration
                 let fixed = attr_use

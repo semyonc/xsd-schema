@@ -477,11 +477,13 @@ pub fn validate_key_unique_structure(
     name_table: &NameTable,
 ) -> SchemaResult<()> {
     let has_name = attrs.get_value_by_name(name_table, "name").is_some();
+    let has_ref = attrs.get_value_by_name(name_table, "ref").is_some();
 
-    if !has_name {
+    // §3.11.6 clause 1: one of @name or @ref must be present (but not both)
+    if !has_name && !has_ref {
         return Err(SchemaError::structural(
             "src-identity-constraint",
-            "Identity constraint (key/unique) must have 'name' attribute",
+            "Identity constraint (key/unique) must have 'name' or 'ref' attribute",
             None,
         ));
     }
@@ -491,8 +493,8 @@ pub fn validate_key_unique_structure(
 
 /// Validate keyref element structure
 ///
-/// - Must have `name` attribute
-/// - Must have `refer` attribute
+/// - Must have `name` or `ref` attribute
+/// - `refer` is required when `name` is present
 /// - Child requirements (selector/field) are validated when the frame finishes
 pub fn validate_keyref_structure(
     attrs: &AttributeMap,
@@ -500,16 +502,19 @@ pub fn validate_keyref_structure(
 ) -> SchemaResult<()> {
     let has_name = attrs.get_value_by_name(name_table, "name").is_some();
     let has_refer = attrs.get_value_by_name(name_table, "refer").is_some();
+    let has_ref = attrs.get_value_by_name(name_table, "ref").is_some();
 
-    if !has_name {
+    // §3.11.6 clause 1: one of @name or @ref must be present
+    if !has_name && !has_ref {
         return Err(SchemaError::structural(
             "src-identity-constraint",
-            "Keyref must have 'name' attribute",
+            "Keyref must have 'name' or 'ref' attribute",
             None,
         ));
     }
 
-    if !has_refer {
+    // §3.11.6 clause 3: @refer required when @name is present
+    if has_name && !has_refer {
         return Err(SchemaError::structural(
             "src-identity-constraint",
             "Keyref must have 'refer' attribute",
@@ -682,6 +687,7 @@ pub fn validate_xsd_version_attribute(
             ("schema", "xpathDefaultNamespace") => true,
             ("selector", "xpathDefaultNamespace") => true,
             ("field", "xpathDefaultNamespace") => true,
+            ("unique", "ref") | ("key", "ref") | ("keyref", "ref") => true,
             // targetNamespace on schema is valid in XSD 1.0
             ("schema", "targetNamespace") => false,
             _ => XSD_1_1_ATTRIBUTES.contains(&attr_name),

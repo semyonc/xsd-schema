@@ -254,6 +254,38 @@ fn validate(schema_xml: &str, instance_xml: &str) -> Result<(), Box<dyn std::err
 }
 ```
 
+### Unparsed entity declarations (ENTITY / ENTITIES types)
+
+XSD §3.16.4 requires that every `xs:ENTITY` or `xs:ENTITIES` value names a
+declared unparsed entity from the document's DTD. Modern streaming XML parsers
+like `quick-xml` deliberately omit DTD processing — DTDs are widely considered
+a legacy attack surface (billion-laughs, external entity injection, etc.) and
+most contemporary XML workflows avoid them entirely.
+
+However, a conformant XSD validator must still enforce the entity-name constraint
+when DTD information is available. To bridge this gap without coupling the
+validator to a DTD parser, `ValidationRuntime` accepts an optional set of
+declared unparsed entity names via `set_unparsed_entities()`:
+
+```rust,ignore
+use std::collections::HashSet;
+
+let mut entities = HashSet::new();
+entities.insert("logo".to_string());
+entities.insert("photo".to_string());
+
+runtime.set_unparsed_entities(entities);
+```
+
+When the set is provided, every `xs:ENTITY` / `xs:ENTITIES` value (including
+defaulted attribute values) is checked against it. Undeclared names produce a
+`cvc-datatype-valid.1.2.1` error. When the set is **not** provided (the
+default), entity-name checking is skipped — the validator still validates
+NCName syntax but does not require DTD context. This opt-in design keeps the
+common case (no DTD) zero-cost while allowing conformance-critical deployments
+to supply the information from whatever DTD source they have (pre-scan,
+catalog, external parser, etc.).
+
 Useful runtime helpers for editor or tooling scenarios:
 
 - `get_expected_elements()` for content-model-aware completion/hints

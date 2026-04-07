@@ -270,6 +270,7 @@ impl<'a> SchemaAssembler<'a> {
             id,
             alternatives,
             identity_constraints,
+            identity_constraint_refs,
             annotation,
             source,
         } = result;
@@ -356,11 +357,12 @@ impl<'a> SchemaAssembler<'a> {
             &self.schema_set.documents,
         )?;
 
-        // Allocate identity constraints into the arena
+        // Allocate identity constraints into the arena and register in namespace table
         let identity_constraint_keys: Vec<IdentityConstraintKey> = identity_constraints
             .into_iter()
             .map(|ic| {
-                self.schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                let ic_name = ic.name;
+                let key = self.schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
                     kind: ic.kind,
                     name: ic.name,
                     ref_name: ic.ref_name,
@@ -370,8 +372,20 @@ impl<'a> SchemaAssembler<'a> {
                     id: ic.id,
                     annotation: ic.annotation,
                     source: ic.source,
-                })
+                });
+                // Register in namespace table for @ref resolution
+                let ns_table = self.schema_set.get_or_create_namespace(target_namespace);
+                ns_table.identity_constraints.insert(ic_name, key);
+                key
             })
+            .collect();
+
+        // Defer XSD 1.1 @ref identity constraint references for resolution
+        // in resolve_all_references() — the target IC may not exist yet
+        // (forward references / included schemas).
+        let pending_ic_refs: Vec<_> = identity_constraint_refs
+            .into_iter()
+            .map(|r| (r.kind, r.ref_name, r.source))
             .collect();
 
         let data = ElementDeclData {
@@ -393,6 +407,7 @@ impl<'a> SchemaAssembler<'a> {
             id,
             alternatives,
             identity_constraints: identity_constraint_keys,
+            pending_ic_refs,
             annotation,
             source,
             // Resolved references (populated after reference resolution phase)

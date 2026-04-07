@@ -123,6 +123,8 @@ pub struct ElementDeclData {
     pub id: Option<String>,
     pub alternatives: Vec<AlternativeResult>,
     pub identity_constraints: Vec<IdentityConstraintKey>,
+    /// XSD 1.1: pending identity constraint @ref references (resolved in resolve_all_references)
+    pub pending_ic_refs: Vec<(IdentityKind, QNameRef, Option<SourceRef>)>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
 
@@ -435,6 +437,7 @@ mod tests {
             id: None,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            pending_ic_refs: vec![],
             annotation: None,
             source: None,
             // Resolved references

@@ -24,13 +24,38 @@ use super::errors::{error, error_with_path, ValidationError};
 use crate::arenas::IdentityConstraintData;
 use crate::ids::IdentityConstraintKey;
 
+/// Extract the single atomic value from any value shape.
+///
+/// Used for IC equality: XSD §3.11.4 says "single atomic values are not
+/// distinguished from lists with single items" — an atomic value and a
+/// singleton list containing the same atomic value are treated as equal.
+fn extract_single_atomic(value: &XmlValue) -> Option<&crate::types::value::XmlAtomicValue> {
+    match &value.value {
+        crate::types::value::XmlValueKind::Atomic(a) => Some(a),
+        crate::types::value::XmlValueKind::List { items, .. } if items.len() == 1 => {
+            Some(&items[0])
+        }
+        crate::types::value::XmlValueKind::Union(inner) => extract_single_atomic(inner),
+        _ => None,
+    }
+}
+
 /// IC value-space equality: compare type_code + value, ignoring schema_type.
 ///
 /// XSD identity constraints compare values in value-space, not by schema type
 /// identity. Two identical primitive values from different anonymous type
 /// restrictions must be considered equal.
+///
+/// Also handles singleton-list ↔ atomic equivalence per XSD §3.11.4.
 fn xml_value_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
-    a.type_code == b.type_code && a.value == b.value
+    if a.type_code == b.type_code && a.value == b.value {
+        return true;
+    }
+    // Singleton-list ↔ atomic equality (XSD §3.11.4)
+    match (extract_single_atomic(a), extract_single_atomic(b)) {
+        (Some(va), Some(vb)) => va == vb,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -261,6 +261,11 @@ impl IdentityFrame {
 
 impl Frame for IdentityFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // §3.11.6 clause 4: if @ref is present, only annotation is allowed
+        if self.ref_name.is_some() {
+            return local_name == xsd_names::ANNOTATION
+                && !self.has_annotation();
+        }
         // Content model: (annotation?, selector, field+)
         if local_name == xsd_names::ANNOTATION {
             // Annotation must come before selector/field
@@ -279,8 +284,9 @@ impl Frame for IdentityFrame {
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
         if local_name == "refer" {
-            // Only keyref has a 'refer' attribute
-            return self.kind == IdentityKind::Keyref;
+            // Only keyref has a 'refer' attribute, and §3.11.6 clause 4
+            // prohibits 'refer' when @ref is present
+            return self.kind == IdentityKind::Keyref && self.ref_name.is_none();
         }
         matches!(local_name, "name" | "ref" | "id")
     }
@@ -305,7 +311,32 @@ impl Frame for IdentityFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
-        // Validate that name is present and is a valid NCName
+        let annotation = merge_foreign_attributes(
+            self.annotation,
+            self.foreign_attributes,
+            self.source.clone(),
+        );
+
+        // XSD 1.1: @ref means this is a reference, not a definition (§3.11.2)
+        if let Some(ref_name) = self.ref_name {
+            // §3.11.6 clause 1: @name and @ref are mutually exclusive
+            if self.name.is_some() {
+                return Err(SchemaError::structural(
+                    "src-identity-constraint.1",
+                    "Identity constraint with 'ref' must not have 'name'",
+                    None,
+                ));
+            }
+            return Ok(FrameResult::IdentityRef(IdentityRefResult {
+                kind: self.kind,
+                ref_name,
+                id: self.id,
+                annotation,
+                source: self.source,
+            }));
+        }
+
+        // Non-ref path: validate name, selector, and fields
         let name = match (&self.name, &self.raw_name) {
             (Some(id), Some(raw)) if is_ncname(raw) => *id,
             (_, Some(raw)) => {
@@ -340,15 +371,10 @@ impl Frame for IdentityFrame {
             ));
         }
 
-        let annotation = merge_foreign_attributes(
-            self.annotation,
-            self.foreign_attributes,
-            self.source.clone(),
-        );
         Ok(FrameResult::Identity(IdentityResult {
             kind: self.kind,
             name,
-            ref_name: self.ref_name,
+            ref_name: None,
             refer: self.refer,
             selector,
             fields: self.fields,

@@ -43,6 +43,7 @@ fn element_data(name: NameId, target_namespace: Option<NameId>) -> crate::arenas
         id: None,
         alternatives: Vec::new(),
         identity_constraints: Vec::new(),
+        pending_ic_refs: vec![],
         annotation: None,
         source: None,
         resolved_type: None,

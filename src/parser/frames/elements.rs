@@ -33,6 +33,8 @@ pub struct ElementFrame {
     id: Option<String>,
     alternatives: Vec<AlternativeResult>,
     identity_constraints: Vec<IdentityResult>,
+    /// XSD 1.1: pending identity constraint references (@ref)
+    identity_constraint_refs: Vec<IdentityRefResult>,
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
@@ -122,6 +124,7 @@ impl ElementFrame {
             id,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            identity_constraint_refs: Vec::new(),
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
@@ -217,6 +220,9 @@ impl Frame for ElementFrame {
             FrameResult::Identity(ic) => {
                 self.identity_constraints.push(ic);
             }
+            FrameResult::IdentityRef(ic_ref) => {
+                self.identity_constraint_refs.push(ic_ref);
+            }
             FrameResult::Skip => {}
             _ => {}
         }
@@ -257,6 +263,7 @@ impl Frame for ElementFrame {
             id: self.id,
             alternatives: self.alternatives,
             identity_constraints: self.identity_constraints,
+            identity_constraint_refs: self.identity_constraint_refs,
             annotation,
             source: self.source,
         }))

@@ -1588,6 +1588,7 @@ mod tests {
             id: None,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            pending_ic_refs: vec![],
             annotation: None,
             source: None,
             resolved_type: None,

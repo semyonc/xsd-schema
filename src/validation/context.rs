@@ -76,6 +76,10 @@ pub struct ElementValidationState {
     pub notation: Option<crate::ids::NotationKey>,
     /// Namespace context snapshot for resolving NOTATION QNames during attribute validation
     pub ns_context: Option<crate::namespace::context::NamespaceContextSnapshot>,
+    /// Unique serial number for this element (monotonically increasing).
+    /// Used for XSD 1.1 ID/IDREF binding: same ID on the same owner element is
+    /// allowed (§3.17.5.2).
+    pub element_serial: u64,
     /// How to process wildcard-matched content
     pub process_contents: ContentProcessing,
     /// Effective base URI for this element (inherited from parent, possibly
@@ -160,6 +164,7 @@ impl ElementValidationState {
             strictly_assessed: false,
             notation: None,
             ns_context: None,
+            element_serial: 0,
             process_contents: ContentProcessing::Strict,
             base_uri: String::new(),
             base_uri_set_by_xml_base: false,

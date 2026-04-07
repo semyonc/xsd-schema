@@ -8052,3 +8052,438 @@ fn test_empty_element_fixed_value_synthesis() {
         v.sink.errors,
     );
 }
+
+// ===========================================================================
+// XSD 1.1 identity-constraint stabilization tests
+// ===========================================================================
+
+/// Phase 1: attribute ref="..." must inherit type from the global declaration
+/// for ID/IDREF tracking (fixes id012, id016).
+#[test]
+fn test_attribute_ref_inherits_type_for_id_tracking() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:attribute name="gid" type="xs:ID"/>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute ref="gid" use="required"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("gid", "", "id1");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    // Duplicate — should trigger cvc-id.2
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("gid", "", "id1");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+        "attribute ref should inherit xs:ID type for duplicate detection, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// Phase 2: singleton list value must match atomic value in IC keyref (§3.11.4).
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_ic_singleton_list_equals_atomic() {
+    use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+    use crate::types::XmlTypeCode;
+    use crate::validation::identity::KeyFieldValue;
+
+    let atomic = KeyFieldValue {
+        string_value: "alpha".to_string(),
+        typed_value: Some(XmlValue::new(
+            XmlTypeCode::Name,
+            XmlValueKind::Atomic(XmlAtomicValue::String("alpha".to_string())),
+        )),
+    };
+    let singleton_list = KeyFieldValue {
+        string_value: "alpha".to_string(),
+        typed_value: Some(XmlValue::new(
+            XmlTypeCode::Name,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::Name,
+                items: vec![XmlAtomicValue::String("alpha".to_string())],
+            },
+        )),
+    };
+
+    assert_eq!(atomic, singleton_list, "atomic xs:Name must equal singleton list-of-xs:Name for IC");
+    assert_eq!(singleton_list, atomic, "equality must be symmetric");
+}
+
+/// Phase 3: XSD 1.1 allows same ID value on same element via multiple ID attributes.
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_xsd11_same_id_on_same_element() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="id1" type="xs:ID"/>
+                                <xs:attribute name="id2" type="xs:ID"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Same ID value on two attributes of the same element — valid in XSD 1.1
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id1", "", "eee");
+    v.validate_attribute("id2", "", "eee");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let dup_errors: Vec<_> = v.sink.errors.iter()
+        .filter(|e| e.constraint == "cvc-id.2")
+        .collect();
+    assert!(
+        dup_errors.is_empty(),
+        "XSD 1.1: same ID on same element must not be a duplicate, errors={:?}",
+        dup_errors,
+    );
+}
+
+/// Phase 3: Same ID on different elements is still an error in XSD 1.1.
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_xsd11_same_id_on_different_elements() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="id" type="xs:ID"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "aaa");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    // Same ID on a different element — error
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "aaa");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+        "XSD 1.1: same ID on different elements must be duplicate, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// Phase 3: ID child element binds to parent (owner-element semantics).
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_xsd11_child_element_id_binds_to_parent() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="node" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="id" type="xs:ID" minOccurs="0" maxOccurs="unbounded"/>
+                                </xs:sequence>
+                                <xs:attribute name="a" type="xs:ID"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // <node a="aaa"><id>zzz</id><id>zzz</id><id>aaa</id></node>
+    // All three <id> children bind to <node> (same owner) — must be valid
+    v.validate_element("node", "", None, None, &ns);
+    v.validate_attribute("a", "", "aaa");
+    v.validate_end_of_attributes();
+
+    v.validate_element("id", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("zzz");
+    v.validate_end_element();
+
+    v.validate_element("id", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("zzz");
+    v.validate_end_element();
+
+    v.validate_element("id", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("aaa");
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let dup_errors: Vec<_> = v.sink.errors.iter()
+        .filter(|e| e.constraint == "cvc-id.2")
+        .collect();
+    assert!(
+        dup_errors.is_empty(),
+        "child ID elements bind to parent; same owner means no duplicate, errors={:?}",
+        dup_errors,
+    );
+}
+
+/// Phase 4: custom list-of-ID type decomposes per-item for ID tracking.
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_xsd11_list_of_id_per_item_tracking() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="idList">
+                <xs:list itemType="xs:ID"/>
+            </xs:simpleType>
+            <xs:simpleType name="idrefList">
+                <xs:list itemType="xs:IDREF"/>
+            </xs:simpleType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="ids" type="idList"/>
+                                <xs:attribute name="refs" type="idrefList"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // Define IDs via list attribute
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("ids", "", "aaa bbb ccc");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    // Reference them via list IDREF
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("refs", "", "aaa bbb ccc");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let idref_errors: Vec<_> = v.sink.errors.iter()
+        .filter(|e| e.constraint == "cvc-id.1")
+        .collect();
+    assert!(
+        idref_errors.is_empty(),
+        "list-of-ID items must be tracked individually; all IDREFs should resolve, errors={:?}",
+        idref_errors,
+    );
+}
+
+/// Phase 5: XSD 1.1 identity constraint @ref resolves to the global definition.
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_xsd11_ic_ref_resolves_global() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="section" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:sequence>
+                                    <xs:element name="item" maxOccurs="unbounded">
+                                        <xs:complexType>
+                                            <xs:attribute name="code" type="xs:string" use="required"/>
+                                        </xs:complexType>
+                                    </xs:element>
+                                </xs:sequence>
+                            </xs:complexType>
+                            <xs:unique ref="unique-code"/>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:unique name="unique-code">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@code"/>
+                </xs:unique>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let validator = SchemaValidator::new(&schema_set, flags);
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    // First section with duplicate codes — should violate the unique constraint
+    v.validate_element("section", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("code", "", "A");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("code", "", "A");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+        "IC @ref must resolve and enforce the unique constraint, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// Phase 6: ENTITY attribute value must name a declared unparsed entity.
+#[test]
+fn test_entity_undeclared_reports_error() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="pic" type="xs:ENTITY" use="required"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    // Set empty entity set — no entities declared
+    v.set_unparsed_entities(std::collections::HashSet::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("pic", "", "mylogo");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-datatype-valid.1.2.1"),
+        "undeclared ENTITY must report error, errors={:?}",
+        v.sink.errors,
+    );
+}
+
+/// Phase 6: declared ENTITY value passes validation.
+#[test]
+fn test_entity_declared_passes() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="pic" type="xs:ENTITY" use="required"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let mut entities = std::collections::HashSet::new();
+    entities.insert("mylogo".to_string());
+    v.set_unparsed_entities(entities);
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_attribute("pic", "", "mylogo");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let entity_errors: Vec<_> = v.sink.errors.iter()
+        .filter(|e| e.constraint == "cvc-datatype-valid.1.2.1")
+        .collect();
+    assert!(
+        entity_errors.is_empty(),
+        "declared ENTITY should pass, errors={:?}",
+        entity_errors,
+    );
+}

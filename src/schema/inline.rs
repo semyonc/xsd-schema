@@ -33,9 +33,9 @@ use crate::ids::*;
 use crate::namespace::NameTable;
 use crate::parser::frames::{
     ComplexContentResult, ElementFrameResult, IdentityKind, IdentityResult, ParticleResult,
-    ParticleTerm, TypeFrameResult, TypeRefResult,
+    ParticleTerm, QNameRef, TypeFrameResult, TypeRefResult,
 };
-use crate::parser::location::SourceMapStorage;
+use crate::parser::location::{SourceMapStorage, SourceRef};
 use crate::schema::SchemaSet;
 
 /// Statistics from the inline type assembly pass
@@ -528,6 +528,86 @@ fn check_keyref_target(
 /// global fallback search across the arena (the spec's `{referenced key}` is
 /// resolved globally in the IC definition symbol space, not restricted to the
 /// same element — the target may be on an ancestor element).
+/// Resolve an XSD 1.1 identity constraint @ref to the referenced IC key.
+///
+/// §3.11.2: the corresponding schema component is the identity-constraint
+/// definition resolved to by the actual value of the ref [attribute].
+/// §3.11.6 clause 5: the referenced IC's category must match the element tag.
+/// Resolve an XSD 1.1 identity constraint @ref to the referenced IC key.
+///
+/// §3.11.2: the corresponding schema component is the identity-constraint
+/// definition resolved to by the actual value of the ref [attribute].
+/// §3.11.6 clause 5: the referenced IC's category must match the element tag.
+pub(crate) fn resolve_ic_ref(
+    kind: IdentityKind,
+    ref_name: &QNameRef,
+    source: Option<&SourceRef>,
+    target_namespace: Option<NameId>,
+    schema_set: &crate::schema::SchemaSet,
+) -> crate::error::SchemaResult<IdentityConstraintKey> {
+    let ref_ns = ref_name.namespace.or(target_namespace);
+    let ref_local = ref_name.local_name;
+
+    // Look up in namespace tables
+    let target_key = schema_set
+        .namespaces
+        .get(&ref_ns)
+        .and_then(|nt| nt.identity_constraints.get(&ref_local))
+        .copied();
+
+    let target_key = match target_key {
+        Some(k) => k,
+        None => {
+            // Search arena as fallback (IC may not be in namespace table yet)
+            let mut found = None;
+            for (key, ic_data) in &schema_set.arenas.identity_constraints {
+                if ic_data.name != ref_local {
+                    continue;
+                }
+                let ic_ns = ic_data
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.documents.get(s.doc_id as usize))
+                    .and_then(|d| d.target_namespace);
+                if ic_ns == ref_ns {
+                    found = Some(key);
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
+                let ref_display = crate::schema::resolver::format_resolved_qname(
+                    &schema_set.name_table, ref_ns, ref_local,
+                );
+                let location = source.and_then(|s| schema_set.source_maps.locate(s));
+                crate::error::SchemaError::structural(
+                    "src-resolve",
+                    format!("Identity constraint ref target '{}' not found", ref_display),
+                    location,
+                )
+            })?
+        }
+    };
+
+    // §3.11.6 clause 5: kind must match
+    let target = &schema_set.arenas.identity_constraints[target_key];
+    if target.kind != kind {
+        let ref_display = crate::schema::resolver::format_resolved_qname(
+            &schema_set.name_table, ref_ns, ref_local,
+        );
+        let location = source.and_then(|s| schema_set.source_maps.locate(s));
+        return Err(crate::error::SchemaError::structural(
+            "src-identity-constraint.5",
+            format!(
+                "Identity constraint ref '{}': referenced constraint is {:?} but expected {:?}",
+                ref_display, target.kind, kind
+            ),
+            location,
+        ));
+    }
+
+    Ok(target_key)
+}
+
 pub(crate) fn validate_keyref_refers(
     identity_constraints: &[IdentityResult],
     target_namespace: Option<NameId>,
@@ -691,19 +771,30 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
                     ));
                 }
             }
-            identity_constraint_keys.push(
-                schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
-                    kind: ic.kind,
-                    name: ic.name,
-                    ref_name: ic.ref_name,
-                    refer: ic.refer,
-                    selector: ic.selector,
-                    fields: ic.fields,
-                    id: ic.id,
-                    annotation: ic.annotation,
-                    source: ic.source,
-                }),
-            );
+            let ic_name = ic.name;
+            let ic_key = schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                kind: ic.kind,
+                name: ic.name,
+                ref_name: ic.ref_name,
+                refer: ic.refer,
+                selector: ic.selector,
+                fields: ic.fields,
+                id: ic.id,
+                annotation: ic.annotation,
+                source: ic.source,
+            });
+            // Register in namespace table for @ref resolution
+            let ns_table = schema_set.get_or_create_namespace(job.target_namespace);
+            ns_table.identity_constraints.insert(ic_name, ic_key);
+            identity_constraint_keys.push(ic_key);
+        }
+        // Resolve XSD 1.1 @ref identity constraint references
+        for ic_ref in &job.elem.identity_constraint_refs {
+            let target_key = resolve_ic_ref(
+                ic_ref.kind, &ic_ref.ref_name, ic_ref.source.as_ref(),
+                job.target_namespace, schema_set,
+            )?;
+            identity_constraint_keys.push(target_key);
         }
 
         let elem_data = ElementDeclData {
@@ -725,6 +816,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
             identity_constraints: identity_constraint_keys,
+            pending_ic_refs: vec![],
             annotation: job.elem.annotation.clone(),
             source: job.elem.source.clone(),
             resolved_type,
@@ -837,19 +929,30 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
                     ));
                 }
             }
-            identity_constraint_keys.push(
-                schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
-                    kind: ic.kind,
-                    name: ic.name,
-                    ref_name: ic.ref_name,
-                    refer: ic.refer,
-                    selector: ic.selector,
-                    fields: ic.fields,
-                    id: ic.id,
-                    annotation: ic.annotation,
-                    source: ic.source,
-                }),
-            );
+            let ic_name = ic.name;
+            let ic_key = schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
+                kind: ic.kind,
+                name: ic.name,
+                ref_name: ic.ref_name,
+                refer: ic.refer,
+                selector: ic.selector,
+                fields: ic.fields,
+                id: ic.id,
+                annotation: ic.annotation,
+                source: ic.source,
+            });
+            // Register in namespace table for @ref resolution
+            let ns_table = schema_set.get_or_create_namespace(job.target_namespace);
+            ns_table.identity_constraints.insert(ic_name, ic_key);
+            identity_constraint_keys.push(ic_key);
+        }
+        // Resolve XSD 1.1 @ref identity constraint references
+        for ic_ref in &job.elem.identity_constraint_refs {
+            let target_key = resolve_ic_ref(
+                ic_ref.kind, &ic_ref.ref_name, ic_ref.source.as_ref(),
+                job.target_namespace, schema_set,
+            )?;
+            identity_constraint_keys.push(target_key);
         }
 
         let elem_data = ElementDeclData {
@@ -871,6 +974,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
             identity_constraints: identity_constraint_keys,
+            pending_ic_refs: vec![],
             annotation: job.elem.annotation.clone(),
             source: job.elem.source.clone(),
             resolved_type,
@@ -1257,6 +1361,7 @@ mod tests {
             id: None,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            pending_ic_refs: vec![],
             annotation: None,
             source: None,
             resolved_type: None,
@@ -1440,6 +1545,7 @@ mod tests {
                     id: None,
                     alternatives: vec![],
                     identity_constraints: vec![],
+                    identity_constraint_refs: vec![],
                     annotation: None,
                     source: None,
                 }),
@@ -1513,6 +1619,7 @@ mod tests {
                         id: None,
                         alternatives: vec![],
                         identity_constraints: vec![],
+                        identity_constraint_refs: vec![],
                         annotation: None,
                         source: None,
                     }),
@@ -1637,6 +1744,7 @@ mod tests {
                             id: None,
                             alternatives: vec![],
                             identity_constraints: vec![],
+                            identity_constraint_refs: vec![],
                             annotation: None,
                             source: None,
                         }),

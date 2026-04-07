@@ -286,10 +286,32 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         schema_set.arenas.attribute_groups.keys().collect();
 
     // Resolve element references
-    for key in element_keys {
-        if let Err(e) = resolve_element_references(schema_set, key, &mut stats) {
+    for key in &element_keys {
+        if let Err(e) = resolve_element_references(schema_set, *key, &mut stats) {
             errors.push(e);
             stats.errors += 1;
+        }
+    }
+
+    // Resolve XSD 1.1 identity constraint @ref references on top-level elements.
+    // This runs after element resolution so ICs from all elements are registered.
+    for &key in &element_keys {
+        let pending = std::mem::take(&mut schema_set.arenas.elements[key].pending_ic_refs);
+        if !pending.is_empty() {
+            let target_ns = schema_set.arenas.elements[key].target_namespace;
+            for (kind, ref_name, source) in pending {
+                match crate::schema::inline::resolve_ic_ref(
+                    kind, &ref_name, source.as_ref(), target_ns, schema_set,
+                ) {
+                    Ok(target_key) => {
+                        schema_set.arenas.elements[key].identity_constraints.push(target_key);
+                    }
+                    Err(e) => {
+                        errors.push(e);
+                        stats.errors += 1;
+                    }
+                }
+            }
         }
     }
 
@@ -1328,6 +1350,7 @@ mod tests {
             id: None,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            pending_ic_refs: vec![],
             annotation: None,
             source: None,
             resolved_type: None,
@@ -1430,6 +1453,7 @@ mod tests {
             id: None,
             alternatives: Vec::new(),
             identity_constraints: Vec::new(),
+            pending_ic_refs: vec![],
             annotation: None,
             source: None,
             // Already resolved (from inline type assembly)
@@ -1490,6 +1514,7 @@ mod tests {
                     id: None,
                     alternatives: vec![],
                     identity_constraints: vec![],
+                    identity_constraint_refs: vec![],
                     annotation: None,
                     source: None,
                 }),

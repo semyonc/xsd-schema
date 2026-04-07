@@ -39,6 +39,8 @@ pub enum FrameResult {
     ComplexContent(ComplexContentDefResult),
     /// Identity constraint completed
     Identity(IdentityResult),
+    /// Identity constraint reference (XSD 1.1 @ref)
+    IdentityRef(IdentityRefResult),
     /// Selector completed
     Selector(SelectorResult),
     /// Field completed
@@ -200,6 +202,8 @@ pub struct ElementFrameResult {
     pub id: Option<String>,
     pub alternatives: Vec<AlternativeResult>,
     pub identity_constraints: Vec<IdentityResult>,
+    /// XSD 1.1: pending identity constraint references (@ref)
+    pub identity_constraint_refs: Vec<IdentityRefResult>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,
 }
@@ -466,6 +470,19 @@ pub struct IdentityResult {
     pub refer: Option<QNameRef>,
     pub selector: SelectorResult,
     pub fields: Vec<FieldResult>,
+    pub id: Option<String>,
+    pub annotation: Option<Annotation>,
+    pub source: Option<SourceRef>,
+}
+
+/// Identity constraint reference result (XSD 1.1 @ref on unique/key/keyref)
+///
+/// Per §3.11.2: when @ref is present, the element does not define a new
+/// component — it IS the referenced component.
+#[derive(Debug, Clone)]
+pub struct IdentityRefResult {
+    pub kind: IdentityKind,
+    pub ref_name: QNameRef,
     pub id: Option<String>,
     pub annotation: Option<Annotation>,
     pub source: Option<SourceRef>,

@@ -1022,6 +1022,40 @@ type ValidationPassResult = Result<(
     Vec<xsd_schema::validation::info::NoNamespaceSchemaLocationHint>,
 ), String>;
 
+/// Scan XML content for DTD unparsed entity declarations.
+///
+/// Looks for `<!ENTITY name SYSTEM/PUBLIC ... NDATA notation>` patterns
+/// and returns the set of entity names.
+fn scan_unparsed_entities(xml: &str) -> std::collections::HashSet<String> {
+    let mut entities = std::collections::HashSet::new();
+    // Find all <!ENTITY ...> declarations
+    let mut search_from = 0;
+    while let Some(start) = xml[search_from..].find("<!ENTITY") {
+        let abs_start = search_from + start;
+        let rest = &xml[abs_start + 8..]; // skip "<!ENTITY"
+        // Find the closing '>'
+        let end = match rest.find('>') {
+            Some(e) => e,
+            None => break,
+        };
+        let decl = &rest[..end];
+        // Check if this is an unparsed entity (contains "NDATA")
+        if decl.contains("NDATA") {
+            // Entity name is the first non-whitespace token after "<!ENTITY"
+            let trimmed = decl.trim_start();
+            // Skip '%' for parameter entities (we only want general entities)
+            if !trimmed.starts_with('%') {
+                if let Some(name_end) = trimmed.find(|c: char| c.is_whitespace()) {
+                    let name = &trimmed[..name_end];
+                    entities.insert(name.to_string());
+                }
+            }
+        }
+        search_from = abs_start + 8 + end + 1;
+    }
+    entities
+}
+
 /// Single validation pass. Returns errors and collected schema-location hints.
 #[allow(clippy::type_complexity)]
 fn validate_instance_pass(
@@ -1044,6 +1078,34 @@ fn validate_instance_pass(
     // Set base URI for schema-location hint resolution
     let base_uri = instance_path.to_string_lossy();
     runtime.set_instance_base_uri(base_uri.as_ref());
+
+    // Pre-scan for DTD unparsed entity declarations (<!ENTITY name ... NDATA notation>)
+    // and feed them to the validator for ENTITY/ENTITIES type checking (§3.16.4).
+    //
+    // Only set when we can reliably determine the entity set:
+    // - If the document has an external DTD subset (<!DOCTYPE ... SYSTEM/PUBLIC ...>),
+    //   we cannot read those entities, so skip entity validation entirely.
+    // - Otherwise, set the scanned entity set (may be empty if no DTD at all,
+    //   which correctly rejects any ENTITY values).
+    {
+        let xml_str = std::str::from_utf8(content).unwrap_or("");
+        // Detect external-only DTD: <!DOCTYPE ... SYSTEM/PUBLIC ...> without
+        // an internal subset (no "["). We can only scan inline entity decls,
+        // so skip entity validation when all entities may be in an external file.
+        let has_external_only_dtd = if let Some(dt_start) = xml_str.find("<!DOCTYPE") {
+            let dt_rest = &xml_str[dt_start..];
+            let dt_end = dt_rest.find('>').unwrap_or(dt_rest.len());
+            let dt_decl = &dt_rest[..dt_end];
+            (dt_decl.contains("SYSTEM") || dt_decl.contains("PUBLIC"))
+                && !dt_decl.contains('[')
+        } else {
+            false
+        };
+        if !has_external_only_dtd {
+            let unparsed = scan_unparsed_entities(xml_str);
+            runtime.set_unparsed_entities(unparsed);
+        }
+    }
 
     let mut reader = Reader::from_reader(content);
     reader.trim_text(false);
