@@ -18,6 +18,7 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
+use crate::parser::frames::{ParticleResult, ParticleTerm};
 use crate::schema::composition::{
     ComponentIdentity, ComponentKey, ComponentKind, record_provenance, redefined_action,
 };
@@ -478,14 +479,83 @@ fn validate_self_derivation_complex(
     Ok(())
 }
 
-/// Validate that a model group's self-reference structure is consistent with
-/// §src-redefine clause 6.
+/// Scratch state for the §src-redefine 6.1 self-reference walker.
+///
+/// `count` is the only always-meaningful field. `min_occurs`/`max_occurs`
+/// are the bounds of the most recently visited matching self-ref, and are
+/// only meaningful when `count == 1` — §6.1.2 only constrains *the* one
+/// self-referencing `<group ref>` in the valid case. When `count > 1`,
+/// §6.1.1 already errors without consulting the bounds.
+struct GroupSelfRefScan {
+    count: u32,
+    min_occurs: u32,
+    max_occurs: Option<u32>,
+}
+
+/// Walk a particle list recursively to implement §src-redefine 6.1's
+/// "among its contents at some level" scan (structures.html:13729-13741).
+///
+/// Descends through inline `<sequence>`/`<choice>`/`<all>` compositors,
+/// stops at element particles (§6.1 element-ancestor exclusion), and does
+/// not follow group references — this is a pre-resolution, purely
+/// structural scan.
+///
+/// The walker mirrors the inline-compositor recursion shape from
+/// `ParticleNormalizer::normalize_particle` in
+/// `src/schema/derivation.rs`, but explicitly does **not** copy the
+/// resolved-group follow-through in `normalize_group`: that post-resolution
+/// code dives into a group ref's target, which would produce an incorrect
+/// §6.1 interpretation here.
+fn count_group_self_refs(
+    particles: &[ParticleResult],
+    expected_name: NameId,
+    scan: &mut GroupSelfRefScan,
+) {
+    for particle in particles {
+        if let ParticleTerm::Group(ref grp) = particle.term {
+            match grp.ref_name {
+                Some(ref ref_name) => {
+                    // Syntactic group reference. Check for self-match;
+                    // never recurse into its (empty-by-AST-invariant)
+                    // particles vector.
+                    if ref_name.local_name == expected_name {
+                        scan.count += 1;
+                        scan.min_occurs = particle.min_occurs;
+                        scan.max_occurs = particle.max_occurs;
+                    }
+                }
+                None => {
+                    // Inline compositor (sequence/choice/all) — descend.
+                    debug_assert!(
+                        grp.name.is_none(),
+                        "named group definition unexpectedly nested in a particle list"
+                    );
+                    count_group_self_refs(&grp.particles, expected_name, scan);
+                }
+            }
+        }
+        // ParticleTerm::Element — terminal per §6.1's
+        // "does not have an <element> ancestor" exclusion. We intentionally
+        // do NOT descend into ElementFrameResult.inline_type.
+        // ParticleTerm::Any — terminal (no particles to scan).
+    }
+}
+
+/// Validate that a redefining model group's self-reference structure is
+/// consistent with §src-redefine clause 6
+/// (`structures.html:13729-13752`, `#src-redefine`).
+///
+/// The scan is **recursive** through inline `<sequence>`/`<choice>`/`<all>`
+/// compositors per §6.1's *"among its contents at some level"* wording,
+/// and stops at any `<element>` ancestor per §6.1's element-ancestor
+/// exclusion.
 ///
 /// Returns `Ok(true)` when the redefine contains exactly one well-formed
-/// self-reference (§6.1), `Ok(false)` when the redefine contains zero
-/// self-references and the caller must schedule a deferred §6.2.2
-/// restriction check. Returns an error for >1 self-refs or a self-ref with
-/// `min/maxOccurs != 1` (violations of §6.1.1 / §6.1.2).
+/// self-reference (§6.1 with §6.1.1 + §6.1.2 satisfied), `Ok(false)` when
+/// the redefine contains zero self-references (§6.2 — the caller must
+/// schedule a deferred §6.2.2 restriction check), and `Err` for `>1`
+/// self-references (§6.1.1 violation) or a single self-ref with
+/// `minOccurs`/`maxOccurs != 1` (§6.1.2 violation).
 fn validate_self_reference_group(
     schema_set: &SchemaSet,
     group_key: ModelGroupKey,
@@ -497,22 +567,14 @@ fn validate_self_reference_group(
         .get(group_key)
         .ok_or_else(|| SchemaError::internal("Group not found"))?;
 
-    let mut self_refs = 0u32;
-    let mut self_ref_min_occurs = 0u32;
-    let mut self_ref_max_occurs: Option<u32> = None;
-    for particle in &group.particles {
-        if let crate::parser::frames::ParticleTerm::Group(ref grp) = particle.term {
-            if let Some(ref ref_name) = grp.ref_name {
-                if ref_name.local_name == expected_name {
-                    self_refs += 1;
-                    self_ref_min_occurs = particle.min_occurs;
-                    self_ref_max_occurs = particle.max_occurs;
-                }
-            }
-        }
-    }
+    let mut scan = GroupSelfRefScan {
+        count: 0,
+        min_occurs: 0,
+        max_occurs: None,
+    };
+    count_group_self_refs(&group.particles, expected_name, &mut scan);
 
-    match self_refs {
+    match scan.count {
         // Clause 6.2 (src-redefine §6.2): the redefining group has no
         // self-reference. Clause 6.2.1 — that the name resolves in S2 — is
         // already enforced by the caller's component lookup against the
@@ -523,17 +585,20 @@ fn validate_self_reference_group(
         // arena flag that schedules that pass.
         0 => Ok(false),
         // Clause 6.1: self-reference present.
-        // Clause 6.1.2: minOccurs and maxOccurs must both be 1.
+        // Clause 6.1.2: minOccurs and maxOccurs must both be 1 on the
+        // self-referencing `<group ref>` particle itself (the
+        // `ParticleResult` whose `term` is `ParticleTerm::Group(ref)`),
+        // not on any enclosing compositor.
         1 => {
-            if self_ref_min_occurs != 1 || self_ref_max_occurs != Some(1) {
+            if scan.min_occurs != 1 || scan.max_occurs != Some(1) {
                 Err(SchemaError::structural(
                     "src-redefine",
                     format!(
                         "Self-referencing group particle must have \
                          minOccurs=1 and maxOccurs=1, but found \
                          minOccurs={} maxOccurs={}",
-                        self_ref_min_occurs,
-                        self_ref_max_occurs
+                        scan.min_occurs,
+                        scan.max_occurs
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "unbounded".to_string()),
                     ),
@@ -551,7 +616,7 @@ fn validate_self_reference_group(
             format!(
                 "Redefined group must contain at most one \
                  self-reference (found {})",
-                self_refs,
+                scan.count,
             ),
             group
                 .source
@@ -1168,6 +1233,289 @@ mod tests {
             "Error should mention maxOccurs: {}",
             msg
         );
+    }
+
+    // -----------------------------------------------------------------
+    // §src-redefine 6.1 deep self-reference scanning
+    // (structures.html:13729-13741, "among its contents at some level")
+    // -----------------------------------------------------------------
+    //
+    // The following four tests exercise the recursive walker
+    // `count_group_self_refs`. They cover, in order:
+    //   1. a valid self-reference nested one level deep inside an
+    //      inline `<sequence>` (§6.1.1 positive case);
+    //   2. a nested self-reference whose `minOccurs` violates §6.1.2;
+    //   3. two self-references at different nesting levels (§6.1.1
+    //      "exactly one such group" violation);
+    //   4. a direct walker test proving `ParticleTerm::Element` is
+    //      terminal (§6.1 element-ancestor exclusion).
+
+    /// Helper: build a bare `ModelGroupDefResult` with min/maxOccurs=1
+    /// and all optional fields defaulted. Shared by the group-ref and
+    /// inline-compositor helpers below.
+    fn model_group_def(
+        ref_name: Option<QNameRef>,
+        compositor: Option<Compositor>,
+        particles: Vec<ParticleResult>,
+    ) -> ModelGroupDefResult {
+        ModelGroupDefResult {
+            name: None,
+            ref_name,
+            compositor,
+            particles,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+        }
+    }
+
+    /// Helper: build a `ParticleTerm::Group` self-reference wrapped in
+    /// an outer `ParticleResult` with the given occurrence bounds.
+    fn self_ref_particle(
+        group_name: NameId,
+        min_occurs: u32,
+        max_occurs: Option<u32>,
+    ) -> ParticleResult {
+        ParticleResult {
+            term: ParticleTerm::Group(model_group_def(
+                Some(QNameRef {
+                    prefix: None,
+                    local_name: group_name,
+                    namespace: None,
+                }),
+                None,
+                vec![],
+            )),
+            min_occurs,
+            max_occurs,
+            source: None,
+        }
+    }
+
+    /// Helper: build a simple `ParticleTerm::Element` with min/maxOccurs=1
+    /// and no inline type. Used to pad a redefine body.
+    fn simple_element_particle(name: NameId) -> ParticleResult {
+        ParticleResult {
+            term: ParticleTerm::Element(ElementFrameResult {
+                name: Some(name),
+                ref_name: None,
+                target_namespace: None,
+                type_ref: None,
+                inline_type: None,
+                substitution_group: vec![],
+                default_value: None,
+                fixed_value: None,
+                nillable: false,
+                is_abstract: false,
+                min_occurs: 1,
+                max_occurs: Some(1),
+                block: DerivationSet::empty(),
+                final_derivation: DerivationSet::empty(),
+                form: None,
+                id: None,
+                alternatives: vec![],
+                identity_constraints: vec![],
+                identity_constraint_refs: vec![],
+                annotation: None,
+                source: None,
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        }
+    }
+
+    /// Helper: wrap a list of particles inside an inline compositor
+    /// (`ParticleTerm::Group` with `ref_name: None, name: None`).
+    fn inline_compositor_particle(
+        compositor: Compositor,
+        inner: Vec<ParticleResult>,
+    ) -> ParticleResult {
+        ParticleResult {
+            term: ParticleTerm::Group(model_group_def(None, Some(compositor), inner)),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        }
+    }
+
+    /// Helper: allocate a new redefining model group whose top-level
+    /// particle list is `top_particles`, matching the name of the
+    /// original group created by `setup_model_group_redefine`.
+    fn alloc_redefining_group(
+        schema_set: &mut SchemaSet,
+        top_particles: Vec<ParticleResult>,
+    ) -> ModelGroupKey {
+        let group_name = schema_set.name_table.add("personGroup");
+        let data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: top_particles,
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        schema_set.arenas.alloc_model_group(data)
+    }
+
+    #[test]
+    fn test_redefine_model_group_nested_self_ref_in_sequence() {
+        // §src-redefine 6.1 "among its contents at some level":
+        // a self-reference nested one level deep inside an inline
+        // `<sequence>` must still be recognised as a §6.1 self-reference
+        // (satisfying §6.1.1 "exactly one such group" and §6.1.2
+        // "minOccurs=1 and maxOccurs=1").
+        let (mut schema_set, _original_key, _ignored) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+        let age_elem = schema_set.name_table.add("age");
+
+        let new_key = alloc_redefining_group(
+            &mut schema_set,
+            vec![inline_compositor_particle(
+                Compositor::Sequence,
+                vec![
+                    self_ref_particle(group_name, 1, Some(1)),
+                    simple_element_particle(age_elem),
+                ],
+            )],
+        );
+
+        let result = apply_model_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_ok(),
+            "nested self-ref inside <sequence> should be accepted \
+             (§src-redefine 6.1 'at some level'): {:?}",
+            result.err()
+        );
+
+        // The walker found one self-ref → §6.1 path → no deferred §6.2.2
+        // restriction check should be scheduled.
+        let group = schema_set.arenas.model_groups.get(new_key).unwrap();
+        assert!(
+            !group.redefine_requires_restriction_check,
+            "§6.1 self-ref path must clear the §6.2.2 restriction flag"
+        );
+    }
+
+    #[test]
+    fn test_redefine_model_group_nested_self_ref_wrong_min_occurs() {
+        // §src-redefine 6.1.2 applies to the self-referencing `<group ref>`
+        // particle's own `minOccurs`/`maxOccurs`, regardless of how deeply
+        // nested it is. A nested self-ref with `minOccurs=2` must still be
+        // rejected.
+        let (mut schema_set, _original_key, _ignored) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+
+        let new_key = alloc_redefining_group(
+            &mut schema_set,
+            vec![inline_compositor_particle(
+                Compositor::Sequence,
+                vec![self_ref_particle(group_name, 2, Some(2))],
+            )],
+        );
+
+        let result = apply_model_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_err(),
+            "nested self-ref with minOccurs=2 should fail (§src-redefine 6.1.2)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("minOccurs"),
+            "error should mention minOccurs: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_redefine_model_group_multiple_self_refs_at_different_depths() {
+        // §src-redefine 6.1.1 "it has exactly one such group". Two
+        // self-references — one at the top level and one nested inside a
+        // `<choice>` — must be rejected. The old shallow scan would have
+        // missed the nested one and incorrectly accepted this fixture.
+        let (mut schema_set, _original_key, _ignored) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+
+        let new_key = alloc_redefining_group(
+            &mut schema_set,
+            vec![
+                // Self-ref at the top level — valid min/max.
+                self_ref_particle(group_name, 1, Some(1)),
+                // A second self-ref nested inside an inline <choice>.
+                inline_compositor_particle(
+                    Compositor::Choice,
+                    vec![self_ref_particle(group_name, 1, Some(1))],
+                ),
+            ],
+        );
+
+        let result = apply_model_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_err(),
+            "two self-refs at different depths should fail (§src-redefine 6.1.1)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("at most one") || msg.contains("found 2"),
+            "error should mention the count violation: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_count_group_self_refs_element_is_terminal() {
+        // §src-redefine 6.1 "and that `<group>` does not have an
+        // `<element>` ancestor": the walker must treat `ParticleTerm::Element`
+        // as terminal and must not descend into its inline type. Implemented
+        // simply by never matching `ParticleTerm::Element` in the walker.
+        //
+        // We verify this sharply by calling the walker directly: a particle
+        // list consisting only of an element particle must contribute zero
+        // self-references even when queried with a live `expected_name`.
+        let schema_set = SchemaSet::new();
+        let group_name = schema_set.name_table.add("personGroup");
+        let age_elem = schema_set.name_table.add("age");
+
+        let particles = vec![simple_element_particle(age_elem)];
+
+        let mut scan = GroupSelfRefScan {
+            count: 0,
+            min_occurs: 0,
+            max_occurs: None,
+        };
+        count_group_self_refs(&particles, group_name, &mut scan);
+        assert_eq!(
+            scan.count, 0,
+            "walker must treat ParticleTerm::Element as terminal per \
+             §src-redefine 6.1 element-ancestor exclusion"
+        );
+
+        // Sanity: the same walker DOES count a top-level self-ref when one
+        // is actually present, so the zero-count above is not a vacuous
+        // "walker never finds anything" result.
+        let particles_with_ref = vec![self_ref_particle(group_name, 1, Some(1))];
+        let mut scan = GroupSelfRefScan {
+            count: 0,
+            min_occurs: 0,
+            max_occurs: None,
+        };
+        count_group_self_refs(&particles_with_ref, group_name, &mut scan);
+        assert_eq!(scan.count, 1, "sanity check: walker detects a top-level self-ref");
     }
 
     #[test]
