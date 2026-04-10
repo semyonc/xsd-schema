@@ -670,17 +670,17 @@ fn validate_complex_extension(
                                     {
                                         // OK: XSD 1.1 all-over-all
                                     }
-                                    Some(Compositor::Choice)
-                                        if schema_set.xsd_version
-                                            == crate::schema::model::XsdVersion::V1_1 =>
-                                    {
-                                        // XSD 1.1: choice extension is structurally valid.
-                                        // cos-particle-extend clause 2 is satisfied by the
-                                        // sequence(base, extension) effective content type.
-                                        // UPA relaxation for wildcard/element overlap applies.
+                                    Some(Compositor::Choice) if !base_is_all => {
+                                        // OK: the effective content type is
+                                        // sequence(base, extension) per §3.4.2.3.3
+                                        // clause 4.2.3.3, so cos-particle-extend
+                                        // clause 2 is satisfied regardless of the
+                                        // extension particle's compositor — as long
+                                        // as the base particle is not xs:all (which
+                                        // would get nested inside the sequence and
+                                        // violate cos-all-limited.1).
                                     }
-                                    Some(compositor @ Compositor::All)
-                                    | Some(compositor @ Compositor::Choice) => {
+                                    Some(compositor @ (Compositor::All | Compositor::Choice)) => {
                                         let location = type_def
                                             .source
                                             .as_ref()
@@ -698,13 +698,15 @@ fn validate_complex_extension(
                                         let (comp_name, reason) = match compositor {
                                             Compositor::All => (
                                                 "all",
-                                                "the resulting content model would violate \
-                                                 cos-all-limited placement constraints",
+                                                "the resulting content model would \
+                                                 violate cos-all-limited placement \
+                                                 constraints",
                                             ),
                                             Compositor::Choice => (
                                                 "choice",
-                                                "cos-particle-extend only allows sequence \
-                                                 extensions (or XSD 1.1 all-over-all)",
+                                                "the base type's xs:all particle would \
+                                                 be nested inside a sequence, \
+                                                 violating cos-all-limited.1",
                                             ),
                                             Compositor::Sequence => unreachable!(),
                                         };
@@ -714,10 +716,7 @@ fn validate_complex_extension(
                                                 "Complex type '{}' cannot extend '{}' with \
                                                  an xs:{} compositor because the base type \
                                                  has non-empty content; {}",
-                                                type_name,
-                                                base_name,
-                                                comp_name,
-                                                reason,
+                                                type_name, base_name, comp_name, reason,
                                             ),
                                             location,
                                         ));

@@ -19,7 +19,7 @@
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
 use crate::schema::composition::{
-    ComponentKey, ComponentKind, record_provenance, redefined_action,
+    ComponentIdentity, ComponentKey, ComponentKind, record_provenance, redefined_action,
 };
 use crate::schema::model::RedefineDirective;
 use crate::schema::SchemaSet;
@@ -117,6 +117,17 @@ fn apply_simple_type_redefine(
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_type(name, TypeKey::Simple(new_key));
 
+    // Make the redefined type visible in the redefining document's
+    // component_index so chained redefines can find it.
+    if let Some(doc_id) = redefining_doc_id {
+        if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
+            doc.component_index.insert(
+                ComponentIdentity { kind: ComponentKind::SimpleType, name, namespace },
+                ComponentKey::Type(TypeKey::Simple(new_key)),
+            );
+        }
+    }
+
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Simple(new_key)),
@@ -184,6 +195,15 @@ fn apply_complex_type_redefine(
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_type(name, TypeKey::Complex(new_key));
 
+    if let Some(doc_id) = redefining_doc_id {
+        if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
+            doc.component_index.insert(
+                ComponentIdentity { kind: ComponentKind::ComplexType, name, namespace },
+                ComponentKey::Type(TypeKey::Complex(new_key)),
+            );
+        }
+    }
+
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Complex(new_key)),
@@ -248,6 +268,15 @@ fn apply_model_group_redefine(
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_model_group(name, new_key);
 
+    if let Some(doc_id) = redefining_doc_id {
+        if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
+            doc.component_index.insert(
+                ComponentIdentity { kind: ComponentKind::ModelGroup, name, namespace },
+                ComponentKey::ModelGroup(new_key),
+            );
+        }
+    }
+
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::ModelGroup(new_key),
@@ -311,6 +340,15 @@ fn apply_attribute_group_redefine(
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
     ns_table.register_attribute_group(name, new_key);
+
+    if let Some(doc_id) = redefining_doc_id {
+        if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
+            doc.component_index.insert(
+                ComponentIdentity { kind: ComponentKind::AttributeGroup, name, namespace },
+                ComponentKey::AttributeGroup(new_key),
+            );
+        }
+    }
 
     record_provenance(
         &mut schema_set.effective_components,
@@ -446,35 +484,75 @@ fn validate_self_reference_group(
         .get(group_key)
         .ok_or_else(|| SchemaError::internal("Group not found"))?;
 
-    let mut self_refs = 0;
+    let mut self_refs = 0u32;
+    let mut self_ref_min_occurs = 0u32;
+    let mut self_ref_max_occurs: Option<u32> = None;
     for particle in &group.particles {
         if let crate::parser::frames::ParticleTerm::Group(ref grp) = particle.term {
             if let Some(ref ref_name) = grp.ref_name {
                 if ref_name.local_name == expected_name {
                     self_refs += 1;
+                    self_ref_min_occurs = particle.min_occurs;
+                    self_ref_max_occurs = particle.max_occurs;
                 }
             }
         }
     }
 
-    if self_refs != 1 {
-        return Err(SchemaError::structural(
+    match self_refs {
+        // Clause 6.2 (src-redefine §6.2): the redefining group has no
+        // self-reference and must be a valid *restriction* of the original
+        // group (clause 6.2.2 requires the new model to accept a subset of
+        // the original's element sequences). Clause 6.2.1 — that the name
+        // resolves in S2 — is already enforced by the caller's component
+        // lookup against the target document. The subset check in 6.2.2 is
+        // a pre-existing gap in this validator (group restriction
+        // derivation is not yet implemented); we accept the redefine here
+        // rather than reject valid cases like annotA019.
+        0 => Ok(()),
+        // Clause 6.1: self-reference present.
+        // Clause 6.1.2: minOccurs and maxOccurs must both be 1.
+        1 => {
+            if self_ref_min_occurs != 1 || self_ref_max_occurs != Some(1) {
+                Err(SchemaError::structural(
+                    "src-redefine",
+                    format!(
+                        "Self-referencing group particle must have \
+                         minOccurs=1 and maxOccurs=1, but found \
+                         minOccurs={} maxOccurs={}",
+                        self_ref_min_occurs,
+                        self_ref_max_occurs
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "unbounded".to_string()),
+                    ),
+                    group
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s)),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+        _ => Err(SchemaError::structural(
             "src-redefine",
             format!(
-                "Redefined group must contain exactly one self-reference (found {})",
-                self_refs
+                "Redefined group must contain at most one \
+                 self-reference (found {})",
+                self_refs,
             ),
             group
                 .source
                 .as_ref()
                 .and_then(|s| schema_set.source_maps.locate(s)),
-        ));
+        )),
     }
-
-    Ok(())
 }
 
-/// Validate that an attribute group contains exactly one self-reference.
+/// Validate self-reference constraints for an attribute group redefine.
+///
+/// Clause 7.1: with self-reference — exactly one is allowed.
+/// Clause 7.2: without self-reference — restriction of original.
 fn validate_self_reference_attribute_group(
     schema_set: &SchemaSet,
     group_key: AttributeGroupKey,
@@ -486,28 +564,36 @@ fn validate_self_reference_attribute_group(
         .get(group_key)
         .ok_or_else(|| SchemaError::internal("Attribute group not found"))?;
 
-    let mut self_refs = 0;
+    let mut self_refs = 0u32;
     for attr_group_ref in &group.attribute_groups {
         if attr_group_ref.local_name == expected_name {
             self_refs += 1;
         }
     }
 
-    if self_refs != 1 {
-        return Err(SchemaError::structural(
+    match self_refs {
+        // Clause 7.2 (src-redefine §7.2): no self-reference — the redefining
+        // attribute group must be a valid restriction of the original
+        // (clause 7.2.2). The 7.2.1 name-resolution check is enforced by
+        // the caller's component lookup; the 7.2.2 attribute-use/wildcard
+        // restriction check is a pre-existing gap and is not gated here,
+        // mirroring the treatment of group clause 6.2 above.
+        0 => Ok(()),
+        // Clause 7.1: exactly one self-reference. Valid.
+        1 => Ok(()),
+        _ => Err(SchemaError::structural(
             "src-redefine",
             format!(
-                "Redefined attribute group must contain exactly one self-reference (found {})",
-                self_refs
+                "Redefined attribute group must contain at most one \
+                 self-reference (found {})",
+                self_refs,
             ),
             group
                 .source
                 .as_ref()
                 .and_then(|s| schema_set.source_maps.locate(s)),
-        ));
+        )),
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -844,6 +930,270 @@ mod tests {
             note.is_empty(),
             "Provenance note for undeclared component should be empty, got: {}",
             note
+        );
+    }
+
+    #[test]
+    fn test_redefine_model_group_no_self_reference() {
+        // Clause 6.2: a redefining group with NO self-reference is valid
+        // (pure restriction of the original).
+        let (mut schema_set, _original_key, _new_key) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+        let age_elem = schema_set.name_table.add("age");
+
+        // Create redefining group WITHOUT self-reference (just element "age")
+        let new_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Element(ElementFrameResult {
+                    name: Some(age_elem),
+                    ref_name: None,
+                    target_namespace: None,
+                    type_ref: None,
+                    inline_type: None,
+                    substitution_group: vec![],
+                    default_value: None,
+                    fixed_value: None,
+                    nillable: false,
+                    is_abstract: false,
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    block: DerivationSet::empty(),
+                    final_derivation: DerivationSet::empty(),
+                    form: None,
+                    id: None,
+                    alternatives: vec![],
+                    identity_constraints: vec![],
+                    identity_constraint_refs: vec![],
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: Some(1),
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+        };
+        let no_selfref_key = schema_set.arenas.alloc_model_group(new_data);
+
+        let result = apply_model_group_redefine(&mut schema_set, no_selfref_key, None, None);
+        assert!(
+            result.is_ok(),
+            "Group redefine without self-reference should succeed (clause 6.2): {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_redefine_model_group_self_ref_wrong_min_occurs() {
+        // Clause 6.1.2: self-ref with minOccurs=0 must be rejected.
+        let (mut schema_set, _original_key, _new_key) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+        let age_elem = schema_set.name_table.add("age");
+
+        let new_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![
+                ParticleResult {
+                    term: ParticleTerm::Group(ModelGroupDefResult {
+                        name: None,
+                        ref_name: Some(QNameRef {
+                            prefix: None,
+                            local_name: group_name,
+                            namespace: None,
+                        }),
+                        compositor: None,
+                        particles: vec![],
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        id: None,
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 0, // ← violates clause 6.1.2
+                    max_occurs: Some(1),
+                    source: None,
+                },
+                ParticleResult {
+                    term: ParticleTerm::Element(ElementFrameResult {
+                        name: Some(age_elem),
+                        ref_name: None,
+                        target_namespace: None,
+                        type_ref: None,
+                        inline_type: None,
+                        substitution_group: vec![],
+                        default_value: None,
+                        fixed_value: None,
+                        nillable: false,
+                        is_abstract: false,
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        block: DerivationSet::empty(),
+                        final_derivation: DerivationSet::empty(),
+                        form: None,
+                        id: None,
+                        alternatives: vec![],
+                        identity_constraints: vec![],
+                        identity_constraint_refs: vec![],
+                        annotation: None,
+                        source: None,
+                    }),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    source: None,
+                },
+            ],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+        };
+        let bad_key = schema_set.arenas.alloc_model_group(new_data);
+
+        let result = apply_model_group_redefine(&mut schema_set, bad_key, None, None);
+        assert!(
+            result.is_err(),
+            "Self-ref with minOccurs=0 should fail (clause 6.1.2)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("minOccurs"),
+            "Error should mention minOccurs: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_redefine_model_group_self_ref_wrong_max_occurs() {
+        // Clause 6.1.2: self-ref with maxOccurs=unbounded must be rejected.
+        let (mut schema_set, _original_key, _new_key) = setup_model_group_redefine();
+
+        let group_name = schema_set.name_table.add("personGroup");
+
+        let new_data = ModelGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            compositor: Some(Compositor::Sequence),
+            particles: vec![ParticleResult {
+                term: ParticleTerm::Group(ModelGroupDefResult {
+                    name: None,
+                    ref_name: Some(QNameRef {
+                        prefix: None,
+                        local_name: group_name,
+                        namespace: None,
+                    }),
+                    compositor: None,
+                    particles: vec![],
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    id: None,
+                    annotation: None,
+                    source: None,
+                }),
+                min_occurs: 1,
+                max_occurs: None, // ← unbounded, violates clause 6.1.2
+                source: None,
+            }],
+            min_occurs: 1,
+            max_occurs: Some(1),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_particles: Vec::new(),
+            resolved_particle_types: Vec::new(),
+            resolved_particle_elements: Vec::new(),
+            redefine_original: None,
+        };
+        let bad_key = schema_set.arenas.alloc_model_group(new_data);
+
+        let result = apply_model_group_redefine(&mut schema_set, bad_key, None, None);
+        assert!(
+            result.is_err(),
+            "Self-ref with maxOccurs=unbounded should fail (clause 6.1.2)"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("maxOccurs"),
+            "Error should mention maxOccurs: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_redefine_attribute_group_no_self_reference() {
+        // Clause 7.2: attribute group redefine with no self-reference is valid.
+        let mut schema_set = SchemaSet::new();
+
+        let group_name = schema_set.name_table.add("commonAttrs");
+
+        let original_data = AttributeGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+        };
+        let _original_key = schema_set.arenas.alloc_attribute_group(original_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_attribute_group(group_name, _original_key);
+
+        // Redefining group with NO self-reference
+        let new_data = AttributeGroupData {
+            name: Some(group_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(), // empty — no self-ref
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+        };
+        let new_key = schema_set.arenas.alloc_attribute_group(new_data);
+
+        let result = apply_attribute_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_ok(),
+            "Attribute group redefine without self-reference should succeed (clause 7.2): {:?}",
+            result.err()
         );
     }
 }

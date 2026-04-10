@@ -2624,9 +2624,11 @@ fn test_reject_extension_with_all_over_choice() {
     }
 }
 
-/// particlesFb003: extending sequence content with choice compositor is invalid
+/// Extending sequence content with choice compositor is valid:
+/// the effective content type is sequence(base, choice) per §3.4.2.3.3
+/// clause 4.2.3.3, satisfying cos-particle-extend clause 2.
 #[test]
-fn test_reject_extension_with_choice_over_sequence() {
+fn test_accept_extension_with_choice_over_sequence() {
     let mut schema_set = SchemaSet::new();
     let xsd = r###"<?xml version="1.0"?>
         <xsd:schema xmlns:xsd="http://www.w3.org/2001/XMLSchema"
@@ -2653,15 +2655,10 @@ fn test_reject_extension_with_choice_over_sequence() {
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
     assert!(
-        result.is_err(),
-        "extending sequence with choice must be rejected"
+        result.is_ok(),
+        "extending sequence with choice is valid per spec: {:?}",
+        result.err()
     );
-    match result.unwrap_err() {
-        crate::error::SchemaError::StructuralError { constraint, .. } => {
-            assert_eq!(constraint, "cos-ct-extends");
-        }
-        other => panic!("Expected cos-ct-extends, got {:?}", other),
-    }
 }
 
 /// particlesFb004: XSD 1.1 all-over-all extension is valid
