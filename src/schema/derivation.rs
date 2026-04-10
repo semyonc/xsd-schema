@@ -2686,6 +2686,489 @@ fn collect_all_effective_attribute_uses(
     result
 }
 
+// ---------------------------------------------------------------------------
+// §3.6.2.2 Effective Attribute Wildcard + §3.10.6.4 Intersection
+// ---------------------------------------------------------------------------
+//
+// These helpers implement the "Common Rules for Attribute Wildcards"
+// (§3.6.2.2) used by both the complex-type restriction path
+// (`validate_attribute_restriction`) and the redefine attribute-group
+// restriction path (`validate_all_redefine_attribute_group_restrictions`).
+//
+// The output is an `EffectiveAttributeWildcard` with a canonical namespace
+// constraint (`CanonicalNs`) in which all `WildcardNamespace` variants have
+// been normalized to either `Any`, an explicit positive set, or a
+// complement set, with `not_namespace` exclusions already folded in and
+// `##other` resolved against XSD version. Intersection then reduces to
+// pure set theory on `HashSet<Option<NameId>>`.
+//
+// Intentionally private to this module — the canonical form never leaks
+// into the arena model.
+
+/// Canonical namespace constraint for attribute wildcards (§3.10.6.4).
+///
+/// All `WildcardNamespace` variants normalize to one of these three cases,
+/// with `not_namespace` exclusions already folded in and `##other`
+/// resolved via XSD-version-aware rules (XSD 1.0 excludes absent namespace,
+/// XSD 1.1 does not).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanonicalNs {
+    /// Every namespace is allowed.
+    Any,
+    /// Positive set of allowed namespaces. `None` represents the absent
+    /// (no-namespace) case.
+    Enum(std::collections::HashSet<Option<NameId>>),
+    /// Complement set: every namespace except those in the set is allowed.
+    /// `Not(empty)` is equivalent to `Any` but is preserved as-is for
+    /// symmetry; `canonical_ns_subset` handles this case.
+    Not(std::collections::HashSet<Option<NameId>>),
+}
+
+/// Effective attribute wildcard, the result of §3.6.2.2.
+///
+/// Target-namespace-free: `namespace` has already been resolved against
+/// each contributor's own target namespace during normalization.
+#[derive(Debug, Clone)]
+struct EffectiveAttributeWildcard {
+    namespace: CanonicalNs,
+    not_qname: Vec<crate::parser::frames::NotQNameItem>,
+    process_contents: ProcessContents,
+}
+
+/// Normalize a single `WildcardResult` into canonical form, resolving
+/// `##other`, `##targetNamespace`, `##local`, list tokens, and folding in
+/// `not_namespace` exclusions against `target_ns`.
+fn normalize_attribute_wildcard(
+    schema_set: &SchemaSet,
+    wc: &WildcardResult,
+    target_ns: Option<NameId>,
+) -> EffectiveAttributeWildcard {
+    use std::collections::HashSet;
+
+    // Step 1: resolve the primary namespace constraint.
+    let base: CanonicalNs = match &wc.namespace {
+        WildcardNamespace::Any => CanonicalNs::Any,
+        WildcardNamespace::Other => {
+            // Version-aware ##other exclusion set (§3.10.1):
+            //   XSD 1.0: excludes {target_ns, absent}
+            //   XSD 1.1: excludes {target_ns} only
+            //
+            // When the schema has no target namespace, the "target
+            // namespace" IS the absent namespace (None), so
+            // `target_ns` is inserted unconditionally to capture that
+            // case. For XSD 1.0 with a non-absent target, we additionally
+            // insert None (HashSet dedupes if target is already None).
+            let mut excl = HashSet::new();
+            excl.insert(target_ns);
+            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+                excl.insert(None);
+            }
+            CanonicalNs::Not(excl)
+        }
+        WildcardNamespace::TargetNamespace => {
+            let mut s = HashSet::new();
+            s.insert(target_ns);
+            CanonicalNs::Enum(s)
+        }
+        WildcardNamespace::Local => {
+            let mut s = HashSet::new();
+            s.insert(None);
+            CanonicalNs::Enum(s)
+        }
+        WildcardNamespace::List(tokens) => {
+            let mut s = HashSet::new();
+            for tok in tokens {
+                s.insert(tok.resolve(target_ns));
+            }
+            CanonicalNs::Enum(s)
+        }
+    };
+
+    // Step 2: fold `not_namespace` exclusions into the canonical form.
+    let not_ns: HashSet<Option<NameId>> = wc
+        .not_namespace
+        .iter()
+        .map(|t| t.resolve(target_ns))
+        .collect();
+
+    let namespace = if not_ns.is_empty() {
+        base
+    } else {
+        match base {
+            CanonicalNs::Any => CanonicalNs::Not(not_ns),
+            CanonicalNs::Enum(set) => {
+                let filtered: HashSet<Option<NameId>> =
+                    set.into_iter().filter(|ns| !not_ns.contains(ns)).collect();
+                CanonicalNs::Enum(filtered)
+            }
+            CanonicalNs::Not(set) => {
+                let mut combined = set;
+                combined.extend(not_ns);
+                CanonicalNs::Not(combined)
+            }
+        }
+    };
+
+    EffectiveAttributeWildcard {
+        namespace,
+        not_qname: wc.not_qname.clone(),
+        process_contents: wc.process_contents,
+    }
+}
+
+/// §3.10.6.4 namespace-constraint intersection. Pure set theory on the
+/// canonical lattice.
+fn intersect_canonical_ns(a: &CanonicalNs, b: &CanonicalNs) -> CanonicalNs {
+    use std::collections::HashSet;
+    match (a, b) {
+        // Any ∩ X = X
+        (CanonicalNs::Any, other) | (other, CanonicalNs::Any) => other.clone(),
+
+        // Enum ∩ Enum = set intersection
+        (CanonicalNs::Enum(s1), CanonicalNs::Enum(s2)) => {
+            let inter: HashSet<Option<NameId>> = s1.intersection(s2).copied().collect();
+            CanonicalNs::Enum(inter)
+        }
+
+        // Enum ∩ Not(N) = Enum \ N
+        (CanonicalNs::Enum(s), CanonicalNs::Not(n))
+        | (CanonicalNs::Not(n), CanonicalNs::Enum(s)) => {
+            let filtered: HashSet<Option<NameId>> =
+                s.iter().filter(|ns| !n.contains(ns)).copied().collect();
+            CanonicalNs::Enum(filtered)
+        }
+
+        // Not(N1) ∩ Not(N2) = Not(N1 ∪ N2)
+        (CanonicalNs::Not(n1), CanonicalNs::Not(n2)) => {
+            let mut union = n1.clone();
+            union.extend(n2.iter().copied());
+            CanonicalNs::Not(union)
+        }
+    }
+}
+
+/// Canonical namespace subset: `a ⊆ b`. Tests whether every namespace
+/// allowed by `a` is also allowed by `b`.
+fn canonical_ns_subset(a: &CanonicalNs, b: &CanonicalNs) -> bool {
+    match (a, b) {
+        // Anything ⊆ Any (Any accepts all namespaces)
+        (_, CanonicalNs::Any) => true,
+
+        // Any ⊆ Not(empty) also holds, but only when b is literally `Any`
+        // after the above match. Otherwise Any is not a subset of anything
+        // finite or complemented.
+        (CanonicalNs::Any, _) => false,
+
+        // Enum(s) ⊆ Enum(t) iff s ⊆ t
+        (CanonicalNs::Enum(s), CanonicalNs::Enum(t)) => s.iter().all(|ns| t.contains(ns)),
+
+        // Enum(s) ⊆ Not(n) iff s ∩ n = ∅  (no element of s is excluded by n)
+        (CanonicalNs::Enum(s), CanonicalNs::Not(n)) => s.iter().all(|ns| !n.contains(ns)),
+
+        // Not(n1) ⊆ Not(n2) iff n2 ⊆ n1  (a's exclusion set must be at
+        // least as large as b's; the larger the exclusion, the smaller the
+        // allowed set)
+        (CanonicalNs::Not(n1), CanonicalNs::Not(n2)) => n2.iter().all(|ns| n1.contains(ns)),
+
+        // Not(n) ⊆ Enum(s): `Not(n)` allows infinitely many namespaces, a
+        // finite `Enum(s)` cannot contain them all. False.
+        (CanonicalNs::Not(_), CanonicalNs::Enum(_)) => false,
+    }
+}
+
+/// Intersect two effective attribute wildcards per §3.10.6.4.
+///
+/// - `namespace`: `intersect_canonical_ns`
+/// - `not_qname`: union of both lists (deduplicated). Per §3.10.6.4
+///   disallowed_names clause 3, `##defined` is preserved if present on
+///   either side.
+/// - `process_contents`: takes the LEFT operand's value. Callers must
+///   pass the operands in the order required by §3.6.2.2 (clause 3.2.1
+///   passes L first, clause 3.2.2 passes W[0] first).
+fn intersect_effective_attribute_wildcards(
+    a: &EffectiveAttributeWildcard,
+    b: &EffectiveAttributeWildcard,
+) -> EffectiveAttributeWildcard {
+    let namespace = intersect_canonical_ns(&a.namespace, &b.namespace);
+
+    // Union not_qname lists. Items whose namespace is no longer admitted
+    // by the intersected constraint are redundant but harmless to keep.
+    let mut not_qname = a.not_qname.clone();
+    for item in &b.not_qname {
+        if !not_qname.contains(item) {
+            not_qname.push(item.clone());
+        }
+    }
+
+    EffectiveAttributeWildcard {
+        namespace,
+        not_qname,
+        process_contents: a.process_contents,
+    }
+}
+
+/// Structural error for attribute-group reference cycles exceeding the
+/// depth guard during §3.6.2.2 walking. These should already be rejected
+/// by the resolver — fail loudly rather than silently synthesize `Any`.
+fn attribute_group_cycle_error() -> SchemaError {
+    SchemaError::structural(
+        "derivation-ok-restriction",
+        "attribute group reference cycle exceeded max depth while computing \
+         effective attribute wildcard (§3.6.2.2)",
+        None,
+    )
+}
+
+/// Combine a local effective wildcard with an ordered sequence of
+/// contributed effective wildcards per §3.6.2.2 clauses 3.1/3.2.1/3.2.2:
+///
+/// * W empty ⇒ `local` (or `None` if neither side is present).
+/// * L non-absent ⇒ pc from L, intersect L with every Wi.
+/// * L absent, W non-empty ⇒ pc from W[0], intersect every Wi.
+fn combine_effective_wildcards(
+    local: Option<EffectiveAttributeWildcard>,
+    w: Vec<EffectiveAttributeWildcard>,
+) -> Option<EffectiveAttributeWildcard> {
+    match (local, w.is_empty()) {
+        (None, true) => None,
+        (Some(l), true) => Some(l),
+        (Some(l), false) => Some(
+            w.into_iter()
+                .fold(l, |acc, wi| intersect_effective_attribute_wildcards(&acc, &wi)),
+        ),
+        (None, false) => {
+            let mut it = w.into_iter();
+            let first = it.next().expect("w is non-empty");
+            Some(it.fold(first, |acc, wi| {
+                intersect_effective_attribute_wildcards(&acc, &wi)
+            }))
+        }
+    }
+}
+
+/// §3.6.2.2 Common Rules for Attribute Wildcards.
+///
+/// Given a local wildcard `local_wc` (optional) and the ordered sequence
+/// of resolved referenced attribute groups, compute the effective
+/// attribute wildcard. Each referenced group's own effective wildcard is
+/// computed recursively (so wildcards inherited through chains of
+/// `<xs:attributeGroup ref=...>` references are properly intersected).
+///
+/// Returns `Err` if the attribute-group reference tree exceeds the depth
+/// guard (cycle protection, matching `collect_attribute_group_uses`).
+fn effective_attribute_wildcard(
+    schema_set: &SchemaSet,
+    local_wc: Option<&WildcardResult>,
+    local_target_ns: Option<NameId>,
+    attribute_groups: &[AttributeGroupKey],
+) -> SchemaResult<Option<EffectiveAttributeWildcard>> {
+    let local = local_wc.map(|w| normalize_attribute_wildcard(schema_set, w, local_target_ns));
+
+    let mut w: Vec<EffectiveAttributeWildcard> = Vec::new();
+    for &ag_key in attribute_groups {
+        collect_effective_group_wildcards(schema_set, ag_key, &mut w, 0)?;
+    }
+
+    Ok(combine_effective_wildcards(local, w))
+}
+
+/// Recursive walker for `effective_attribute_wildcard`: follows
+/// `resolved_ref` delegation, then iterates `resolved_attribute_groups`
+/// in document order. Each referenced group's own effective wildcard is
+/// computed and appended to `out` if it is non-absent (per §3.6.2.2
+/// step 2 — "non-absent `{attribute wildcard}`s").
+///
+/// Depth guard matches `collect_attribute_group_uses` (> 20).
+fn collect_effective_group_wildcards(
+    schema_set: &SchemaSet,
+    ag_key: AttributeGroupKey,
+    out: &mut Vec<EffectiveAttributeWildcard>,
+    depth: usize,
+) -> SchemaResult<()> {
+    if depth > 20 {
+        return Err(attribute_group_cycle_error());
+    }
+
+    let Some(ag) = schema_set.arenas.attribute_groups.get(ag_key) else {
+        return Ok(());
+    };
+
+    if let Some(ref_key) = ag.resolved_ref {
+        return collect_effective_group_wildcards(schema_set, ref_key, out, depth + 1);
+    }
+
+    if let Some(eff) = effective_attribute_wildcard_for_group(schema_set, ag, depth + 1)? {
+        out.push(eff);
+    }
+
+    Ok(())
+}
+
+/// Compute the effective wildcard for a single attribute group, walking
+/// `resolved_ref` delegation and `resolved_attribute_groups` recursively.
+/// Separate from the top-level `effective_attribute_wildcard` so the depth
+/// counter propagates correctly through nested calls.
+fn effective_attribute_wildcard_for_group(
+    schema_set: &SchemaSet,
+    ag: &crate::arenas::AttributeGroupData,
+    depth: usize,
+) -> SchemaResult<Option<EffectiveAttributeWildcard>> {
+    if depth > 20 {
+        return Err(attribute_group_cycle_error());
+    }
+
+    if let Some(ref_key) = ag.resolved_ref {
+        let Some(target) = schema_set.arenas.attribute_groups.get(ref_key) else {
+            return Ok(None);
+        };
+        return effective_attribute_wildcard_for_group(schema_set, target, depth + 1);
+    }
+
+    let local = ag
+        .attribute_wildcard
+        .as_ref()
+        .map(|w| normalize_attribute_wildcard(schema_set, w, ag.target_namespace));
+
+    let mut w: Vec<EffectiveAttributeWildcard> = Vec::new();
+    for &nested_key in &ag.resolved_attribute_groups {
+        collect_effective_group_wildcards(schema_set, nested_key, &mut w, depth + 1)?;
+    }
+
+    Ok(combine_effective_wildcards(local, w))
+}
+
+/// Check that `derived` is a valid restriction of `base` (derived ⊆ base)
+/// per cos-ns-subset (§3.10.6.2) on attribute wildcards.
+///
+/// Verifies:
+/// 1. canonical namespace subset (clauses 1-4 of §3.10.6.2 on the
+///    namespace constraint),
+/// 2. each QName in `base.not_qname` must not be allowed by `derived`
+///    (§3.10.6.2 disallowed_names clause 1). "Not allowed" covers any
+///    rejection mechanism on the derived side: namespace constraint,
+///    literal notQName entry, or `##defined` (which rejects any
+///    globally declared attribute). This is delegated to
+///    `effective_wildcard_allows_attribute` so all three mechanisms
+///    are checked uniformly.
+/// 3. if `base.not_qname` contains `##defined`, derived must also
+///    (§3.10.6.2 clause 2); same for `##sibling` (clause 3). These
+///    two keywords require literal containment, unlike QName members.
+/// 4. derived processContents strictness ≥ base strictness (mirrors
+///    `validate_open_content_restriction` at derivation.rs:2488-2501).
+///
+/// Takes `schema_set` because `##defined` coverage requires a lookup
+/// against `schema_set.lookup_attribute` via
+/// `effective_wildcard_allows_attribute`.
+///
+/// On failure returns `Err(reason)` so callers can build informative
+/// error messages.
+fn effective_attribute_wildcard_restricts(
+    schema_set: &SchemaSet,
+    derived: &EffectiveAttributeWildcard,
+    base: &EffectiveAttributeWildcard,
+) -> Result<(), &'static str> {
+    use crate::parser::frames::NotQNameItem;
+
+    if !canonical_ns_subset(&derived.namespace, &base.namespace) {
+        return Err("namespace constraint is not a subset of the base wildcard");
+    }
+
+    // §3.10.6.2 disallowed_names clause 1: each QName member of base's
+    // not_qname must not be admitted by derived. `effective_wildcard_allows_attribute`
+    // correctly handles namespace-constraint rejection, literal QName
+    // exclusion, and `##defined` (with schema lookup) in one pass.
+    for item in &base.not_qname {
+        match item {
+            NotQNameItem::QName { namespace, local_name } => {
+                if effective_wildcard_allows_attribute(
+                    schema_set,
+                    derived,
+                    *namespace,
+                    *local_name,
+                ) {
+                    return Err(
+                        "notQName exclusions do not cover the base wildcard's disallowed names",
+                    );
+                }
+            }
+            // Clause 2: `##defined` requires literal containment.
+            NotQNameItem::Defined => {
+                if !derived.not_qname.iter().any(|d| matches!(d, NotQNameItem::Defined)) {
+                    return Err("base wildcard excludes ##defined but derived does not");
+                }
+            }
+            // Clause 3: `##definedSibling` requires literal containment.
+            NotQNameItem::DefinedSibling => {
+                if !derived
+                    .not_qname
+                    .iter()
+                    .any(|d| matches!(d, NotQNameItem::DefinedSibling))
+                {
+                    return Err("base wildcard excludes ##definedSibling but derived does not");
+                }
+            }
+        }
+    }
+
+    if process_contents_strictness(derived.process_contents)
+        < process_contents_strictness(base.process_contents)
+    {
+        return Err("processContents is weaker than the base wildcard");
+    }
+
+    Ok(())
+}
+
+/// Does this effective wildcard admit a specific `(namespace, name)`
+/// attribute?
+///
+/// Mirror of `wildcard_allows_attribute` (derivation.rs:3091) operating
+/// on the canonical form. Preserves the load-bearing `NotQNameItem::Defined`
+/// semantics documented at derivation.rs:3078-3090 — `##defined` only
+/// excludes attributes that are actually globally declared, not an
+/// unconditional block.
+fn effective_wildcard_allows_attribute(
+    schema_set: &SchemaSet,
+    wc: &EffectiveAttributeWildcard,
+    attr_namespace: Option<NameId>,
+    attr_name: NameId,
+) -> bool {
+    // Namespace constraint check.
+    let ns_ok = match &wc.namespace {
+        CanonicalNs::Any => true,
+        CanonicalNs::Enum(set) => set.contains(&attr_namespace),
+        CanonicalNs::Not(set) => !set.contains(&attr_namespace),
+    };
+    if !ns_ok {
+        return false;
+    }
+
+    // not_qname exclusions, including ##defined schema lookup.
+    for item in &wc.not_qname {
+        match item {
+            crate::parser::frames::NotQNameItem::QName { namespace: qns, local_name } => {
+                if *qns == attr_namespace && *local_name == attr_name {
+                    return false;
+                }
+            }
+            crate::parser::frames::NotQNameItem::Defined => {
+                if schema_set
+                    .lookup_attribute(attr_namespace, attr_name)
+                    .is_some()
+                {
+                    return false;
+                }
+            }
+            crate::parser::frames::NotQNameItem::DefinedSibling => {
+                // Not meaningful for attribute wildcards; ignore (matches
+                // `wildcard_allows_attribute`).
+            }
+        }
+    }
+
+    true
+}
+
 /// Recursively expand an attribute group into effective attribute uses.
 fn collect_attribute_group_uses(
     schema_set: &SchemaSet,
@@ -2725,6 +3208,48 @@ fn is_type_derived_from(
     base_key: TypeKey,
 ) -> bool {
     schema_set.is_type_derived_from(derived_key, base_key, DerivationSet::empty())
+}
+
+/// Outcome of comparing derived and base effective attribute wildcards.
+/// Shared by the complex-type restriction path and the redefine
+/// attribute-group restriction path.
+enum WildcardRestrictionOutcome {
+    /// Derived has no effective wildcard; any base is valid.
+    DerivedAbsent,
+    /// Derived has a wildcard but base has none — invalid restriction.
+    AddedInDerived,
+    /// Both have wildcards and the subset check failed with the given
+    /// reason string.
+    NotSubset(&'static str),
+    /// Both have wildcards and derived is a valid restriction of base.
+    Valid,
+}
+
+/// Compare two precomputed effective attribute wildcards and classify
+/// the restriction relationship. The caller is responsible for deciding
+/// how to report each outcome.
+fn classify_attribute_wildcard_restriction(
+    schema_set: &SchemaSet,
+    derived_eff: Option<&EffectiveAttributeWildcard>,
+    base_eff: Option<&EffectiveAttributeWildcard>,
+) -> WildcardRestrictionOutcome {
+    match (derived_eff, base_eff) {
+        (None, _) => WildcardRestrictionOutcome::DerivedAbsent,
+        (Some(_), None) => WildcardRestrictionOutcome::AddedInDerived,
+        (Some(d), Some(b)) => match effective_attribute_wildcard_restricts(schema_set, d, b) {
+            Ok(()) => WildcardRestrictionOutcome::Valid,
+            Err(reason) => WildcardRestrictionOutcome::NotSubset(reason),
+        },
+    }
+}
+
+/// True when the complex type has no local attribute wildcard AND no
+/// attribute groups that could contribute one — the §3.6.2.2 walk is
+/// guaranteed to return `None`, so callers can skip the full computation.
+fn complex_type_has_no_attribute_wildcard_source(
+    type_def: &crate::arenas::ComplexTypeDefData,
+) -> bool {
+    type_def.attribute_wildcard.is_none() && type_def.resolved_attribute_groups.is_empty()
 }
 
 /// Validate attribute uses in a complex type restriction.
@@ -2806,6 +3331,57 @@ fn validate_attribute_restriction(
                 ),
                 location,
             ));
+        }
+    }
+
+    // §3.4.6.3 clause 3 (attribute wildcard half): compute the effective
+    // attribute wildcard for both sides per §3.6.2.2 and verify
+    // derived ⊆ base. When the derived type has no wildcard source at
+    // all, the §3.6.2.2 walk is guaranteed to return `None` and the
+    // restriction is trivially valid — skip both walks in that common
+    // case to avoid O(types × groups) arena lookups per compile.
+    if !complex_type_has_no_attribute_wildcard_source(derived) {
+        let derived_eff = effective_attribute_wildcard(
+            schema_set,
+            derived.attribute_wildcard.as_ref(),
+            derived.target_namespace,
+            &derived.resolved_attribute_groups,
+        )?;
+        let base_eff = effective_attribute_wildcard(
+            schema_set,
+            base.attribute_wildcard.as_ref(),
+            base.target_namespace,
+            &base.resolved_attribute_groups,
+        )?;
+
+        match classify_attribute_wildcard_restriction(
+            schema_set,
+            derived_eff.as_ref(),
+            base_eff.as_ref(),
+        ) {
+            WildcardRestrictionOutcome::DerivedAbsent | WildcardRestrictionOutcome::Valid => {}
+            WildcardRestrictionOutcome::AddedInDerived => {
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': derived type has an attribute \
+                         wildcard but the base type does not",
+                        type_name, base_name,
+                    ),
+                    location,
+                ));
+            }
+            WildcardRestrictionOutcome::NotSubset(reason) => {
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': attribute wildcard is not \
+                         a valid restriction of the base wildcard: {}",
+                        type_name, base_name, reason,
+                    ),
+                    location,
+                ));
+            }
         }
     }
 
@@ -3059,91 +3635,10 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
 //     restriction check.
 //   - §3.2.2: a prohibited `<xs:attribute>` is NOT an attribute use.
 //
-// Scope limitations (deferred to joint follow-ups with
-// `validate_attribute_restriction`):
-//   - §3.6.2.2 effective attribute-group wildcard intersection across
-//     referenced groups — only local parsed wildcards are inspected here.
-//   - Wildcard-vs-wildcard subset (derived ⊆ base).
+// Scope limitations:
 //   - Chained redefines (`orig → v1 → v2`) resolve nested `group-ref`s via
 //     the currently bound namespace version; see
 //     `normalize_model_group_as_particle` doc comment.
-
-/// Free-function port of the runtime validator method at
-/// `validation/runtime.rs::wildcard_allows_attribute`.
-///
-/// Returns `true` if `wildcard` admits an attribute with the given
-/// `(attr_namespace, attr_name)` in the context of `target_namespace` (the
-/// target namespace of the component that declares the wildcard).
-///
-/// **Do not replace this with** `wildcard_namespace_matches` composed with
-/// `wildcard_not_qname_excludes`. Two invariants the composition would
-/// break:
-///
-/// 1. `wildcard_not_qname_excludes` treats `NotQNameItem::Defined` as an
-///    unconditional exclusion, while the runtime (correctly, per §3.10.4
-///    *"Wildcard allows NameAndNS"*) only excludes `##defined` when the
-///    attribute is actually globally declared.
-/// 2. `wildcard_namespace_matches` hardcodes XSD 1.0 `##other` semantics
-///    (excludes both target namespace *and* the absent namespace), but
-///    XSD 1.1 admits the absent namespace under `##other`. We delegate the
-///    `##other` branch to the version-aware `other_matches_namespace`
-///    (types/complex.rs:291) instead, matching the runtime's behaviour.
-fn wildcard_allows_attribute(
-    schema_set: &SchemaSet,
-    wildcard: &WildcardResult,
-    attr_namespace: Option<NameId>,
-    attr_name: NameId,
-    target_namespace: Option<NameId>,
-) -> bool {
-    // Namespace constraint. Use the version-aware `other_matches_namespace`
-    // for the `##other` branch (see invariant 2 in the doc comment);
-    // delegate everything else to `wildcard_namespace_matches`, which is
-    // correct for `Any`/`TargetNamespace`/`Local`/`List`.
-    let ns_ok = match &wildcard.namespace {
-        WildcardNamespace::Other => crate::types::complex::other_matches_namespace(
-            attr_namespace,
-            target_namespace,
-            schema_set.xsd_version,
-        ),
-        _ => wildcard_namespace_matches(&wildcard.namespace, attr_namespace, target_namespace),
-    };
-    if !ns_ok {
-        return false;
-    }
-    // not_namespace exclusions — three-line loop mirroring
-    // `runtime.rs::wildcard_allows_namespace`.
-    for token in &wildcard.not_namespace {
-        let excluded_ns = token.resolve(target_namespace);
-        if attr_namespace == excluded_ns {
-            return false;
-        }
-    }
-    // not_qname exclusions (including `##defined` resolved via schema lookup).
-    for item in &wildcard.not_qname {
-        match item {
-            crate::parser::frames::NotQNameItem::QName {
-                namespace: qns,
-                local_name,
-            } => {
-                if *qns == attr_namespace && *local_name == attr_name {
-                    return false;
-                }
-            }
-            crate::parser::frames::NotQNameItem::Defined => {
-                if schema_set
-                    .lookup_attribute(attr_namespace, attr_name)
-                    .is_some()
-                {
-                    return false;
-                }
-            }
-            // `##definedSibling` is rejected at parse time for attribute
-            // wildcards — mirror runtime's behaviour and ignore.
-            crate::parser::frames::NotQNameItem::DefinedSibling => {}
-        }
-    }
-    true
-}
 
 /// Flatten an attribute group's effective attribute uses, filtering out
 /// prohibited uses per §3.2.2 (a prohibited `<xs:attribute>` is not an
@@ -3272,12 +3767,15 @@ fn validate_all_redefine_group_restrictions(
     }
 }
 
-/// Driver for §src-redefine 7.2.2: partial implementation of §3.4.6.3 clause 3
-/// (derivation-ok-restriction, attribute side) applied to redefined attribute
-/// groups. Checks subset, required-stays-required, and type tightening
-/// against the locally-declared base wildcard. §3.6.2.2 effective-wildcard
-/// intersection and wildcard-vs-wildcard subset are intentionally deferred —
-/// see the module header comment.
+/// Driver for §src-redefine 7.2.2: implementation of §3.4.6.3 clause 3
+/// (derivation-ok-restriction, attribute side) applied to redefined
+/// attribute groups. Checks:
+///  - every derived attribute is present in the base (direct match) or
+///    admitted by the base's effective attribute wildcard (§3.6.2.2);
+///  - clause 3(b) type tightening on directly-matched pairs;
+///  - required-stays-required;
+///  - wildcard-vs-wildcard subset: the derived group's effective
+///    attribute wildcard must be a valid restriction of the original's.
 fn validate_all_redefine_attribute_group_restrictions(
     schema_set: &SchemaSet,
     errors: &mut Vec<SchemaError>,
@@ -3300,9 +3798,27 @@ fn validate_all_redefine_attribute_group_restrictions(
         let derived_attrs = collect_flat_attribute_uses_for_group(schema_set, _key);
         let base_attrs = collect_flat_attribute_uses_for_group(schema_set, original_key);
 
+        // Compute the base's effective attribute wildcard per §3.6.2.2
+        // once, outside the per-attribute loop. This is the full
+        // intersection across the original group's local wildcard and
+        // the wildcards of every referenced nested attribute group.
+        let base_effective_wc = match effective_attribute_wildcard(
+            schema_set,
+            original.attribute_wildcard.as_ref(),
+            original.target_namespace,
+            &original.resolved_attribute_groups,
+        ) {
+            Ok(eff) => eff,
+            Err(e) => {
+                errors.push(e);
+                stats.errors += 1;
+                continue;
+            }
+        };
+
         // Subset check (clause 3, first half): every derived attribute must
         // be valid in the base, either directly by (namespace, name) match
-        // or via the base's local {attribute wildcard}. Also applies the
+        // or via the base's effective {attribute wildcard}. Also applies the
         // clause 3(b) type-subsumption check for directly-matched pairs.
         let mut failed = false;
         for da in &derived_attrs {
@@ -3332,14 +3848,14 @@ fn validate_all_redefine_attribute_group_restrictions(
                 }
                 continue;
             }
-            // (b) Admitted by base's (local) {attribute wildcard}.
-            if let Some(base_wildcard) = original.attribute_wildcard.as_ref() {
-                if wildcard_allows_attribute(
+            // (b) Admitted by the base's *effective* {attribute wildcard}
+            // (§3.6.2.2), not just the original group's local wildcard.
+            if let Some(ref bwc) = base_effective_wc {
+                if effective_wildcard_allows_attribute(
                     schema_set,
-                    base_wildcard,
+                    bwc,
                     da.target_namespace,
                     da.name,
-                    original.target_namespace,
                 ) {
                     continue;
                 }
@@ -3365,6 +3881,7 @@ fn validate_all_redefine_attribute_group_restrictions(
 
         // Required-stays-required (clause 3(a)): every base Required attribute
         // must also be Required in the derived side.
+        let mut req_failed = false;
         for ba in &base_attrs {
             if ba.use_kind != AttributeUseKind::Required {
                 continue;
@@ -3386,8 +3903,59 @@ fn validate_all_redefine_attribute_group_restrictions(
                         ),
                     ));
                     stats.errors += 1;
+                    req_failed = true;
                     break;
                 }
+            }
+        }
+        if req_failed {
+            continue;
+        }
+
+        // Wildcard-vs-wildcard subset (clause 3, second half of §3.6.2.2):
+        // the derived group's effective attribute wildcard must be a
+        // valid restriction of the original's. This catches cases where
+        // the redefined group broadens an inherited wildcard even when
+        // every directly-named attribute already checks out.
+        let derived_effective_wc = match effective_attribute_wildcard(
+            schema_set,
+            derived.attribute_wildcard.as_ref(),
+            derived.target_namespace,
+            &derived.resolved_attribute_groups,
+        ) {
+            Ok(eff) => eff,
+            Err(e) => {
+                errors.push(e);
+                stats.errors += 1;
+                continue;
+            }
+        };
+        match classify_attribute_wildcard_restriction(
+            schema_set,
+            derived_effective_wc.as_ref(),
+            base_effective_wc.as_ref(),
+        ) {
+            WildcardRestrictionOutcome::DerivedAbsent | WildcardRestrictionOutcome::Valid => {}
+            WildcardRestrictionOutcome::AddedInDerived => {
+                errors.push(make_redefine_attr_group_restriction_error(
+                    schema_set,
+                    derived,
+                    "redefined attribute group declares an attribute wildcard but \
+                     the original has none",
+                ));
+                stats.errors += 1;
+            }
+            WildcardRestrictionOutcome::NotSubset(reason) => {
+                errors.push(make_redefine_attr_group_restriction_error(
+                    schema_set,
+                    derived,
+                    &format!(
+                        "attribute wildcard is not a valid restriction of the \
+                         original: {}",
+                        reason,
+                    ),
+                ));
+                stats.errors += 1;
             }
         }
     }
@@ -4101,56 +4669,67 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_wildcard_allows_attribute_any_admits_anything() {
-        let schema_set = SchemaSet::new();
-        let name = schema_set.name_table.add("foo");
-        let w = default_wildcard(WildcardNamespace::Any);
-        assert!(wildcard_allows_attribute(&schema_set, &w, None, name, None));
+    /// Normalize `w` against `target_ns` and ask whether the resulting
+    /// effective wildcard admits `(attr_ns, attr_name)`. Used by the
+    /// spec-invariant pin tests below so they exercise the production
+    /// canonical-form path.
+    fn admits(
+        schema_set: &SchemaSet,
+        w: &WildcardResult,
+        target_ns: Option<NameId>,
+        attr_ns: Option<NameId>,
+        attr_name: NameId,
+    ) -> bool {
+        let eff = normalize_attribute_wildcard(schema_set, w, target_ns);
+        effective_wildcard_allows_attribute(schema_set, &eff, attr_ns, attr_name)
     }
 
     #[test]
-    fn test_wildcard_allows_attribute_other_excludes_target_ns() {
+    fn test_effective_wildcard_any_admits_anything() {
+        let schema_set = SchemaSet::new();
+        let name = schema_set.name_table.add("foo");
+        let w = default_wildcard(WildcardNamespace::Any);
+        assert!(admits(&schema_set, &w, None, None, name));
+    }
+
+    #[test]
+    fn test_effective_wildcard_other_excludes_target_ns() {
         // ##other must exclude the target namespace itself.
         let schema_set = SchemaSet::new();
         let ns = schema_set.name_table.add("urn:foo");
         let name = schema_set.name_table.add("bar");
         let w = default_wildcard(WildcardNamespace::Other);
         assert!(
-            !wildcard_allows_attribute(&schema_set, &w, Some(ns), name, Some(ns)),
+            !admits(&schema_set, &w, Some(ns), Some(ns), name),
             "##other must NOT admit the target namespace"
         );
     }
 
     #[test]
-    fn test_wildcard_allows_attribute_other_admits_different_ns() {
+    fn test_effective_wildcard_other_admits_different_ns() {
         let schema_set = SchemaSet::new();
         let tns = schema_set.name_table.add("urn:foo");
         let other_ns = schema_set.name_table.add("urn:bar");
         let name = schema_set.name_table.add("qux");
         let w = default_wildcard(WildcardNamespace::Other);
         assert!(
-            wildcard_allows_attribute(&schema_set, &w, Some(other_ns), name, Some(tns)),
+            admits(&schema_set, &w, Some(tns), Some(other_ns), name),
             "##other must admit a namespace different from the target"
         );
     }
 
     #[test]
-    fn test_wildcard_allows_attribute_other_absent_ns_xsd10_vs_xsd11() {
+    fn test_effective_wildcard_other_absent_ns_xsd10_vs_xsd11() {
         // §3.10.4.2 `##other` differs by version:
         //   - XSD 1.0: excludes both the target namespace AND the absent namespace.
         //   - XSD 1.1: excludes only the target namespace; the absent namespace is admitted.
-        // Pins the fix that `wildcard_allows_attribute` delegates the
-        // `Other` branch to the version-aware `other_matches_namespace`
-        // (types/complex.rs:291) instead of the XSD-1.0-hardcoded
-        // `wildcard_namespace_matches`.
         let schema_10 = SchemaSet::new(); // defaults to XSD 1.0
         let tns = schema_10.name_table.add("urn:foo");
         let name = schema_10.name_table.add("local_attr");
         let w = default_wildcard(WildcardNamespace::Other);
 
         assert!(
-            !wildcard_allows_attribute(&schema_10, &w, None, name, Some(tns)),
+            !admits(&schema_10, &w, Some(tns), None, name),
             "XSD 1.0: ##other must NOT admit the absent namespace"
         );
 
@@ -4158,17 +4737,15 @@ mod tests {
         let tns11 = schema_11.name_table.add("urn:foo");
         let name11 = schema_11.name_table.add("local_attr");
         assert!(
-            wildcard_allows_attribute(&schema_11, &w, None, name11, Some(tns11)),
+            admits(&schema_11, &w, Some(tns11), None, name11),
             "XSD 1.1: ##other MUST admit the absent namespace"
         );
     }
 
     #[test]
-    fn test_wildcard_allows_attribute_defined_excludes_declared_only() {
+    fn test_effective_wildcard_defined_excludes_declared_only() {
         // §3.10.4 `##defined` excludes ONLY attributes that are globally
-        // declared. This is the correctness invariant that the helper
-        // exists to preserve — `wildcard_not_qname_excludes` wrongly
-        // excludes `##defined` unconditionally.
+        // declared — not all attributes unconditionally.
         use crate::arenas::AttributeDeclData;
         use crate::parser::frames::NotQNameItem;
 
@@ -4176,8 +4753,6 @@ mod tests {
         let declared_name = schema_set.name_table.add("declared_attr");
         let undeclared_name = schema_set.name_table.add("undeclared_attr");
 
-        // Globally declare `declared_attr`. Minimal AttributeDeclData — the
-        // helper only cares that `lookup_attribute` returns Some.
         let attr_data = AttributeDeclData {
             name: Some(declared_name),
             target_namespace: None,
@@ -4203,20 +4778,18 @@ mod tests {
         let mut w = default_wildcard(WildcardNamespace::Any);
         w.not_qname = vec![NotQNameItem::Defined];
 
-        // Declared → excluded.
         assert!(
-            !wildcard_allows_attribute(&schema_set, &w, None, declared_name, None),
+            !admits(&schema_set, &w, None, None, declared_name),
             "##defined MUST exclude globally-declared attributes"
         );
-        // Undeclared → admitted.
         assert!(
-            wildcard_allows_attribute(&schema_set, &w, None, undeclared_name, None),
+            admits(&schema_set, &w, None, None, undeclared_name),
             "##defined MUST NOT exclude attributes that are not globally declared"
         );
     }
 
     #[test]
-    fn test_wildcard_allows_attribute_not_qname_literal_excludes() {
+    fn test_effective_wildcard_not_qname_literal_excludes() {
         use crate::parser::frames::NotQNameItem;
 
         let schema_set = SchemaSet::new();
@@ -4229,8 +4802,8 @@ mod tests {
             local_name: blocked,
         }];
 
-        assert!(!wildcard_allows_attribute(&schema_set, &w, None, blocked, None));
-        assert!(wildcard_allows_attribute(&schema_set, &w, None, allowed, None));
+        assert!(!admits(&schema_set, &w, None, None, blocked));
+        assert!(admits(&schema_set, &w, None, None, allowed));
     }
 
     #[test]
@@ -4357,4 +4930,819 @@ mod tests {
         assert_eq!(uses[0].name, opt_name);
     }
 
+    // -----------------------------------------------------------------
+    // §3.6.2.2 effective attribute wildcard + §3.10.6.4 intersection
+    // -----------------------------------------------------------------
+
+    fn wildcard_with_ns(namespace: WildcardNamespace) -> WildcardResult {
+        WildcardResult {
+            namespace,
+            process_contents: ProcessContents::Strict,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn test_normalize_any() {
+        let schema_set = SchemaSet::new();
+        let wc = wildcard_with_ns(WildcardNamespace::Any);
+        let eff = normalize_attribute_wildcard(&schema_set, &wc, None);
+        assert!(matches!(eff.namespace, CanonicalNs::Any));
+    }
+
+    #[test]
+    fn test_normalize_list_resolves_tokens() {
+        use crate::parser::frames::NamespaceToken;
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let target = schema_set.name_table.add("http://t");
+
+        let wc = wildcard_with_ns(WildcardNamespace::List(vec![
+            NamespaceToken::Uri(ns_a),
+            NamespaceToken::TargetNamespace,
+            NamespaceToken::Local,
+        ]));
+        let eff = normalize_attribute_wildcard(&schema_set, &wc, Some(target));
+        match eff.namespace {
+            CanonicalNs::Enum(set) => {
+                assert!(set.contains(&Some(ns_a)));
+                assert!(set.contains(&Some(target)));
+                assert!(set.contains(&None));
+                assert_eq!(set.len(), 3);
+            }
+            _ => panic!("expected Enum"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_other_xsd10_vs_xsd11() {
+        // Pins the fix documented at types/complex.rs:287-303 — XSD 1.0
+        // `##other` excludes {target, absent}; XSD 1.1 excludes {target}
+        // only.
+        let schema_10 = SchemaSet::new();
+        let schema_11 = SchemaSet::xsd11();
+        let target_10 = schema_10.name_table.add("http://t");
+        let target_11 = schema_11.name_table.add("http://t");
+
+        let wc10 = wildcard_with_ns(WildcardNamespace::Other);
+        let wc11 = wildcard_with_ns(WildcardNamespace::Other);
+
+        let eff10 = normalize_attribute_wildcard(&schema_10, &wc10, Some(target_10));
+        let eff11 = normalize_attribute_wildcard(&schema_11, &wc11, Some(target_11));
+
+        match eff10.namespace {
+            CanonicalNs::Not(set) => {
+                assert!(set.contains(&Some(target_10)));
+                assert!(set.contains(&None), "XSD 1.0 ##other excludes absent");
+            }
+            _ => panic!("expected Not"),
+        }
+        match eff11.namespace {
+            CanonicalNs::Not(set) => {
+                assert!(set.contains(&Some(target_11)));
+                assert!(!set.contains(&None), "XSD 1.1 ##other admits absent");
+            }
+            _ => panic!("expected Not"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_other_absent_target_namespace() {
+        // Regression: when the schema has no target namespace, the
+        // "target namespace" IS the absent namespace (None), so
+        // ##other must exclude None even in XSD 1.1. An earlier
+        // implementation skipped inserting None for XSD 1.1 when
+        // target_ns was None, producing Not({}) ≡ Any and incorrectly
+        // accepting invalid derivations for no-targetNamespace schemas.
+        let schema_10 = SchemaSet::new();
+        let schema_11 = SchemaSet::xsd11();
+
+        let wc = wildcard_with_ns(WildcardNamespace::Other);
+        let eff10 = normalize_attribute_wildcard(&schema_10, &wc, None);
+        let eff11 = normalize_attribute_wildcard(&schema_11, &wc, None);
+
+        for (label, eff) in [("XSD 1.0", eff10), ("XSD 1.1", eff11)] {
+            match eff.namespace {
+                CanonicalNs::Not(set) => {
+                    assert!(
+                        set.contains(&None),
+                        "{}: ##other with absent target MUST exclude the absent namespace",
+                        label,
+                    );
+                }
+                other => panic!("{}: expected Not, got {:?}", label, other),
+            }
+        }
+    }
+
+    #[test]
+    fn test_effective_wildcard_restricts_defined_covers_declared_qname() {
+        // Regression: per §3.10.6.2 disallowed_names clause 1, a base
+        // QName exclusion is satisfied whenever the derived wildcard
+        // is "not allowed" for that QName — including via a derived
+        // `##defined` when the base QName names a globally declared
+        // attribute. An earlier implementation required literal
+        // `QName{}` containment and wrongly rejected this pattern.
+        use crate::arenas::AttributeDeclData;
+        use crate::parser::frames::NotQNameItem;
+
+        let mut schema_set = SchemaSet::new();
+        let declared_name = schema_set.name_table.add("declared_attr");
+
+        // Globally declare `declared_attr`.
+        let attr_data = AttributeDeclData {
+            name: Some(declared_name),
+            target_namespace: None,
+            ref_name: None,
+            type_ref: None,
+            inline_type: None,
+            default_value: None,
+            fixed_value: None,
+            use_kind: None,
+            form: None,
+            inheritable: false,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_type: None,
+            resolved_ref: None,
+        };
+        let attr_key = schema_set.arenas.alloc_attribute(attr_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_attribute(declared_name, attr_key);
+
+        // Base excludes the declared attribute by literal QName.
+        let base = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: vec![NotQNameItem::QName {
+                namespace: None,
+                local_name: declared_name,
+            }],
+            process_contents: ProcessContents::Strict,
+        };
+        // Derived excludes via ##defined — should cover the base
+        // exclusion because declared_attr is globally declared.
+        let derived = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: vec![NotQNameItem::Defined],
+            process_contents: ProcessContents::Strict,
+        };
+
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &derived, &base).is_ok(),
+            "derived ##defined must cover a base literal QName exclusion \
+             when the attribute is globally declared"
+        );
+
+        // Undeclared attribute: ##defined does NOT cover it.
+        let undeclared = schema_set.name_table.add("undeclared_attr");
+        let base_undeclared = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: vec![NotQNameItem::QName {
+                namespace: None,
+                local_name: undeclared,
+            }],
+            process_contents: ProcessContents::Strict,
+        };
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &derived, &base_undeclared).is_err(),
+            "derived ##defined must NOT cover a base QName exclusion \
+             when the attribute is not globally declared"
+        );
+    }
+
+    #[test]
+    fn test_normalize_folds_not_namespace() {
+        use crate::parser::frames::NamespaceToken;
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+
+        // Any wildcard with not_namespace=[ns_a] becomes Not({ns_a}).
+        let mut wc = wildcard_with_ns(WildcardNamespace::Any);
+        wc.not_namespace = vec![NamespaceToken::Uri(ns_a)];
+        let eff = normalize_attribute_wildcard(&schema_set, &wc, None);
+        match eff.namespace {
+            CanonicalNs::Not(set) => {
+                assert_eq!(set.len(), 1);
+                assert!(set.contains(&Some(ns_a)));
+            }
+            _ => panic!("expected Not"),
+        }
+    }
+
+    #[test]
+    fn test_intersect_any_is_identity() {
+        let mut s = std::collections::HashSet::new();
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        s.insert(Some(ns_a));
+
+        let enum_a = CanonicalNs::Enum(s.clone());
+        let result = intersect_canonical_ns(&CanonicalNs::Any, &enum_a);
+        assert_eq!(result, enum_a);
+        let result2 = intersect_canonical_ns(&enum_a, &CanonicalNs::Any);
+        assert_eq!(result2, enum_a);
+    }
+
+    #[test]
+    fn test_intersect_enum_enum_is_set_intersection() {
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+        let ns_c = schema_set.name_table.add("http://c");
+
+        let mut s1 = std::collections::HashSet::new();
+        s1.insert(Some(ns_a));
+        s1.insert(Some(ns_b));
+        let mut s2 = std::collections::HashSet::new();
+        s2.insert(Some(ns_b));
+        s2.insert(Some(ns_c));
+
+        let result = intersect_canonical_ns(
+            &CanonicalNs::Enum(s1),
+            &CanonicalNs::Enum(s2),
+        );
+        match result {
+            CanonicalNs::Enum(set) => {
+                assert_eq!(set.len(), 1);
+                assert!(set.contains(&Some(ns_b)));
+            }
+            _ => panic!("expected Enum"),
+        }
+    }
+
+    #[test]
+    fn test_intersect_enum_not_is_set_difference() {
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+
+        let mut s = std::collections::HashSet::new();
+        s.insert(Some(ns_a));
+        s.insert(Some(ns_b));
+        let mut n = std::collections::HashSet::new();
+        n.insert(Some(ns_b));
+
+        let result = intersect_canonical_ns(
+            &CanonicalNs::Enum(s),
+            &CanonicalNs::Not(n),
+        );
+        match result {
+            CanonicalNs::Enum(set) => {
+                assert_eq!(set.len(), 1);
+                assert!(set.contains(&Some(ns_a)));
+            }
+            _ => panic!("expected Enum"),
+        }
+    }
+
+    #[test]
+    fn test_intersect_not_not_is_union_of_exclusions() {
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+
+        let mut n1 = std::collections::HashSet::new();
+        n1.insert(Some(ns_a));
+        let mut n2 = std::collections::HashSet::new();
+        n2.insert(Some(ns_b));
+
+        let result = intersect_canonical_ns(
+            &CanonicalNs::Not(n1),
+            &CanonicalNs::Not(n2),
+        );
+        match result {
+            CanonicalNs::Not(set) => {
+                assert_eq!(set.len(), 2);
+                assert!(set.contains(&Some(ns_a)));
+                assert!(set.contains(&Some(ns_b)));
+            }
+            _ => panic!("expected Not"),
+        }
+    }
+
+    #[test]
+    fn test_canonical_ns_subset_various() {
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+
+        let empty_set = std::collections::HashSet::new();
+        let mut s_a = std::collections::HashSet::new();
+        s_a.insert(Some(ns_a));
+        let mut s_ab = std::collections::HashSet::new();
+        s_ab.insert(Some(ns_a));
+        s_ab.insert(Some(ns_b));
+
+        // Anything ⊆ Any
+        assert!(canonical_ns_subset(&CanonicalNs::Any, &CanonicalNs::Any));
+        assert!(canonical_ns_subset(&CanonicalNs::Enum(s_a.clone()), &CanonicalNs::Any));
+        assert!(canonical_ns_subset(&CanonicalNs::Not(s_a.clone()), &CanonicalNs::Any));
+
+        // Any ⊄ non-Any
+        assert!(!canonical_ns_subset(&CanonicalNs::Any, &CanonicalNs::Enum(s_a.clone())));
+
+        // Enum(s) ⊆ Enum(t) iff s ⊆ t
+        assert!(canonical_ns_subset(
+            &CanonicalNs::Enum(s_a.clone()),
+            &CanonicalNs::Enum(s_ab.clone()),
+        ));
+        assert!(!canonical_ns_subset(
+            &CanonicalNs::Enum(s_ab.clone()),
+            &CanonicalNs::Enum(s_a.clone()),
+        ));
+
+        // Enum(s) ⊆ Not(n) iff s ∩ n = ∅
+        assert!(canonical_ns_subset(
+            &CanonicalNs::Enum(s_a.clone()),
+            &CanonicalNs::Not(empty_set.clone()),
+        ));
+        assert!(!canonical_ns_subset(
+            &CanonicalNs::Enum(s_a.clone()),
+            &CanonicalNs::Not(s_a.clone()),
+        ));
+
+        // Not(n1) ⊆ Not(n2) iff n2 ⊆ n1 (derived exclusion must be ≥ base)
+        assert!(canonical_ns_subset(
+            &CanonicalNs::Not(s_ab.clone()),
+            &CanonicalNs::Not(s_a.clone()),
+        ));
+        assert!(!canonical_ns_subset(
+            &CanonicalNs::Not(s_a.clone()),
+            &CanonicalNs::Not(s_ab.clone()),
+        ));
+
+        // Not(n) ⊄ Enum(s) — infinite cannot fit in finite
+        assert!(!canonical_ns_subset(
+            &CanonicalNs::Not(empty_set),
+            &CanonicalNs::Enum(s_a),
+        ));
+    }
+
+    #[test]
+    fn test_effective_attribute_wildcard_absent_no_groups_returns_none() {
+        let schema_set = SchemaSet::new();
+        let result = effective_attribute_wildcard(&schema_set, None, None, &[]);
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn test_effective_attribute_wildcard_local_only() {
+        let schema_set = SchemaSet::new();
+        let wc = wildcard_with_ns(WildcardNamespace::Any);
+        let result = effective_attribute_wildcard(&schema_set, Some(&wc), None, &[]).unwrap();
+        let eff = result.expect("expected Some");
+        assert!(matches!(eff.namespace, CanonicalNs::Any));
+    }
+
+    #[test]
+    fn test_effective_attribute_wildcard_intersects_across_group_and_local() {
+        use crate::arenas::AttributeGroupData;
+        use crate::parser::frames::NamespaceToken;
+
+        let mut schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+
+        // Referenced group has wildcard List[a, b]
+        let group_wc = WildcardResult {
+            namespace: WildcardNamespace::List(vec![
+                NamespaceToken::Uri(ns_a),
+                NamespaceToken::Uri(ns_b),
+            ]),
+            process_contents: ProcessContents::Strict,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let group = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: Some(group_wc),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let group_key = schema_set.arenas.alloc_attribute_group(group);
+
+        // Local wildcard is List[a]. Intersection should be {a}.
+        let local = WildcardResult {
+            namespace: WildcardNamespace::List(vec![NamespaceToken::Uri(ns_a)]),
+            process_contents: ProcessContents::Strict,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let result = effective_attribute_wildcard(
+            &schema_set,
+            Some(&local),
+            None,
+            &[group_key],
+        )
+        .unwrap();
+        let eff = result.expect("expected Some");
+        match eff.namespace {
+            CanonicalNs::Enum(set) => {
+                assert_eq!(set.len(), 1);
+                assert!(set.contains(&Some(ns_a)));
+            }
+            other => panic!("expected Enum({{ns_a}}), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_effective_attribute_wildcard_no_local_uses_first_group_pc() {
+        use crate::arenas::AttributeGroupData;
+
+        let mut schema_set = SchemaSet::new();
+        let group_wc = WildcardResult {
+            namespace: WildcardNamespace::Any,
+            process_contents: ProcessContents::Lax,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let group = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: Some(group_wc),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let group_key = schema_set.arenas.alloc_attribute_group(group);
+
+        // No local ⇒ pc comes from W[0] (Lax).
+        let result = effective_attribute_wildcard(&schema_set, None, None, &[group_key]).unwrap();
+        let eff = result.expect("expected Some");
+        assert_eq!(eff.process_contents, ProcessContents::Lax);
+        assert!(matches!(eff.namespace, CanonicalNs::Any));
+    }
+
+    #[test]
+    fn test_effective_wildcard_allows_attribute_basic() {
+        let schema_set = SchemaSet::new();
+        let name = schema_set.name_table.add("foo");
+        let ns_a = schema_set.name_table.add("http://a");
+
+        let any_eff = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Strict,
+        };
+        assert!(effective_wildcard_allows_attribute(
+            &schema_set, &any_eff, Some(ns_a), name,
+        ));
+
+        let mut s = std::collections::HashSet::new();
+        s.insert(Some(ns_a));
+        let enum_eff = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Enum(s),
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Strict,
+        };
+        assert!(effective_wildcard_allows_attribute(
+            &schema_set, &enum_eff, Some(ns_a), name,
+        ));
+        assert!(!effective_wildcard_allows_attribute(
+            &schema_set, &enum_eff, None, name,
+        ));
+    }
+
+    #[test]
+    fn test_effective_wildcard_restricts_enforces_subset() {
+        let schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let ns_b = schema_set.name_table.add("http://b");
+
+        let mut s_a = std::collections::HashSet::new();
+        s_a.insert(Some(ns_a));
+        let mut s_ab = std::collections::HashSet::new();
+        s_ab.insert(Some(ns_a));
+        s_ab.insert(Some(ns_b));
+
+        let derived_narrow = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Enum(s_a.clone()),
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Strict,
+        };
+        let base_wide = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Enum(s_ab.clone()),
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Strict,
+        };
+
+        assert!(effective_attribute_wildcard_restricts(&schema_set, &derived_narrow, &base_wide).is_ok());
+        assert!(effective_attribute_wildcard_restricts(&schema_set, &base_wide, &derived_narrow).is_err());
+    }
+
+    #[test]
+    fn test_effective_wildcard_restricts_enforces_process_contents() {
+        let schema_set = SchemaSet::new();
+        let skip_eff = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Skip,
+        };
+        let strict_eff = EffectiveAttributeWildcard {
+            namespace: CanonicalNs::Any,
+            not_qname: Vec::new(),
+            process_contents: ProcessContents::Strict,
+        };
+        // Strict restricts Skip (tightening).
+        assert!(effective_attribute_wildcard_restricts(&schema_set, &strict_eff, &skip_eff).is_ok());
+        // Skip cannot restrict Strict (loosening).
+        assert!(effective_attribute_wildcard_restricts(&schema_set, &skip_eff, &strict_eff).is_err());
+    }
+
+    #[test]
+    fn test_validate_attribute_restriction_rejects_added_wildcard() {
+        // Base has no wildcard, derived adds Any — invalid restriction.
+        let mut schema_set = SchemaSet::new();
+        let base = create_complex_type_data(None);
+        let base_key = schema_set.arenas.alloc_complex_type(base);
+
+        let mut derived = create_complex_type_data(None);
+        derived.attribute_wildcard = Some(wildcard_with_ns(WildcardNamespace::Any));
+        derived.derivation_method = Some(DerivationMethod::Restriction);
+        derived.resolved_base_type = Some(TypeKey::Complex(base_key));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived);
+
+        let derived_ref = schema_set.arenas.complex_types.get(derived_key).unwrap();
+        let base_ref = schema_set.arenas.complex_types.get(base_key).unwrap();
+        let result = validate_attribute_restriction(&schema_set, derived_ref, base_ref);
+        assert!(result.is_err());
+        if let Err(SchemaError::StructuralError { constraint, message, .. }) = result {
+            assert_eq!(constraint, "derivation-ok-restriction");
+            assert!(
+                message.contains("wildcard"),
+                "message should mention wildcard, got: {}",
+                message
+            );
+        } else {
+            panic!("expected StructuralError");
+        }
+    }
+
+    #[test]
+    fn test_validate_attribute_restriction_accepts_narrower_wildcard() {
+        use crate::parser::frames::NamespaceToken;
+        let mut schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+
+        let mut base = create_complex_type_data(None);
+        base.attribute_wildcard = Some(wildcard_with_ns(WildcardNamespace::Any));
+        let base_key = schema_set.arenas.alloc_complex_type(base);
+
+        let mut derived = create_complex_type_data(None);
+        derived.attribute_wildcard = Some(wildcard_with_ns(WildcardNamespace::List(vec![
+            NamespaceToken::Uri(ns_a),
+        ])));
+        derived.derivation_method = Some(DerivationMethod::Restriction);
+        derived.resolved_base_type = Some(TypeKey::Complex(base_key));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived);
+
+        let derived_ref = schema_set.arenas.complex_types.get(derived_key).unwrap();
+        let base_ref = schema_set.arenas.complex_types.get(base_key).unwrap();
+        assert!(validate_attribute_restriction(&schema_set, derived_ref, base_ref).is_ok());
+    }
+
+    #[test]
+    fn test_validate_attribute_restriction_allows_removing_wildcard() {
+        // Base has Any, derived removes the wildcard — always valid
+        // (restriction may remove the wildcard).
+        let mut schema_set = SchemaSet::new();
+        let mut base = create_complex_type_data(None);
+        base.attribute_wildcard = Some(wildcard_with_ns(WildcardNamespace::Any));
+        let base_key = schema_set.arenas.alloc_complex_type(base);
+
+        let mut derived = create_complex_type_data(None);
+        derived.derivation_method = Some(DerivationMethod::Restriction);
+        derived.resolved_base_type = Some(TypeKey::Complex(base_key));
+        let derived_key = schema_set.arenas.alloc_complex_type(derived);
+
+        let derived_ref = schema_set.arenas.complex_types.get(derived_key).unwrap();
+        let base_ref = schema_set.arenas.complex_types.get(base_key).unwrap();
+        assert!(validate_attribute_restriction(&schema_set, derived_ref, base_ref).is_ok());
+    }
+
+    #[test]
+    fn test_redefine_attribute_group_rejects_broader_wildcard() {
+        // Original has Any; redefined "restriction" keeps Any + adds a
+        // broader-than-original effective wildcard via added scope —
+        // emulated here by giving the redefined side a wildcard that
+        // excludes fewer namespaces than the original (via not_namespace).
+        use crate::arenas::AttributeGroupData;
+        use crate::parser::frames::NamespaceToken;
+
+        let mut schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+
+        // Original wildcard: Any with not_namespace=[ns_a]  ⇒  Not({ns_a})
+        let mut original_wc = wildcard_with_ns(WildcardNamespace::Any);
+        original_wc.not_namespace = vec![NamespaceToken::Uri(ns_a)];
+        let original = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: Some(original_wc),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let original_key = schema_set.arenas.alloc_attribute_group(original);
+
+        // Derived wildcard: plain Any (allows ns_a, which original excludes).
+        let derived = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: Some(wildcard_with_ns(WildcardNamespace::Any)),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: Some(original_key),
+            redefine_requires_restriction_check: true,
+        };
+        schema_set.arenas.alloc_attribute_group(derived);
+
+        let mut errors = Vec::new();
+        let mut stats = DerivationStats::default();
+        validate_all_redefine_attribute_group_restrictions(&schema_set, &mut errors, &mut stats);
+
+        assert!(
+            !errors.is_empty(),
+            "expected a src-redefine.7.2.2 error for broader derived wildcard"
+        );
+        let msg = match &errors[0] {
+            SchemaError::StructuralError { constraint, message, .. } => {
+                assert_eq!(*constraint, "src-redefine.7.2.2");
+                message.clone()
+            }
+            _ => panic!("expected StructuralError"),
+        };
+        assert!(
+            msg.contains("wildcard") || msg.contains("restriction"),
+            "error should mention wildcard restriction, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_redefine_attribute_group_effective_wildcard_admits_inherited_attr() {
+        // Original attribute group references a nested group whose local
+        // wildcard is List[ns_a]. The redefined group adds an attribute in
+        // ns_a. Without the §3.6.2.2 effective-wildcard fix, this would
+        // fail: the original's *local* attribute_wildcard is None, so the
+        // old code would reject ns_a even though the inherited wildcard
+        // admits it.
+        use crate::arenas::{AttributeGroupData, ResolvedAttributeUse};
+        use crate::parser::frames::{
+            AttributeFrameResult, AttributeUseKind as AuK, AttributeUseResult, NamespaceToken,
+        };
+
+        let mut schema_set = SchemaSet::new();
+        let ns_a = schema_set.name_table.add("http://a");
+        let attr_name = schema_set.name_table.add("foo");
+
+        // Nested group with wildcard List[ns_a].
+        let nested_wc = WildcardResult {
+            namespace: WildcardNamespace::List(vec![NamespaceToken::Uri(ns_a)]),
+            process_contents: ProcessContents::Strict,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        };
+        let nested = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: Some(nested_wc),
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let nested_key = schema_set.arenas.alloc_attribute_group(nested);
+
+        // Original group: no local wildcard, references nested.
+        let original = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: Vec::new(),
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: vec![nested_key],
+            resolved_attributes: Vec::new(),
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let original_key = schema_set.arenas.alloc_attribute_group(original);
+
+        // Redefined group: adds an attribute in ns_a, inherits the nested
+        // wildcard through the same reference chain.
+        let attr_use = AttributeUseResult {
+            attribute: AttributeFrameResult {
+                name: Some(attr_name),
+                ref_name: None,
+                target_namespace: Some(ns_a),
+                type_ref: None,
+                inline_type: None,
+                default_value: None,
+                fixed_value: None,
+                use_kind: None,
+                form: None,
+                inheritable: false,
+                id: None,
+                annotation: None,
+                source: None,
+            },
+            use_kind: AuK::Optional,
+        };
+        let derived = AttributeGroupData {
+            name: None,
+            target_namespace: None,
+            ref_name: None,
+            attributes: vec![attr_use],
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: vec![nested_key],
+            resolved_attributes: vec![ResolvedAttributeUse {
+                resolved_type: None,
+                resolved_ref: None,
+            }],
+            redefine_original: Some(original_key),
+            redefine_requires_restriction_check: true,
+        };
+        schema_set.arenas.alloc_attribute_group(derived);
+
+        let mut errors = Vec::new();
+        let mut stats = DerivationStats::default();
+        validate_all_redefine_attribute_group_restrictions(&schema_set, &mut errors, &mut stats);
+
+        assert!(
+            errors.is_empty(),
+            "attribute admitted by inherited effective wildcard should not error; got: {:?}",
+            errors
+                .iter()
+                .map(|e| format!("{:?}", e))
+                .collect::<Vec<_>>()
+        );
+    }
 }
