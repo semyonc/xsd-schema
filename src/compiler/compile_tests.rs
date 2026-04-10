@@ -1207,6 +1207,7 @@ fn register_model_group(
         resolved_particle_types: vec![],
         resolved_particle_elements: vec![],
         redefine_original: None,
+        redefine_requires_restriction_check: false,
     };
     let key = schema_set.arenas.alloc_model_group(data);
     schema_set

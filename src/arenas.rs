@@ -184,6 +184,11 @@ pub struct AttributeGroupData {
 
     /// Original attribute group key before redefine (for self-reference resolution)
     pub redefine_original: Option<AttributeGroupKey>,
+    /// When this attribute group is a zero-self-reference redefine, the
+    /// deferred §src-redefine 7.2.2 restriction check must verify it is a
+    /// valid restriction of `redefine_original` after reference resolution
+    /// completes. `false` for every non-redefine construction site.
+    pub redefine_requires_restriction_check: bool,
 }
 
 /// Resolved particle term - stores resolved keys for particle references
@@ -228,6 +233,11 @@ pub struct ModelGroupData {
 
     /// Original model group key before redefine (for self-reference resolution)
     pub redefine_original: Option<ModelGroupKey>,
+    /// When this model group is a zero-self-reference redefine, the deferred
+    /// §src-redefine 6.2.2 restriction check must verify it is a valid
+    /// restriction of `redefine_original` after reference resolution
+    /// completes. `false` for every non-redefine construction site.
+    pub redefine_requires_restriction_check: bool,
 }
 
 /// Placeholder for Notation (defined in schema/decl.rs)

@@ -258,11 +258,14 @@ fn apply_model_group_redefine(
         )
     })?;
 
-    validate_self_reference_group(schema_set, new_key, name)?;
+    let has_self_ref = validate_self_reference_group(schema_set, new_key, name)?;
 
-    // Store original key so self-references can be redirected during resolution
+    // Store original key so self-references can be redirected during resolution.
+    // When the redefine has zero self-references, flag it for the deferred
+    // §src-redefine 6.2.2 restriction check in `validate_all_derivations`.
     if let Some(group) = schema_set.arenas.model_groups.get_mut(new_key) {
         group.redefine_original = Some(original_key);
+        group.redefine_requires_restriction_check = !has_self_ref;
     }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
@@ -331,11 +334,14 @@ fn apply_attribute_group_redefine(
         )
     })?;
 
-    validate_self_reference_attribute_group(schema_set, new_key, name)?;
+    let has_self_ref = validate_self_reference_attribute_group(schema_set, new_key, name)?;
 
-    // Store original key so self-references can be redirected during resolution
+    // Store original key so self-references can be redirected during resolution.
+    // When the redefine has zero self-references, flag it for the deferred
+    // §src-redefine 7.2.2 restriction check in `validate_all_derivations`.
     if let Some(group) = schema_set.arenas.attribute_groups.get_mut(new_key) {
         group.redefine_original = Some(original_key);
+        group.redefine_requires_restriction_check = !has_self_ref;
     }
 
     let ns_table = schema_set.get_or_create_namespace(namespace);
@@ -472,12 +478,19 @@ fn validate_self_derivation_complex(
     Ok(())
 }
 
-/// Validate that a model group contains exactly one self-reference.
+/// Validate that a model group's self-reference structure is consistent with
+/// §src-redefine clause 6.
+///
+/// Returns `Ok(true)` when the redefine contains exactly one well-formed
+/// self-reference (§6.1), `Ok(false)` when the redefine contains zero
+/// self-references and the caller must schedule a deferred §6.2.2
+/// restriction check. Returns an error for >1 self-refs or a self-ref with
+/// `min/maxOccurs != 1` (violations of §6.1.1 / §6.1.2).
 fn validate_self_reference_group(
     schema_set: &SchemaSet,
     group_key: ModelGroupKey,
     expected_name: NameId,
-) -> SchemaResult<()> {
+) -> SchemaResult<bool> {
     let group = schema_set
         .arenas
         .model_groups
@@ -501,15 +514,14 @@ fn validate_self_reference_group(
 
     match self_refs {
         // Clause 6.2 (src-redefine §6.2): the redefining group has no
-        // self-reference and must be a valid *restriction* of the original
-        // group (clause 6.2.2 requires the new model to accept a subset of
-        // the original's element sequences). Clause 6.2.1 — that the name
-        // resolves in S2 — is already enforced by the caller's component
-        // lookup against the target document. The subset check in 6.2.2 is
-        // a pre-existing gap in this validator (group restriction
-        // derivation is not yet implemented); we accept the redefine here
-        // rather than reject valid cases like annotA019.
-        0 => Ok(()),
+        // self-reference. Clause 6.2.1 — that the name resolves in S2 — is
+        // already enforced by the caller's component lookup against the
+        // target document. Clause 6.2.2 — that the new model is a valid
+        // restriction of the original — is enforced later by the deferred
+        // `validate_all_redefine_group_restrictions` pass once reference
+        // resolution is complete. Return `false` so the caller sets the
+        // arena flag that schedules that pass.
+        0 => Ok(false),
         // Clause 6.1: self-reference present.
         // Clause 6.1.2: minOccurs and maxOccurs must both be 1.
         1 => {
@@ -531,7 +543,7 @@ fn validate_self_reference_group(
                         .and_then(|s| schema_set.source_maps.locate(s)),
                 ))
             } else {
-                Ok(())
+                Ok(true)
             }
         }
         _ => Err(SchemaError::structural(
@@ -552,12 +564,18 @@ fn validate_self_reference_group(
 /// Validate self-reference constraints for an attribute group redefine.
 ///
 /// Clause 7.1: with self-reference — exactly one is allowed.
-/// Clause 7.2: without self-reference — restriction of original.
+/// Clause 7.2: without self-reference — restriction of original (checked
+/// later by `validate_all_redefine_attribute_group_restrictions`).
+///
+/// Returns `Ok(true)` when the redefine contains exactly one self-reference
+/// (§7.1), `Ok(false)` when the redefine contains zero self-references and
+/// the caller must schedule a deferred §7.2.2 restriction check. Errors
+/// for >1 self-refs.
 fn validate_self_reference_attribute_group(
     schema_set: &SchemaSet,
     group_key: AttributeGroupKey,
     expected_name: NameId,
-) -> SchemaResult<()> {
+) -> SchemaResult<bool> {
     let group = schema_set
         .arenas
         .attribute_groups
@@ -572,15 +590,15 @@ fn validate_self_reference_attribute_group(
     }
 
     match self_refs {
-        // Clause 7.2 (src-redefine §7.2): no self-reference — the redefining
-        // attribute group must be a valid restriction of the original
-        // (clause 7.2.2). The 7.2.1 name-resolution check is enforced by
-        // the caller's component lookup; the 7.2.2 attribute-use/wildcard
-        // restriction check is a pre-existing gap and is not gated here,
-        // mirroring the treatment of group clause 6.2 above.
-        0 => Ok(()),
+        // Clause 7.2 (src-redefine §7.2): no self-reference. Clause 7.2.1
+        // is enforced by the caller's component lookup; clause 7.2.2 (the
+        // restriction check) is deferred to
+        // `validate_all_redefine_attribute_group_restrictions` which runs
+        // after reference resolution. Return `false` so the caller sets
+        // the arena flag that schedules that pass.
+        0 => Ok(false),
         // Clause 7.1: exactly one self-reference. Valid.
-        1 => Ok(()),
+        1 => Ok(true),
         _ => Err(SchemaError::structural(
             "src-redefine",
             format!(
@@ -662,6 +680,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let original_key = schema_set.arenas.alloc_model_group(original_data);
         schema_set
@@ -737,6 +756,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let new_key = schema_set.arenas.alloc_model_group(new_data);
 
@@ -800,6 +820,7 @@ mod tests {
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let original_key = schema_set.arenas.alloc_attribute_group(original_data);
         schema_set
@@ -825,6 +846,7 @@ mod tests {
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let new_key = schema_set.arenas.alloc_attribute_group(new_data);
 
@@ -886,6 +908,7 @@ mod tests {
                     resolved_particle_types: Vec::new(),
                     resolved_particle_elements: Vec::new(),
                     redefine_original: None,
+                    redefine_requires_restriction_check: false,
                 }),
             ),
             ComponentKind::ModelGroup,
@@ -986,6 +1009,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let no_selfref_key = schema_set.arenas.alloc_model_group(new_data);
 
@@ -1070,6 +1094,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let bad_key = schema_set.arenas.alloc_model_group(new_data);
 
@@ -1128,6 +1153,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let bad_key = schema_set.arenas.alloc_model_group(new_data);
 
@@ -1165,6 +1191,7 @@ mod tests {
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let _original_key = schema_set.arenas.alloc_attribute_group(original_data);
         schema_set
@@ -1186,6 +1213,7 @@ mod tests {
             resolved_attribute_groups: Vec::new(),
             resolved_attributes: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
         let new_key = schema_set.arenas.alloc_attribute_group(new_data);
 

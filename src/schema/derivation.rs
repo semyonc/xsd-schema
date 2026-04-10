@@ -97,6 +97,13 @@ pub fn validate_all_derivations(
         }
     }
 
+    // §src-redefine 6.2.2 / 7.2.2 deferred restriction checks — must run
+    // after reference resolution and type-derivation passes, because
+    // `resolved_particle_types` / `resolved_attributes` on the flagged
+    // groups are only populated post-resolve.
+    validate_all_redefine_group_restrictions(schema_set, &mut errors, &mut stats);
+    validate_all_redefine_attribute_group_restrictions(schema_set, &mut errors, &mut stats);
+
     // Return first error if any
     if let Some(first_error) = errors.into_iter().next() {
         return Err(first_error);
@@ -1241,6 +1248,60 @@ fn normalize_type_particle(
     // XSD 1.1: skip flattening to preserve structural grouping needed for
     // intensional restriction (e.g. a single-branch choice whose collapsed
     // sequence must match against a multi-branch choice in the base).
+    if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+        let particle = flatten_same_compositor_groups(particle);
+        return Ok(particle);
+    }
+    Ok(particle)
+}
+
+/// Normalize a top-level named model group into a `NormalizedParticle` for
+/// §src-redefine 6.2.2 restriction comparisons.
+///
+/// **Chain-of-redefine caveat**: when called on an original whose own
+/// particles include `group-ref`s, those refs are resolved via
+/// `schema_set.lookup_model_group` inside [`ParticleNormalizer::normalize_group`]
+/// — which returns the *currently bound* version. For a chain
+/// `orig → v1 → v2`, v1's inner group-refs resolve to whatever the
+/// current namespace binding is, not to what v1 saw at creation time. This
+/// is a pre-existing limitation shared with the complex-type restriction
+/// path; it is not fixed here.
+fn normalize_model_group_as_particle(
+    schema_set: &SchemaSet,
+    group_data: &crate::arenas::ModelGroupData,
+) -> SchemaResult<NormalizedParticle> {
+    let compositor = group_data.compositor.ok_or_else(|| {
+        SchemaError::internal("redefined named model group missing compositor")
+    })?;
+
+    let mut normalizer = ParticleNormalizer::new(
+        schema_set,
+        group_data.target_namespace,
+        &group_data.resolved_particle_types,
+    );
+    let particles = group_data
+        .particles
+        .iter()
+        .map(|particle| normalizer.normalize_particle(particle))
+        .collect::<SchemaResult<Vec<_>>>()?;
+
+    let wrapper = NormalizedParticle {
+        term: NormalizedParticleTerm::Group(NormalizedGroup {
+            compositor,
+            particles,
+        }),
+        min_occurs: group_data.min_occurs,
+        max_occurs: group_data.max_occurs,
+        source: group_data.source.clone(),
+    };
+
+    // `normalize_particle` collapses every child; the outer wrapper we
+    // built by hand above is *not* collapsed and must be so explicitly so
+    // a single-element named group ends up shaped identically to the same
+    // content inside a complex type.
+    let particle = collapse_single_child_groups(wrapper);
+    let particle = remove_pointless_particles(particle);
+    // XSD 1.1: skip flattening (same rationale as `normalize_type_particle`).
     if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
         let particle = flatten_same_compositor_groups(particle);
         return Ok(particle);
@@ -2976,6 +3037,362 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// §src-redefine 6.2.2 / 7.2.2 — deferred restriction validation for redefines
+// ---------------------------------------------------------------------------
+//
+// When an `<xs:redefine>` child group (or attribute group) has zero
+// self-references, §src-redefine clauses 6.2.2 / 7.2.2 require that the
+// redefined component be a *valid restriction* of the original. Composition
+// (`schema/redefine.rs`) validates the self-reference shape (clauses 6.1 /
+// 7.1) and flags zero-self-ref redefines via
+// `redefine_requires_restriction_check`; this module does the deferred
+// restriction check after reference resolution is complete.
+//
+// Spec anchors (source of truth: `structures.html` — W3C XSD 1.1 §src-redefine
+// and §3.4.6.3 Derivation Valid (Restriction, Complex)):
+//   - §src-redefine 6.2.2: redefined model group must be a valid restriction
+//     of the original per §3.9.6 Particle Valid (Restriction).
+//   - §src-redefine 7.2.2: redefined attribute group must satisfy clause 3
+//     of §3.4.6.3 (clause-3 only, NOT clause-4 local-type-substitution).
+//   - §3.8: pointless particles (`maxOccurs=0`) are eliminated before the
+//     restriction check.
+//   - §3.2.2: a prohibited `<xs:attribute>` is NOT an attribute use.
+//
+// Scope limitations (deferred to joint follow-ups with
+// `validate_attribute_restriction`):
+//   - §3.6.2.2 effective attribute-group wildcard intersection across
+//     referenced groups — only local parsed wildcards are inspected here.
+//   - Wildcard-vs-wildcard subset (derived ⊆ base).
+//   - Chained redefines (`orig → v1 → v2`) resolve nested `group-ref`s via
+//     the currently bound namespace version; see
+//     `normalize_model_group_as_particle` doc comment.
+
+/// Free-function port of the runtime validator method at
+/// `validation/runtime.rs::wildcard_allows_attribute`.
+///
+/// Returns `true` if `wildcard` admits an attribute with the given
+/// `(attr_namespace, attr_name)` in the context of `target_namespace` (the
+/// target namespace of the component that declares the wildcard).
+///
+/// **Do not replace this with** `wildcard_namespace_matches` composed with
+/// `wildcard_not_qname_excludes`. Two invariants the composition would
+/// break:
+///
+/// 1. `wildcard_not_qname_excludes` treats `NotQNameItem::Defined` as an
+///    unconditional exclusion, while the runtime (correctly, per §3.10.4
+///    *"Wildcard allows NameAndNS"*) only excludes `##defined` when the
+///    attribute is actually globally declared.
+/// 2. `wildcard_namespace_matches` hardcodes XSD 1.0 `##other` semantics
+///    (excludes both target namespace *and* the absent namespace), but
+///    XSD 1.1 admits the absent namespace under `##other`. We delegate the
+///    `##other` branch to the version-aware `other_matches_namespace`
+///    (types/complex.rs:291) instead, matching the runtime's behaviour.
+fn wildcard_allows_attribute(
+    schema_set: &SchemaSet,
+    wildcard: &WildcardResult,
+    attr_namespace: Option<NameId>,
+    attr_name: NameId,
+    target_namespace: Option<NameId>,
+) -> bool {
+    // Namespace constraint. Use the version-aware `other_matches_namespace`
+    // for the `##other` branch (see invariant 2 in the doc comment);
+    // delegate everything else to `wildcard_namespace_matches`, which is
+    // correct for `Any`/`TargetNamespace`/`Local`/`List`.
+    let ns_ok = match &wildcard.namespace {
+        WildcardNamespace::Other => crate::types::complex::other_matches_namespace(
+            attr_namespace,
+            target_namespace,
+            schema_set.xsd_version,
+        ),
+        _ => wildcard_namespace_matches(&wildcard.namespace, attr_namespace, target_namespace),
+    };
+    if !ns_ok {
+        return false;
+    }
+    // not_namespace exclusions — three-line loop mirroring
+    // `runtime.rs::wildcard_allows_namespace`.
+    for token in &wildcard.not_namespace {
+        let excluded_ns = token.resolve(target_namespace);
+        if attr_namespace == excluded_ns {
+            return false;
+        }
+    }
+    // not_qname exclusions (including `##defined` resolved via schema lookup).
+    for item in &wildcard.not_qname {
+        match item {
+            crate::parser::frames::NotQNameItem::QName {
+                namespace: qns,
+                local_name,
+            } => {
+                if *qns == attr_namespace && *local_name == attr_name {
+                    return false;
+                }
+            }
+            crate::parser::frames::NotQNameItem::Defined => {
+                if schema_set
+                    .lookup_attribute(attr_namespace, attr_name)
+                    .is_some()
+                {
+                    return false;
+                }
+            }
+            // `##definedSibling` is rejected at parse time for attribute
+            // wildcards — mirror runtime's behaviour and ignore.
+            crate::parser::frames::NotQNameItem::DefinedSibling => {}
+        }
+    }
+    true
+}
+
+/// Flatten an attribute group's effective attribute uses, filtering out
+/// prohibited uses per §3.2.2 (a prohibited `<xs:attribute>` is not an
+/// attribute use on either side of a restriction comparison).
+fn collect_flat_attribute_uses_for_group(
+    schema_set: &SchemaSet,
+    ag_key: AttributeGroupKey,
+) -> Vec<EffectiveAttributeUse> {
+    let mut result = Vec::new();
+    collect_attribute_group_uses(schema_set, ag_key, &mut result, 0);
+    result.retain(|eau| eau.use_kind != AttributeUseKind::Prohibited);
+    result
+}
+
+/// Construct a §src-redefine 6.2.2 structural error for a model group whose
+/// restriction of its original cannot be validated.
+fn make_redefine_group_restriction_error(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ModelGroupData,
+    detail: &str,
+) -> SchemaError {
+    let name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let location = derived
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.source_maps.locate(s));
+    SchemaError::structural(
+        "src-redefine.6.2.2",
+        format!(
+            "Redefined group '{}' must be a valid restriction of the original \
+             (§src-redefine 6.2.2): {}",
+            name, detail,
+        ),
+        location,
+    )
+}
+
+/// Construct a §src-redefine 7.2.2 structural error for an attribute group
+/// whose restriction of its original cannot be validated.
+fn make_redefine_attr_group_restriction_error(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::AttributeGroupData,
+    detail: &str,
+) -> SchemaError {
+    let name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let location = derived
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.source_maps.locate(s));
+    SchemaError::structural(
+        "src-redefine.7.2.2",
+        format!(
+            "Redefined attribute group '{}' must be a valid restriction of the original \
+             (§src-redefine 7.2.2): {}",
+            name, detail,
+        ),
+        location,
+    )
+}
+
+/// Driver for §src-redefine 6.2.2: for each model group flagged as a
+/// zero-self-reference redefine, verify its normalized particle is a valid
+/// restriction of the original's normalized particle per §3.9.6 Particle
+/// Valid (Restriction).
+fn validate_all_redefine_group_restrictions(
+    schema_set: &SchemaSet,
+    errors: &mut Vec<SchemaError>,
+    stats: &mut DerivationStats,
+) {
+    for (_key, derived) in schema_set.arenas.model_groups.iter() {
+        if !derived.redefine_requires_restriction_check {
+            continue;
+        }
+        let Some(original_key) = derived.redefine_original else {
+            continue;
+        };
+        let Some(original) = schema_set.arenas.model_groups.get(original_key) else {
+            continue;
+        };
+
+        let derived_particle = match normalize_model_group_as_particle(schema_set, derived) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(e);
+                stats.errors += 1;
+                continue;
+            }
+        };
+        let base_particle = match normalize_model_group_as_particle(schema_set, original) {
+            Ok(p) => p,
+            Err(e) => {
+                errors.push(e);
+                stats.errors += 1;
+                continue;
+            }
+        };
+
+        // Empty-group special case (§3.8 + §3.9.6): when the derived group
+        // normalizes to empty content after pointless-particle removal
+        // (e.g. its only child had `maxOccurs=0`), `particle_restricts` does
+        // not model the "empty content" case correctly — it would reject
+        // legal restrictions whenever the base does not normalize to the
+        // exact same surviving shape. Mirror the existing short-circuit in
+        // `validate_content_particle_restriction` (derivation.rs:1148-1161):
+        // empty derived is a valid restriction iff the base is emptiable.
+        if derived_particle.max_occurs == Some(0) || is_empty_group(&derived_particle) {
+            if !particle_is_emptiable(&base_particle) {
+                errors.push(make_redefine_group_restriction_error(
+                    schema_set,
+                    derived,
+                    "removes required content model of the original group",
+                ));
+                stats.errors += 1;
+            }
+            continue;
+        }
+
+        if !particle_restricts(schema_set, &derived_particle, &base_particle) {
+            errors.push(make_redefine_group_restriction_error(
+                schema_set,
+                derived,
+                "content model is not a valid restriction of the original group",
+            ));
+            stats.errors += 1;
+        }
+    }
+}
+
+/// Driver for §src-redefine 7.2.2: partial implementation of §3.4.6.3 clause 3
+/// (derivation-ok-restriction, attribute side) applied to redefined attribute
+/// groups. Checks subset, required-stays-required, and type tightening
+/// against the locally-declared base wildcard. §3.6.2.2 effective-wildcard
+/// intersection and wildcard-vs-wildcard subset are intentionally deferred —
+/// see the module header comment.
+fn validate_all_redefine_attribute_group_restrictions(
+    schema_set: &SchemaSet,
+    errors: &mut Vec<SchemaError>,
+    stats: &mut DerivationStats,
+) {
+    for (_key, derived) in schema_set.arenas.attribute_groups.iter() {
+        if !derived.redefine_requires_restriction_check {
+            continue;
+        }
+        let Some(original_key) = derived.redefine_original else {
+            continue;
+        };
+        let Some(original) = schema_set.arenas.attribute_groups.get(original_key) else {
+            continue;
+        };
+
+        // Flatten both sides, filtering out Prohibited uses (§3.2.2).
+        // The derived key is the key we're iterating on — look it up to
+        // get an `AttributeGroupKey` for `collect_flat_attribute_uses_for_group`.
+        let derived_attrs = collect_flat_attribute_uses_for_group(schema_set, _key);
+        let base_attrs = collect_flat_attribute_uses_for_group(schema_set, original_key);
+
+        // Subset check (clause 3, first half): every derived attribute must
+        // be valid in the base, either directly by (namespace, name) match
+        // or via the base's local {attribute wildcard}. Also applies the
+        // clause 3(b) type-subsumption check for directly-matched pairs.
+        let mut failed = false;
+        for da in &derived_attrs {
+            // (a) Direct match by (namespace, name).
+            if let Some(ba) = base_attrs
+                .iter()
+                .find(|b| b.name == da.name && b.target_namespace == da.target_namespace)
+            {
+                // Type tightening (clause 3(b)): derived type must equal or
+                // be derived from base type when both are resolved.
+                if let (Some(dt), Some(bt)) = (da.resolved_type, ba.resolved_type) {
+                    if dt != bt && !is_type_derived_from(schema_set, dt, bt) {
+                        let attr_name_str = schema_set.name_table.resolve(da.name).to_string();
+                        errors.push(make_redefine_attr_group_restriction_error(
+                            schema_set,
+                            derived,
+                            &format!(
+                                "attribute '{}' has a type that is not validly derived from the \
+                                 base attribute type",
+                                attr_name_str,
+                            ),
+                        ));
+                        stats.errors += 1;
+                        failed = true;
+                        break;
+                    }
+                }
+                continue;
+            }
+            // (b) Admitted by base's (local) {attribute wildcard}.
+            if let Some(base_wildcard) = original.attribute_wildcard.as_ref() {
+                if wildcard_allows_attribute(
+                    schema_set,
+                    base_wildcard,
+                    da.target_namespace,
+                    da.name,
+                    original.target_namespace,
+                ) {
+                    continue;
+                }
+            }
+            // Neither (a) nor (b) holds — not a valid restriction.
+            let attr_name_str = schema_set.name_table.resolve(da.name).to_string();
+            errors.push(make_redefine_attr_group_restriction_error(
+                schema_set,
+                derived,
+                &format!(
+                    "attribute '{}' is not present in the original and is not admitted by \
+                     the original's attribute wildcard",
+                    attr_name_str,
+                ),
+            ));
+            stats.errors += 1;
+            failed = true;
+            break;
+        }
+        if failed {
+            continue;
+        }
+
+        // Required-stays-required (clause 3(a)): every base Required attribute
+        // must also be Required in the derived side.
+        for ba in &base_attrs {
+            if ba.use_kind != AttributeUseKind::Required {
+                continue;
+            }
+            let matching = derived_attrs
+                .iter()
+                .find(|d| d.name == ba.name && d.target_namespace == ba.target_namespace);
+            match matching {
+                Some(da) if da.use_kind == AttributeUseKind::Required => {}
+                _ => {
+                    let attr_name_str = schema_set.name_table.resolve(ba.name).to_string();
+                    errors.push(make_redefine_attr_group_restriction_error(
+                        schema_set,
+                        derived,
+                        &format!(
+                            "base attribute '{}' is required but the redefined group does not \
+                             declare it as required",
+                            attr_name_str,
+                        ),
+                    ));
+                    stats.errors += 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3657,6 +4074,287 @@ mod tests {
             Some(urn_a),
         );
         assert!(!result, "List containing base's target ns must NOT be a subset of ##other");
+    }
+
+    // -----------------------------------------------------------------
+    // §src-redefine 6.2.2 / 7.2.2 — focused pin tests
+    //
+    // Broad end-to-end rejection coverage (schR5/attgC028/mgO013) and
+    // positive-coverage guards (annotA019, attgC017, schH1, schU1, …)
+    // are already exercised by the W3C conformance suite. The tests
+    // below pin the subtle invariants that are NOT directly covered by
+    // conformance: (a) the `wildcard_allows_attribute` helper's
+    // `##defined` correctness — which is the whole reason the helper
+    // exists, and (b) the `all{required_e1}` vs `all{}` particle shape
+    // that `mgO013` ultimately relies on.
+    // -----------------------------------------------------------------
+
+    fn default_wildcard(ns: WildcardNamespace) -> WildcardResult {
+        WildcardResult {
+            namespace: ns,
+            process_contents: ProcessContents::Strict,
+            not_namespace: Vec::new(),
+            not_qname: Vec::new(),
+            id: None,
+            annotation: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_any_admits_anything() {
+        let schema_set = SchemaSet::new();
+        let name = schema_set.name_table.add("foo");
+        let w = default_wildcard(WildcardNamespace::Any);
+        assert!(wildcard_allows_attribute(&schema_set, &w, None, name, None));
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_other_excludes_target_ns() {
+        // ##other must exclude the target namespace itself.
+        let schema_set = SchemaSet::new();
+        let ns = schema_set.name_table.add("urn:foo");
+        let name = schema_set.name_table.add("bar");
+        let w = default_wildcard(WildcardNamespace::Other);
+        assert!(
+            !wildcard_allows_attribute(&schema_set, &w, Some(ns), name, Some(ns)),
+            "##other must NOT admit the target namespace"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_other_admits_different_ns() {
+        let schema_set = SchemaSet::new();
+        let tns = schema_set.name_table.add("urn:foo");
+        let other_ns = schema_set.name_table.add("urn:bar");
+        let name = schema_set.name_table.add("qux");
+        let w = default_wildcard(WildcardNamespace::Other);
+        assert!(
+            wildcard_allows_attribute(&schema_set, &w, Some(other_ns), name, Some(tns)),
+            "##other must admit a namespace different from the target"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_other_absent_ns_xsd10_vs_xsd11() {
+        // §3.10.4.2 `##other` differs by version:
+        //   - XSD 1.0: excludes both the target namespace AND the absent namespace.
+        //   - XSD 1.1: excludes only the target namespace; the absent namespace is admitted.
+        // Pins the fix that `wildcard_allows_attribute` delegates the
+        // `Other` branch to the version-aware `other_matches_namespace`
+        // (types/complex.rs:291) instead of the XSD-1.0-hardcoded
+        // `wildcard_namespace_matches`.
+        let schema_10 = SchemaSet::new(); // defaults to XSD 1.0
+        let tns = schema_10.name_table.add("urn:foo");
+        let name = schema_10.name_table.add("local_attr");
+        let w = default_wildcard(WildcardNamespace::Other);
+
+        assert!(
+            !wildcard_allows_attribute(&schema_10, &w, None, name, Some(tns)),
+            "XSD 1.0: ##other must NOT admit the absent namespace"
+        );
+
+        let schema_11 = SchemaSet::xsd11();
+        let tns11 = schema_11.name_table.add("urn:foo");
+        let name11 = schema_11.name_table.add("local_attr");
+        assert!(
+            wildcard_allows_attribute(&schema_11, &w, None, name11, Some(tns11)),
+            "XSD 1.1: ##other MUST admit the absent namespace"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_defined_excludes_declared_only() {
+        // §3.10.4 `##defined` excludes ONLY attributes that are globally
+        // declared. This is the correctness invariant that the helper
+        // exists to preserve — `wildcard_not_qname_excludes` wrongly
+        // excludes `##defined` unconditionally.
+        use crate::arenas::AttributeDeclData;
+        use crate::parser::frames::NotQNameItem;
+
+        let mut schema_set = SchemaSet::new();
+        let declared_name = schema_set.name_table.add("declared_attr");
+        let undeclared_name = schema_set.name_table.add("undeclared_attr");
+
+        // Globally declare `declared_attr`. Minimal AttributeDeclData — the
+        // helper only cares that `lookup_attribute` returns Some.
+        let attr_data = AttributeDeclData {
+            name: Some(declared_name),
+            target_namespace: None,
+            ref_name: None,
+            type_ref: None,
+            inline_type: None,
+            default_value: None,
+            fixed_value: None,
+            use_kind: None,
+            form: None,
+            inheritable: false,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_type: None,
+            resolved_ref: None,
+        };
+        let attr_key = schema_set.arenas.alloc_attribute(attr_data);
+        schema_set
+            .get_or_create_namespace(None)
+            .register_attribute(declared_name, attr_key);
+
+        let mut w = default_wildcard(WildcardNamespace::Any);
+        w.not_qname = vec![NotQNameItem::Defined];
+
+        // Declared → excluded.
+        assert!(
+            !wildcard_allows_attribute(&schema_set, &w, None, declared_name, None),
+            "##defined MUST exclude globally-declared attributes"
+        );
+        // Undeclared → admitted.
+        assert!(
+            wildcard_allows_attribute(&schema_set, &w, None, undeclared_name, None),
+            "##defined MUST NOT exclude attributes that are not globally declared"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_allows_attribute_not_qname_literal_excludes() {
+        use crate::parser::frames::NotQNameItem;
+
+        let schema_set = SchemaSet::new();
+        let blocked = schema_set.name_table.add("blocked");
+        let allowed = schema_set.name_table.add("allowed");
+
+        let mut w = default_wildcard(WildcardNamespace::Any);
+        w.not_qname = vec![NotQNameItem::QName {
+            namespace: None,
+            local_name: blocked,
+        }];
+
+        assert!(!wildcard_allows_attribute(&schema_set, &w, None, blocked, None));
+        assert!(wildcard_allows_attribute(&schema_set, &w, None, allowed, None));
+    }
+
+    #[test]
+    fn test_particle_restricts_all_required_over_empty_all_rejects() {
+        // Pin test for the exact shape mgO013 reaches after
+        // `remove_pointless_particles`: base `all{}` (e1{0,0} removed)
+        // vs derived `all{e1{1,1}}`. The driver must reject — derived
+        // adds a required particle to empty content, which is not a
+        // valid restriction under §3.9.6.
+        let schema_set = SchemaSet::new();
+        let e1_name = schema_set.name_table.add("e1");
+        let any_type = TypeKey::Complex(schema_set.any_type_key());
+
+        let make_elem = |min_occurs: u32, max_occurs: Option<u32>| NormalizedParticle {
+            term: NormalizedParticleTerm::Element(NormalizedElement {
+                name: e1_name,
+                namespace: None,
+                type_key: any_type,
+                element_key: None,
+                block: DerivationSet::empty(),
+                nillable: false,
+                fixed_value: None,
+            }),
+            min_occurs,
+            max_occurs,
+            source: None,
+        };
+
+        let derived = NormalizedParticle {
+            term: NormalizedParticleTerm::Group(NormalizedGroup {
+                compositor: Compositor::All,
+                particles: vec![make_elem(1, Some(1))],
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        };
+        let base_empty_all = NormalizedParticle {
+            term: NormalizedParticleTerm::Group(NormalizedGroup {
+                compositor: Compositor::All,
+                particles: Vec::new(),
+            }),
+            min_occurs: 1,
+            max_occurs: Some(1),
+            source: None,
+        };
+
+        assert!(
+            !particle_restricts(&schema_set, &derived, &base_empty_all),
+            "all{{e1{{1,1}}}} must NOT restrict all{{}} — derived adds a required particle"
+        );
+    }
+
+    #[test]
+    fn test_collect_flat_attribute_uses_filters_prohibited() {
+        // §3.2.2: prohibited attribute uses do NOT correspond to components
+        // and must not appear in either side of a restriction comparison.
+        use crate::arenas::AttributeGroupData;
+        use crate::parser::frames::{
+            AttributeFrameResult, AttributeUseKind as AuK, AttributeUseResult,
+        };
+
+        let mut schema_set = SchemaSet::new();
+        let grp_name = schema_set.name_table.add("ag");
+        let opt_name = schema_set.name_table.add("opt");
+        let banned_name = schema_set.name_table.add("banned");
+
+        let make_attr = |name: NameId, kind: AuK| AttributeUseResult {
+            attribute: AttributeFrameResult {
+                name: Some(name),
+                ref_name: None,
+                target_namespace: None,
+                type_ref: None,
+                inline_type: None,
+                default_value: None,
+                fixed_value: None,
+                use_kind: None,
+                form: None,
+                inheritable: false,
+                id: None,
+                annotation: None,
+                source: None,
+            },
+            use_kind: kind,
+        };
+
+        let ag = AttributeGroupData {
+            name: Some(grp_name),
+            target_namespace: None,
+            ref_name: None,
+            attributes: vec![
+                make_attr(opt_name, AuK::Optional),
+                make_attr(banned_name, AuK::Prohibited),
+            ],
+            attribute_groups: Vec::new(),
+            attribute_wildcard: None,
+            id: None,
+            annotation: None,
+            source: None,
+            resolved_ref: None,
+            resolved_attribute_groups: Vec::new(),
+            resolved_attributes: vec![
+                crate::arenas::ResolvedAttributeUse {
+                    resolved_type: None,
+                    resolved_ref: None,
+                },
+                crate::arenas::ResolvedAttributeUse {
+                    resolved_type: None,
+                    resolved_ref: None,
+                },
+            ],
+            redefine_original: None,
+            redefine_requires_restriction_check: false,
+        };
+        let ag_key = schema_set.arenas.alloc_attribute_group(ag);
+
+        let uses = collect_flat_attribute_uses_for_group(&schema_set, ag_key);
+        // Prohibited must be dropped; only `opt` survives.
+        assert_eq!(
+            uses.len(),
+            1,
+            "prohibited attribute uses must be filtered out"
+        );
+        assert_eq!(uses[0].name, opt_name);
     }
 
 }

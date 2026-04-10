@@ -503,6 +503,7 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_particle_types: Vec::new(),
                     resolved_particle_elements: Vec::new(),
                     redefine_original: None,
+                    redefine_requires_restriction_check: false,
                 };
                 let key = self.schema_set.arenas.alloc_model_group(data);
                 if register {
@@ -538,6 +539,7 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_attribute_groups: Vec::new(),
                     resolved_attributes: Vec::new(),
                     redefine_original: None,
+                    redefine_requires_restriction_check: false,
                 };
                 let key = self.schema_set.arenas.alloc_attribute_group(data);
                 if register {

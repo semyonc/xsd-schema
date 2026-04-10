@@ -1563,6 +1563,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
 
         let _group_key = schema_set.arenas.alloc_model_group(group_data);
@@ -1772,6 +1773,7 @@ mod tests {
             resolved_particle_types: Vec::new(),
             resolved_particle_elements: Vec::new(),
             redefine_original: None,
+            redefine_requires_restriction_check: false,
         };
 
         let group_key = schema_set.arenas.alloc_model_group(group_data);
