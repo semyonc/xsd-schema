@@ -70,10 +70,30 @@ pub enum ExpectedOutcome {
     Valid,
     /// Schema should be invalid
     Invalid,
+    /// Instance validity should be `notKnown`
+    NotKnown,
+    /// Latent schema error surfaced during instance validation
+    RuntimeSchemaError,
+    /// Expected result depends on an implementation-defined choice
+    ImplementationDefined,
+    /// Expected result depends on an implementation-dependent choice
+    ImplementationDependent,
+    /// Expected result is intentionally under/over-specified by the suite
+    Indeterminate,
     /// Instance should validate against schema
     InstanceValid,
     /// Instance should NOT validate against schema
     InstanceInvalid,
+    /// Instance result is intentionally under/over-specified by the suite
+    InstanceIndeterminate,
+    /// Instance result depends on an implementation-defined choice
+    InstanceImplementationDefined,
+    /// Instance result depends on an implementation-dependent choice
+    InstanceImplementationDependent,
+    /// Latent schema error surfaced during instance validation
+    InstanceRuntimeSchemaError,
+    /// Instance validity should be `notKnown`
+    InstanceNotKnown,
 }
 
 /// Test suite statistics
@@ -130,6 +150,67 @@ pub struct VersionedExpected {
 
 /// Recognized XSD versions for SchemaSet selection
 const XSD_VERSIONS: &[&str] = &["1.0", "1.1"];
+
+fn parse_expected_outcome(
+    validity: &str,
+    in_instance_test: bool,
+) -> Result<ExpectedOutcome, String> {
+    let outcome = match (in_instance_test, validity) {
+        (false, "valid") => ExpectedOutcome::Valid,
+        (false, "invalid") => ExpectedOutcome::Invalid,
+        (false, "notKnown") => ExpectedOutcome::NotKnown,
+        (false, "runtime-schema-error") => ExpectedOutcome::RuntimeSchemaError,
+        (false, "implementation-defined") => ExpectedOutcome::ImplementationDefined,
+        (false, "implementation-dependent") => ExpectedOutcome::ImplementationDependent,
+        (false, "indeterminate") => ExpectedOutcome::Indeterminate,
+        (true, "valid") => ExpectedOutcome::InstanceValid,
+        (true, "invalid") => ExpectedOutcome::InstanceInvalid,
+        (true, "notKnown") => ExpectedOutcome::InstanceNotKnown,
+        (true, "runtime-schema-error") => ExpectedOutcome::InstanceRuntimeSchemaError,
+        (true, "implementation-defined") => ExpectedOutcome::InstanceImplementationDefined,
+        (true, "implementation-dependent") => ExpectedOutcome::InstanceImplementationDependent,
+        (true, "indeterminate") => ExpectedOutcome::InstanceIndeterminate,
+        (_, other) => {
+            return Err(format!("Unsupported expected validity '{}'", other));
+        }
+    };
+    Ok(outcome)
+}
+
+fn is_non_asserting_expected(outcome: ExpectedOutcome) -> bool {
+    matches!(
+        outcome,
+        ExpectedOutcome::Indeterminate
+            | ExpectedOutcome::ImplementationDefined
+            | ExpectedOutcome::ImplementationDependent
+            | ExpectedOutcome::InstanceIndeterminate
+            | ExpectedOutcome::InstanceImplementationDefined
+            | ExpectedOutcome::InstanceImplementationDependent
+    )
+}
+
+fn expected_skip_reason(outcome: ExpectedOutcome) -> Option<&'static str> {
+    match outcome {
+        ExpectedOutcome::Indeterminate | ExpectedOutcome::InstanceIndeterminate => Some(
+            "W3C expected outcome is 'indeterminate'; the driver skips non-asserting cases",
+        ),
+        ExpectedOutcome::ImplementationDefined
+        | ExpectedOutcome::InstanceImplementationDefined => Some(
+            "W3C expected outcome is 'implementation-defined'; this driver does not model implementation profiles",
+        ),
+        ExpectedOutcome::ImplementationDependent
+        | ExpectedOutcome::InstanceImplementationDependent => Some(
+            "W3C expected outcome is 'implementation-dependent'; this driver does not model implementation profiles",
+        ),
+        ExpectedOutcome::RuntimeSchemaError => Some(
+            "W3C expected outcome 'runtime-schema-error' is meaningless for schema tests",
+        ),
+        ExpectedOutcome::InstanceRuntimeSchemaError => Some(
+            "W3C expected outcome 'runtime-schema-error' is not modeled separately by this driver",
+        ),
+        _ => None,
+    }
+}
 
 /// Check if a version string is a recognized XSD version
 fn is_xsd_version(v: &str) -> bool {
@@ -407,20 +488,14 @@ impl TestSuiteParser {
                                 }
 
                                 if let Some(validity) = validity_str {
-                                    let outcome = if in_instance_test {
-                                        match validity.as_str() {
-                                            "valid" => ExpectedOutcome::InstanceValid,
-                                            "invalid" => ExpectedOutcome::InstanceInvalid,
-                                            _ => ExpectedOutcome::InstanceValid,
-                                        }
-                                    } else {
-                                        match validity.as_str() {
-                                            "valid" => ExpectedOutcome::Valid,
-                                            "invalid" => ExpectedOutcome::Invalid,
-                                            "notKnown" => ExpectedOutcome::Valid,
-                                            _ => ExpectedOutcome::Valid,
-                                        }
-                                    };
+                                    let outcome =
+                                        parse_expected_outcome(&validity, in_instance_test)
+                                            .map_err(|e| {
+                                                format!(
+                                                    "Invalid expected outcome '{}' in {:?}: {}",
+                                                    validity, path, e
+                                                )
+                                            })?;
 
                                     test.expected_versions.push(VersionedExpected {
                                         version: expected_version,
@@ -504,8 +579,8 @@ impl TestSuiteParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn scan_directory(&self, dir: &Path, tests: &mut Vec<TestCase>) -> Result<(), String> {
-        let entries = fs::read_dir(dir)
-            .map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
+        let entries =
+            fs::read_dir(dir).map_err(|e| format!("Failed to read directory {:?}: {}", dir, e))?;
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -776,13 +851,20 @@ impl TestRunner {
                         }
                     } else {
                         // Profile label filter: match against version_label
-                        if !t.version_label.split_whitespace().any(|tok| tok == version.as_str()) {
+                        if !t
+                            .version_label
+                            .split_whitespace()
+                            .any(|tok| tok == version.as_str())
+                        {
                             return false;
                         }
                     }
                 }
                 if !self.name_filters.is_empty()
-                    && !self.name_filters.iter().any(|n| t.name.contains(n.as_str()))
+                    && !self
+                        .name_filters
+                        .iter()
+                        .any(|n| t.name.contains(n.as_str()))
                 {
                     return false;
                 }
@@ -801,9 +883,7 @@ impl TestRunner {
             let result = self.run_test(test);
 
             // Update group stats
-            let stats = stats_by_group
-                .entry(result.group.clone())
-                .or_default();
+            let stats = stats_by_group.entry(result.group.clone()).or_default();
             stats.add_result(&result);
 
             if self.verbose {
@@ -813,10 +893,7 @@ impl TestRunner {
                     TestOutcome::Skip => "SKIP",
                     TestOutcome::Error => "ERROR",
                 };
-                println!(
-                    "  {} - {} ({:?})",
-                    status, result.name, result.duration
-                );
+                println!("  {} - {} ({:?})", status, result.name, result.duration);
                 if let Some(ref msg) = result.error_message {
                     println!("    Error: {}", msg);
                 }
@@ -890,15 +967,44 @@ impl TestRunner {
 
         // Determine outcome
         let (actual, error_message) = match (test.expected, &parse_error) {
+            (expected, _) if is_non_asserting_expected(expected) => (
+                TestOutcome::Skip,
+                expected_skip_reason(expected).map(str::to_string),
+            ),
             (ExpectedOutcome::Valid, None) => (TestOutcome::Pass, None),
             (ExpectedOutcome::Valid, Some(e)) => (TestOutcome::Fail, Some(e.clone())),
-            (ExpectedOutcome::Invalid, None) => {
-                (TestOutcome::Fail, Some("Schema was valid but expected invalid".to_string()))
-            }
+            (ExpectedOutcome::Invalid, None) => (
+                TestOutcome::Fail,
+                Some("Schema was valid but expected invalid".to_string()),
+            ),
             (ExpectedOutcome::Invalid, Some(_)) => (TestOutcome::Pass, None),
+            (ExpectedOutcome::NotKnown, _) => (
+                TestOutcome::Skip,
+                Some("W3C expected outcome 'notKnown' is meaningless for schema tests".to_string()),
+            ),
+            (ExpectedOutcome::RuntimeSchemaError, _) => (
+                TestOutcome::Skip,
+                Some(
+                    "W3C expected outcome 'runtime-schema-error' is meaningless for schema tests"
+                        .to_string(),
+                ),
+            ),
+            // `runtime-schema-error` on an instance test is not modeled separately
+            // by this driver; skip unconditionally so a schema-compile failure on
+            // such a test does not surface as Error.
+            (ExpectedOutcome::InstanceRuntimeSchemaError, _) => (
+                TestOutcome::Skip,
+                expected_skip_reason(ExpectedOutcome::InstanceRuntimeSchemaError)
+                    .map(str::to_string),
+            ),
 
             // Instance validation tests
-            (ExpectedOutcome::InstanceValid, _) | (ExpectedOutcome::InstanceInvalid, _) => {
+            (
+                ExpectedOutcome::InstanceValid
+                | ExpectedOutcome::InstanceInvalid
+                | ExpectedOutcome::InstanceNotKnown,
+                _,
+            ) => {
                 // Schema must compile successfully for instance tests
                 if let Some(ref e) = parse_error {
                     return TestResult {
@@ -936,28 +1042,48 @@ impl TestRunner {
                 };
 
                 match validate_instance(&schema_set, instance_file) {
-                    Ok((has_errors, error_msgs)) => {
-                        let instance_valid = !has_errors;
-                        match (test.expected, instance_valid) {
-                            (ExpectedOutcome::InstanceValid, true) => (TestOutcome::Pass, None),
-                            (ExpectedOutcome::InstanceValid, false) => {
-                                let detail = if error_msgs.is_empty() {
-                                    "Instance was invalid but expected valid".to_string()
-                                } else {
-                                    format!("Instance was invalid but expected valid: {}", error_msgs.join("; "))
-                                };
-                                (TestOutcome::Fail, Some(detail))
-                            }
-                            (ExpectedOutcome::InstanceInvalid, false) => (TestOutcome::Pass, None),
-                            (ExpectedOutcome::InstanceInvalid, true) => {
-                                (TestOutcome::Fail, Some("Instance was valid but expected invalid".to_string()))
-                            }
-                            _ => unreachable!(),
+                    Ok((actual_outcome, error_msgs)) => match (test.expected, actual_outcome) {
+                        (ExpectedOutcome::InstanceValid, InstanceActualOutcome::Valid) => {
+                            (TestOutcome::Pass, None)
                         }
-                    }
+                        (ExpectedOutcome::InstanceValid, _) => {
+                            let detail = if error_msgs.is_empty() {
+                                format!("Instance was {:?} but expected valid", actual_outcome)
+                            } else {
+                                format!(
+                                    "Instance was {:?} but expected valid: {}",
+                                    actual_outcome,
+                                    error_msgs.join("; ")
+                                )
+                            };
+                            (TestOutcome::Fail, Some(detail))
+                        }
+                        (ExpectedOutcome::InstanceInvalid, InstanceActualOutcome::Invalid) => {
+                            (TestOutcome::Pass, None)
+                        }
+                        (ExpectedOutcome::InstanceInvalid, _) => (
+                            TestOutcome::Fail,
+                            Some(format!(
+                                "Instance was {:?} but expected invalid",
+                                actual_outcome
+                            )),
+                        ),
+                        (ExpectedOutcome::InstanceNotKnown, InstanceActualOutcome::NotKnown) => {
+                            (TestOutcome::Pass, None)
+                        }
+                        (ExpectedOutcome::InstanceNotKnown, _) => (
+                            TestOutcome::Fail,
+                            Some(format!(
+                                "Instance was {:?} but expected notKnown",
+                                actual_outcome
+                            )),
+                        ),
+                        _ => unreachable!(),
+                    },
                     Err(e) => (TestOutcome::Error, Some(e)),
                 }
             }
+            _ => unreachable!("non-asserting expected outcomes are handled before execution"),
         };
 
         TestResult {
@@ -977,10 +1103,17 @@ impl TestRunner {
 
 const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstanceActualOutcome {
+    Valid,
+    Invalid,
+    NotKnown,
+}
+
 /// Validate an instance document against a compiled schema set.
 ///
-/// Returns `Ok(true)` if validation errors were found, `Ok(false)` if
-/// the instance is valid. Returns `Err` on I/O or XML parse errors.
+/// Returns the root validity classification plus collected validation messages.
+/// Returns `Err` on I/O or XML parse errors.
 /// Validate an instance document against a compiled schema set.
 ///
 /// If the first validation pass collects `xsi:schemaLocation` or
@@ -990,37 +1123,38 @@ const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 fn validate_instance(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
-) -> Result<(bool, Vec<String>), String> {
-    let content = fs::read(instance_path)
-        .map_err(|e| format!("Failed to read instance: {}", e))?;
+) -> Result<(InstanceActualOutcome, Vec<String>), String> {
+    let content = fs::read(instance_path).map_err(|e| format!("Failed to read instance: {}", e))?;
 
     // Canonicalize instance path so schema-location hints resolve correctly
-    let canonical_path = instance_path.canonicalize()
+    let canonical_path = instance_path
+        .canonicalize()
         .unwrap_or_else(|_| instance_path.to_path_buf());
 
-    let (has_errors, error_msgs, sl_hints, nnsl_hints) =
+    let (actual_outcome, error_msgs, sl_hints, nnsl_hints) =
         validate_instance_pass(schema_set, &canonical_path, &content)?;
 
     // Two-pass: if hints were collected, use the library's enrich_schema_set()
     // to build an enriched schema set and re-validate.
-    if let Some(enriched) =
-        xsd_schema::enrich_schema_set(schema_set, &sl_hints, &nnsl_hints)
-    {
-        let (has_errors2, error_msgs2, _, _) =
+    if let Some(enriched) = xsd_schema::enrich_schema_set(schema_set, &sl_hints, &nnsl_hints) {
+        let (actual_outcome2, error_msgs2, _, _) =
             validate_instance_pass(&enriched, &canonical_path, &content)?;
-        return Ok((has_errors2, error_msgs2));
+        return Ok((actual_outcome2, error_msgs2));
     }
 
-    Ok((has_errors, error_msgs))
+    Ok((actual_outcome, error_msgs))
 }
 
 /// Result of a single validation pass: errors and collected schema-location hints.
-type ValidationPassResult = Result<(
-    bool,
-    Vec<String>,
-    Vec<xsd_schema::validation::info::SchemaLocationHint>,
-    Vec<xsd_schema::validation::info::NoNamespaceSchemaLocationHint>,
-), String>;
+type ValidationPassResult = Result<
+    (
+        InstanceActualOutcome,
+        Vec<String>,
+        Vec<xsd_schema::validation::info::SchemaLocationHint>,
+        Vec<xsd_schema::validation::info::NoNamespaceSchemaLocationHint>,
+    ),
+    String,
+>;
 
 /// Scan XML content for DTD unparsed entity declarations.
 ///
@@ -1033,7 +1167,7 @@ fn scan_unparsed_entities(xml: &str) -> std::collections::HashSet<String> {
     while let Some(start) = xml[search_from..].find("<!ENTITY") {
         let abs_start = search_from + start;
         let rest = &xml[abs_start + 8..]; // skip "<!ENTITY"
-        // Find the closing '>'
+                                          // Find the closing '>'
         let end = match rest.find('>') {
             Some(e) => e,
             None => break,
@@ -1063,6 +1197,8 @@ fn validate_instance_pass(
     instance_path: &Path,
     content: &[u8],
 ) -> ValidationPassResult {
+    use xsd_schema::validation::SchemaValidity;
+
     let flags = xsd_schema::validation::ValidationFlags::default()
         | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
 
@@ -1096,8 +1232,7 @@ fn validate_instance_pass(
             let dt_rest = &xml_str[dt_start..];
             let dt_end = dt_rest.find('>').unwrap_or(dt_rest.len());
             let dt_decl = &dt_rest[..dt_end];
-            (dt_decl.contains("SYSTEM") || dt_decl.contains("PUBLIC"))
-                && !dt_decl.contains('[')
+            (dt_decl.contains("SYSTEM") || dt_decl.contains("PUBLIC")) && !dt_decl.contains('[')
         } else {
             false
         };
@@ -1126,6 +1261,7 @@ fn validate_instance_pass(
     // Whitespace/text outside the root element (e.g. between <?xml?> and
     // root, or after the root closes) is not significant for validation.
     let mut depth: usize = 0;
+    let mut root_validity: Option<SchemaValidity> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -1165,19 +1301,26 @@ fn validate_instance_pass(
                 validate_attributes(e, &prefix_map, &mut runtime)?;
 
                 runtime.validate_end_of_attributes();
-                runtime.validate_end_element();
+                let end_info = runtime.validate_end_element();
+                if depth == 1 {
+                    root_validity = Some(end_info.validity);
+                }
                 depth -= 1;
 
                 // Pop namespace scope
                 pop_ns_scope(&mut prefix_map, &mut scope_stack);
             }
             Ok(Event::End(_)) => {
-                runtime.validate_end_element();
+                let end_info = runtime.validate_end_element();
+                if depth == 1 {
+                    root_validity = Some(end_info.validity);
+                }
                 depth -= 1;
                 pop_ns_scope(&mut prefix_map, &mut scope_stack);
             }
             Ok(Event::Text(ref e)) if depth > 0 => {
-                let text = e.unescape()
+                let text = e
+                    .unescape()
                     .map_err(|err| format!("Text unescape error: {}", err))?;
                 if text.chars().all(|c| c.is_whitespace()) {
                     runtime.validate_whitespace(&text);
@@ -1208,7 +1351,16 @@ fn validate_instance_pass(
     }
 
     let error_msgs: Vec<String> = errors.iter().map(|e| format!("{}", e)).collect();
-    Ok((!errors.is_empty(), error_msgs, sl_hints, nnsl_hints))
+    let actual_outcome = if !errors.is_empty() {
+        InstanceActualOutcome::Invalid
+    } else {
+        match root_validity.unwrap_or(SchemaValidity::NotKnown) {
+            SchemaValidity::Valid => InstanceActualOutcome::Valid,
+            SchemaValidity::Invalid => InstanceActualOutcome::Invalid,
+            SchemaValidity::NotKnown => InstanceActualOutcome::NotKnown,
+        }
+    };
+    Ok((actual_outcome, error_msgs, sl_hints, nnsl_hints))
 }
 
 /// Split a QName into (prefix_bytes, local_bytes).
@@ -1227,7 +1379,14 @@ fn process_element_start(
     prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
     schema_set: &xsd_schema::SchemaSet,
-) -> Result<(Option<String>, Option<String>, xsd_schema::namespace::context::NamespaceContextSnapshot), String> {
+) -> Result<
+    (
+        Option<String>,
+        Option<String>,
+        xsd_schema::namespace::context::NamespaceContextSnapshot,
+    ),
+    String,
+> {
     let mut scope_prefixes: Vec<Vec<u8>> = Vec::new();
 
     // First pass: collect namespace declarations
@@ -1236,14 +1395,22 @@ fn process_element_start(
         let key = attr.key.as_ref();
         if key == b"xmlns" {
             // Default namespace declaration
-            let value = attr.unescape_value()
+            let value = attr
+                .unescape_value()
                 .map_err(|err| format!("Attribute unescape error: {}", err))?;
-            prefix_map.entry(b"".to_vec()).or_default().push(value.to_string());
+            prefix_map
+                .entry(b"".to_vec())
+                .or_default()
+                .push(value.to_string());
             scope_prefixes.push(b"".to_vec());
         } else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
-            let value = attr.unescape_value()
+            let value = attr
+                .unescape_value()
                 .map_err(|err| format!("Attribute unescape error: {}", err))?;
-            prefix_map.entry(prefix.to_vec()).or_default().push(value.to_string());
+            prefix_map
+                .entry(prefix.to_vec())
+                .or_default()
+                .push(value.to_string());
             scope_prefixes.push(prefix.to_vec());
         }
     }
@@ -1269,7 +1436,8 @@ fn process_element_start(
                 if ns_uri == XSI_NAMESPACE {
                     let local = std::str::from_utf8(attr_local)
                         .map_err(|err| format!("UTF-8 error: {}", err))?;
-                    let value = attr.unescape_value()
+                    let value = attr
+                        .unescape_value()
                         .map_err(|err| format!("Attribute unescape error: {}", err))?;
                     match local {
                         "type" => xsi_type = Some(value.to_string()),
@@ -1299,12 +1467,14 @@ fn resolve_element_name(
         .to_string();
     let namespace = if prefix.is_empty() {
         // Default namespace
-        prefix_map.get(&b"".to_vec())
+        prefix_map
+            .get(&b"".to_vec())
             .and_then(|stack| stack.last())
             .cloned()
             .unwrap_or_default()
     } else {
-        prefix_map.get(prefix)
+        prefix_map
+            .get(prefix)
             .and_then(|stack| stack.last())
             .cloned()
             .unwrap_or_default()
@@ -1325,17 +1495,19 @@ fn validate_attributes<S: xsd_schema::validation::ValidationSink>(
             continue;
         }
         let (attr_prefix, attr_local_bytes) = split_prefix_local(key);
-        let attr_local = std::str::from_utf8(attr_local_bytes)
-            .map_err(|err| format!("UTF-8 error: {}", err))?;
+        let attr_local =
+            std::str::from_utf8(attr_local_bytes).map_err(|err| format!("UTF-8 error: {}", err))?;
         let attr_ns = if attr_prefix.is_empty() {
             String::new()
         } else {
-            prefix_map.get(attr_prefix)
+            prefix_map
+                .get(attr_prefix)
                 .and_then(|stack| stack.last())
                 .cloned()
                 .unwrap_or_default()
         };
-        let value = attr.unescape_value()
+        let value = attr
+            .unescape_value()
             .map_err(|err| format!("Attribute unescape error: {}", err))?;
         runtime.validate_attribute(attr_local, &attr_ns, &value);
     }
@@ -1348,7 +1520,8 @@ fn build_ns_context(
     prefix_map: &HashMap<Vec<u8>, Vec<String>>,
     schema_set: &xsd_schema::SchemaSet,
 ) -> xsd_schema::namespace::context::NamespaceContextSnapshot {
-    let default_ns = prefix_map.get(&b"".to_vec())
+    let default_ns = prefix_map
+        .get(&b"".to_vec())
         .and_then(|stack| stack.last())
         .filter(|s| !s.is_empty())
         .map(|s| schema_set.name_table.add(s));
@@ -1421,10 +1594,7 @@ pub fn print_summary(stats_by_group: &HashMap<String, TestStats>) {
         total.skipped,
         total.errors
     );
-    println!(
-        "Pass rate: {:.1}%",
-        total.pass_rate() * 100.0
-    );
+    println!("Pass rate: {:.1}%", total.pass_rate() * 100.0);
     println!("Duration: {:?}", total.total_duration);
 }
 
@@ -1514,7 +1684,10 @@ fn main() {
     };
 
     if !test_suite_path.exists() {
-        eprintln!("Error: Test suite path does not exist: {:?}", test_suite_path);
+        eprintln!(
+            "Error: Test suite path does not exist: {:?}",
+            test_suite_path
+        );
         std::process::exit(1);
     }
 
@@ -1570,11 +1743,25 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_schema_indeterminate_as_non_asserting() {
+        assert_eq!(
+            super::parse_expected_outcome("indeterminate", false).unwrap(),
+            super::ExpectedOutcome::Indeterminate
+        );
+    }
 
+    #[test]
+    fn parse_instance_not_known_preserves_expected_outcome() {
+        assert_eq!(
+            super::parse_expected_outcome("notKnown", true).unwrap(),
+            super::ExpectedOutcome::InstanceNotKnown
+        );
+    }
 
     #[test]
     fn test_stats_pass_rate() {
-        let mut stats = TestStats::default();
+        let mut stats = super::TestStats::default();
         stats.passed = 80;
         stats.failed = 20;
 
@@ -1583,7 +1770,7 @@ mod tests {
 
     #[test]
     fn test_stats_total() {
-        let mut stats = TestStats::default();
+        let mut stats = super::TestStats::default();
         stats.passed = 10;
         stats.failed = 5;
         stats.skipped = 3;
@@ -1594,7 +1781,7 @@ mod tests {
 
     #[test]
     fn test_empty_stats() {
-        let stats = TestStats::default();
+        let stats = super::TestStats::default();
         assert_eq!(stats.pass_rate(), 0.0);
         assert_eq!(stats.total(), 0);
     }

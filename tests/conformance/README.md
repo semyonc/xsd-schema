@@ -94,11 +94,21 @@ Each test in the W3C suite declares an expected outcome:
 |----------|---------|
 | `Valid` | Schema should be accepted |
 | `Invalid` | Schema should be rejected |
+| `NotKnown` | Instance validity is unknown; meaningless for schema tests |
+| `RuntimeSchemaError` | Latent schema error surfaced during instance validation |
+| `ImplementationDefined` / `ImplementationDependent` | Outcome depends on an implementation-specific choice |
+| `Indeterminate` | W3C suite intentionally does not assert a single correct result |
 | `InstanceValid` | Instance document should validate against its schema |
 | `InstanceInvalid` | Instance document should fail validation |
 
 The driver compares actual behavior against the expected outcome and reports
 each test as **Pass**, **Fail**, **Skip**, or **Error**.
+
+For the W3C metadata-only outcomes `implementation-defined`,
+`implementation-dependent`, and `indeterminate`, the driver records a `Skip`
+instead of forcing them into `valid` / `invalid`. Schema-side `notKnown` and
+`runtime-schema-error` are also treated as non-asserting because the XSTS
+schema defines those values as meaningless for schema tests.
 
 ## Source Files
 

@@ -132,7 +132,7 @@ if [ -d "$TEST_SUITE" ]; then
 
     # ── 5. Full XSD 1.0 particle catalog (INFO) ──────────────────────────
 
-    run_info "Conformance: full particle catalog (1407/1411 baseline)" \
+    run_info "Conformance: full particle catalog (1406 pass / 3 fail / 2 skip baseline)" \
         cargo test --test conformance --features xsd11 -- \
             --test-suite "$TEST_SUITE" --version 1.0 --group particles
 else

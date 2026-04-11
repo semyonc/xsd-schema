@@ -29,8 +29,18 @@ pub enum TestOutcome {
 pub enum ExpectedOutcome {
     Valid,
     Invalid,
+    NotKnown,
+    RuntimeSchemaError,
+    ImplementationDefined,
+    ImplementationDependent,
+    Indeterminate,
     InstanceValid,
     InstanceInvalid,
+    InstanceIndeterminate,
+    InstanceImplementationDefined,
+    InstanceImplementationDependent,
+    InstanceRuntimeSchemaError,
+    InstanceNotKnown,
 }
 
 /// A single test case result (from driver)
@@ -92,10 +102,7 @@ pub struct ReportGenerator {
 
 impl ReportGenerator {
     /// Create a new report generator
-    pub fn new(
-        results: Vec<TestResult>,
-        stats_by_group: HashMap<String, TestStats>,
-    ) -> Self {
+    pub fn new(results: Vec<TestResult>, stats_by_group: HashMap<String, TestStats>) -> Self {
         Self {
             results,
             stats_by_group,
@@ -234,7 +241,11 @@ impl ReportGenerator {
             let comma = if i < self.results.len() - 1 { "," } else { "" };
             writeln!(writer, "    {{")?;
             writeln!(writer, "      \"name\": \"{}\",", escape_json(&result.name))?;
-            writeln!(writer, "      \"group\": \"{}\",", escape_json(&result.group))?;
+            writeln!(
+                writer,
+                "      \"group\": \"{}\",",
+                escape_json(&result.group)
+            )?;
             writeln!(
                 writer,
                 "      \"expected\": \"{}\",",
@@ -264,10 +275,7 @@ impl ReportGenerator {
     /// Write a CSV report
     fn write_csv<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         // Header
-        writeln!(
-            writer,
-            "name,group,expected,actual,duration_ms,error"
-        )?;
+        writeln!(writer, "name,group,expected,actual,duration_ms,error")?;
 
         // Results
         for result in &self.results {
@@ -373,7 +381,9 @@ impl ReportGenerator {
         )?;
 
         // Group summary
-        writeln!(writer, r#"
+        writeln!(
+            writer,
+            r#"
     <h2>Results by Group</h2>
     <table>
         <tr>
@@ -383,7 +393,8 @@ impl ReportGenerator {
             <th>Skipped</th>
             <th>Errors</th>
             <th>Pass Rate</th>
-        </tr>"#)?;
+        </tr>"#
+        )?;
 
         for (group, stats) in &self.stats_by_group {
             writeln!(
@@ -470,8 +481,18 @@ fn expected_to_str(outcome: ExpectedOutcome) -> &'static str {
     match outcome {
         ExpectedOutcome::Valid => "valid",
         ExpectedOutcome::Invalid => "invalid",
+        ExpectedOutcome::NotKnown => "notKnown",
+        ExpectedOutcome::RuntimeSchemaError => "runtime-schema-error",
+        ExpectedOutcome::ImplementationDefined => "implementation-defined",
+        ExpectedOutcome::ImplementationDependent => "implementation-dependent",
+        ExpectedOutcome::Indeterminate => "indeterminate",
         ExpectedOutcome::InstanceValid => "instanceValid",
         ExpectedOutcome::InstanceInvalid => "instanceInvalid",
+        ExpectedOutcome::InstanceIndeterminate => "instanceIndeterminate",
+        ExpectedOutcome::InstanceImplementationDefined => "instanceImplementationDefined",
+        ExpectedOutcome::InstanceImplementationDependent => "instanceImplementationDependent",
+        ExpectedOutcome::InstanceRuntimeSchemaError => "instanceRuntimeSchemaError",
+        ExpectedOutcome::InstanceNotKnown => "instanceNotKnown",
     }
 }
 
