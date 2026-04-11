@@ -32,6 +32,208 @@ use crate::schema::composition::{
 use crate::schema::model::{DerivationSet, OverrideComponent, OverrideDirective};
 use crate::schema::SchemaSet;
 
+/// Extract the `(kind, namespace, name)` identity tuple for an override
+/// component. Returns `None` for anonymous components (legal for local
+/// inline types but never valid as direct children of `<xs:override>`,
+/// where every component is required to carry a `name`). The existing
+/// `override_*` helpers enforce the name requirement with an explicit
+/// `src-override` error; this helper is intentionally lenient so it can
+/// be reused by the pre-pass without duplicating error emission.
+fn override_component_identity(
+    schema_set: &SchemaSet,
+    component: &OverrideComponent,
+) -> Option<(ComponentKind, Option<NameId>, NameId)> {
+    match *component {
+        OverrideComponent::SimpleType(k) => {
+            let t = schema_set.arenas.simple_types.get(k)?;
+            Some((ComponentKind::SimpleType, t.target_namespace, t.name?))
+        }
+        OverrideComponent::ComplexType(k) => {
+            let t = schema_set.arenas.complex_types.get(k)?;
+            Some((ComponentKind::ComplexType, t.target_namespace, t.name?))
+        }
+        OverrideComponent::Group(k) => {
+            let g = schema_set.arenas.model_groups.get(k)?;
+            Some((ComponentKind::ModelGroup, g.target_namespace, g.name?))
+        }
+        OverrideComponent::AttributeGroup(k) => {
+            let g = schema_set.arenas.attribute_groups.get(k)?;
+            Some((ComponentKind::AttributeGroup, g.target_namespace, g.name?))
+        }
+        OverrideComponent::Element(k) => {
+            let e = schema_set.arenas.elements.get(k)?;
+            Some((ComponentKind::Element, e.target_namespace, e.name?))
+        }
+        OverrideComponent::Attribute(k) => {
+            let a = schema_set.arenas.attributes.get(k)?;
+            Some((ComponentKind::Attribute, a.target_namespace, a.name?))
+        }
+        OverrideComponent::Notation(k) => {
+            let n = schema_set.arenas.notations.get(k)?;
+            Some((ComponentKind::Notation, n.target_namespace, n.name))
+        }
+    }
+}
+
+/// Validate every `<xs:override>` directive in the schema set against
+/// §4.2.5 constraints, before any directive is applied.
+///
+/// Enforces two rules and emits `src-override` on failure:
+///
+/// 1. **Target-namespace compatibility.** The overriding and overridden
+///    documents must either both lack a `targetNamespace` or share the
+///    same value. The chameleon case (overriding has a namespace,
+///    overridden has none) is legal.
+///
+/// 2. **No conflicting duplicate overrides in a single document.**
+///    Two children sharing `(kind, namespace, local-name)` inside one
+///    `<xs:override>` block are always rejected; across separate blocks
+///    they are only rejected when both would actually match a component
+///    in their target set (matching `apply_override`'s silent-skip rule
+///    for unmatched children).
+pub fn validate_override_directives(schema_set: &SchemaSet) -> SchemaResult<()> {
+    for doc in &schema_set.documents {
+        for directive in &doc.overrides {
+            let Some(target_id) = directive.resolved_doc_id else {
+                continue;
+            };
+            let Some(target_doc) = schema_set.documents.get(target_id as usize) else {
+                continue;
+            };
+            // Use the *effective* post-chameleon `target_namespace` on
+            // both sides — an included target may already have been
+            // chameleon-adopted into a parent namespace, so the
+            // pre-chameleon `declared_target_namespace` would reject
+            // compositions the spec considers valid.
+            let d1_ns = doc.target_namespace;
+            let d2_ns = target_doc.target_namespace;
+            let compatible = match (d1_ns, d2_ns) {
+                (None, None) => true,
+                (Some(_), None) => true, // chameleon case
+                (Some(a), Some(b)) => a == b,
+                (None, Some(_)) => false,
+            };
+            if !compatible {
+                let location = directive
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                let d1_label = d1_ns
+                    .map(|ns| schema_set.name_table.resolve(ns).to_string())
+                    .unwrap_or_else(|| "(absent)".to_string());
+                let d2_label = d2_ns
+                    .map(|ns| schema_set.name_table.resolve(ns).to_string())
+                    .unwrap_or_else(|| "(absent)".to_string());
+                return Err(SchemaError::structural(
+                    "src-override",
+                    format!(
+                        "Override target-namespace mismatch: overriding schema \
+                         '{}' (ns={}) cannot override '{}' (ns={}); both must \
+                         share the same namespace or both must lack one (§4.2.5)",
+                        doc.base_uri, d1_label, target_doc.base_uri, d2_label,
+                    ),
+                    location,
+                ));
+            }
+        }
+
+        let mut active_cross_block: HashSet<(ComponentKind, Option<NameId>, NameId)> =
+            HashSet::new();
+        for directive in &doc.overrides {
+            let target_set = match directive.resolved_doc_id {
+                Some(id) => compute_target_set(schema_set, id),
+                None => HashSet::new(),
+            };
+            let mut in_block: HashSet<(ComponentKind, Option<NameId>, NameId)> =
+                HashSet::new();
+            for component in &directive.components {
+                let Some(identity) =
+                    override_component_identity(schema_set, component)
+                else {
+                    continue;
+                };
+                if !in_block.insert(identity) {
+                    let (kind, _ns, name) = identity;
+                    let location = directive
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    let name_str = schema_set.name_table.resolve(name);
+                    return Err(SchemaError::structural(
+                        "src-override",
+                        format!(
+                            "Duplicate override of {} '{}' inside a single \
+                             <xs:override> block in schema document '{}' (§4.2.5)",
+                            kind.display_name(),
+                            name_str,
+                            doc.base_uri,
+                        ),
+                        location,
+                    ));
+                }
+                let (kind, namespace, name) = identity;
+                let matches_target =
+                    target_set_has_identity(schema_set, &target_set, kind, namespace, name);
+                if matches_target && !active_cross_block.insert(identity) {
+                    let location = directive
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    let name_str = schema_set.name_table.resolve(name);
+                    return Err(SchemaError::structural(
+                        "src-override",
+                        format!(
+                            "Duplicate override of {} '{}' across separate \
+                             <xs:override> blocks in schema document '{}': both \
+                             children match and would replace the same target \
+                             component (§4.2.5)",
+                            kind.display_name(),
+                            name_str,
+                            doc.base_uri,
+                        ),
+                        location,
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check whether the component with the given `(kind, namespace, name)`
+/// identity exists in any document in the target set. Returns `true`
+/// when the target set is empty (unresolved doc — treated as
+/// unconditional replacement, matching [`target_set_has_component`]).
+fn target_set_has_identity(
+    schema_set: &SchemaSet,
+    target_set: &HashSet<DocumentId>,
+    kind: ComponentKind,
+    namespace: Option<NameId>,
+    name: NameId,
+) -> bool {
+    if target_set.is_empty() {
+        return true;
+    }
+    target_set.iter().any(|&doc_id| {
+        let Some(doc) = schema_set.documents.get(doc_id as usize) else {
+            return false;
+        };
+        let idx = &doc.component_index;
+        match kind {
+            ComponentKind::SimpleType => idx.lookup_simple_type(namespace, name).is_some(),
+            ComponentKind::ComplexType => idx.lookup_complex_type(namespace, name).is_some(),
+            ComponentKind::Element => idx.lookup_element(namespace, name).is_some(),
+            ComponentKind::Attribute => idx.lookup_attribute(namespace, name).is_some(),
+            ComponentKind::ModelGroup => idx.lookup_model_group(namespace, name).is_some(),
+            ComponentKind::AttributeGroup => {
+                idx.lookup_attribute_group(namespace, name).is_some()
+            }
+            ComponentKind::Notation => idx.lookup_notation(namespace, name).is_some(),
+            ComponentKind::IdentityConstraint => false,
+        }
+    })
+}
+
 /// Compute the target set of an override directive per XSD 1.1 §4.2.5.
 ///
 /// The target set is the transitive closure of include + override edges

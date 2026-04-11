@@ -62,6 +62,23 @@ pub enum ComponentKind {
     IdentityConstraint,
 }
 
+impl ComponentKind {
+    /// Human-readable label for diagnostic messages
+    /// (e.g. "simple type", "attribute group").
+    pub fn display_name(self) -> &'static str {
+        match self {
+            ComponentKind::SimpleType => "simple type",
+            ComponentKind::ComplexType => "complex type",
+            ComponentKind::Element => "element",
+            ComponentKind::Attribute => "attribute",
+            ComponentKind::ModelGroup => "model group",
+            ComponentKind::AttributeGroup => "attribute group",
+            ComponentKind::Notation => "notation",
+            ComponentKind::IdentityConstraint => "identity constraint",
+        }
+    }
+}
+
 /// Unique identity of a schema component (kind + QName).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ComponentIdentity {

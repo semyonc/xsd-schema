@@ -108,6 +108,27 @@ fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTyp
     None
 }
 
+/// Walk the simple-type derivation chain and return `true` if any
+/// ancestor (including `sk` itself) declares an `enumeration` facet.
+/// `FacetSet::inherit_from` does not propagate enumeration through base
+/// types, so [`collect_facets`] alone cannot answer this question.
+fn has_enumeration_in_chain(sk: SimpleTypeKey, schema_set: &SchemaSet) -> bool {
+    let mut current = sk;
+    for _ in 0..100 {
+        let Some(st_data) = schema_set.arenas.simple_types.get(current) else {
+            return false;
+        };
+        if st_data.facets.enumeration.is_some() {
+            return true;
+        }
+        match st_data.resolved_base_type {
+            Some(TypeKey::Simple(base)) => current = base,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Collect the effective facet set for a simple type by walking the derivation chain.
 ///
 /// Starts from the most-derived type's facets, then inherits from each base type.
@@ -173,6 +194,21 @@ fn validate_atomic_type(
     };
 
     let facets = collect_facets(sk, schema_set);
+
+    // XSD Part 2 §3.2 / W3C bug 14388: `xs:NOTATION` is only usable via
+    // restriction with an `enumeration` facet binding the value to a
+    // declared notation. The schema may legally reference `xs:NOTATION`
+    // directly, but any instance value must fail because there is no
+    // enumeration to match against.
+    if type_code == XmlTypeCode::Notation && !has_enumeration_in_chain(sk, schema_set) {
+        return Err(errors::error(
+            "cvc-datatype-valid",
+            "xs:NOTATION cannot be used directly for instance validation; \
+             only datatypes derived from NOTATION by restriction with an \
+             enumeration facet are permitted (§3.2)",
+            None,
+        ));
+    }
 
     // Compute normalized value (PSVI [schema normalized value])
     let effective_ws = facets

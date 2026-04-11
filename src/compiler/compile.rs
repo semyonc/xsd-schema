@@ -184,10 +184,26 @@ impl<'a> CompileContext<'a> {
 
         // Determine element name and namespace
         let (name, namespace, element_key) = if let Some(ref_name) = &elem.ref_name {
-            // Element reference - look up in schema set
+            // An unresolved ref with an explicit namespace is an error
+            // (§4.2.4: imports are not transitive). No-namespace refs
+            // stay lenient — chameleon-adopted target components leave
+            // such refs pointing at empty-namespace names that no
+            // longer exist, but the owning complex type is replaced by
+            // an override before any instance reaches it.
             let key = self
                 .schema_set
                 .lookup_element(ref_name.namespace, ref_name.local_name);
+            if key.is_none() && ref_name.namespace.is_some() {
+                let name_str = crate::schema::resolver::format_resolved_qname(
+                    &self.schema_set.name_table,
+                    ref_name.namespace,
+                    ref_name.local_name,
+                );
+                return Err(NfaCompileError::unresolved_element(
+                    name_str,
+                    elem.source.clone().or_else(|| source.cloned()),
+                ));
+            }
             (ref_name.local_name, ref_name.namespace, key)
         } else if let Some(name) = elem.name {
             // Local element declaration

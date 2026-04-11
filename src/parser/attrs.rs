@@ -211,9 +211,16 @@ impl AttributeMap {
     }
 }
 
-/// Parse a boolean attribute value
+/// Parse a boolean attribute value.
+///
+/// `xs:boolean` has a fixed `whiteSpace=collapse` facet (XSD Part 2 §3.3.2),
+/// so `" 1 "` must parse as `true`. We do **not** use [`str::trim`] because
+/// it strips the full Unicode whitespace set, but §4.3.6 defines the
+/// whiteSpace facet over only `#x20 #x9 #xA #xD`. Values padded with
+/// non-XML whitespace (e.g. NBSP `U+00A0`) must still be rejected.
 pub fn parse_boolean(value: &str) -> Result<bool, String> {
-    match value {
+    let is_xml_ws = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    match value.trim_matches(is_xml_ws) {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
         _ => Err(format!("Invalid boolean value: '{}'", value)),

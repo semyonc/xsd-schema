@@ -175,14 +175,19 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
         apply_redefine(schema_set, &redefine)?;
     }
 
-    // Phase 2b: apply overrides (records Overridden provenance)
+    // Phase 2a: reject invalid override schemas (§4.2.5) before any
+    // override side-effect touches namespace tables or provenance.
+    #[cfg(feature = "xsd11")]
+    override_dir::validate_override_directives(schema_set)?;
+
+    // Phase 2b: apply overrides in topological order so that outer
+    // overrides of the same component always win over inner ones
+    // reached through the include/override closure. Flat document-order
+    // iteration mis-orders the `over009` double-override shape because
+    // the BFS loader assigns outer docs *lower* ids.
     #[cfg(feature = "xsd11")]
     {
-        let overrides: Vec<_> = schema_set
-            .documents
-            .iter()
-            .flat_map(|doc| doc.overrides.iter().cloned())
-            .collect();
+        let overrides = topologically_ordered_overrides(schema_set);
         for override_dir in overrides {
             apply_override(schema_set, &override_dir)?;
         }
@@ -444,6 +449,82 @@ fn topologically_ordered_redefines(
         .collect();
     tagged.sort_by_key(|(d, _)| *d);
     tagged.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Return all collected override directives ordered so that every
+/// override's target document has already had its own overrides applied.
+///
+/// Mirrors [`topologically_ordered_redefines`] but walks override + include
+/// edges: an override's target set is the transitive closure of include +
+/// override edges (§4.2.5), so an outer document must sort strictly after
+/// every document it reaches that way. Depth recurrence:
+/// `depth(doc) = 1 + max(depth(target))` over `(overrides ∪ includes)`,
+/// zero when neither set is non-empty.
+#[cfg(feature = "xsd11")]
+fn topologically_ordered_overrides(
+    schema_set: &SchemaSet,
+) -> Vec<crate::schema::model::OverrideDirective> {
+    use std::collections::{HashMap, HashSet};
+    use crate::ids::DocumentId;
+    use crate::schema::model::{OverrideDirective, SchemaDocument};
+
+    fn depth(
+        doc_id: DocumentId,
+        docs: &[SchemaDocument],
+        cache: &mut HashMap<DocumentId, usize>,
+        visiting: &mut HashSet<DocumentId>,
+    ) -> usize {
+        if let Some(&d) = cache.get(&doc_id) {
+            return d;
+        }
+        if !visiting.insert(doc_id) {
+            // Cycle guard: treat revisited nodes as depth 0.
+            return 0;
+        }
+        let d = docs
+            .iter()
+            .find(|d| d.id == doc_id)
+            .map(|doc| {
+                let mut max_dep = 0usize;
+                for o in &doc.overrides {
+                    if let Some(target) = o.resolved_doc_id {
+                        let t = depth(target, docs, cache, visiting) + 1;
+                        if t > max_dep {
+                            max_dep = t;
+                        }
+                    }
+                }
+                for inc in &doc.includes {
+                    if let Some(target) = inc.resolved_doc_id {
+                        let t = depth(target, docs, cache, visiting) + 1;
+                        if t > max_dep {
+                            max_dep = t;
+                        }
+                    }
+                }
+                max_dep
+            })
+            .unwrap_or(0);
+        visiting.remove(&doc_id);
+        cache.insert(doc_id, d);
+        d
+    }
+
+    let mut cache: HashMap<DocumentId, usize> = HashMap::new();
+    for doc in &schema_set.documents {
+        depth(doc.id, &schema_set.documents, &mut cache, &mut HashSet::new());
+    }
+
+    let mut tagged: Vec<(usize, OverrideDirective)> = schema_set
+        .documents
+        .iter()
+        .flat_map(|doc| {
+            let d = cache.get(&doc.id).copied().unwrap_or(0);
+            doc.overrides.iter().cloned().map(move |o| (d, o))
+        })
+        .collect();
+    tagged.sort_by_key(|(d, _)| *d);
+    tagged.into_iter().map(|(_, o)| o).collect()
 }
 
 /// Collect all declared components from every document's component index
