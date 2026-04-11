@@ -26,7 +26,7 @@
 //! - `derivation-ok-restriction` - Complex Type Derivation OK (Restriction)
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::ids::{AttributeGroupKey, ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
+use crate::ids::{AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::frames::{
     AttributeUseKind, ComplexContentResult, Compositor, DerivationMethod,
     ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm, ProcessContents,
@@ -744,47 +744,10 @@ fn validate_complex_extension(
                 #[cfg(feature = "xsd11")]
                 validate_open_content_extension(schema_set, type_def, base_type)?;
 
-                // XSD 1.1 ct-props-correct.4: No two distinct members of the
-                // effective {attribute uses} may have the same expanded name.
-                // This catches cases where extension adds an attribute that
-                // conflicts with an inherited one (e.g. same name, different
-                // fixed value).
-                if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
-                    let all_attrs =
-                        collect_all_effective_attribute_uses(schema_set, type_def, 0);
-                    let location = type_def
-                        .source
-                        .as_ref()
-                        .and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(
-                        schema_set,
-                        type_def.name,
-                        type_def.target_namespace,
-                    );
-                    for (i, attr) in all_attrs.iter().enumerate() {
-                        for other in &all_attrs[i + 1..] {
-                            if attr.name == other.name
-                                && attr.target_namespace == other.target_namespace
-                                && (attr.fixed_value != other.fixed_value
-                                    || attr.use_kind != other.use_kind
-                                    || attr.resolved_type != other.resolved_type)
-                            {
-                                let attr_name_str =
-                                    schema_set.name_table.resolve(attr.name);
-                                return Err(SchemaError::structural(
-                                    "ct-props-correct",
-                                    format!(
-                                        "Complex type '{}': duplicate attribute use \
-                                         '{}' with conflicting properties \
-                                         (ct-props-correct clause 4)",
-                                        type_name, attr_name_str,
-                                    ),
-                                    location,
-                                ));
-                            }
-                        }
-                    }
-                }
+                // ct-props-correct.4 is enforced globally by
+                // `validate_complex_type_attribute_uniqueness` (run from
+                // `pipeline.rs` after reference resolution); no extension-
+                // local check needed here.
             }
         }
     }
@@ -2655,37 +2618,6 @@ fn collect_effective_attribute_uses(
     result
 }
 
-/// Collect ALL effective attribute uses for a complex type including inherited
-/// ones from extension base types (for ct-props-correct.4 duplicate detection).
-/// Does NOT deduplicate — duplicates are exactly what ct-props-correct.4 flags.
-fn collect_all_effective_attribute_uses(
-    schema_set: &SchemaSet,
-    type_def: &crate::arenas::ComplexTypeDefData,
-    depth: usize,
-) -> Vec<EffectiveAttributeUse> {
-    if depth > 50 {
-        return vec![];
-    }
-    let mut result = collect_effective_attribute_uses(schema_set, type_def);
-
-    // Walk up the extension chain to collect inherited attributes too.
-    // We do NOT deduplicate: if derived re-declares an attribute that is also
-    // in the base, both entries appear, and the ct-props-correct.4 check
-    // below will catch any conflict.
-    if type_def.derivation_method == Some(DerivationMethod::Extension) {
-        if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
-            if let Some(base) = schema_set.arenas.complex_types.get(base_key) {
-                result.extend(collect_all_effective_attribute_uses(
-                    schema_set,
-                    base,
-                    depth + 1,
-                ));
-            }
-        }
-    }
-    result
-}
-
 // ---------------------------------------------------------------------------
 // §3.6.2.2 Effective Attribute Wildcard + §3.10.6.4 Intersection
 // ---------------------------------------------------------------------------
@@ -3613,6 +3545,289 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
     Ok(())
 }
 
+/// `ct-props-correct.4` / `ag-props-correct.2`: every complex type's
+/// effective `{attribute uses}` must contain at most one entry per
+/// `(target_namespace, name)`. Two distinct attribute declarations with the
+/// same expanded name are forbidden by both XSD 1.0 and XSD 1.1.
+///
+/// The check is keyed by *declaration identity*, not by `(name, namespace)`,
+/// so reaching the same declaration along multiple paths (including XSD 1.1
+/// circular attribute groups) does not produce a false positive — only
+/// genuinely distinct declarations that happen to share an expanded name
+/// are flagged. The W3C `attQ011` fixture exercises the cross-attribute-
+/// group case where attribute "foo" appears once via a global
+/// `<attribute ref="x:foo"/>` reference and once via a redefined
+/// `<attributeGroup ref="x:red"/>` whose members include a local
+/// `<attribute name="foo"/>`.
+pub fn validate_complex_type_attribute_uniqueness(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use std::collections::{HashMap, HashSet};
+
+    // Stable identity of an attribute declaration. Variants:
+    // - `GlobalRef(k)`        — `<xs:attribute ref="...">` resolving to
+    //                            global attribute key `k`.
+    // - `InlineGroup(g, i)`   — i-th inline `<xs:attribute>` in
+    //                            attribute group `g`.
+    // - `InlineComplex(c, i)` — i-th inline `<xs:attribute>` in
+    //                            complex type `c`.
+    #[derive(Hash, PartialEq, Eq, Clone, Copy)]
+    enum AttrDeclId {
+        GlobalRef(AttributeKey),
+        InlineGroup(AttributeGroupKey, usize),
+        InlineComplex(ComplexTypeKey, usize),
+    }
+
+    fn walk_attribute_group(
+        schema_set: &SchemaSet,
+        ag_key: AttributeGroupKey,
+        visiting_groups: &mut HashSet<AttributeGroupKey>,
+        seen: &mut HashSet<AttrDeclId>,
+        out: &mut Vec<EffectiveAttributeUse>,
+    ) {
+        if !visiting_groups.insert(ag_key) {
+            return;
+        }
+        let Some(ag) = schema_set.arenas.attribute_groups.get(ag_key) else {
+            visiting_groups.remove(&ag_key);
+            return;
+        };
+        if let Some(ref_key) = ag.resolved_ref {
+            walk_attribute_group(schema_set, ref_key, visiting_groups, seen, out);
+            visiting_groups.remove(&ag_key);
+            return;
+        }
+
+        for (i, attr_use) in ag.attributes.iter().enumerate() {
+            let resolved = ag.resolved_attributes.get(i);
+            let decl_id = if let Some(global_key) = resolved.and_then(|r| r.resolved_ref) {
+                AttrDeclId::GlobalRef(global_key)
+            } else {
+                AttrDeclId::InlineGroup(ag_key, i)
+            };
+            if seen.insert(decl_id) {
+                if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+                    out.push(eau);
+                }
+            }
+        }
+        for &nested in &ag.resolved_attribute_groups {
+            walk_attribute_group(schema_set, nested, visiting_groups, seen, out);
+        }
+
+        visiting_groups.remove(&ag_key);
+    }
+
+    fn collect_with_dedup(
+        schema_set: &SchemaSet,
+        type_def: &crate::arenas::ComplexTypeDefData,
+        ct_key: ComplexTypeKey,
+        depth: usize,
+        visiting_groups: &mut HashSet<AttributeGroupKey>,
+        seen: &mut HashSet<AttrDeclId>,
+        out: &mut Vec<EffectiveAttributeUse>,
+    ) {
+        if depth > 50 {
+            return;
+        }
+        for (i, attr_use) in type_def.attributes.iter().enumerate() {
+            let resolved = type_def.resolved_attributes.get(i);
+            let decl_id = if let Some(global_key) = resolved.and_then(|r| r.resolved_ref) {
+                AttrDeclId::GlobalRef(global_key)
+            } else {
+                AttrDeclId::InlineComplex(ct_key, i)
+            };
+            if seen.insert(decl_id) {
+                if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+                    out.push(eau);
+                }
+            }
+        }
+        for &ag_key in &type_def.resolved_attribute_groups {
+            visiting_groups.clear();
+            walk_attribute_group(schema_set, ag_key, visiting_groups, seen, out);
+        }
+        if type_def.derivation_method == Some(DerivationMethod::Extension) {
+            if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
+                if let Some(base) = schema_set.arenas.complex_types.get(base_key) {
+                    collect_with_dedup(
+                        schema_set, base, base_key, depth + 1, visiting_groups, seen, out,
+                    );
+                }
+            }
+        }
+    }
+
+    // Reusable scratch buffers, cleared per type to avoid per-iteration
+    // allocator traffic on schemas with many complex types.
+    let mut seen: HashSet<AttrDeclId> = HashSet::new();
+    let mut attrs: Vec<EffectiveAttributeUse> = Vec::new();
+    let mut visiting_groups: HashSet<AttributeGroupKey> = HashSet::new();
+    let mut by_name: HashMap<(Option<NameId>, NameId), ()> = HashMap::new();
+
+    for (key, type_def) in schema_set.arenas.complex_types.iter() {
+        seen.clear();
+        attrs.clear();
+        by_name.clear();
+        collect_with_dedup(
+            schema_set,
+            type_def,
+            key,
+            0,
+            &mut visiting_groups,
+            &mut seen,
+            &mut attrs,
+        );
+
+        // §3.4.6: a prohibited attribute use is NOT an entry in the
+        // `{attribute uses}` set, so it cannot collide with a (re-)declared
+        // use in a derived type.
+        attrs.retain(|eau| eau.use_kind != AttributeUseKind::Prohibited);
+
+        for attr in &attrs {
+            if by_name.insert((attr.target_namespace, attr.name), ()).is_some() {
+                let attr_name_str = schema_set.name_table.resolve(attr.name);
+                let type_name = format_type_name(
+                    schema_set,
+                    type_def.name,
+                    type_def.target_namespace,
+                );
+                let location = type_def
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                return Err(SchemaError::structural(
+                    "ct-props-correct",
+                    format!(
+                        "Complex type '{}': two distinct attribute declarations \
+                         with the same expanded name '{}' (ct-props-correct \
+                         clause 4 / ag-props-correct clause 2)",
+                        type_name, attr_name_str,
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// XSD 1.0 §3.2.17 lexical check for `xs:anyURI` source attributes on
+/// `xs:appinfo` and `xs:documentation`. The W3C `anyURI_a001_1336` fixture
+/// places `source="9999...anyURI:"` and `source="1111...http://foo/bar"`
+/// on annotations of an element declaration; both have a colon whose
+/// scheme prefix starts with a digit, which is invalid per RFC 2396.
+/// XSD 1.1 explicitly relaxed the rule, so this validator is XSD 1.0-only.
+///
+/// We deliberately scope the check to annotation `source` attributes:
+///   - directives' `schemaLocation` values like `"0"` and `"123"` are
+///     valid relative URIs per RFC 2396 and survive any reasonable
+///     strict lexer;
+///   - the same goes for `xs:notation/@public`/`@system` and
+///     `xs:anyAttribute/@namespace` numeric values in the same fixture.
+///
+/// The annotation source values are the only unambiguously-malformed
+/// anyURIs in the fixture, and they alone are sufficient to make the
+/// schema fail per the W3C "one or more invalid anyURIs" ruling.
+pub fn validate_xsd10_annotation_source_anyuri(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::schema::annotation::{Annotation, AnnotationItem};
+    use crate::schema::model::XsdVersion;
+    use crate::types::validators::is_strict_xsd10_anyuri;
+
+    if schema_set.xsd_version != XsdVersion::V1_0 {
+        return Ok(());
+    }
+
+    fn check_annotation(
+        schema_set: &SchemaSet,
+        annotation: Option<&Annotation>,
+    ) -> SchemaResult<()> {
+        let Some(annotation) = annotation else {
+            return Ok(());
+        };
+        for item in &annotation.items {
+            match item {
+                AnnotationItem::AppInfo(ai) => {
+                    if let Some(ref src) = ai.source {
+                        if !is_strict_xsd10_anyuri(src) {
+                            let location = ai
+                                .source_ref
+                                .as_ref()
+                                .and_then(|s| schema_set.source_maps.locate(s));
+                            return Err(SchemaError::structural(
+                                "cvc-datatype-valid",
+                                format!(
+                                    "<xs:appinfo source=\"{}\"> is not a valid xs:anyURI \
+                                     (XSD 1.0 strict scheme syntax)",
+                                    src
+                                ),
+                                location,
+                            ));
+                        }
+                    }
+                }
+                AnnotationItem::Documentation(d) => {
+                    if let Some(ref src) = d.source {
+                        if !is_strict_xsd10_anyuri(src) {
+                            let location = d
+                                .source_ref
+                                .as_ref()
+                                .and_then(|s| schema_set.source_maps.locate(s));
+                            return Err(SchemaError::structural(
+                                "cvc-datatype-valid",
+                                format!(
+                                    "<xs:documentation source=\"{}\"> is not a valid \
+                                     xs:anyURI (XSD 1.0 strict scheme syntax)",
+                                    src
+                                ),
+                                location,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // Walk every arena that can carry an annotation. NOTE: anyone adding a
+    // new annotatable arena type must extend this list.
+    for (_k, ct) in schema_set.arenas.complex_types.iter() {
+        check_annotation(schema_set, ct.annotation.as_ref())?;
+    }
+    for (_k, st) in schema_set.arenas.simple_types.iter() {
+        check_annotation(schema_set, st.annotation.as_ref())?;
+    }
+    for (_k, el) in schema_set.arenas.elements.iter() {
+        check_annotation(schema_set, el.annotation.as_ref())?;
+    }
+    for (_k, at) in schema_set.arenas.attributes.iter() {
+        check_annotation(schema_set, at.annotation.as_ref())?;
+    }
+    for (_k, ag) in schema_set.arenas.attribute_groups.iter() {
+        check_annotation(schema_set, ag.annotation.as_ref())?;
+    }
+    for (_k, mg) in schema_set.arenas.model_groups.iter() {
+        check_annotation(schema_set, mg.annotation.as_ref())?;
+    }
+    for (_k, n) in schema_set.arenas.notations.iter() {
+        check_annotation(schema_set, n.annotation.as_ref())?;
+    }
+    for (_k, ic) in schema_set.arenas.identity_constraints.iter() {
+        check_annotation(schema_set, ic.annotation.as_ref())?;
+    }
+    // Schema-level top-level `<xs:annotation>` elements (a schema can hold
+    // several, hence `Vec<Annotation>` rather than `Option<Annotation>`).
+    for doc in &schema_set.documents {
+        for ann in &doc.annotations {
+            check_annotation(schema_set, Some(ann))?;
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // §src-redefine 6.2.2 / 7.2.2 — deferred restriction validation for redefines
 // ---------------------------------------------------------------------------
@@ -3839,6 +4054,33 @@ fn validate_all_redefine_attribute_group_restrictions(
                                 "attribute '{}' has a type that is not validly derived from the \
                                  base attribute type",
                                 attr_name_str,
+                            ),
+                        ));
+                        stats.errors += 1;
+                        failed = true;
+                        break;
+                    }
+                }
+                // Fixed-value tightening (clause 3, derivation-ok-restriction
+                // §3.4.6.3 attribute side): if the base attribute use has
+                // {value constraint} = (fixed, V), the derived attribute use
+                // must also have {value constraint} = (fixed, V). It cannot
+                // be relaxed to (default, V), nor removed entirely. The W3C
+                // `schM10` fixture exercises the fixed→default relaxation.
+                if let Some(ref base_fixed) = ba.fixed_value {
+                    let derived_matches = da
+                        .fixed_value
+                        .as_ref()
+                        .is_some_and(|dv| dv == base_fixed);
+                    if !derived_matches {
+                        let attr_name_str = schema_set.name_table.resolve(da.name).to_string();
+                        errors.push(make_redefine_attr_group_restriction_error(
+                            schema_set,
+                            derived,
+                            &format!(
+                                "attribute '{}' relaxes or removes the base 'fixed=\"{}\"' \
+                                 value constraint",
+                                attr_name_str, base_fixed,
                             ),
                         ));
                         stats.errors += 1;

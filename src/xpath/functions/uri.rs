@@ -239,21 +239,7 @@ fn parse_uri_components(uri: &str) -> Result<UriComponents<'_>, ()> {
     Ok((scheme, authority, path, query))
 }
 
-/// Check if a string is a valid URI scheme.
-fn is_valid_scheme(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let mut chars = s.chars();
-    if let Some(first) = chars.next() {
-        if !first.is_ascii_alphabetic() {
-            return false;
-        }
-        chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
-    } else {
-        false
-    }
-}
+use crate::types::validators::is_valid_uri_scheme as is_valid_scheme;
 
 /// Merge paths according to RFC 3986.
 fn merge_paths(has_authority: bool, base_path: &str, relative: &str) -> String {

@@ -274,6 +274,20 @@ pub fn load_and_process_schema(
         validate_attribute_id_constraints(schema_set)?;
     }
 
+    // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
+    // source attributes. XSD 1.1 explicitly relaxed the rule, so this is
+    // a no-op there.
+    if config.resolve_references {
+        crate::schema::validate_xsd10_annotation_source_anyuri(schema_set)?;
+    }
+
+    // Phase 4.77: ct-props-correct.4 / ag-props-correct.2 — every complex
+    // type's effective attribute uses must be unique by (namespace, name).
+    // Applies to BOTH XSD 1.0 and 1.1.
+    if config.resolve_references {
+        crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
+    }
+
     // Phase 4.8: Validate substitution group membership constraints (e-props-correct.4)
     if config.resolve_references {
         crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
@@ -351,6 +365,14 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     validate_attribute_id_constraints(schema_set)?;
+
+    // (XSD 1.0): strict xs:anyURI lexical check on annotation source
+    // attributes. XSD 1.1 explicitly relaxed the rule, so no-op there.
+    crate::schema::validate_xsd10_annotation_source_anyuri(schema_set)?;
+
+    // ct-props-correct.4 / ag-props-correct.2 — every complex type's
+    // effective attribute uses must be unique by (namespace, name).
+    crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
 
     // Validate substitution group membership constraints (e-props-correct.4)
     crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
@@ -676,6 +698,20 @@ pub async fn load_and_process_schema_async(
     // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
+    }
+
+    // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
+    // source attributes. XSD 1.1 explicitly relaxed the rule, so this is
+    // a no-op there.
+    if config.resolve_references {
+        crate::schema::validate_xsd10_annotation_source_anyuri(schema_set)?;
+    }
+
+    // Phase 4.77: ct-props-correct.4 / ag-props-correct.2 — every complex
+    // type's effective attribute uses must be unique by (namespace, name).
+    // Applies to BOTH XSD 1.0 and 1.1.
+    if config.resolve_references {
+        crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
     }
 
     // Phase 5: Allocate arena element declarations (sync)

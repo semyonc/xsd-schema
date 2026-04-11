@@ -1314,6 +1314,68 @@ impl TypeValidator for AnyUriValidator {
     }
 }
 
+/// Check if a string is a valid URI scheme per RFC 2396 §3.1 / RFC 3986
+/// (`alpha *( alpha | digit | "+" | "-" | "." )`). Empty is invalid.
+pub fn is_valid_uri_scheme(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else { return false };
+    if !first.is_ascii_alphabetic() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.')
+}
+
+/// Strict XSD 1.0 lexical check for an `xs:anyURI` value.
+///
+/// XSD 1.0 §3.2.17 ties `xs:anyURI` to RFC 2396, which forbids a URI
+/// reference whose first colon is preceded by anything other than a valid
+/// scheme name. The W3C `anyURI_a001_1336` fixture relies on exactly this
+/// check: the schema contains `appinfo/@source="9999...anyURI:"` and
+/// `documentation/@source="1111...http://foo/bar"`, both of which place a
+/// digit in the (would-be) scheme position. XSD 1.1 explicitly relaxed
+/// the rule, so callers must gate this on `XsdVersion::V1_0`.
+///
+/// The check is intentionally narrow — it only catches the malformed-scheme
+/// shape — to avoid false positives on the many sloppy-but-spec-legal URIs
+/// in the existing conformance corpus (numeric relative segments like `"0"`
+/// or `"123"` remain accepted as valid relative-path references).
+///
+/// `xs:anyURI` declares `whiteSpace = collapse`. The common case of an
+/// annotation `source` value has no whitespace at all, so we skip the
+/// allocation entirely unless the input actually contains whitespace.
+pub fn is_strict_xsd10_anyuri(value: &str) -> bool {
+    let collapsed: String;
+    let value: &str = if value.chars().any(char::is_whitespace) {
+        collapsed = normalize_whitespace(value, WhitespaceMode::Collapse);
+        collapsed.as_str()
+    } else {
+        value
+    };
+
+    if value.is_empty() {
+        return true;
+    }
+
+    // Find the first character among ':' / '/' / '?' / '#'. Anything before
+    // that delimiter is the candidate scheme; if the delimiter is ':' the
+    // scheme syntax must be valid.
+    let mut scheme_end: Option<usize> = None;
+    for (i, c) in value.char_indices() {
+        match c {
+            ':' => {
+                scheme_end = Some(i);
+                break;
+            }
+            // Pure relative reference — scheme rule does not apply.
+            '/' | '?' | '#' => return true,
+            _ => {}
+        }
+    }
+    // No colon at all — relative reference, always lexically OK.
+    let Some(end) = scheme_end else { return true };
+    is_valid_uri_scheme(&value[..end])
+}
+
 // ============================================================================
 // Date/Time Parsing Helpers
 // ============================================================================

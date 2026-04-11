@@ -808,21 +808,79 @@ pub fn convert_directives(
                 let mut groups = Vec::new();
                 let mut attribute_groups = Vec::new();
 
+                // §src-redefine clause 5 / 7.2.1: each named component can be
+                // redefined at most once within a single `<xs:redefine>`
+                // block. The W3C `schT2` fixture exercises this. The check
+                // must run before `assemble_*` so a duplicate's allocation
+                // does not pollute the arenas before we error out.
+                let mut seen_simple_types: HashSet<NameId> = HashSet::new();
+                let mut seen_complex_types: HashSet<NameId> = HashSet::new();
+                let mut seen_groups: HashSet<NameId> = HashSet::new();
+                let mut seen_attribute_groups: HashSet<NameId> = HashSet::new();
+
+                fn dup_redefine_err(
+                    schema_set: &SchemaSet,
+                    kind_label: &str,
+                    name: NameId,
+                    source: Option<&SourceRef>,
+                ) -> SchemaError {
+                    let location = source.and_then(|s| schema_set.source_maps.locate(s));
+                    SchemaError::structural(
+                        "src-redefine",
+                        format!(
+                            "Duplicate <xs:{} name=\"{}\"> within a single <xs:redefine> block",
+                            kind_label,
+                            schema_set.name_table.resolve(name),
+                        ),
+                        location,
+                    )
+                }
+
                 for component in red.components {
                     match component {
                         RedefineComponent::SimpleType(st) => {
+                            if let Some(name) = st.name {
+                                if !seen_simple_types.insert(name) {
+                                    return Err(dup_redefine_err(
+                                        assembler.schema_set,
+                                        "simpleType",
+                                        name,
+                                        st.source.as_ref(),
+                                    ));
+                                }
+                            }
                             let key = assembler.assemble_type(TypeFrameResult::Simple(st), false)?;
                             if let TypeKey::Simple(simple) = key {
                                 simple_types.push(simple);
                             }
                         }
                         RedefineComponent::ComplexType(ct) => {
+                            if let Some(name) = ct.name {
+                                if !seen_complex_types.insert(name) {
+                                    return Err(dup_redefine_err(
+                                        assembler.schema_set,
+                                        "complexType",
+                                        name,
+                                        ct.source.as_ref(),
+                                    ));
+                                }
+                            }
                             let key = assembler.assemble_type(TypeFrameResult::Complex(ct), false)?;
                             if let TypeKey::Complex(complex) = key {
                                 complex_types.push(complex);
                             }
                         }
                         RedefineComponent::Group(group) => {
+                            if let Some(name) = group.name {
+                                if !seen_groups.insert(name) {
+                                    return Err(dup_redefine_err(
+                                        assembler.schema_set,
+                                        "group",
+                                        name,
+                                        group.source.as_ref(),
+                                    ));
+                                }
+                            }
                             if let GroupKeyResult::Model(key) = assembler
                                 .assemble_group(GroupFrameResult::Model(group), false)?
                             {
@@ -830,6 +888,16 @@ pub fn convert_directives(
                             }
                         }
                         RedefineComponent::AttributeGroup(group) => {
+                            if let Some(name) = group.name {
+                                if !seen_attribute_groups.insert(name) {
+                                    return Err(dup_redefine_err(
+                                        assembler.schema_set,
+                                        "attributeGroup",
+                                        name,
+                                        group.source.as_ref(),
+                                    ));
+                                }
+                            }
                             if let GroupKeyResult::Attribute(key) = assembler
                                 .assemble_group(GroupFrameResult::Attribute(group), false)?
                             {

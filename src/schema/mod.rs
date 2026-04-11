@@ -90,6 +90,8 @@ pub use dependencies::{
 // Re-exports from derivation
 pub use derivation::{
     validate_all_derivations, validate_attribute_id_constraints,
+    validate_complex_type_attribute_uniqueness,
+    validate_xsd10_annotation_source_anyuri,
     DerivationStats as DerivationValidationStats,
 };
 
@@ -144,6 +146,16 @@ pub fn compile_all_patterns(schema_set: &mut SchemaSet) -> SchemaResult<()> {
 /// 3. **Store** — save the effective component list on `SchemaSet` for later
 ///    diagnostic and provenance queries.
 pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    // Phase 0: validate that every redefine has a real parse-time original.
+    // Cyclic xs:include is legal per §4.2.3 and several W3C/IBM fixtures
+    // (`schU1`, `D1→D2→D3` chains) demonstrate that legitimate transitive
+    // redefine chains must continue to be accepted. The constraint we
+    // enforce here is the narrower §src-redefine rule that the redefining
+    // component must reference an *existing* original — not one that is
+    // only present because the chained-redefine cross-doc insert (later in
+    // this function) has masked its absence.
+    validate_redefine_originals_exist(schema_set)?;
+
     // Phase 1: collect declared components from all documents
     collect_declared_components(schema_set);
 
@@ -179,20 +191,191 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     Ok(())
 }
 
+/// Validate that every `<xs:redefine>` directive's redefined components
+/// have a real *parse-time* original in the target schema, reachable via a
+/// non-cyclic chain of redefines.
+///
+/// ## Why this exists
+///
+/// `apply_*_redefine` already performs a per-component lookup against the
+/// target document's `component_index`, but that index is mutated by the
+/// chained-redefine cross-doc insert at the end of each apply call. In a
+/// cyclic redefine pair like the IBM `s4_2_4si01b` fixture (`01b` redefines
+/// `01`, `01` redefines `01b`, only `01b` declares `c1` at top level),
+/// applying `01`'s redefine first inserts the new `c1` into `01`'s index;
+/// `01b`'s subsequent redefine of `01` then "finds" `c1` in `01` only
+/// because of that insert. The original `c1` never existed in `01` at parse
+/// time, so the redefine should be rejected as `src-redefine` invalid.
+///
+/// We catch the case here, *before* any redefine runs, by walking the chain
+/// from the target document toward a top-level declaration **without ever
+/// stepping back through the redefining document**. The exclusion is what
+/// distinguishes a cyclic non-anchored case from a legitimate transitive
+/// chain `D₁ → D₂ → D₃` where only `D₃` declares the component at top level
+/// (which is valid: `D₁`'s redefine of `D₂`'s c finds `c` via `D₂ → D₃`,
+/// and the path `D₂ → D₃` does not loop back through `D₁`).
+fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use std::collections::HashSet;
+    use crate::ids::{DocumentId, NameId};
+    use crate::schema::composition::ComponentKind;
+
+    // DFS over the redefine subgraph. `visiting` is a stack-scoped cycle
+    // break: callers seed it with documents that must NOT be revisited
+    // (typically the redefining document itself), and the walker
+    // inserts/removes its own ancestors.
+    fn lookup_via_redefine_chain(
+        schema_set: &SchemaSet,
+        start_doc: DocumentId,
+        kind: ComponentKind,
+        namespace: Option<NameId>,
+        name: NameId,
+        visiting: &mut HashSet<DocumentId>,
+    ) -> bool {
+        if !visiting.insert(start_doc) {
+            return false;
+        }
+        let found = (|| {
+            let Some(doc) = schema_set.documents.get(start_doc as usize) else {
+                return false;
+            };
+            let direct = match kind {
+                ComponentKind::SimpleType => {
+                    doc.component_index.lookup_simple_type(namespace, name).is_some()
+                }
+                ComponentKind::ComplexType => {
+                    doc.component_index.lookup_complex_type(namespace, name).is_some()
+                }
+                ComponentKind::ModelGroup => {
+                    doc.component_index.lookup_model_group(namespace, name).is_some()
+                }
+                ComponentKind::AttributeGroup => {
+                    doc.component_index.lookup_attribute_group(namespace, name).is_some()
+                }
+                _ => false,
+            };
+            if direct {
+                return true;
+            }
+            for r in &doc.redefines {
+                if let Some(target) = r.resolved_doc_id {
+                    if lookup_via_redefine_chain(
+                        schema_set, target, kind, namespace, name, visiting,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })();
+        visiting.remove(&start_doc);
+        found
+    }
+
+    let make_err = |schema_set: &SchemaSet,
+                    redefining_doc: &crate::schema::model::SchemaDocument,
+                    directive: &crate::schema::model::RedefineDirective,
+                    kind_label: &str,
+                    name: NameId| {
+        let target_label = directive
+            .resolved_doc_id
+            .and_then(|id| schema_set.documents.get(id as usize))
+            .map(|d| d.base_uri.as_str())
+            .unwrap_or(directive.schema_location.as_str());
+        let location = directive
+            .source
+            .as_ref()
+            .and_then(|s| schema_set.source_maps.locate(s));
+        SchemaError::structural(
+            "src-redefine",
+            format!(
+                "Original {} '{}' not found at parse time in '{}' for redefinition \
+                 from '{}' (the redefine chain has no non-cyclic anchor)",
+                kind_label,
+                schema_set.name_table.resolve(name),
+                target_label,
+                redefining_doc.base_uri,
+            ),
+            location,
+        )
+    };
+
+    for doc in &schema_set.documents {
+        for redefine in &doc.redefines {
+            let Some(target_doc_id) = redefine.resolved_doc_id else {
+                continue;
+            };
+
+            // Each redefined component contributes one
+            // (kind, namespace, name, label) tuple. The label is for
+            // diagnostics; the rest drives the chain walk.
+            let simples = redefine.simple_types.iter().filter_map(|&k| {
+                let st = schema_set.arenas.simple_types.get(k)?;
+                Some((ComponentKind::SimpleType, st.target_namespace, st.name?, "simple type"))
+            });
+            let complexes = redefine.complex_types.iter().filter_map(|&k| {
+                let ct = schema_set.arenas.complex_types.get(k)?;
+                Some((ComponentKind::ComplexType, ct.target_namespace, ct.name?, "complex type"))
+            });
+            let groups = redefine.groups.iter().filter_map(|&k| {
+                let g = schema_set.arenas.model_groups.get(k)?;
+                Some((ComponentKind::ModelGroup, g.target_namespace, g.name?, "model group"))
+            });
+            let attr_groups = redefine.attribute_groups.iter().filter_map(|&k| {
+                let ag = schema_set.arenas.attribute_groups.get(k)?;
+                Some((ComponentKind::AttributeGroup, ag.target_namespace, ag.name?, "attribute group"))
+            });
+
+            // Pre-seed the visiting set with the redefining document so
+            // cyclic self-references through the chain cannot satisfy the
+            // lookup. The DFS walker inserts/removes its own ancestors and
+            // restores `visiting` to this seeded state on return, so we can
+            // reuse the same set across all components.
+            let mut visiting: HashSet<DocumentId> = HashSet::with_capacity(4);
+            visiting.insert(doc.id);
+
+            for (kind, namespace, name, label) in simples.chain(complexes).chain(groups).chain(attr_groups) {
+                if !lookup_via_redefine_chain(
+                    schema_set, target_doc_id, kind, namespace, name, &mut visiting,
+                ) {
+                    return Err(make_err(schema_set, doc, redefine, label, name));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Return all collected redefine directives ordered so that every redefine's
 /// target document has already had its own redefines applied.
 ///
 /// The order is computed from a per-document *dependency depth*:
-///   depth(doc) = 0 if doc has no redefines, else
-///                1 + max(depth(target) for each redefine target in doc)
+///   depth(doc) = 0 when doc has no redefines and no includes, else
+///                max(
+///                  1 + max(depth(target) for each redefine target),
+///                  1 + max(depth(target) for each include target),
+///                )
+///
+/// **Why includes count too.** When an outer schema includes a document
+/// that already redefines component X *and* the outer schema also
+/// directly redefines X, the spec is famously underspecified about which
+/// redefine wins (W3C bug 4136). The IBM/W3C `schU*` test sets resolve
+/// the ambiguity by treating the outer caller's redefine as the
+/// conventional winner: it must be applied *after* anything dragged in
+/// via include. Adding includes to the depth recurrence gives the outer
+/// document a strictly higher depth than any document it pulls in, so
+/// it sorts after them and its redefine lands last (and wins).
 ///
 /// Documents are then stable-sorted by their depth (ascending). Redefines
 /// keep their original document order for equal depths, so within a single
 /// document the per-redefine order matches source order.
 ///
-/// Cycles cannot occur for well-formed XSD (a redefine cannot form a loop),
-/// but the traversal is defensive and treats any cycle as depth 0 rather
-/// than looping.
+/// Cycles can legally occur via include-of-redefine-of-includer chains
+/// (the `schU*` family is exactly this shape). The traversal is
+/// defensive: any revisited node returns depth 0 from the cycle guard,
+/// breaking the loop without caching the broken value, so the eventual
+/// cached depth still reflects the longest *acyclic* path through the
+/// graph.
 fn topologically_ordered_redefines(
     schema_set: &SchemaSet,
 ) -> Vec<crate::schema::model::RedefineDirective> {
@@ -220,6 +403,17 @@ fn topologically_ordered_redefines(
                 let mut max_dep = 0usize;
                 for r in &doc.redefines {
                     if let Some(target) = r.resolved_doc_id {
+                        let t = depth(target, docs, cache, visiting) + 1;
+                        if t > max_dep {
+                            max_dep = t;
+                        }
+                    }
+                }
+                // §schU* convention: the includer must be deeper than
+                // anything it includes, so its own redefines apply
+                // *after* the included document's redefines.
+                for inc in &doc.includes {
+                    if let Some(target) = inc.resolved_doc_id {
                         let t = depth(target, docs, cache, visiting) + 1;
                         if t > max_dep {
                             max_dep = t;

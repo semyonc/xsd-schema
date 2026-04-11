@@ -3970,7 +3970,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         for (i, attr_use) in group_data.attributes.iter().enumerate() {
             let resolved = group_data.resolved_attributes.get(i);
             let attr_key = resolved.and_then(|r| r.resolved_ref);
-            let attr_type = resolved.and_then(|r| r.resolved_type);
+            // For `<xs:attribute ref="x:foo"/>` uses, the use's own
+            // `resolved_type` is `None` — the type lives on the global
+            // declaration. Fall back to the resolved type recorded on the
+            // global decl, otherwise simple-type validation gets skipped
+            // (the W3C `xsd003b` fixture exercises this through a redefined
+            // `simpleType` whose enum-restricted facet must be applied to
+            // an attribute reached via an attribute group).
+            let attr_type = resolved
+                .and_then(|r| r.resolved_type)
+                .or_else(|| {
+                    attr_key
+                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                        .and_then(|d| d.resolved_type)
+                });
             let (name, namespace) =
                 self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
             let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
