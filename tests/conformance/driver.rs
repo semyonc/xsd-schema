@@ -1199,6 +1199,12 @@ fn validate_instance_pass(
 ) -> ValidationPassResult {
     use xsd_schema::validation::SchemaValidity;
 
+    // Conformance runs identity-constraint processing on top of the
+    // strict-conformance default flags. `ALLOW_XML_ATTRIBUTES` is deliberately
+    // NOT added — the W3C XSD test suite exercises the spec rule that
+    // xml:lang / xml:space / xml:base must be matched by a declared attribute
+    // use or an attribute wildcard whose namespace constraint admits the
+    // xml namespace (e.g. open044/open045).
     let flags = xsd_schema::validation::ValidationFlags::default()
         | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
 

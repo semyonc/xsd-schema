@@ -1423,7 +1423,13 @@ fn resolve_open_content(
         return None;
     }
 
-    let doc = source.and_then(|s| schema_set.documents.get(s.doc_id as usize));
+    // Use defaults_doc() so components that were moved into an xs:override
+    // read the overridden schema document's <xs:defaultOpenContent> — per
+    // §4.2.5 and the saxon open043 test ("For types defined within xs:override,
+    // the relevant defaultOpenContent is the one in the overridden schema
+    // document").  For non-override components defaults_doc() == doc_id so
+    // normal parsing is unchanged.
+    let doc = source.and_then(|s| schema_set.documents.get(s.defaults_doc() as usize));
     let default = doc.and_then(|d| d.default_open_content.as_ref())?;
 
     if !default.applies_to_empty && content_is_empty(content) {

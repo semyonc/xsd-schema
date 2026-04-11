@@ -83,23 +83,59 @@ bitflags! {
     /// Flags controlling validation behavior
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ValidationFlags: u32 {
-        /// Report warnings in addition to errors
+        /// Report warnings in addition to errors (default on).
         const REPORT_WARNINGS = 0x0001;
-        /// Process identity constraints (key, unique, keyref)
+        /// Process identity constraints (key, unique, keyref).
+        ///
+        /// When this bit is clear, the runtime still parses `xs:key` /
+        /// `xs:unique` / `xs:keyref` declarations but skips constraint
+        /// evaluation during instance validation. Clear this bit to save
+        /// work when you only need type-level validation.
         const PROCESS_IDENTITY_CONSTRAINTS = 0x0002;
-        /// Allow xml:* attributes without explicit declaration
+        /// Accept every attribute in the reserved
+        /// `http://www.w3.org/XML/1998/namespace` namespace (i.e. `xml:lang`,
+        /// `xml:space`, `xml:base`, `xml:id`) without checking the element's
+        /// complex type for an allowing declaration or wildcard.
+        ///
+        /// This bit is a lenient-parser convenience, **not** an XSD
+        /// conformance mode. The XSD 1.0/1.1 spec requires every attribute
+        /// — including those in the xml namespace — to be matched by a
+        /// declared `{attribute use}` or an `{attribute wildcard}` whose
+        /// namespace constraint admits the xml namespace. Enabling this
+        /// flag therefore deviates from strict conformance; it is off by
+        /// default.
+        ///
+        /// Typical use: set this bit when feeding arbitrary XML through the
+        /// validator and you want `xml:lang` to "just work" even against
+        /// schemas that don't explicitly import the xml namespace. Leave
+        /// it clear for strict XSD conformance validation (including the
+        /// W3C XSD test suite).
         const ALLOW_XML_ATTRIBUTES = 0x0004;
-        /// Strict mode: treat all warnings as errors
+        /// Strict mode: treat all warnings as errors.
         const STRICT_MODE = 0x0008;
-        /// Enable XSD 1.1 assertion processing (fragment buffering)
+        /// Enable XSD 1.1 assertion processing (fragment buffering).
         #[cfg(feature = "xsd11")]
         const PROCESS_ASSERTIONS = 0x0010;
     }
 }
 
 impl Default for ValidationFlags {
+    /// The strict-conformance defaults.
+    ///
+    /// The default only enables `REPORT_WARNINGS`. Identity constraints,
+    /// `xml:*` leniency, strict-mode warning promotion, and XSD 1.1 assertion
+    /// processing are all opt-in — combine them with `|`:
+    ///
+    /// ```
+    /// use xsd_schema::validation::ValidationFlags;
+    ///
+    /// let flags = ValidationFlags::default()
+    ///     | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
+    ///     | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+    /// # let _ = flags;
+    /// ```
     fn default() -> Self {
-        ValidationFlags::REPORT_WARNINGS | ValidationFlags::ALLOW_XML_ATTRIBUTES
+        ValidationFlags::REPORT_WARNINGS
     }
 }
 
@@ -413,7 +449,9 @@ mod tests {
     fn test_validation_flags_default() {
         let flags = ValidationFlags::default();
         assert!(flags.contains(ValidationFlags::REPORT_WARNINGS));
-        assert!(flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
+        // Strict-conformance defaults: ALLOW_XML_ATTRIBUTES, identity
+        // constraints, and strict-mode warning promotion are all opt-in.
+        assert!(!flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
         assert!(!flags.contains(ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS));
         assert!(!flags.contains(ValidationFlags::STRICT_MODE));
     }
@@ -441,7 +479,11 @@ mod tests {
         assert!(with_flag.contains(ValidationFlags::PROCESS_ASSERTIONS));
         // Original defaults still present
         assert!(with_flag.contains(ValidationFlags::REPORT_WARNINGS));
-        assert!(with_flag.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
+        // ALLOW_XML_ATTRIBUTES is no longer in the default — verify it stays
+        // opt-in when callers explicitly mix it in.
+        assert!(!with_flag.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
+        let with_xml = with_flag | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+        assert!(with_xml.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
     }
 
     #[test]

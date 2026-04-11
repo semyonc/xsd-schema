@@ -159,6 +159,52 @@ Each event returns `SchemaInfo`, which can be used to inspect the selected
 declaration, resolved type, content model, typed value, and XSD 1.1 type
 alternative/assertion results.
 
+### ValidationFlags
+
+`SchemaValidator::new(&schema_set, flags)` takes a `ValidationFlags` bitset
+that turns runtime features on and off. The type is a
+[`bitflags`](https://docs.rs/bitflags)-style set, so compose with `|`, remove
+with `-`, and test with `.contains(...)`.
+
+| Flag | Default | Purpose |
+| --- | --- | --- |
+| `REPORT_WARNINGS` | **on** | Emit XSD warnings (non-fatal diagnostics) to the sink alongside errors. Clear this if you only want hard errors. |
+| `PROCESS_IDENTITY_CONSTRAINTS` | off | Evaluate `xs:key`, `xs:unique`, and `xs:keyref` during instance validation. Declarations are always *parsed*; this bit controls whether their constraints are *enforced*. Leave off when you only need type-level validation — saves the per-element key/keyref bookkeeping. |
+| `ALLOW_XML_ATTRIBUTES` | off | Accept every attribute in the reserved `http://www.w3.org/XML/1998/namespace` namespace (`xml:lang`, `xml:space`, `xml:base`, `xml:id`) **without** checking the element's complex type for an allowing declaration or wildcard. This is a lenient-parser convenience and is **not** XSD-conformant: the spec requires every attribute (including those in the xml namespace) to be matched by a declared `{attribute use}` or an `{attribute wildcard}` whose namespace constraint admits the xml namespace. Set this bit when you want `xml:lang` to "just work" against schemas that don't explicitly import the xml namespace; leave it clear for strict conformance (e.g. when running the W3C XSD test suite). `xml:base` base-URI tracking for `xsi:schemaLocation` hint resolution happens **regardless** of this flag — the flag only affects whether the attribute itself participates in type-level attribute validation. |
+| `STRICT_MODE` | off | Promote warnings to errors. Combine with `REPORT_WARNINGS`. |
+| `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. Requires a fragment-buffering validator constructed via `SchemaValidator::new_fragment_buffer(...)`; setting the bit on a plain `SchemaValidator::new(...)` will panic at run start to surface the misconfiguration. |
+
+The default — `ValidationFlags::default()` — enables only `REPORT_WARNINGS`.
+This matches the strict-conformance posture: identity constraints, `xml:*`
+leniency, and strict-mode warning promotion are all opt-in. Two common
+recipes:
+
+```rust,ignore
+use xsd_schema::validation::ValidationFlags;
+
+// Strict XSD conformance with key/unique/keyref enforcement:
+let strict = ValidationFlags::default()
+    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+
+// Lenient mode for hand-written schemas: accept xml:lang / xml:space / xml:base
+// on any element even if the schema does not declare them.
+let lenient = ValidationFlags::default()
+    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
+    | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+```
+
+For XSD 1.1 assertion-backed types, use the fragment-buffering validator
+constructor and add `PROCESS_ASSERTIONS`:
+
+```rust,ignore
+use xsd_schema::validation::{SchemaValidator, ValidationFlags};
+
+let flags = ValidationFlags::default()
+    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
+    | ValidationFlags::PROCESS_ASSERTIONS;
+let validator = SchemaValidator::new_fragment_buffer(&schema_set, flags);
+```
+
 Minimal `quick-xml` integration:
 
 ```rust

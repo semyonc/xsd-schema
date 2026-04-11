@@ -2,6 +2,32 @@
 // Open Content Frames (XSD 1.1)
 // ============================================================================
 
+/// Reject `minOccurs` / `maxOccurs` on the wildcard child of `xs:openContent`
+/// or `xs:defaultOpenContent`.
+///
+/// The XSD 1.1 schema for schemas declares these two parents as containing
+/// a restricted wildcard type with `minOccurs` and `maxOccurs` **prohibited**
+/// (W3C Bugzilla 15618; saxon open048 test). When the parser sees default
+/// values `(1, Some(1))` we assume the attributes were absent; any other
+/// value means the schema author explicitly wrote a disallowed attribute.
+fn validate_open_content_wildcard_occurs(
+    min_occurs: u32,
+    max_occurs: Option<u32>,
+    _source: Option<&SourceRef>,
+) -> SchemaResult<()> {
+    if min_occurs != 1 || max_occurs != Some(1) {
+        return Err(SchemaError::structural(
+            "src-openContent",
+            "xs:any inside xs:openContent/xs:defaultOpenContent must not \
+             carry 'minOccurs' or 'maxOccurs' (XSD 1.1 structures schema, \
+             see W3C Bugzilla 15618)"
+                .to_string(),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Frame for xs:openContent
 pub struct OpenContentFrame {
     mode: OpenContentMode,
@@ -53,6 +79,16 @@ impl Frame for OpenContentFrame {
             }
             FrameResult::Particle(particle) => {
                 if let ParticleTerm::Any(wc) = particle.term {
+                    // XSD 1.1 §3.4.2 (schema for schemas): the xs:any child of
+                    // xs:openContent uses a restricted wildcard type that
+                    // PROHIBITS minOccurs and maxOccurs. See W3C Bugzilla
+                    // 15618 and the saxon open048 test. Reject any wildcard
+                    // whose occurrence range differs from the default [1,1].
+                    validate_open_content_wildcard_occurs(
+                        particle.min_occurs,
+                        particle.max_occurs,
+                        particle.source.as_ref(),
+                    )?;
                     self.wildcard = Some(wc);
                 }
             }
@@ -146,6 +182,13 @@ impl Frame for DefaultOpenContentFrame {
             }
             FrameResult::Particle(particle) => {
                 if let ParticleTerm::Any(wc) = particle.term {
+                    // Same restriction applies to xs:defaultOpenContent — the
+                    // wildcard child prohibits minOccurs / maxOccurs.
+                    validate_open_content_wildcard_occurs(
+                        particle.min_occurs,
+                        particle.max_occurs,
+                        particle.source.as_ref(),
+                    )?;
                     self.wildcard = Some(wc);
                 }
             }
