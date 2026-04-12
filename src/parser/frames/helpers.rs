@@ -341,6 +341,22 @@ pub(crate) fn parse_not_qname(
     Ok(items)
 }
 
+/// Parse an XSD nonNegativeInteger/positiveInteger facet value.
+///
+/// Applies whitespace collapse (the schema-for-schemas types these attributes
+/// as `nonNegativeInteger`/`positiveInteger`) and strips an optional leading `+`.
+fn parse_nonneg_integer<T: std::str::FromStr>(value: &str, facet_name: &str) -> SchemaResult<T> {
+    let trimmed = value.trim();
+    let text = trimmed.strip_prefix('+').unwrap_or(trimmed);
+    text.parse().map_err(|_| {
+        SchemaError::structural(
+            "st-props-correct",
+            format!("Invalid {} value '{}': must be a nonNegativeInteger", facet_name, value),
+            None,
+        )
+    })
+}
+
 /// Apply a facet to a facet set
 fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
     use crate::types::facets::{FacetFixed, WhitespaceMode};
@@ -360,19 +376,13 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
             facets.add_pattern_unchecked(facet.value, facet.source);
         }
         FacetKind::MinLength => {
-            if let Ok(v) = facet.value.parse() {
-                facets.set_min_length(v, fixed, facet.source);
-            }
+            facets.set_min_length(parse_nonneg_integer(&facet.value, "minLength")?, fixed, facet.source);
         }
         FacetKind::MaxLength => {
-            if let Ok(v) = facet.value.parse() {
-                facets.set_max_length(v, fixed, facet.source);
-            }
+            facets.set_max_length(parse_nonneg_integer(&facet.value, "maxLength")?, fixed, facet.source);
         }
         FacetKind::Length => {
-            if let Ok(v) = facet.value.parse() {
-                facets.set_length(v, fixed, facet.source);
-            }
+            facets.set_length(parse_nonneg_integer(&facet.value, "length")?, fixed, facet.source);
         }
         FacetKind::MinInclusive => {
             facets.set_min_inclusive(facet.value, fixed, facet.source);
@@ -387,14 +397,18 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
             facets.set_max_exclusive(facet.value, fixed, facet.source);
         }
         FacetKind::TotalDigits => {
-            if let Ok(v) = facet.value.parse() {
-                facets.set_total_digits(v, fixed, facet.source);
+            let v: u32 = parse_nonneg_integer(&facet.value, "totalDigits")?;
+            if v == 0 {
+                return Err(SchemaError::structural(
+                    "st-props-correct",
+                    "Invalid totalDigits value '0': must be a positiveInteger (> 0)",
+                    None,
+                ));
             }
+            facets.set_total_digits(v, fixed, facet.source);
         }
         FacetKind::FractionDigits => {
-            if let Ok(v) = facet.value.parse() {
-                facets.set_fraction_digits(v, fixed, facet.source);
-            }
+            facets.set_fraction_digits(parse_nonneg_integer(&facet.value, "fractionDigits")?, fixed, facet.source);
         }
         FacetKind::WhiteSpace => {
             let mode = match facet.value.as_str() {

@@ -309,6 +309,10 @@ fn validate_simple_restriction(
             })?;
     }
 
+    // Validate that facet values are in the base type's value space
+    // (e.g., enumeration values must be valid for xs:float when base is xs:float)
+    validate_facet_values_against_base_type(schema_set, type_def, base_key)?;
+
     Ok(())
 }
 
@@ -2467,7 +2471,116 @@ fn validate_open_content_restriction(
     Ok(())
 }
 
-/// Get facets for a type (works for both simple and complex types)
+/// Check if a type derives from NOTATION or QName.
+fn is_notation_or_qname_base(schema_set: &SchemaSet, key: TypeKey) -> bool {
+    let TypeKey::Simple(sk) = key else { return false };
+    let bt = schema_set.builtin_types();
+    schema_set.derives_from(sk, bt.notation) || schema_set.derives_from(sk, bt.qname)
+}
+
+/// Walk up the simple type chain past any types that have enumeration facets.
+///
+/// Returns the first ancestor without enumeration facets.  This lets us
+/// validate enumeration values against the "structural" base (bounds, digits,
+/// lexical form) without hitting the string-equality enumeration comparison
+/// in `validate_simple_type` (which can false-reject when canonical forms
+/// differ — e.g. `12:00:00.990` vs `12:00:00.99`).  The enumeration-subset
+/// rule is already enforced by `merge_with_base`.
+fn base_without_enumeration(schema_set: &SchemaSet, key: TypeKey) -> TypeKey {
+    let mut current = key;
+    for _ in 0..100 {
+        if let TypeKey::Simple(sk) = current {
+            if let Some(st_data) = schema_set.arenas.simple_types.get(sk) {
+                if st_data.facets.enumeration.is_none() {
+                    return current;
+                }
+                if let Some(base) = st_data.resolved_base_type {
+                    current = base;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    current
+}
+
+/// Validate that facet values are in the value space of the base type.
+///
+/// Reuses the existing `validate_simple_type` runtime infrastructure (type code
+/// resolution, facet collection, validator dispatch) to check each locally
+/// declared facet value against the base type at schema-compile time.
+///
+/// Implements XSD Part 2 constraints:
+/// - `enumeration-valid-restriction`: enumeration values must be in the base type's value space
+/// - `minInclusive-valid-restriction`, `maxInclusive-valid-restriction`,
+///   `minExclusive-valid-restriction`, `maxExclusive-valid-restriction`:
+///   bound values must be in the base type's value space
+fn validate_facet_values_against_base_type(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::SimpleTypeDefData,
+    base_key: TypeKey,
+) -> SchemaResult<()> {
+    // Skip NOTATION/QName base types: validate_simple_type blocks bare xs:NOTATION
+    // at instance-validation time ("cannot be used directly"), and both types need
+    // namespace-declaration context unavailable during schema compilation.
+    if is_notation_or_qname_base(schema_set, base_key) {
+        return Ok(());
+    }
+
+    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+
+    // Validate enumeration values.
+    // Walk past any base with its own enumeration to avoid string-equality comparison
+    // (canonical-form mismatch). merge_with_base already checks the subset rule.
+    if let Some(ref enum_facet) = type_def.facets.enumeration {
+        let enum_base = base_without_enumeration(schema_set, base_key);
+        for value in &enum_facet.values {
+            if crate::validation::simple::validate_simple_type(value, enum_base, schema_set).is_err() {
+                return Err(SchemaError::structural(
+                    "enumeration-valid-restriction",
+                    format!(
+                        "Enumeration value '{}' in type '{}' is not in the value space of the base type",
+                        value, type_name
+                    ),
+                    location.clone(),
+                ));
+            }
+        }
+    }
+
+    // Validate bound facet values
+    let check_bound = |value: &str, constraint: &'static str, facet_name: &str| -> SchemaResult<()> {
+        if crate::validation::simple::validate_simple_type(value, base_key, schema_set).is_err() {
+            return Err(SchemaError::structural(
+                constraint,
+                format!(
+                    "{} value '{}' in type '{}' is not in the value space of the base type",
+                    facet_name, value, type_name
+                ),
+                location.clone(),
+            ));
+        }
+        Ok(())
+    };
+
+    if let Some(ref f) = type_def.facets.min_inclusive {
+        check_bound(&f.value, "minInclusive-valid-restriction", "minInclusive")?;
+    }
+    if let Some(ref f) = type_def.facets.max_inclusive {
+        check_bound(&f.value, "maxInclusive-valid-restriction", "maxInclusive")?;
+    }
+    if let Some(ref f) = type_def.facets.min_exclusive {
+        check_bound(&f.value, "minExclusive-valid-restriction", "minExclusive")?;
+    }
+    if let Some(ref f) = type_def.facets.max_exclusive {
+        check_bound(&f.value, "maxExclusive-valid-restriction", "maxExclusive")?;
+    }
+
+    Ok(())
+}
+
 fn get_type_facets(schema_set: &SchemaSet, type_key: TypeKey) -> SchemaResult<Option<FacetSet>> {
     match type_key {
         TypeKey::Simple(key) => {
