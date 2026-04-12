@@ -187,7 +187,8 @@ pub fn validate_element_structure(
 ///
 /// Local attributes:
 /// - Must have exactly one of `name` OR `ref`
-/// - If `ref` is present, type/default/fixed/form are prohibited
+/// - If `ref` is present, type/form are prohibited (src-attribute.3.2)
+/// - `default` and `fixed` ARE allowed on refs (they set the attribute use's value constraint)
 pub fn validate_attribute_structure(
     attrs: &AttributeMap,
     name_table: &NameTable,
@@ -245,10 +246,11 @@ pub fn validate_attribute_structure(
             ));
         }
 
-        // If ref is present, certain attributes are prohibited
+        // src-attribute.3.2: If ref is present, <simpleType>, form and type must be absent.
+        // Note: default and fixed ARE allowed on attribute references — they set the
+        // attribute use's value constraint, overriding the referenced declaration's.
         if has_ref {
-            let ref_prohibited = ["type", "default", "fixed", "form"];
-            for prohibited in &ref_prohibited {
+            for prohibited in &["type", "form"] {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
                         "src-attribute",

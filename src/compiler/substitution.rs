@@ -39,8 +39,7 @@ pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroup
         let (effective_block, effective_final) = effective_element_constraints(schema_set, head_elem);
         if !effective_block.contains_substitution() {
             let head_type = head_elem.resolved_type;
-            let exclude =
-                derivation_exclusions(schema_set, effective_block, effective_final, head_type);
+            let exclude = derivation_exclusions(effective_block, effective_final);
 
             let mut stack = member_map.get(&head_key).cloned().unwrap_or_default();
             let mut visited = HashSet::new();
@@ -91,38 +90,20 @@ fn resolved_element(
 }
 
 pub(crate) fn derivation_exclusions(
-    schema_set: &SchemaSet,
     effective_block: DerivationSet,
     effective_final: DerivationSet,
-    head_type: Option<TypeKey>,
 ) -> DerivationSet {
-    let mut exclude = effective_block & derivation_mask();
-    exclude |= effective_final & derivation_mask();
-    if let Some(head_type) = head_type {
-        exclude |= type_final_derivation(schema_set, head_type) & derivation_mask();
-    }
-    exclude
+    // Per §3.3.6.3 / §3.9.6 the exclusion set is built solely from the
+    // head *element's* {substitution group exclusions} (element `final`)
+    // and, for instance-time checks, its `block` attribute.  The head
+    // *type's* {final} is intentionally excluded here: is_type_derived_from
+    // walks the full derivation chain and the type's own finality is a
+    // property of the type hierarchy, not the element declaration.
+    (effective_block | effective_final) & derivation_mask()
 }
 
 fn derivation_mask() -> DerivationSet {
     DerivationSet::EXTENSION | DerivationSet::RESTRICTION | DerivationSet::LIST | DerivationSet::UNION
-}
-
-fn type_final_derivation(schema_set: &SchemaSet, type_key: TypeKey) -> DerivationSet {
-    match type_key {
-        TypeKey::Simple(key) => schema_set
-            .arenas
-            .simple_types
-            .get(key)
-            .map(|t| t.final_derivation)
-            .unwrap_or_default(),
-        TypeKey::Complex(key) => schema_set
-            .arenas
-            .complex_types
-            .get(key)
-            .map(|t| t.final_derivation)
-            .unwrap_or_default(),
-    }
 }
 
 pub(crate) fn is_substitutable(
@@ -202,8 +183,7 @@ pub(crate) fn is_element_substitutable_for(
     }
 
     // Check type derivation with exclusion mask
-    let exclude =
-        derivation_exclusions(schema_set, effective_block, effective_final, head_elem.resolved_type);
+    let exclude = derivation_exclusions(effective_block, effective_final);
     is_substitutable(
         schema_set,
         head_elem.resolved_type,
@@ -229,7 +209,7 @@ fn check_substitution_group_affiliation(
         return false;
     };
     let (_, effective_final) = effective_element_constraints(schema_set, head_elem);
-    let exclude = derivation_exclusions(schema_set, DerivationSet::empty(), effective_final, head_elem.resolved_type);
+    let exclude = derivation_exclusions(DerivationSet::empty(), effective_final);
     is_substitutable(schema_set, head_elem.resolved_type, exclude, member_elem.resolved_type)
 }
 
@@ -383,14 +363,19 @@ mod tests {
         assert!(!names.contains(&(member_name, None)));
     }
 
+    // Per §3.3.4 the {substitution group exclusions} are derived solely from the
+    // *element* declaration's `final` attribute.  The head *type's* {final} does
+    // not gate substitution group membership.  This test verifies that setting
+    // final_derivation on the head type alone does NOT block the member.
     #[test]
-    fn test_substitution_group_type_final_blocks_member() {
+    fn test_substitution_group_type_final_does_not_block_member() {
         let mut schema_set = SchemaSet::new();
         let head_name = schema_set.name_table.add("head");
         let member_name = schema_set.name_table.add("member");
         let head_type = schema_set.builtin_types().decimal;
         let member_type = TypeKey::Simple(schema_set.builtin_types().int);
 
+        // Mark the head *type* as final for restriction — this must not block the member.
         if let Some(type_def) = schema_set.arenas.simple_types.get_mut(head_type) {
             type_def.final_derivation = DerivationSet::RESTRICTION;
         }
@@ -411,7 +396,8 @@ mod tests {
 
         let map = build_substitution_group_map(&schema_set);
         let names = map.get(&head_key).unwrap();
-        assert!(!names.contains(&(member_name, None)));
+        // The type's {final} must NOT gate membership; only the element's final does.
+        assert!(names.contains(&(member_name, None)));
     }
 
     #[test]

@@ -3628,17 +3628,25 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ));
                         return XsiTypeOutcome::InvalidDerivation;
                     }
-                    // cvc-elt.4.3: validly substitutable (with element's block keywords)
-                    if !block.is_empty()
+                    // cvc-elt.4.3: validly substitutable — combine the element's
+                    // {disallowed substitutions} (block) with the declared type's
+                    // {prohibited substitutions} into a single exclusion mask.
+                    let mut combined_block = block;
+                    if let TypeKey::Complex(declared_ct_key) = declared {
+                        if let Some(declared_ct) = self.schema_set.arenas.complex_types.get(declared_ct_key) {
+                            combined_block |= declared_ct.block.element_block_mask();
+                        }
+                    }
+                    if !combined_block.is_empty()
                         && !self
                             .schema_set
-                            .is_type_derived_from(type_key, declared, block)
+                            .is_type_derived_from(type_key, declared, combined_block)
                     {
                         deferred_errors.push((
                             "cvc-elt.4.3",
                             format!(
                                 "xsi:type '{}' is not validly substitutable for the declared type \
-                                 (blocked by element's 'block' attribute)",
+                                 (blocked by 'block' attribute)",
                                 xsi_type_str
                             ),
                         ));

@@ -411,6 +411,14 @@ impl Frame for AttributeFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // src-attribute.3.2: ref + <simpleType> are mutually exclusive
+        if self.ref_name.is_some() && self.inline_type.is_some() {
+            return Err(SchemaError::structural(
+                "src-attribute",
+                "Attribute reference cannot have inline simpleType",
+                None,
+            ));
+        }
         // src-attribute.4: type and inline simpleType are mutually exclusive
         if self.type_ref.is_some() && self.inline_type.is_some() {
             return Err(SchemaError::structural(

@@ -158,6 +158,12 @@ impl SchemaLoader for EmbeddedLoader {
                         SchemaError::resolution(format!("Invalid UTF-8 in embedded schema: {}", e))
                     })
                 }
+                "xlink.xsd" => {
+                    let bytes = crate::embedded::XLINK_XSD;
+                    String::from_utf8(bytes.to_vec()).map_err(|e| {
+                        SchemaError::resolution(format!("Invalid UTF-8 in embedded schema: {}", e))
+                    })
+                }
                 _ => Err(SchemaError::resolution(format!(
                     "Unknown embedded schema: {}",
                     rest
@@ -344,6 +350,12 @@ impl SchemaCatalog {
         self.add(
             "http://www.w3.org/XML/1998/namespace",
             "embedded://xml.xsd",
+        );
+
+        // XLink namespace (xlink:type, xlink:href, etc.) - uses embedded schema
+        self.add(
+            "http://www.w3.org/1999/xlink",
+            "embedded://xlink.xsd",
         );
 
         // XML Schema instance namespace (xsi:type, xsi:nil, etc.)
@@ -578,17 +590,11 @@ impl SchemaResolver {
         base_uri: &str,
         schema_set: &mut SchemaSet,
     ) -> SchemaResult<Option<LoadOutcome>> {
-        // Import does not do chameleon namespace adoption
-        if let Some(location) = schema_location {
-            return Ok(Some(self.load_schema(location, base_uri, schema_set, None)?));
-        }
-
-        // Otherwise, try catalog lookup.
-        // Guard: skip if the catalog URL was already loaded (prevents duplicate
-        // declarations when a prior explicit import loaded the same file via a
-        // different path). We do NOT guard on namespace presence — that would
-        // break multi-document namespaces where several files share the same
-        // targetNamespace.
+        // Import does not do chameleon namespace adoption.
+        //
+        // Catalog takes priority: if the namespace has a catalog entry, use it
+        // instead of the schemaLocation hint.  This follows standard XML Catalog
+        // semantics and lets embedded/local schemas override remote HTTP URLs.
         if let Some(ns) = namespace {
             if let Some(location) = self.catalog.lookup(ns) {
                 let location = location.to_string();
@@ -599,7 +605,14 @@ impl SchemaResolver {
                 if !catalog_already_loaded {
                     return Ok(Some(self.load_schema(&location, base_uri, schema_set, None)?));
                 }
+                // Catalog entry already loaded — done.
+                return Ok(None);
             }
+        }
+
+        // No catalog match — try schemaLocation if provided.
+        if let Some(location) = schema_location {
+            return Ok(Some(self.load_schema(location, base_uri, schema_set, None)?));
         }
 
         // Import without schemaLocation and no catalog entry is allowed
@@ -817,9 +830,36 @@ pub async fn resolve_all_directives_async(
         }
     }
 
-    // Process imports
+    // Process imports — catalog takes priority over schemaLocation
     for (i, import) in imports.iter().enumerate() {
-        if let Some(location) = import.schema_location.as_deref() {
+        // Check catalog first (namespace mapping overrides location hints)
+        let catalog_location = import.namespace.as_deref()
+            .and_then(|ns| resolver.catalog.lookup(ns).map(|l| l.to_string()));
+
+        if let Some(location) = catalog_location {
+            let catalog_already_loaded = resolver
+                .resolve_location(&location, &base_uri)
+                .ok()
+                .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
+            if catalog_already_loaded {
+                continue;
+            }
+            match resolver.load_schema_async(&location, &base_uri, schema_set, None).await {
+                Ok(ref outcome) => {
+                    if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
+                        result.loaded.push(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                    } else {
+                        result.skipped.push(location.clone());
+                    }
+                    record_edge(
+                        schema_set, doc_id, outcome, CompositionEdgeKind::Import,
+                        import.source.as_ref(), &location,
+                    );
+                }
+                Err(e) => result.import_errors.push(e),
+            }
+        } else if let Some(location) = import.schema_location.as_deref() {
             match resolver.load_schema_async(location, &base_uri, schema_set, None).await {
                 Ok(ref outcome) => {
                     if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
@@ -834,36 +874,6 @@ pub async fn resolve_all_directives_async(
                     );
                 }
                 Err(e) => result.import_errors.push(e),
-            }
-        } else if let Some(ns) = import.namespace.as_deref() {
-            if let Some(location) = resolver.catalog.lookup(ns) {
-                let location = location.to_string();
-                // Same guard as the sync path: skip if the catalog URL was
-                // already loaded to prevent duplicate-declaration errors when
-                // the catalog and a prior explicit import resolve to different
-                // URLs pointing at the same namespace content.
-                let catalog_already_loaded = resolver
-                    .resolve_location(&location, &base_uri)
-                    .ok()
-                    .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
-                if catalog_already_loaded {
-                    continue;
-                }
-                match resolver.load_schema_async(&location, &base_uri, schema_set, None).await {
-                    Ok(ref outcome) => {
-                        if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
-                            result.loaded.push(*id);
-                            schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
-                        } else {
-                            result.skipped.push(location.clone());
-                        }
-                        record_edge(
-                            schema_set, doc_id, outcome, CompositionEdgeKind::Import,
-                            import.source.as_ref(), &location,
-                        );
-                    }
-                    Err(e) => result.import_errors.push(e),
-                }
             }
         }
     }

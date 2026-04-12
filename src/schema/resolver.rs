@@ -293,6 +293,55 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         }
     }
 
+    // Post-pass: inherit type from substitution group head for elements that have a
+    // substitutionGroup but no explicit type (§3.3.2.1 rule 3).  We iterate until
+    // stable so that transitive chains (A → B → C where none have an explicit type)
+    // are fully resolved.
+    if errors.is_empty() {
+        loop {
+            let mut changed = false;
+            for &key in &element_keys {
+                let (needs_type, subst_groups) = {
+                    let elem = schema_set.arenas.elements.get(key).unwrap();
+                    (
+                        elem.resolved_type.is_none()
+                            && elem.resolved_ref.is_none()
+                            && !elem.resolved_substitution_groups.is_empty(),
+                        elem.resolved_substitution_groups.clone(),
+                    )
+                };
+                if needs_type {
+                    for &head_key in &subst_groups {
+                        if let Some(head_type) = schema_set
+                            .arenas
+                            .elements
+                            .get(head_key)
+                            .and_then(|h| h.resolved_type)
+                        {
+                            let elem = schema_set.arenas.elements.get_mut(key).unwrap();
+                            assign_element_type(elem, head_type);
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // Final anyType fallback for elements that still have no type (e.g., circular
+        // substitution group chains or heads that themselves have no type).
+        let any_type = TypeKey::Complex(schema_set.any_type_key());
+        for &key in &element_keys {
+            if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+                if elem.resolved_type.is_none() && elem.resolved_ref.is_none() {
+                    assign_element_type(elem, any_type);
+                }
+            }
+        }
+    }
+
     // Resolve XSD 1.1 identity constraint @ref references on top-level elements.
     // This runs after element resolution so ICs from all elements are registered.
     for &key in &element_keys {
@@ -436,6 +485,18 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
     Ok(stats)
 }
 
+/// Set an element's resolved type and propagate to XSD 1.1 type alternatives
+/// that have no explicit type (they use the element's declared type as fallback).
+fn assign_element_type(elem: &mut crate::arenas::ElementDeclData, type_key: TypeKey) {
+    elem.resolved_type = Some(type_key);
+    #[cfg(feature = "xsd11")]
+    for alt in &mut elem.alternatives {
+        if alt.resolved_type.is_none() && alt.type_ref.is_none() {
+            alt.resolved_type = Some(type_key);
+        }
+    }
+}
+
 /// Resolve references in an element declaration
 fn resolve_element_references(
     schema_set: &mut SchemaSet,
@@ -480,7 +541,10 @@ fn resolve_element_references(
     } else {
         None
     };
-    if resolved_type.is_none() && ref_name.is_none() {
+    // Only fall back to anyType when there is no substitution group.
+    // Elements with a substitutionGroup but no explicit type inherit the
+    // head's type in the post-pass inside resolve_all_references (§3.3.2.1 rule 3).
+    if resolved_type.is_none() && ref_name.is_none() && substitution_groups.is_empty() {
         resolved_type = Some(TypeKey::Complex(schema_set.any_type_key()));
     }
 
@@ -688,6 +752,27 @@ fn resolve_simple_type_references(
         resolved_members.push(type_key);
     }
     resolved_members.extend(already_resolved_members);
+
+    // For list and union types without an explicit base, the XSD spec defines the
+    // {base type definition} to be anySimpleType (§4.1.2 / §3.16.2.2).
+    // Setting resolved_base_type here makes is_simple_type_derived_from work
+    // correctly when checking derivation from anySimpleType (e.g. e-props-correct.4).
+    let resolved_base = if resolved_base.is_none() {
+        let variety = schema_set
+            .arenas
+            .simple_types
+            .get(key)
+            .map(|t| t.variety)
+            .unwrap_or(SimpleTypeVariety::Atomic);
+        if matches!(variety, SimpleTypeVariety::List | SimpleTypeVariety::Union) {
+            let any_simple = schema_set.builtin_types().any_simple_type;
+            Some(TypeKey::Simple(any_simple))
+        } else {
+            None
+        }
+    } else {
+        resolved_base
+    };
 
     // Store resolved references back
     if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {

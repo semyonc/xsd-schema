@@ -192,7 +192,7 @@ pub use parser::resolver::{
 pub use parser::resolver::AsyncSchemaLoader;
 
 // Re-export embedded assets
-pub use embedded::{XML_XSD, XML_NAMESPACE, get_embedded_schema, has_embedded_schema};
+pub use embedded::{XML_XSD, XLINK_XSD, XML_NAMESPACE, XLINK_NAMESPACE, get_embedded_schema, has_embedded_schema};
 
 // Re-export compiler types
 pub use compiler::{

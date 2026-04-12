@@ -594,8 +594,17 @@ impl SchemaSet {
     ) -> bool {
         use crate::parser::frames::DerivationMethod;
 
-        if let Some(type_def) = self.arenas.complex_types.get(derived) {
-            // Check derivation method
+        // Walk the complex type chain, stepping through each derivation level.
+        // A complex type with simpleContent can have a chain:
+        //   ct_n (restriction of ct_{n-1}) → … → ct_1 (extension of simple_type)
+        let mut current = derived;
+        let mut visited = std::collections::HashSet::new();
+
+        while visited.insert(current) {
+            let Some(type_def) = self.arenas.complex_types.get(current) else {
+                break;
+            };
+
             let method_flag = match type_def.derivation_method {
                 Some(DerivationMethod::Extension) => DerivationSet::EXTENSION,
                 Some(DerivationMethod::Restriction) | None => DerivationSet::RESTRICTION,
@@ -605,13 +614,19 @@ impl SchemaSet {
                 return false;
             }
 
-            // Check if base type is the target simple type
-            if let Some(TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
-                if simple_base == base {
-                    return true;
+            match type_def.resolved_base_type {
+                Some(TypeKey::Simple(simple_base)) => {
+                    if simple_base == base {
+                        return true;
+                    }
+                    // Walk further up the simple type chain.
+                    return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
                 }
-                // Continue checking up the simple type chain
-                return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
+                Some(TypeKey::Complex(complex_base)) => {
+                    // Base is another complex type; keep walking.
+                    current = complex_base;
+                }
+                None => break,
             }
         }
 
