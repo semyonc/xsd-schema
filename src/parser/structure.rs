@@ -286,7 +286,9 @@ pub fn validate_attribute_structure(
                     None,
                 ));
             }
-            if has_fixed {
+            // src-attribute §3.2.3 clause 5: use="prohibited" + fixed is only an error in XSD 1.1.
+            // In XSD 1.0 the combination is syntactically odd but not explicitly forbidden.
+            if has_fixed && ctx.xsd_version == XsdVersion::V1_1 {
                 return Err(SchemaError::structural(
                     "src-attribute",
                     "Prohibited attribute cannot have 'fixed' attribute",

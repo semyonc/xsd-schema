@@ -678,7 +678,12 @@ impl FacetSet {
 
         // === Numeric bounds ===
         // Note: Full numeric comparison would require parsing the values
-        // For now, we check fixed constraints and inherit missing values
+        // For now, we check fixed constraints and inherit missing values.
+        //
+        // A derived type may switch between Inclusive and Exclusive for the same bound
+        // (e.g., base has minInclusive, derived has minExclusive).  Per cos-st-restricts,
+        // only the derived facet applies, so we must NOT inherit the base facet when the
+        // derived type already supplies the complementary one.
         if let Some(ref base_facet) = base.min_inclusive {
             if let Some(ref derived) = result.min_inclusive {
                 if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
@@ -688,7 +693,8 @@ impl FacetSet {
                         &derived.value,
                     ));
                 }
-            } else {
+            } else if result.min_exclusive.is_none() {
+                // Only inherit if derived hasn't replaced it with minExclusive
                 result.min_inclusive = Some(base_facet.clone());
             }
         }
@@ -702,7 +708,8 @@ impl FacetSet {
                         &derived.value,
                     ));
                 }
-            } else {
+            } else if result.max_exclusive.is_none() {
+                // Only inherit if derived hasn't replaced it with maxExclusive
                 result.max_inclusive = Some(base_facet.clone());
             }
         }
@@ -716,7 +723,8 @@ impl FacetSet {
                         &derived.value,
                     ));
                 }
-            } else {
+            } else if result.min_inclusive.is_none() {
+                // Only inherit if derived hasn't replaced it with minInclusive
                 result.min_exclusive = Some(base_facet.clone());
             }
         }
@@ -730,7 +738,8 @@ impl FacetSet {
                         &derived.value,
                     ));
                 }
-            } else {
+            } else if result.max_inclusive.is_none() {
+                // Only inherit if derived hasn't replaced it with maxInclusive
                 result.max_exclusive = Some(base_facet.clone());
             }
         }
