@@ -124,6 +124,7 @@ pub mod builder;
 
 // Regex pattern conversion (shared between XSD and XPath)
 pub mod regex_convert;
+pub(crate) mod regex_xsd_unicode;
 
 // NFA compiler for content models
 pub mod compiler;

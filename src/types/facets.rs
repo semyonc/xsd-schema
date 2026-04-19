@@ -24,6 +24,9 @@ use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::location::SourceRef;
 #[cfg(not(feature = "xsd11"))]
 use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
+#[cfg(feature = "xsd11")]
+use crate::regex_convert::rewrite_xsd10_category_escapes;
+use crate::schema::model::XsdVersion;
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
 use std::collections::HashSet;
@@ -99,9 +102,21 @@ impl PatternFacet {
     ///
     /// The pattern is converted from XSD regex syntax to Rust regex syntax
     /// and compiled. Returns an error if the pattern is invalid.
+    ///
+    /// `xsd_version` controls the `\p{X}` category escape semantics: under
+    /// `V1_0` recognized general-category names are expanded to Unicode 3.0
+    /// ranges; `V1_1` passes them through to the backend unchanged.
     #[cfg(not(feature = "xsd11"))]
-    pub fn new(value: String, source: Option<SourceRef>) -> FacetResult<Self> {
-        let rust_pattern = convert_xml_pattern(&value, ConvertOptions::xsd());
+    pub fn new(
+        value: String,
+        source: Option<SourceRef>,
+        xsd_version: XsdVersion,
+    ) -> FacetResult<Self> {
+        let opts = match xsd_version {
+            XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
+            XsdVersion::V1_1 => ConvertOptions::xsd(),
+        };
+        let rust_pattern = convert_xml_pattern(&value, opts);
         let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
             pattern: value.clone(),
             message: e.to_string(),
@@ -118,15 +133,27 @@ impl PatternFacet {
     /// Uses `regexml` for native XML Schema 1.1 regex support with full Unicode.
     /// Validates with XSD regex rules (rejecting XPath-only constructs like `^$`,
     /// backreferences, `(?:...)`), then compiles with anchoring for full-string match.
+    ///
+    /// Under `XsdVersion::V1_0` the pattern is additionally rewritten so that
+    /// `\p{X}` / `\P{X}` general-category escapes resolve to the Unicode 3.0
+    /// assignments before regexml sees them.
     #[cfg(feature = "xsd11")]
-    pub fn new(value: String, source: Option<SourceRef>) -> FacetResult<Self> {
+    pub fn new(
+        value: String,
+        source: Option<SourceRef>,
+        xsd_version: XsdVersion,
+    ) -> FacetResult<Self> {
         // Validate pattern against XSD regex rules (rejects non-XSD constructs)
         regexml::Regex::xsd(&value, "").map_err(|e| FacetError::InvalidPattern {
             pattern: value.clone(),
             message: format!("{:?}", e),
         })?;
+        let pinned = match xsd_version {
+            XsdVersion::V1_0 => rewrite_xsd10_category_escapes(&value),
+            XsdVersion::V1_1 => value.clone(),
+        };
         // Compile with explicit anchoring for full-string matching
-        let anchored = format!("^(?:{})$", value);
+        let anchored = format!("^(?:{})$", pinned);
         let compiled =
             regexml::Regex::xpath(&anchored, "").map_err(|e| FacetError::InvalidPattern {
                 pattern: value.clone(),
@@ -150,9 +177,13 @@ impl PatternFacet {
 
     /// Compile the pattern if not already compiled
     #[cfg(not(feature = "xsd11"))]
-    pub fn compile(&mut self) -> FacetResult<()> {
+    pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
-            let rust_pattern = convert_xml_pattern(&self.value, ConvertOptions::xsd());
+            let opts = match xsd_version {
+                XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
+                XsdVersion::V1_1 => ConvertOptions::xsd(),
+            };
+            let rust_pattern = convert_xml_pattern(&self.value, opts);
             let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: e.to_string(),
@@ -164,15 +195,19 @@ impl PatternFacet {
 
     /// Compile the pattern if not already compiled
     #[cfg(feature = "xsd11")]
-    pub fn compile(&mut self) -> FacetResult<()> {
+    pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
             // Validate against XSD regex rules first
             regexml::Regex::xsd(&self.value, "").map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: format!("{:?}", e),
             })?;
+            let pinned = match xsd_version {
+                XsdVersion::V1_0 => rewrite_xsd10_category_escapes(&self.value),
+                XsdVersion::V1_1 => self.value.clone(),
+            };
             // Compile with explicit anchoring for full-string matching
-            let anchored = format!("^(?:{})$", self.value);
+            let anchored = format!("^(?:{})$", pinned);
             let compiled = regexml::Regex::xpath(&anchored, "").map_err(|e| {
                 FacetError::InvalidPattern {
                     pattern: self.value.clone(),
@@ -190,7 +225,8 @@ impl PatternFacet {
         match &self.compiled {
             Some(regex) => regex.is_match(value),
             None => {
-                // Try to compile on-the-fly (fallback)
+                // Defensive fallback: compile on-the-fly using XSD 1.1 defaults.
+                // Reached only if a facet was never compiled via `compile_patterns`.
                 if let Ok(rust_pattern) = std::panic::catch_unwind(|| convert_xml_pattern(&self.value, ConvertOptions::xsd())) {
                     if let Ok(regex) = Regex::new(&rust_pattern) {
                         return regex.is_match(value);
@@ -207,7 +243,9 @@ impl PatternFacet {
         match &self.compiled {
             Some(regex) => regex.is_match(value),
             None => {
-                // Try to compile on-the-fly (fallback): validate XSD, then anchor
+                // Defensive fallback: validate and compile on-the-fly with XSD 1.1
+                // defaults. Reached only if a facet was never compiled via
+                // `compile_patterns`.
                 if regexml::Regex::xsd(&self.value, "").is_ok() {
                     let anchored = format!("^(?:{})$", self.value);
                     if let Ok(regex) = regexml::Regex::xpath(&anchored, "") {
@@ -390,8 +428,13 @@ impl FacetSet {
     }
 
     /// Add a pattern facet (compiles the pattern)
-    pub fn add_pattern(&mut self, value: String, source: Option<SourceRef>) -> FacetResult<()> {
-        let pattern = PatternFacet::new(value, source)?;
+    pub fn add_pattern(
+        &mut self,
+        value: String,
+        source: Option<SourceRef>,
+        xsd_version: XsdVersion,
+    ) -> FacetResult<()> {
+        let pattern = PatternFacet::new(value, source, xsd_version)?;
         self.patterns.push(pattern);
         Ok(())
     }
@@ -402,9 +445,12 @@ impl FacetSet {
     }
 
     /// Compile all uncompiled patterns. Returns the first error encountered.
-    pub fn compile_patterns(&mut self) -> FacetResult<()> {
+    ///
+    /// `xsd_version` selects the Unicode-category semantics for `\p{X}`: V1_0
+    /// pins to Unicode 3.0; V1_1 passes through to the backend.
+    pub fn compile_patterns(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         for pattern in &mut self.patterns {
-            pattern.compile()?;
+            pattern.compile(xsd_version)?;
         }
         Ok(())
     }
@@ -1624,8 +1670,8 @@ mod tests {
     #[test]
     fn test_facet_set_patterns() {
         let mut facets = FacetSet::new();
-        facets.add_pattern("[a-z]+".to_string(), None).unwrap();
-        facets.add_pattern("[0-9]+".to_string(), None).unwrap();
+        facets.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        facets.add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1).unwrap();
 
         assert_eq!(facets.patterns.len(), 2);
     }
@@ -1647,7 +1693,7 @@ mod tests {
         let mut base = FacetSet::new();
         base.set_min_length(5, FacetFixed::Fixed, None);
         base.set_max_length(100, FacetFixed::Default, None);
-        base.add_pattern("[a-z]+".to_string(), None).unwrap();
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
 
         let mut derived = FacetSet::new();
         derived.set_max_length(50, FacetFixed::Default, None); // Override
@@ -1713,7 +1759,8 @@ mod tests {
 
     #[test]
     fn test_pattern_matching() {
-        let pattern = PatternFacet::new("[a-z]+".to_string(), None).unwrap();
+        let pattern =
+            PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("hello"));
         assert!(!pattern.matches("HELLO"));
         assert!(!pattern.matches("hello123"));
@@ -1722,7 +1769,8 @@ mod tests {
     #[test]
     fn test_pattern_xsd_anchoring() {
         // XSD patterns are implicitly anchored
-        let pattern = PatternFacet::new("abc".to_string(), None).unwrap();
+        let pattern =
+            PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("abc"));
         assert!(!pattern.matches("xabc"));
         assert!(!pattern.matches("abcx"));
@@ -1731,7 +1779,8 @@ mod tests {
     #[test]
     fn test_pattern_xsd_name_chars() {
         // Test \i (initial name char) and \c (name char)
-        let pattern = PatternFacet::new(r"\i\c*".to_string(), None).unwrap();
+        let pattern =
+            PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("foo"));
         assert!(pattern.matches("_bar"));
         assert!(pattern.matches("x123"));
@@ -1740,7 +1789,7 @@ mod tests {
 
     #[test]
     fn test_invalid_pattern() {
-        let result = PatternFacet::new("[invalid".to_string(), None);
+        let result = PatternFacet::new("[invalid".to_string(), None, XsdVersion::V1_1);
         assert!(result.is_err());
     }
 
@@ -1800,7 +1849,7 @@ mod tests {
     #[test]
     fn test_validate_string_pattern() {
         let mut facets = FacetSet::new();
-        facets.add_pattern("[a-z]+".to_string(), None).unwrap();
+        facets.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
 
         assert!(facets.validate_string("hello").is_ok());
         assert!(facets.validate_string("HELLO").is_err());
@@ -1990,10 +2039,10 @@ mod tests {
     #[test]
     fn test_merge_with_base_patterns_cumulative() {
         let mut base = FacetSet::new();
-        base.add_pattern("[a-z]+".to_string(), None).unwrap();
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
 
         let mut derived = FacetSet::new();
-        derived.add_pattern("[0-9]+".to_string(), None).unwrap();
+        derived.add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1).unwrap();
 
         let merged = derived.merge_with_base(&base).unwrap();
         assert_eq!(merged.patterns.len(), 2);
