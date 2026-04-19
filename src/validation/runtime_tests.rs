@@ -1097,34 +1097,55 @@ fn test_attribute_ref_required_missing() {
 }
 
 #[test]
-fn test_prohibited_attribute_despite_wildcard() {
-    // Issue 2: use="prohibited" should NOT fall through to anyAttribute
-    let schema_set = load_schema(
+fn test_prohibited_attribute_wildcard_rescue() {
+    // cvc-complex-type.3.2.2: clause 3.2.2 (wildcard) is independent of 3.2.1.
+    // A matching wildcard rescues a prohibited attribute (attZ002 / addB034 pattern).
+
+    // Case A: prohibited + matching anyAttribute ##any → VALID (wildcard rescues)
+    let schema_a = load_schema(
         r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
-            <xs:attribute name="blocked" type="xs:string"/>
             <xs:element name="root">
                 <xs:complexType>
-                    <xs:simpleContent>
-                        <xs:extension base="xs:string">
-                            <xs:attribute ref="blocked" use="prohibited"/>
-                            <xs:anyAttribute namespace="##any" processContents="skip"/>
-                        </xs:extension>
-                    </xs:simpleContent>
+                    <xs:attribute name="blocked" use="prohibited"/>
+                    <xs:anyAttribute namespace="##any" processContents="skip"/>
                 </xs:complexType>
             </xs:element>
         </xs:schema>"###,
     );
-
-    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let validator = SchemaValidator::new(&schema_a, ValidationFlags::default());
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    let _info = v.validate_attribute("blocked", "", "value");
+    // skip wildcard → no error (validity is NotKnown, which is correct PSVI for skip)
+    assert!(
+        !v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+        "wildcard should rescue prohibited attribute; errors: {:?}",
+        v.sink.errors
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
 
+    // Case B: prohibited with no matching wildcard → INVALID (truly prohibited)
+    let schema_b = load_schema(
+        r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="blocked" use="prohibited"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"###,
+    );
+    let validator = SchemaValidator::new(&schema_b, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
     v.validate_element("root", "", None, None, &ns);
     let info = v.validate_attribute("blocked", "", "value");
     assert_eq!(
         info.validity,
         SchemaValidity::Invalid,
-        "prohibited attribute must be rejected even when anyAttribute is present"
+        "prohibited without wildcard must be rejected"
     );
     assert!(
         v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"
@@ -1132,11 +1153,6 @@ fn test_prohibited_attribute_despite_wildcard() {
         "expected 'prohibited' error, errors: {:?}",
         v.sink.errors
     );
-
-    v.validate_end_of_attributes();
-    v.validate_text("hello");
-    v.validate_end_element();
-    assert!(v.end_validation().is_ok());
 }
 
 #[test]

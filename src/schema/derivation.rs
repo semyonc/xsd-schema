@@ -2619,7 +2619,6 @@ fn element_wildcard_to_result(ew: &crate::schema::wildcard::ElementWildcard) -> 
 
 /// Canonical namespace form: finite allowed set, or finite excluded set
 /// (complement in the "namespace universe").
-#[cfg(feature = "xsd11")]
 #[derive(Debug, Clone)]
 enum NsForm {
     Pos(Vec<Option<NameId>>),
@@ -2629,7 +2628,6 @@ enum NsForm {
 /// Normalise a wildcard's `{namespace constraint}` into canonical form,
 /// resolving `##targetNamespace`/`##local` tokens and merging `notNamespace`
 /// into the excluded set.
-#[cfg(feature = "xsd11")]
 fn wildcard_to_ns_form(
     ns: &WildcardNamespace,
     not_namespace: &[crate::parser::frames::NamespaceToken],
@@ -2680,7 +2678,6 @@ fn wildcard_to_ns_form(
 /// pair suitable for a `WildcardResult`. Any excluded-set result that's empty
 /// collapses to `##any`; a non-empty excluded set becomes `##any` with
 /// `notNamespace` tokens.
-#[cfg(feature = "xsd11")]
 fn ns_form_to_wildcard(
     form: NsForm,
 ) -> (WildcardNamespace, Vec<crate::parser::frames::NamespaceToken>) {
@@ -2701,7 +2698,6 @@ fn ns_form_to_wildcard(
 /// Convert a resolved namespace (`Some(id)` = URI, `None` = absent/local) into
 /// a parser-form `NamespaceToken`. Used by the open-content derivation helpers
 /// to reconstruct parser-form wildcards from canonicalised lists.
-#[cfg(feature = "xsd11")]
 fn ns_token(ns: Option<NameId>) -> crate::parser::frames::NamespaceToken {
     match ns {
         Some(id) => crate::parser::frames::NamespaceToken::Uri(id),
@@ -2716,8 +2712,7 @@ fn ns_token(ns: Option<NameId>) -> crate::parser::frames::NamespaceToken {
 ///
 /// Tokens in the produced `WildcardResult` are already resolved against the
 /// input target namespaces, so the caller does not need to supply one.
-#[cfg(feature = "xsd11")]
-fn wildcard_result_union(
+pub(crate) fn wildcard_result_union(
     a: &WildcardResult,
     a_tns: Option<NameId>,
     b: &WildcardResult,

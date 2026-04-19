@@ -1205,6 +1205,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // lax assessment, use xs:anyType which has anyAttribute processContents=lax.
         let type_key = ev_state.schema_type;
         let process_contents = ev_state.process_contents;
+
+        // When the element is skip-processed (matched by a processContents="skip"
+        // xs:any wildcard), accept all attributes without schema validation.
+        // The element is not assessed, so its attributes cannot generate cvc-complex-type
+        // errors regardless of whether the element has a global declaration.
+        if process_contents == ContentProcessing::Skip {
+            self.current_state = ValidatorState::Attribute;
+            let result = SchemaInfo::empty();
+            self.post_process_attribute(local_name, namespace, value, &result);
+            return result;
+        }
+
         let ct_key = match type_key {
             Some(TypeKey::Complex(ct)) => ct,
             None if process_contents != ContentProcessing::Skip => {
@@ -1213,7 +1225,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.schema_set.any_type_key()
             }
             _ => {
-                // Simple type or skip: no attributes expected (except xsi:*)
+                // Simple type: no attributes expected (except xsi:*)
                 // Still run post-processing so IC attribute fields and
                 // ID/IDREF collection are not skipped.
                 self.current_state = ValidatorState::Attribute;
@@ -3159,8 +3171,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
         value: &str,
     ) -> SchemaInfo {
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-        let found = self.find_attribute_in_type(ct_data, local_name, namespace);
+        let found = {
+            let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+            self.find_attribute_in_type(ct_data, local_name, namespace)
+        };
+        // cvc-complex-type.3.2.2: clause 3.2.2 (wildcard) is checked
+        // independently of 3.2.1 — a Prohibited declaration does not block a
+        // matching wildcard (XSD 1.0 behaviour; W3C attZ002, addB034, addB136).
+        // Applies identically under XSD 1.1: §3.2.2 mapping drops
+        // use="prohibited" from {attribute uses}, so §3.4.4.2 clause 2.1
+        // never matches and the fall-through to clause 2.2 (wildcard) is
+        // the spec-compliant rescue. The §3.4.4.2 clause-4 Note about
+        // "attribute use always takes precedence" is non-normative and
+        // addresses only non-prohibited matches.
+        // Cached so the rescued-prohibited path does not walk the base chain
+        // a second time when it falls through to the NotFound arm below.
+        let mut wildcard_cache: Option<(Option<WildcardResult>, Option<NameId>)> = None;
+        let found = match found {
+            AttributeLookup::Prohibited => {
+                let (wc, wc_tns) = {
+                    let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+                    self.find_effective_wildcard(ct_data)
+                };
+                let rescued = match wc.as_ref() {
+                    Some(w) => self.wildcard_allows_attribute(w, namespace, local_name, wc_tns),
+                    None => false,
+                };
+                wildcard_cache = Some((wc, wc_tns));
+                if rescued {
+                    AttributeLookup::NotFound
+                } else {
+                    AttributeLookup::Prohibited
+                }
+            }
+            other => other,
+        };
 
         match found {
             AttributeLookup::Found(attr_key, attr_type, fixed_value, inheritable) => {
@@ -3249,10 +3294,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 SchemaInfo::invalid()
             }
             AttributeLookup::NotFound => {
-                let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-                let effective_wildcard = self.find_effective_wildcard(ct_data);
+                let (effective_wildcard, effective_wc_tns) = wildcard_cache.unwrap_or_else(|| {
+                    let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+                    self.find_effective_wildcard(ct_data)
+                });
                 if let Some(ref wildcard) = effective_wildcard {
-                    let target_ns = ct_data.target_namespace;
+                    let target_ns = effective_wc_tns;
                     if self.wildcard_allows_attribute(wildcard, namespace, local_name, target_ns) {
                         let result = match wildcard.process_contents {
                             ProcessContents::Skip => SchemaInfo::empty(),
@@ -4058,62 +4105,121 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         (well_known::EMPTY, None)
     }
 
-    /// Find the effective attribute wildcard for a complex type.
+    /// Find the effective attribute wildcard for a complex type, returning the
+    /// wildcard and the target namespace context needed to resolve `##other` /
+    /// `##targetNamespace` tokens stored inside it.
     ///
-    /// Checks the type's own `attribute_wildcard` first, then walks
-    /// referenced attribute groups recursively.
+    /// For extension derivation (§3.4.2.5) the effective wildcard is the union
+    /// of the type's own wildcard with the base type's effective wildcard
+    /// (§3.10.6.3 cos-aw-union). After union the result is in canonical form
+    /// (resolved namespace lists), so the returned tns is `None`.
+    /// For restriction and non-derived types the wildcard may still carry
+    /// symbolic tokens; the returned tns is the origin namespace context.
     fn find_effective_wildcard(
         &self,
         ct_data: &ComplexTypeDefData,
-    ) -> Option<WildcardResult> {
-        if ct_data.attribute_wildcard.is_some() {
-            return ct_data.attribute_wildcard.clone();
+    ) -> (Option<WildcardResult>, Option<NameId>) {
+        self.find_effective_wildcard_bounded(ct_data, 0)
+    }
+
+    /// Belt-and-braces depth cap mirroring `compute_effective_open_content`
+    /// in `src/schema/derivation.rs`. Reference resolution rejects cyclic
+    /// base chains upstream; this guard is defensive.
+    fn find_effective_wildcard_bounded(
+        &self,
+        ct_data: &ComplexTypeDefData,
+        depth: u32,
+    ) -> (Option<WildcardResult>, Option<NameId>) {
+        if depth > 100 {
+            return (None, None);
         }
-        // Check the content's attribute wildcard (e.g. xs:anyType stores it
-        // inside ComplexContentDefResult, not at the top-level).
-        if let crate::parser::frames::ComplexContentResult::Complex(ref def) = ct_data.content {
-            if def.attribute_wildcard.is_some() {
-                return def.attribute_wildcard.clone();
+        use crate::parser::frames::DerivationMethod;
+
+        let (own_wc, own_tns) = self.find_own_wildcard(ct_data);
+
+        if ct_data.derivation_method == Some(DerivationMethod::Extension) {
+            // §3.4.2.5: effective attribute wildcard = union of own + base's.
+            if let Some(TypeKey::Complex(base_key)) = ct_data.resolved_base_type {
+                if base_key != self.schema_set.any_type_key() {
+                    let base_data = &self.schema_set.arenas.complex_types[base_key];
+                    let (base_wc, base_wc_tns) =
+                        self.find_effective_wildcard_bounded(base_data, depth + 1);
+                    return match (own_wc, base_wc) {
+                        (Some(a), Some(b)) => {
+                            // Use each wildcard's origin tns (not the type's tns) so that
+                            // ##other in an imported attribute group resolves correctly.
+                            let unioned = crate::schema::derivation::wildcard_result_union(
+                                &a, own_tns, &b, base_wc_tns,
+                            );
+                            (Some(unioned), None) // canonical result needs no tns
+                        }
+                        (Some(a), None) => (Some(a), own_tns),
+                        (None, Some(b)) => (Some(b), base_wc_tns),
+                        (None, None) => (None, None),
+                    };
+                }
             }
+            return (own_wc, own_tns); // extension of anyType — no base wildcard
         }
-        let mut visited = HashSet::new();
-        let result = self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited);
-        if result.is_some() {
-            return result;
+
+        // Restriction / no derivation: use own wildcard, or walk base chain.
+        if own_wc.is_some() {
+            return (own_wc, own_tns);
         }
-        // Walk base type chain for inherited anyAttribute (XSD spec §3.4.2.4)
         if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
             if base_ct_key != self.schema_set.any_type_key() {
                 let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
-                return self.find_effective_wildcard(base_data);
+                return self.find_effective_wildcard_bounded(base_data, depth + 1);
             }
         }
-        None
+        (None, None)
     }
 
+    /// Return the wildcard declared directly on this type — its own
+    /// `anyAttribute` or any `anyAttribute` from its attribute groups —
+    /// together with the target namespace context for resolving symbolic tokens.
+    fn find_own_wildcard(
+        &self,
+        ct_data: &ComplexTypeDefData,
+    ) -> (Option<WildcardResult>, Option<NameId>) {
+        if ct_data.attribute_wildcard.is_some() {
+            return (ct_data.attribute_wildcard.clone(), ct_data.target_namespace);
+        }
+        // xs:anyType stores the wildcard inside ComplexContentDefResult.
+        if let crate::parser::frames::ComplexContentResult::Complex(ref def) = ct_data.content {
+            if def.attribute_wildcard.is_some() {
+                return (def.attribute_wildcard.clone(), ct_data.target_namespace);
+            }
+        }
+        let mut visited = HashSet::new();
+        self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited)
+    }
+
+    /// Search attribute groups for a wildcard, returning it with its origin
+    /// group's target namespace (needed for resolving `##other` tokens).
     fn find_group_wildcard_recursive(
         &self,
         group_keys: &[AttributeGroupKey],
         visited: &mut HashSet<AttributeGroupKey>,
-    ) -> Option<WildcardResult> {
+    ) -> (Option<WildcardResult>, Option<NameId>) {
         for &gk in group_keys {
             if !visited.insert(gk) {
                 continue;
             }
             if let Some(group_data) = self.schema_set.arenas.get_attribute_group(gk) {
                 if let Some(ref wc) = group_data.attribute_wildcard {
-                    return Some(wc.clone());
+                    return (Some(wc.clone()), group_data.target_namespace);
                 }
                 let result = self.find_group_wildcard_recursive(
                     &group_data.resolved_attribute_groups,
                     visited,
                 );
-                if result.is_some() {
+                if result.0.is_some() {
                     return result;
                 }
             }
         }
-        None
+        (None, None)
     }
 
     /// Find an attribute declaration in a complex type's attribute list
@@ -4129,10 +4235,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
 
             if attr_name == local_name && attr_ns == namespace {
-                if attr_use.use_kind == AttributeUseKind::Prohibited {
-                    return AttributeLookup::Prohibited;
-                }
-
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
                 let attr_type = resolved
                     .and_then(|r| r.resolved_type)
@@ -4153,6 +4255,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             .and_then(|d| d.fixed_value.clone())
                     });
 
+                if attr_use.use_kind == AttributeUseKind::Prohibited {
+                    // In XSD 1.0, use="prohibited" combined with fixed=X is a valid
+                    // schema construct (constraint au-props-correct.5 was added in XSD 1.1).
+                    // The combination means the attribute may appear with the fixed value.
+                    // (W3C test attP031: schema valid in 1.0, instance with fixed value valid.)
+                    if fixed.is_some()
+                        && self.schema_set.xsd_version == XsdVersion::V1_0
+                    {
+                        let inheritable = attr_use.attribute.inheritable;
+                        return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
+                    }
+                    return AttributeLookup::Prohibited;
+                }
+
                 let inheritable = attr_use.attribute.inheritable;
                 return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
             }
@@ -4162,7 +4278,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         for ga in self.collect_group_attributes(ct_data) {
             if ga.name == local_name && ga.namespace == namespace {
                 if ga.use_kind == AttributeUseKind::Prohibited {
-                    return AttributeLookup::Prohibited;
+                    // A prohibited use inside an attribute group is transparent —
+                    // it does NOT propagate the prohibition to the referencing type
+                    // (W3C Bugzilla #4043 / TSTF conclusion). Skip it and let the
+                    // base-type chain walk below decide.
+                    break;
                 }
                 #[cfg(feature = "xsd11")]
                 let inheritable = ga.inheritable;
