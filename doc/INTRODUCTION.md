@@ -22,11 +22,16 @@ Notes:
 - `async` does not make the whole pipeline async. It only affects schema loading
   and directive resolution I/O.
 - If you just want the smallest build, use XSD 1.0 without default features.
-- If you need XSD 1.0 validation but with `regexml`-backed regex support or
-  the XPath engine, enable the `xsd11` feature and create your schema set with
-  `SchemaSet::new()` (which selects XSD 1.0 mode). The `xsd11` feature controls
-  which code is *compiled*; `SchemaSet::new()` vs `SchemaSet::xsd11()` controls
-  which *semantics* are applied at runtime.
+- If you need XSD 1.0 validation with the XPath engine (or full `regexml`-backed
+  XSD regex features like character-class subtraction), enable the `xsd11`
+  feature and create your schema set with `SchemaSet::new()` (XSD 1.0 mode).
+  The `xsd11` feature controls which code is *compiled*; `SchemaSet::new()`
+  vs `SchemaSet::xsd11()` controls which *semantics* are applied at runtime.
+  Note: pattern-facet `\p{X}` category escapes are version-gated — XSD 1.0
+  mode pins the tables to Unicode 3.0 (matching the W3C XSD 1.0 test corpus,
+  see `src/regex_xsd_unicode.rs`) regardless of whether the engine is the
+  `regex` crate or `regexml`, while XSD 1.1 mode passes through to regexml's
+  current Unicode tables per §G.4.2's "or in some later version" clause.
 
 ## Main Entry Points
 
