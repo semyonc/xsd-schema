@@ -524,7 +524,7 @@ fn validate_complex_type(
     match type_def.derivation_method {
         Some(DerivationMethod::Extension) => {
             stats.extensions_validated += 1;
-            validate_complex_extension(schema_set, type_def)?;
+            validate_complex_extension(schema_set, key, type_def)?;
         }
         Some(DerivationMethod::Restriction) => {
             stats.restrictions_validated += 1;
@@ -544,6 +544,8 @@ fn validate_complex_type(
 /// Constraint: cos-ct-extends (Complex Type Derivation OK - Extension)
 fn validate_complex_extension(
     schema_set: &SchemaSet,
+    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))]
+    derived_key: ComplexTypeKey,
     type_def: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     // Get base type
@@ -746,7 +748,13 @@ fn validate_complex_extension(
 
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
-                validate_open_content_extension(schema_set, type_def, base_type)?;
+                validate_open_content_extension(
+                    schema_set,
+                    derived_key,
+                    type_def,
+                    base_complex_key,
+                    base_type,
+                )?;
 
                 // ct-props-correct.4 is enforced globally by
                 // `validate_complex_type_attribute_uniqueness` (run from
@@ -2282,13 +2290,20 @@ fn is_wildcard_ns_subset(
         return false;
     }
 
-    // notNamespace: derived must exclude at least everything base excludes.
-    // Resolve tokens before comparing so that ##targetNamespace and an
-    // explicit URI are treated as equivalent.
+    // notNamespace: for every namespace that base excludes, derived must
+    // not allow it.  The naive "derived.not_namespace ⊇ base.not_namespace"
+    // check over-rejects when derived's positive `{namespace constraint}`
+    // already excludes the namespace by construction (e.g. derived is a
+    // finite List whose members don't overlap base's notNamespace set).
     for base_excl in &base.not_namespace {
         let base_ns = base_excl.resolve(base_target_ns);
-        let found = derived.not_namespace.iter().any(|d| d.resolve(derived_target_ns) == base_ns);
-        if !found {
+        let derived_allows = wildcard_namespace_matches(
+            &derived.namespace, base_ns, derived_target_ns,
+        ) && !derived
+            .not_namespace
+            .iter()
+            .any(|d| d.resolve(derived_target_ns) == base_ns);
+        if derived_allows {
             return false;
         }
     }
@@ -2305,29 +2320,41 @@ fn is_wildcard_ns_subset(
 
 /// Validate open-content compatibility for complex type extension (cos-ct-extends).
 ///
-/// Rules:
-/// - If base has no OC, derived may freely add OC.
-/// - If base has OC, derived must also have OC.
-/// - Suffix cannot extend interleave.
-/// - Derived wildcard must be a superset of base wildcard.
+/// Implements §3.4.6.2 clauses 1.4.3.2.2 by comparing the **effective**
+/// `{open content}` property of each type (BOT, EOT) per §3.4.2.3 clauses
+/// 4–6, rather than the raw `<xs:openContent>` child elements.
+///
+/// EOT inherits from the base when the derivation omits `<openContent>` or
+/// specifies `mode="none"` (clause 6.1); otherwise EOT's wildcard is the
+/// union (§3.10.6.3 cos-aw-union) of the derivation's wildcard with the
+/// base's (clause 6.2). This lets schemas like saxonData/Open/open027 (base
+/// has suffix OC, derived declares none) and open047 (derivation widens the
+/// wildcard via notNamespace) pass validation.
 #[cfg(feature = "xsd11")]
 fn validate_open_content_extension(
     schema_set: &SchemaSet,
+    derived_key: ComplexTypeKey,
     derived: &crate::arenas::ComplexTypeDefData,
+    base_key: ComplexTypeKey,
     base: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
-    let base_oc = effective_open_content(base.open_content.as_ref());
-    let derived_oc = effective_open_content(derived.open_content.as_ref());
+    let bot = compute_effective_open_content(schema_set, base_key);
+    let eot = compute_effective_open_content(schema_set, derived_key);
 
-    // If base has no open content, derived may freely add — OK
-    let Some(base_oc) = base_oc else { return Ok(()); };
+    // Clause 1.4.3.2.2.3.1: if BOT is absent, extension is unconstrained wrt OC.
+    let Some(bot) = bot else { return Ok(()); };
 
     let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
     let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
-    // Derived must also have open content when base has it
-    let Some(derived_oc) = derived_oc else {
+    // If BOT is present then EOT must be too (by construction of EOT: if
+    // derivation has no OC and no mode=none override, clause 6.1 inherits BOT).
+    // Reaching `None` here means the derivation's own `<openContent mode="none"/>`
+    // plus an empty explicit content type collapsed EOT to absent in a way the
+    // base does not satisfy — or, without that override, that the base chain
+    // produced an OC but the derived chain didn't (mismatch).
+    let Some(eot) = eot else {
         return Err(SchemaError::structural(
             "cos-ct-extends",
             format!(
@@ -2339,10 +2366,10 @@ fn validate_open_content_extension(
         ));
     };
 
-    // Mode: suffix cannot extend interleave
-    if base_oc.mode == OpenContentMode::Interleave
-        && derived_oc.mode == OpenContentMode::Suffix
-    {
+    // Clause 1.4.3.2.2.3: either EOT.mode = interleave, or both modes = suffix.
+    let mode_ok = eot.mode == OpenContentMode::Interleave
+        || (bot.mode == OpenContentMode::Suffix && eot.mode == OpenContentMode::Suffix);
+    if !mode_ok {
         return Err(SchemaError::structural(
             "cos-ct-extends",
             format!(
@@ -2354,13 +2381,11 @@ fn validate_open_content_extension(
         ));
     }
 
-    // Wildcard: derived must be superset of base (i.e. base ns-constraint ⊆ derived)
-    if let (Some(base_wc), Some(derived_wc)) =
-        (base_oc.wildcard.as_ref(), derived_oc.wildcard.as_ref())
-    {
+    // Clause 1.4.3.2.2.4: BOT.{wildcard}.{namespace constraint} ⊆ EOT.{wildcard}.
+    if let (Some(bot_wc), Some(eot_wc)) = (bot.wildcard.as_ref(), eot.wildcard.as_ref()) {
         if !is_wildcard_ns_subset(
-            base_wc, base.target_namespace,
-            derived_wc, derived.target_namespace,
+            bot_wc, base.target_namespace,
+            eot_wc, derived.target_namespace,
         ) {
             return Err(SchemaError::structural(
                 "cos-ct-extends",
@@ -2375,6 +2400,367 @@ fn validate_open_content_extension(
     }
 
     Ok(())
+}
+
+/// Effective `{open content}` property per §3.4.2.3 clauses 5–6.
+///
+/// Represents a non-absent open content: an absent OC is encoded as `None`
+/// (returned by `compute_effective_open_content`). `target_namespace` is the
+/// context for resolving any unresolved `##targetNamespace` tokens inside
+/// `wildcard` — needed because a type's own `<openContent>` child is stored
+/// with tokens in parser form.
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone)]
+struct EffectiveOpenContent {
+    mode: OpenContentMode,
+    wildcard: Option<WildcardResult>,
+    target_namespace: Option<NameId>,
+}
+
+/// Compute the effective `{open content}` of a complex type per §3.4.2.3
+/// clauses 5 and 6. Walks the base chain through extension derivations.
+///
+/// Returns `None` when the type's effective OC is absent.
+#[cfg(feature = "xsd11")]
+fn compute_effective_open_content(
+    schema_set: &SchemaSet,
+    key: ComplexTypeKey,
+) -> Option<EffectiveOpenContent> {
+    compute_effective_open_content_bounded(schema_set, key, 0)
+}
+
+#[cfg(feature = "xsd11")]
+fn compute_effective_open_content_bounded(
+    schema_set: &SchemaSet,
+    key: ComplexTypeKey,
+    depth: u32,
+) -> Option<EffectiveOpenContent> {
+    // Guard against pathological cycles — reference resolution should have
+    // detected them upstream, but keep a local belt-and-braces cap.
+    if depth > 100 {
+        return None;
+    }
+    let type_data = schema_set.arenas.complex_types.get(key)?;
+    let target_ns = type_data.target_namespace;
+
+    // Clause 5: select the "wildcard element" (the OC source for this type).
+    // Clause 5.1 picks the <xs:openContent> child element regardless of its
+    // @mode — a literal `mode="none"` still "corresponds" to the element per
+    // the spec.  The clause-6.1 mode=none branch below handles that case,
+    // short-circuiting the defaultOpenContent fallback that 5.2 would apply.
+    let own_oc: Option<EffectiveOpenContent> = type_data.open_content.as_ref().map(|oc| EffectiveOpenContent {
+        mode: oc.mode,
+        wildcard: oc.wildcard.clone(),
+        target_namespace: target_ns,
+    });
+
+    let wildcard_element: Option<EffectiveOpenContent> = if own_oc.is_some() {
+        // Clause 5.1
+        own_oc
+    } else if let Some(default) = type_data
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.documents.get(s.defaults_doc() as usize))
+        .and_then(|d| d.default_open_content.as_ref())
+    {
+        // Clause 5.2: schema-level <xs:defaultOpenContent> applies when
+        // appliesToEmpty=true OR the explicit content type is non-empty.
+        if default.applies_to_empty || !explicit_content_is_empty(schema_set, type_data, 0) {
+            default_open_content_to_effective(default, target_ns)
+        } else {
+            None
+        }
+    } else {
+        None // Clause 5.3
+    };
+
+    // Base's effective OC (clause 4.2 inheritance). Only inherited across
+    // extension; for restriction or anyType-derivation the base OC does not
+    // flow into the derived explicit content type.
+    let base_oc: Option<EffectiveOpenContent> = if matches!(
+        type_data.derivation_method,
+        Some(DerivationMethod::Extension)
+    ) {
+        match type_data.resolved_base_type {
+            Some(TypeKey::Complex(base_key)) => {
+                compute_effective_open_content_bounded(schema_set, base_key, depth + 1)
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Clause 6.1: absent / mode=None wildcard element → inherit base.
+    let Some(we) = wildcard_element else { return base_oc; };
+    if we.mode == OpenContentMode::None {
+        return base_oc;
+    }
+
+    // Clause 6.2: build a new OC record with the unioned wildcard.
+    let wildcard = match (base_oc.as_ref(), we.wildcard.as_ref()) {
+        (Some(b), Some(w)) => match &b.wildcard {
+            Some(bw) => Some(wildcard_result_union(bw, b.target_namespace, w, target_ns)),
+            None => Some(w.clone()),
+        },
+        (None, Some(w)) => Some(w.clone()),
+        (Some(b), None) => b.wildcard.clone(),
+        (None, None) => None,
+    };
+
+    Some(EffectiveOpenContent { mode: we.mode, wildcard, target_namespace: target_ns })
+}
+
+/// Determine whether a complex type's *explicit content type* is empty per
+/// §3.4.2.3 clause 3 (needed for clause 5.2.2's `appliesToEmpty` gate).
+///
+/// For extension with no derivation-level particle, the explicit content is
+/// the base's — so recurse. For restriction or non-derivation types the
+/// explicit content is the derivation's own content.
+#[cfg(feature = "xsd11")]
+fn explicit_content_is_empty(
+    schema_set: &SchemaSet,
+    type_data: &crate::arenas::ComplexTypeDefData,
+    depth: u32,
+) -> bool {
+    if depth > 100 {
+        return true;
+    }
+    let own_empty = match &type_data.content {
+        ComplexContentResult::Empty => true,
+        ComplexContentResult::Complex(def) => def.particle.is_none(),
+        ComplexContentResult::Simple(_) => false,
+    };
+    if !own_empty {
+        return false;
+    }
+    if matches!(type_data.derivation_method, Some(DerivationMethod::Extension)) {
+        if let Some(TypeKey::Complex(base_key)) = type_data.resolved_base_type {
+            if let Some(base_data) = schema_set.arenas.complex_types.get(base_key) {
+                return explicit_content_is_empty(schema_set, base_data, depth + 1);
+            }
+        }
+    }
+    true
+}
+
+/// Convert a `DefaultOpenContent` (schema-model form built from the
+/// `<xs:defaultOpenContent>` element) into the `EffectiveOpenContent` form
+/// used during derivation validation.
+#[cfg(feature = "xsd11")]
+fn default_open_content_to_effective(
+    default: &crate::schema::model::DefaultOpenContent,
+    target_ns: Option<NameId>,
+) -> Option<EffectiveOpenContent> {
+    let mode = match default.mode {
+        crate::schema::model::OpenContentMode::None => OpenContentMode::None,
+        crate::schema::model::OpenContentMode::Interleave => OpenContentMode::Interleave,
+        crate::schema::model::OpenContentMode::Suffix => OpenContentMode::Suffix,
+    };
+    if mode == OpenContentMode::None {
+        return None;
+    }
+    let wildcard = default
+        .wildcard
+        .as_ref()
+        .map(element_wildcard_to_result);
+    Some(EffectiveOpenContent { mode, wildcard, target_namespace: target_ns })
+}
+
+/// Convert a schema-model `ElementWildcard` to a parser-form `WildcardResult`
+/// so it can share the subset / union helpers below.
+#[cfg(feature = "xsd11")]
+fn element_wildcard_to_result(ew: &crate::schema::wildcard::ElementWildcard) -> WildcardResult {
+    use crate::parser::frames::NotQNameItem;
+    use crate::schema::wildcard::{NamespaceConstraint, QNameDisallowed};
+
+    let (namespace, not_namespace) = match &ew.namespace_constraint {
+        NamespaceConstraint::Any => (WildcardNamespace::Any, Vec::new()),
+        NamespaceConstraint::Other => (WildcardNamespace::Other, Vec::new()),
+        NamespaceConstraint::Enumeration(nss) => (
+            WildcardNamespace::List(nss.iter().copied().map(ns_token).collect()),
+            Vec::new(),
+        ),
+        NamespaceConstraint::Not(nss) => (
+            WildcardNamespace::Any,
+            nss.iter().copied().map(ns_token).collect(),
+        ),
+    };
+
+    let process_contents = match ew.process_contents {
+        crate::schema::wildcard::ProcessContents::Strict => ProcessContents::Strict,
+        crate::schema::wildcard::ProcessContents::Lax => ProcessContents::Lax,
+        crate::schema::wildcard::ProcessContents::Skip => ProcessContents::Skip,
+    };
+
+    let not_qname = ew
+        .not_qnames
+        .iter()
+        .map(|q| match q {
+            QNameDisallowed::QName { namespace, local_name } => NotQNameItem::QName {
+                namespace: *namespace,
+                local_name: *local_name,
+            },
+            QNameDisallowed::Defined => NotQNameItem::Defined,
+            QNameDisallowed::DefinedSibling => NotQNameItem::DefinedSibling,
+        })
+        .collect();
+
+    WildcardResult {
+        namespace,
+        process_contents,
+        not_namespace,
+        not_qname,
+        id: ew.id.clone(),
+        annotation: None,
+        source: ew.source.clone(),
+    }
+}
+
+/// Canonical namespace form: finite allowed set, or finite excluded set
+/// (complement in the "namespace universe").
+#[cfg(feature = "xsd11")]
+#[derive(Debug, Clone)]
+enum NsForm {
+    Pos(Vec<Option<NameId>>),
+    Neg(Vec<Option<NameId>>),
+}
+
+/// Normalise a wildcard's `{namespace constraint}` into canonical form,
+/// resolving `##targetNamespace`/`##local` tokens and merging `notNamespace`
+/// into the excluded set.
+#[cfg(feature = "xsd11")]
+fn wildcard_to_ns_form(
+    ns: &WildcardNamespace,
+    not_namespace: &[crate::parser::frames::NamespaceToken],
+    target_ns: Option<NameId>,
+) -> NsForm {
+    let resolved_not: Vec<Option<NameId>> = not_namespace
+        .iter()
+        .map(|t| t.resolve(target_ns))
+        .collect();
+    match ns {
+        WildcardNamespace::Any => NsForm::Neg(resolved_not),
+        WildcardNamespace::Other => {
+            let mut excl = other_exclusion_set(target_ns);
+            for r in resolved_not {
+                if !excl.contains(&r) {
+                    excl.push(r);
+                }
+            }
+            NsForm::Neg(excl)
+        }
+        WildcardNamespace::TargetNamespace => {
+            let base = target_ns;
+            if resolved_not.contains(&base) {
+                NsForm::Pos(Vec::new())
+            } else {
+                NsForm::Pos(vec![base])
+            }
+        }
+        WildcardNamespace::Local => {
+            if resolved_not.contains(&None) {
+                NsForm::Pos(Vec::new())
+            } else {
+                NsForm::Pos(vec![None])
+            }
+        }
+        WildcardNamespace::List(tokens) => {
+            let allowed: Vec<Option<NameId>> = tokens
+                .iter()
+                .map(|t| t.resolve(target_ns))
+                .filter(|r| !resolved_not.contains(r))
+                .collect();
+            NsForm::Pos(allowed)
+        }
+    }
+}
+
+/// Convert a canonical `NsForm` back into `(WildcardNamespace, not_namespace)`
+/// pair suitable for a `WildcardResult`. Any excluded-set result that's empty
+/// collapses to `##any`; a non-empty excluded set becomes `##any` with
+/// `notNamespace` tokens.
+#[cfg(feature = "xsd11")]
+fn ns_form_to_wildcard(
+    form: NsForm,
+) -> (WildcardNamespace, Vec<crate::parser::frames::NamespaceToken>) {
+    use crate::parser::frames::NamespaceToken;
+    match form {
+        NsForm::Pos(list) => {
+            let tokens: Vec<NamespaceToken> = list.into_iter().map(ns_token).collect();
+            (WildcardNamespace::List(tokens), Vec::new())
+        }
+        NsForm::Neg(list) if list.is_empty() => (WildcardNamespace::Any, Vec::new()),
+        NsForm::Neg(list) => {
+            let tokens: Vec<NamespaceToken> = list.into_iter().map(ns_token).collect();
+            (WildcardNamespace::Any, tokens)
+        }
+    }
+}
+
+/// Convert a resolved namespace (`Some(id)` = URI, `None` = absent/local) into
+/// a parser-form `NamespaceToken`. Used by the open-content derivation helpers
+/// to reconstruct parser-form wildcards from canonicalised lists.
+#[cfg(feature = "xsd11")]
+fn ns_token(ns: Option<NameId>) -> crate::parser::frames::NamespaceToken {
+    match ns {
+        Some(id) => crate::parser::frames::NamespaceToken::Uri(id),
+        None => crate::parser::frames::NamespaceToken::Local,
+    }
+}
+
+/// Wildcard union per §3.10.6.3 cos-aw-union, restricted to the namespace
+/// constraint portion. `notQName` items are intersected (an excluded QName
+/// stays excluded only if both wildcards exclude it). `processContents` is
+/// inherited from `a` (convention: `a` is the derivation's own `<any>`).
+///
+/// Tokens in the produced `WildcardResult` are already resolved against the
+/// input target namespaces, so the caller does not need to supply one.
+#[cfg(feature = "xsd11")]
+fn wildcard_result_union(
+    a: &WildcardResult,
+    a_tns: Option<NameId>,
+    b: &WildcardResult,
+    b_tns: Option<NameId>,
+) -> WildcardResult {
+    let form_a = wildcard_to_ns_form(&a.namespace, &a.not_namespace, a_tns);
+    let form_b = wildcard_to_ns_form(&b.namespace, &b.not_namespace, b_tns);
+
+    let merged = match (form_a, form_b) {
+        (NsForm::Pos(mut pa), NsForm::Pos(pb)) => {
+            for item in pb {
+                if !pa.contains(&item) {
+                    pa.push(item);
+                }
+            }
+            NsForm::Pos(pa)
+        }
+        (NsForm::Pos(pa), NsForm::Neg(nb)) | (NsForm::Neg(nb), NsForm::Pos(pa)) => {
+            NsForm::Neg(nb.into_iter().filter(|ns| !pa.contains(ns)).collect())
+        }
+        (NsForm::Neg(na), NsForm::Neg(nb)) => {
+            NsForm::Neg(na.into_iter().filter(|ns| nb.contains(ns)).collect())
+        }
+    };
+
+    let (namespace, not_namespace) = ns_form_to_wildcard(merged);
+
+    let not_qname: Vec<crate::parser::frames::NotQNameItem> = a
+        .not_qname
+        .iter()
+        .filter(|item| b.not_qname.contains(item))
+        .cloned()
+        .collect();
+
+    WildcardResult {
+        namespace,
+        process_contents: a.process_contents,
+        not_namespace,
+        not_qname,
+        id: None,
+        annotation: None,
+        source: a.source.clone(),
+    }
 }
 
 /// Validate open-content compatibility for complex type restriction (derivation-ok-restriction).
@@ -4834,6 +5220,11 @@ mod tests {
     fn test_extension_base_has_oc_derived_has_none() {
         use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
 
+        // Per §3.4.2.3 clause 6.1 and §3.4.6.2 clause 1.4.3.2.2:
+        // when the derivation declares no <xs:openContent>, the effective
+        // {open content} of the derived type (EOT) inherits the base's
+        // (BOT).  That trivially satisfies clauses 1.4.3.2.2.3 and
+        // 1.4.3.2.2.4, so extension is valid.  (saxonData/Open/open027.)
         let mut schema_set = SchemaSet::new();
 
         let mut base_data = create_complex_type_data(None);
@@ -4845,18 +5236,13 @@ mod tests {
         let mut derived_data = create_complex_type_data(None);
         derived_data.derivation_method = Some(DerivationMethod::Extension);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
-        // No open_content on derived
+        // No open_content on derived — inherits from base per clause 6.1.
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
         let mut stats = DerivationStats::default();
         let result = validate_complex_type(&schema_set, derived_key, &mut stats);
 
-        assert!(result.is_err());
-        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
-            assert_eq!(constraint, "cos-ct-extends");
-        } else {
-            panic!("Expected cos-ct-extends error");
-        }
+        assert!(result.is_ok(), "derived inherits BOT per clause 6.1: {:?}", result);
     }
 
     #[cfg(feature = "xsd11")]
