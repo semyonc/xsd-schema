@@ -165,6 +165,8 @@ pub enum BuiltInType {
     DayTimeDuration,
     /// xs:dateTimeStamp (XSD 1.1)
     DateTimeStamp,
+    /// xs:error - the bottom type (union of no members); has no valid values (XSD 1.1)
+    XsError,
 }
 
 impl BuiltInType {
@@ -237,6 +239,7 @@ impl BuiltInType {
                 | Self::YearMonthDuration
                 | Self::DayTimeDuration
                 | Self::DateTimeStamp
+                | Self::XsError
         )
     }
 
@@ -300,6 +303,7 @@ impl BuiltInType {
             Self::YearMonthDuration,
             Self::DayTimeDuration,
             Self::DateTimeStamp,
+            Self::XsError,
         ]
         .into_iter()
     }
@@ -362,6 +366,7 @@ impl From<BuiltInType> for XmlTypeCode {
             BuiltInType::YearMonthDuration => XmlTypeCode::YearMonthDuration,
             BuiltInType::DayTimeDuration => XmlTypeCode::DayTimeDuration,
             BuiltInType::DateTimeStamp => XmlTypeCode::DateTimeStamp,
+            BuiltInType::XsError => XmlTypeCode::Error,
         }
     }
 }
@@ -424,6 +429,7 @@ impl TryFrom<XmlTypeCode> for BuiltInType {
             XmlTypeCode::YearMonthDuration => Ok(BuiltInType::YearMonthDuration),
             XmlTypeCode::DayTimeDuration => Ok(BuiltInType::DayTimeDuration),
             XmlTypeCode::DateTimeStamp => Ok(BuiltInType::DateTimeStamp),
+            XmlTypeCode::Error => Ok(BuiltInType::XsError),
             // Node types, AnyType, None, Item are not simple types
             _ => Err(()),
         }
@@ -771,8 +777,7 @@ mod tests {
 
     #[test]
     fn test_builtin_all_count() {
-        // Should have 50 built-in types (47 XSD 1.0 + 3 XSD 1.1 derived + UntypedAtomic)
-        assert_eq!(BuiltInType::all().count(), 50);
+        assert_eq!(BuiltInType::all().count(), 51);
     }
 
     #[test]

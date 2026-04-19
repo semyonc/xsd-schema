@@ -28,7 +28,7 @@
 //! | union | Must have `memberTypes` XOR inline simpleTypes |
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::namespace::NameTable;
+use crate::namespace::{NameTable, is_ncname};
 use crate::parser::attrs::AttributeMap;
 use crate::parser::location::SourceRef;
 use crate::schema::XsdVersion;
@@ -196,6 +196,17 @@ pub fn validate_attribute_structure(
 ) -> SchemaResult<()> {
     let has_name = attrs.get_value_by_name(name_table, "name").is_some();
     let has_ref = attrs.get_value_by_name(name_table, "ref").is_some();
+
+    // src-attribute.1 / src-element.1: the name must be a valid NCName.
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(name_val) {
+            return Err(SchemaError::structural(
+                "src-attribute",
+                format!("Attribute 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
 
     if ctx.is_top_level {
         // Top-level attribute validation

@@ -101,6 +101,9 @@ struct ParserState<'a, 'b, 'c> {
     root_schema: Option<SchemaFrameResult>,
     /// Collected xs:ID values for document-level uniqueness checking
     id_values: HashSet<String>,
+    /// True when the root xs:schema element has a vc: version condition that
+    /// excludes this document; all children of xs:schema are then skipped.
+    vc_schema_excluded: bool,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -121,6 +124,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             source_map,
             root_schema: None,
             id_values: HashSet::new(),
+            vc_schema_excluded: false,
         }
     }
 
@@ -490,6 +494,22 @@ fn handle_start_element(
     let (xsd_attrs, foreign_attrs) = categorize_attributes(parsed_attrs, state.ns_context.name_table());
     let attr_map = AttributeMap::new(xsd_attrs);
 
+    // §F (XSD 1.1 Appendix F): conditional inclusion via vc:* attributes.
+    let vc_excluded = if foreign_attrs.is_empty() {
+        false
+    } else {
+        let ns_snapshot = state.ns_context.snapshot();
+        should_skip_for_vc(&foreign_attrs, state.ns_context.name_table(), &ns_snapshot, state.config.xsd_version)?
+    };
+    if state.frame_stack.is_empty() {
+        if vc_excluded {
+            state.vc_schema_excluded = true;
+        }
+    } else if vc_excluded || state.vc_schema_excluded {
+        push_skip_frame(state, source_ref, foreign_attrs)?;
+        return Ok(());
+    }
+
     // Check if this is an XSD element (must do before borrowing frame)
     let is_in_xsd_ns = state.is_in_xsd_namespace(element_ns);
 
@@ -758,6 +778,171 @@ fn handle_cdata(
         state.frame_stack.push(frame);
     }
     Ok(())
+}
+
+/// XSD 1.1 Appendix F — conditional inclusion via vc:* version attributes.
+///
+/// Returns `Ok(true)` if the element should be excluded (skipped), `Ok(false)`
+/// if it should be included. Returns `Err` if any vc:* version attribute has
+/// an invalid decimal value (the schema is then structurally invalid).
+fn should_skip_for_vc(
+    foreign_attrs: &[ForeignAttribute],
+    name_table: &NameTable,
+    ns_snapshot: &crate::namespace::NamespaceContextSnapshot,
+    xsd_version: XsdVersion,
+) -> SchemaResult<bool> {
+    const VC_NAMESPACE: &str = "http://www.w3.org/2007/XMLSchema-versioning";
+    let Some(vc_ns_id) = name_table.get(VC_NAMESPACE) else {
+        return Ok(false);
+    };
+    let current: f64 = match xsd_version {
+        XsdVersion::V1_0 => 1.0,
+        XsdVersion::V1_1 => 1.1,
+    };
+    for attr in foreign_attrs {
+        if attr.namespace != Some(vc_ns_id) {
+            continue;
+        }
+        let local = name_table.resolve_ref(attr.local_name);
+        let include = match local {
+            "minVersion" | "maxVersion" | "minVersionExclusive" | "maxVersionExclusive" => {
+                let bound = match attr.value.trim().parse::<f64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        if xsd_version == XsdVersion::V1_1 {
+                            return Err(err_versioning(format!(
+                                "Invalid vc:{} value '{}': must be a valid xs:decimal",
+                                local, attr.value.trim()
+                            )));
+                        }
+                        // XSD 1.0: vc: attributes are informational only; ignore invalid values
+                        continue;
+                    }
+                };
+                match local {
+                    "minVersion" => current >= bound,
+                    "maxVersion" => current <= bound,
+                    "minVersionExclusive" => current > bound,
+                    _ => current < bound,
+                }
+            }
+            "typeAvailable" | "typeUnavailable" | "facetAvailable" | "facetUnavailable" => {
+                // In XSD 1.0, these vc: attributes are silently ignored.
+                if xsd_version != XsdVersion::V1_1 {
+                    continue;
+                }
+                let is_available_attr = matches!(local, "typeAvailable" | "facetAvailable");
+                let is_type_check = matches!(local, "typeAvailable" | "typeUnavailable");
+                let mut available_count = 0usize;
+                let mut total_count = 0usize;
+                for token in attr.value.split_whitespace() {
+                    total_count += 1;
+                    if vc_token_available(token, local, is_type_check, ns_snapshot, name_table, xsd_version)? {
+                        available_count += 1;
+                    }
+                }
+                if total_count == 0 {
+                    continue;
+                }
+                // typeAvailable/facetAvailable: include iff ALL items available.
+                // typeUnavailable/facetUnavailable: include iff ANY item is unavailable.
+                if is_available_attr {
+                    available_count == total_count
+                } else {
+                    available_count < total_count
+                }
+            }
+            _ => continue,
+        };
+        if !include {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn err_versioning(msg: String) -> SchemaError {
+    SchemaError::structural("src-versioning", msg, None)
+}
+
+/// Evaluate a single QName token in a vc:typeAvailable / facetAvailable list.
+fn vc_token_available(
+    token: &str,
+    local: &str,
+    is_type_check: bool,
+    ns_snapshot: &crate::namespace::NamespaceContextSnapshot,
+    name_table: &NameTable,
+    xsd_version: XsdVersion,
+) -> SchemaResult<bool> {
+    use crate::namespace::is_ncname;
+    let (prefix_str, local_str) = match token.find(':') {
+        Some(pos) => (Some(&token[..pos]), &token[pos + 1..]),
+        None => (None, token),
+    };
+    if !is_ncname(local_str) {
+        return Err(err_versioning(format!(
+            "Invalid QName '{}' in vc:{}: '{}' is not a valid NCName",
+            token, local, local_str
+        )));
+    }
+    let ns_id = match prefix_str {
+        Some(p) => {
+            if !is_ncname(p) {
+                return Err(err_versioning(format!(
+                    "Invalid QName '{}' in vc:{}: '{}' is not a valid NCName prefix",
+                    token, local, p
+                )));
+            }
+            let p_id = name_table.get(p).ok_or_else(|| {
+                err_versioning(format!(
+                    "Undeclared prefix '{}' in vc:{} value '{}'",
+                    p, local, token
+                ))
+            })?;
+            Some(ns_snapshot.resolve_prefix(p_id).ok_or_else(|| {
+                err_versioning(format!(
+                    "Undeclared prefix '{}' in vc:{} value '{}'",
+                    p, local, token
+                ))
+            })?)
+        }
+        None => None,
+    };
+    if ns_id != Some(crate::namespace::well_known::XS_NAMESPACE) {
+        return Ok(false);
+    }
+    Ok(if is_type_check {
+        vc_is_xs_type_available(local_str, xsd_version)
+    } else {
+        vc_is_xs_facet_available(local_str)
+    })
+}
+
+fn vc_is_xs_type_available(local_name: &str, xsd_version: XsdVersion) -> bool {
+    match crate::types::XmlTypeCode::from_local_name(local_name) {
+        Some(code) => !code.is_xsd11() || xsd_version == XsdVersion::V1_1,
+        None => false,
+    }
+}
+
+fn vc_is_xs_facet_available(local_name: &str) -> bool {
+    matches!(
+        local_name,
+        "minLength"
+            | "maxLength"
+            | "length"
+            | "pattern"
+            | "enumeration"
+            | "whiteSpace"
+            | "totalDigits"
+            | "fractionDigits"
+            | "minInclusive"
+            | "maxInclusive"
+            | "minExclusive"
+            | "maxExclusive"
+            | "assertion"
+            | "explicitTimezone"
+    )
 }
 
 /// Push a skip frame for error recovery

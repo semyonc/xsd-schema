@@ -141,6 +141,10 @@ pub struct BuiltinTypes {
     /// xs:untypedAtomic (XSD 1.1)
     pub untyped_atomic: Option<SimpleTypeKey>,
 
+    // XSD 1.1 bottom type
+    /// xs:error - the bottom type (union of no members); has no valid values (XSD 1.1)
+    pub error: Option<SimpleTypeKey>,
+
     // Binary types
     /// xs:hexBinary
     pub hex_binary: SimpleTypeKey,
@@ -269,6 +273,7 @@ impl BuiltinTypes {
                 BuiltInType::NMTOKENS | BuiltInType::IDREFS | BuiltInType::ENTITIES => {
                     crate::parser::frames::SimpleTypeVariety::List
                 }
+                BuiltInType::XsError => crate::parser::frames::SimpleTypeVariety::Union,
                 _ => crate::parser::frames::SimpleTypeVariety::Atomic,
             };
 
@@ -348,7 +353,7 @@ impl BuiltinTypes {
         let entities = create_type(BuiltInType::ENTITIES);
 
         // XSD 1.1 types (only if XSD 1.1 mode)
-        let (any_atomic_type, untyped_atomic, year_month_duration, day_time_duration, datetime_stamp) =
+        let (any_atomic_type, untyped_atomic, year_month_duration, day_time_duration, datetime_stamp, error) =
             if xsd_version == XsdVersion::V1_1 {
                 (
                     Some(create_type(BuiltInType::AnyAtomicType)),
@@ -356,9 +361,10 @@ impl BuiltinTypes {
                     Some(create_type(BuiltInType::YearMonthDuration)),
                     Some(create_type(BuiltInType::DayTimeDuration)),
                     Some(create_type(BuiltInType::DateTimeStamp)),
+                    Some(create_type(BuiltInType::XsError)),
                 )
             } else {
-                (None, None, None, None, None)
+                (None, None, None, None, None, None)
             };
 
         // Anonymous list(anyURI) for xsi:schemaLocation built-in attribute type.
@@ -461,6 +467,9 @@ impl BuiltinTypes {
         }
         if let Some(key) = datetime_stamp {
             add_to_maps(BuiltInType::DateTimeStamp, key);
+        }
+        if let Some(key) = error {
+            add_to_maps(BuiltInType::XsError, key);
         }
 
         // Resolve item types for built-in list types so that
@@ -601,6 +610,7 @@ impl BuiltinTypes {
             day_time_duration,
             datetime_stamp,
             untyped_atomic,
+            error,
             hex_binary,
             base64_binary,
             any_uri,
@@ -755,6 +765,8 @@ fn get_builtin_base_type(code: XmlTypeCode) -> Option<XmlTypeCode> {
         XmlTypeCode::YearMonthDuration => Some(XmlTypeCode::Duration),
         XmlTypeCode::DayTimeDuration => Some(XmlTypeCode::Duration),
         XmlTypeCode::DateTimeStamp => Some(XmlTypeCode::DateTime),
+        // xs:error is a union with no members; formally derives from xs:anySimpleType
+        XmlTypeCode::Error => Some(XmlTypeCode::AnySimpleType),
 
         // List types derive from anySimpleType
         XmlTypeCode::NmTokens | XmlTypeCode::IdRefs | XmlTypeCode::Entities => {
@@ -783,8 +795,6 @@ mod tests {
         let mut schema_set = create_test_schema_set();
         let builtin = BuiltinTypes::new(&mut schema_set);
 
-        // Check that we have the expected number of types for XSD 1.0
-        // Total 50 built-in types - 5 XSD 1.1 types = 45
         assert_eq!(builtin.count(), 45);
     }
 
@@ -793,9 +803,7 @@ mod tests {
         let mut schema_set = create_test_schema_set_v11();
         let builtin = BuiltinTypes::new(&mut schema_set);
 
-        // Check that we have the expected number of types for XSD 1.1
-        // All 50 built-in types are registered
-        assert_eq!(builtin.count(), 50);
+        assert_eq!(builtin.count(), 51);
 
         // XSD 1.1 types should be present
         assert!(builtin.any_atomic_type.is_some());

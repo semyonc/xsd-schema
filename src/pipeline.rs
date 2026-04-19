@@ -37,7 +37,7 @@ use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
     build_dependency_graph, validate_all_derivations, validate_attribute_id_constraints,
-    compile_all_patterns,
+    validate_element_value_constraints, compile_all_patterns,
 };
 use crate::SchemaSet;
 
@@ -270,8 +270,10 @@ pub fn load_and_process_schema(
     }
 
     // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
+    // and e-props-correct.2 / .4 (element default/fixed values).
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
+        validate_element_value_constraints(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
@@ -365,6 +367,9 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     validate_attribute_id_constraints(schema_set)?;
+
+    // e-props-correct.2 / e-props-correct.4 — validate element default/fixed values
+    validate_element_value_constraints(schema_set)?;
 
     // (XSD 1.0): strict xs:anyURI lexical check on annotation source
     // attributes. XSD 1.1 explicitly relaxed the rule, so no-op there.
@@ -696,8 +701,10 @@ pub async fn load_and_process_schema_async(
     }
 
     // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
+    // and e-props-correct.2 / .4 (element default/fixed values).
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
+        validate_element_value_constraints(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation

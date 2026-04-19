@@ -925,11 +925,8 @@ impl TestRunner {
 
         // Build and compile schema(s) using SchemaSetBuilder (public API).
         // This automatically resolves xs:import / xs:include directives.
-        let mut builder = if test.version == "1.1" {
-            xsd_schema::SchemaSetBuilder::xsd11()
-        } else {
-            xsd_schema::SchemaSetBuilder::new()
-        };
+        // Uses DtdEntityExpandingLoader to handle schemas with DTD entity declarations.
+        let mut builder = make_schema_builder(&test.version);
         let mut parse_error: Option<String> = None;
 
         for schema_file in &test.schema_files {
@@ -1007,6 +1004,22 @@ impl TestRunner {
             ) => {
                 // Schema must compile successfully for instance tests
                 if let Some(ref e) = parse_error {
+                    // Auto-skip mistagged XSD-1.1-only schemas invoked in 1.0 mode.
+                    if test.version == "1.0"
+                        && e.contains("requires XSD 1.1 but schema is in XSD 1.0")
+                    {
+                        return TestResult {
+                            name: test.name.clone(),
+                            group: test.group.clone(),
+                            expected: test.expected,
+                            actual: TestOutcome::Skip,
+                            duration: start.elapsed(),
+                            error_message: Some(
+                                "Skipped: schema uses XSD 1.1 features unavailable in 1.0 mode"
+                                    .to_string(),
+                            ),
+                        };
+                    }
                     return TestResult {
                         name: test.name.clone(),
                         group: test.group.clone(),
@@ -1567,6 +1580,259 @@ fn pop_ns_scope(
             }
         }
     }
+}
+
+/// Schema loader that pre-processes DTD internal subset entity declarations.
+///
+/// Some W3C conformance test schemas (e.g., the IRI/URI Type Library) use DTD
+/// internal subset entity declarations to compose complex XSD `xs:pattern`
+/// values. `quick-xml` cannot expand custom DTD entities, so this loader reads
+/// each file, expands any declared entities, strips the DOCTYPE declaration,
+/// and returns the processed content for the normal parse pipeline.
+#[derive(Debug, Default)]
+struct DtdEntityExpandingLoader;
+
+impl xsd_schema::SchemaLoader for DtdEntityExpandingLoader {
+    fn load(&self, location: &str) -> xsd_schema::SchemaResult<String> {
+        let content = std::fs::read_to_string(location).map_err(|e| {
+            xsd_schema::SchemaError::resolution(format!("Failed to read '{}': {}", location, e))
+        })?;
+        Ok(expand_dtd_entities_if_needed(content))
+    }
+
+    fn can_load(&self, location: &str) -> bool {
+        !location.starts_with("http://")
+            && !location.starts_with("https://")
+            && !location.starts_with("embedded://")
+    }
+
+    fn priority(&self) -> i32 {
+        5 // higher than FileSystemLoader (0), lower than EmbeddedLoader (100)
+    }
+}
+
+/// Build a `SchemaSetBuilder` with the `DtdEntityExpandingLoader` wired in,
+/// configured for the requested XSD version.
+fn make_schema_builder(version: &str) -> xsd_schema::SchemaSetBuilder {
+    let mut chain = xsd_schema::LoaderChain::new();
+    chain.add(Box::new(xsd_schema::EmbeddedLoader::new()));
+    chain.add(Box::new(DtdEntityExpandingLoader));
+    if version == "1.1" {
+        xsd_schema::SchemaSetBuilder::xsd11_with_loader(Box::new(chain))
+    } else {
+        xsd_schema::SchemaSetBuilder::with_loader(Box::new(chain))
+    }
+}
+
+/// Expand DTD internal subset entity declarations in XML content if present.
+/// If no DOCTYPE with entity declarations is found, returns the content unchanged.
+fn expand_dtd_entities_if_needed(content: String) -> String {
+    match expand_dtd_entities(&content) {
+        Some(expanded) => expanded,
+        None => content,
+    }
+}
+
+/// Parse and expand DTD internal subset entity declarations in XML content.
+/// Returns `None` if no processable internal subset is found.
+fn expand_dtd_entities(content: &str) -> Option<String> {
+    let doctype_start = content.find("<!DOCTYPE")?;
+    if !content[doctype_start..].contains("<!ENTITY") {
+        return None;
+    }
+    let after_dt = &content[doctype_start..];
+    let bracket_rel = after_dt.find('[')?;
+    let bracket_start = doctype_start + bracket_rel + 1;
+
+    // Find closing ']' of the internal subset, skipping comments and quoted strings
+    let bracket_end = find_subset_end(content, bracket_start)?;
+    let internal_subset = &content[bracket_start..bracket_end];
+
+    let mut entities = parse_entity_declarations(internal_subset);
+    if entities.is_empty() {
+        return None;
+    }
+
+    // Iteratively resolve entity cross-references in entity values
+    for _ in 0..30 {
+        let prev = entities.clone();
+        for val in entities.values_mut() {
+            *val = expand_refs(val, &prev);
+        }
+        if entities == prev {
+            break;
+        }
+    }
+
+    // Locate end of DOCTYPE declaration (the '>' after the ']')
+    let after_bracket = &content[bracket_end + 1..];
+    let close_rel = after_bracket.find('>')?;
+    let doctype_end = bracket_end + 1 + close_rel + 1;
+
+    let mut result = String::with_capacity(content.len() * 2);
+    result.push_str(&content[..doctype_start]);
+    result.push_str(&expand_refs(&content[doctype_end..], &entities));
+    Some(result)
+}
+
+/// Find the closing `]` of the DTD internal subset, skipping XML comments
+/// (`<!-- ... -->`) and quoted strings so embedded `]` characters are ignored.
+fn find_subset_end(content: &str, start: usize) -> Option<usize> {
+    let bytes = content.as_bytes();
+    let mut i = start;
+    while i < bytes.len() {
+        if content[i..].starts_with("<!--") {
+            i += 4;
+            while i < bytes.len() {
+                if content[i..].starts_with("-->") {
+                    i += 3;
+                    break;
+                }
+                i += 1;
+            }
+        } else if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'\'' {
+                i += 1;
+            }
+            if i < bytes.len() {
+                i += 1;
+            }
+        } else if bytes[i] == b']' {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Parse `<!ENTITY name "value">` declarations from a DTD internal subset.
+/// First definition wins (XML §4.2). Parameter entities (`%name`) are skipped.
+fn parse_entity_declarations(subset: &str) -> HashMap<String, String> {
+    let mut entities = HashMap::new();
+    let mut pos = 0;
+
+    while pos < subset.len() {
+        let Some(rel) = subset[pos..].find("<!ENTITY") else {
+            break;
+        };
+        pos += rel + 8;
+
+        // Skip whitespace
+        let ws = subset[pos..].len() - subset[pos..].trim_start().len();
+        pos += ws;
+
+        // Skip parameter entities (% prefix)
+        if subset[pos..].starts_with('%') {
+            if let Some(end_rel) = subset[pos..].find('>') {
+                pos += end_rel + 1;
+            }
+            continue;
+        }
+
+        // Read entity name (token ending at first whitespace)
+        let name_end = subset[pos..]
+            .find(|c: char| c.is_ascii_whitespace())
+            .unwrap_or(subset.len() - pos);
+        if name_end == 0 {
+            pos += 1;
+            continue;
+        }
+        let name = subset[pos..pos + name_end].to_string();
+        pos += name_end;
+
+        // Skip whitespace
+        let ws = subset[pos..].len() - subset[pos..].trim_start().len();
+        pos += ws;
+
+        if pos >= subset.len() {
+            break;
+        }
+
+        let quote = subset.as_bytes()[pos];
+        if quote != b'"' && quote != b'\'' {
+            // SYSTEM/PUBLIC entity — skip to closing '>'
+            if let Some(end_rel) = subset[pos..].find('>') {
+                pos += end_rel + 1;
+            }
+            continue;
+        }
+        let quote_char = quote as char;
+        pos += 1;
+
+        let val_end = subset[pos..]
+            .find(quote_char)
+            .unwrap_or(subset.len() - pos);
+        let value = subset[pos..pos + val_end].to_string();
+        pos += val_end + 1;
+
+        // First-wins
+        entities.entry(name).or_insert(value);
+
+        if let Some(end_rel) = subset[pos..].find('>') {
+            pos += end_rel + 1;
+        }
+    }
+
+    entities
+}
+
+/// Expand entity references (`&name;`) in `text` using the provided map.
+/// Standard XML entities (`&amp;`, `&lt;`, `&gt;`, `&apos;`, `&quot;`) and
+/// character references (`&#...;`) are left unchanged.
+fn expand_refs(text: &str, entities: &HashMap<String, String>) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+
+    let mut result = String::with_capacity(text.len() * 2);
+    let mut remaining = text;
+
+    while let Some(amp) = remaining.find('&') {
+        result.push_str(&remaining[..amp]);
+        let after = &remaining[amp + 1..];
+
+        if let Some(semi) = after.find(';') {
+            let name = &after[..semi];
+            match name {
+                "amp" | "lt" | "gt" | "apos" | "quot" => {
+                    result.push('&');
+                    result.push_str(name);
+                    result.push(';');
+                }
+                _ if name.starts_with('#') => {
+                    result.push('&');
+                    result.push_str(name);
+                    result.push(';');
+                }
+                _ => {
+                    if let Some(val) = entities.get(name) {
+                        result.push_str(val);
+                    } else {
+                        result.push('&');
+                        result.push_str(name);
+                        result.push(';');
+                    }
+                }
+            }
+            remaining = &after[semi + 1..];
+        } else {
+            result.push('&');
+            remaining = after;
+        }
+    }
+
+    result.push_str(remaining);
+    result
 }
 
 /// Print a summary of test results

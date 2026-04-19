@@ -213,6 +213,10 @@ pub enum XmlTypeCode {
     IdRefs = 59,
     /// xs:ENTITIES (list of ENTITY)
     Entities = 60,
+
+    // XSD 1.1 bottom type (61)
+    /// xs:error - the bottom type (union of no members); has no valid values (XSD 1.1)
+    Error = 61,
 }
 
 impl XmlTypeCode {
@@ -236,7 +240,7 @@ impl XmlTypeCode {
     #[inline]
     pub fn is_atomic(&self) -> bool {
         (*self as u8) >= Self::UntypedAtomic as u8
-            && !matches!(self, Self::NmTokens | Self::IdRefs | Self::Entities)
+            && !matches!(self, Self::NmTokens | Self::IdRefs | Self::Entities | Self::Error)
     }
 
     /// Returns true if this is a list type (NMTOKENS, IDREFS, ENTITIES).
@@ -316,6 +320,7 @@ impl XmlTypeCode {
                 | Self::YearMonthDuration
                 | Self::DayTimeDuration
                 | Self::DateTimeStamp
+                | Self::Error
         )
     }
 
@@ -388,6 +393,7 @@ impl XmlTypeCode {
             Self::NmTokens => Some("NMTOKENS"),
             Self::IdRefs => Some("IDREFS"),
             Self::Entities => Some("ENTITIES"),
+            Self::Error => Some("error"),
         }
     }
 
@@ -445,6 +451,7 @@ impl XmlTypeCode {
             "NMTOKENS" => Some(Self::NmTokens),
             "IDREFS" => Some(Self::IdRefs),
             "ENTITIES" => Some(Self::Entities),
+            "error" => Some(Self::Error),
             _ => None,
         }
     }

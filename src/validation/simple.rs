@@ -380,7 +380,24 @@ fn validate_union_type(
             let facets = collect_facets(sk, schema_set);
             if !facets.is_empty() {
                 let check_value = result.typed_value.to_string_value();
-                facets.validate_string(&check_value).map_err(|e| {
+                // §cvc-pattern-valid: patterns apply to the LEXICAL form (original value),
+                // not the canonical/parsed form (e.g. "-.5" must match "\-\.\d+" not "-0.5")
+                let lex_value = normalize_whitespace(value, WhitespaceMode::Collapse);
+                facets.validate_patterns_only(&lex_value).map_err(|e| {
+                    let code = errors::facet_constraint_code(&e);
+                    errors::from_facet_error(code, e, None)
+                })?;
+                // Enumeration checked in value space: re-parse each enum value as the
+                // matched primitive type and compare canonical forms (handles float/
+                // double rounding and duration leading-zero differences)
+                let type_code = result.typed_value.type_code;
+                facets.validate_enum_value_space(
+                    |s| VALIDATOR_REGISTRY
+                        .validate(type_code, s)
+                        .map(|v| v.to_string_value() == check_value)
+                        .unwrap_or(false),
+                    &check_value,
+                ).map_err(|e| {
                     let code = errors::facet_constraint_code(&e);
                     errors::from_facet_error(code, e, None)
                 })?;

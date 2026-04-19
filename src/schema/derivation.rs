@@ -3658,6 +3658,84 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
     Ok(())
 }
 
+/// `e-props-correct.2` and `e-props-correct.4`: validate that element
+/// `default`/`fixed` values are type-valid for the declared type.
+///
+/// - `e-props-correct.2`: the value must be valid for the element's type.
+/// - `e-props-correct.4`: if the type is (or derives from) xs:ID, no value
+///   constraint is allowed.
+pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::types::XmlTypeCode;
+
+    let id_key = schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id);
+    let any_type_key = TypeKey::Complex(schema_set.any_type_key());
+
+    for (_key, elem) in schema_set.arenas.elements.iter() {
+        let (value, is_fixed) = match (&elem.default_value, &elem.fixed_value) {
+            (Some(v), _) => (v.as_str(), false),
+            (_, Some(v)) => (v.as_str(), true),
+            (None, None) => continue,
+        };
+
+        // Element refs inherit constraints from the referenced element
+        if elem.resolved_ref.is_some() {
+            continue;
+        }
+
+        let type_key = match elem.resolved_type {
+            Some(tk) if tk != any_type_key => tk,
+            _ => continue,
+        };
+
+        let elem_name = || {
+            elem.name
+                .map(|n| schema_set.name_table.resolve_ref(n))
+                .unwrap_or("(anonymous)")
+        };
+        let location = || elem.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+        let constraint = if is_fixed { "fixed" } else { "default" };
+
+        // e-props-correct.4: xs:ID (or derived) cannot have a value constraint
+        if let (Some(id_simple_key), TypeKey::Simple(st_key)) = (id_key, type_key) {
+            if schema_set.derives_from(st_key, id_simple_key) {
+                return Err(SchemaError::structural(
+                    "e-props-correct.4",
+                    format!(
+                        "Element '{}' has type xs:ID (or derived) and must not have a {} value constraint",
+                        elem_name(), constraint
+                    ),
+                    location(),
+                ));
+            }
+        }
+
+        // e-props-correct.2: value must be valid for the declared type
+        let effective_type = match type_key {
+            TypeKey::Simple(_) => Some(type_key),
+            TypeKey::Complex(ck) => schema_set
+                .arenas
+                .complex_types
+                .get(ck)
+                .and_then(|ct| effective_simple_content_type_key(schema_set, ct)),
+        };
+
+        if let Some(st_key) = effective_type {
+            if crate::validation::simple::validate_simple_type(value, st_key, schema_set).is_err() {
+                return Err(SchemaError::structural(
+                    "e-props-correct.2",
+                    format!(
+                        "Element '{}' {} value '{}' is not valid for its declared type",
+                        elem_name(), constraint, value
+                    ),
+                    location(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// `ct-props-correct.4` / `ag-props-correct.2`: every complex type's
 /// effective `{attribute uses}` must contain at most one entry per
 /// `(target_namespace, name)`. Two distinct attribute declarations with the

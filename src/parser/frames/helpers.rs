@@ -262,14 +262,28 @@ fn parse_namespace_constraint(
         "##targetNamespace" => Ok(WildcardNamespace::TargetNamespace),
         "##local" => Ok(WildcardNamespace::Local),
         _ => {
-            let namespaces: Vec<NamespaceToken> = value
-                .split_whitespace()
-                .map(|s| match s {
-                    "##targetNamespace" => NamespaceToken::TargetNamespace,
-                    "##local" => NamespaceToken::Local,
-                    _ => NamespaceToken::Uri(name_table.add(s)),
-                })
-                .collect();
+            let mut namespaces = Vec::new();
+            for s in value.split_whitespace() {
+                match s {
+                    "##targetNamespace" => namespaces.push(NamespaceToken::TargetNamespace),
+                    "##local" => namespaces.push(NamespaceToken::Local),
+                    "##any" | "##other" => {
+                        return Err(SchemaError::structural(
+                            "src-wildcard",
+                            format!("'{}' must appear alone, not in a list namespace constraint", s),
+                            None,
+                        ))
+                    }
+                    s if s.starts_with("##") => {
+                        return Err(SchemaError::structural(
+                            "src-wildcard",
+                            format!("Unrecognized namespace token '{}'; expected ##any, ##other, ##targetNamespace, ##local, or a URI", s),
+                            None,
+                        ))
+                    }
+                    _ => namespaces.push(NamespaceToken::Uri(name_table.add(s))),
+                }
+            }
             Ok(WildcardNamespace::List(namespaces))
         }
     }

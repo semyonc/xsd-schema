@@ -130,6 +130,19 @@ impl SchemaSetBuilder {
         Self::with_version(XsdVersion::V1_1)
     }
 
+    /// Create a builder configured for XSD 1.1 with a custom schema loader.
+    pub fn xsd11_with_loader(loader: Box<dyn SchemaLoader>) -> Self {
+        let mut resolver = SchemaResolver::with_loader(loader);
+        resolver.catalog_mut().add_xml_catalog();
+        Self {
+            schema_set: SchemaSet::with_version(XsdVersion::V1_1),
+            resolver,
+            pending_docs: Vec::new(),
+            errors: Vec::new(),
+            import_errors: Vec::new(),
+        }
+    }
+
     /// Create a builder with a custom async loader for non-blocking I/O.
     ///
     /// The async loader is used by [`add_async`](SchemaSetBuilder::add_async)

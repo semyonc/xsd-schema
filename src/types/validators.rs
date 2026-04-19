@@ -612,8 +612,20 @@ impl TypeValidator for BooleanValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Boolean only has pattern and enumeration facets
-        facets.validate_string(&result.to_string_value())?;
+        // §cvc-pattern-valid: pattern applies to lexical representation, not canonical form.
+        // "1" must match pattern "[1]{1}" even though canonical form is "true".
+        facets.validate_patterns_only(value)?;
+        // §cvc-enumeration-valid: compare in value space ("1" == "true" == true)
+        if let XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) = result.value {
+            facets.validate_enum_value_space(
+                |s| match normalize_whitespace(s, WhitespaceMode::Collapse).as_str() {
+                    "true" | "1" => b,
+                    "false" | "0" => !b,
+                    _ => false,
+                },
+                value,
+            )?;
+        }
         Ok(result)
     }
 
@@ -726,12 +738,16 @@ impl TypeValidator for FloatValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Get the parsed float value and validate bounds
         if let XmlValueKind::Atomic(XmlAtomicValue::Float(f)) = result.value {
             facets.validate_float(f)?;
+            // §cvc-enumeration-valid: compare in value space, not lexically
+            facets.validate_enum_value_space(
+                |s| parse_float(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                    .ok().map(|e| float_eq(f, e)).unwrap_or(false),
+                value,
+            )?;
         }
-        // Also validate pattern/enumeration via string
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -765,12 +781,16 @@ impl TypeValidator for DoubleValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        // Get the parsed double value and validate bounds
         if let XmlValueKind::Atomic(XmlAtomicValue::Double(d)) = result.value {
             facets.validate_double(d)?;
+            // §cvc-enumeration-valid: compare in value space, not lexically
+            facets.validate_enum_value_space(
+                |s| parse_double(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                    .ok().map(|e| double_eq(d, e)).unwrap_or(false),
+                value,
+            )?;
         }
-        // Also validate pattern/enumeration via string
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -800,6 +820,37 @@ fn parse_double(s: &str) -> Result<f64, String> {
         "NaN" => Ok(f64::NAN),
         _ => s.parse().map_err(|e: std::num::ParseFloatError| e.to_string()),
     }
+}
+
+/// Value-space equality for xs:float (NaN == NaN per XSD, ±0 equal per IEEE 754)
+fn float_eq(a: f32, b: f32) -> bool {
+    if a.is_nan() && b.is_nan() { return true; }
+    a == b
+}
+
+/// Value-space equality for xs:double (NaN == NaN per XSD, ±0 equal per IEEE 754)
+fn double_eq(a: f64, b: f64) -> bool {
+    if a.is_nan() && b.is_nan() { return true; }
+    a == b
+}
+
+/// Value-space equality for xs:duration per §3.3.6.
+/// Two durations are equal iff their signed total-months components are equal
+/// AND their signed total day-time seconds components are equal.
+fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
+    let sign = |d: &DurationValue| if d.negative { -1i64 } else { 1 };
+    let total_months = |d: &DurationValue| d.years as i64 * 12 + d.months as i64;
+    if sign(a) * total_months(a) != sign(b) * total_months(b) {
+        return false;
+    }
+    let day_secs = |d: &DurationValue| {
+        let s = rust_decimal::Decimal::from(d.days as i64) * rust_decimal::Decimal::from(86400)
+            + rust_decimal::Decimal::from(d.hours as i64) * rust_decimal::Decimal::from(3600)
+            + rust_decimal::Decimal::from(d.minutes as i64) * rust_decimal::Decimal::from(60)
+            + d.seconds;
+        if d.negative { -s } else { s }
+    };
+    day_secs(a) == day_secs(b)
 }
 
 // ============================================================================
@@ -889,8 +940,14 @@ impl TypeValidator for DurationValidator {
             validate_bounds(dur, facets, "duration", value, |s| {
                 parse_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            // §cvc-enumeration-valid: compare in value space, not lexically
+            facets.validate_enum_value_space(
+                |s| parse_duration(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                    .ok().map(|e| duration_eq(dur, &e)).unwrap_or(false),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -2624,7 +2681,10 @@ impl TypeValidator for QNameValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        facets.validate_string(&result.to_string_value())?;
+        // §cvc-length-valid §1.3 / §cvc-minLength-valid §1.3 / §cvc-maxLength-valid §1.3:
+        // For QName any value is always facet-valid w.r.t. length/minLength/maxLength.
+        // Only pattern and enumeration constrain the value.
+        facets.validate_string_patterns_enums(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -2682,7 +2742,10 @@ impl TypeValidator for NotationValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        facets.validate_string(&result.to_string_value())?;
+        // §cvc-length-valid §1.3 / §cvc-minLength-valid §1.3 / §cvc-maxLength-valid §1.3:
+        // For NOTATION any value is always facet-valid w.r.t. length/minLength/maxLength.
+        // Only pattern and enumeration constrain the value.
+        facets.validate_string_patterns_enums(&result.to_string_value())?;
         Ok(result)
     }
 

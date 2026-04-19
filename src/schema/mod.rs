@@ -90,6 +90,7 @@ pub use dependencies::{
 // Re-exports from derivation
 pub use derivation::{
     validate_all_derivations, validate_attribute_id_constraints,
+    validate_element_value_constraints,
     validate_complex_type_attribute_uniqueness,
     validate_xsd10_annotation_source_anyuri,
     DerivationStats as DerivationValidationStats,

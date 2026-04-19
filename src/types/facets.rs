@@ -1008,6 +1008,37 @@ impl FacetSet {
         Ok(())
     }
 
+    /// Validate only pattern facets (no enumeration, no length).
+    /// Used when enumeration must be checked in value space rather than lexically.
+    pub fn validate_patterns_only(&self, value: &str) -> FacetResult<()> {
+        let normalized = match &self.whitespace {
+            Some(ws) => normalize_whitespace(value, ws.value),
+            None => value.to_string(),
+        };
+        for pattern in &self.patterns {
+            if !pattern.matches(&normalized) {
+                return Err(FacetError::pattern(&normalized, &pattern.value));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate enumeration in value space using a caller-supplied match predicate.
+    /// `is_match(enum_str)` returns true if the instance value equals the given
+    /// enumeration lexical value. `display` is used in the error message on failure.
+    pub fn validate_enum_value_space(
+        &self,
+        is_match: impl Fn(&str) -> bool,
+        display: &str,
+    ) -> FacetResult<()> {
+        if let Some(ref enumeration) = self.enumeration {
+            if !enumeration.values.iter().any(|s| is_match(s)) {
+                return Err(FacetError::enumeration(display));
+            }
+        }
+        Ok(())
+    }
+
     /// Validate a decimal value against numeric facets
     pub fn validate_decimal(&self, value: &rust_decimal::Decimal) -> FacetResult<()> {
         // Check totalDigits
