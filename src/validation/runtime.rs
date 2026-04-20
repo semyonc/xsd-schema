@@ -1035,6 +1035,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Compare an instance value against a schema fixed value using value-space equality.
+    ///
+    /// Returns `true` if the values are considered equal.  Uses typed-value (value-space)
+    /// comparison when a `type_key` is available, falling back to raw string equality.
+    /// Fast-path: if the strings are already identical, returns `true` without parsing.
+    fn fixed_value_matches(
+        instance: &str,
+        fixed: &str,
+        type_key: Option<TypeKey>,
+        schema_set: &crate::schema::SchemaSet,
+    ) -> bool {
+        if instance == fixed {
+            return true;
+        }
+        let Some(tk) = type_key else {
+            return false;
+        };
+        let Ok(inst_result) = super::simple::validate_simple_type(instance, tk, schema_set) else {
+            return false;
+        };
+        let Ok(fixed_result) = super::simple::validate_simple_type(fixed, tk, schema_set) else {
+            return false;
+        };
+        inst_result.typed_value == fixed_result.typed_value
+    }
+
     /// Validate an attribute (string-based lookup)
     pub fn validate_attribute(
         &mut self,
@@ -1751,11 +1777,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
 
-            // Check fixed value on element
+            // Check fixed value on element — cvc-elt.5.2.2.2.2 (§3.3.4.3).
+            // Use value-space comparison so that lexically-different but value-equivalent
+            // forms (e.g. boolean "1" vs "true", float "1.0" vs "1.000", token whitespace)
+            // are treated as matching.
             if let Some(elem_key) = ev_state.element_decl {
                 let elem_data = &self.schema_set.arenas.elements[elem_key];
                 if let Some(fixed) = &elem_data.fixed_value {
-                    if ev_state.text_content != *fixed {
+                    if !Self::fixed_value_matches(
+                        &ev_state.text_content,
+                        fixed,
+                        ev_state.schema_type,
+                        self.schema_set,
+                    ) {
                         let elem_name =
                             self.schema_set.name_table.resolve(ev_state.local_name);
                         let err = errors::error(
@@ -1774,7 +1808,44 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
-        // 2b. Assertion evaluation hook (XSD 1.1)
+        // 2b. Fixed value check for mixed-content elements — cvc-elt.5.2.2.1 + 5.2.2.2.1 (§3.3.4.3).
+        if ev_state.content_type == Some(ContentType::Mixed) && !ev_state.is_nil {
+            if let Some(elem_key) = ev_state.element_decl {
+                let elem_data = &self.schema_set.arenas.elements[elem_key];
+                if let Some(ref fixed) = elem_data.fixed_value {
+                    let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
+                    if ev_state.has_element_children {
+                        // cvc-elt.5.2.2.1: no element children when fixed value is present
+                        let err = errors::error(
+                            "cvc-elt.5.2.2.1",
+                            format!(
+                                "Element '{}' has fixed value '{}' but contains element children",
+                                elem_name, fixed,
+                            ),
+                            self.current_location.clone(),
+                        );
+                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
+                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        ev_state.validity = SchemaValidity::Invalid;
+                    } else if ev_state.has_text && ev_state.text_content != *fixed {
+                        // cvc-elt.5.2.2.2.1: initial value (concatenated text) must match fixed
+                        let err = errors::error(
+                            "cvc-elt.5.2.2.2",
+                            format!(
+                                "Element '{}' has fixed value '{}' but actual value is '{}'",
+                                elem_name, fixed, ev_state.text_content,
+                            ),
+                            self.current_location.clone(),
+                        );
+                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
+                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        ev_state.validity = SchemaValidity::Invalid;
+                    }
+                }
+            }
+        }
+
+        // 2c. Assertion evaluation hook (XSD 1.1)
         #[cfg(feature = "xsd11")]
         let type_has_assertions = matches!(ev_state.schema_type,
             Some(TypeKey::Complex(ct_key)) if has_inherited_assertions(ct_key, &self.schema_set.arenas));
@@ -3210,7 +3281,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         match found {
             AttributeLookup::Found(attr_key, attr_type, fixed_value, inheritable) => {
                 if let Some(fixed) = fixed_value {
-                    if value != fixed {
+                    if !Self::fixed_value_matches(value, &fixed, attr_type, self.schema_set) {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
                         self.report_error(
                             "cvc-attribute.4",
@@ -3748,7 +3819,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
 
                 if let Some(fixed_val) = fixed {
-                    if value != fixed_val {
+                    if !Self::fixed_value_matches(value, &fixed_val, attr_type, self.schema_set) {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
                         self.report_error(
                             "cvc-attribute.4",
@@ -3853,7 +3924,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
 
                 if let Some(fixed_val) = fixed {
-                    if value != fixed_val {
+                    if !Self::fixed_value_matches(value, &fixed_val, attr_type, self.schema_set) {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
                         self.report_error(
                             "cvc-attribute.4",

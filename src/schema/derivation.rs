@@ -4076,17 +4076,21 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
         let location = || elem.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
         let constraint = if is_fixed { "fixed" } else { "default" };
 
-        // e-props-correct.4: xs:ID (or derived) cannot have a value constraint
-        if let (Some(id_simple_key), TypeKey::Simple(st_key)) = (id_key, type_key) {
-            if schema_set.derives_from(st_key, id_simple_key) {
-                return Err(SchemaError::structural(
-                    "e-props-correct.4",
-                    format!(
-                        "Element '{}' has type xs:ID (or derived) and must not have a {} value constraint",
-                        elem_name(), constraint
-                    ),
-                    location(),
-                ));
+        // e-props-correct.4: xs:ID (or derived) cannot have a value constraint.
+        // XSD 1.1 §3.3.6.1 removes this restriction (it has no analogous clause);
+        // only apply in XSD 1.0 mode.
+        if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+            if let (Some(id_simple_key), TypeKey::Simple(st_key)) = (id_key, type_key) {
+                if schema_set.derives_from(st_key, id_simple_key) {
+                    return Err(SchemaError::structural(
+                        "e-props-correct.4",
+                        format!(
+                            "Element '{}' has type xs:ID (or derived) and must not have a {} value constraint",
+                            elem_name(), constraint
+                        ),
+                        location(),
+                    ));
+                }
             }
         }
 
