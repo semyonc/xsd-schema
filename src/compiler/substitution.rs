@@ -122,18 +122,14 @@ pub(crate) fn effective_element_constraints(
     schema_set: &SchemaSet,
     element: &crate::arenas::ElementDeclData,
 ) -> (DerivationSet, DerivationSet) {
-    let mut block = element.block;
+    // block is resolved at assembly time (block="" overrides blockDefault, absent inherits it).
+    let block = element.block;
     let mut final_derivation = element.final_derivation;
 
-    if block.is_empty() || final_derivation.is_empty() {
+    if final_derivation.is_empty() {
         if let Some(source) = element.source.as_ref() {
             if let Some(doc) = schema_set.documents.get(source.doc_id as usize) {
-                if block.is_empty() {
-                    block = doc.block_default;
-                }
-                if final_derivation.is_empty() {
-                    final_derivation = doc.final_default;
-                }
+                final_derivation = doc.final_default;
             }
         }
     }
@@ -430,19 +426,20 @@ mod tests {
 
     #[test]
     fn test_substitution_group_block_default_blocks_member() {
+        // Assembly would apply blockDefault to elements without an explicit block.
+        // This test simulates that: head.block = SUBSTITUTION (inherited from blockDefault).
         let mut schema_set = SchemaSet::new();
         let head_name = schema_set.name_table.add("head");
         let member_name = schema_set.name_table.add("member");
         let head_type = TypeKey::Simple(schema_set.builtin_types().decimal);
         let member_type = TypeKey::Simple(schema_set.builtin_types().int);
-        let source = with_doc(&mut schema_set, DerivationSet::SUBSTITUTION, DerivationSet::empty());
 
-        let head_key = schema_set
-            .arenas
-            .alloc_element(element_data(head_name, head_type, Some(source.clone())));
+        let mut head = element_data(head_name, head_type, None);
+        head.block = DerivationSet::SUBSTITUTION;
+        let head_key = schema_set.arenas.alloc_element(head);
         let member_key = schema_set
             .arenas
-            .alloc_element(element_data(member_name, member_type, Some(source)));
+            .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements

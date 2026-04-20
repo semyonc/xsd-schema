@@ -36,7 +36,20 @@ use crate::parser::frames::{
     ParticleTerm, QNameRef, TypeFrameResult, TypeRefResult,
 };
 use crate::parser::location::{SourceMapStorage, SourceRef};
+use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
+
+/// Resolve a parsed `block` attribute to an effective `DerivationSet`.
+/// `Some(set)` → explicit (including `block=""` = empty, which overrides blockDefault).
+/// `None` → absent; inherit the source document's `blockDefault`.
+fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
+    block.unwrap_or_else(|| {
+        source
+            .and_then(|s| schema_set.documents.get(s.doc_id as usize))
+            .map(|d| d.block_default)
+            .unwrap_or_default()
+    })
+}
 
 /// Statistics from the inline type assembly pass
 #[derive(Debug, Default)]
@@ -797,6 +810,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             identity_constraint_keys.push(target_key);
         }
 
+        let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -810,7 +824,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             is_abstract: job.elem.is_abstract,
             min_occurs: job.elem.min_occurs,
             max_occurs: job.elem.max_occurs,
-            block: job.elem.block,
+            block,
             final_derivation: job.elem.final_derivation,
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
@@ -955,6 +969,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             identity_constraint_keys.push(target_key);
         }
 
+        let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -968,7 +983,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             is_abstract: job.elem.is_abstract,
             min_occurs: job.elem.min_occurs,
             max_occurs: job.elem.max_occurs,
-            block: job.elem.block,
+            block,
             final_derivation: job.elem.final_derivation,
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
@@ -1076,6 +1091,7 @@ fn assemble_inline_type(
                 ComplexContentResult::Complex(cc) => cc.assertions.clone(),
                 ComplexContentResult::Empty => Vec::new(),
             };
+            let block = resolve_block(complex.block, complex.source.as_ref(), schema_set);
             let data = ComplexTypeDefData {
                 name: complex.name, // May be None for anonymous types
                 target_namespace,
@@ -1089,7 +1105,7 @@ fn assemble_inline_type(
                 mixed: complex.mixed,
                 is_abstract: complex.is_abstract,
                 final_derivation: complex.final_derivation,
-                block: complex.block,
+                block,
                 default_attributes_apply: complex.default_attributes_apply,
                 id: complex.id.clone(),
                 #[cfg(feature = "xsd11")]

@@ -956,6 +956,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        // §3.3.4.4 cvc-type clause 2: if T is a complex type definition, T.{abstract} must be false.
+        let abstract_type_invalid = !xsi_type_invalid
+            && matches!(type_key, Some(TypeKey::Complex(k))
+                if self.schema_set.arenas.complex_types.get(k).is_some_and(|ct| ct.is_abstract));
+
         // 7. xsi:nil
         let is_nil = if let Some(nil_str) = xsi_nil {
             nil_str == "true" || nil_str == "1"
@@ -976,7 +981,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.content_state = content_state;
         ev_state.content_type = Some(content_type);
         ev_state.is_nil = is_nil;
-        ev_state.validity = if xsi_type_invalid {
+        ev_state.validity = if xsi_type_invalid || abstract_type_invalid {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid
@@ -1003,6 +1008,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 format!("Element '{}' is abstract and cannot appear in instances", elem_name),
             );
         }
+        if abstract_type_invalid {
+            let type_name = if let Some(TypeKey::Complex(ct_key)) = type_key {
+                self.schema_set.arenas.complex_types.get(ct_key)
+                    .and_then(|ct| ct.name)
+                    .map(|n| self.schema_set.name_table.resolve(n))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            self.report_error(
+                "cvc-type.2",
+                format!("Type '{}' is abstract and cannot be used to validate an element", type_name),
+            );
+        }
         if nillable_violation {
             let elem_name = self.schema_set.name_table.resolve(local_name);
             self.report_error(
@@ -1021,7 +1040,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.detect_assertions_on_element(type_key, local_name, namespace);
 
         // 10. Return SchemaInfo
-        let validity = if xsi_type_invalid {
+        let validity = if xsi_type_invalid || abstract_type_invalid {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid

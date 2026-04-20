@@ -1181,7 +1181,7 @@ pub struct ComplexTypeFrame {
     mixed: bool,
     is_abstract: bool,
     final_derivation: DerivationSet,
-    block: DerivationSet,
+    block: Option<DerivationSet>,
     default_attributes_apply: bool,
     id: Option<String>,
     content: ComplexContentResult,
@@ -1215,7 +1215,7 @@ impl ComplexTypeFrame {
             attrs.get_value_by_name(name_table, "final"),
         )?;
 
-        let block = parse_derivation_set(
+        let block = parse_block_attr(
             attrs.get_value_by_name(name_table, "block"),
         )?;
 

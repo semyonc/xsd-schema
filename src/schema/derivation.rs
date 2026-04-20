@@ -997,10 +997,10 @@ impl<'a> ParticleNormalizer<'a> {
             .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
 
         // Compute effective block for local element
-        let block = if !elem.block.is_empty() {
-            elem.block
-        } else {
-            source
+        // block=None means absent → inherit blockDefault; Some(b) means explicit (including "").
+        let block = match elem.block {
+            Some(b) => b,
+            None => source
                 .and_then(|s| {
                     let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
                     self.schema_set
@@ -1008,7 +1008,7 @@ impl<'a> ParticleNormalizer<'a> {
                         .get(doc_id as usize)
                         .map(|d| d.block_default)
                 })
-                .unwrap_or_default()
+                .unwrap_or_default(),
         };
 
         Ok(NormalizedElement {

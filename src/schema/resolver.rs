@@ -1593,7 +1593,7 @@ mod tests {
                     is_abstract: false,
                     min_occurs: 1,
                     max_occurs: Some(1),
-                    block: DerivationSet::empty(),
+                    block: None,
                     final_derivation: DerivationSet::empty(),
                     form: None,
                     id: None,

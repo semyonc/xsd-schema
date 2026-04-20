@@ -27,7 +27,7 @@ pub struct ElementFrame {
     is_abstract: bool,
     min_occurs: u32,
     max_occurs: Option<u32>,
-    block: DerivationSet,
+    block: Option<DerivationSet>,
     final_derivation: DerivationSet,
     form: Option<String>,
     id: Option<String>,
@@ -88,7 +88,7 @@ impl ElementFrame {
 
         let max_occurs = parse_max_occurs_attr(attrs, name_table, "maxOccurs")?;
 
-        let block = parse_derivation_set(
+        let block = parse_block_attr(
             attrs.get_value_by_name(name_table, "block"),
         )?;
 

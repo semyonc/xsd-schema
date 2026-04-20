@@ -191,13 +191,11 @@ impl<'a> SchemaAssembler<'a> {
                     source,
                 } = *complex;
                 let mut final_derivation = final_derivation;
-                let mut block = block;
                 if final_derivation.is_empty() {
                     final_derivation = self.final_default;
                 }
-                if block.is_empty() {
-                    block = self.block_default;
-                }
+                // block="" explicitly overrides blockDefault; None (absent) inherits it.
+                let block = block.unwrap_or(self.block_default);
                 let open_content = match &content {
                     ComplexContentResult::Complex(def) => def.open_content.clone(),
                     _ => None,
@@ -277,16 +275,16 @@ impl<'a> SchemaAssembler<'a> {
         let source_ref = source.clone();
         let name = name.ok_or_else(|| missing_name("element", source_ref.as_ref(), self.schema_set))?;
         let target_namespace = local_namespace.or(self.target_namespace);
-        let mut block = block;
         let mut final_derivation = final_derivation;
-        if ref_name.is_none() {
-            if block.is_empty() {
-                block = self.block_default;
-            }
+        // block="" explicitly overrides blockDefault; None (absent) inherits it.
+        let block = if ref_name.is_none() {
             if final_derivation.is_empty() {
                 final_derivation = self.final_default;
             }
-        }
+            block.unwrap_or(self.block_default)
+        } else {
+            block.unwrap_or_default()
+        };
 
         // Check identity constraint name uniqueness (per schema document)
         // XSD Constraint: Identity Constraint Name Uniqueness (§3.11.1)

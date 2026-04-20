@@ -121,7 +121,7 @@ pub struct ComplexTypeResult {
     pub mixed: bool,
     pub is_abstract: bool,
     pub final_derivation: DerivationSet,
-    pub block: DerivationSet,
+    pub block: Option<DerivationSet>,
     pub default_attributes_apply: bool,
     pub id: Option<String>,
     #[cfg(feature = "xsd11")]
@@ -196,7 +196,7 @@ pub struct ElementFrameResult {
     pub is_abstract: bool,
     pub min_occurs: u32,
     pub max_occurs: Option<u32>,
-    pub block: DerivationSet,
+    pub block: Option<DerivationSet>,
     pub final_derivation: DerivationSet,
     pub form: Option<String>,
     pub id: Option<String>,
