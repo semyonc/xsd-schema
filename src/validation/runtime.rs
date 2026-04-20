@@ -711,17 +711,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let matched_elem_key = match_info.and_then(|i| i.element_key);
         let matched_type = match_info.and_then(|i| i.resolved_type);
 
-        // If the content model provided a resolved type for a local element,
-        // don't fall back to a global element with the same QName (it may have
-        // a different type).
-        let element_key = if matched_type.is_some() {
-            matched_elem_key
-        } else {
-            matched_elem_key
-                .or_else(|| self.schema_set.lookup_element(namespace, local_name))
-        };
-
-        // 4. Handle missing element
+        // Determine process_contents before element_key lookup: a skip wildcard
+        // must suppress the global declaration lookup (§3.10.4 cvc-wildcard).
         let process_contents = match_info
             .and_then(|i| i.process_contents)
             .map(|pc| match pc {
@@ -736,8 +727,31 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     .unwrap_or(ContentProcessing::Strict)
             });
 
+        // If the content model provided a resolved type for a local element,
+        // don't fall back to a global element with the same QName (it may have
+        // a different type).
+        let element_key = if matched_type.is_some() || process_contents == ContentProcessing::Skip {
+            matched_elem_key
+        } else {
+            matched_elem_key
+                .or_else(|| self.schema_set.lookup_element(namespace, local_name))
+        };
+
         if element_key.is_none() {
             if content_model_accepted {
+                if process_contents == ContentProcessing::Skip {
+                    let mut ev_state = ElementValidationState::new(local_name, namespace);
+                    ev_state.ns_context = Some(ns_context.clone());
+                    ev_state.process_contents = ContentProcessing::Skip;
+                    ev_state.content_state = ContentValidatorState::Simple;
+                    ev_state.validity = SchemaValidity::NotKnown;
+                    self.push_element(ev_state);
+                    self.advance_constraints_start_element(local_name, namespace, None);
+                    #[cfg(feature = "xsd11")]
+                    self.detect_assertions_on_element(None, local_name, namespace);
+                    return SchemaInfo::empty();
+                }
+
                 // Content model accepted this element (wildcard in content model)
                 // but no global declaration exists.
                 let is_nil = matches!(xsi_nil, Some("true") | Some("1"));

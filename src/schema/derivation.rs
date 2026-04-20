@@ -1099,14 +1099,24 @@ fn validate_content_particle_restriction(
 
     match (derived_particle, base_particle) {
         (None, None) => Ok(()),
-        (Some(_), None) => Err(SchemaError::structural(
-            "derivation-ok-restriction",
-            format!(
-                "Complex type '{}' adds particle content while restricting '{}' which has empty content",
-                type_name, base_name
-            ),
-            location,
-        )),
+        (Some(derived_particle), None) => {
+            let derived_particle = normalize_type_particle(schema_set, derived, derived_particle)?;
+            // Empty derived particle can restrict an empty-particle base, but not simpleContent (different violation).
+            if !matches!(effective_base.content, ComplexContentResult::Simple(_))
+                && is_effectively_empty(&derived_particle)
+            {
+                Ok(())
+            } else {
+                Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' adds particle content while restricting '{}' which has empty content",
+                        type_name, base_name
+                    ),
+                    location,
+                ))
+            }
+        }
         (None, Some(base_particle)) => {
             let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
             if particle_is_emptiable(&base_particle) {
@@ -1126,8 +1136,7 @@ fn validate_content_particle_restriction(
             let derived_particle = normalize_type_particle(schema_set, derived, derived_particle)?;
             let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
 
-            // A top-level particle with maxOccurs=0 is pointless (§3.8) — treat as empty
-            if derived_particle.max_occurs == Some(0) || is_empty_group(&derived_particle) {
+            if is_effectively_empty(&derived_particle) {
                 if particle_is_emptiable(&base_particle) {
                     return Ok(());
                 } else {
@@ -1167,6 +1176,29 @@ fn validate_content_particle_restriction(
 /// Check if a normalized particle is an empty group (all children removed as pointless).
 fn is_empty_group(particle: &NormalizedParticle) -> bool {
     matches!(&particle.term, NormalizedParticleTerm::Group(group) if group.particles.is_empty())
+}
+
+/// Top-level particle with maxOccurs=0 or fully pruned group — treated as empty content per §3.8.
+fn is_effectively_empty(particle: &NormalizedParticle) -> bool {
+    particle.max_occurs == Some(0) || is_empty_group(particle)
+}
+
+/// Value-space equality for fixed values.
+fn fixed_values_equal(schema_set: &SchemaSet, type_key: TypeKey, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let Ok(a_result) =
+        crate::validation::simple::validate_simple_type(a, type_key, schema_set)
+    else {
+        return false;
+    };
+    let Ok(b_result) =
+        crate::validation::simple::validate_simple_type(b, type_key, schema_set)
+    else {
+        return false;
+    };
+    a_result.typed_value == b_result.typed_value
 }
 
 fn complex_content_particle(content: &ComplexContentResult) -> Option<&ParticleResult> {
@@ -1551,10 +1583,13 @@ fn particle_restricts(
             )
             // 3. nillable: derived nillable only if base nillable
             && (base_element.nillable || !derived_element.nillable)
-            // 4. fixed value: if base is fixed, derived must be fixed with same value
-            && match &base_element.fixed_value {
-                None => true,
-                Some(base_fixed) => derived_element.fixed_value.as_ref() == Some(base_fixed),
+            // 4. fixed value: if base is fixed, derived must be fixed with same value (value-space)
+            && match (&base_element.fixed_value, &derived_element.fixed_value) {
+                (None, _) => true,
+                (Some(_), None) => false,
+                (Some(base_fixed), Some(derived_fixed)) => {
+                    fixed_values_equal(schema_set, derived_element.type_key, derived_fixed, base_fixed)
+                }
             }
             // TODO: 5. identity-constraint definitions subset (not yet implemented)
             // 6. block superset (masked to element-relevant bits)

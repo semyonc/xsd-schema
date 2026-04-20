@@ -184,6 +184,8 @@ fn parse_qname_ref(
     name_table: &NameTable,
     ns_snapshot: &NamespaceContextSnapshot,
 ) -> SchemaResult<QNameRef> {
+    // xs:QName has whiteSpace=collapse.
+    let value = value.trim();
     let (local, prefix) = if let Some(pos) = value.find(':') {
         let prefix = &value[..pos];
         let local = &value[pos + 1..];
