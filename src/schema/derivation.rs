@@ -263,6 +263,17 @@ fn validate_simple_restriction(
         None => return Ok(()), // No base type to validate against
     };
 
+    // cos-st-restricts.1.1: base type must be a simple type definition
+    if let TypeKey::Complex(_) = base_key {
+        let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+        let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+        return Err(SchemaError::structural(
+            "cos-st-restricts",
+            format!("Simple type '{}': base type must be a simple type definition (cos-st-restricts.1.1)", type_name),
+            location,
+        ));
+    }
+
     stats.restrictions_validated += 1;
 
     // Check that base type is not final for restriction

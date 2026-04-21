@@ -391,6 +391,14 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         FacetFixed::Default
     };
 
+    let dup = |name: &str| {
+        SchemaError::structural(
+            "st-props-correct",
+            format!("Facet '{}' must not appear more than once in a restriction", name),
+            None,
+        )
+    };
+
     match facet.kind {
         FacetKind::Enumeration => {
             facets.add_enumeration(facet.value, facet.source);
@@ -400,27 +408,35 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
             facets.add_pattern_unchecked(facet.value, facet.source);
         }
         FacetKind::MinLength => {
+            if facets.min_length.is_some() { return Err(dup("minLength")); }
             facets.set_min_length(parse_nonneg_integer(&facet.value, "minLength")?, fixed, facet.source);
         }
         FacetKind::MaxLength => {
+            if facets.max_length.is_some() { return Err(dup("maxLength")); }
             facets.set_max_length(parse_nonneg_integer(&facet.value, "maxLength")?, fixed, facet.source);
         }
         FacetKind::Length => {
+            if facets.length.is_some() { return Err(dup("length")); }
             facets.set_length(parse_nonneg_integer(&facet.value, "length")?, fixed, facet.source);
         }
         FacetKind::MinInclusive => {
+            if facets.min_inclusive.is_some() { return Err(dup("minInclusive")); }
             facets.set_min_inclusive(facet.value, fixed, facet.source);
         }
         FacetKind::MaxInclusive => {
+            if facets.max_inclusive.is_some() { return Err(dup("maxInclusive")); }
             facets.set_max_inclusive(facet.value, fixed, facet.source);
         }
         FacetKind::MinExclusive => {
+            if facets.min_exclusive.is_some() { return Err(dup("minExclusive")); }
             facets.set_min_exclusive(facet.value, fixed, facet.source);
         }
         FacetKind::MaxExclusive => {
+            if facets.max_exclusive.is_some() { return Err(dup("maxExclusive")); }
             facets.set_max_exclusive(facet.value, fixed, facet.source);
         }
         FacetKind::TotalDigits => {
+            if facets.total_digits.is_some() { return Err(dup("totalDigits")); }
             let v: u32 = parse_nonneg_integer(&facet.value, "totalDigits")?;
             if v == 0 {
                 return Err(SchemaError::structural(
@@ -432,9 +448,11 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
             facets.set_total_digits(v, fixed, facet.source);
         }
         FacetKind::FractionDigits => {
+            if facets.fraction_digits.is_some() { return Err(dup("fractionDigits")); }
             facets.set_fraction_digits(parse_nonneg_integer(&facet.value, "fractionDigits")?, fixed, facet.source);
         }
         FacetKind::WhiteSpace => {
+            if facets.whitespace.is_some() { return Err(dup("whiteSpace")); }
             let mode = match facet.value.as_str() {
                 "preserve" => WhitespaceMode::Preserve,
                 "replace" => WhitespaceMode::Replace,
@@ -453,6 +471,7 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
             );
         }
         FacetKind::ExplicitTimezone => {
+            if facets.explicit_timezone.is_some() { return Err(dup("explicitTimezone")); }
             // XSD 1.1: explicitTimezone facet
             let mode = match facet.value.as_str() {
                 "required" => ExplicitTimezone::Required,
