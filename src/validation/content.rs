@@ -176,7 +176,11 @@ impl ContentValidatorState {
                         };
                         if allow && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns)
                         {
-                            // Accept via open content; do NOT advance NFA state
+                            // Suffix mode: lock NFA to accept-only so no declared elements
+                            // are accepted after the first open-content element (§3.10.4 suffix semantics).
+                            if matches!(oc.mode, TypesOpenContentMode::Suffix) {
+                                *active_states = ActiveStates::Simple([nfa.accept_state].into());
+                            }
                             return Some(ElementMatchInfo {
                                 element_key: None,
                                 resolved_type: None,

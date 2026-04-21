@@ -1271,17 +1271,32 @@ fn compile_content_model_matcher_impl(
         ComplexContentResult::Empty | ComplexContentResult::Simple(_) => None,
     };
 
-    // For extensions, prepend the base type's content model
+    // For extensions, prepend the base type's content model. Capture base's effective
+    // OC for §3.4.2.3 clause 6 inheritance/union on XSD 1.1.
+    #[cfg(feature = "xsd11")]
+    let mut inherited_oc: Option<OpenContent> = None;
+    #[cfg(feature = "xsd11")]
+    let mut base_target_ns: Option<NameId> = None;
+
     let base_nfa = if is_extension {
         if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
             let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
+            #[cfg(feature = "xsd11")]
+            { base_target_ns = base_type_def.target_namespace; }
             let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
             match base_matcher {
                 ContentModelMatcher::Nfa(nfa) => Some(nfa),
-                ContentModelMatcher::WithOpenContent { nfa, .. } => Some(nfa),
+                ContentModelMatcher::WithOpenContent { nfa, mode, wildcard } => {
+                    #[cfg(feature = "xsd11")]
+                    { inherited_oc = Some(OpenContent { mode, wildcard, source: None }); }
+                    #[cfg(not(feature = "xsd11"))]
+                    let _ = (mode, wildcard);
+                    Some(nfa)
+                }
                 ContentModelMatcher::AllGroup(ref model) => {
                     if own_nfa.is_none() {
-                        // Extension adds only attributes — return base AllGroup directly
+                        // Extension adds only attributes — base AllGroup already carries its OC;
+                        // attach_open_content(AllGroup, None) preserves it.
                         let open_content = resolve_open_content(
                             schema_set,
                             &type_def.content,
@@ -1316,6 +1331,24 @@ fn compile_content_model_matcher_impl(
 
     let base_matcher = ContentModelMatcher::Nfa(effective_nfa);
 
+    // §3.4.2.3 clause 6 (inherit + union) for XSD 1.1 extensions; simple resolve otherwise.
+    #[cfg(feature = "xsd11")]
+    let open_content = if schema_set.xsd_version == XsdVersion::V1_1 && is_extension {
+        effective_open_content_for_extension(
+            schema_set,
+            type_def,
+            base_target_ns,
+            inherited_oc.as_ref(),
+        )
+    } else {
+        resolve_open_content(
+            schema_set,
+            &type_def.content,
+            type_def.open_content.as_ref(),
+            type_def.source.as_ref(),
+        )
+    };
+    #[cfg(not(feature = "xsd11"))]
     let open_content = resolve_open_content(
         schema_set,
         &type_def.content,
@@ -1324,6 +1357,140 @@ fn compile_content_model_matcher_impl(
     );
 
     Ok(attach_open_content(base_matcher, open_content))
+}
+
+/// §3.4.2.3 clauses 5–6: effective open content for an XSD 1.1 extension type.
+#[cfg(feature = "xsd11")]
+fn effective_open_content_for_extension(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    base_target_ns: Option<NameId>,
+    inherited: Option<&OpenContent>,
+) -> Option<OpenContent> {
+    let own_oc = resolve_open_content(
+        schema_set,
+        &type_def.content,
+        type_def.open_content.as_ref(),
+        type_def.source.as_ref(),
+    );
+    match own_oc {
+        // Clause 6.1: own OC absent or mode="none" → inherit base OC.
+        None => inherited.cloned(),
+        // Clause 6.2: union wildcards with base OC.
+        Some(own) => {
+            let Some(base_oc) = inherited else {
+                return Some(own);
+            };
+            let derived_target_ns = type_def.target_namespace;
+            let unioned_wildcard = match (own.wildcard.as_ref(), base_oc.wildcard.as_ref()) {
+                (Some(own_wc), Some(base_wc)) => {
+                    Some(wildcard_ref_union(base_wc, base_target_ns, own_wc, derived_target_ns))
+                }
+                (Some(own_wc), None) => Some(own_wc.clone()),
+                (None, Some(base_wc)) => Some(base_wc.clone()),
+                (None, None) => None,
+            };
+            Some(OpenContent { mode: own.mode, wildcard: unioned_wildcard, source: own.source })
+        }
+    }
+}
+
+/// §3.10.6.3 cos-aw-union on `WildcardRef`.
+#[cfg(feature = "xsd11")]
+fn wildcard_ref_union(
+    base: &WildcardRef,
+    base_target_ns: Option<NameId>,
+    derived: &WildcardRef,
+    derived_target_ns: Option<NameId>,
+) -> WildcardRef {
+    let c1 = expand_ns_constraint(&base.namespace_constraint, base_target_ns);
+    let c2 = expand_ns_constraint(&derived.namespace_constraint, derived_target_ns);
+    let union_ns = namespace_constraint_union(c1, c2);
+
+    let process_contents =
+        less_restrictive_process_contents(base.process_contents, derived.process_contents);
+
+    // notQName union: exclusion requires both sides to exclude.
+    let not_qnames: Vec<_> = base
+        .not_qnames
+        .iter()
+        .filter(|q| derived.not_qnames.contains(q))
+        .cloned()
+        .collect();
+
+    WildcardRef {
+        namespace_constraint: union_ns,
+        process_contents,
+        not_qnames,
+        has_defined_sibling: false,
+        source: derived.source.clone(),
+    }
+}
+
+/// Expand token-form namespace constraints (Other/TargetNamespace/Local) to explicit sets.
+#[cfg(feature = "xsd11")]
+fn expand_ns_constraint(nc: &NamespaceConstraint, target_ns: Option<NameId>) -> NamespaceConstraint {
+    match nc {
+        NamespaceConstraint::Other => NamespaceConstraint::Not(vec![target_ns, None]),
+        NamespaceConstraint::TargetNamespace => NamespaceConstraint::List(vec![target_ns]),
+        NamespaceConstraint::Local => NamespaceConstraint::List(vec![None]),
+        other => other.clone(),
+    }
+}
+
+/// §3.10.6.3 set union. Callers must pre-expand token forms via `expand_ns_constraint`.
+#[cfg(feature = "xsd11")]
+fn namespace_constraint_union(c1: NamespaceConstraint, c2: NamespaceConstraint) -> NamespaceConstraint {
+    match (c1, c2) {
+        // Any ∪ X = Any
+        (NamespaceConstraint::Any, _) | (_, NamespaceConstraint::Any) => NamespaceConstraint::Any,
+        // Not(E1) ∪ Not(E2) = Not(E1 ∩ E2)
+        (NamespaceConstraint::Not(e1), NamespaceConstraint::Not(e2)) => {
+            let intersection: Vec<_> = e1.iter().filter(|x| e2.contains(x)).cloned().collect();
+            if intersection.is_empty() {
+                NamespaceConstraint::Any
+            } else {
+                NamespaceConstraint::Not(intersection)
+            }
+        }
+        // Not(E) ∪ Pos(S) = Not(E \ S)  [and symmetric]
+        (NamespaceConstraint::Not(e), NamespaceConstraint::List(s))
+        | (NamespaceConstraint::List(s), NamespaceConstraint::Not(e)) => {
+            let diff: Vec<_> = e.into_iter().filter(|x| !s.contains(x)).collect();
+            if diff.is_empty() {
+                NamespaceConstraint::Any
+            } else {
+                NamespaceConstraint::Not(diff)
+            }
+        }
+        // Pos(S1) ∪ Pos(S2) = Pos(S1 ∪ S2)
+        (NamespaceConstraint::List(mut a), NamespaceConstraint::List(b)) => {
+            for x in b {
+                if !a.contains(&x) {
+                    a.push(x);
+                }
+            }
+            NamespaceConstraint::List(a)
+        }
+        // Token forms should be pre-expanded; widen to Any defensively.
+        (NamespaceConstraint::Other | NamespaceConstraint::TargetNamespace | NamespaceConstraint::Local, _)
+        | (_, NamespaceConstraint::Other | NamespaceConstraint::TargetNamespace | NamespaceConstraint::Local) => {
+            NamespaceConstraint::Any
+        }
+    }
+}
+
+/// Return the less-restrictive of two processContents values (skip > lax > strict).
+#[cfg(feature = "xsd11")]
+fn less_restrictive_process_contents(
+    a: TypesProcessContents,
+    b: TypesProcessContents,
+) -> TypesProcessContents {
+    match (a, b) {
+        (TypesProcessContents::Skip, _) | (_, TypesProcessContents::Skip) => TypesProcessContents::Skip,
+        (TypesProcessContents::Lax, _) | (_, TypesProcessContents::Lax) => TypesProcessContents::Lax,
+        _ => TypesProcessContents::Strict,
+    }
 }
 
 fn empty_nfa() -> NfaTable {
