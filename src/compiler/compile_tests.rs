@@ -1,4 +1,5 @@
 use super::*;
+use crate::parser::frames::OpenContentMode;
 use crate::parser::location::{SourceRef, SourceSpan};
 use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
 use crate::schema::wildcard::ElementWildcard;

@@ -342,6 +342,28 @@ pub enum OpenContentMode {
     Suffix,
 }
 
+impl From<crate::parser::frames::OpenContentMode> for OpenContentMode {
+    fn from(m: crate::parser::frames::OpenContentMode) -> Self {
+        use crate::parser::frames::OpenContentMode as Src;
+        match m {
+            Src::None => Self::None,
+            Src::Interleave => Self::Interleave,
+            Src::Suffix => Self::Suffix,
+        }
+    }
+}
+
+impl From<crate::schema::model::OpenContentMode> for OpenContentMode {
+    fn from(m: crate::schema::model::OpenContentMode) -> Self {
+        use crate::schema::model::OpenContentMode as Src;
+        match m {
+            Src::None => Self::None,
+            Src::Interleave => Self::Interleave,
+            Src::Suffix => Self::Suffix,
+        }
+    }
+}
+
 /// Attribute use (attribute declaration with use constraints)
 #[derive(Debug, Clone)]
 pub struct AttributeUse {

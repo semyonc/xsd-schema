@@ -100,70 +100,22 @@ pub struct PatternFacet {
 impl PatternFacet {
     /// Create a new pattern facet from an XSD pattern string.
     ///
-    /// The pattern is converted from XSD regex syntax to Rust regex syntax
-    /// and compiled. Returns an error if the pattern is invalid.
+    /// The pattern is validated and compiled using the appropriate backend
+    /// (XSD 1.0: `regex` via `convert_xml_pattern`; XSD 1.1: `regexml` after
+    /// a `\p{X}` rewrite if `xsd_version == V1_0`). Returns an error if the
+    /// pattern is invalid.
     ///
     /// `xsd_version` controls the `\p{X}` category escape semantics: under
     /// `V1_0` recognized general-category names are expanded to Unicode 3.0
     /// ranges; `V1_1` passes them through to the backend unchanged.
-    #[cfg(not(feature = "xsd11"))]
     pub fn new(
         value: String,
         source: Option<SourceRef>,
         xsd_version: XsdVersion,
     ) -> FacetResult<Self> {
-        let opts = match xsd_version {
-            XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
-            XsdVersion::V1_1 => ConvertOptions::xsd(),
-        };
-        let rust_pattern = convert_xml_pattern(&value, opts);
-        let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
-            pattern: value.clone(),
-            message: e.to_string(),
-        })?;
-        Ok(Self {
-            value,
-            compiled: Some(compiled),
-            source,
-        })
-    }
-
-    /// Create a new pattern facet from an XSD pattern string.
-    ///
-    /// Uses `regexml` for native XML Schema 1.1 regex support with full Unicode.
-    /// Validates with XSD regex rules (rejecting XPath-only constructs like `^$`,
-    /// backreferences, `(?:...)`), then compiles with anchoring for full-string match.
-    ///
-    /// Under `XsdVersion::V1_0` the pattern is additionally rewritten so that
-    /// `\p{X}` / `\P{X}` general-category escapes resolve to the Unicode 3.0
-    /// assignments before regexml sees them.
-    #[cfg(feature = "xsd11")]
-    pub fn new(
-        value: String,
-        source: Option<SourceRef>,
-        xsd_version: XsdVersion,
-    ) -> FacetResult<Self> {
-        // Validate pattern against XSD regex rules (rejects non-XSD constructs)
-        regexml::Regex::xsd(&value, "").map_err(|e| FacetError::InvalidPattern {
-            pattern: value.clone(),
-            message: format!("{:?}", e),
-        })?;
-        let pinned = match xsd_version {
-            XsdVersion::V1_0 => rewrite_xsd10_category_escapes(&value),
-            XsdVersion::V1_1 => value.clone(),
-        };
-        // Compile with explicit anchoring for full-string matching
-        let anchored = format!("^(?:{})$", pinned);
-        let compiled =
-            regexml::Regex::xpath(&anchored, "").map_err(|e| FacetError::InvalidPattern {
-                pattern: value.clone(),
-                message: format!("{:?}", e),
-            })?;
-        Ok(Self {
-            value,
-            compiled: Some(Arc::new(compiled)),
-            source,
-        })
+        let mut facet = Self::new_unchecked(value, source);
+        facet.compile(xsd_version)?;
+        Ok(facet)
     }
 
     /// Create a pattern facet without compiling (for deferred compilation)
@@ -197,14 +149,18 @@ impl PatternFacet {
     #[cfg(feature = "xsd11")]
     pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
-            // Validate against XSD regex rules first
+            // Validate against XSD regex rules first. Intentional two-pass:
+            // xsd() rejects XPath-only constructs (e.g. `^$`, backrefs, `(?:...)`)
+            // that xpath() would otherwise accept.
             regexml::Regex::xsd(&self.value, "").map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: format!("{:?}", e),
             })?;
-            let pinned = match xsd_version {
-                XsdVersion::V1_0 => rewrite_xsd10_category_escapes(&self.value),
-                XsdVersion::V1_1 => self.value.clone(),
+            // Under XSD 1.0 the \p{X} rewrite produces a new String; under 1.1
+            // we borrow self.value directly — no allocation.
+            let pinned: std::borrow::Cow<'_, str> = match xsd_version {
+                XsdVersion::V1_0 => std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&self.value)),
+                XsdVersion::V1_1 => std::borrow::Cow::Borrowed(&self.value),
             };
             // Compile with explicit anchoring for full-string matching
             let anchored = format!("^(?:{})$", pinned);
@@ -366,7 +322,9 @@ pub struct FacetSet {
     // Pattern facets (multiple patterns are ANDed)
     pub patterns: Vec<PatternFacet>,
 
-    // Enumeration (allowed values)
+    // Enumeration (allowed values). The `Option` is only the presence flag;
+    // multi-valued semantics live inside `EnumerationFacet::values` (HashSet),
+    // so enumeration is exempt from st-props-correct.1 "no duplicate facet" (§3.16.2).
     pub enumeration: Option<EnumerationFacet>,
 
     // Whitespace handling

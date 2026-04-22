@@ -439,9 +439,8 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
 /// XSD 1.1 relaxes this to allow `xs:any` and group references in all groups.
 fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::parser::frames::{Compositor, ComplexContentResult};
-    use crate::schema::model::XsdVersion;
 
-    if schema_set.xsd_version != XsdVersion::V1_0 {
+    if !schema_set.is_xsd10() {
         return Ok(());
     }
 
@@ -472,7 +471,7 @@ fn check_all_group_no_wildcards(
 
     for particle in particles {
         if let ParticleTerm::Any(wc) = &particle.term {
-            let location = wc.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+            let location = schema_set.locate(wc.source.as_ref());
             return Err(crate::error::SchemaError::structural(
                 "src-model-group",
                 "In XSD 1.0, xs:any (wildcard) is not allowed inside an xs:all group".to_string(),

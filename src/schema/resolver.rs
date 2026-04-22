@@ -432,7 +432,7 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                 stats.attribute_groups_resolved += 1;
             } else {
                 // Step B: Error for unresolvable defaultAttributes
-                let location = doc.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+                let location = schema_set.locate(doc.source.as_ref());
                 let name_str = format_resolved_qname(
                     &schema_set.name_table,
                     qname.namespace_uri,

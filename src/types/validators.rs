@@ -78,6 +78,22 @@ impl From<FacetError> for ValidationError {
 /// Result type for validation operations
 pub type ValidationResult<T> = Result<T, ValidationError>;
 
+/// Build the `validate_enum_value_space` closure for a type whose instance
+/// value has been parsed. Each enumeration candidate lexical is normalized
+/// (whitespace=collapse), parsed with `$parse_fn` (returning `Result` or
+/// `Option` with `.ok()`), then compared against `$typed` using `$eq_fn`.
+///
+/// Used by Float / Double / Duration validators — §cvc-enumeration-valid
+/// compares in value space (not lexically) for these types.
+macro_rules! enum_matches_value_space {
+    ($typed:expr, $parse_fn:expr, $eq_fn:expr) => {
+        |s: &str| $parse_fn(&normalize_whitespace(s, WhitespaceMode::Collapse))
+            .ok()
+            .map(|e| $eq_fn($typed, e))
+            .unwrap_or(false)
+    };
+}
+
 /// Trait for XSD type validators
 ///
 /// Validators are responsible for:
@@ -742,8 +758,7 @@ impl TypeValidator for FloatValidator {
             facets.validate_float(f)?;
             // §cvc-enumeration-valid: compare in value space, not lexically
             facets.validate_enum_value_space(
-                |s| parse_float(&normalize_whitespace(s, WhitespaceMode::Collapse))
-                    .ok().map(|e| float_eq(f, e)).unwrap_or(false),
+                enum_matches_value_space!(f, parse_float, float_eq),
                 value,
             )?;
         }
@@ -785,8 +800,7 @@ impl TypeValidator for DoubleValidator {
             facets.validate_double(d)?;
             // §cvc-enumeration-valid: compare in value space, not lexically
             facets.validate_enum_value_space(
-                |s| parse_double(&normalize_whitespace(s, WhitespaceMode::Collapse))
-                    .ok().map(|e| double_eq(d, e)).unwrap_or(false),
+                enum_matches_value_space!(d, parse_double, double_eq),
                 value,
             )?;
         }
@@ -822,17 +836,7 @@ fn parse_double(s: &str) -> Result<f64, String> {
     }
 }
 
-/// Value-space equality for xs:float (NaN == NaN per XSD, ±0 equal per IEEE 754)
-fn float_eq(a: f32, b: f32) -> bool {
-    if a.is_nan() && b.is_nan() { return true; }
-    a == b
-}
-
-/// Value-space equality for xs:double (NaN == NaN per XSD, ±0 equal per IEEE 754)
-fn double_eq(a: f64, b: f64) -> bool {
-    if a.is_nan() && b.is_nan() { return true; }
-    a == b
-}
+use crate::types::equality::{double_eq, float_eq};
 
 /// Value-space equality for xs:duration per §3.3.6.
 /// Two durations are equal iff their signed total-months components are equal
@@ -942,8 +946,7 @@ impl TypeValidator for DurationValidator {
             })?;
             // §cvc-enumeration-valid: compare in value space, not lexically
             facets.validate_enum_value_space(
-                |s| parse_duration(&normalize_whitespace(s, WhitespaceMode::Collapse))
-                    .ok().map(|e| duration_eq(dur, &e)).unwrap_or(false),
+                enum_matches_value_space!(dur, parse_duration, |a, b| duration_eq(a, &b)),
                 value,
             )?;
         }

@@ -17,7 +17,7 @@ use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
 use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents, WildcardNamespace, WildcardResult};
 use crate::parser::location::SourceLocation;
-use crate::schema::model::{DerivationSet, XsdVersion};
+use crate::schema::model::DerivationSet;
 use crate::schema::resolver::format_resolved_qname;
 use crate::schema::SchemaSet;
 use crate::types::XmlTypeCode;
@@ -534,16 +534,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state: &mut ElementValidationState,
     ) {
         for err in assertion_errors {
-            let err = if !self.element_path.is_empty() {
-                err.with_path(self.element_path.clone())
-            } else {
-                err
-            };
-            let err = match &self.current_location {
-                Some(loc) => err.with_location(loc.clone()),
-                None => err,
-            };
-            self.emit_error_to(err, &mut ev_state.error_codes);
+            self.report_validation_error_to(err, &mut ev_state.error_codes);
             ev_state.validity = SchemaValidity::Invalid;
         }
     }
@@ -603,6 +594,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.validate_element_by_id(name_id, ns_id, xsi_type, xsi_nil, ns_context)
     }
 
+    /// Push a skip-wildcard-matched element onto the stack with
+    /// `process_contents=Skip`, `validity=NotKnown`, and no content-model
+    /// validation. Returns the empty SchemaInfo callers propagate on skip.
+    fn push_skipped_element(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        ns_context: &NamespaceContextSnapshot,
+    ) -> SchemaInfo {
+        let mut ev_state = ElementValidationState::new(local_name, namespace);
+        ev_state.ns_context = Some(ns_context.clone());
+        ev_state.process_contents = ContentProcessing::Skip;
+        ev_state.content_state = ContentValidatorState::Simple;
+        ev_state.validity = SchemaValidity::NotKnown;
+        self.push_element(ev_state);
+        self.advance_constraints_start_element(local_name, namespace, None);
+        #[cfg(feature = "xsd11")]
+        self.detect_assertions_on_element(None, local_name, namespace);
+        SchemaInfo::empty()
+    }
+
     /// Validate an element start event (NameId fast-path)
     pub fn validate_element_by_id(
         &mut self,
@@ -646,16 +658,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if parent.process_contents == ContentProcessing::Skip {
                 // Skipped element: don't validate content model, push as skip, return
                 parent.has_element_children = true;
-                let mut ev_state = ElementValidationState::new(local_name, namespace);
-                ev_state.ns_context = Some(ns_context.clone());
-                ev_state.process_contents = ContentProcessing::Skip;
-                ev_state.content_state = ContentValidatorState::Simple;
-                ev_state.validity = SchemaValidity::NotKnown;
-                self.push_element(ev_state);
-                self.advance_constraints_start_element(local_name, namespace, None);
-                #[cfg(feature = "xsd11")]
-                self.detect_assertions_on_element(None, local_name, namespace);
-                return SchemaInfo::empty();
+                return self.push_skipped_element(local_name, namespace, ns_context);
             } else if parent.is_nil {
                 let parent_name = self
                     .schema_set
@@ -740,16 +743,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if element_key.is_none() {
             if content_model_accepted {
                 if process_contents == ContentProcessing::Skip {
-                    let mut ev_state = ElementValidationState::new(local_name, namespace);
-                    ev_state.ns_context = Some(ns_context.clone());
-                    ev_state.process_contents = ContentProcessing::Skip;
-                    ev_state.content_state = ContentValidatorState::Simple;
-                    ev_state.validity = SchemaValidity::NotKnown;
-                    self.push_element(ev_state);
-                    self.advance_constraints_start_element(local_name, namespace, None);
-                    #[cfg(feature = "xsd11")]
-                    self.detect_assertions_on_element(None, local_name, namespace);
-                    return SchemaInfo::empty();
+                    return self.push_skipped_element(local_name, namespace, ns_context);
                 }
 
                 // Content model accepted this element (wildcard in content model)
@@ -957,9 +951,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         // §3.3.4.4 cvc-type clause 2: if T is a complex type definition, T.{abstract} must be false.
-        let abstract_type_invalid = !xsi_type_invalid
-            && matches!(type_key, Some(TypeKey::Complex(k))
-                if self.schema_set.arenas.complex_types.get(k).is_some_and(|ct| ct.is_abstract));
+        // Hoist the complex-type fetch once so the cvc-type.2 error path below can
+        // reuse the name/target_namespace without re-resolving the arena entry.
+        let abstract_ct_info: Option<(Option<NameId>, Option<NameId>)> =
+            if !xsi_type_invalid {
+                if let Some(TypeKey::Complex(k)) = type_key {
+                    self.schema_set.arenas.complex_types.get(k)
+                        .filter(|ct| ct.is_abstract)
+                        .map(|ct| (ct.name, ct.target_namespace))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+        let abstract_type_invalid = abstract_ct_info.is_some();
 
         // 7. xsi:nil
         let is_nil = if let Some(nil_str) = xsi_nil {
@@ -1008,15 +1014,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 format!("Element '{}' is abstract and cannot appear in instances", elem_name),
             );
         }
-        if abstract_type_invalid {
-            let type_name = if let Some(TypeKey::Complex(ct_key)) = type_key {
-                self.schema_set.arenas.complex_types.get(ct_key)
-                    .and_then(|ct| ct.name)
-                    .map(|n| self.schema_set.name_table.resolve(n))
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
+        if let Some((ct_name, ct_ns)) = abstract_ct_info {
+            let type_name = crate::schema::derivation::format_type_name(
+                self.schema_set, ct_name, ct_ns,
+            );
             self.report_error(
                 "cvc-type.2",
                 format!("Type '{}' is abstract and cannot be used to validate an element", type_name),
@@ -1066,32 +1067,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             #[cfg(feature = "xsd11")]
             assertion_outcome: None,
         }
-    }
-
-    /// Compare an instance value against a schema fixed value using value-space equality.
-    ///
-    /// Returns `true` if the values are considered equal.  Uses typed-value (value-space)
-    /// comparison when a `type_key` is available, falling back to raw string equality.
-    /// Fast-path: if the strings are already identical, returns `true` without parsing.
-    fn fixed_value_matches(
-        instance: &str,
-        fixed: &str,
-        type_key: Option<TypeKey>,
-        schema_set: &crate::schema::SchemaSet,
-    ) -> bool {
-        if instance == fixed {
-            return true;
-        }
-        let Some(tk) = type_key else {
-            return false;
-        };
-        let Ok(inst_result) = super::simple::validate_simple_type(instance, tk, schema_set) else {
-            return false;
-        };
-        let Ok(fixed_result) = super::simple::validate_simple_type(fixed, tk, schema_set) else {
-            return false;
-        };
-        inst_result.typed_value == fixed_result.typed_value
     }
 
     /// Validate an attribute (string-based lookup)
@@ -1754,8 +1729,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             ),
                             self.current_location.clone(),
                         );
-                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
-                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        self.report_validation_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1795,16 +1769,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ev_state.normalized_value = result.normalized_value;
                     }
                     Err(err) => {
-                        let err = match &self.current_location {
-                            Some(loc) => err.with_location(loc.clone()),
-                            None => err,
-                        };
-                        let err = if self.element_path.is_empty() {
-                            err
-                        } else {
-                            err.with_path(self.element_path.clone())
-                        };
-                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        self.report_validation_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1813,16 +1778,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // Check fixed value on element — cvc-elt.5.2.2.2.2 (§3.3.4.3).
             // Use value-space comparison so that lexically-different but value-equivalent
             // forms (e.g. boolean "1" vs "true", float "1.0" vs "1.000", token whitespace)
-            // are treated as matching.
+            // are treated as matching. Reuses `ev_state.typed_value` parsed above
+            // (line ~1778) to avoid a second parse of the same text content.
             if let Some(elem_key) = ev_state.element_decl {
                 let elem_data = &self.schema_set.arenas.elements[elem_key];
                 if let Some(fixed) = &elem_data.fixed_value {
-                    if !Self::fixed_value_matches(
-                        &ev_state.text_content,
-                        fixed,
-                        ev_state.schema_type,
-                        self.schema_set,
-                    ) {
+                    let matches = if let Some(ref typed) = ev_state.typed_value {
+                        super::simple::fixed_matches_typed(
+                            &ev_state.text_content,
+                            typed,
+                            fixed,
+                            ev_state.schema_type,
+                            self.schema_set,
+                        )
+                    } else {
+                        super::simple::fixed_values_equal(
+                            &ev_state.text_content,
+                            fixed,
+                            ev_state.schema_type,
+                            self.schema_set,
+                        )
+                    };
+                    if !matches {
                         let elem_name =
                             self.schema_set.name_table.resolve(ev_state.local_name);
                         let err = errors::error(
@@ -1833,8 +1810,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             ),
                             self.current_location.clone(),
                         );
-                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
-                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        self.report_validation_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1857,8 +1833,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             ),
                             self.current_location.clone(),
                         );
-                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
-                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        self.report_validation_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     } else if ev_state.has_text && ev_state.text_content != *fixed {
                         // cvc-elt.5.2.2.2.1: initial value (concatenated text) must match fixed
@@ -1870,8 +1845,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             ),
                             self.current_location.clone(),
                         );
-                        let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
-                        self.emit_error_to(err, &mut ev_state.error_codes);
+                        self.report_validation_error_to(err, &mut ev_state.error_codes);
                         ev_state.validity = SchemaValidity::Invalid;
                     }
                 }
@@ -1994,8 +1968,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 ),
                                 self.current_location.clone(),
                             );
-                            let err = if self.element_path.is_empty() { err } else { err.with_path(self.element_path.clone()) };
-                            self.emit_error_to(err, &mut ev_state.error_codes);
+                            self.report_validation_error_to(err, &mut ev_state.error_codes);
                             ev_state.validity = SchemaValidity::Invalid;
                             assertion_outcome = Some(AssertionOutcome::Failed);
                         }
@@ -2604,17 +2577,36 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.emit_error(err);
     }
 
-    /// Enrich an existing `ValidationError` with location/path and report it.
-    fn report_validation_error(&mut self, err: ValidationError) {
+    /// Enrich `err` with `current_location` and `element_path` (if either is set).
+    /// `with_location` / `with_path` overwrite so this is safe to call even when
+    /// the error already carries them.
+    fn enrich(&self, err: ValidationError) -> ValidationError {
         let err = match &self.current_location {
             Some(loc) => err.with_location(loc.clone()),
             None => err,
         };
-        let err = if self.element_path.is_empty() {
+        if self.element_path.is_empty() {
             err
         } else {
             err.with_path(self.element_path.clone())
-        };
+        }
+    }
+
+    /// Enrich `err` with current location/path and report it to an explicit
+    /// `codes` target (e.g. during `validate_end_element` after the element
+    /// has been popped off the stack).
+    fn report_validation_error_to(
+        &mut self,
+        err: ValidationError,
+        codes: &mut Vec<&'static str>,
+    ) {
+        let err = self.enrich(err);
+        self.emit_error_to(err, codes);
+    }
+
+    /// Enrich an existing `ValidationError` with location/path and report it.
+    fn report_validation_error(&mut self, err: ValidationError) {
+        let err = self.enrich(err);
         self.emit_error(err);
     }
 
@@ -3135,9 +3127,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn register_id_value(&mut self, value: String, owner_serial: u64) {
         match self.id_values.get(&value) {
             Some(&existing_serial) => {
-                if !(self.schema_set.xsd_version == XsdVersion::V1_1
-                    && existing_serial == owner_serial)
-                {
+                if !(self.schema_set.is_xsd11() && existing_serial == owner_serial) {
                     self.report_error(
                         "cvc-id.2",
                         format!("Duplicate ID value '{}'", value),
@@ -3313,20 +3303,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         match found {
             AttributeLookup::Found(attr_key, attr_type, fixed_value, inheritable) => {
-                if let Some(fixed) = fixed_value {
-                    if !Self::fixed_value_matches(value, &fixed, attr_type, self.schema_set) {
-                        let attr_name = self.schema_set.name_table.resolve(local_name);
-                        self.report_error(
-                            "cvc-attribute.4",
-                            format!(
-                                "Attribute '{}' has fixed value '{}' but got '{}'",
-                                attr_name, fixed, value
-                            ),
-                        );
-                        self.mark_current_invalid();
-                    }
-                }
-
+                // Parse value once; reused for the fixed-value check and for SchemaInfo.
                 let mut member_type = None;
                 let mut typed_value = None;
                 let mut normalized_value = None;
@@ -3343,6 +3320,25 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             attr_validity = SchemaValidity::Invalid;
                             self.mark_current_invalid();
                         }
+                    }
+                }
+
+                if let Some(fixed) = fixed_value {
+                    let matches = if let Some(ref tv) = typed_value {
+                        super::simple::fixed_matches_typed(value, tv, &fixed, attr_type, self.schema_set)
+                    } else {
+                        super::simple::fixed_values_equal(value, &fixed, attr_type, self.schema_set)
+                    };
+                    if !matches {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed, value
+                            ),
+                        );
+                        self.mark_current_invalid();
                     }
                 }
 
@@ -3851,22 +3847,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let attr_type = attr_data.and_then(|d| d.resolved_type);
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
 
-                if let Some(fixed_val) = fixed {
-                    if !Self::fixed_value_matches(value, &fixed_val, attr_type, self.schema_set) {
-                        let attr_name = self.schema_set.name_table.resolve(local_name);
-                        self.report_error(
-                            "cvc-attribute.4",
-                            format!(
-                                "Attribute '{}' has fixed value '{}' but got '{}'",
-                                attr_name, fixed_val, value
-                            ),
-                        );
-                        if let Some(s) = self.validation_stack.last_mut() {
-                            s.validity = SchemaValidity::Invalid;
-                        }
-                    }
-                }
-
+                // Parse value once; reused for the fixed-value check and SchemaInfo.
                 let mut member_type = None;
                 let mut typed_value = None;
                 let mut normalized_value = None;
@@ -3883,20 +3864,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             normalized_value = result.normalized_value;
                         }
                         Err(err) => {
-                            let err = match &self.current_location {
-                                Some(loc) => err.with_location(loc.clone()),
-                                None => err,
-                            };
-                            let err = if self.element_path.is_empty() {
-                                err
-                            } else {
-                                err.with_path(self.element_path.clone())
-                            };
-                            self.emit_error(err);
+                            self.report_validation_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {
                                 s.validity = SchemaValidity::Invalid;
                             }
+                        }
+                    }
+                }
+
+                if let Some(fixed_val) = fixed {
+                    let matches = if let Some(ref tv) = typed_value {
+                        super::simple::fixed_matches_typed(value, tv, &fixed_val, attr_type, self.schema_set)
+                    } else {
+                        super::simple::fixed_values_equal(value, &fixed_val, attr_type, self.schema_set)
+                    };
+                    if !matches {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed_val, value
+                            ),
+                        );
+                        if let Some(s) = self.validation_stack.last_mut() {
+                            s.validity = SchemaValidity::Invalid;
                         }
                     }
                 }
@@ -3956,22 +3949,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let attr_type = attr_data.and_then(|d| d.resolved_type);
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
 
-                if let Some(fixed_val) = fixed {
-                    if !Self::fixed_value_matches(value, &fixed_val, attr_type, self.schema_set) {
-                        let attr_name = self.schema_set.name_table.resolve(local_name);
-                        self.report_error(
-                            "cvc-attribute.4",
-                            format!(
-                                "Attribute '{}' has fixed value '{}' but got '{}'",
-                                attr_name, fixed_val, value
-                            ),
-                        );
-                        if let Some(s) = self.validation_stack.last_mut() {
-                            s.validity = SchemaValidity::Invalid;
-                        }
-                    }
-                }
-
+                // Parse value once; reused for the fixed-value check and SchemaInfo.
                 let mut member_type = None;
                 let mut typed_value = None;
                 let mut normalized_value = None;
@@ -3988,20 +3966,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             normalized_value = result.normalized_value;
                         }
                         Err(err) => {
-                            let err = match &self.current_location {
-                                Some(loc) => err.with_location(loc.clone()),
-                                None => err,
-                            };
-                            let err = if self.element_path.is_empty() {
-                                err
-                            } else {
-                                err.with_path(self.element_path.clone())
-                            };
-                            self.emit_error(err);
+                            self.report_validation_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {
                                 s.validity = SchemaValidity::Invalid;
                             }
+                        }
+                    }
+                }
+
+                if let Some(fixed_val) = fixed {
+                    let matches = if let Some(ref tv) = typed_value {
+                        super::simple::fixed_matches_typed(value, tv, &fixed_val, attr_type, self.schema_set)
+                    } else {
+                        super::simple::fixed_values_equal(value, &fixed_val, attr_type, self.schema_set)
+                    };
+                    if !matches {
+                        let attr_name = self.schema_set.name_table.resolve(local_name);
+                        self.report_error(
+                            "cvc-attribute.4",
+                            format!(
+                                "Attribute '{}' has fixed value '{}' but got '{}'",
+                                attr_name, fixed_val, value
+                            ),
+                        );
+                        if let Some(s) = self.validation_stack.last_mut() {
+                            s.validity = SchemaValidity::Invalid;
                         }
                     }
                 }
@@ -4364,9 +4354,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // schema construct (constraint au-props-correct.5 was added in XSD 1.1).
                     // The combination means the attribute may appear with the fixed value.
                     // (W3C test attP031: schema valid in 1.0, instance with fixed value valid.)
-                    if fixed.is_some()
-                        && self.schema_set.xsd_version == XsdVersion::V1_0
-                    {
+                    if fixed.is_some() && self.schema_set.is_xsd10() {
                         let inheritable = attr_use.attribute.inheritable;
                         return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
                     }

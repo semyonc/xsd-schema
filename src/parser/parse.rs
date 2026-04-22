@@ -724,9 +724,18 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
     // Pop namespace scope
     state.pop_scope();
 
-    // Attach result to parent frame
+    // Attach result to parent frame. Errors from attach() (e.g. st-props-correct
+    // duplicate facet from apply_facet) are attributed to the child frame's
+    // source location — that is the offending element per §3.16.2.
     if let Some(parent) = state.current_frame_mut() {
-        parent.attach(result)?;
+        if let Err(e) = parent.attach(result) {
+            let e = if let Some(ref src) = source_ref {
+                e.with_location(state.source_map.locate(src.span.start))
+            } else {
+                e
+            };
+            return Err(e);
+        }
     }
     // If no parent, store the root schema result
     else if let FrameResult::Schema(schema_result) = result {

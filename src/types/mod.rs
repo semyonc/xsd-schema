@@ -25,6 +25,7 @@ pub mod value;
 pub mod sequence;
 pub mod validators;
 pub mod convert;
+pub mod equality;
 
 // Re-exports
 pub use facets::{

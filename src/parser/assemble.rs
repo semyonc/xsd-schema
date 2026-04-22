@@ -291,7 +291,7 @@ impl<'a> SchemaAssembler<'a> {
         for ic in &identity_constraints {
             if !self.identity_constraint_names.insert(ic.name) {
                 // Name already exists in this document - duplicate error
-                let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                let location = self.schema_set.locate(ic.source.as_ref());
                 let name_str = self.schema_set.name_table.resolve(ic.name);
                 return Err(SchemaError::structural(
                     "ic-unique",
@@ -315,7 +315,7 @@ impl<'a> SchemaAssembler<'a> {
                 xsd_version,
             ) {
                 let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
-                let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                let location = self.schema_set.locate(ic.source.as_ref());
                 return Err(SchemaError::structural(
                     "src-identity-constraint",
                     format!("Identity constraint '{}': invalid selector XPath '{}': {}", ic_name, ic.selector.xpath, e),
@@ -334,7 +334,7 @@ impl<'a> SchemaAssembler<'a> {
                     xsd_version,
                 ) {
                     let ic_name = self.schema_set.name_table.resolve_ref(ic.name);
-                    let location = ic.source.as_ref().and_then(|s| self.schema_set.source_maps.locate(s));
+                    let location = self.schema_set.locate(ic.source.as_ref());
                     return Err(SchemaError::structural(
                         "src-identity-constraint",
                         format!("Identity constraint '{}': invalid field XPath '{}': {}", ic_name, field.xpath, e),
@@ -763,7 +763,7 @@ pub fn build_schema_document(
         doc.default_open_content = Some(crate::schema::DefaultOpenContent {
             source: doc_result.source.clone(),
             applies_to_empty: doc_result.applies_to_empty,
-            mode: convert_open_content_mode(doc_result.mode),
+            mode: doc_result.mode.into(),
             wildcard: doc_result
                 .wildcard
                 .as_ref()
@@ -1029,18 +1029,6 @@ pub fn parse_form_choice(value: Option<&str>) -> FormChoice {
         Some("qualified") => FormChoice::Qualified,
         Some("unqualified") | None => FormChoice::Unqualified,
         _ => FormChoice::Unqualified,
-    }
-}
-
-fn convert_open_content_mode(
-    mode: crate::parser::frames::OpenContentMode,
-) -> crate::schema::OpenContentMode {
-    match mode {
-        crate::parser::frames::OpenContentMode::None => crate::schema::OpenContentMode::None,
-        crate::parser::frames::OpenContentMode::Interleave => {
-            crate::schema::OpenContentMode::Interleave
-        }
-        crate::parser::frames::OpenContentMode::Suffix => crate::schema::OpenContentMode::Suffix,
     }
 }
 

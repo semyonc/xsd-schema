@@ -145,6 +145,19 @@ pub enum ComplexContentResult {
     Complex(ComplexContentDefResult),
 }
 
+impl ComplexContentResult {
+    /// Returns `true` if this content is "empty" per §3.4.6.3 / §3.4.2.3:
+    /// explicit `Empty`, or a complex content with no particle.
+    /// SimpleContent is never empty.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ComplexContentResult::Empty => true,
+            ComplexContentResult::Complex(def) => def.particle.is_none(),
+            ComplexContentResult::Simple(_) => false,
+        }
+    }
+}
+
 /// Simple content definition result
 #[derive(Debug, Clone)]
 pub struct SimpleContentDefResult {

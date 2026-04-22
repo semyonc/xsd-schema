@@ -116,36 +116,13 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
                 'p' | 'P' => {
                     let negated = next == 'P';
                     chars.next();
-                    if chars.peek() != Some(&'{') {
-                        result.push('\\');
-                        result.push(next);
-                        continue;
-                    }
-                    chars.next();
-                    let mut name = String::new();
-                    let mut closed = false;
-                    for c in chars.by_ref() {
-                        if c == '}' {
-                            closed = true;
-                            break;
-                        }
-                        name.push(c);
-                    }
-                    if closed
-                        && options.xsd_version == XsdVersion::V1_0
-                        && try_expand_category(&mut result, &name, negated, in_class)
-                    {
-                        continue;
-                    }
-                    // Fallback: pass through unchanged (block escapes, unknown
-                    // categories, XSD 1.1, or unterminated escape).
-                    result.push('\\');
-                    result.push(next);
-                    result.push('{');
-                    result.push_str(&name);
-                    if closed {
-                        result.push('}');
-                    }
+                    handle_category_escape(
+                        &mut result,
+                        &mut chars,
+                        negated,
+                        in_class,
+                        options.xsd_version == XsdVersion::V1_0,
+                    );
                 }
                 // Other escapes - pass through
                 _ => {
@@ -205,31 +182,7 @@ pub fn rewrite_xsd10_category_escapes(pattern: &str) -> String {
         }
         let negated = next == 'P';
         chars.next();
-        if chars.peek() != Some(&'{') {
-            result.push('\\');
-            result.push(next);
-            continue;
-        }
-        chars.next();
-        let mut name = String::new();
-        let mut closed = false;
-        for c in chars.by_ref() {
-            if c == '}' {
-                closed = true;
-                break;
-            }
-            name.push(c);
-        }
-        if closed && try_expand_category(&mut result, &name, negated, in_class) {
-            continue;
-        }
-        result.push('\\');
-        result.push(next);
-        result.push('{');
-        result.push_str(&name);
-        if closed {
-            result.push('}');
-        }
+        handle_category_escape(&mut result, &mut chars, negated, in_class, true);
     }
     result
 }
@@ -266,6 +219,47 @@ fn try_expand_category(out: &mut String, name: &str, negated: bool, in_class: bo
     out.push_str(body);
     out.push(']');
     true
+}
+
+/// Parse `{name}` (the body of a `\p{…}` / `\P{…}` escape) and append either
+/// the expanded character class (when `try_expand` is true and `name` is a
+/// recognized general-category code) or the verbatim original token.
+///
+/// Caller has already consumed `\` and the `p`/`P`; `chars` is positioned
+/// just before the opening `{` (or at a stray `\p`/`\P` if `{` is absent).
+fn handle_category_escape(
+    out: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    negated: bool,
+    in_class: bool,
+    try_expand: bool,
+) {
+    let marker = if negated { 'P' } else { 'p' };
+    if chars.peek() != Some(&'{') {
+        out.push('\\');
+        out.push(marker);
+        return;
+    }
+    chars.next();
+    let mut name = String::new();
+    let mut closed = false;
+    for c in chars.by_ref() {
+        if c == '}' {
+            closed = true;
+            break;
+        }
+        name.push(c);
+    }
+    if try_expand && closed && try_expand_category(out, &name, negated, in_class) {
+        return;
+    }
+    out.push('\\');
+    out.push(marker);
+    out.push('{');
+    out.push_str(&name);
+    if closed {
+        out.push('}');
+    }
 }
 
 #[cfg(test)]

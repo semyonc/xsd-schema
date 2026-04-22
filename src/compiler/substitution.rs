@@ -119,22 +119,12 @@ pub(crate) fn is_substitutable(
 }
 
 pub(crate) fn effective_element_constraints(
-    schema_set: &SchemaSet,
+    _schema_set: &SchemaSet,
     element: &crate::arenas::ElementDeclData,
 ) -> (DerivationSet, DerivationSet) {
-    // block is resolved at assembly time (block="" overrides blockDefault, absent inherits it).
-    let block = element.block;
-    let mut final_derivation = element.final_derivation;
-
-    if final_derivation.is_empty() {
-        if let Some(source) = element.source.as_ref() {
-            if let Some(doc) = schema_set.documents.get(source.doc_id as usize) {
-                final_derivation = doc.final_default;
-            }
-        }
-    }
-
-    (block, final_derivation)
+    // Both block and final_derivation are resolved at assembly time
+    // (the assembler applies blockDefault/finalDefault to empty/absent entries).
+    (element.block, element.final_derivation)
 }
 
 /// Check if `candidate_key` is validly substitutable for `head_key`
@@ -256,8 +246,7 @@ pub fn validate_all_substitution_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::location::{SourceRef, SourceSpan};
-    use crate::schema::model::SchemaDocument;
+    use crate::parser::location::SourceRef;
 
     fn element_data(
         name: NameId,
@@ -290,19 +279,6 @@ mod tests {
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
         }
-    }
-
-    fn with_doc(
-        schema_set: &mut SchemaSet,
-        block_default: DerivationSet,
-        final_default: DerivationSet,
-    ) -> SourceRef {
-        let doc_id = schema_set.documents.len() as u32;
-        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
-        doc.block_default = block_default;
-        doc.final_default = final_default;
-        schema_set.documents.push(doc);
-        SourceRef::new(doc_id, SourceSpan::new(0, 0))
     }
 
     #[test]
@@ -456,19 +432,20 @@ mod tests {
 
     #[test]
     fn test_substitution_group_final_default_blocks_member() {
+        // Assembly would apply finalDefault to elements without an explicit final.
+        // This test simulates that: head.final_derivation = RESTRICTION (inherited from finalDefault).
         let mut schema_set = SchemaSet::new();
         let head_name = schema_set.name_table.add("head");
         let member_name = schema_set.name_table.add("member");
         let head_type = TypeKey::Simple(schema_set.builtin_types().decimal);
         let member_type = TypeKey::Simple(schema_set.builtin_types().int);
-        let source = with_doc(&mut schema_set, DerivationSet::empty(), DerivationSet::RESTRICTION);
 
-        let head_key = schema_set
-            .arenas
-            .alloc_element(element_data(head_name, head_type, Some(source.clone())));
+        let mut head = element_data(head_name, head_type, None);
+        head.final_derivation = DerivationSet::RESTRICTION;
+        let head_key = schema_set.arenas.alloc_element(head);
         let member_key = schema_set
             .arenas
-            .alloc_element(element_data(member_name, member_type, Some(source)));
+            .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements

@@ -41,11 +41,16 @@ use crate::schema::SchemaSet;
 
 /// Resolve a parsed `block` attribute to an effective `DerivationSet`.
 /// `Some(set)` → explicit (including `block=""` = empty, which overrides blockDefault).
-/// `None` → absent; inherit the source document's `blockDefault`.
+/// `None` → absent; inherit the source document's `blockDefault`, following
+/// `schema_defaults_doc` for override-copied components so they see the
+/// override document's defaults rather than the origin schema's.
 fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
     block.unwrap_or_else(|| {
         source
-            .and_then(|s| schema_set.documents.get(s.doc_id as usize))
+            .and_then(|s| {
+                let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
+                schema_set.documents.get(doc_id as usize)
+            })
             .map(|d| d.block_default)
             .unwrap_or_default()
     })

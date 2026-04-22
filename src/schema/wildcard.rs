@@ -244,76 +244,9 @@ pub enum QNameDisallowed {
     DefinedSibling,
 }
 
-/// Union of wildcards (for computing intersections/unions)
-#[derive(Debug, Clone)]
-pub struct WildcardUnion {
-    /// Combined namespace constraint
-    pub namespace_constraint: NamespaceConstraint,
-    /// Combined process contents (most restrictive)
-    pub process_contents: ProcessContents,
-}
-
-impl WildcardUnion {
-    /// Compute the union of two wildcards
-    pub fn union(w1: &ElementWildcard, w2: &ElementWildcard) -> Self {
-        // Union: allow what either allows
-        let namespace_constraint = match (&w1.namespace_constraint, &w2.namespace_constraint) {
-            (NamespaceConstraint::Any, _) | (_, NamespaceConstraint::Any) => {
-                NamespaceConstraint::Any
-            }
-            (NamespaceConstraint::Enumeration(ns1), NamespaceConstraint::Enumeration(ns2)) => {
-                let mut combined: Vec<Option<NameId>> = ns1.clone();
-                for ns in ns2 {
-                    if !combined.contains(ns) {
-                        combined.push(*ns);
-                    }
-                }
-                NamespaceConstraint::Enumeration(combined)
-            }
-            // Simplified - real implementation needs more cases
-            _ => NamespaceConstraint::Any,
-        };
-
-        // Process contents: most restrictive
-        let process_contents = match (w1.process_contents, w2.process_contents) {
-            (ProcessContents::Strict, _) | (_, ProcessContents::Strict) => ProcessContents::Strict,
-            (ProcessContents::Lax, _) | (_, ProcessContents::Lax) => ProcessContents::Lax,
-            _ => ProcessContents::Skip,
-        };
-
-        Self {
-            namespace_constraint,
-            process_contents,
-        }
-    }
-
-    /// Compute the intersection of two wildcards
-    pub fn intersection(w1: &ElementWildcard, w2: &ElementWildcard) -> Self {
-        // Intersection: allow what both allow
-        let namespace_constraint = match (&w1.namespace_constraint, &w2.namespace_constraint) {
-            (NamespaceConstraint::Any, other) | (other, NamespaceConstraint::Any) => other.clone(),
-            (NamespaceConstraint::Enumeration(ns1), NamespaceConstraint::Enumeration(ns2)) => {
-                let combined: Vec<Option<NameId>> =
-                    ns1.iter().filter(|ns| ns2.contains(ns)).copied().collect();
-                NamespaceConstraint::Enumeration(combined)
-            }
-            // Simplified - real implementation needs more cases
-            _ => NamespaceConstraint::Enumeration(vec![]),
-        };
-
-        // Process contents: most restrictive
-        let process_contents = match (w1.process_contents, w2.process_contents) {
-            (ProcessContents::Strict, _) | (_, ProcessContents::Strict) => ProcessContents::Strict,
-            (ProcessContents::Lax, _) | (_, ProcessContents::Lax) => ProcessContents::Lax,
-            _ => ProcessContents::Skip,
-        };
-
-        Self {
-            namespace_constraint,
-            process_contents,
-        }
-    }
-}
+// The stubbed `WildcardUnion::union` / `::intersection` were removed — the
+// canonical §3.10.6.3 cos-aw-union lives in `schema::derivation::wildcard_result_union`
+// (added by B1, extended by B3). No production code depended on the stubs.
 
 #[cfg(test)]
 mod tests {
@@ -378,30 +311,4 @@ mod tests {
         assert_eq!(wildcard.process_contents, ProcessContents::Strict);
     }
 
-    #[test]
-    fn test_wildcard_union() {
-        let w1 = ElementWildcard {
-            namespace_constraint: NamespaceConstraint::list(vec![Some(NameId(1))]),
-            process_contents: ProcessContents::Lax,
-            ..Default::default()
-        };
-
-        let w2 = ElementWildcard {
-            namespace_constraint: NamespaceConstraint::list(vec![Some(NameId(2))]),
-            process_contents: ProcessContents::Skip,
-            ..Default::default()
-        };
-
-        let union = WildcardUnion::union(&w1, &w2);
-        // Union should have both namespaces
-        match union.namespace_constraint {
-            NamespaceConstraint::Enumeration(ns) => {
-                assert!(ns.contains(&Some(NameId(1))));
-                assert!(ns.contains(&Some(NameId(2))));
-            }
-            _ => panic!("Expected enumeration"),
-        }
-        // Process contents should be most restrictive (Lax over Skip)
-        assert_eq!(union.process_contents, ProcessContents::Lax);
-    }
 }

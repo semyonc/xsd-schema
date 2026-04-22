@@ -38,6 +38,55 @@ pub fn validate_simple_type(
     validate_simple_type_inner(value, type_key, schema_set)
 }
 
+/// Value-space equality for fixed/default values (§3.3.4.3 clause 5.2.2.2.2, §3.2.4.4).
+///
+/// Fast-path lexical match; otherwise parses both strings against `type_key`
+/// and compares their typed values. Returns `false` when `type_key` is `None`
+/// or when either parse fails.
+pub fn fixed_values_equal(
+    a: &str,
+    b: &str,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> bool {
+    if a == b {
+        return true;
+    }
+    let Some(tk) = type_key else {
+        return false;
+    };
+    let Ok(a_result) = validate_simple_type(a, tk, schema_set) else {
+        return false;
+    };
+    let Ok(b_result) = validate_simple_type(b, tk, schema_set) else {
+        return false;
+    };
+    a_result.typed_value == b_result.typed_value
+}
+
+/// Value-space equality when the instance's typed value is already computed.
+///
+/// Avoids re-parsing `instance_raw`; only parses `fixed` on lexical mismatch.
+/// Returns `false` when `type_key` is `None` or when parsing `fixed` fails.
+pub fn fixed_matches_typed(
+    instance_raw: &str,
+    instance_typed: &XmlValue,
+    fixed: &str,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> bool {
+    if instance_raw == fixed {
+        return true;
+    }
+    let Some(tk) = type_key else {
+        return false;
+    };
+    let Ok(fixed_result) = validate_simple_type(fixed, tk, schema_set) else {
+        return false;
+    };
+    *instance_typed == fixed_result.typed_value
+}
+
 fn validate_simple_type_inner(
     value: &str,
     type_key: TypeKey,

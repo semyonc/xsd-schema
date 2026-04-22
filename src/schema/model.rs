@@ -11,7 +11,7 @@ use bitflags::bitflags;
 use crate::ids::*;
 use crate::namespace::NameTable;
 use crate::namespace::table::well_known;
-use crate::parser::location::{SourceMapStorage, SourceRef};
+use crate::parser::location::{SourceLocation, SourceMapStorage, SourceRef};
 use crate::namespace::QualifiedName;
 use crate::schema::annotation::Annotation;
 use crate::schema::composition::{
@@ -189,6 +189,22 @@ impl SchemaSet {
         set.builtin_types = Some(builtin_types);
 
         set
+    }
+
+    /// Returns `true` if this schema set is configured for XSD 1.0.
+    pub fn is_xsd10(&self) -> bool {
+        self.xsd_version == XsdVersion::V1_0
+    }
+
+    /// Returns `true` if this schema set is configured for XSD 1.1.
+    pub fn is_xsd11(&self) -> bool {
+        self.xsd_version == XsdVersion::V1_1
+    }
+
+    /// Resolve an optional `SourceRef` to its line/column location.
+    /// Returns `None` if the source is absent or cannot be located.
+    pub fn locate(&self, source: Option<&SourceRef>) -> Option<SourceLocation> {
+        source.and_then(|s| self.source_maps.locate(s))
     }
 
     /// Returns `true` if any parsing errors were collected during error-recovery parsing.
@@ -982,6 +998,17 @@ pub enum OpenContentMode {
     #[default]
     Interleave,
     Suffix,
+}
+
+impl From<crate::parser::frames::OpenContentMode> for OpenContentMode {
+    fn from(m: crate::parser::frames::OpenContentMode) -> Self {
+        use crate::parser::frames::OpenContentMode as Src;
+        match m {
+            Src::None => Self::None,
+            Src::Interleave => Self::Interleave,
+            Src::Suffix => Self::Suffix,
+        }
+    }
 }
 
 #[cfg(test)]

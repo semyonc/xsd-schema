@@ -34,7 +34,7 @@ use crate::parser::frames::{
 };
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::{OpenContentMode, OpenContentResult};
-use crate::parser::location::SourceRef;
+use crate::parser::location::{SourceLocation, SourceRef};
 use crate::schema::dependencies::DependencyGraph;
 use crate::schema::SchemaSet;
 use crate::schema::model::DerivationSet;
@@ -170,8 +170,7 @@ fn validate_applicable_facets(
                 || facets.explicit_timezone.is_some();
 
             if has_inapplicable {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 let inapplicable = list_inapplicable_facets_for_list(facets);
                 return Err(SchemaError::structural(
                     "cos-applicable-facets",
@@ -198,8 +197,7 @@ fn validate_applicable_facets(
                 || facets.explicit_timezone.is_some();
 
             if has_inapplicable {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 let inapplicable = list_inapplicable_facets_for_union(facets);
                 return Err(SchemaError::structural(
                     "cos-applicable-facets",
@@ -265,8 +263,7 @@ fn validate_simple_restriction(
 
     // cos-st-restricts.1.1: base type must be a simple type definition
     if let TypeKey::Complex(_) = base_key {
-        let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-        let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+        let (location, type_name) = type_error_context(schema_set, type_def);
         return Err(SchemaError::structural(
             "cos-st-restricts",
             format!("Simple type '{}': base type must be a simple type definition (cos-st-restricts.1.1)", type_name),
@@ -279,14 +276,8 @@ fn validate_simple_restriction(
     // Check that base type is not final for restriction
     if let TypeKey::Simple(base_simple_key) = base_key {
         if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
-            let effective_final = effective_type_final(
-                schema_set,
-                base_type.final_derivation,
-                base_type.source.as_ref(),
-            );
-            if effective_final.contains_restriction() {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            if base_type.final_derivation.contains_restriction() {
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
@@ -310,8 +301,7 @@ fn validate_simple_restriction(
             .facets
             .merge_with_base(base_facets)
             .map_err(|e| {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 SchemaError::structural(
                     "cos-st-restricts",
                     format!("Simple type '{}' has invalid restriction: {}", type_name, e),
@@ -337,14 +327,8 @@ fn validate_simple_list(
     // Check that the item type is not final for list derivation
     if let Some(TypeKey::Simple(item_simple_key)) = type_def.resolved_item_type {
         if let Some(item_type) = schema_set.arenas.simple_types.get(item_simple_key) {
-            let effective_final = effective_type_final(
-                schema_set,
-                item_type.final_derivation,
-                item_type.source.as_ref(),
-            );
-            if effective_final.contains_list() {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            if item_type.final_derivation.contains_list() {
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 let item_name = format_type_name(schema_set, item_type.name, item_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
@@ -361,14 +345,8 @@ fn validate_simple_list(
     // Also check the base type's final for restriction (list types restrict xs:anySimpleType)
     if let Some(TypeKey::Simple(base_simple_key)) = type_def.resolved_base_type {
         if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
-            let effective_final = effective_type_final(
-                schema_set,
-                base_type.final_derivation,
-                base_type.source.as_ref(),
-            );
-            if effective_final.contains_list() {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            if base_type.final_derivation.contains_list() {
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
@@ -401,8 +379,7 @@ fn validate_simple_list(
                     }
                     SimpleTypeVariety::List => {
                         // Invalid - list of list is not allowed
-                        let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                        let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                        let (location, type_name) = type_error_context(schema_set, type_def);
                         return Err(SchemaError::structural(
                             "cos-list-of-atomic",
                             format!("List type '{}' has list item type, which is not allowed", type_name),
@@ -412,8 +389,7 @@ fn validate_simple_list(
                     SimpleTypeVariety::Union => {
                         // Must check that union doesn't contain list members
                         if union_contains_list(schema_set, item_type) {
-                            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                            let (location, type_name) = type_error_context(schema_set, type_def);
                             return Err(SchemaError::structural(
                                 "cos-list-of-atomic",
                                 format!("List type '{}' has union item type containing list member", type_name),
@@ -426,8 +402,7 @@ fn validate_simple_list(
         }
         TypeKey::Complex(_) => {
             // Complex types cannot be list item types
-            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            let (location, type_name) = type_error_context(schema_set, type_def);
             return Err(SchemaError::structural(
                 "cos-list-of-atomic",
                 format!("List type '{}' has complex item type, which is not allowed", type_name),
@@ -473,14 +448,8 @@ fn validate_simple_union(
     for member_key in &type_def.resolved_member_types {
         if let TypeKey::Simple(simple_key) = member_key {
             if let Some(member_type) = schema_set.arenas.simple_types.get(*simple_key) {
-                let effective_final = effective_type_final(
-                    schema_set,
-                    member_type.final_derivation,
-                    member_type.source.as_ref(),
-                );
-                if effective_final.contains_union() {
-                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                if member_type.final_derivation.contains_union() {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
                     let member_name = format_type_name(schema_set, member_type.name, member_type.target_namespace);
                     return Err(SchemaError::structural(
                         "cos-st-restricts",
@@ -503,8 +472,7 @@ fn validate_simple_union(
             }
             TypeKey::Complex(_) => {
                 // Invalid - complex types cannot be union members
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 return Err(SchemaError::structural(
                     "cos-union-memberTypes",
                     format!("Union type '{}' has complex member type, which is not allowed", type_name),
@@ -571,8 +539,7 @@ fn validate_complex_extension(
             // Extension from simple type is valid only with simpleContent
             // complexContent extension from simple type is invalid
             if matches!(type_def.content, ComplexContentResult::Complex(_)) {
-                let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                let (location, type_name) = type_error_context(schema_set, type_def);
                 return Err(SchemaError::structural(
                     "cos-ct-extends",
                     format!(
@@ -585,14 +552,8 @@ fn validate_complex_extension(
 
             // Check that simple base type is not final for extension
             if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
-                let effective_final = effective_type_final(
-                    schema_set,
-                    base_type.final_derivation,
-                    base_type.source.as_ref(),
-                );
-                if effective_final.contains_extension() {
-                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                if base_type.final_derivation.contains_extension() {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
                     let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "cos-ct-extends",
@@ -608,11 +569,8 @@ fn validate_complex_extension(
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
                 // Check that base type is not final for extension
-                if effective_type_final(schema_set, base_type.final_derivation, base_type.source.as_ref())
-                    .contains_extension()
-                {
-                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                if base_type.final_derivation.contains_extension() {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
                     let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "cos-ct-extends",
@@ -631,11 +589,8 @@ fn validate_complex_extension(
                 //   simpleContent base + complexContent derived is always invalid.
                 if matches!(base_type.content, ComplexContentResult::Simple(_)) {
                     if let ComplexContentResult::Complex(ref complex) = type_def.content {
-                        if complex.particle.is_some()
-                            || schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1
-                        {
-                            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                        if complex.particle.is_some() || schema_set.is_xsd11() {
+                            let (location, type_name) = type_error_context(schema_set, type_def);
                             let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                             return Err(SchemaError::structural(
                                 "cos-ct-extends",
@@ -795,8 +750,7 @@ fn validate_complex_restriction(
         TypeKey::Simple(base_simple_key) => {
             // ct-props-correct.2: If the base type is a simple type definition,
             // the derivation method must be extension (not restriction).
-            let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-            let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+            let (location, type_name) = type_error_context(schema_set, type_def);
             let base_name = if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
                 format_type_name(schema_set, base_type.name, base_type.target_namespace)
             } else {
@@ -815,11 +769,8 @@ fn validate_complex_restriction(
         TypeKey::Complex(base_complex_key) => {
             if let Some(base_type) = schema_set.arenas.complex_types.get(base_complex_key) {
                 // Check that base type is not final for restriction
-                if effective_type_final(schema_set, base_type.final_derivation, base_type.source.as_ref())
-                    .contains_restriction()
-                {
-                    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-                    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+                if base_type.final_derivation.contains_restriction() {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
                     let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "derivation-ok-restriction",
@@ -1194,24 +1145,6 @@ fn is_effectively_empty(particle: &NormalizedParticle) -> bool {
     particle.max_occurs == Some(0) || is_empty_group(particle)
 }
 
-/// Value-space equality for fixed values.
-fn fixed_values_equal(schema_set: &SchemaSet, type_key: TypeKey, a: &str, b: &str) -> bool {
-    if a == b {
-        return true;
-    }
-    let Ok(a_result) =
-        crate::validation::simple::validate_simple_type(a, type_key, schema_set)
-    else {
-        return false;
-    };
-    let Ok(b_result) =
-        crate::validation::simple::validate_simple_type(b, type_key, schema_set)
-    else {
-        return false;
-    };
-    a_result.typed_value == b_result.typed_value
-}
-
 fn complex_content_particle(content: &ComplexContentResult) -> Option<&ParticleResult> {
     match content {
         ComplexContentResult::Complex(def) => def.particle.as_ref(),
@@ -1266,7 +1199,7 @@ fn normalize_type_particle(
     // XSD 1.1: skip flattening to preserve structural grouping needed for
     // intensional restriction (e.g. a single-branch choice whose collapsed
     // sequence must match against a multi-branch choice in the base).
-    if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+    if !schema_set.is_xsd11() {
         let particle = flatten_same_compositor_groups(particle);
         return Ok(particle);
     }
@@ -1320,7 +1253,7 @@ fn normalize_model_group_as_particle(
     let particle = collapse_single_child_groups(wrapper);
     let particle = remove_pointless_particles(particle);
     // XSD 1.1: skip flattening (same rationale as `normalize_type_particle`).
-    if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+    if !schema_set.is_xsd11() {
         let particle = flatten_same_compositor_groups(particle);
         return Ok(particle);
     }
@@ -1479,7 +1412,7 @@ fn particle_restricts(
 ) -> bool {
     // XSD 1.1 intensional restriction: fold single-child sequence/all groups
     // symmetrically on both sides so they are compared in the same normal form.
-    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+    if schema_set.is_xsd11() {
         if let Some(folded) = fold_single_child_group(derived) {
             return particle_restricts(schema_set, &folded, base);
         }
@@ -1492,7 +1425,7 @@ fn particle_restricts(
     // multi-branch choice. The expand_choice_branches approach merges choice occurs into
     // branches, which gives wrong results for RecurseLax when max_occurs=1.
     // For repeated choices (max>1), the spec is ambiguous — provisionally accept.
-    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0
+    if schema_set.is_xsd10()
         && derived.min_occurs == 0
         && !matches!(
             &derived.term,
@@ -1514,7 +1447,7 @@ fn particle_restricts(
         if let Some(derived_branches) = expand_choice_branches(derived) {
             // XSD 1.0 RecurseLax: order-preserving mapping required.
             // XSD 1.1: unordered set-based matching.
-            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+            if schema_set.is_xsd10() {
                 return choice_branches_restrict_ordered(
                     schema_set,
                     &derived_branches,
@@ -1534,7 +1467,7 @@ fn particle_restricts(
                 // XSD 1.1: try "restricts any single branch" first.
                 // Sound because if derived restricts one branch, it restricts
                 // a subset of the choice's language.
-                if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+                if schema_set.is_xsd11() {
                     let any_branch = base_branches
                         .iter()
                         .any(|candidate| particle_restricts(schema_set, derived, candidate));
@@ -1599,7 +1532,12 @@ fn particle_restricts(
                 (None, _) => true,
                 (Some(_), None) => false,
                 (Some(base_fixed), Some(derived_fixed)) => {
-                    fixed_values_equal(schema_set, derived_element.type_key, derived_fixed, base_fixed)
+                    crate::validation::simple::fixed_values_equal(
+                        derived_fixed,
+                        base_fixed,
+                        Some(derived_element.type_key),
+                        schema_set,
+                    )
                 }
             }
             // TODO: 5. identity-constraint definitions subset (not yet implemented)
@@ -1985,7 +1923,7 @@ fn sequence_particles_restrict(
             // 3. XSD 1.1: expand choice in derived sequence.
             //    Each branch must independently work from the current base position
             //    for the entire remaining derived + base suffix.
-            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+            if schema_set.is_xsd11() {
                 if let Some(branches) =
                     expand_choice_branches(&derived_particles[derived_index])
                 {
@@ -2008,7 +1946,7 @@ fn sequence_particles_restrict(
             //    Compensates for the disabled flatten_same_compositor_groups.
             //    sequence{1,1}(a, b, c, ...) at derived can be inlined into
             //    the parent sequence and matched element-by-element against base.
-            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_1 {
+            if schema_set.is_xsd11() {
                 if let NormalizedParticleTerm::Group(dg) =
                     &derived_particles[derived_index].term
                 {
@@ -2098,7 +2036,7 @@ fn all_particles_restrict(
 ) -> bool {
     // XSD 1.0: All:All uses order-preserving Recurse (same as Sequence:Sequence).
     // XSD 1.1: RecurseUnordered allows reordering via backtracking.
-    if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+    if schema_set.is_xsd10() {
         return sequence_particles_restrict(schema_set, derived_particles, base_particles);
     }
     recurse_unordered(schema_set, derived_particles, base_particles)
@@ -2390,8 +2328,7 @@ fn validate_open_content_extension(
     // Clause 1.4.3.2.2.3.1: if BOT is absent, extension is unconstrained wrt OC.
     let Some(bot) = bot else { return Ok(()); };
 
-    let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let (location, type_name) = type_error_context(schema_set, derived);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
     // If BOT is present then EOT must be too (by construction of EOT: if
@@ -2572,12 +2509,7 @@ fn explicit_content_is_empty(
     if depth > 100 {
         return true;
     }
-    let own_empty = match &type_data.content {
-        ComplexContentResult::Empty => true,
-        ComplexContentResult::Complex(def) => def.particle.is_none(),
-        ComplexContentResult::Simple(_) => false,
-    };
-    if !own_empty {
+    if !type_data.content.is_empty() {
         return false;
     }
     if matches!(type_data.derivation_method, Some(DerivationMethod::Extension)) {
@@ -2822,8 +2754,7 @@ fn validate_open_content_restriction(
 
     // If base has no open content, derived must not add one
     if base_oc.is_none() && derived_oc.is_some() {
-        let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-        let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+        let (location, type_name) = type_error_context(schema_set, derived);
         let base_name = format_type_name(schema_set, base.name, base.target_namespace);
         return Err(SchemaError::structural(
             "derivation-ok-restriction",
@@ -2841,8 +2772,7 @@ fn validate_open_content_restriction(
         return Ok(());
     };
 
-    let location = derived.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-    let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
+    let (location, type_name) = type_error_context(schema_set, derived);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
     // Mode: if base is suffix, derived cannot use interleave
@@ -2955,8 +2885,7 @@ fn validate_facet_values_against_base_type(
         return Ok(());
     }
 
-    let location = type_def.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
-    let type_name = format_type_name(schema_set, type_def.name, type_def.target_namespace);
+    let (location, type_name) = type_error_context(schema_set, type_def);
 
     // Validate enumeration values.
     // Walk past any base with its own enumeration to avoid string-equality comparison
@@ -3026,7 +2955,7 @@ fn get_type_facets(schema_set: &SchemaSet, type_key: TypeKey) -> SchemaResult<Op
 }
 
 /// Format a type name for error messages
-fn format_type_name(
+pub(crate) fn format_type_name(
     schema_set: &SchemaSet,
     name: Option<NameId>,
     namespace: Option<NameId>,
@@ -3050,24 +2979,38 @@ fn format_type_name(
     }
 }
 
-fn effective_type_final(
+/// Minimal "type-like component" view used by [`type_error_context`].
+/// Implemented by the type-def structs whose errors carry both a source
+/// location and a formatted type name.
+pub(crate) trait TypeDefForError {
+    fn error_name(&self) -> Option<NameId>;
+    fn error_target_namespace(&self) -> Option<NameId>;
+    fn error_source(&self) -> Option<&SourceRef>;
+}
+
+impl TypeDefForError for crate::arenas::SimpleTypeDefData {
+    fn error_name(&self) -> Option<NameId> { self.name }
+    fn error_target_namespace(&self) -> Option<NameId> { self.target_namespace }
+    fn error_source(&self) -> Option<&SourceRef> { self.source.as_ref() }
+}
+
+impl TypeDefForError for crate::arenas::ComplexTypeDefData {
+    fn error_name(&self) -> Option<NameId> { self.name }
+    fn error_target_namespace(&self) -> Option<NameId> { self.target_namespace }
+    fn error_source(&self) -> Option<&SourceRef> { self.source.as_ref() }
+}
+
+/// Returns `(location, type_name)` for error construction on a type component.
+/// Pairs [`SchemaSet::locate`] with [`format_type_name`] since they always
+/// co-occur in `SchemaError::structural` calls built for a type.
+pub(crate) fn type_error_context<T: TypeDefForError>(
     schema_set: &SchemaSet,
-    final_derivation: DerivationSet,
-    source: Option<&SourceRef>,
-) -> DerivationSet {
-    if !final_derivation.is_empty() {
-        return final_derivation;
-    }
-
-    let Some(source) = source else {
-        return final_derivation;
-    };
-
-    schema_set
-        .documents
-        .get(source.doc_id as usize)
-        .map(|doc| doc.final_default)
-        .unwrap_or(final_derivation)
+    type_def: &T,
+) -> (Option<SourceLocation>, String) {
+    (
+        schema_set.locate(type_def.error_source()),
+        format_type_name(schema_set, type_def.error_name(), type_def.error_target_namespace()),
+    )
 }
 
 /// Resolved effective attribute use for comparison during restriction validation.
@@ -3232,7 +3175,7 @@ fn normalize_attribute_wildcard(
             // insert None (HashSet dedupes if target is already None).
             let mut excl = HashSet::new();
             excl.insert(target_ns);
-            if schema_set.xsd_version == crate::schema::model::XsdVersion::V1_0 {
+            if schema_set.is_xsd10() {
                 excl.insert(None);
             }
             CanonicalNs::Not(excl)
@@ -3989,10 +3932,9 @@ fn resolve_inline_simple_type_base(
 /// fixed). XSD 1.1 relaxes this restriction. Called from the pipeline after
 /// reference resolution.
 pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
-    use crate::schema::model::XsdVersion;
     use crate::types::XmlTypeCode;
 
-    if schema_set.xsd_version != XsdVersion::V1_0 {
+    if !schema_set.is_xsd10() {
         return Ok(());
     }
 
@@ -4018,7 +3960,7 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
                         "Attribute '{}' has type xs:ID (or derived) and must not have a {} value constraint",
                         attr_name, constraint
                     ),
-                    attr_data.source.as_ref().and_then(|s| schema_set.source_maps.locate(s)),
+                    schema_set.locate(attr_data.source.as_ref()),
                 ));
             }
         }
@@ -4119,13 +4061,13 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
                 .map(|n| schema_set.name_table.resolve_ref(n))
                 .unwrap_or("(anonymous)")
         };
-        let location = || elem.source.as_ref().and_then(|s| schema_set.source_maps.locate(s));
+        let location = || schema_set.locate(elem.source.as_ref());
         let constraint = if is_fixed { "fixed" } else { "default" };
 
         // e-props-correct.4: xs:ID (or derived) cannot have a value constraint.
         // XSD 1.1 §3.3.6.1 removes this restriction (it has no analogous clause);
         // only apply in XSD 1.0 mode.
-        if schema_set.xsd_version != crate::schema::model::XsdVersion::V1_1 {
+        if !schema_set.is_xsd11() {
             if let (Some(id_simple_key), TypeKey::Simple(st_key)) = (id_key, type_key) {
                 if schema_set.derives_from(st_key, id_simple_key) {
                     return Err(SchemaError::structural(
@@ -4355,10 +4297,9 @@ pub fn validate_xsd10_annotation_source_anyuri(
     schema_set: &SchemaSet,
 ) -> SchemaResult<()> {
     use crate::schema::annotation::{Annotation, AnnotationItem};
-    use crate::schema::model::XsdVersion;
     use crate::types::validators::is_strict_xsd10_anyuri;
 
-    if schema_set.xsd_version != XsdVersion::V1_0 {
+    if !schema_set.is_xsd10() {
         return Ok(());
     }
 
@@ -4581,7 +4522,7 @@ fn validate_all_redefine_group_restrictions(
         // exact same surviving shape. Mirror the existing short-circuit in
         // `validate_content_particle_restriction` (derivation.rs:1148-1161):
         // empty derived is a valid restriction iff the base is emptiable.
-        if derived_particle.max_occurs == Some(0) || is_empty_group(&derived_particle) {
+        if is_effectively_empty(&derived_particle) {
             if !particle_is_emptiable(&base_particle) {
                 errors.push(make_redefine_group_restriction_error(
                     schema_set,
@@ -4830,8 +4771,6 @@ mod tests {
     use super::*;
     use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
     use crate::parser::frames::ComplexContentResult;
-    use crate::parser::location::{SourceRef, SourceSpan};
-    use crate::schema::model::SchemaDocument;
     use crate::schema::model::DerivationSet;
 
     fn create_simple_type_data(name: Option<NameId>, variety: SimpleTypeVariety) -> SimpleTypeDefData {
@@ -5097,15 +5036,12 @@ mod tests {
 
     #[test]
     fn test_validate_extension_of_final_default_type_error() {
+        // Assembly would apply finalDefault to types without an explicit final.
+        // This test simulates that: base.final_derivation = extension (inherited from finalDefault).
         let mut schema_set = SchemaSet::new();
-        let doc_id = schema_set.documents.len() as crate::ids::DocumentId;
-        let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
-        doc.final_default = DerivationSet::extension();
-        schema_set.documents.push(doc);
 
-        // Create base complex type with final from schema default.
         let mut base_data = create_complex_type_data(None);
-        base_data.source = Some(SourceRef::new(doc_id, SourceSpan::new(0, 0)));
+        base_data.final_derivation = DerivationSet::extension();
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
         // Create derived type with extension (should fail).

@@ -9,11 +9,11 @@ use crate::parser::frames::DerivationMethod;
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::frames::{
     Compositor, ComplexContentResult, ElementFrameResult, ModelGroupDefResult, NamespaceToken,
-    NotQNameItem, OpenContentMode, OpenContentResult, ParticleResult, ParticleTerm,
+    NotQNameItem, OpenContentResult, ParticleResult, ParticleTerm,
     ProcessContents, QNameRef, TypeRefResult, WildcardNamespace, WildcardResult,
 };
 use crate::parser::location::SourceRef;
-use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
+use crate::schema::model::{DefaultOpenContent, XsdVersion};
 use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint as SchemaNamespaceConstraint};
 use crate::schema::SchemaSet;
 #[cfg(test)]
@@ -480,7 +480,7 @@ impl<'a> CompileContext<'a> {
                 #[cfg(feature = "xsd11")]
                 ParticleTerm::Group(group) => {
                     // XSD 1.0 forbids group refs inside xs:all even in an xsd11 build
-                    if self.schema_set.xsd_version != XsdVersion::V1_1 {
+                    if !self.schema_set.is_xsd11() {
                         return Err(NfaCompileError::invalid_all_group(
                             particle.source.clone().or_else(|| source.cloned()),
                         ));
@@ -1333,7 +1333,7 @@ fn compile_content_model_matcher_impl(
 
     // §3.4.2.3 clause 6 (inherit + union) for XSD 1.1 extensions; simple resolve otherwise.
     #[cfg(feature = "xsd11")]
-    let open_content = if schema_set.xsd_version == XsdVersion::V1_1 && is_extension {
+    let open_content = if schema_set.is_xsd11() && is_extension {
         effective_open_content_for_extension(
             schema_set,
             type_def,
@@ -1575,7 +1575,7 @@ fn resolve_open_content(
     explicit: Option<&OpenContentResult>,
     source: Option<&SourceRef>,
 ) -> Option<OpenContent> {
-    if schema_set.xsd_version != XsdVersion::V1_1 {
+    if !schema_set.is_xsd11() {
         return None;
     }
 
@@ -1599,19 +1599,11 @@ fn resolve_open_content(
     let doc = source.and_then(|s| schema_set.documents.get(s.defaults_doc() as usize));
     let default = doc.and_then(|d| d.default_open_content.as_ref())?;
 
-    if !default.applies_to_empty && content_is_empty(content) {
+    if !default.applies_to_empty && content.is_empty() {
         return None;
     }
 
     open_content_from_default(default, schema_set)
-}
-
-fn content_is_empty(content: &ComplexContentResult) -> bool {
-    match content {
-        ComplexContentResult::Empty => true,
-        ComplexContentResult::Complex(def) => def.particle.is_none(),
-        ComplexContentResult::Simple(_) => false,
-    }
 }
 
 fn open_content_from_result(
@@ -1619,7 +1611,7 @@ fn open_content_from_result(
     schema_set: &SchemaSet,
     target_namespace: Option<NameId>,
 ) -> Option<OpenContent> {
-    let mode = convert_open_content_mode(result.mode);
+    let mode: TypesOpenContentMode = result.mode.into();
     if matches!(mode, TypesOpenContentMode::None) {
         return None;
     }
@@ -1635,7 +1627,7 @@ fn open_content_from_default(
     default: &DefaultOpenContent,
     schema_set: &SchemaSet,
 ) -> Option<OpenContent> {
-    let mode = convert_schema_open_content_mode(default.mode);
+    let mode: TypesOpenContentMode = default.mode.into();
     if matches!(mode, TypesOpenContentMode::None) {
         return None;
     }
@@ -1645,22 +1637,6 @@ fn open_content_from_default(
         wildcard: default.wildcard.as_ref().map(|w| wildcard_ref_from_default(w, schema_set)),
         source: default.source.clone(),
     })
-}
-
-fn convert_open_content_mode(mode: OpenContentMode) -> TypesOpenContentMode {
-    match mode {
-        OpenContentMode::None => TypesOpenContentMode::None,
-        OpenContentMode::Interleave => TypesOpenContentMode::Interleave,
-        OpenContentMode::Suffix => TypesOpenContentMode::Suffix,
-    }
-}
-
-fn convert_schema_open_content_mode(mode: SchemaOpenContentMode) -> TypesOpenContentMode {
-    match mode {
-        SchemaOpenContentMode::None => TypesOpenContentMode::None,
-        SchemaOpenContentMode::Interleave => TypesOpenContentMode::Interleave,
-        SchemaOpenContentMode::Suffix => TypesOpenContentMode::Suffix,
-    }
 }
 
 /// Expand all globally declared element QNames from the schema set.
