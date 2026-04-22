@@ -88,11 +88,11 @@ impl ElementFrame {
 
         let max_occurs = parse_max_occurs_attr(attrs, name_table, "maxOccurs")?;
 
-        let block = parse_block_attr(
+        let block = parse_derivation_set_opt(
             attrs.get_value_by_name(name_table, "block"),
         )?;
 
-        let final_derivation = parse_final_attr(
+        let final_derivation = parse_derivation_set_opt(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 

@@ -87,14 +87,14 @@ mod tests {
     /// Absent `final=` attribute → None (caller inherits finalDefault).
     #[test]
     fn test_parse_final_attr_absent() {
-        let result = parse_final_attr(None).unwrap();
+        let result = parse_derivation_set_opt(None).unwrap();
         assert!(result.is_none(), "absent final= must be None so finalDefault is applied");
     }
 
     /// `final=""` → Some(empty set): explicit override, no derivation blocked.
     #[test]
     fn test_parse_final_attr_explicit_empty() {
-        let result = parse_final_attr(Some("")).unwrap();
+        let result = parse_derivation_set_opt(Some("")).unwrap();
         assert!(result.is_some(), "final=\"\" must be Some (explicit override)");
         assert!(result.unwrap().is_empty(), "final=\"\" must produce an empty DerivationSet");
     }
@@ -102,7 +102,7 @@ mod tests {
     /// `final="#all"` → Some(ALL).
     #[test]
     fn test_parse_final_attr_all() {
-        let result = parse_final_attr(Some("#all")).unwrap();
+        let result = parse_derivation_set_opt(Some("#all")).unwrap();
         assert!(result.is_some());
         let set = result.unwrap();
         assert!(set.contains(DerivationSet::EXTENSION));
@@ -112,7 +112,7 @@ mod tests {
     /// `final="restriction extension"` → Some(RESTRICTION | EXTENSION).
     #[test]
     fn test_parse_final_attr_list() {
-        let result = parse_final_attr(Some("restriction extension")).unwrap();
+        let result = parse_derivation_set_opt(Some("restriction extension")).unwrap();
         assert!(result.is_some());
         let set = result.unwrap();
         assert!(set.contains(DerivationSet::RESTRICTION));

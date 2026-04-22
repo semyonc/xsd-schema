@@ -40,7 +40,7 @@ impl SimpleTypeFrame {
             .get_value_by_name(name_table, "name")
             .and_then(|s| name_table.get(s));
 
-        let final_derivation = parse_final_attr(
+        let final_derivation = parse_derivation_set_opt(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 
@@ -1211,11 +1211,11 @@ impl ComplexTypeFrame {
 
         let is_abstract = parse_bool_attr_default(attrs, name_table, "abstract", false)?;
 
-        let final_derivation = parse_final_attr(
+        let final_derivation = parse_derivation_set_opt(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 
-        let block = parse_block_attr(
+        let block = parse_derivation_set_opt(
             attrs.get_value_by_name(name_table, "block"),
         )?;
 

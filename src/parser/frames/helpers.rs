@@ -148,7 +148,7 @@ fn parse_open_content_mode_attr(
 /// Parse a `block`/`final`-style attribute. `None` = attribute absent; caller
 /// decides whether to inherit a document-level default. `Some(set)` = present
 /// (including the empty value `""`, which explicitly overrides any default).
-fn parse_block_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> {
+fn parse_derivation_set_opt(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -178,17 +178,10 @@ fn parse_block_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> 
     Ok(Some(set))
 }
 
-/// Parse a `final=` attribute. `None` = attribute absent; caller decides whether
-/// to inherit a document-level `finalDefault`. `Some(set)` = present (including
-/// `final=""`, which explicitly overrides any default).
-fn parse_final_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> {
-    parse_block_attr(value)
-}
-
 /// Parse a derivation set, collapsing absent into empty (caller has no
 /// None-vs-empty distinction to make).
 fn parse_derivation_set(value: Option<&str>) -> SchemaResult<DerivationSet> {
-    Ok(parse_block_attr(value)?.unwrap_or_default())
+    Ok(parse_derivation_set_opt(value)?.unwrap_or_default())
 }
 
 /// Parse a QName reference with namespace resolution

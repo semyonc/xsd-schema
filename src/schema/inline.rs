@@ -39,38 +39,34 @@ use crate::parser::location::{SourceMapStorage, SourceRef};
 use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
 
-/// Resolve a parsed `block` attribute to an effective `DerivationSet`.
-/// `Some(set)` → explicit (including `block=""` = empty, which overrides blockDefault).
-/// `None` → absent; inherit the source document's `blockDefault`, following
-/// `schema_defaults_doc` for override-copied components so they see the
-/// override document's defaults rather than the origin schema's.
-fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
-    block.unwrap_or_else(|| {
+/// Resolve a parsed `block`/`final` attribute to an effective `DerivationSet`.
+/// `Some(set)` → explicit (including `""` = empty, which overrides the default).
+/// `None` → absent; inherit the source document's default via `pick_default`,
+/// following `schema_defaults_doc` for override-copied components so they see
+/// the override document's defaults rather than the origin schema's.
+fn resolve_derivation_default(
+    parsed: Option<DerivationSet>,
+    source: Option<&SourceRef>,
+    schema_set: &SchemaSet,
+    pick_default: impl Fn(&crate::schema::model::SchemaDocument) -> DerivationSet,
+) -> DerivationSet {
+    parsed.unwrap_or_else(|| {
         source
             .and_then(|s| {
                 let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
                 schema_set.documents.get(doc_id as usize)
             })
-            .map(|d| d.block_default)
+            .map(pick_default)
             .unwrap_or_default()
     })
 }
 
-/// Resolve a parsed `final` attribute to an effective `DerivationSet`.
-/// `Some(set)` → explicit (including `final=""` = empty, which overrides finalDefault).
-/// `None` → absent; inherit the source document's `finalDefault`, following
-/// `schema_defaults_doc` for override-copied components so they see the
-/// override document's defaults rather than the origin schema's.
+fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
+    resolve_derivation_default(block, source, schema_set, |d| d.block_default)
+}
+
 fn resolve_final(final_derivation: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
-    final_derivation.unwrap_or_else(|| {
-        source
-            .and_then(|s| {
-                let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
-                schema_set.documents.get(doc_id as usize)
-            })
-            .map(|d| d.final_default)
-            .unwrap_or_default()
-    })
+    resolve_derivation_default(final_derivation, source, schema_set, |d| d.final_default)
 }
 
 /// Statistics from the inline type assembly pass
