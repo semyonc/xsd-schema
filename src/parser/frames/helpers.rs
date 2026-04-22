@@ -147,7 +147,7 @@ fn parse_open_content_mode_attr(
 
 /// Parse a `block`/`final`-style attribute. `None` = attribute absent; caller
 /// decides whether to inherit a document-level default. `Some(set)` = present
-/// (including the empty value, which explicitly overrides any default).
+/// (including the empty value `""`, which explicitly overrides any default).
 fn parse_block_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> {
     let Some(value) = value else {
         return Ok(None);
@@ -176,6 +176,13 @@ fn parse_block_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> 
     }
 
     Ok(Some(set))
+}
+
+/// Parse a `final=` attribute. `None` = attribute absent; caller decides whether
+/// to inherit a document-level `finalDefault`. `Some(set)` = present (including
+/// `final=""`, which explicitly overrides any default).
+fn parse_final_attr(value: Option<&str>) -> SchemaResult<Option<DerivationSet>> {
+    parse_block_attr(value)
 }
 
 /// Parse a derivation set, collapsing absent into empty (caller has no

@@ -138,10 +138,8 @@ impl<'a> SchemaAssembler<'a> {
                     annotation,
                     source,
                 } = *simple;
-                let mut final_derivation = final_derivation;
-                if final_derivation.is_empty() {
-                    final_derivation = self.final_default;
-                }
+                // final="" explicitly overrides finalDefault; None (absent) inherits it.
+                let final_derivation = final_derivation.unwrap_or(self.final_default);
                 let source_ref = source.clone();
                 let name = name.ok_or_else(|| missing_name("simpleType", source_ref.as_ref(), self.schema_set))?;
                 let data = SimpleTypeDefData {
@@ -190,10 +188,8 @@ impl<'a> SchemaAssembler<'a> {
                     annotation,
                     source,
                 } = *complex;
-                let mut final_derivation = final_derivation;
-                if final_derivation.is_empty() {
-                    final_derivation = self.final_default;
-                }
+                // final="" explicitly overrides finalDefault; None (absent) inherits it.
+                let final_derivation = final_derivation.unwrap_or(self.final_default);
                 // block="" explicitly overrides blockDefault; None (absent) inherits it.
                 let block = block.unwrap_or(self.block_default);
                 let open_content = match &content {
@@ -275,15 +271,18 @@ impl<'a> SchemaAssembler<'a> {
         let source_ref = source.clone();
         let name = name.ok_or_else(|| missing_name("element", source_ref.as_ref(), self.schema_set))?;
         let target_namespace = local_namespace.or(self.target_namespace);
-        let mut final_derivation = final_derivation;
+        // final="" explicitly overrides finalDefault; None (absent) inherits it.
         // block="" explicitly overrides blockDefault; None (absent) inherits it.
-        let block = if ref_name.is_none() {
-            if final_derivation.is_empty() {
-                final_derivation = self.final_default;
-            }
-            block.unwrap_or(self.block_default)
+        let (final_derivation, block) = if ref_name.is_none() {
+            (
+                final_derivation.unwrap_or(self.final_default),
+                block.unwrap_or(self.block_default),
+            )
         } else {
-            block.unwrap_or_default()
+            (
+                final_derivation.unwrap_or_default(),
+                block.unwrap_or_default(),
+            )
         };
 
         // Check identity constraint name uniqueness (per schema document)

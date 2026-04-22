@@ -17,7 +17,7 @@ enum SimpleTypePhase {
 pub struct SimpleTypeFrame {
     phase: SimpleTypePhase,
     name: Option<NameId>,
-    final_derivation: DerivationSet,
+    final_derivation: Option<DerivationSet>,
     id: Option<String>,
     derivation_id: Option<String>,
     variety: Option<SimpleTypeVariety>,
@@ -40,7 +40,7 @@ impl SimpleTypeFrame {
             .get_value_by_name(name_table, "name")
             .and_then(|s| name_table.get(s));
 
-        let final_derivation = parse_derivation_set(
+        let final_derivation = parse_final_attr(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 
@@ -757,7 +757,7 @@ impl Frame for ListFrame {
             item_type: item,
             member_types: Vec::new(),
             facets: FacetSet::new(),
-            final_derivation: DerivationSet::empty(),
+            final_derivation: None,
             id: None,
             derivation_id: self.id,
             annotation,
@@ -870,7 +870,7 @@ impl Frame for UnionFrame {
             item_type: None,
             member_types: self.member_types,
             facets: FacetSet::new(),
-            final_derivation: DerivationSet::empty(),
+            final_derivation: None,
             id: None,
             derivation_id: self.id,
             annotation,
@@ -1180,7 +1180,7 @@ pub struct ComplexTypeFrame {
     derivation_method: Option<DerivationMethod>,
     mixed: bool,
     is_abstract: bool,
-    final_derivation: DerivationSet,
+    final_derivation: Option<DerivationSet>,
     block: Option<DerivationSet>,
     default_attributes_apply: bool,
     id: Option<String>,
@@ -1211,7 +1211,7 @@ impl ComplexTypeFrame {
 
         let is_abstract = parse_bool_attr_default(attrs, name_table, "abstract", false)?;
 
-        let final_derivation = parse_derivation_set(
+        let final_derivation = parse_final_attr(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 

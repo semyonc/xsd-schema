@@ -1563,7 +1563,6 @@ mod tests {
     fn test_resolver_preserves_inline_resolved_type_in_model_group() {
         use crate::arenas::{ModelGroupData, ResolvedParticleTerm};
         use crate::parser::frames::{Compositor, ElementFrameResult, ParticleResult, ParticleTerm};
-        use crate::schema::model::DerivationSet;
 
         let mut schema_set = SchemaSet::new();
 
@@ -1594,7 +1593,7 @@ mod tests {
                     min_occurs: 1,
                     max_occurs: Some(1),
                     block: None,
-                    final_derivation: DerivationSet::empty(),
+                    final_derivation: None,
                     form: None,
                     id: None,
                     alternatives: vec![],

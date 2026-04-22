@@ -28,7 +28,7 @@ pub struct ElementFrame {
     min_occurs: u32,
     max_occurs: Option<u32>,
     block: Option<DerivationSet>,
-    final_derivation: DerivationSet,
+    final_derivation: Option<DerivationSet>,
     form: Option<String>,
     id: Option<String>,
     alternatives: Vec<AlternativeResult>,
@@ -92,7 +92,7 @@ impl ElementFrame {
             attrs.get_value_by_name(name_table, "block"),
         )?;
 
-        let final_derivation = parse_derivation_set(
+        let final_derivation = parse_final_attr(
             attrs.get_value_by_name(name_table, "final"),
         )?;
 

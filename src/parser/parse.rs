@@ -1243,6 +1243,86 @@ mod tests {
         }
     }
 
+    /// §3.3.1.2 / §3.4.1: `final=""` on an element/type is an explicit empty override —
+    /// it must NOT be replaced by the document-level `finalDefault`. Only absent `final=`
+    /// inherits `finalDefault`. This test verifies that the assembler correctly distinguishes
+    /// the two cases (T22b fix).
+    #[test]
+    fn test_final_explicit_empty_overrides_final_default() {
+        let mut schema_set = SchemaSet::new();
+        let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                       finalDefault="restriction">
+              <!-- final="" is explicit override: no derivation blocked, despite finalDefault -->
+              <xs:element name="unlocked" type="xs:string" final=""/>
+              <!-- absent final= inherits finalDefault="restriction" -->
+              <xs:element name="inherited" type="xs:string"/>
+              <xs:complexType name="UnlockedType" final=""/>
+              <xs:complexType name="InheritedType"/>
+              <xs:simpleType name="UnlockedSimple" final="">
+                <xs:restriction base="xs:string"/>
+              </xs:simpleType>
+              <xs:simpleType name="InheritedSimple">
+                <xs:restriction base="xs:string"/>
+              </xs:simpleType>
+            </xs:schema>"#;
+
+        let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
+        assert!(result.is_ok());
+
+        let ns_table = schema_set.namespaces.get(&None).expect("default namespace");
+
+        // Element: final="" → empty (NOT restriction)
+        let unlocked_id = schema_set.name_table.get("unlocked").expect("unlocked");
+        let unlocked_key = ns_table.elements.get(&unlocked_id).expect("element key");
+        let unlocked = schema_set.arenas.elements.get(*unlocked_key).expect("element");
+        assert!(unlocked.final_derivation.is_empty(),
+            "final=\"\" must produce empty set, not inherit finalDefault");
+
+        // Element: absent final → restriction (from finalDefault)
+        let inherited_id = schema_set.name_table.get("inherited").expect("inherited");
+        let inherited_key = ns_table.elements.get(&inherited_id).expect("element key");
+        let inherited = schema_set.arenas.elements.get(*inherited_key).expect("element");
+        assert!(inherited.final_derivation.contains_restriction(),
+            "absent final= must inherit finalDefault=restriction");
+
+        // ComplexType: final="" → empty
+        let ut_id = schema_set.name_table.get("UnlockedType").expect("UnlockedType");
+        let ut_key = ns_table.types.get(&ut_id).expect("type key");
+        if let crate::ids::TypeKey::Complex(key) = ut_key {
+            let ct = schema_set.arenas.complex_types.get(*key).expect("complex type");
+            assert!(ct.final_derivation.is_empty(),
+                "complexType final=\"\" must not inherit finalDefault");
+        }
+
+        // ComplexType: absent final → restriction
+        let it_id = schema_set.name_table.get("InheritedType").expect("InheritedType");
+        let it_key = ns_table.types.get(&it_id).expect("type key");
+        if let crate::ids::TypeKey::Complex(key) = it_key {
+            let ct = schema_set.arenas.complex_types.get(*key).expect("complex type");
+            assert!(ct.final_derivation.contains_restriction(),
+                "complexType absent final= must inherit finalDefault");
+        }
+
+        // SimpleType: final="" → empty
+        let us_id = schema_set.name_table.get("UnlockedSimple").expect("UnlockedSimple");
+        let us_key = ns_table.types.get(&us_id).expect("type key");
+        if let crate::ids::TypeKey::Simple(key) = us_key {
+            let st = schema_set.arenas.simple_types.get(*key).expect("simple type");
+            assert!(st.final_derivation.is_empty(),
+                "simpleType final=\"\" must not inherit finalDefault");
+        }
+
+        // SimpleType: absent final → restriction
+        let is_id = schema_set.name_table.get("InheritedSimple").expect("InheritedSimple");
+        let is_key = ns_table.types.get(&is_id).expect("type key");
+        if let crate::ids::TypeKey::Simple(key) = is_key {
+            let st = schema_set.arenas.simple_types.get(*key).expect("simple type");
+            assert!(st.final_derivation.contains_restriction(),
+                "simpleType absent final= must inherit finalDefault");
+        }
+    }
+
     #[test]
     fn test_duplicate_id_detected() {
         let mut schema_set = SchemaSet::new();

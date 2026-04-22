@@ -56,6 +56,23 @@ fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schem
     })
 }
 
+/// Resolve a parsed `final` attribute to an effective `DerivationSet`.
+/// `Some(set)` → explicit (including `final=""` = empty, which overrides finalDefault).
+/// `None` → absent; inherit the source document's `finalDefault`, following
+/// `schema_defaults_doc` for override-copied components so they see the
+/// override document's defaults rather than the origin schema's.
+fn resolve_final(final_derivation: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
+    final_derivation.unwrap_or_else(|| {
+        source
+            .and_then(|s| {
+                let doc_id = s.schema_defaults_doc.unwrap_or(s.doc_id);
+                schema_set.documents.get(doc_id as usize)
+            })
+            .map(|d| d.final_default)
+            .unwrap_or_default()
+    })
+}
+
 /// Statistics from the inline type assembly pass
 #[derive(Debug, Default)]
 pub struct InlineAssemblyStats {
@@ -816,6 +833,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
         }
 
         let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
+        let final_derivation = resolve_final(job.elem.final_derivation, job.elem.source.as_ref(), schema_set);
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -830,7 +848,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             min_occurs: job.elem.min_occurs,
             max_occurs: job.elem.max_occurs,
             block,
-            final_derivation: job.elem.final_derivation,
+            final_derivation,
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
@@ -975,6 +993,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
         }
 
         let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
+        let final_derivation = resolve_final(job.elem.final_derivation, job.elem.source.as_ref(), schema_set);
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -989,7 +1008,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             min_occurs: job.elem.min_occurs,
             max_occurs: job.elem.max_occurs,
             block,
-            final_derivation: job.elem.final_derivation,
+            final_derivation,
             form: job.elem.form.clone(),
             id: job.elem.id.clone(),
             alternatives: job.elem.alternatives.clone(),
@@ -1063,6 +1082,7 @@ fn assemble_inline_type(
 ) -> SchemaResult<TypeKey> {
     match type_frame {
         TypeFrameResult::Simple(simple) => {
+            let final_derivation = resolve_final(simple.final_derivation, simple.source.as_ref(), schema_set);
             let data = SimpleTypeDefData {
                 name: simple.name, // May be None for anonymous types
                 target_namespace,
@@ -1071,7 +1091,7 @@ fn assemble_inline_type(
                 item_type: simple.item_type.clone(),
                 member_types: simple.member_types.clone(),
                 facets: simple.facets.clone(),
-                final_derivation: simple.final_derivation,
+                final_derivation,
                 id: simple.id.clone(),
                 derivation_id: simple.derivation_id.clone(),
                 annotation: simple.annotation.clone(),
@@ -1097,6 +1117,7 @@ fn assemble_inline_type(
                 ComplexContentResult::Empty => Vec::new(),
             };
             let block = resolve_block(complex.block, complex.source.as_ref(), schema_set);
+            let final_derivation = resolve_final(complex.final_derivation, complex.source.as_ref(), schema_set);
             let data = ComplexTypeDefData {
                 name: complex.name, // May be None for anonymous types
                 target_namespace,
@@ -1109,7 +1130,7 @@ fn assemble_inline_type(
                 attribute_wildcard: complex.attribute_wildcard.clone(),
                 mixed: complex.mixed,
                 is_abstract: complex.is_abstract,
-                final_derivation: complex.final_derivation,
+                final_derivation,
                 block,
                 default_attributes_apply: complex.default_attributes_apply,
                 id: complex.id.clone(),
@@ -1339,7 +1360,7 @@ mod tests {
             item_type: None,
             member_types: Vec::new(),
             facets: FacetSet::new(),
-            final_derivation: DerivationSet::empty(),
+            final_derivation: None,
             id: None,
             derivation_id: None,
             annotation: None,

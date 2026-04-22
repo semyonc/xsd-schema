@@ -687,7 +687,7 @@ mod tests {
         Compositor, ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm, QNameRef,
     };
     use crate::schema::composition::ComponentKind;
-    use crate::schema::model::{DerivationSet, SchemaDocument};
+    use crate::schema::model::SchemaDocument;
 
     /// Helper: set up a schema set with a base document and a named model group.
     fn setup_model_group_redefine() -> (SchemaSet, ModelGroupKey, ModelGroupKey) {
@@ -722,7 +722,7 @@ mod tests {
                     min_occurs: 1,
                     max_occurs: Some(1),
                     block: None,
-                    final_derivation: DerivationSet::empty(),
+                    final_derivation: None,
                     form: None,
                     id: None,
                     alternatives: vec![],
@@ -797,7 +797,7 @@ mod tests {
                         min_occurs: 1,
                         max_occurs: Some(1),
                         block: None,
-                        final_derivation: DerivationSet::empty(),
+                        final_derivation: None,
                         form: None,
                         id: None,
                         alternatives: vec![],
@@ -1051,7 +1051,7 @@ mod tests {
                     min_occurs: 1,
                     max_occurs: Some(1),
                     block: None,
-                    final_derivation: DerivationSet::empty(),
+                    final_derivation: None,
                     form: None,
                     id: None,
                     alternatives: vec![],
@@ -1135,7 +1135,7 @@ mod tests {
                         min_occurs: 1,
                         max_occurs: Some(1),
                         block: None,
-                        final_derivation: DerivationSet::empty(),
+                        final_derivation: None,
                         form: None,
                         id: None,
                         alternatives: vec![],
@@ -1312,7 +1312,7 @@ mod tests {
                 min_occurs: 1,
                 max_occurs: Some(1),
                 block: None,
-                final_derivation: DerivationSet::empty(),
+                final_derivation: None,
                 form: None,
                 id: None,
                 alternatives: vec![],
