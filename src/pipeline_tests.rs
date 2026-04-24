@@ -2777,10 +2777,15 @@ fn test_reject_required_attribute_becomes_optional() {
     }
 }
 
-/// particlesZ017b: namespace-aware attribute matching — derived omits
-/// required base attribute (different namespace, same local name)
+/// Restriction that omits a base required attribute is valid —
+/// the attribute is inherited unchanged per §3.4.2.3 mapping
+/// (the derived type's effective {attribute uses} still contains the
+/// required `ns1:id` attribute; clause 3 of derivation-ok-restriction
+/// is trivially satisfied for inherited uses). The test exercises the
+/// namespace-aware matcher: `ns1:id` and a hypothetical no-namespace
+/// `id` must be kept distinct when searching for overrides.
 #[test]
-fn test_reject_restriction_conflated_namespace_attribute() {
+fn test_accept_restriction_inherits_namespaced_required_attribute() {
     let mut schema_set = SchemaSet::new();
     let xsd = r###"<?xml version="1.0"?>
         <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
@@ -2805,15 +2810,12 @@ fn test_reject_restriction_conflated_namespace_attribute() {
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
     assert!(
-        result.is_err(),
-        "derived type missing required ns1:id attribute must be rejected"
+        result.is_ok(),
+        "omitting a base required attribute inherits it unchanged, \
+         which is a valid restriction (spec §3.4.2.3 mapping + \
+         derivation-ok-restriction clause 3): {:?}",
+        result.err(),
     );
-    match result.unwrap_err() {
-        crate::error::SchemaError::StructuralError { constraint, .. } => {
-            assert_eq!(constraint, "derivation-ok-restriction");
-        }
-        other => panic!("Expected derivation-ok-restriction, got {:?}", other),
-    }
 }
 
 /// particlesZ018: simpleContent restriction with list type over atomic base
