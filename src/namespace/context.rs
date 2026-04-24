@@ -146,6 +146,18 @@ impl<'a> NamespaceContext<'a> {
         self.default_namespace = uri.map(|u| self.name_table.add(u));
     }
 
+    /// Set the default namespace to an already-interned `NameId`.
+    ///
+    /// Used by the parser to install a chameleon-adopted namespace on the
+    /// root `<xs:schema>` scope (§4.2.3 clause 2.3): when an included schema
+    /// has no `targetNamespace` and no explicit `xmlns` default, unqualified
+    /// QName references inside it must resolve to the includer's target
+    /// namespace. Pre-setting the scope's default namespace produces that
+    /// resolution naturally during subsequent QName parsing.
+    pub fn set_default_namespace_id(&mut self, ns: Option<NameId>) {
+        self.default_namespace = ns;
+    }
+
     /// Get all namespace bindings in scope
     ///
     /// # Arguments

@@ -104,6 +104,13 @@ struct ParserState<'a, 'b, 'c> {
     /// True when the root xs:schema element has a vc: version condition that
     /// excludes this document; all children of xs:schema are then skipped.
     vc_schema_excluded: bool,
+    /// Chameleon namespace to adopt (§4.2.3 clause 2.3) when this document
+    /// is being included by a schema with a target namespace and itself has
+    /// neither a `targetNamespace` attribute nor an explicit `xmlns` default.
+    /// Applied to the root `<xs:schema>` scope so that unqualified QName
+    /// references inside the included document resolve to the includer's
+    /// target namespace (matching how top-level definitions are re-namespaced).
+    chameleon_namespace: Option<NameId>,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -112,6 +119,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
         doc_id: DocumentId,
         config: &'b ParserConfig,
         source_map: &'c SourceMap,
+        chameleon_namespace: Option<NameId>,
     ) -> Self {
         let ns_context = NamespaceContext::new(name_table);
         Self {
@@ -125,6 +133,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             root_schema: None,
             id_values: HashSet::new(),
             vc_schema_excluded: false,
+            chameleon_namespace,
         }
     }
 
@@ -261,7 +270,13 @@ pub fn parse_schema_with_chameleon(
     let doc_id = schema_set.source_maps.len() as DocumentId;
 
     // Create parser state with reference to source_map
-    let mut state = ParserState::new(&mut schema_set.name_table, doc_id, &config, &source_map);
+    let mut state = ParserState::new(
+        &mut schema_set.name_table,
+        doc_id,
+        &config,
+        &source_map,
+        chameleon_namespace,
+    );
 
     // Create XML reader
     let mut reader = TrackedReader::from_bytes(xml);
@@ -493,6 +508,29 @@ fn handle_start_element(
     )?;
     let (xsd_attrs, foreign_attrs) = categorize_attributes(parsed_attrs, state.ns_context.name_table());
     let attr_map = AttributeMap::new(xsd_attrs);
+
+    // Chameleon include (§4.2.3 clause 2.3): if this is the root `<xs:schema>`
+    // of a document being chameleon-included and the document declares neither
+    // its own `targetNamespace` nor an explicit `xmlns` default, install the
+    // includer's target namespace as the default for QName resolution. Unqualified
+    // type/element/group/attribute references inside the document will then
+    // resolve to the includer's namespace — matching the fact that top-level
+    // definitions in the included schema are re-namespaced into the includer's
+    // target namespace (see `parse_schema_with_chameleon` below).
+    if state.frame_stack.is_empty()
+        && local_name == xsd_names::SCHEMA
+        && state.is_in_xsd_namespace(element_ns)
+    {
+        if let Some(chameleon_ns) = state.chameleon_namespace {
+            let has_own_tns = attr_map
+                .get_value_by_name(state.ns_context.name_table(), "targetNamespace")
+                .is_some();
+            let default_is_null = state.ns_context.default_namespace().is_none();
+            if !has_own_tns && default_is_null {
+                state.ns_context.set_default_namespace_id(Some(chameleon_ns));
+            }
+        }
+    }
 
     // §F (XSD 1.1 Appendix F): conditional inclusion via vc:* attributes.
     let vc_excluded = if foreign_attrs.is_empty() {
