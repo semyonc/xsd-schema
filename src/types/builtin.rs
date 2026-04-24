@@ -175,6 +175,8 @@ pub struct BuiltinTypes {
     // Lookup maps for fast access
     /// Map from XmlTypeCode to SimpleTypeKey
     by_type_code: HashMap<XmlTypeCode, SimpleTypeKey>,
+    /// Reverse map from SimpleTypeKey to XmlTypeCode, so `get_type_code` is O(1).
+    by_key: HashMap<SimpleTypeKey, XmlTypeCode>,
     /// Map from local name NameId to SimpleTypeKey (for XS namespace)
     by_local_name: HashMap<NameId, SimpleTypeKey>,
 
@@ -394,12 +396,14 @@ impl BuiltinTypes {
 
         // Build lookup maps
         let mut by_type_code = HashMap::new();
+        let mut by_key = HashMap::new();
         let mut by_local_name = HashMap::new();
 
         // Helper to add to lookup maps
         let mut add_to_maps = |builtin: BuiltInType, key: SimpleTypeKey| {
             let type_code = builtin.type_code();
             by_type_code.insert(type_code, key);
+            by_key.insert(key, type_code);
 
             let local_name = builtin.local_name();
             let name_id = schema_set.name_table.add(local_name);
@@ -622,6 +626,7 @@ impl BuiltinTypes {
             idrefs,
             entities,
             by_type_code,
+            by_key,
             by_local_name,
             xsi_type_attr,
             xsi_nil_attr,
@@ -648,13 +653,7 @@ impl BuiltinTypes {
     ///
     /// Returns `None` if the key is not a built-in type.
     pub fn get_type_code(&self, key: SimpleTypeKey) -> Option<XmlTypeCode> {
-        // Iterate over the map to find the type code for this key
-        for (&code, &k) in &self.by_type_code {
-            if k == key {
-                return Some(code);
-            }
-        }
-        None
+        self.by_key.get(&key).copied()
     }
 
     /// Check if a type key is a built-in type.
@@ -662,13 +661,28 @@ impl BuiltinTypes {
         self.get_type_code(key).is_some()
     }
 
+    /// True when `key` is the `xs:anyAtomicType` built-in (XSD 1.1 only).
+    #[inline]
+    pub fn is_any_atomic_type(&self, key: SimpleTypeKey) -> bool {
+        self.any_atomic_type == Some(key)
+    }
+
     /// Get the base type for a built-in type (for derivation hierarchy).
     ///
     /// Returns the immediate base type in the XSD type hierarchy.
     /// Returns `None` for `anySimpleType` (the root of simple types).
+    ///
+    /// In XSD 1.1 mode, primitive atomic types derive from `xs:anyAtomicType`
+    /// per §3.16.7.3; in XSD 1.0 they derive from `xs:anySimpleType`.
     pub fn get_base_type(&self, key: SimpleTypeKey) -> Option<SimpleTypeKey> {
         let code = self.get_type_code(key)?;
         let base_code = get_builtin_base_type(code)?;
+        if base_code == XmlTypeCode::AnySimpleType
+            && code.is_primitive_atomic()
+            && self.any_atomic_type.is_some()
+        {
+            return self.any_atomic_type;
+        }
         self.get_by_type_code(base_code)
     }
 

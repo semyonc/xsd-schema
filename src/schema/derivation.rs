@@ -210,11 +210,101 @@ fn validate_applicable_facets(
             }
         }
         SimpleTypeVariety::Atomic => {
-            // Atomic types: all facets potentially applicable (depends on base type)
+            // Atomic types: applicability depends on the primitive ancestor
+            // (§4.1.5 / Table F.1 of Datatypes). Walk up the base chain to the
+            // closest built-in primitive and check each facet kind against it.
+            if let Some(primitive_code) = primitive_type_code(schema_set, type_def) {
+                use crate::types::facets::{facet_applicable_for_type, FacetApplicability, FacetKind};
+                let facets = &type_def.facets;
+                let mut bad: Vec<&'static str> = Vec::new();
+                let mut check = |present: bool, kind: FacetKind| {
+                    if present
+                        && matches!(
+                            facet_applicable_for_type(kind, primitive_code),
+                            FacetApplicability::NotApplicable
+                        )
+                    {
+                        bad.push(kind.name());
+                    }
+                };
+                check(facets.length.is_some(), FacetKind::Length);
+                check(facets.min_length.is_some(), FacetKind::MinLength);
+                check(facets.max_length.is_some(), FacetKind::MaxLength);
+                check(facets.whitespace.is_some(), FacetKind::Whitespace);
+                check(facets.min_inclusive.is_some(), FacetKind::MinInclusive);
+                check(facets.max_inclusive.is_some(), FacetKind::MaxInclusive);
+                check(facets.min_exclusive.is_some(), FacetKind::MinExclusive);
+                check(facets.max_exclusive.is_some(), FacetKind::MaxExclusive);
+                check(facets.total_digits.is_some(), FacetKind::TotalDigits);
+                check(facets.fraction_digits.is_some(), FacetKind::FractionDigits);
+                check(facets.explicit_timezone.is_some(), FacetKind::ExplicitTimezone);
+                if !bad.is_empty() {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
+                    return Err(SchemaError::structural(
+                        "cos-applicable-facets",
+                        format!(
+                            "Atomic type '{}' has inapplicable facet(s) for primitive '{}': {}",
+                            type_name,
+                            primitive_code.local_name().unwrap_or("<unnamed>"),
+                            bad.join(", ")
+                        ),
+                        location,
+                    ));
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+/// Walk a simple type's base chain to the closest built-in with an `XmlTypeCode`.
+///
+/// Depth is capped at 64 — the XSD primitive hierarchy is shallow and the
+/// dependency graph already rejects cycles before this runs, so the bound is
+/// purely a defence against a malformed arena state.
+fn primitive_type_code(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::SimpleTypeDefData,
+) -> Option<crate::types::XmlTypeCode> {
+    let builtin = schema_set.builtin_types();
+    let mut current_base = type_def.resolved_base_type;
+    for _ in 0..64 {
+        let Some(TypeKey::Simple(k)) = current_base else { return None; };
+        if let Some(code) = builtin.get_type_code(k) {
+            return Some(code);
+        }
+        current_base = schema_set
+            .arenas
+            .simple_types
+            .get(k)
+            .and_then(|t| t.resolved_base_type);
+    }
+    None
+}
+
+/// Emit a `cos-st-restricts`-family error when `simple_key` names
+/// `xs:anyAtomicType`, which XSD 1.1 bug 11103 declared abstract — it must
+/// not appear as a restriction base, list item type, or union member.
+fn reject_any_atomic_type(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::SimpleTypeDefData,
+    simple_key: SimpleTypeKey,
+    constraint: &'static str,
+    role: &'static str,
+) -> SchemaResult<()> {
+    if !schema_set.builtin_types().is_any_atomic_type(simple_key) {
+        return Ok(());
+    }
+    let (location, type_name) = type_error_context(schema_set, type_def);
+    Err(SchemaError::structural(
+        constraint,
+        format!(
+            "Simple type '{}' cannot {} xs:anyAtomicType (abstract per XSD 1.1 bug 11103)",
+            type_name, role
+        ),
+        location,
+    ))
 }
 
 /// List inapplicable facet names for list types
@@ -269,6 +359,10 @@ fn validate_simple_restriction(
             format!("Simple type '{}': base type must be a simple type definition (cos-st-restricts.1.1)", type_name),
             location,
         ));
+    }
+
+    if let TypeKey::Simple(base_simple_key) = base_key {
+        reject_any_atomic_type(schema_set, type_def, base_simple_key, "cos-st-restricts", "restrict")?;
     }
 
     stats.restrictions_validated += 1;
@@ -372,6 +466,7 @@ fn validate_simple_list(
     // Item type must be atomic (not a list, not a union containing lists)
     match item_key {
         TypeKey::Simple(simple_key) => {
+            reject_any_atomic_type(schema_set, type_def, simple_key, "cos-list-of-atomic", "use as list item type")?;
             if let Some(item_type) = schema_set.arenas.simple_types.get(simple_key) {
                 match item_type.variety {
                     SimpleTypeVariety::Atomic => {
@@ -467,8 +562,14 @@ fn validate_simple_union(
     // All member types must be simple types
     for member_key in &type_def.resolved_member_types {
         match member_key {
-            TypeKey::Simple(_) => {
-                // Valid - simple types are OK
+            TypeKey::Simple(simple_key) => {
+                reject_any_atomic_type(
+                    schema_set,
+                    type_def,
+                    *simple_key,
+                    "cos-union-memberTypes",
+                    "use as union member type",
+                )?;
             }
             TypeKey::Complex(_) => {
                 // Invalid - complex types cannot be union members

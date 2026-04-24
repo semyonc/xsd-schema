@@ -472,12 +472,21 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::ExplicitTimezone => {
             if facets.explicit_timezone.is_some() { return Err(dup("explicitTimezone")); }
-            // XSD 1.1: explicitTimezone facet
+            // XSD 1.1 §4.3.16: explicitTimezone value must be one of required/prohibited/optional.
             let mode = match facet.value.as_str() {
                 "required" => ExplicitTimezone::Required,
                 "prohibited" => ExplicitTimezone::Prohibited,
                 "optional" => ExplicitTimezone::Optional,
-                _ => ExplicitTimezone::Optional,
+                other => {
+                    return Err(SchemaError::structural(
+                        "st-props-correct",
+                        format!(
+                            "Invalid explicitTimezone value '{}': expected 'required', 'prohibited', or 'optional'",
+                            other
+                        ),
+                        None,
+                    ));
+                }
             };
             facets.set_explicit_timezone(mode, fixed, facet.source);
         }

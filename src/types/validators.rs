@@ -1442,76 +1442,144 @@ pub fn is_strict_xsd10_anyuri(value: &str) -> bool {
 
 /// Parse XSD duration
 fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
-    // Simple regex-like parsing: -?P(nY)?(nM)?(nD)?(T(nH)?(nM)?(nS)?)?
-    let mut chars = s.chars().peekable();
-    let negative = chars.peek() == Some(&'-');
+    // Lexical form per §3.3.6 (Datatypes):
+    //   -?P([0-9]+Y)?([0-9]+M)?([0-9]+D)?(T([0-9]+H)?([0-9]+M)?([0-9]+(\.[0-9]+)?S)?)?
+    // At least one designator after `P` is required; after `T` at least one
+    // time designator is required. Fraction is only legal on the seconds field.
+    let bad = |message: String| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "duration",
+        message,
+    };
+
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    let negative = bytes.first() == Some(&b'-');
     if negative {
-        chars.next();
+        pos += 1;
     }
-
-    if chars.next() != Some('P') {
-        return Err(ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "duration",
-            message: "Must start with 'P'".to_string(),
-        });
+    if bytes.get(pos) != Some(&b'P') {
+        return Err(bad("Must start with 'P'".to_string()));
     }
+    pos += 1;
 
-    let mut years = 0u32;
-    let mut months = 0u32;
-    let mut days = 0u32;
-    let mut hours = 0u32;
-    let mut minutes = 0u32;
-    let mut seconds = Decimal::ZERO;
+    let mut out = DurationValue {
+        negative,
+        years: 0,
+        months: 0,
+        days: 0,
+        hours: 0,
+        minutes: 0,
+        seconds: Decimal::ZERO,
+    };
+    // Duplicate-designator detection. Index order matches `Field` below.
+    let mut seen = [false; 6];
     let mut in_time = false;
 
-    let rest: String = chars.collect();
-    let mut pos = 0;
-
-    while pos < rest.len() {
-        if rest[pos..].starts_with('T') {
+    while pos < bytes.len() {
+        if bytes[pos] == b'T' {
+            if in_time {
+                return Err(bad("Duplicate 'T' separator".to_string()));
+            }
             in_time = true;
             pos += 1;
             continue;
         }
 
-        // Find number
-        let start = pos;
-        while pos < rest.len() && (rest.as_bytes()[pos].is_ascii_digit() || rest.as_bytes()[pos] == b'.') {
+        let int_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
             pos += 1;
         }
-        if pos == start || pos >= rest.len() {
-            break;
+        if pos == int_start {
+            return Err(bad(format!(
+                "Unexpected character '{}' at position {}",
+                bytes[pos] as char, pos
+            )));
+        }
+        let int_end = pos;
+        if pos < bytes.len() && bytes[pos] == b'.' {
+            pos += 1;
+            let frac_start = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos == frac_start {
+                return Err(bad("Fractional part must have at least one digit".to_string()));
+            }
+        }
+        let has_fraction = pos != int_end;
+        if pos >= bytes.len() {
+            return Err(bad("Missing designator after number".to_string()));
+        }
+        let designator = bytes[pos];
+        pos += 1;
+        let num_str = &s[int_start..pos - 1];
+
+        // Resolve the designator to a slot; the letter 'M' is overloaded on `T`.
+        let (field, name, allow_fraction): (Field, &str, bool) = match (designator, in_time) {
+            (b'Y', false) => (Field::Years, "Y", false),
+            (b'M', false) => (Field::Months, "M", false),
+            (b'D', false) => (Field::Days, "D", false),
+            (b'H', true) => (Field::Hours, "H", false),
+            (b'M', true) => (Field::Minutes, "M", false),
+            (b'S', true) => (Field::Seconds, "S", true),
+            (other, _) => {
+                return Err(bad(format!(
+                    "Unexpected designator '{}' (in_time={})",
+                    other as char, in_time
+                )));
+            }
+        };
+        if seen[field as usize] {
+            return Err(bad(format!("Duplicate '{}' designator", name)));
+        }
+        seen[field as usize] = true;
+        if has_fraction && !allow_fraction {
+            return Err(bad(format!("'{}' must be an integer", name)));
         }
 
-        let num_str = &rest[start..pos];
-        let designator = rest.as_bytes()[pos] as char;
-        pos += 1;
-
-        match designator {
-            'Y' if !in_time => years = num_str.parse().unwrap_or(0),
-            'M' if !in_time => months = num_str.parse().unwrap_or(0),
-            'D' => days = num_str.parse().unwrap_or(0),
-            'H' => hours = num_str.parse().unwrap_or(0),
-            'M' if in_time => minutes = num_str.parse().unwrap_or(0),
-            'S' => seconds = num_str.parse().unwrap_or(Decimal::ZERO),
-            _ => return Err(ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "duration",
-                message: format!("Unknown designator '{}'", designator),
-            }),
+        match field {
+            Field::Seconds => {
+                out.seconds = num_str
+                    .parse()
+                    .map_err(|_| bad(format!("Invalid seconds value '{}'", num_str)))?;
+            }
+            _ => {
+                let v: u32 = num_str
+                    .parse()
+                    .map_err(|_| bad(format!("Invalid {} value '{}'", name, num_str)))?;
+                match field {
+                    Field::Years => out.years = v,
+                    Field::Months => out.months = v,
+                    Field::Days => out.days = v,
+                    Field::Hours => out.hours = v,
+                    Field::Minutes => out.minutes = v,
+                    Field::Seconds => unreachable!(),
+                }
+            }
         }
     }
 
-    Ok(DurationValue {
-        negative,
-        years,
-        months,
-        days,
-        hours,
-        minutes,
-        seconds,
-    })
+    if !seen.iter().any(|&b| b) {
+        return Err(bad("Duration must contain at least one component".to_string()));
+    }
+    let any_time = seen[Field::Hours as usize] || seen[Field::Minutes as usize] || seen[Field::Seconds as usize];
+    if in_time && !any_time {
+        return Err(bad("Time designator 'T' requires at least one time component".to_string()));
+    }
+
+    Ok(out)
+}
+
+#[repr(u8)]
+#[derive(Copy, Clone)]
+enum Field {
+    Years = 0,
+    Months = 1,
+    Days = 2,
+    Hours = 3,
+    Minutes = 4,
+    Seconds = 5,
 }
 
 /// Parse XSD dateTime

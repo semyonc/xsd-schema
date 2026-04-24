@@ -803,9 +803,25 @@ impl FacetSet {
             result.assertions.push(assertion.clone());
         }
 
-        // ExplicitTimezone
+        // ExplicitTimezone — §4.3.16 Valid explicitTimezone Restrictions:
+        //   base=optional   → derived ∈ {optional, required, prohibited}
+        //   base=required   → derived ∈ {required}
+        //   base=prohibited → derived ∈ {prohibited}
+        // This restriction is independent of {fixed}; fixed adds only a
+        // stronger value-equality requirement on top.
         if let Some(ref base_etz) = base.explicit_timezone {
             if let Some(ref derived) = result.explicit_timezone {
+                let restriction_ok = match base_etz.value {
+                    ExplicitTimezone::Optional => true,
+                    ExplicitTimezone::Required => derived.value == ExplicitTimezone::Required,
+                    ExplicitTimezone::Prohibited => derived.value == ExplicitTimezone::Prohibited,
+                };
+                if !restriction_ok {
+                    return Err(FacetError::derivation(format!(
+                        "explicitTimezone {:?} is not a valid restriction of base {:?}",
+                        derived.value, base_etz.value
+                    )));
+                }
                 if base_etz.fixed == FacetFixed::Fixed && derived.value != base_etz.value {
                     return Err(FacetError::fixed_violation(
                         "explicitTimezone",

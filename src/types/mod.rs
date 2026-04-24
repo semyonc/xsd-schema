@@ -250,6 +250,34 @@ impl XmlTypeCode {
         matches!(self, Self::NmTokens | Self::IdRefs | Self::Entities)
     }
 
+    /// Returns true if this is one of the 19 XSD primitive atomic types
+    /// that derive from `xs:anyAtomicType` in XSD 1.1 (§3.16.7.3).
+    #[inline]
+    pub fn is_primitive_atomic(&self) -> bool {
+        matches!(
+            self,
+            Self::String
+                | Self::Boolean
+                | Self::Decimal
+                | Self::Float
+                | Self::Double
+                | Self::Duration
+                | Self::DateTime
+                | Self::Time
+                | Self::Date
+                | Self::GYearMonth
+                | Self::GYear
+                | Self::GMonthDay
+                | Self::GDay
+                | Self::GMonth
+                | Self::HexBinary
+                | Self::Base64Binary
+                | Self::AnyUri
+                | Self::QName
+                | Self::Notation
+        )
+    }
+
     /// Returns true if this is a numeric type.
     #[inline]
     pub fn is_numeric(&self) -> bool {
