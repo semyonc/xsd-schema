@@ -274,6 +274,8 @@ pub fn load_and_process_schema(
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
+        #[cfg(feature = "xsd11")]
+        crate::schema::validate_element_type_alternatives(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
@@ -370,6 +372,10 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     // e-props-correct.2 / e-props-correct.4 — validate element default/fixed values
     validate_element_value_constraints(schema_set)?;
+
+    // XSD 1.1 src-type-alternative: only the last <xs:alternative> may omit @test.
+    #[cfg(feature = "xsd11")]
+    crate::schema::validate_element_type_alternatives(schema_set)?;
 
     // (XSD 1.0): strict xs:anyURI lexical check on annotation source
     // attributes. XSD 1.1 explicitly relaxed the rule, so no-op there.
@@ -704,6 +710,8 @@ pub async fn load_and_process_schema_async(
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
+        #[cfg(feature = "xsd11")]
+        crate::schema::validate_element_type_alternatives(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation

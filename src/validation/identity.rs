@@ -46,14 +46,66 @@ fn extract_single_atomic(value: &XmlValue) -> Option<&crate::types::value::XmlAt
 /// identity. Two identical primitive values from different anonymous type
 /// restrictions must be considered equal.
 ///
+/// For date/time/duration types the derived `PartialEq` compares fields
+/// (hour=12+tz=Z differs from hour=13+tz=+01 even though both denote the
+/// same instant), so we fall back to each type's `PartialOrd::partial_cmp`
+/// which uses value-space (instant / total seconds) comparison.
+///
 /// Also handles singleton-list ↔ atomic equivalence per XSD §3.11.4.
 fn xml_value_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
     if a.type_code == b.type_code && a.value == b.value {
         return true;
     }
+    if a.type_code == b.type_code && xml_value_datetime_eq(a, b) {
+        return true;
+    }
     // Singleton-list ↔ atomic equality (XSD §3.11.4)
     match (extract_single_atomic(a), extract_single_atomic(b)) {
-        (Some(va), Some(vb)) => va == vb,
+        (Some(va), Some(vb)) => va == vb || xml_atomic_datetime_eq(va, vb),
+        _ => false,
+    }
+}
+
+/// Value-space equality for date/time/duration atomic kinds using their
+/// `PartialOrd` implementations (which compare in value-space).
+///
+/// XSD Part 2 §3.3.8.2 "Order relation on dateTime" treats date/time/dateTime
+/// values with a timezone and those without as incomparable (neither equal
+/// nor ordered) for identity-constraint purposes. Duration kinds always
+/// compare by total magnitude.
+fn xml_atomic_datetime_eq(
+    a: &crate::types::value::XmlAtomicValue,
+    b: &crate::types::value::XmlAtomicValue,
+) -> bool {
+    use crate::types::value::XmlAtomicValue as V;
+    match (a, b) {
+        (V::DateTime(x), V::DateTime(y)) => {
+            x.timezone.is_some() == y.timezone.is_some()
+                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        (V::Date(x), V::Date(y)) => {
+            x.timezone.is_some() == y.timezone.is_some()
+                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        (V::Time(x), V::Time(y)) => {
+            x.timezone.is_some() == y.timezone.is_some()
+                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        (V::Duration(x), V::Duration(y)) => x.partial_cmp(y) == Some(std::cmp::Ordering::Equal),
+        (V::YearMonthDuration(x), V::YearMonthDuration(y)) => {
+            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        (V::DayTimeDuration(x), V::DayTimeDuration(y)) => {
+            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        }
+        _ => false,
+    }
+}
+
+fn xml_value_datetime_eq(a: &XmlValue, b: &XmlValue) -> bool {
+    use crate::types::value::XmlValueKind;
+    match (&a.value, &b.value) {
+        (XmlValueKind::Atomic(va), XmlValueKind::Atomic(vb)) => xml_atomic_datetime_eq(va, vb),
         _ => false,
     }
 }

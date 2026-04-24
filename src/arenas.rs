@@ -97,6 +97,10 @@ pub struct ComplexTypeDefData {
     pub resolved_content_particle_types: Vec<Option<TypeKey>>,
     /// Resolved element keys for local elements in content particles (flat depth-first element order)
     pub resolved_content_particle_elements: Vec<Option<ElementKey>>,
+    /// Resolved inline simpleType inside simpleContent/restriction
+    /// (§3.4.2.2 clause 1.1 — the B simple type definition).
+    /// Only present when simpleContent has an explicit inline `<xs:simpleType>`.
+    pub resolved_simple_content_type: Option<TypeKey>,
 
     /// Original complex type key before redefine (for base-type resolution)
     pub redefine_original: Option<ComplexTypeKey>,

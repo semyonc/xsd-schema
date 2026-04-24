@@ -1714,6 +1714,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            resolved_simple_content_type: None,
             redefine_original: None,
         };
         let ct_key = schema_set.arenas.alloc_complex_type(ct_data);

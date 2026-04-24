@@ -111,7 +111,9 @@ fn validate_simple_type_inner(
             }
         }
         TypeKey::Complex(ck) => {
-            // Complex type with simpleContent — walk resolved_base_type to find the simple type
+            // §3.4.2.2 clause 1.1: the inline <xs:simpleType> inside
+            // simpleContent/restriction is the content type when present;
+            // otherwise inherit by walking resolved_base_type.
             let ct_data = match schema_set.arenas.complex_types.get(ck) {
                 Some(d) => d,
                 None => {
@@ -122,7 +124,9 @@ fn validate_simple_type_inner(
                     ));
                 }
             };
-            if let Some(base_key) = ct_data.resolved_base_type {
+            if let Some(inline_st) = ct_data.resolved_simple_content_type {
+                validate_simple_type_inner(value, inline_st, schema_set)
+            } else if let Some(base_key) = ct_data.resolved_base_type {
                 validate_simple_type_inner(value, base_key, schema_set)
             } else {
                 // No base type — treat as anySimpleType (accept any value)

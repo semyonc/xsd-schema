@@ -38,7 +38,7 @@ use crate::parser::location::{SourceLocation, SourceRef};
 use crate::schema::dependencies::DependencyGraph;
 use crate::schema::SchemaSet;
 use crate::schema::model::DerivationSet;
-use crate::types::facets::FacetSet;
+use crate::types::facets::{FacetKind, FacetSet};
 
 /// Statistics from derivation validation
 #[derive(Debug, Default)]
@@ -3333,32 +3333,35 @@ fn validate_facet_values_against_base_type(
         }
     }
 
-    // Validate bound facet values
-    let check_bound = |value: &str, constraint: &'static str, facet_name: &str| -> SchemaResult<()> {
-        if crate::validation::simple::validate_simple_type(value, base_key, schema_set).is_err() {
-            return Err(SchemaError::structural(
+    // Validate bound facet values. XSD Part 2 §4.3.9 permits a derived bound
+    // to equal the base's same-kind bound (boundary equality), even though
+    // that base value is not in the base's own value space.
+    let check_bound = |value: &str, constraint: &'static str, kind: FacetKind| -> SchemaResult<()> {
+        match crate::validation::simple::validate_simple_type(value, base_key, schema_set) {
+            Ok(_) => Ok(()),
+            Err(err) if is_bound_self_violation(&err, kind, schema_set, base_key, value) => Ok(()),
+            Err(_) => Err(SchemaError::structural(
                 constraint,
                 format!(
                     "{} value '{}' in type '{}' is not in the value space of the base type",
-                    facet_name, value, type_name
+                    kind.name(), value, type_name
                 ),
                 location.clone(),
-            ));
+            )),
         }
-        Ok(())
     };
 
     if let Some(ref f) = type_def.facets.min_inclusive {
-        check_bound(&f.value, "minInclusive-valid-restriction", "minInclusive")?;
+        check_bound(&f.value, "minInclusive-valid-restriction", FacetKind::MinInclusive)?;
     }
     if let Some(ref f) = type_def.facets.max_inclusive {
-        check_bound(&f.value, "maxInclusive-valid-restriction", "maxInclusive")?;
+        check_bound(&f.value, "maxInclusive-valid-restriction", FacetKind::MaxInclusive)?;
     }
     if let Some(ref f) = type_def.facets.min_exclusive {
-        check_bound(&f.value, "minExclusive-valid-restriction", "minExclusive")?;
+        check_bound(&f.value, "minExclusive-valid-restriction", FacetKind::MinExclusive)?;
     }
     if let Some(ref f) = type_def.facets.max_exclusive {
-        check_bound(&f.value, "maxExclusive-valid-restriction", "maxExclusive")?;
+        check_bound(&f.value, "maxExclusive-valid-restriction", FacetKind::MaxExclusive)?;
     }
 
     Ok(())
@@ -4242,6 +4245,116 @@ fn validate_attribute_restriction(
     Ok(())
 }
 
+/// Treat a facet-bound-literal validation failure as acceptable only when it
+/// is a same-kind bound violation *and* the derived literal equals the base
+/// type's matching bound literal. XSD Part 2 §4.3.9 permits equality at the
+/// boundary (derived `maxExclusive` = base `maxExclusive`) even though the
+/// base's value space excludes values equal to its own bound.
+fn is_bound_self_violation(
+    err: &crate::validation::errors::ValidationError,
+    kind: FacetKind,
+    schema_set: &SchemaSet,
+    base_key: TypeKey,
+    value: &str,
+) -> bool {
+    let code = match kind {
+        FacetKind::MaxExclusive => "cvc-maxExclusive-valid",
+        FacetKind::MaxInclusive => "cvc-maxInclusive-valid",
+        FacetKind::MinExclusive => "cvc-minExclusive-valid",
+        FacetKind::MinInclusive => "cvc-minInclusive-valid",
+        _ => return false,
+    };
+    if err.constraint != code {
+        return false;
+    }
+    let Some(base_bound) = find_base_bound_literal(schema_set, base_key, kind) else {
+        return false;
+    };
+    let Some(v) = parse_past_own_bound(schema_set, base_key, value) else {
+        return false;
+    };
+    let Some(b) = parse_past_own_bound(schema_set, base_key, &base_bound) else {
+        return false;
+    };
+    v.typed_value == b.typed_value
+}
+
+/// Parse `value` as an instance of `base_key`, falling back to the nearest
+/// ancestor without bound facets when the direct parse fails on a same-kind
+/// bound violation (the boundary-equality case this helper exists to serve).
+fn parse_past_own_bound(
+    schema_set: &SchemaSet,
+    base_key: TypeKey,
+    value: &str,
+) -> Option<crate::validation::simple::SimpleTypeResult> {
+    if let Ok(r) = crate::validation::simple::validate_simple_type(value, base_key, schema_set) {
+        return Some(r);
+    }
+    let without_bounds = lexical_base(schema_set, base_key)?;
+    crate::validation::simple::validate_simple_type(value, without_bounds, schema_set).ok()
+}
+
+/// Walk past bound-restriction types to find a primitive base suitable for
+/// lexical-only parsing of a bound literal.
+fn lexical_base(schema_set: &SchemaSet, base_key: TypeKey) -> Option<TypeKey> {
+    let mut current = base_key;
+    for _ in 0..100 {
+        match current {
+            TypeKey::Simple(sk) => {
+                let st = schema_set.arenas.simple_types.get(sk)?;
+                let has_bounds = st.facets.min_inclusive.is_some()
+                    || st.facets.min_exclusive.is_some()
+                    || st.facets.max_inclusive.is_some()
+                    || st.facets.max_exclusive.is_some();
+                if !has_bounds {
+                    return Some(current);
+                }
+                current = st.resolved_base_type?;
+            }
+            TypeKey::Complex(_) => return None,
+        }
+    }
+    None
+}
+
+/// Find the base type's same-kind bound literal by walking the simple-type
+/// chain. Returns the first matching facet literal encountered.
+fn find_base_bound_literal(
+    schema_set: &SchemaSet,
+    base_key: TypeKey,
+    kind: FacetKind,
+) -> Option<String> {
+    let mut current = base_key;
+    for _ in 0..100 {
+        match current {
+            TypeKey::Simple(sk) => {
+                let st = schema_set.arenas.simple_types.get(sk)?;
+                let literal = match kind {
+                    FacetKind::MaxExclusive => {
+                        st.facets.max_exclusive.as_ref().map(|f| f.value.clone())
+                    }
+                    FacetKind::MaxInclusive => {
+                        st.facets.max_inclusive.as_ref().map(|f| f.value.clone())
+                    }
+                    FacetKind::MinExclusive => {
+                        st.facets.min_exclusive.as_ref().map(|f| f.value.clone())
+                    }
+                    FacetKind::MinInclusive => {
+                        st.facets.min_inclusive.as_ref().map(|f| f.value.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(v) = literal {
+                    return Some(v);
+                }
+                current = st.resolved_base_type?;
+            }
+            TypeKey::Complex(_) => return None,
+        }
+    }
+    None
+}
+
 /// Walk the complex type extension chain to find the effective simple content
 /// type key. Returns `None` if there is no simple content type in the chain.
 fn effective_simple_content_type_key(
@@ -4545,6 +4658,45 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
         }
     }
 
+    Ok(())
+}
+
+/// XSD 1.1 §3.3.2 Schema Representation Constraint: Type Alternative
+/// Representation OK (`src-type-alternative`).
+///
+/// Among an element's sequence of `<xs:alternative>` children, only the last
+/// alternative is allowed to omit the `test` attribute (acting as a default
+/// fallback). An alternative without `@test` in a non-final position is a
+/// schema error.
+#[cfg(feature = "xsd11")]
+pub fn validate_element_type_alternatives(schema_set: &SchemaSet) -> SchemaResult<()> {
+    if !schema_set.is_xsd11() {
+        return Ok(());
+    }
+    for (_key, elem) in schema_set.arenas.elements.iter() {
+        let alts = &elem.alternatives;
+        if alts.len() < 2 {
+            continue;
+        }
+        for alt in &alts[..alts.len() - 1] {
+            if alt.test.is_none() {
+                let name = elem
+                    .name
+                    .map(|n| schema_set.name_table.resolve_ref(n))
+                    .unwrap_or("(anonymous)");
+                let location = schema_set.locate(elem.source.as_ref());
+                return Err(SchemaError::structural(
+                    "src-type-alternative",
+                    format!(
+                        "Element '{}': <xs:alternative> without a 'test' attribute is only \
+                         permitted as the last alternative",
+                        name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -5306,6 +5458,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            resolved_simple_content_type: None,
             redefine_original: None,
         }
     }

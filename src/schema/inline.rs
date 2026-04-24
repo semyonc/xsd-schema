@@ -116,6 +116,9 @@ enum InlineRole {
     /// Inline type on alternative at index in element's alternatives vec (XSD 1.1)
     #[cfg(feature = "xsd11")]
     AlternativeType(usize),
+    /// Inline `<xs:simpleType>` inside simpleContent/restriction
+    /// (§3.4.2.2 clause 1.1 — the B simple type definition)
+    SimpleContentInlineType,
 }
 
 /// Owner of an inline type
@@ -368,6 +371,17 @@ fn collect_content_inline_types(
                         target_namespace: target_ns,
                     });
                 }
+            }
+
+            // §3.4.2.2 clause 1.1: inline <xs:simpleType> inside
+            // simpleContent/restriction is the content type definition B.
+            if let Some(inline_st) = &simple_content.content_type {
+                jobs.push(InlineTypeJob {
+                    owner: InlineOwner::ComplexType(owner_key),
+                    role: InlineRole::SimpleContentInlineType,
+                    type_frame: TypeFrameResult::Simple(Box::new((**inline_st).clone())),
+                    target_namespace: target_ns,
+                });
             }
         }
         ComplexContentResult::Empty => {}
@@ -1142,6 +1156,7 @@ fn assemble_inline_type(
                 resolved_attributes: Vec::new(),
                 resolved_content_particle_types: Vec::new(),
                 resolved_content_particle_elements: Vec::new(),
+                resolved_simple_content_type: None,
                 redefine_original: None,
             };
             let key = schema_set.arenas.alloc_complex_type(data);
@@ -1230,6 +1245,10 @@ fn update_owner(
                             complex.resolved_content_particle_types.push(None);
                         }
                         complex.resolved_content_particle_types[idx] = Some(type_key);
+                        stats.complex_type_inline_derivations += 1;
+                    }
+                    InlineRole::SimpleContentInlineType => {
+                        complex.resolved_simple_content_type = Some(type_key);
                         stats.complex_type_inline_derivations += 1;
                     }
                     _ => {}
@@ -1718,6 +1737,7 @@ mod tests {
             resolved_attributes: Vec::new(),
             resolved_content_particle_types: Vec::new(),
             resolved_content_particle_elements: Vec::new(),
+            resolved_simple_content_type: None,
             redefine_original: None,
         };
 

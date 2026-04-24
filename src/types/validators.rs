@@ -841,6 +841,18 @@ use crate::types::equality::{double_eq, float_eq};
 /// Value-space equality for xs:duration per §3.3.6.
 /// Two durations are equal iff their signed total-months components are equal
 /// AND their signed total day-time seconds components are equal.
+fn datetime_value_eq(a: &DateTimeValue, b: &DateTimeValue) -> bool {
+    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
+fn date_value_eq(a: &DateValue, b: &DateValue) -> bool {
+    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
+fn time_value_eq(a: &TimeValue, b: &TimeValue) -> bool {
+    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
 fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
     let sign = |d: &DurationValue| if d.negative { -1i64 } else { 1 };
     let total_months = |d: &DurationValue| d.years as i64 * 12 + d.months as i64;
@@ -986,8 +998,12 @@ impl TypeValidator for DateTimeValidator {
             validate_bounds(dt, facets, "dateTime", value, |s| {
                 parse_datetime(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(dt, parse_datetime, |a, b| datetime_value_eq(a, &b)),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -1023,8 +1039,12 @@ impl TypeValidator for DateValidator {
             validate_bounds(d, facets, "date", value, |s| {
                 parse_date(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(d, parse_date, |a, b| date_value_eq(a, &b)),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -1060,8 +1080,12 @@ impl TypeValidator for TimeValidator {
             validate_bounds(t, facets, "time", value, |s| {
                 parse_time(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(t, parse_time, |a, b| time_value_eq(a, &b)),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -1598,15 +1622,58 @@ fn parse_datetime(s: &str) -> ValidationResult<DateTimeValue> {
     let date = parse_date_part(parts[0], "dateTime")?;
     let time = parse_time_part(parts[1], "dateTime")?;
 
+    // Normalize 24:00:00 → 00:00:00 of the next day (XSD Part 2 §3.3.8).
+    // The literal `24:00:00` is only valid with minute=0 and second=0.
+    let (year, month, day, hour) = if time.0 == 24 {
+        if time.1 != 0 || time.2 != Decimal::from(0) {
+            return Err(ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "dateTime",
+                message: "24:00:00 requires minute=0 and second=0".to_string(),
+            });
+        }
+        let (y, m, d) = add_one_day(date.0, date.1, date.2);
+        (y, m, d, 0u8)
+    } else {
+        (date.0, date.1, date.2, time.0)
+    };
+
     Ok(DateTimeValue {
-        year: date.0,
-        month: date.1,
-        day: date.2,
-        hour: time.0,
+        year,
+        month,
+        day,
+        hour,
         minute: time.1,
         second: time.2,
         timezone: tz,
     })
+}
+
+/// Increment a date by one day, handling month/year boundaries.
+fn add_one_day(year: i32, month: u8, day: u8) -> (i32, u8, u8) {
+    let dim = days_in_month(year, month);
+    if (day as u32) < dim {
+        (year, month, day + 1)
+    } else if month < 12 {
+        (year, month + 1, 1)
+    } else {
+        // Year 0 is excluded in XSD 1.0 but valid in XSD 1.1; either way,
+        // the next day after 12/31 of year Y is 1/1 of year Y+1.
+        (year + 1, 1, 1)
+    }
+}
+
+/// Days in a (Gregorian) month, accounting for leap years.
+fn days_in_month(year: i32, month: u8) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 /// Parse XSD date
@@ -1619,16 +1686,47 @@ fn parse_date(s: &str) -> ValidationResult<DateValue> {
 /// Parse XSD time
 fn parse_time(s: &str) -> ValidationResult<TimeValue> {
     let (time_str, tz) = split_timezone(s);
-    let (hour, minute, second) = parse_time_part(time_str, "time")?;
+    let (mut hour, minute, second) = parse_time_part(time_str, "time")?;
+    // Normalize 24:00:00 → 00:00:00 (XSD Part 2 §3.3.9).
+    // The literal `24:00:00` is only valid with minute=0 and second=0.
+    if hour == 24 {
+        if minute != 0 || second != Decimal::from(0) {
+            return Err(ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "time",
+                message: "24:00:00 requires minute=0 and second=0".to_string(),
+            });
+        }
+        hour = 0;
+    }
     Ok(TimeValue { hour, minute, second, timezone: tz })
+}
+
+/// Validate the lexical form of a yearFrag per XSD Part 2 §3.3.9:
+/// `yearFrag ::= '-'? (([1-9] digit digit digitRep) | ('0' digit digit digit))`.
+/// In particular: at least four digits, and five-or-more-digit forms must
+/// start with a non-zero leading digit.
+fn valid_year_lexical(year_str: &str) -> bool {
+    let digits = year_str.strip_prefix('-').unwrap_or(year_str);
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    if digits.len() < 4 {
+        return false;
+    }
+    if digits.len() > 4 && digits.starts_with('0') {
+        return false;
+    }
+    true
 }
 
 /// Parse date part (YYYY-MM-DD)
 fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u8, u8)> {
     let parts: Vec<&str> = s.split('-').collect();
-    let (year, month, day) = if s.starts_with('-') && parts.len() >= 4 {
+    let (year_str, year, month, day) = if s.starts_with('-') && parts.len() >= 4 {
         // Negative year
-        let year: i32 = format!("-{}", parts[1]).parse().map_err(|_| ValidationError::InvalidLexical {
+        let year_str = format!("-{}", parts[1]);
+        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
             message: "Invalid year".to_string(),
@@ -1643,9 +1741,10 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
             type_name,
             message: "Invalid day".to_string(),
         })?;
-        (year, month, day)
+        (year_str, year, month, day)
     } else if parts.len() == 3 {
-        let year: i32 = parts[0].parse().map_err(|_| ValidationError::InvalidLexical {
+        let year_str = parts[0].to_string();
+        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
             message: "Invalid year".to_string(),
@@ -1660,7 +1759,7 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
             type_name,
             message: "Invalid day".to_string(),
         })?;
-        (year, month, day)
+        (year_str, year, month, day)
     } else {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
@@ -1669,11 +1768,31 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
         });
     };
 
+    if !valid_year_lexical(&year_str) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Invalid year: must be 4+ digits, no leading zeros except single '0YYY' form".to_string(),
+        });
+    }
+
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
             message: "Date out of range".to_string(),
+        });
+    }
+
+    // Reject days that don't exist in the given month (e.g. Feb 29 of a
+    // non-leap year, Apr 31). Spec §3.3.9 / §3.3.10 require lexical
+    // representations to denote dates that exist in the proleptic
+    // Gregorian calendar.
+    if (day as u32) > days_in_month(year, month) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Day does not exist in the given month".to_string(),
         });
     }
 
@@ -1761,8 +1880,9 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
     let (date_str, tz) = split_timezone(s);
     let parts: Vec<&str> = date_str.split('-').collect();
 
-    let (year, month) = if date_str.starts_with('-') && parts.len() >= 3 {
-        let year: i32 = format!("-{}", parts[1]).parse().map_err(|_| ValidationError::InvalidLexical {
+    let (year_str, year, month) = if date_str.starts_with('-') && parts.len() >= 3 {
+        let year_str = format!("-{}", parts[1]);
+        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gYearMonth",
             message: "Invalid year".to_string(),
@@ -1772,9 +1892,10 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
             type_name: "gYearMonth",
             message: "Invalid month".to_string(),
         })?;
-        (year, month)
+        (year_str, year, month)
     } else if parts.len() == 2 {
-        let year: i32 = parts[0].parse().map_err(|_| ValidationError::InvalidLexical {
+        let year_str = parts[0].to_string();
+        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gYearMonth",
             message: "Invalid year".to_string(),
@@ -1784,7 +1905,7 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
             type_name: "gYearMonth",
             message: "Invalid month".to_string(),
         })?;
-        (year, month)
+        (year_str, year, month)
     } else {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
@@ -1792,6 +1913,14 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
             message: "Invalid format".to_string(),
         });
     };
+
+    if !valid_year_lexical(&year_str) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gYearMonth",
+            message: "Invalid year lexical form".to_string(),
+        });
+    }
 
     if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
@@ -1812,6 +1941,13 @@ fn parse_gyear(s: &str) -> ValidationResult<GYearValue> {
         type_name: "gYear",
         message: "Invalid year".to_string(),
     })?;
+    if !valid_year_lexical(year_str) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gYear",
+            message: "Invalid year lexical form".to_string(),
+        });
+    }
     Ok(GYearValue { year, timezone: tz })
 }
 
@@ -3095,7 +3231,17 @@ impl TypeValidator for DateTimeStampValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        facets.validate_string(&result.to_string_value())?;
+        if let XmlValueKind::Atomic(XmlAtomicValue::DateTime(ref dt)) = result.value {
+            facets.validate_explicit_timezone(dt.timezone.is_some())?;
+            validate_bounds(dt, facets, "dateTimeStamp", value, |s| {
+                parse_datetime(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
+            })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(dt, parse_datetime, |a, b| datetime_value_eq(a, &b)),
+                value,
+            )?;
+        }
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 

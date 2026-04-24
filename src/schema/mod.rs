@@ -95,6 +95,8 @@ pub use derivation::{
     validate_xsd10_annotation_source_anyuri,
     DerivationStats as DerivationValidationStats,
 };
+#[cfg(feature = "xsd11")]
+pub use derivation::validate_element_type_alternatives;
 
 // Re-exports from redefine
 pub use redefine::apply_redefine;
