@@ -895,6 +895,36 @@ impl Frame for UnionFrame {
 // Simple/Complex Content Frames
 // ============================================================================
 
+/// src-ct: the XSD schema-for-schemas content model of
+/// `<xs:simpleContent>/<xs:restriction>` and `<xs:simpleContent>/<xs:extension>`
+/// permits only facets (restriction only), attributes, attribute groups, an
+/// attribute wildcard, and (XSD 1.1) assertions. Model groups and
+/// `<xs:openContent>` are not allowed.
+fn reject_simple_content_particle_or_open_content(
+    context: &str,
+    particle: Option<&ParticleResult>,
+    open_content: Option<&OpenContentResult>,
+) -> SchemaResult<()> {
+    if particle.is_some() {
+        return Err(SchemaError::structural(
+            "src-ct",
+            format!(
+                "{context} must not contain a model group \
+                 (xs:sequence, xs:choice, xs:all, or xs:group)"
+            ),
+            None,
+        ));
+    }
+    if open_content.is_some() {
+        return Err(SchemaError::structural(
+            "src-ct",
+            format!("{context} must not contain xs:openContent"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// Frame for xs:simpleContent
 pub struct SimpleContentFrame {
     id: Option<String>,
@@ -910,6 +940,11 @@ pub struct SimpleContentFrame {
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
+    /// `true` after a <restriction> or <extension> child has been seen.
+    /// The XSD schema-for-schemas content model `(annotation?, (restriction |
+    /// extension))` forbids any further children — including a trailing
+    /// <annotation> — so we reject them via `allows`.
+    derivation_seen: bool,
 }
 
 impl SimpleContentFrame {
@@ -936,12 +971,16 @@ impl SimpleContentFrame {
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
+            derivation_seen: false,
         })
     }
 }
 
 impl Frame for SimpleContentFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        if self.derivation_seen {
+            return false;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION | xsd_names::RESTRICTION | xsd_names::EXTENSION
@@ -952,7 +991,11 @@ impl Frame for SimpleContentFrame {
         matches!(local_name, "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if matches!(local_name, xsd_names::RESTRICTION | xsd_names::EXTENSION) {
+            self.derivation_seen = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -960,6 +1003,14 @@ impl Frame for SimpleContentFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Restriction(res) => {
+                // src-ct: the XSD schema-for-schemas content model of
+                // <xs:simpleContent>/{restriction|extension} does not permit
+                // model groups or <xs:openContent>.
+                reject_simple_content_particle_or_open_content(
+                    "xs:simpleContent/xs:restriction",
+                    res.particle.as_ref(),
+                    res.open_content.as_ref(),
+                )?;
                 if res.base_type.is_some() && res.inline_type.is_some() {
                     // simpleContent/restriction with both base and inline simpleType:
                     // base names the complex type being restricted,
@@ -984,6 +1035,11 @@ impl Frame for SimpleContentFrame {
                 self.derivation_id = res.id.clone();
             }
             FrameResult::Extension(res) => {
+                reject_simple_content_particle_or_open_content(
+                    "xs:simpleContent/xs:extension",
+                    res.particle.as_ref(),
+                    res.open_content.as_ref(),
+                )?;
                 self.base_type = res.base_type;
                 self.derivation = Some(DerivationMethod::Extension);
                 self.attributes = res.attributes;
@@ -1037,6 +1093,9 @@ impl Frame for SimpleContentFrame {
 pub struct ComplexContentFrame {
     id: Option<String>,
     mixed: bool,
+    /// `true` when the `<xs:complexContent mixed="…">` attribute was
+    /// explicitly present.  See `ComplexContentDefResult::mixed_explicit`.
+    mixed_explicit: bool,
     base_type: Option<TypeRefResult>,
     derivation: Option<DerivationMethod>,
     particle: Option<ParticleResult>,
@@ -1049,6 +1108,8 @@ pub struct ComplexContentFrame {
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
+    /// See `SimpleContentFrame::derivation_seen`.
+    derivation_seen: bool,
 }
 
 impl ComplexContentFrame {
@@ -1061,11 +1122,14 @@ impl ComplexContentFrame {
             .get_value_by_name(name_table, "id")
             .map(String::from);
 
-        let mixed = parse_bool_attr_default(attrs, name_table, "mixed", false)?;
+        let mixed_opt = parse_optional_bool_attr(attrs, name_table, "mixed")?;
+        let mixed_explicit = mixed_opt.is_some();
+        let mixed = mixed_opt.unwrap_or(false);
 
         Ok(Self {
             id,
             mixed,
+            mixed_explicit,
             base_type: None,
             derivation: None,
             particle: None,
@@ -1078,12 +1142,16 @@ impl ComplexContentFrame {
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
+            derivation_seen: false,
         })
     }
 }
 
 impl Frame for ComplexContentFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        if self.derivation_seen {
+            return false;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION | xsd_names::RESTRICTION | xsd_names::EXTENSION
@@ -1094,7 +1162,11 @@ impl Frame for ComplexContentFrame {
         matches!(local_name, "id" | "mixed")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if matches!(local_name, xsd_names::RESTRICTION | xsd_names::EXTENSION) {
+            self.derivation_seen = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -1130,10 +1202,20 @@ impl Frame for ComplexContentFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // src-ct: the XML content model of <xs:complexContent> requires exactly
+        // one of <xs:restriction> or <xs:extension> as a child (plus an optional
+        // leading annotation). An empty <xs:complexContent> or one containing
+        // only an annotation is a content-model violation.
+        let derivation = self.derivation.ok_or_else(|| SchemaError::structural(
+            "src-ct",
+            "xs:complexContent requires an xs:restriction or xs:extension child",
+            None,
+        ))?;
         Ok(FrameResult::ComplexContent(ComplexContentDefResult {
             particle: self.particle,
-            derivation: self.derivation.unwrap_or(DerivationMethod::Restriction),
+            derivation,
             mixed: self.mixed,
+            mixed_explicit: self.mixed_explicit,
             base_type: self.base_type,
             open_content: self.open_content,
             attributes: self.attributes,
@@ -1379,7 +1461,14 @@ impl Frame for ComplexTypeFrame {
                 self.attributes = std::mem::take(&mut cc.attributes);
                 self.attribute_groups = std::mem::take(&mut cc.attribute_groups);
                 self.attribute_wildcard = cc.attribute_wildcard.take();
-                self.mixed = cc.mixed;
+                // §3.4.2.3 clause 1.1: the `mixed` attribute on <complexContent>
+                // takes precedence when explicitly present; otherwise retain the
+                // outer <complexType mixed="…"> value already on `self.mixed`.
+                if cc.mixed_explicit {
+                    self.mixed = cc.mixed;
+                } else {
+                    cc.mixed = self.mixed;
+                }
                 self.content = ComplexContentResult::Complex(cc);
             }
             FrameResult::Particle(particle) => {
@@ -1387,6 +1476,7 @@ impl Frame for ComplexTypeFrame {
                     particle: Some(particle),
                     derivation: DerivationMethod::Restriction,
                     mixed: self.mixed,
+                    mixed_explicit: true,
                     base_type: None,
                     open_content: None,
                     attributes: Vec::new(),
@@ -1422,6 +1512,7 @@ impl Frame for ComplexTypeFrame {
                     particle: Some(particle),
                     derivation: DerivationMethod::Restriction,
                     mixed: self.mixed,
+                    mixed_explicit: true,
                     base_type: None,
                     open_content: None,
                     attributes: Vec::new(),
@@ -1459,6 +1550,7 @@ impl Frame for ComplexTypeFrame {
                         particle: None,
                         derivation: DerivationMethod::Restriction,
                         mixed: self.mixed,
+                        mixed_explicit: true,
                         base_type: None,
                         open_content: self.open_content,
                         attributes: Vec::new(),

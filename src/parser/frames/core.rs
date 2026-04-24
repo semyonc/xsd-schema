@@ -182,7 +182,16 @@ pub struct SimpleContentDefResult {
 pub struct ComplexContentDefResult {
     pub particle: Option<ParticleResult>,
     pub derivation: DerivationMethod,
+    /// Effective `mixed` value. Per §3.4.2.3 clause 1.1, `mixed` on
+    /// `<xs:complexContent>` takes precedence when present, otherwise the
+    /// outer `<xs:complexType mixed="…">` attribute is used. The assembler
+    /// (`ComplexTypeFrame::attach`) consults `mixed_explicit` to decide
+    /// whether to inherit the outer value when this field is false.
     pub mixed: bool,
+    /// `true` when the `<xs:complexContent>` element carried an explicit
+    /// `mixed="…"` attribute — distinguishes "explicitly false" from
+    /// "absent, fall back to outer".
+    pub mixed_explicit: bool,
     pub base_type: Option<TypeRefResult>,
     pub open_content: Option<OpenContentResult>,
     pub attributes: Vec<AttributeUseResult>,

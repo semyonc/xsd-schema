@@ -1686,6 +1686,7 @@ mod tests {
                 particle: Some(content_particle),
                 derivation: crate::parser::frames::DerivationMethod::Restriction,
                 mixed: false,
+                mixed_explicit: false,
                 base_type: None,
                 open_content: None,
                 attributes: Vec::new(),

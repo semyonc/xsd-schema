@@ -582,6 +582,28 @@ fn validate_complex_extension(
                     ));
                 }
 
+                // src-ct.2 (§3.4.6.2): when the derived type uses <xs:simpleContent>
+                // and the <xs:extension> alternative, the base's {content type}
+                // must be either a simple type (clause 2.1.3 requires a simple-type
+                // base, handled above via TypeKey::Simple) or a complex type whose
+                // {content type} is a simple type definition (clause 2.1.1).
+                // A base with element-only or mixed complex content is rejected.
+                if matches!(type_def.content, ComplexContentResult::Simple(_))
+                    && !matches!(base_type.content, ComplexContentResult::Simple(_))
+                {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
+                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    return Err(SchemaError::structural(
+                        "src-ct",
+                        format!(
+                            "Complex type '{}' uses xs:simpleContent extension but base '{}' \
+                             does not have a simple {{content type}} (src-ct.2.1.1)",
+                            type_name, base_name,
+                        ),
+                        location,
+                    ));
+                }
+
                 // cos-ct-extends: Cannot use complexContent extension to add particles
                 // to a base type with simpleContent.
                 // XSD 1.0: only rejected when a particle is actually added.
@@ -605,6 +627,8 @@ fn validate_complex_extension(
                         }
                     }
                 }
+
+                validate_extension_mixed_parity(schema_set, type_def, base_type)?;
 
                 // cos-ct-extends / cos-particle-extend: Cannot extend non-empty
                 // non-all content with an all compositor.  The effective content
@@ -782,6 +806,35 @@ fn validate_complex_restriction(
                     ));
                 }
 
+                // (§3.4.6.4 clause 5.4.1 mixed-parity check intentionally
+                // omitted: the W3C suite marks several valid-schema tests
+                // that restrict mixed to element-only — e.g. particlesL012,
+                // mgA015, idK012 — relying on the spec's "pointless mixed
+                // restriction" tolerance applied by Saxon and Xerces.)
+
+                // src-ct.2 (§3.4.6.2): when the derived type uses <xs:simpleContent>
+                // and the <xs:restriction> alternative, the base must be either a
+                // complex type with a simple {content type} (clause 2.1.1) or a
+                // complex type whose {content type} is mixed and whose particle is
+                // emptiable (clause 2.1.2). Element-only or mixed-but-not-emptiable
+                // bases are rejected.
+                if matches!(type_def.content, ComplexContentResult::Simple(_))
+                    && !is_valid_simple_content_restriction_base(schema_set, base_type)
+                {
+                    let (location, type_name) = type_error_context(schema_set, type_def);
+                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    return Err(SchemaError::structural(
+                        "src-ct",
+                        format!(
+                            "Complex type '{}' uses xs:simpleContent restriction but base '{}' \
+                             does not have a simple {{content type}} nor mixed+emptiable content \
+                             (src-ct.2.1.1 / 2.1.2)",
+                            type_name, base_name,
+                        ),
+                        location,
+                    ));
+                }
+
                 validate_content_particle_restriction(schema_set, type_def, base_type)?;
 
                 // XSD 1.1: Validate open-content compatibility
@@ -799,6 +852,104 @@ fn validate_complex_restriction(
     }
 
     Ok(())
+}
+
+/// §3.4.2.3 mapping: the `mixed` flag carried by a `<complexContent>` wrapper
+/// overrides the outer `<complexType mixed="…">` attribute.  For complex
+/// types authored in the short form (no `<complexContent>` wrapper), the
+/// outer attribute applies unchanged.
+fn effective_mixed_of(
+    type_def: &crate::arenas::ComplexTypeDefData,
+    complex: &crate::parser::frames::ComplexContentDefResult,
+) -> bool {
+    // `complex.mixed` reflects the `<complexContent mixed="…">` attribute.
+    // When the complexType was parsed from a short form, the wrapper is
+    // synthesized with mixed=false and the outer attribute is preserved on
+    // `type_def.mixed` — so we OR the two.  When the wrapper is present,
+    // `type_def.mixed` carries the same bit, so the OR is a no-op.
+    complex.mixed || type_def.mixed
+}
+
+/// cos-ct-extends clause 1.4.3.2.2.4.1 (§3.4.6.2): when the derived type
+/// supplies its own particle, the effective mixed of the derived {content
+/// type} must match the base's — both element-only, or both mixed. Skipped
+/// when either side lacks a particle, because §3.4.2.3 clause 4.1 then
+/// copies the base's {content type} verbatim into the derived, trivially
+/// satisfying parity regardless of the outer `mixed="true"` attribute.
+fn validate_extension_mixed_parity(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+    base_type: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    let ComplexContentResult::Complex(ref base_complex) = base_type.content else {
+        return Ok(());
+    };
+    let ComplexContentResult::Complex(ref derived_complex) = type_def.content else {
+        return Ok(());
+    };
+    if base_complex.particle.is_none() || derived_complex.particle.is_none() {
+        return Ok(());
+    }
+    let base_mixed = effective_mixed_of(base_type, base_complex);
+    let derived_mixed = effective_mixed_of(type_def, derived_complex);
+    if derived_mixed == base_mixed {
+        return Ok(());
+    }
+    let (location, type_name) = type_error_context(schema_set, type_def);
+    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+    Err(SchemaError::structural(
+        "cos-ct-extends",
+        format!(
+            "Complex type '{}' cannot extend '{}' — derived is {} but base is {} \
+             (cos-ct-extends clause 1.4.3.2.2.4.1)",
+            type_name,
+            base_name,
+            if derived_mixed { "mixed" } else { "element-only" },
+            if base_mixed { "mixed" } else { "element-only" },
+        ),
+        location,
+    ))
+}
+
+/// §3.4.6.2 src-ct.2: a complex type derived via `<xs:simpleContent>` from
+/// another complex base is legal only when the base's `{content type}` is
+/// a simple type (clause 2.1.1) or when — for the restriction branch — the
+/// base is mixed with an emptiable particle (clause 2.1.2).
+/// Returns `true` if the base is acceptable for a simpleContent restriction.
+fn is_valid_simple_content_restriction_base(
+    schema_set: &SchemaSet,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> bool {
+    match &base.content {
+        ComplexContentResult::Simple(_) => true,
+        ComplexContentResult::Complex(complex) => {
+            // Clause 2.1.2: mixed content with an emptiable particle.  The
+            // `mixed` flag on a <complexContent> wrapper overrides the outer
+            // <complexType mixed="…"> attribute per §3.4.2.2, so consult it
+            // here; the outer flag applies only to the short-form path.
+            if !complex.mixed {
+                return false;
+            }
+            match &complex.particle {
+                // Absent particle ≡ empty sequence ≡ emptiable.
+                None => true,
+                Some(particle) => {
+                    match normalize_type_particle(schema_set, base, particle) {
+                        Ok(normalized) => particle_is_emptiable(&normalized),
+                        Err(_) => false,
+                    }
+                }
+            }
+        }
+        // Short-form complex type without <simpleContent>/<complexContent>:
+        // the {content type} is determined by §3.4.2.2 from the outer
+        // `mixed` attribute and any top-level particle.  When `mixed` is
+        // true and no particle is present, the type has mixed emptiable
+        // content and is a valid base for simpleContent restriction
+        // (clause 2.1.2).  When `mixed` is false, the content type is
+        // element-only-empty, which is not a valid base.
+        ComplexContentResult::Empty => base.mixed,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1454,10 +1605,36 @@ fn particle_restricts(
                     &base_branches,
                 );
             }
+            // XSD 1.1: each derived branch must restrict some base branch —
+            // OR, when the derived branch is emptiable and at least one base
+            // branch is emptiable, the derived branch's empty production is
+            // covered by that emptiable base branch and the non-empty form
+            // (min≥1) must restrict some base branch. This handles cases
+            // like addB118 where the derived choice is optional (min=0) but
+            // no single base choice branch is emptiable AND accepts the
+            // derived's elements — the union of branches covers it.
+            let base_has_emptiable_branch =
+                base_branches.iter().any(particle_is_emptiable);
             return derived_branches.iter().all(|branch| {
-                base_branches
+                if base_branches
                     .iter()
                     .any(|candidate| particle_restricts(schema_set, branch, candidate))
+                {
+                    return true;
+                }
+                if branch.min_occurs == 0 && base_has_emptiable_branch {
+                    let mut non_empty = branch.clone();
+                    non_empty.min_occurs = non_empty.min_occurs.max(1);
+                    if non_empty.max_occurs.is_some_and(|m| m == 0) {
+                        // original was min=0,max=0 (empty); empty production
+                        // alone is covered, no non-empty form to check.
+                        return true;
+                    }
+                    return base_branches.iter().any(|candidate| {
+                        particle_restricts(schema_set, &non_empty, candidate)
+                    });
+                }
+                false
             });
         }
 
@@ -1989,6 +2166,45 @@ fn sequence_particles_restrict(
         .all(particle_is_emptiable)
 }
 
+/// Merge element particles in an unordered-matching context that share the
+/// same expanded name (local + target namespace). The merged particle sums
+/// `min_occurs` and `max_occurs` (unbounded on either side stays unbounded).
+///
+/// Used by `recurse_unordered` to support Sequence→All derivations where the
+/// derived sequence lists the same element more than once (saxonData
+/// All/all216 is the canonical case). Order within the derived side
+/// doesn't affect the base's all-group language, so treating duplicate
+/// names as one combined occurrence range is sound.
+///
+/// Non-element particles (wildcards, nested groups) are passed through
+/// unchanged: collapsing them would change their matching semantics.
+fn merge_duplicate_elements(particles: &[NormalizedParticle]) -> Vec<NormalizedParticle> {
+    let mut merged: Vec<NormalizedParticle> = Vec::with_capacity(particles.len());
+    for particle in particles {
+        let NormalizedParticleTerm::Element(elem) = &particle.term else {
+            merged.push(particle.clone());
+            continue;
+        };
+        let existing = merged.iter_mut().find(|m| {
+            matches!(
+                &m.term,
+                NormalizedParticleTerm::Element(other)
+                    if other.name == elem.name && other.namespace == elem.namespace
+            )
+        });
+        if let Some(existing) = existing {
+            existing.min_occurs = existing.min_occurs.saturating_add(particle.min_occurs);
+            existing.max_occurs = match (existing.max_occurs, particle.max_occurs) {
+                (None, _) | (_, None) => None,
+                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            };
+        } else {
+            merged.push(particle.clone());
+        }
+    }
+    merged
+}
+
 /// RecurseUnordered: order-independent bipartite matching of particles.
 /// Each derived particle must match some base particle (one-to-one),
 /// and unmatched base particles must be emptiable.
@@ -2025,8 +2241,41 @@ fn recurse_unordered(
         false
     }
 
+    // Merge duplicate-name element particles in the derived side: unordered
+    // matching counts total occurrences per element, not particle positions.
+    let merged_owned;
+    let derived_particles = if derived_particles.iter().any(|p| {
+        matches!(&p.term, NormalizedParticleTerm::Element(_))
+    }) && has_duplicate_element_names(derived_particles)
+    {
+        merged_owned = merge_duplicate_elements(derived_particles);
+        &merged_owned[..]
+    } else {
+        derived_particles
+    };
+
     let mut used = vec![false; base_particles.len()];
     backtrack(schema_set, derived_particles, base_particles, &mut used, 0)
+}
+
+/// True when two or more element particles in the slice share the same
+/// expanded name — a cheap check to avoid the allocation in
+/// `merge_duplicate_elements` for the overwhelming-majority case where
+/// every element particle is unique.
+fn has_duplicate_element_names(particles: &[NormalizedParticle]) -> bool {
+    for (i, a) in particles.iter().enumerate() {
+        let NormalizedParticleTerm::Element(a_elem) = &a.term else {
+            continue;
+        };
+        for b in &particles[i + 1..] {
+            if let NormalizedParticleTerm::Element(b_elem) = &b.term {
+                if a_elem.name == b_elem.name && a_elem.namespace == b_elem.namespace {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn all_particles_restrict(
@@ -2736,12 +2985,69 @@ pub(crate) fn wildcard_result_union(
     }
 }
 
+/// True when the derived complex type's explicit particle is absent or
+/// normalizes to an empty group (`<xs:sequence/>`, `<xs:all/>`, or a group
+/// whose children all prune away). Used to decide when the stricter
+/// open-content restriction checks can be safely relaxed: if the derived
+/// particle contributes no elements to the content language, the derived
+/// type's language comes entirely from its open content wildcard, so the
+/// mode-and-subset checks against the base reduce to a pure wildcard-
+/// subset check (cos-ns-subset).
+#[cfg(feature = "xsd11")]
+fn derived_particle_is_empty(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+) -> bool {
+    let Some(particle) = complex_content_particle(&derived.content) else {
+        return true;
+    };
+    let Ok(normalized) = normalize_type_particle(schema_set, derived, particle) else {
+        return false;
+    };
+    is_effectively_empty(&normalized)
+}
+
+/// Extract a wildcard from a base type's effective content particle when it
+/// is a single wildcard (optionally wrapped in a pointless sequence/all
+/// group). Returns `None` when the base has element particles that would
+/// require the derived type's empty particle to not be a valid restriction.
+///
+/// This supports §3.4.6.4 clause 1 (language containment) for the narrow
+/// case where the base has no `<xs:openContent>` but its content model is
+/// a single wildcard — which is language-equivalent to having
+/// interleave/suffix open content over that same wildcard.
+#[cfg(feature = "xsd11")]
+fn base_content_single_wildcard<'a>(
+    schema_set: &'a SchemaSet,
+    base: &'a crate::arenas::ComplexTypeDefData,
+) -> Option<NormalizedWildcard> {
+    let (particle_owner, particle) = effective_base_content_particle(schema_set, base);
+    let particle = particle?;
+    let normalized = normalize_type_particle(schema_set, particle_owner, particle).ok()?;
+    match &normalized.term {
+        NormalizedParticleTerm::Wildcard(wc) => Some((**wc).clone()),
+        NormalizedParticleTerm::Group(group) => {
+            if group.particles.len() == 1 {
+                if let NormalizedParticleTerm::Wildcard(wc) = &group.particles[0].term {
+                    return Some((**wc).clone());
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// Validate open-content compatibility for complex type restriction (derivation-ok-restriction).
 ///
 /// Rules:
-/// - If base has no OC, derived must not add OC.
+/// - If base has no OC, derived must not add OC — **unless** the derived
+///   particle is empty and the base's content model is a single wildcard
+///   that subsumes the derived OC's wildcard (language-equivalent case).
 /// - If base has OC but derived doesn't — OK (restriction removes it).
-/// - Interleave cannot restrict suffix.
+/// - Interleave cannot restrict suffix — **unless** the derived particle
+///   is empty, in which case the mode choice is irrelevant because the
+///   derived language is the wildcard closure.
 /// - Derived wildcard must be a subset of base wildcard.
 #[cfg(feature = "xsd11")]
 fn validate_open_content_restriction(
@@ -2752,8 +3058,25 @@ fn validate_open_content_restriction(
     let base_oc = effective_open_content(base.open_content.as_ref());
     let derived_oc = effective_open_content(derived.open_content.as_ref());
 
-    // If base has no open content, derived must not add one
+    // If base has no open content, derived must not add one — except when
+    // the derived particle is empty and the base's single-wildcard particle
+    // subsumes the derived OC wildcard (language containment, §3.4.6.4).
     if base_oc.is_none() && derived_oc.is_some() {
+        if derived_particle_is_empty(schema_set, derived) {
+            let derived_oc_wc = derived_oc.as_ref().and_then(|o| o.wildcard.as_ref());
+            if let Some(d_wc) = derived_oc_wc {
+                if let Some(base_wc) = base_content_single_wildcard(schema_set, base) {
+                    if is_wildcard_ns_subset(
+                        d_wc,
+                        derived.target_namespace,
+                        &base_wc.wildcard,
+                        base_wc.target_namespace,
+                    ) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let (location, type_name) = type_error_context(schema_set, derived);
         let base_name = format_type_name(schema_set, base.name, base.target_namespace);
         return Err(SchemaError::structural(
@@ -2775,9 +3098,12 @@ fn validate_open_content_restriction(
     let (location, type_name) = type_error_context(schema_set, derived);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
-    // Mode: if base is suffix, derived cannot use interleave
+    // Mode: if base is suffix, derived cannot use interleave — unless the
+    // derived particle is empty, in which case the derived language is just
+    // the wildcard closure and the mode choice is irrelevant.
     if base_oc.mode == OpenContentMode::Suffix
         && derived_oc.mode == OpenContentMode::Interleave
+        && !derived_particle_is_empty(schema_set, derived)
     {
         return Err(SchemaError::structural(
             "derivation-ok-restriction",
@@ -3690,13 +4016,20 @@ fn validate_attribute_restriction(
     let type_name = format_type_name(schema_set, derived.name, derived.target_namespace);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
 
-    // Check clause 3: required base attributes must remain required
+    // Check clause 3: required base attributes must remain required in the
+    // derived type's effective {attribute uses}.
+    //
+    // Per §3.4.2.3 mapping rules, an attribute use in the base that is NOT
+    // matched (by name + target namespace) by a directly-declared use in the
+    // restriction is inherited into the derived type's {attribute uses}
+    // unchanged.  The derived type therefore satisfies clause 3 trivially for
+    // inherited attribute uses — we only need to reject cases where the
+    // derived type explicitly *declares* the attribute with a weaker use
+    // kind (optional or prohibited).
     for base_attr in &base_attrs {
         if base_attr.use_kind != AttributeUseKind::Required {
             continue;
         }
-
-        let attr_name_str = schema_set.name_table.resolve(base_attr.name);
 
         // Find matching derived attribute by expanded name (namespace + local)
         let derived_attr = derived_attrs
@@ -3704,15 +4037,20 @@ fn validate_attribute_restriction(
             .find(|a| a.name == base_attr.name && a.target_namespace == base_attr.target_namespace);
 
         match derived_attr {
-            Some(da) if da.use_kind == AttributeUseKind::Required => {
-                // OK: required stays required
-            }
-            _ => {
+            // Explicit re-declaration preserves required-ness: OK.
+            Some(da) if da.use_kind == AttributeUseKind::Required => {}
+            // Not declared in restriction → inherited from base as required: OK.
+            None => {}
+            // Explicit re-declaration with weaker use (optional / prohibited):
+            // the derived type's effective {attribute uses} no longer guarantees
+            // presence — reject as invalid restriction.
+            Some(_) => {
+                let attr_name_str = schema_set.name_table.resolve(base_attr.name);
                 return Err(SchemaError::structural(
                     "derivation-ok-restriction",
                     format!(
                         "Complex type '{}' restricting '{}': base type requires attribute '{}' \
-                         but the derived type does not declare it as required",
+                         but the derived type weakens it to optional or prohibited",
                         type_name, base_name, attr_name_str,
                     ),
                     location,
@@ -4229,6 +4567,17 @@ pub fn validate_complex_type_attribute_uniqueness(
     let mut visiting_groups: HashSet<AttributeGroupKey> = HashSet::new();
     let mut by_name: HashMap<(Option<NameId>, NameId), ()> = HashMap::new();
 
+    // ct-props-correct clause 4 is XSD 1.0-only. Hoist the `xs:ID` builtin
+    // lookup out of the per-complex-type loop; it's an arena-backed constant
+    // for the lifetime of the schema set.
+    let id_key_for_xsd10 = if schema_set.is_xsd10() {
+        schema_set
+            .builtin_types()
+            .get_by_type_code(crate::types::XmlTypeCode::Id)
+    } else {
+        None
+    };
+
     for (key, type_def) in schema_set.arenas.complex_types.iter() {
         seen.clear();
         attrs.clear();
@@ -4267,6 +4616,40 @@ pub fn validate_complex_type_attribute_uniqueness(
                          with the same expanded name '{}' (ct-props-correct \
                          clause 4 / ag-props-correct clause 2)",
                         type_name, attr_name_str,
+                    ),
+                    location,
+                ));
+            }
+        }
+
+        // ct-props-correct clause 4 (XSD 1.0 only): "Two distinct members of
+        // the {attribute uses} must not have {type definition}s which are
+        // both `xs:ID` or are derived from `xs:ID`." XSD 1.1 dropped this
+        // constraint — see saxon's id001 test which explicitly documents
+        // that an XSD 1.1 type may declare multiple ID-typed attributes.
+        if let Some(id_key) = id_key_for_xsd10 {
+            let mut id_attrs = attrs.iter().filter(|attr| match attr.resolved_type {
+                Some(TypeKey::Simple(st_key)) => schema_set.derives_from(st_key, id_key),
+                _ => false,
+            });
+            if let (Some(first), Some(second)) = (id_attrs.next(), id_attrs.next()) {
+                let first_name = schema_set.name_table.resolve(first.name);
+                let second_name = schema_set.name_table.resolve(second.name);
+                let type_name = format_type_name(
+                    schema_set,
+                    type_def.name,
+                    type_def.target_namespace,
+                );
+                let location = type_def
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                return Err(SchemaError::structural(
+                    "ct-props-correct",
+                    format!(
+                        "Complex type '{}': attributes '{}' and '{}' both have \
+                         xs:ID-derived types (ct-props-correct clause 4; XSD 1.0 only)",
+                        type_name, first_name, second_name,
                     ),
                     location,
                 ));
@@ -5306,7 +5689,11 @@ mod tests {
 
     #[cfg(feature = "xsd11")]
     #[test]
-    fn test_restriction_interleave_cannot_restrict_suffix() {
+    fn test_restriction_empty_derived_allows_interleave_over_suffix() {
+        // Per §3.4.6.4 (language containment), an empty derived particle
+        // emits only wildcard content, so the OC mode choice is irrelevant —
+        // interleave and suffix accept the same empty-particle language.
+        // Mirrors W3C saxonData/Open/open020/open021 which expect VALID.
         use crate::parser::frames::{OpenContentMode, ProcessContents, WildcardNamespace};
 
         let mut schema_set = SchemaSet::new();
@@ -5327,13 +5714,11 @@ mod tests {
 
         let mut stats = DerivationStats::default();
         let result = validate_complex_type(&schema_set, derived_key, &mut stats);
-
-        assert!(result.is_err());
-        if let Err(SchemaError::StructuralError { constraint, .. }) = result {
-            assert_eq!(constraint, "derivation-ok-restriction");
-        } else {
-            panic!("Expected derivation-ok-restriction error");
-        }
+        assert!(
+            result.is_ok(),
+            "empty derived content should accept interleave over suffix, got {:?}",
+            result.err(),
+        );
     }
 
     #[cfg(feature = "xsd11")]

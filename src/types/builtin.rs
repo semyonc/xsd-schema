@@ -222,6 +222,7 @@ impl BuiltinTypes {
                 }),
                 derivation: DerivationMethod::Restriction,
                 mixed: true,
+                mixed_explicit: true,
                 base_type: None,
                 open_content: None,
                 attributes: Vec::new(),
