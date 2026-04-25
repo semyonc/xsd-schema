@@ -1546,6 +1546,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ev_state.local_name,
                         ev_state.namespace,
                         &cta_attrs,
+                        ev_state.ns_context.as_ref(),
+                        Some(self.instance_base_uri.as_str()).filter(|s| !s.is_empty()),
                         self.schema_set,
                     );
                     if let Some(new_type_key) = new_type {
@@ -3586,6 +3588,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                 }
 
+                // QName/NOTATION prefix-binding check (Datatypes §3.3.18 /
+                // §3.3.19) — the simple-type validator can't see namespaces.
+                if attr_validity == SchemaValidity::Valid {
+                    match self.resolve_attribute_qname_typed_value(typed_value.as_ref(), value) {
+                        Ok(Some(resolved)) => typed_value = Some(resolved),
+                        Ok(None) => {}
+                        Err(prefix) => {
+                            let attr_name = self.schema_set.name_table.resolve(local_name);
+                            self.report_error(
+                                "cvc-datatype-valid.1.2.1",
+                                format!(
+                                    "Attribute '{}' has QName value '{}' with undeclared prefix '{}'",
+                                    attr_name, value, prefix
+                                ),
+                            );
+                            self.mark_current_invalid();
+                            attr_validity = SchemaValidity::Invalid;
+                        }
+                    }
+                }
+
                 if let Some(fixed) = fixed_value {
                     let matches = if let Some(ref tv) = typed_value {
                         super::simple::fixed_matches_typed(value, tv, &fixed, attr_type, self.schema_set)
@@ -3888,6 +3911,51 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.schema_set.lookup_notation(qn.namespace_uri, qn.local_name)
     }
 
+    /// Resolve a QName/NOTATION attribute's typed value against the current
+    /// element's namespace context.
+    ///
+    /// Returns:
+    /// - `Ok(Some(value))` — typed value has been re-built with a resolved
+    ///   `XmlAtomicValue::QName` / `Notation`; caller should replace.
+    /// - `Ok(None)` — nothing to do (non-QName type, no ns_context, or
+    ///   non-`UndefinedPrefix` lexical error already flagged by the simple
+    ///   type validator).
+    /// - `Err(prefix)` — the attribute carries a prefix that is not in
+    ///   scope; caller should report cvc-datatype-valid.1.2.1.
+    fn resolve_attribute_qname_typed_value(
+        &self,
+        typed_value: Option<&XmlValue>,
+        value: &str,
+    ) -> Result<Option<XmlValue>, String> {
+        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        let Some(tv) = typed_value else { return Ok(None) };
+        if tv.type_code != XmlTypeCode::QName && tv.type_code != XmlTypeCode::Notation {
+            return Ok(None);
+        }
+        let Some(ctx) = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref())
+        else {
+            return Ok(None);
+        };
+        let qn = match parse_qname_with_snapshot(value, ctx, &self.schema_set.name_table, true) {
+            Ok(qn) => qn,
+            Err(QNameError::UndefinedPrefix(prefix)) => return Err(prefix),
+            Err(_) => return Ok(None),
+        };
+        let atom = if tv.type_code == XmlTypeCode::Notation {
+            XmlAtomicValue::Notation(qn)
+        } else {
+            XmlAtomicValue::QName(qn)
+        };
+        Ok(Some(XmlValue {
+            type_code: tv.type_code,
+            schema_type: tv.schema_type,
+            value: XmlValueKind::Atomic(atom),
+        }))
+    }
+
     /// Resolve a QName/NOTATION-typed value for IC purposes.
     ///
     /// QName values from simple type validation are stored as `XmlAtomicValue::String`
@@ -3903,6 +3971,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         use crate::types::value::{XmlAtomicValue, XmlValueKind};
         let val = typed_value.as_ref()?;
         if val.type_code != XmlTypeCode::QName && val.type_code != XmlTypeCode::Notation {
+            return None;
+        }
+        // Attribute validation may have already resolved the QName/NOTATION
+        // against the element's namespace context (see
+        // `validate_attribute_against_type`). Skip the re-parse in that case.
+        if matches!(
+            val.value,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(_))
+                | XmlValueKind::Atomic(XmlAtomicValue::Notation(_))
+        ) {
             return None;
         }
         let ctx = ns_context?;

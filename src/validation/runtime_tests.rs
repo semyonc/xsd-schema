@@ -5565,6 +5565,9 @@ fn test_strict_undeclared_same_assessment_as_lax() {
 #[test]
 fn test_cta_preserves_xsi_type_invalidity() {
     // CTA switch after bad xsi:type → type switches, validity stays Invalid
+    // typeB extends typeA so the CTA alternative is validly substitutable
+    // (§3.12.6) — the test exercises switch-after-xsi:type-failure, not
+    // substitutability itself.
     let schema_set = load_schema_xsd11(
         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:complexType name="typeA">
@@ -5573,9 +5576,13 @@ fn test_cta_preserves_xsi_type_invalidity() {
                 </xs:sequence>
             </xs:complexType>
             <xs:complexType name="typeB">
-                <xs:sequence>
-                    <xs:element name="b" type="xs:string"/>
-                </xs:sequence>
+                <xs:complexContent>
+                    <xs:extension base="typeA">
+                        <xs:sequence>
+                            <xs:element name="b" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:extension>
+                </xs:complexContent>
             </xs:complexType>
             <xs:element name="root" type="typeA">
                 <xs:alternative test="@kind = 'B'" type="typeB"/>

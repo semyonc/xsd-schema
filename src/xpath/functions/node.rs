@@ -620,6 +620,17 @@ fn compute_base_uri<N: DomNavigator>(node: &N, static_base_uri: Option<&str>) ->
         }
 
         if !nav.move_to_parent() {
+            // No further ancestor: in CTA fragment evaluation the
+            // synthetic Root is severed from the tree (§3.12.4 — E
+            // is the root of the CTA XDM instance), so we never
+            // observe a `Root` node above the test element. The
+            // navigator still surfaces the document-level base URI
+            // via `nav.base_uri()` once no `xml:base` is found, so
+            // pick it up here as the bottom of the chain.
+            let doc_base = nav.base_uri();
+            if !doc_base.is_empty() {
+                xml_bases.push(doc_base.to_string());
+            }
             break;
         }
     }

@@ -36,6 +36,12 @@ pub struct BufferDocument<'a> {
     pub(crate) source_spans: NodeSourceSpans,
     pub(crate) id_elements: HashMap<Box<str>, u32>,
     pub(crate) schema_set: Option<&'a SchemaSet>,
+    /// Document-level base URI surfaced by `BufferDocNavigator::base_uri()`
+    /// when no `xml:base` is found and the cursor reaches the document root.
+    /// Used by CTA fragment evaluation to expose the instance file URI to
+    /// `fn:base-uri(.)` while leaving the static base URI in
+    /// `XPathContext::base_uri` free to carry the schema document URI.
+    pub(crate) fragment_base_uri: Option<&'a str>,
 }
 
 impl<'a> BufferDocument<'a> {
@@ -134,6 +140,28 @@ impl<'a> BufferDocument<'a> {
         self.id_elements.get(id).copied()
     }
 
+    // ── CTA fragment configuration ─────────────────────────────────────
+
+    /// Reconfigure this document so that `elem_ref` is the root of the
+    /// XDM tree visible to the navigator (XSD 1.1 §3.12.4 CTA XDM
+    /// instance shape).
+    ///
+    /// After this call, `move_to_parent()` from `elem_ref` returns `false`
+    /// (the synthetic Root node at index 0 is severed from the tree),
+    /// `move_to_root()` lands on `elem_ref`, and the `following::*` /
+    /// `preceding::*` axes cannot escape the subtree anchored at
+    /// `elem_ref`. The optional `base_uri` argument is surfaced by
+    /// `BufferDocNavigator::base_uri()` when no `xml:base` is found,
+    /// so `fn:base-uri(.)` can return the instance file URI even
+    /// though the static base URI in the XPath context is set to the
+    /// schema document URI.
+    pub(crate) fn set_cta_fragment(&mut self, elem_ref: u32, base_uri: Option<&'a str>) {
+        self.kind = DocumentKind::Fragment;
+        self.root = elem_ref;
+        self.nodes.update(elem_ref, |n| n.parent = NULL);
+        self.fragment_base_uri = base_uri;
+    }
+
     // ── Navigator factory ─────────────────────────────────────────────
 
     /// Creates a navigator positioned at the document root.
@@ -195,6 +223,7 @@ mod tests {
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
             schema_set: None,
+            fragment_base_uri: None,
         }
     }
 

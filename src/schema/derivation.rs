@@ -4381,6 +4381,12 @@ struct EffectiveAttributeUse {
     use_kind: AttributeUseKind,
     resolved_type: Option<TypeKey>,
     fixed_value: Option<String>,
+    /// XSD 1.1 §3.5.1 / §3.2.2.3: the use-level `{inheritable}` is the local
+    /// `inheritable` attribute when present; for `ref`-based uses without an
+    /// own `inheritable` it falls back to the resolved declaration's
+    /// `{inheritable}`. Used by §3.4.6.3 derivation-ok-restriction to enforce
+    /// `G.{inheritable} = S.{inheritable}` (subsumes clause 5.3).
+    inheritable: bool,
 }
 
 /// Resolve a single attribute use + its parallel resolved data into an
@@ -4428,12 +4434,32 @@ fn resolve_single_attribute_use(
             .and_then(|decl| decl.fixed_value.clone())
     });
 
+    // {inheritable} per §3.2.2.3: the actual value of the use's
+    // `inheritable` attribute (default false). For ref-based uses, the
+    // mapping rule says use the {attribute declaration}.{inheritable} —
+    // but the parser stores the use's literal value with a `false`
+    // default, indistinguishable from "unspecified". Fall back to the
+    // referenced declaration's inheritable when the use itself is a
+    // ref and is not flagged.
+    let inheritable = if attr_use.attribute.inheritable {
+        true
+    } else if attr_use.attribute.ref_name.is_some() {
+        resolved
+            .and_then(|r| r.resolved_ref)
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
+            .map(|decl| decl.inheritable)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
     Some(EffectiveAttributeUse {
         name,
         target_namespace,
         use_kind: attr_use.use_kind,
         resolved_type,
         fixed_value,
+        inheritable,
     })
 }
 
@@ -5327,6 +5353,39 @@ fn validate_attribute_restriction(
                 ),
                 location,
             ));
+        }
+    }
+
+    // §3.4.6.3 clause 3 / "subsumes" clause 5.3 (XSD 1.1 only):
+    // for each attribute use that exists in both the base and the derived
+    // type, the base's {inheritable} must equal the derived's. The default
+    // binding for an attribute information item subsumes only when the
+    // attribute use's inheritability matches; flipping it changes the
+    // descendant attribute-inheritance graph, which is not a valid
+    // restriction.
+    if schema_set.is_xsd11() {
+        for derived_attr in &derived_attrs {
+            let Some(base_attr) = base_attrs.iter().find(|a| {
+                a.name == derived_attr.name && a.target_namespace == derived_attr.target_namespace
+            }) else {
+                continue;
+            };
+            if base_attr.inheritable != derived_attr.inheritable {
+                let attr_name_str = schema_set.name_table.resolve(derived_attr.name);
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': attribute '{}' changes \
+                         {{inheritable}} from {} to {}",
+                        type_name,
+                        base_name,
+                        attr_name_str,
+                        base_attr.inheritable,
+                        derived_attr.inheritable,
+                    ),
+                    location,
+                ));
+            }
         }
     }
 
@@ -6416,6 +6475,276 @@ pub fn validate_wildcard_element_type_table_consistency(
                     location,
                 ));
             }
+        }
+    }
+
+    Ok(())
+}
+
+// Shared helpers for §3.8.6.3 / §3.4.6.3 cos-element-consistent.
+
+/// Per-local-element record produced by [`collect_local_elements`].
+#[cfg(feature = "xsd11")]
+type LocalElementEntry = (Option<NameId>, NameId, ElementKey, Option<SourceRef>);
+
+/// Recursively walk a complex type's content model and emit one
+/// `LocalElementEntry` per inline local element declaration.
+///
+/// `flat_idx` tracks the walker's position in the owning CT's
+/// `resolved_content_particle_elements`, which is the post-resolution
+/// arena lookup that carries CTA alternatives (the parser-frame
+/// `AlternativeResult` slice on the `ElementParticle` is stale for
+/// inline alternatives resolved later).
+#[cfg(feature = "xsd11")]
+fn walk_collect_local_elements(
+    particle: &ParticleResult,
+    target_ns: Option<NameId>,
+    local_keys: &[Option<ElementKey>],
+    flat_idx: &mut usize,
+    out: &mut Vec<LocalElementEntry>,
+) {
+    if let ParticleTerm::Group(group) = &particle.term {
+        walk_group_local_elements(&group.particles, target_ns, local_keys, flat_idx, out);
+    }
+}
+
+#[cfg(feature = "xsd11")]
+fn walk_group_local_elements(
+    particles: &[ParticleResult],
+    target_ns: Option<NameId>,
+    local_keys: &[Option<ElementKey>],
+    flat_idx: &mut usize,
+    out: &mut Vec<LocalElementEntry>,
+) {
+    for p in particles {
+        match &p.term {
+            ParticleTerm::Element(elem) if elem.ref_name.is_none() => {
+                if let Some(Some(elem_key)) = local_keys.get(*flat_idx) {
+                    let ns = elem.target_namespace.or(target_ns);
+                    if let Some(name) = elem.name {
+                        out.push((ns, name, *elem_key, elem.source.clone()));
+                    }
+                }
+                *flat_idx += 1;
+            }
+            ParticleTerm::Element(_) => {
+                *flat_idx += 1;
+            }
+            ParticleTerm::Group(group) if group.ref_name.is_none() => {
+                walk_group_local_elements(&group.particles, target_ns, local_keys, flat_idx, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Collect every local element declaration in `ct`'s content model.
+#[cfg(feature = "xsd11")]
+fn collect_local_elements(ct: &crate::arenas::ComplexTypeDefData) -> Vec<LocalElementEntry> {
+    let mut out = Vec::new();
+    let ComplexContentResult::Complex(cc) = &ct.content else {
+        return out;
+    };
+    let Some(particle) = cc.particle.as_ref() else {
+        return out;
+    };
+    let mut flat_idx = 0usize;
+    walk_collect_local_elements(
+        particle,
+        ct.target_namespace,
+        &ct.resolved_content_particle_elements,
+        &mut flat_idx,
+        &mut out,
+    );
+    out
+}
+
+/// Resolve an alternative's effective `TypeKey`, falling back to the
+/// schema-set's name lookup or built-in registry when the parser-frame
+/// `resolved_type` is absent.
+#[cfg(feature = "xsd11")]
+fn alt_effective_type(
+    alt: &crate::parser::frames::AlternativeResult,
+    schema_set: &SchemaSet,
+) -> Option<TypeKey> {
+    use crate::parser::frames::TypeRefResult;
+    if let Some(t) = alt.resolved_type {
+        return Some(t);
+    }
+    if let Some(TypeRefResult::QName(qname)) = &alt.type_ref {
+        return schema_set
+            .lookup_type(qname.namespace, qname.local_name)
+            .or_else(|| schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name));
+    }
+    None
+}
+
+/// Two alternative lists are equivalent when they have the same length,
+/// pairwise-equal `@test` strings, and pairwise-equal effective types.
+#[cfg(feature = "xsd11")]
+fn alternatives_equivalent(
+    a: &[crate::parser::frames::AlternativeResult],
+    b: &[crate::parser::frames::AlternativeResult],
+    schema_set: &SchemaSet,
+) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b.iter()).all(|(x, y)| {
+        x.test == y.test && alt_effective_type(x, schema_set) == alt_effective_type(y, schema_set)
+    })
+}
+
+/// XSD 1.1 §3.8.6.3 / cos-element-consistent: two local element declarations
+/// with the same expanded QName in the same complex-type content model must
+/// have equivalent type tables (or both have no type table).
+#[cfg(feature = "xsd11")]
+pub fn validate_local_element_type_table_consistency(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use std::collections::HashMap;
+
+    if !schema_set.is_xsd11() {
+        return Ok(());
+    }
+
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        let local_elems = collect_local_elements(ct);
+        if local_elems.len() < 2 {
+            continue;
+        }
+
+        let mut by_name: HashMap<(Option<NameId>, NameId), Vec<usize>> = HashMap::new();
+        for (i, (ns, name, _, _)) in local_elems.iter().enumerate() {
+            by_name.entry((*ns, *name)).or_default().push(i);
+        }
+
+        for (qname, indices) in &by_name {
+            if indices.len() < 2 {
+                continue;
+            }
+            let first_idx = indices[0];
+            let first_decl = &schema_set.arenas.elements[local_elems[first_idx].2];
+            for &idx in &indices[1..] {
+                let other_decl = &schema_set.arenas.elements[local_elems[idx].2];
+                if alternatives_equivalent(
+                    &first_decl.alternatives,
+                    &other_decl.alternatives,
+                    schema_set,
+                ) {
+                    continue;
+                }
+                let qn_str = match qname.0 {
+                    Some(ns) => format!(
+                        "{{{}}}{}",
+                        schema_set.name_table.resolve_ref(ns),
+                        schema_set.name_table.resolve_ref(qname.1),
+                    ),
+                    None => schema_set.name_table.resolve_ref(qname.1).to_string(),
+                };
+                let location = schema_set
+                    .locate(local_elems[idx].3.as_ref())
+                    .or_else(|| schema_set.locate(ct.source.as_ref()));
+                return Err(SchemaError::structural(
+                    "cos-element-consistent",
+                    format!(
+                        "Two local element declarations of '{}' appear in the same \
+                         content model but their type tables are not equivalent \
+                         (§3.8.6.3 / cos-element-consistent)",
+                        qn_str
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// XSD 1.1 §3.4.6.3 / cos-element-consistent (cross-derivation): when a
+/// complex type T restricts a base type B and both contain local element
+/// declarations with the same expanded QName, the type tables of those
+/// declarations must be equivalent (or both absent).
+///
+/// Complements `validate_local_element_type_table_consistency`, which
+/// catches duplicates *within* one content model.
+#[cfg(feature = "xsd11")]
+pub fn validate_restriction_local_element_type_table_consistency(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use std::collections::HashMap;
+
+    if !schema_set.is_xsd11() {
+        return Ok(());
+    }
+
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        // §3.4.6.2 (extension) only adds particles and never re-issues
+        // them, so type-table consistency is automatic there. Restrict to
+        // §3.4.6.3 (restriction).
+        if ct.derivation_method != Some(crate::parser::frames::DerivationMethod::Restriction) {
+            continue;
+        }
+        let Some(TypeKey::Complex(base_ck)) = ct.resolved_base_type else {
+            continue;
+        };
+        let Some(base_ct) = schema_set.arenas.complex_types.get(base_ck) else {
+            continue;
+        };
+
+        let derived_locals = collect_local_elements(ct);
+        if derived_locals.is_empty() {
+            continue;
+        }
+        let base_locals = collect_local_elements(base_ct);
+        if base_locals.is_empty() {
+            continue;
+        }
+
+        // Multiple base locals with the same name is itself invalid; the
+        // in-CT consistency pass will reject the base independently.
+        let mut base_by_name: HashMap<(Option<NameId>, NameId), ElementKey> = HashMap::new();
+        for (ns, name, ek, _) in &base_locals {
+            base_by_name.entry((*ns, *name)).or_insert(*ek);
+        }
+
+        for (ns, name, derived_ek, derived_src) in &derived_locals {
+            let Some(&base_ek) = base_by_name.get(&(*ns, *name)) else {
+                continue;
+            };
+            let derived_decl = &schema_set.arenas.elements[*derived_ek];
+            let base_decl = &schema_set.arenas.elements[base_ek];
+            if alternatives_equivalent(
+                &derived_decl.alternatives,
+                &base_decl.alternatives,
+                schema_set,
+            ) {
+                continue;
+            }
+            let qn_str = match ns {
+                Some(ns_id) => format!(
+                    "{{{}}}{}",
+                    schema_set.name_table.resolve_ref(*ns_id),
+                    schema_set.name_table.resolve_ref(*name),
+                ),
+                None => schema_set.name_table.resolve_ref(*name).to_string(),
+            };
+            let location = schema_set
+                .locate(derived_src.as_ref())
+                .or_else(|| schema_set.locate(ct.source.as_ref()));
+            let derived_name = format_type_name(schema_set, ct.name, ct.target_namespace);
+            let base_name = format_type_name(schema_set, base_ct.name, base_ct.target_namespace);
+            return Err(SchemaError::structural(
+                "cos-element-consistent",
+                format!(
+                    "Complex type '{}' restricting '{}': local element '{}' has a \
+                     type table that is not equivalent to the base type's local \
+                     element of the same name (§3.4.6.3 / cos-element-consistent)",
+                    derived_name, base_name, qn_str,
+                ),
+                location,
+            ));
         }
     }
 

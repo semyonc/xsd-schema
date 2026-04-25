@@ -275,11 +275,7 @@ pub fn load_and_process_schema(
         validate_attribute_id_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
         #[cfg(feature = "xsd11")]
-        crate::schema::validate_element_type_alternatives(schema_set)?;
-        // §3.10.6.1 rule 4: notQName entries must lie within the wildcard's
-        // namespace constraint. XSD 1.1-only; gated internally.
-        #[cfg(feature = "xsd11")]
-        crate::schema::validate_wildcard_disallowed_names(schema_set)?;
+        xsd11_pre_resolution_validations(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
@@ -305,14 +301,21 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
-        // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
-        // wildcard + global element with same QName ⇒ type tables must agree.
-        // Runs AFTER allocate_content_particle_elements because it reads each
-        // CT's `resolved_content_particle_elements` to pick up post-resolution
-        // alternatives stored on the arena entry rather than the stale
-        // parser-frame copy.
+        // XSD 1.1: assemble inline alternative types attached to local
+        // elements (which only acquired their ElementKey in the pass
+        // above), then re-run reference resolution and content-particle
+        // allocation so the new types get their base/particle resolved.
         #[cfg(feature = "xsd11")]
-        crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
+        {
+            let new_alt_types =
+                crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
+            if !new_alt_types.is_empty() {
+                resolve_all_references(schema_set)?;
+                allocate_content_particle_elements(schema_set)?;
+            }
+        }
+        #[cfg(feature = "xsd11")]
+        xsd11_element_consistency_checks(schema_set)?;
         validate_all_group_outer_occurs(schema_set)?;
         validate_all_group_content(schema_set)?;
         validate_all_particle_occurs(schema_set)?;
@@ -385,13 +388,8 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // e-props-correct.2 / e-props-correct.4 — validate element default/fixed values
     validate_element_value_constraints(schema_set)?;
 
-    // XSD 1.1 src-type-alternative: only the last <xs:alternative> may omit @test.
     #[cfg(feature = "xsd11")]
-    crate::schema::validate_element_type_alternatives(schema_set)?;
-    // §3.10.6.1 rule 4: notQName entries must lie within the wildcard's
-    // namespace constraint. XSD 1.1-only; gated internally.
-    #[cfg(feature = "xsd11")]
-    crate::schema::validate_wildcard_disallowed_names(schema_set)?;
+    xsd11_pre_resolution_validations(schema_set)?;
 
     // (XSD 1.0): strict xs:anyURI lexical check on annotation source
     // attributes. XSD 1.1 explicitly relaxed the rule, so no-op there.
@@ -406,19 +404,63 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
-    // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
-    // wildcard + global element with same QName ⇒ type tables must agree.
-    // Runs AFTER allocate_content_particle_elements because it reads each CT's
-    // `resolved_content_particle_elements` to pick up post-resolution
-    // alternatives stored on the arena entry rather than the stale parser-frame
-    // copy.
+    // XSD 1.1: assemble inline alternative types attached to local
+    // elements (which only acquired their ElementKey above).
     #[cfg(feature = "xsd11")]
-    crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
+    {
+        let new_alt_types =
+            crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
+        if !new_alt_types.is_empty() {
+            resolve_all_references(schema_set)?;
+            allocate_content_particle_elements(schema_set)?;
+        }
+    }
+    #[cfg(feature = "xsd11")]
+    xsd11_element_consistency_checks(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
     validate_all_group_content(schema_set)?;
     validate_all_particle_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
     Ok((inline_stats, resolution_stats))
+}
+
+/// XSD 1.1 schema-validity checks that run after type derivation but before
+/// inline alternative-type resolution and content-particle allocation.
+///
+/// Covers the three §3.12.x / §3.10.6.1 passes that touch alternative
+/// declarations and wildcard `notQName` lists. No-op when xsd11 is disabled
+/// (every callee gates internally on `schema_set.is_xsd11()`).
+#[cfg(feature = "xsd11")]
+fn xsd11_pre_resolution_validations(schema_set: &SchemaSet) -> SchemaResult<()> {
+    // src-type-alternative: only the last <xs:alternative> may omit @test.
+    crate::schema::validate_element_type_alternatives(schema_set)?;
+    // §3.12.4: undefined variables, unbound prefixes, user-defined types
+    // in instance-of/cast.
+    crate::schema::validate_cta_xpath(schema_set)?;
+    // §3.12.6 cos-ct-alternative-substitutable.
+    crate::schema::validate_cta_substitutability(schema_set)?;
+    // §3.10.6.1 rule 4: notQName entries must lie within the wildcard's
+    // namespace constraint.
+    crate::schema::validate_wildcard_disallowed_names(schema_set)?;
+    Ok(())
+}
+
+/// XSD 1.1 cos-element-consistent passes that run after content-particle
+/// allocation has populated each complex type's
+/// `resolved_content_particle_elements` (which carries the post-resolution
+/// alternative type-table the parser-frame copy lacks).
+#[cfg(feature = "xsd11")]
+fn xsd11_element_consistency_checks(schema_set: &SchemaSet) -> SchemaResult<()> {
+    // §3.8.6.3: same-named local element declarations within one content
+    // model must have equivalent type tables.
+    crate::schema::validate_local_element_type_table_consistency(schema_set)?;
+    // §3.8.6.3 (extended): local element + lax/strict wildcard + global
+    // element with same QName ⇒ type tables must agree.
+    crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
+    // §3.4.6.3: when a restriction-derived complex type re-issues a base
+    // local element, the type tables must remain equivalent.
+    crate::schema::validate_restriction_local_element_type_table_consistency(schema_set)?;
+    Ok(())
 }
 
 /// Validate outer occurrence constraints on top-level all-groups.
@@ -754,11 +796,7 @@ pub async fn load_and_process_schema_async(
         validate_attribute_id_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
         #[cfg(feature = "xsd11")]
-        crate::schema::validate_element_type_alternatives(schema_set)?;
-        // §3.10.6.1 rule 4: notQName entries must lie within the wildcard's
-        // namespace constraint. XSD 1.1-only; gated internally.
-        #[cfg(feature = "xsd11")]
-        crate::schema::validate_wildcard_disallowed_names(schema_set)?;
+        xsd11_pre_resolution_validations(schema_set)?;
     }
 
     // Phase 4.76 (XSD 1.0): strict xs:anyURI lexical check on annotation
@@ -779,14 +817,19 @@ pub async fn load_and_process_schema_async(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
-        // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
-        // wildcard + global element with same QName ⇒ type tables must agree.
-        // Runs AFTER allocate_content_particle_elements because it reads each
-        // CT's `resolved_content_particle_elements` to pick up post-resolution
-        // alternatives stored on the arena entry rather than the stale
-        // parser-frame copy.
+        // XSD 1.1: assemble inline alternative types attached to local
+        // elements (which only acquired their ElementKey above).
         #[cfg(feature = "xsd11")]
-        crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
+        {
+            let new_alt_types =
+                crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
+            if !new_alt_types.is_empty() {
+                resolve_all_references(schema_set)?;
+                allocate_content_particle_elements(schema_set)?;
+            }
+        }
+        #[cfg(feature = "xsd11")]
+        xsd11_element_consistency_checks(schema_set)?;
     }
 
     Ok(stats)

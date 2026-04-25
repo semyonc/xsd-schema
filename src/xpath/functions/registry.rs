@@ -450,6 +450,18 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
             SequenceType::star(crate::types::sequence::ItemType::AnyNode),
         ),
     ));
+    // fn:collection() / fn:collection($arg) — without an external default
+    // collection or a registered URI, both forms return the empty sequence
+    // (XPath 2.0 functions §15.5.6). This minimal stub is sufficient for
+    // CTA tests that probe `empty(collection())`.
+    registry.register(FunctionEntry::new(
+        FunctionId::Collection,
+        FunctionSignature::range(
+            FN_NAMESPACE, "collection", 0, 1,
+            vec![string_opt()],
+            SequenceType::star(crate::types::sequence::ItemType::AnyNode),
+        ),
+    ));
 
     // ========================================================================
     // DateTime Functions

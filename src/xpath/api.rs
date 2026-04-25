@@ -240,6 +240,14 @@ impl XPathExpr {
         &self.external_vars
     }
 
+    /// Borrow the bound AST arena of this expression.
+    ///
+    /// Useful for callers that want to inspect the compiled tree
+    /// (e.g. CTA schema-time validation walking type expressions).
+    pub fn arena(&self) -> &AstArena {
+        &self.arena
+    }
+
     /// Create an evaluator for this expression.
     ///
     /// The evaluator uses a builder pattern to set variables and other options

@@ -31,6 +31,8 @@ pub mod redefine;
 pub mod override_dir;
 #[cfg(feature = "xsd11")]
 pub mod edc;
+#[cfg(feature = "xsd11")]
+pub mod cta;
 
 // Re-exports from model
 pub use model::{
@@ -103,6 +105,14 @@ pub use derivation::validate_element_type_alternatives;
 pub use derivation::validate_wildcard_disallowed_names;
 #[cfg(feature = "xsd11")]
 pub use derivation::validate_wildcard_element_type_table_consistency;
+#[cfg(feature = "xsd11")]
+pub use derivation::validate_local_element_type_table_consistency;
+#[cfg(feature = "xsd11")]
+pub use derivation::validate_restriction_local_element_type_table_consistency;
+#[cfg(feature = "xsd11")]
+pub use cta::validate_cta_xpath;
+#[cfg(feature = "xsd11")]
+pub use cta::validate_cta_substitutability;
 
 // Re-exports from redefine
 pub use redefine::apply_redefine;

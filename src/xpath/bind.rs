@@ -209,8 +209,20 @@ pub fn bind_node(
                 bind_node(arena, *pred_id, ctx, binder)?;
             }
 
-            // Resolve the name test if present
-            let resolved = resolve_node_test(&path_step.test, ctx)?;
+            // Resolve the name test if present.
+            //
+            // The default-element-namespace only applies to element name
+            // tests. For attribute and namespace axes the expanded QName
+            // of an unprefixed local name is always (no-namespace, local).
+            // §2.5.2 of the XPath 2.0 spec — see also W3C cta0044, where
+            // a schema with `xpathDefaultNamespace="abc"` declaring
+            // unqualified attributes would otherwise see `@switch`
+            // resolved into the default namespace and miss the actual
+            // unprefixed attribute on the instance.
+            let axis = path_step.axis;
+            let is_attribute_axis =
+                matches!(axis, super::ast::Axis::Attribute | super::ast::Axis::Namespace);
+            let resolved = resolve_node_test_with_axis(&path_step.test, ctx, is_attribute_axis)?;
             if let AstNode::PathStep(ref mut node) = arena.get_mut(id) {
                 node.resolved_test = resolved;
             }
@@ -260,17 +272,18 @@ fn resolve_var_qname(
     }
 }
 
-/// Resolve a NodeTest to a ResolvedNameTest.
-///
-/// For Name tests, converts AST-level NameTest (strings) to type-system NameTest (NameIds).
-/// For Kind tests, returns None (kind tests don't need name resolution at this level).
-fn resolve_node_test(
+/// Resolve a NodeTest to a ResolvedNameTest with axis-aware namespace
+/// handling. When `is_attribute_axis` is true (attribute or namespace
+/// axis), an unprefixed local name resolves to the no-namespace QName
+/// instead of using the default-element-namespace.
+fn resolve_node_test_with_axis(
     test: &NodeTest,
     ctx: &XPathContext<'_>,
+    is_attribute_axis: bool,
 ) -> Result<Option<ResolvedNameTest>, XPathError> {
     match test {
         NodeTest::Name(name_test) => {
-            let resolved = resolve_name_test(name_test, ctx)?;
+            let resolved = resolve_name_test_with_axis(name_test, ctx, is_attribute_axis)?;
             Ok(Some(resolved))
         }
         NodeTest::Kind(_) => {
@@ -289,9 +302,10 @@ fn resolve_node_test(
 /// - `prefix:*` -> LocalWildcard (namespace URI)
 /// - `*:local` -> NamespaceWildcard (local name)
 /// - `prefix:local` or `local` -> QName
-fn resolve_name_test(
+fn resolve_name_test_with_axis(
     name_test: &NameTest,
     ctx: &XPathContext<'_>,
+    is_attribute_axis: bool,
 ) -> Result<ResolvedNameTest, XPathError> {
     match (&name_test.prefix, &name_test.local_name) {
         // * - wildcard matches any name
@@ -306,16 +320,17 @@ fn resolve_name_test(
         // prefix:* - any local name in namespace
         (Some(prefix), None) => {
             if prefix.is_empty() {
-                // Empty prefix with wildcard local = default namespace wildcard
-                // Use default element namespace if set
-                if let Some(ns_id) = ctx.default_element_ns {
-                    Ok(ResolvedNameTest::LocalWildcard(ns_id))
-                } else {
-                    // No default namespace - matches no-namespace elements
-                    // Use empty string as namespace
-                    let empty_ns = ctx.names.add("");
-                    Ok(ResolvedNameTest::LocalWildcard(empty_ns))
+                // Empty prefix with wildcard local. For element axes
+                // the default-element-namespace applies; for attribute
+                // and namespace axes an unprefixed name is always in
+                // no namespace per XPath 2.0 §2.5.2.
+                if !is_attribute_axis {
+                    if let Some(ns_id) = ctx.default_element_ns {
+                        return Ok(ResolvedNameTest::LocalWildcard(ns_id));
+                    }
                 }
+                let empty_ns = ctx.names.add("");
+                Ok(ResolvedNameTest::LocalWildcard(empty_ns))
             } else {
                 let prefix_id = ctx.names.add(prefix);
                 let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
@@ -329,8 +344,15 @@ fn resolve_name_test(
         (Some(prefix), Some(local)) => {
             let local_id = ctx.names.add(local);
             if prefix.is_empty() {
-                // No prefix - use default element namespace if set
-                let ns_id = ctx.default_element_ns;
+                // Unprefixed local name. Element axes pick up the
+                // default-element-namespace; attribute and namespace
+                // axes always resolve to no namespace per XPath 2.0
+                // §2.5.2 (W3C cta0044 regression).
+                let ns_id = if is_attribute_axis {
+                    None
+                } else {
+                    ctx.default_element_ns
+                };
                 Ok(ResolvedNameTest::QName(QualifiedName::new(ns_id, local_id, None)))
             } else {
                 let prefix_id = ctx.names.add(prefix);

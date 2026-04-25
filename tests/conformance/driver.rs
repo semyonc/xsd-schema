@@ -151,6 +151,24 @@ pub struct VersionedExpected {
 /// Recognized XSD versions for SchemaSet selection
 const XSD_VERSIONS: &[&str] = &["1.0", "1.1"];
 
+/// CTA XPath profile that this implementation supports.
+///
+/// XSD 1.1 §3.12.4 defines two XPath profiles for type alternatives:
+///   - `full-xpath-in-CTA` — full XPath 2.0 in the test attribute
+///   - `restricted-xpath-in-CTA` — a subset (attribute access only)
+///
+/// Some W3C tests carry per-profile expected outcomes:
+///   <expected validity="valid"   version="full-xpath-in-CTA"/>
+///   <expected validity="invalid" version="restricted-xpath-in-CTA"/>
+///
+/// This driver implements the full profile, so we run the matching
+/// variant and skip variants whose label is a non-supported profile.
+const ACTIVE_CTA_PROFILE: &str = "full-xpath-in-CTA";
+
+/// Profile labels we recognise but explicitly do not implement. Test
+/// variants tagged with these are dropped during expansion.
+const UNSUPPORTED_CTA_PROFILES: &[&str] = &["restricted-xpath-in-CTA"];
+
 fn parse_expected_outcome(
     validity: &str,
     in_instance_test: bool,
@@ -689,11 +707,26 @@ fn expand_test_versions(test: TestCase, out: &mut Vec<TestCase>) {
             });
         }
     } else {
-        // Profile-specific expected entries exist. For each XSD version,
-        // emit one variant per profile label. The profile label drives
-        // expected-outcome resolution and --version filtering.
-        for ver in &xsd_versions {
-            for label in &profile_labels {
+        // Profile-specific expected entries exist. We pick a single
+        // variant per XSD version corresponding to ACTIVE_CTA_PROFILE
+        // (the profile this driver implements). Variants tagged with
+        // an UNSUPPORTED_CTA_PROFILES label are dropped — running them
+        // would just compare the result against an outcome that does
+        // not describe this implementation. If the active profile is
+        // not present in the entries, fall back to the first label so
+        // that profile-tagged tests still run with *some* expectation.
+        let supported_label = profile_labels
+            .iter()
+            .find(|l| l.as_str() == ACTIVE_CTA_PROFILE)
+            .cloned()
+            .or_else(|| {
+                profile_labels
+                    .iter()
+                    .find(|l| !UNSUPPORTED_CTA_PROFILES.contains(&l.as_str()))
+                    .cloned()
+            });
+        if let Some(label) = supported_label {
+            for ver in &xsd_versions {
                 variants.push(ExpandedVariant {
                     xsd_version: ver.clone(),
                     profile_label: Some(label.clone()),

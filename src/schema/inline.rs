@@ -733,7 +733,14 @@ pub(crate) fn validate_keyref_refers(
 ///
 /// Must be called after inline type assembly and reference resolution.
 pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaResult<()> {
-    // Collection pass: walk all complex types and collect jobs
+    // Collection pass: walk all complex types and collect jobs.
+    //
+    // Skip elements whose slot in `resolved_content_particle_elements` is
+    // already populated, so the function is safe to re-run (e.g., after
+    // a second inline-type assembly pass for alternatives discovered on
+    // local elements). The flat_idx still advances on every particle so
+    // newly added complex types collected in the same pass keep correct
+    // indexing.
     let mut jobs = Vec::new();
     for (key, complex) in schema_set.arenas.complex_types.iter() {
         let target_ns = complex.target_namespace;
@@ -752,6 +759,18 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             }
         }
     }
+    // Drop jobs whose slot is already filled in the owning complex type.
+    jobs.retain(|job| {
+        match schema_set
+            .arenas
+            .complex_types
+            .get(job.complex_type_key)
+            .and_then(|ct| ct.resolved_content_particle_elements.get(job.flat_idx))
+        {
+            Some(Some(_)) => false, // already allocated
+            _ => true,
+        }
+    });
 
     // Build per-document sets of already-known identity constraint names for uniqueness checking
     // XSD §4.2.1: IC names must be unique per schema document, not globally
@@ -882,6 +901,73 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
     }
 
     Ok(())
+}
+
+/// XSD 1.1: Assemble inline `<xs:alternative>` types attached to *local*
+/// element declarations.
+///
+/// The first inline-type assembly pass only walks `arenas.elements`,
+/// which at that point contains global elements only. Local elements
+/// declared inside complex-type particles are allocated later by
+/// [`allocate_content_particle_elements`], and any inline alternative
+/// types they carry would otherwise stay unresolved.
+///
+/// Run this after [`allocate_content_particle_elements`]. It:
+///
+/// 1. Walks every element declaration whose alternatives have an
+///    `inline_type` but no `resolved_type`.
+/// 2. Calls [`assemble_inline_type`] to add the inline complex/simple
+///    type to the arena and stores the resulting `TypeKey` on the
+///    alternative.
+/// 3. Returns the list of complex-type keys that were newly added so
+///    the caller can re-run reference resolution and content-particle
+///    allocation on them.
+///
+/// The caller must also call [`resolve_all_references`] and
+/// [`allocate_content_particle_elements`] again so the new types get
+/// their `resolved_base_type`, `resolved_content_particle_types`, and
+/// `resolved_content_particle_elements` populated. Both passes are
+/// idempotent for already-resolved entries.
+#[cfg(feature = "xsd11")]
+pub fn resolve_local_element_alternatives(
+    schema_set: &mut SchemaSet,
+) -> SchemaResult<Vec<ComplexTypeKey>> {
+    use crate::ids::ComplexTypeKey;
+
+    // Collect (element_key, alt_idx, type_frame) triples first to avoid
+    // mutating arenas while iterating them.
+    let mut pending: Vec<(ElementKey, usize, TypeFrameResult, Option<NameId>)> = Vec::new();
+    for (key, elem) in schema_set.arenas.elements.iter() {
+        for (idx, alt) in elem.alternatives.iter().enumerate() {
+            if alt.resolved_type.is_some() {
+                continue;
+            }
+            let Some(inline_type) = &alt.inline_type else {
+                continue;
+            };
+            pending.push((
+                key,
+                idx,
+                (**inline_type).clone(),
+                elem.target_namespace,
+            ));
+        }
+    }
+
+    let mut new_complex_keys: Vec<ComplexTypeKey> = Vec::new();
+    for (elem_key, alt_idx, type_frame, target_ns) in pending {
+        let type_key = assemble_inline_type(schema_set, &type_frame, target_ns)?;
+        if let TypeKey::Complex(ct_key) = type_key {
+            new_complex_keys.push(ct_key);
+        }
+        if let Some(elem) = schema_set.arenas.elements.get_mut(elem_key) {
+            if let Some(alt) = elem.alternatives.get_mut(alt_idx) {
+                alt.resolved_type = Some(type_key);
+            }
+        }
+    }
+
+    Ok(new_complex_keys)
 }
 
 /// Allocation job for a local element in a named model group particle

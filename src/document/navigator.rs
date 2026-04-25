@@ -167,7 +167,7 @@ impl<'a> BufferDocNavigator<'a> {
     }
 
     /// Walks ancestors looking for `xml:base` attribute.
-    fn resolve_base_uri(&self) -> &str {
+    fn resolve_base_uri(&self) -> &'a str {
         let mut nav = self.clone();
         loop {
             let node = nav.node();
@@ -197,7 +197,11 @@ impl<'a> BufferDocNavigator<'a> {
                 break;
             }
         }
-        ""
+        // No xml:base found while walking up. CTA fragment evaluation
+        // installs the instance file URI as `fragment_base_uri` so
+        // `fn:base-uri(.)` reports the instance URI even though the
+        // synthetic XDM tree has no `xml:base` to anchor it (§3.12.4).
+        self.doc.fragment_base_uri.unwrap_or("")
     }
 
     /// Finds the NsRef boundary for Local namespace scope on `elem`.

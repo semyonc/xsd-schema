@@ -168,6 +168,8 @@ pub enum FunctionId {
     Root,
     /// fn:id($arg as xs:string*, $node as node()) as element()*
     Id,
+    /// fn:collection($arg as xs:string?) as node()*
+    Collection,
 
     // ========== DateTime Functions ==========
     /// fn:dateTime($arg1, $arg2)
@@ -783,6 +785,20 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Lang => node::lang(context, args),
         FunctionId::Root => node::root(context, args),
         FunctionId::Id => node::id(context, args),
+        FunctionId::Collection => {
+            // fn:collection($arg?) — without a registered default collection
+            // or URI handler, both forms return the empty sequence per
+            // XPath/XQuery F&O §15.5.6. Sufficient for CTA tests that
+            // only probe `empty(collection())`.
+            if args.len() > 1 {
+                return Err(XPathError::wrong_number_of_arguments(
+                    "collection",
+                    1,
+                    args.len(),
+                ));
+            }
+            Ok(XPathValue::Empty)
+        }
 
         // ====================================================================
         // DateTime functions (Phase 6)

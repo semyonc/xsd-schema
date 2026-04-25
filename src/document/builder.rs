@@ -118,6 +118,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
             schema_set,
+            fragment_base_uri: None,
         };
 
         Ok(Self {
