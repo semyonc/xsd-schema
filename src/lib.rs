@@ -184,6 +184,7 @@ pub use builder::{SchemaSetBuilder, CompiledSchemaSet, CompilationStats};
 
 // Re-export resolver types
 pub use parser::resolver::{
+    decode_xml_bytes, decode_xml_to_utf8_bytes,
     SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
     SchemaResolver, ResolverConfig, SchemaCatalog,
 };

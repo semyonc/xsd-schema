@@ -289,8 +289,10 @@ impl TestSuiteParser {
         path: &Path,
         inherited_version: Option<&str>,
     ) -> Result<Vec<TestCase>, String> {
-        let content = fs::read_to_string(path)
+        let raw = fs::read(path)
             .map_err(|e| format!("Failed to read manifest {:?}: {}", path, e))?;
+        let content = xsd_schema::decode_xml_bytes(raw)
+            .map_err(|e| format!("Failed to decode manifest {:?}: {}", path, e))?;
 
         // Resolve document paths relative to the manifest file's directory
         let manifest_dir = path
@@ -1137,7 +1139,9 @@ fn validate_instance(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
 ) -> Result<(InstanceActualOutcome, Vec<String>), String> {
-    let content = fs::read(instance_path).map_err(|e| format!("Failed to read instance: {}", e))?;
+    let raw = fs::read(instance_path).map_err(|e| format!("Failed to read instance: {}", e))?;
+    let content = xsd_schema::decode_xml_to_utf8_bytes(raw)
+        .map_err(|e| format!("Failed to decode instance: {}", e))?;
 
     // Canonicalize instance path so schema-location hints resolve correctly
     let canonical_path = instance_path
@@ -1594,9 +1598,10 @@ struct DtdEntityExpandingLoader;
 
 impl xsd_schema::SchemaLoader for DtdEntityExpandingLoader {
     fn load(&self, location: &str) -> xsd_schema::SchemaResult<String> {
-        let content = std::fs::read_to_string(location).map_err(|e| {
+        let bytes = std::fs::read(location).map_err(|e| {
             xsd_schema::SchemaError::resolution(format!("Failed to read '{}': {}", location, e))
         })?;
+        let content = xsd_schema::decode_xml_bytes(bytes)?;
         Ok(expand_dtd_entities_if_needed(content))
     }
 

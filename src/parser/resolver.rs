@@ -65,6 +65,82 @@ pub enum LoadOutcome {
     Cycle(String),
 }
 
+
+// ============================================================================
+// Encoding-Aware Decoding
+// ============================================================================
+
+const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+const UTF16_LE_BOM: &[u8] = &[0xFF, 0xFE];
+const UTF16_BE_BOM: &[u8] = &[0xFE, 0xFF];
+
+#[derive(Copy, Clone)]
+enum Endian {
+    Le,
+    Be,
+}
+
+/// Decode raw XML bytes into UTF-8 bytes, sniffing common Unicode encodings
+/// per XML 1.0 §F.1.
+///
+/// Recognizes UTF-8 with/without BOM and UTF-16 LE/BE with/without BOM. The
+/// returned `Vec<u8>` is the input buffer unchanged when it is already UTF-8
+/// with no BOM (zero-copy fast path).
+pub fn decode_xml_to_utf8_bytes(bytes: Vec<u8>) -> SchemaResult<Vec<u8>> {
+    if bytes.starts_with(UTF8_BOM) {
+        return Ok(bytes[UTF8_BOM.len()..].to_vec());
+    }
+    if bytes.starts_with(UTF16_LE_BOM) {
+        return Ok(decode_utf16(&bytes[UTF16_LE_BOM.len()..], Endian::Le)?.into_bytes());
+    }
+    if bytes.starts_with(UTF16_BE_BOM) {
+        return Ok(decode_utf16(&bytes[UTF16_BE_BOM.len()..], Endian::Be)?.into_bytes());
+    }
+    if let Some(endian) = sniff_utf16_no_bom(&bytes) {
+        return Ok(decode_utf16(&bytes, endian)?.into_bytes());
+    }
+    Ok(bytes)
+}
+
+/// Decode raw XML bytes into a UTF-8 `String`, sniffing common Unicode
+/// encodings per XML 1.0 §F.1. See [`decode_xml_to_utf8_bytes`].
+pub fn decode_xml_bytes(bytes: Vec<u8>) -> SchemaResult<String> {
+    let utf8 = decode_xml_to_utf8_bytes(bytes)?;
+    String::from_utf8(utf8)
+        .map_err(|e| SchemaError::resolution(format!("Invalid UTF-8 content: {}", e)))
+}
+
+fn sniff_utf16_no_bom(bytes: &[u8]) -> Option<Endian> {
+    // XML 1.0 §F.1: with no BOM, the first four bytes of '<?' in UTF-16 LE
+    // are `3C 00 ?? 00` and in UTF-16 BE are `00 3C 00 ??`. The non-null
+    // third/fourth byte distinguishes UTF-16 from UTF-32.
+    if bytes.len() < 4 {
+        return None;
+    }
+    match (bytes[0], bytes[1]) {
+        (0x3C, 0x00) if bytes[2] != 0x00 && bytes[3] == 0x00 => Some(Endian::Le),
+        (0x00, 0x3C) if bytes[2] == 0x00 && bytes[3] != 0x00 => Some(Endian::Be),
+        _ => None,
+    }
+}
+
+fn decode_utf16(bytes: &[u8], endian: Endian) -> SchemaResult<String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err(SchemaError::resolution(
+            "UTF-16 byte stream has an odd number of bytes".to_string(),
+        ));
+    }
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| match endian {
+            Endian::Le => u16::from_le_bytes([c[0], c[1]]),
+            Endian::Be => u16::from_be_bytes([c[0], c[1]]),
+        })
+        .collect();
+    String::from_utf16(&units)
+        .map_err(|e| SchemaError::resolution(format!("Invalid UTF-16 sequence: {}", e)))
+}
+
 // ============================================================================
 // SchemaLoader Trait and Implementations
 // ============================================================================
@@ -118,9 +194,10 @@ impl FileSystemLoader {
 impl SchemaLoader for FileSystemLoader {
     fn load(&self, location: &str) -> SchemaResult<String> {
         let path = Path::new(location);
-        std::fs::read_to_string(path).map_err(|e| {
+        let bytes = std::fs::read(path).map_err(|e| {
             SchemaError::resolution(format!("Failed to read file '{}': {}", location, e))
-        })
+        })?;
+        decode_xml_bytes(bytes)
     }
 
     fn can_load(&self, location: &str) -> bool {
