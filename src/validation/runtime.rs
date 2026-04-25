@@ -15,7 +15,7 @@ use crate::ids::{AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, Id
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
-use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents, WildcardNamespace, WildcardResult};
+use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::DerivationSet;
 use crate::schema::resolver::format_resolved_qname;
@@ -24,7 +24,7 @@ use crate::types::XmlTypeCode;
 use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
-use crate::types::complex::{ProcessContents as TypesProcessContents, other_matches_namespace};
+use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
@@ -3391,20 +3391,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // the spec-compliant rescue. The §3.4.4.2 clause-4 Note about
         // "attribute use always takes precedence" is non-normative and
         // addresses only non-prohibited matches.
-        // Cached so the rescued-prohibited path does not walk the base chain
-        // a second time when it falls through to the NotFound arm below.
-        let mut wildcard_cache: Option<(Option<WildcardResult>, Option<NameId>)> = None;
+        //
+        // The wildcard is the FULL effective attribute wildcard per
+        // §3.6.2.2 (own + groups intersection) chained with §3.4.2.5's
+        // extension-union over the base chain — `compute_runtime_attribute_wildcard`
+        // returns this canonical form. Cached so the rescued-prohibited
+        // path does not recompute when falling through to NotFound.
+        let mut wildcard_cache: Option<
+            Option<crate::schema::derivation::EffectiveAttributeWildcard>,
+        > = None;
         let found = match found {
             AttributeLookup::Prohibited => {
-                let (wc, wc_tns) = {
-                    let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-                    self.find_effective_wildcard(ct_data)
-                };
+                let wc = crate::schema::derivation::compute_runtime_attribute_wildcard(
+                    self.schema_set, ct_key,
+                );
                 let rescued = match wc.as_ref() {
-                    Some(w) => self.wildcard_allows_attribute(w, namespace, local_name, wc_tns),
+                    Some(w) => crate::schema::derivation::effective_wildcard_allows_attribute(
+                        self.schema_set, w, namespace, local_name,
+                    ),
                     None => false,
                 };
-                wildcard_cache = Some((wc, wc_tns));
+                wildcard_cache = Some(wc);
                 if rescued {
                     AttributeLookup::NotFound
                 } else {
@@ -3507,13 +3514,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 SchemaInfo::invalid()
             }
             AttributeLookup::NotFound => {
-                let (effective_wildcard, effective_wc_tns) = wildcard_cache.unwrap_or_else(|| {
-                    let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-                    self.find_effective_wildcard(ct_data)
+                let effective_wildcard = wildcard_cache.unwrap_or_else(|| {
+                    crate::schema::derivation::compute_runtime_attribute_wildcard(
+                        self.schema_set, ct_key,
+                    )
                 });
                 if let Some(ref wildcard) = effective_wildcard {
-                    let target_ns = effective_wc_tns;
-                    if self.wildcard_allows_attribute(wildcard, namespace, local_name, target_ns) {
+                    if crate::schema::derivation::effective_wildcard_allows_attribute(
+                        self.schema_set, wildcard, namespace, local_name,
+                    ) {
                         let result = match wildcard.process_contents {
                             ProcessContents::Skip => SchemaInfo::empty(),
                             ProcessContents::Strict => {
@@ -4138,71 +4147,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Check whether a wildcard allows a given namespace.
-    fn wildcard_allows_namespace(
-        &self,
-        wildcard: &WildcardResult,
-        namespace: Option<NameId>,
-        target_namespace: Option<NameId>,
-    ) -> bool {
-        // Positive namespace check
-        let ns_ok = match &wildcard.namespace {
-            WildcardNamespace::Any => true,
-            WildcardNamespace::Other => {
-                other_matches_namespace(namespace, target_namespace, self.schema_set.xsd_version)
-            }
-            WildcardNamespace::TargetNamespace => namespace == target_namespace,
-            WildcardNamespace::Local => namespace.is_none(),
-            WildcardNamespace::List(ns_list) => {
-                ns_list.iter().any(|t| t.resolve(target_namespace) == namespace)
-            }
-        };
-        if !ns_ok {
-            return false;
-        }
-        // Check notNamespace exclusions
-        for token in &wildcard.not_namespace {
-            let excluded_ns = token.resolve(target_namespace);
-            if namespace == excluded_ns {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// Check whether a wildcard allows a given attribute (namespace + notQName).
-    fn wildcard_allows_attribute(
-        &self,
-        wildcard: &WildcardResult,
-        namespace: Option<NameId>,
-        name: NameId,
-        target_namespace: Option<NameId>,
-    ) -> bool {
-        if !self.wildcard_allows_namespace(wildcard, namespace, target_namespace) {
-            return false;
-        }
-        // Check notQName exclusions
-        for item in &wildcard.not_qname {
-            match item {
-                crate::parser::frames::NotQNameItem::QName { namespace: qns, local_name } => {
-                    if *qns == namespace && *local_name == name {
-                        return false;
-                    }
-                }
-                crate::parser::frames::NotQNameItem::Defined => {
-                    // Reject if this attribute is globally declared
-                    if self.schema_set.lookup_attribute(namespace, name).is_some() {
-                        return false;
-                    }
-                }
-                crate::parser::frames::NotQNameItem::DefinedSibling => {
-                    // Should never appear on attribute wildcards (rejected at parse time)
-                }
-            }
-        }
-        true
-    }
-
     /// Collect all attribute uses from resolved attribute groups (recursively).
     fn collect_group_attributes(
         &self,
@@ -4312,122 +4256,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         (well_known::EMPTY, None)
     }
 
-    /// Find the effective attribute wildcard for a complex type, returning the
-    /// wildcard and the target namespace context needed to resolve `##other` /
-    /// `##targetNamespace` tokens stored inside it.
-    ///
-    /// For extension derivation (§3.4.2.5) the effective wildcard is the union
-    /// of the type's own wildcard with the base type's effective wildcard
-    /// (§3.10.6.3 cos-aw-union). After union the result is in canonical form
-    /// (resolved namespace lists), so the returned tns is `None`.
-    /// For restriction and non-derived types the wildcard may still carry
-    /// symbolic tokens; the returned tns is the origin namespace context.
-    fn find_effective_wildcard(
-        &self,
-        ct_data: &ComplexTypeDefData,
-    ) -> (Option<WildcardResult>, Option<NameId>) {
-        self.find_effective_wildcard_bounded(ct_data, 0)
-    }
-
-    /// Belt-and-braces depth cap mirroring `compute_effective_open_content`
-    /// in `src/schema/derivation.rs`. Reference resolution rejects cyclic
-    /// base chains upstream; this guard is defensive.
-    fn find_effective_wildcard_bounded(
-        &self,
-        ct_data: &ComplexTypeDefData,
-        depth: u32,
-    ) -> (Option<WildcardResult>, Option<NameId>) {
-        if depth > 100 {
-            return (None, None);
-        }
-        use crate::parser::frames::DerivationMethod;
-
-        let (own_wc, own_tns) = self.find_own_wildcard(ct_data);
-
-        if ct_data.derivation_method == Some(DerivationMethod::Extension) {
-            // §3.4.2.5: effective attribute wildcard = union of own + base's.
-            if let Some(TypeKey::Complex(base_key)) = ct_data.resolved_base_type {
-                if base_key != self.schema_set.any_type_key() {
-                    let base_data = &self.schema_set.arenas.complex_types[base_key];
-                    let (base_wc, base_wc_tns) =
-                        self.find_effective_wildcard_bounded(base_data, depth + 1);
-                    return match (own_wc, base_wc) {
-                        (Some(a), Some(b)) => {
-                            // Use each wildcard's origin tns (not the type's tns) so that
-                            // ##other in an imported attribute group resolves correctly.
-                            let unioned = crate::schema::derivation::wildcard_result_union(
-                                &a, own_tns, &b, base_wc_tns,
-                            );
-                            (Some(unioned), None) // canonical result needs no tns
-                        }
-                        (Some(a), None) => (Some(a), own_tns),
-                        (None, Some(b)) => (Some(b), base_wc_tns),
-                        (None, None) => (None, None),
-                    };
-                }
-            }
-            return (own_wc, own_tns); // extension of anyType — no base wildcard
-        }
-
-        // Restriction / no derivation: use own wildcard, or walk base chain.
-        if own_wc.is_some() {
-            return (own_wc, own_tns);
-        }
-        if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
-            if base_ct_key != self.schema_set.any_type_key() {
-                let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
-                return self.find_effective_wildcard_bounded(base_data, depth + 1);
-            }
-        }
-        (None, None)
-    }
-
-    /// Return the wildcard declared directly on this type — its own
-    /// `anyAttribute` or any `anyAttribute` from its attribute groups —
-    /// together with the target namespace context for resolving symbolic tokens.
-    fn find_own_wildcard(
-        &self,
-        ct_data: &ComplexTypeDefData,
-    ) -> (Option<WildcardResult>, Option<NameId>) {
-        if ct_data.attribute_wildcard.is_some() {
-            return (ct_data.attribute_wildcard.clone(), ct_data.target_namespace);
-        }
-        // xs:anyType stores the wildcard inside ComplexContentDefResult.
-        if let crate::parser::frames::ComplexContentResult::Complex(ref def) = ct_data.content {
-            if def.attribute_wildcard.is_some() {
-                return (def.attribute_wildcard.clone(), ct_data.target_namespace);
-            }
-        }
-        let mut visited = HashSet::new();
-        self.find_group_wildcard_recursive(&ct_data.resolved_attribute_groups, &mut visited)
-    }
-
-    /// Search attribute groups for a wildcard, returning it with its origin
-    /// group's target namespace (needed for resolving `##other` tokens).
-    fn find_group_wildcard_recursive(
-        &self,
-        group_keys: &[AttributeGroupKey],
-        visited: &mut HashSet<AttributeGroupKey>,
-    ) -> (Option<WildcardResult>, Option<NameId>) {
-        for &gk in group_keys {
-            if !visited.insert(gk) {
-                continue;
-            }
-            if let Some(group_data) = self.schema_set.arenas.get_attribute_group(gk) {
-                if let Some(ref wc) = group_data.attribute_wildcard {
-                    return (Some(wc.clone()), group_data.target_namespace);
-                }
-                let result = self.find_group_wildcard_recursive(
-                    &group_data.resolved_attribute_groups,
-                    visited,
-                );
-                if result.0.is_some() {
-                    return result;
-                }
-            }
-        }
-        (None, None)
-    }
+    // Effective-attribute-wildcard helpers superseded by
+    // `crate::schema::derivation::compute_runtime_attribute_wildcard`,
+    // which implements full §3.6.2.2 (own + groups intersection) plus
+    // §3.4.2.5 (extension union over the base chain) in canonical form.
 
     /// Find an attribute declaration in a complex type's attribute list
     fn find_attribute_in_type(

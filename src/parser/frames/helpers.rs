@@ -318,7 +318,14 @@ pub(crate) fn parse_not_namespace(
         .collect()
 }
 
-/// Parse notQName attribute (XSD 1.1)
+/// Parse notQName attribute (XSD 1.1).
+///
+/// Validates the QName lexical form per Datatypes §3.3.18 and rejects
+/// undeclared prefixes per §3.10.6.1 rule 1 (a wildcard's properties must
+/// match the property tableau, including QName lexical validity). The
+/// per-name namespace-allowed check from §3.10.6.1 rule 4 is applied after
+/// assembly when the wildcard's resolved namespace constraint is available
+/// (see `validate_wildcard_disallowed_names`).
 #[cfg(feature = "xsd11")]
 pub(crate) fn parse_not_qname(
     value: Option<&str>,
@@ -335,8 +342,9 @@ pub(crate) fn parse_not_qname(
             "##defined" => items.push(NotQNameItem::Defined),
             "##definedSibling" => {
                 if !is_element_wildcard {
+                    // §3.10.6.1 rule 5: attribute wildcards must not use sibling.
                     return Err(SchemaError::structural(
-                        "src-wildcard",
+                        "w-props-correct",
                         "##definedSibling is not allowed on xs:anyAttribute".to_string(),
                         None,
                     ));
@@ -344,20 +352,67 @@ pub(crate) fn parse_not_qname(
                 items.push(NotQNameItem::DefinedSibling);
             }
             _ => {
-                // Parse as QName
-                let (local, prefix) = if let Some(pos) = s.find(':') {
-                    (&s[pos + 1..], Some(&s[..pos]))
-                } else {
-                    (s, None)
+                // Validate QName lexical form: split on the FIRST colon and
+                // require that both parts are non-empty NCNames with no
+                // additional colons. This rejects ":name", "name:", and
+                // "a:b:c" forms (covers wild038 / wild039).
+                let (prefix, local) = match s.split_once(':') {
+                    Some((p, l)) => (Some(p), l),
+                    None => (None, s),
                 };
-                let local_name = name_table.add(local);
+                if local.is_empty() || local.contains(':') {
+                    return Err(SchemaError::structural(
+                        "w-props-correct",
+                        format!("Invalid QName '{}' in notQName", s),
+                        None,
+                    ));
+                }
+                if let Some(p) = prefix {
+                    if p.is_empty() {
+                        return Err(SchemaError::structural(
+                            "w-props-correct",
+                            format!("Invalid QName '{}' in notQName", s),
+                            None,
+                        ));
+                    }
+                }
+
                 let namespace = if let Some(p) = prefix {
-                    let prefix_id = name_table.add(p);
-                    ns_snapshot.resolve_prefix(prefix_id)
+                    // Reject undeclared prefixes (covers wild036 / wild037).
+                    let prefix_id = match name_table.get(p) {
+                        Some(id) => id,
+                        None => {
+                            return Err(SchemaError::structural(
+                                "w-props-correct",
+                                format!(
+                                    "Undeclared prefix '{}' in notQName entry '{}'",
+                                    p, s
+                                ),
+                                None,
+                            ));
+                        }
+                    };
+                    match ns_snapshot.resolve_prefix(prefix_id) {
+                        Some(ns) => Some(ns),
+                        None => {
+                            return Err(SchemaError::structural(
+                                "w-props-correct",
+                                format!(
+                                    "Undeclared prefix '{}' in notQName entry '{}'",
+                                    p, s
+                                ),
+                                None,
+                            ));
+                        }
+                    }
                 } else {
-                    // Unprefixed: use default namespace if declared
+                    // Unprefixed: per the QName datatype, unprefixed names
+                    // resolve to the default namespace (if one is declared)
+                    // or otherwise to the absent namespace.
                     ns_snapshot.default_namespace()
                 };
+
+                let local_name = name_table.add(local);
                 items.push(NotQNameItem::QName { namespace, local_name });
             }
         }

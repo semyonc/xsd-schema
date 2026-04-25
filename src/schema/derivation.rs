@@ -3233,6 +3233,7 @@ fn element_wildcard_to_result(ew: &crate::schema::wildcard::ElementWildcard) -> 
 
 /// Canonical namespace form: finite allowed set, or finite excluded set
 /// (complement in the "namespace universe").
+#[cfg(feature = "xsd11")]
 #[derive(Debug, Clone)]
 enum NsForm {
     Pos(Vec<Option<NameId>>),
@@ -3242,6 +3243,7 @@ enum NsForm {
 /// Normalise a wildcard's `{namespace constraint}` into canonical form,
 /// resolving `##targetNamespace`/`##local` tokens and merging `notNamespace`
 /// into the excluded set.
+#[cfg(feature = "xsd11")]
 fn wildcard_to_ns_form(
     ns: &WildcardNamespace,
     not_namespace: &[crate::parser::frames::NamespaceToken],
@@ -3292,6 +3294,7 @@ fn wildcard_to_ns_form(
 /// pair suitable for a `WildcardResult`. Any excluded-set result that's empty
 /// collapses to `##any`; a non-empty excluded set becomes `##any` with
 /// `notNamespace` tokens.
+#[cfg(feature = "xsd11")]
 fn ns_form_to_wildcard(
     form: NsForm,
 ) -> (WildcardNamespace, Vec<crate::parser::frames::NamespaceToken>) {
@@ -3312,6 +3315,7 @@ fn ns_form_to_wildcard(
 /// Convert a resolved namespace (`Some(id)` = URI, `None` = absent/local) into
 /// a parser-form `NamespaceToken`. Used by the open-content derivation helpers
 /// to reconstruct parser-form wildcards from canonicalised lists.
+#[cfg(feature = "xsd11")]
 fn ns_token(ns: Option<NameId>) -> crate::parser::frames::NamespaceToken {
     match ns {
         Some(id) => crate::parser::frames::NamespaceToken::Uri(id),
@@ -3326,6 +3330,7 @@ fn ns_token(ns: Option<NameId>) -> crate::parser::frames::NamespaceToken {
 ///
 /// Tokens in the produced `WildcardResult` are already resolved against the
 /// input target namespaces, so the caller does not need to supply one.
+#[cfg(feature = "xsd11")]
 pub(crate) fn wildcard_result_union(
     a: &WildcardResult,
     a_tns: Option<NameId>,
@@ -3975,7 +3980,7 @@ fn collect_effective_attribute_uses(
 /// resolved via XSD-version-aware rules (XSD 1.0 excludes absent namespace,
 /// XSD 1.1 does not).
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CanonicalNs {
+pub(crate) enum CanonicalNs {
     /// Every namespace is allowed.
     Any,
     /// Positive set of allowed namespaces. `None` represents the absent
@@ -3992,10 +3997,10 @@ enum CanonicalNs {
 /// Target-namespace-free: `namespace` has already been resolved against
 /// each contributor's own target namespace during normalization.
 #[derive(Debug, Clone)]
-struct EffectiveAttributeWildcard {
-    namespace: CanonicalNs,
-    not_qname: Vec<crate::parser::frames::NotQNameItem>,
-    process_contents: ProcessContents,
+pub(crate) struct EffectiveAttributeWildcard {
+    pub(crate) namespace: CanonicalNs,
+    pub(crate) not_qname: Vec<crate::parser::frames::NotQNameItem>,
+    pub(crate) process_contents: ProcessContents,
 }
 
 /// Normalize a single `WildcardResult` into canonical form, resolving
@@ -4110,6 +4115,49 @@ fn intersect_canonical_ns(a: &CanonicalNs, b: &CanonicalNs) -> CanonicalNs {
     }
 }
 
+/// §3.10.6.3 cos-aw-union on the canonical namespace lattice.
+/// Mirror of `intersect_canonical_ns` for the union side.
+fn union_canonical_ns(a: &CanonicalNs, b: &CanonicalNs) -> CanonicalNs {
+    use std::collections::HashSet;
+    match (a, b) {
+        // Any ∪ X = Any
+        (CanonicalNs::Any, _) | (_, CanonicalNs::Any) => CanonicalNs::Any,
+
+        // Enum(s1) ∪ Enum(s2) = set union
+        (CanonicalNs::Enum(s1), CanonicalNs::Enum(s2)) => {
+            let mut union = s1.clone();
+            union.extend(s2.iter().copied());
+            CanonicalNs::Enum(union)
+        }
+
+        // Enum(s) ∪ Not(n) = Not(n \ s) — every namespace b allows
+        // (= everything except n) plus everything in s. The result is
+        // "not (n minus s)": elements of n already in s no longer need
+        // to be excluded.
+        (CanonicalNs::Enum(s), CanonicalNs::Not(n))
+        | (CanonicalNs::Not(n), CanonicalNs::Enum(s)) => {
+            let filtered: HashSet<Option<NameId>> =
+                n.iter().filter(|ns| !s.contains(ns)).copied().collect();
+            if filtered.is_empty() {
+                CanonicalNs::Any
+            } else {
+                CanonicalNs::Not(filtered)
+            }
+        }
+
+        // Not(n1) ∪ Not(n2) = Not(n1 ∩ n2). A namespace is excluded by
+        // the union only if it's excluded by both sides.
+        (CanonicalNs::Not(n1), CanonicalNs::Not(n2)) => {
+            let inter: HashSet<Option<NameId>> = n1.intersection(n2).copied().collect();
+            if inter.is_empty() {
+                CanonicalNs::Any
+            } else {
+                CanonicalNs::Not(inter)
+            }
+        }
+    }
+}
+
 /// Canonical namespace subset: `a ⊆ b`. Tests whether every namespace
 /// allowed by `a` is also allowed by `b`.
 fn canonical_ns_subset(a: &CanonicalNs, b: &CanonicalNs) -> bool {
@@ -4219,7 +4267,7 @@ fn combine_effective_wildcards(
 ///
 /// Returns `Err` if the attribute-group reference tree exceeds the depth
 /// guard (cycle protection, matching `collect_attribute_group_uses`).
-fn effective_attribute_wildcard(
+pub(crate) fn effective_attribute_wildcard(
     schema_set: &SchemaSet,
     local_wc: Option<&WildcardResult>,
     local_target_ns: Option<NameId>,
@@ -4233,6 +4281,172 @@ fn effective_attribute_wildcard(
     }
 
     Ok(combine_effective_wildcards(local, w))
+}
+
+/// Runtime entry point for attribute wildcard matching.
+///
+/// Returns the type's full effective `{attribute wildcard}` per §3.6.2.2
+/// (intersection of own + attribute groups) chained with §3.4.2.5's
+/// extension union over the base chain. Restriction picks the derived's
+/// own (§3.6.2.2 result), falling back to the base only when the derived
+/// has no own wildcard at all — matching the prior `find_effective_wildcard`
+/// runtime convention.
+///
+/// The return value is target-namespace-free: all `##targetNamespace` /
+/// `##other` / list tokens have been resolved against each contributor's
+/// origin target namespace, so the runtime can match attributes against
+/// `EffectiveAttributeWildcard.namespace` directly.
+pub(crate) fn compute_runtime_attribute_wildcard(
+    schema_set: &SchemaSet,
+    ct_key: ComplexTypeKey,
+) -> Option<EffectiveAttributeWildcard> {
+    compute_runtime_attribute_wildcard_bounded(schema_set, ct_key, 0)
+}
+
+fn compute_runtime_attribute_wildcard_bounded(
+    schema_set: &SchemaSet,
+    ct_key: ComplexTypeKey,
+    depth: u32,
+) -> Option<EffectiveAttributeWildcard> {
+    if depth > 100 {
+        return None;
+    }
+    let ct = schema_set.arenas.complex_types.get(ct_key)?;
+
+    // Own §3.6.2.2 result: own xs:anyAttribute combined with all referenced
+    // attribute groups via the existing canonical helpers. Errors here
+    // (cycle overflow) collapse to "no wildcard" — this is the runtime
+    // path; cycles are rejected upstream.
+    let own_local = own_attribute_wildcard_ref(ct);
+    let own = effective_attribute_wildcard(
+        schema_set,
+        own_local,
+        ct.target_namespace,
+        &ct.resolved_attribute_groups,
+    )
+    .ok()
+    .flatten();
+
+    let Some(TypeKey::Complex(base_key)) = ct.resolved_base_type else {
+        return own;
+    };
+    if base_key == schema_set.any_type_key() {
+        return own;
+    }
+
+    match ct.derivation_method {
+        Some(DerivationMethod::Extension) => {
+            let base = compute_runtime_attribute_wildcard_bounded(schema_set, base_key, depth + 1);
+            match (own, base) {
+                (Some(a), Some(b)) => Some(union_effective_attribute_wildcards(&a, &b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            }
+        }
+        // Restriction or no derivation: derived's own wildcard is
+        // authoritative. If the derived has no wildcard at all, fall
+        // back to the base for inheritance-style behaviour matching
+        // the prior runtime semantics.
+        _ => own.or_else(|| {
+            compute_runtime_attribute_wildcard_bounded(schema_set, base_key, depth + 1)
+        }),
+    }
+}
+
+/// Pull the type's "own" attribute wildcard out of either the top-level
+/// field or the SimpleContent / ComplexContent derivation arm where the
+/// `<xs:anyAttribute>` legitimately lives.
+fn own_attribute_wildcard_ref(
+    ct: &crate::arenas::ComplexTypeDefData,
+) -> Option<&WildcardResult> {
+    if let Some(wc) = ct.attribute_wildcard.as_ref() {
+        return Some(wc);
+    }
+    match &ct.content {
+        ComplexContentResult::Empty => None,
+        ComplexContentResult::Simple(sc) => sc.attribute_wildcard.as_ref(),
+        ComplexContentResult::Complex(cc) => cc.attribute_wildcard.as_ref(),
+    }
+}
+
+/// §3.4.2.5 extension union of two effective attribute wildcards.
+///
+/// - `namespace`: `union_canonical_ns` (set-theoretic union)
+/// - `not_qname`: per §3.10.6.3 cos-aw-union, the union must not admit any
+///   name that neither input wildcard admits. A literal QName excluded by
+///   one wildcard stays excluded in the union iff the other wildcard
+///   doesn't admit it either (whether by namespace or by its own
+///   disallowed_names). `##defined` / `##definedSibling` keep the simple
+///   intersection rule — each is in the result iff both inputs have it.
+/// - `process_contents`: less restrictive of the two (Skip > Lax > Strict).
+fn union_effective_attribute_wildcards(
+    a: &EffectiveAttributeWildcard,
+    b: &EffectiveAttributeWildcard,
+) -> EffectiveAttributeWildcard {
+    use crate::parser::frames::NotQNameItem;
+
+    let namespace = union_canonical_ns(&a.namespace, &b.namespace);
+
+    // Combine disallowed names. For each QName excluded by one side, keep
+    // it excluded iff the other side also excludes it (by namespace or by
+    // literal QName). For `##defined` / `##definedSibling`, the simple
+    // intersection rule applies.
+    let mut not_qname: Vec<NotQNameItem> = Vec::new();
+
+    let mut consider = |item: &NotQNameItem, other: &EffectiveAttributeWildcard| {
+        match item {
+            NotQNameItem::QName { namespace, local_name } => {
+                let admitted_by_other_ns = match &other.namespace {
+                    CanonicalNs::Any => true,
+                    CanonicalNs::Enum(set) => set.contains(namespace),
+                    CanonicalNs::Not(set) => !set.contains(namespace),
+                };
+                let excluded_by_other_qname = other.not_qname.iter().any(|o| match o {
+                    NotQNameItem::QName { namespace: ons, local_name: oln } => {
+                        ons == namespace && oln == local_name
+                    }
+                    NotQNameItem::Defined | NotQNameItem::DefinedSibling => false,
+                });
+                if (!admitted_by_other_ns || excluded_by_other_qname)
+                    && !not_qname.contains(item)
+                {
+                    not_qname.push(item.clone());
+                }
+            }
+            NotQNameItem::Defined | NotQNameItem::DefinedSibling => {
+                if other
+                    .not_qname
+                    .iter()
+                    .any(|o| std::mem::discriminant(o) == std::mem::discriminant(item))
+                    && !not_qname.contains(item)
+                {
+                    not_qname.push(item.clone());
+                }
+            }
+        }
+    };
+
+    for item in &a.not_qname {
+        consider(item, b);
+    }
+    for item in &b.not_qname {
+        consider(item, a);
+    }
+
+    let process_contents = if process_contents_strictness(a.process_contents)
+        <= process_contents_strictness(b.process_contents)
+    {
+        a.process_contents
+    } else {
+        b.process_contents
+    };
+
+    EffectiveAttributeWildcard {
+        namespace,
+        not_qname,
+        process_contents,
+    }
 }
 
 /// Recursive walker for `effective_attribute_wildcard`: follows
@@ -4390,7 +4604,7 @@ fn effective_attribute_wildcard_restricts(
 /// semantics documented at derivation.rs:3078-3090 — `##defined` only
 /// excludes attributes that are actually globally declared, not an
 /// unconditional block.
-fn effective_wildcard_allows_attribute(
+pub(crate) fn effective_wildcard_allows_attribute(
     schema_set: &SchemaSet,
     wc: &EffectiveAttributeWildcard,
     attr_namespace: Option<NameId>,
@@ -5327,6 +5541,149 @@ pub fn validate_complex_type_attribute_uniqueness(
             }
         }
     }
+    Ok(())
+}
+
+/// XSD 1.1 §3.10.6.1 rule 4 (Wildcard Properties Correct): for every QName
+/// member in a wildcard's `{disallowed names}`, that QName's namespace name
+/// must be admitted by the wildcard's `{namespace constraint}` (the
+/// combination of `namespace` and `notNamespace`).
+///
+/// In other words: the schema cannot list a notQName entry whose namespace
+/// the wildcard already excludes — such an entry would be redundant and
+/// the spec rules it out as a structural error. Covers W3C saxonData
+/// `wild031`..`wild035` (and is the post-parse step that backs the
+/// per-entry checks `parse_not_qname` performs at parse time).
+///
+/// The check needs the resolved target namespace of the wildcard's owner
+/// to interpret `##targetNamespace`/`##other`/`##local`, which is only
+/// available after assembly — hence this is a separate pipeline pass
+/// rather than something `parse_not_qname` can do on its own.
+#[cfg(feature = "xsd11")]
+pub fn validate_wildcard_disallowed_names(schema_set: &SchemaSet) -> SchemaResult<()> {
+    if !schema_set.is_xsd11() {
+        return Ok(());
+    }
+
+    fn check_wildcard(
+        schema_set: &SchemaSet,
+        wc: &WildcardResult,
+        target_ns: Option<NameId>,
+    ) -> SchemaResult<()> {
+        use crate::parser::frames::NotQNameItem;
+
+        for item in &wc.not_qname {
+            let NotQNameItem::QName { namespace: q_ns, local_name } = item else {
+                continue;
+            };
+            // The QName must satisfy the wildcard's namespace constraint
+            // (cvc-wildcard-namespace §3.10.4.3): it must be admitted by
+            // the positive constraint AND not be excluded by notNamespace.
+            let admitted_by_constraint = wildcard_namespace_matches(
+                &wc.namespace, *q_ns, target_ns,
+            );
+            let excluded_by_not_namespace = wc
+                .not_namespace
+                .iter()
+                .any(|t| t.resolve(target_ns) == *q_ns);
+            if !admitted_by_constraint || excluded_by_not_namespace {
+                let location = schema_set.locate(wc.source.as_ref());
+                let qname_text = match q_ns {
+                    Some(ns) => format!(
+                        "{{{}}}:{}",
+                        schema_set.name_table.resolve_ref(*ns),
+                        schema_set.name_table.resolve_ref(*local_name),
+                    ),
+                    None => schema_set
+                        .name_table
+                        .resolve_ref(*local_name)
+                        .to_string(),
+                };
+                return Err(SchemaError::structural(
+                    "w-props-correct",
+                    format!(
+                        "notQName entry '{}' is not admitted by the wildcard's \
+                         namespace constraint (§3.10.6.1 rule 4)",
+                        qname_text
+                    ),
+                    location,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_particle(
+        schema_set: &SchemaSet,
+        particle: &ParticleResult,
+        target_ns: Option<NameId>,
+        depth: usize,
+    ) -> SchemaResult<()> {
+        if depth > 100 {
+            return Ok(());
+        }
+        match &particle.term {
+            ParticleTerm::Any(wc) => check_wildcard(schema_set, wc, target_ns)?,
+            ParticleTerm::Group(group) => {
+                for child in &group.particles {
+                    check_particle(schema_set, child, target_ns, depth + 1)?;
+                }
+            }
+            ParticleTerm::Element(_) => {}
+        }
+        Ok(())
+    }
+
+    // Complex types: own attribute_wildcard + content particles + any
+    // attribute_wildcard hiding inside the SimpleContent / ComplexContent
+    // derivation defs.
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        let target_ns = ct.target_namespace;
+        if let Some(wc) = ct.attribute_wildcard.as_ref() {
+            check_wildcard(schema_set, wc, target_ns)?;
+        }
+        match &ct.content {
+            ComplexContentResult::Empty => {}
+            ComplexContentResult::Simple(sc) => {
+                if let Some(wc) = sc.attribute_wildcard.as_ref() {
+                    check_wildcard(schema_set, wc, target_ns)?;
+                }
+            }
+            ComplexContentResult::Complex(cc) => {
+                if let Some(wc) = cc.attribute_wildcard.as_ref() {
+                    check_wildcard(schema_set, wc, target_ns)?;
+                }
+                if let Some(p) = cc.particle.as_ref() {
+                    check_particle(schema_set, p, target_ns, 0)?;
+                }
+                if let Some(oc) = cc.open_content.as_ref() {
+                    if let Some(wc) = oc.wildcard.as_ref() {
+                        check_wildcard(schema_set, wc, target_ns)?;
+                    }
+                }
+            }
+        }
+        if let Some(oc) = ct.open_content.as_ref() {
+            if let Some(wc) = oc.wildcard.as_ref() {
+                check_wildcard(schema_set, wc, target_ns)?;
+            }
+        }
+    }
+
+    // Attribute groups: own attribute_wildcard.
+    for (_key, ag) in schema_set.arenas.attribute_groups.iter() {
+        if let Some(wc) = ag.attribute_wildcard.as_ref() {
+            check_wildcard(schema_set, wc, ag.target_namespace)?;
+        }
+    }
+
+    // Model-group definitions: walk content particles for element wildcards.
+    for (_key, mg) in schema_set.arenas.model_groups.iter() {
+        for child in &mg.particles {
+            check_particle(schema_set, child, mg.target_namespace, 0)?;
+        }
+    }
+
     Ok(())
 }
 
