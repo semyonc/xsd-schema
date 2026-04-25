@@ -187,6 +187,150 @@ pub fn rewrite_xsd10_category_escapes(pattern: &str) -> String {
     result
 }
 
+/// Validate XSD 1.0 regex character-class hyphen rules — stricter than the backend
+/// parsers and stricter than XSD 1.1.
+///
+/// Per XSD 1.0 Datatypes §F (regex grammar productions [14]–[22]) under longest-match
+/// disambiguation, an unescaped `-` inside a character class must be (a) the first
+/// atom (immediately after `[` or `[^`), (b) the last atom (immediately before `]`),
+/// (c) the middle character of an `seRange` (e.g. `a-z`), or (d) the subtraction
+/// operator separating a `posCharGroup` from a nested `charClassExpr` (`...-[...]`).
+/// Any other position — e.g. `[a-c-1]`, `[^a-d-b-c]`, `[a-z-+]`, `[--z]` — is
+/// ambiguous and a syntax error in XSD 1.0. XSD 1.1 (Datatypes 1.1 §G) relaxed
+/// these rules, allowing literal hyphens elsewhere via `XmlCharIncDash`, so this
+/// validator must only be invoked for XSD 1.0.
+pub fn validate_xml_pattern_syntax(pattern: &str) -> Result<(), String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut index = 0;
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => index = skip_escape(&chars, index + 1),
+            '[' => index = validate_char_class(&chars, index + 1)?,
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct ClassAtom {
+    available_for_range: bool,
+    unescaped_hyphen: bool,
+}
+
+fn validate_char_class(chars: &[char], mut index: usize) -> Result<usize, String> {
+    let mut prev_atom: Option<ClassAtom> = None;
+    let mut at_group_start = true;
+    let mut allow_nested_class = false;
+
+    if chars.get(index) == Some(&'^') {
+        index += 1;
+    }
+
+    while index < chars.len() {
+        match chars[index] {
+            '\\' => {
+                let (is_single_char, next_index) = consume_class_escape(chars, index + 1);
+                prev_atom = Some(ClassAtom { available_for_range: is_single_char, unescaped_hyphen: false });
+                at_group_start = false;
+                allow_nested_class = false;
+                index = next_index;
+            }
+            '[' => {
+                if !allow_nested_class {
+                    return Err("unescaped '[' in character class".to_string());
+                }
+                index = validate_char_class(chars, index + 1)?;
+                prev_atom = Some(ClassAtom { available_for_range: false, unescaped_hyphen: false });
+                at_group_start = false;
+                allow_nested_class = false;
+            }
+            ']' => return Ok(index + 1),
+            '-' => {
+                let next = chars.get(index + 1).copied();
+                let next_after = chars.get(index + 2).copied();
+
+                if next == Some('[') {
+                    allow_nested_class = true;
+                    prev_atom = None;
+                    at_group_start = false;
+                    index += 1;
+                    continue;
+                }
+
+                if at_group_start || next == Some(']') || (next == Some('-') && next_after == Some('[')) {
+                    prev_atom = Some(ClassAtom { available_for_range: true, unescaped_hyphen: true });
+                    at_group_start = false;
+                    allow_nested_class = false;
+                    index += 1;
+                    continue;
+                }
+
+                let Some(prev) = prev_atom else {
+                    return Err("hyphen is not a valid character range operator".to_string());
+                };
+                if !prev.available_for_range || prev.unescaped_hyphen {
+                    return Err("hyphen is not a valid character range operator".to_string());
+                }
+
+                let Some((range_end, next_index)) = peek_single_class_atom(chars, index + 1) else {
+                    return Err("hyphen is not followed by a valid range endpoint".to_string());
+                };
+                if range_end.unescaped_hyphen {
+                    return Err("unescaped hyphen cannot be a character range endpoint".to_string());
+                }
+
+                prev_atom = Some(ClassAtom { available_for_range: false, unescaped_hyphen: false });
+                at_group_start = false;
+                allow_nested_class = false;
+                index = next_index;
+            }
+            _ => {
+                prev_atom = Some(ClassAtom { available_for_range: true, unescaped_hyphen: false });
+                at_group_start = false;
+                allow_nested_class = false;
+                index += 1;
+            }
+        }
+    }
+
+    Err("unterminated character class".to_string())
+}
+
+fn skip_escape(chars: &[char], index: usize) -> usize {
+    if matches!(chars.get(index), Some('p' | 'P')) && chars.get(index + 1) == Some(&'{') {
+        let mut cursor = index + 2;
+        while cursor < chars.len() {
+            if chars[cursor] == '}' {
+                return cursor + 1;
+            }
+            cursor += 1;
+        }
+        return cursor;
+    }
+    index.saturating_add(1).min(chars.len())
+}
+
+fn consume_class_escape(chars: &[char], index: usize) -> (bool, usize) {
+    let is_single_char = matches!(
+        chars.get(index),
+        Some('n' | 'r' | 't' | '\\' | '|' | '.' | '?' | '*' | '+' | '(' | ')' | '{' | '}' | '-' | '[' | ']' | '^')
+    );
+    (is_single_char, skip_escape(chars, index))
+}
+
+fn peek_single_class_atom(chars: &[char], index: usize) -> Option<(ClassAtom, usize)> {
+    match chars.get(index).copied()? {
+        '\\' => {
+            let (is_single_char, next_index) = consume_class_escape(chars, index + 1);
+            is_single_char.then_some((ClassAtom { available_for_range: false, unescaped_hyphen: false }, next_index))
+        }
+        '[' | ']' => None,
+        '-' => Some((ClassAtom { available_for_range: false, unescaped_hyphen: true }, index + 1)),
+        _ => Some((ClassAtom { available_for_range: false, unescaped_hyphen: false }, index + 1)),
+    }
+}
+
 /// Shared lowering for `\p{X}` / `\P{X}` under XSD 1.0 Unicode-3.0 pinning.
 ///
 /// Returns `true` if `name` is a recognized general-category code and the
@@ -431,5 +575,40 @@ mod tests {
         let result = rewrite_xsd10_category_escapes(r"\P{N}+");
         assert!(result.starts_with("[^"));
         assert!(result.ends_with("]+"));
+    }
+
+    #[test]
+    fn test_validate_xsd10_character_class_hyphen_rules() {
+        for valid in [
+            r"[a-d]",
+            r"[-a]+",
+            r"[-]",
+            r"[a-]",
+            r"[a-\}-]+",
+            r"[a-z--[b-z]]",
+            r"[a-b-[0-9]]+",
+        ] {
+            assert!(
+                validate_xml_pattern_syntax(valid).is_ok(),
+                "expected valid XSD 1.0 regex: {valid}",
+            );
+        }
+
+        // Invalid forms drawn from W3C msData reF20-23, reG26-33, reH19-21 and
+        // saxonData/Simple/simple045 — each is listed as XSD-1.0-invalid in the
+        // suite manifest, regardless of whether XSD 1.1 accepts the same form.
+        for invalid in [
+            r"[^a-d-b-c]",
+            r"[a-c-1-4x-z-7-9]*",
+            r"[a-a-x-x]+",
+            r"[a-z-+]*",
+            r"[a--b]",
+            r"[--z]",
+        ] {
+            assert!(
+                validate_xml_pattern_syntax(invalid).is_err(),
+                "expected invalid XSD 1.0 regex: {invalid}",
+            );
+        }
     }
 }

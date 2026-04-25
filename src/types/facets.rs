@@ -26,6 +26,7 @@ use crate::parser::location::SourceRef;
 use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 #[cfg(feature = "xsd11")]
 use crate::regex_convert::rewrite_xsd10_category_escapes;
+use crate::regex_convert::validate_xml_pattern_syntax;
 use crate::schema::model::XsdVersion;
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
@@ -131,6 +132,12 @@ impl PatternFacet {
     #[cfg(not(feature = "xsd11"))]
     pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
+            if xsd_version == XsdVersion::V1_0 {
+                validate_xml_pattern_syntax(&self.value).map_err(|message| FacetError::InvalidPattern {
+                    pattern: self.value.clone(),
+                    message,
+                })?;
+            }
             let opts = match xsd_version {
                 XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
                 XsdVersion::V1_1 => ConvertOptions::xsd(),
@@ -149,6 +156,12 @@ impl PatternFacet {
     #[cfg(feature = "xsd11")]
     pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
+            if xsd_version == XsdVersion::V1_0 {
+                validate_xml_pattern_syntax(&self.value).map_err(|message| FacetError::InvalidPattern {
+                    pattern: self.value.clone(),
+                    message,
+                })?;
+            }
             // Validate against XSD regex rules first. Intentional two-pass:
             // xsd() rejects XPath-only constructs (e.g. `^$`, backrefs, `(?:...)`)
             // that xpath() would otherwise accept.
