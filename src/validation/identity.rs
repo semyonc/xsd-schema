@@ -548,6 +548,21 @@ impl ConstraintStruct {
         }
     }
 
+    /// Handle an element start event for an element inside a wildcard
+    /// `processContents="skip"` subtree. Bumps depth tracking on selectors and
+    /// fields so the matching state pops correctly when the subtree ends, but
+    /// suppresses any new matches: skipped elements are outside the schema's
+    /// validation scope and must not be visible to identity-constraint
+    /// selectors/fields per XSD 1.1 §3.11.4 (see wild101..103).
+    pub fn start_element_skipped(&mut self, _local_name: NameId, _ns: NameId) {
+        self.selector.move_to_skipped_element();
+        for frame in &mut self.collection_stack {
+            for field in &mut frame.fields {
+                field.move_to_skipped_element();
+            }
+        }
+    }
+
     /// Return all field indices whose axis matches the given attribute.
     ///
     /// Multiple fields can match the same attribute (e.g. repeated or

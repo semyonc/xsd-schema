@@ -101,6 +101,8 @@ pub use derivation::{
 pub use derivation::validate_element_type_alternatives;
 #[cfg(feature = "xsd11")]
 pub use derivation::validate_wildcard_disallowed_names;
+#[cfg(feature = "xsd11")]
+pub use derivation::validate_wildcard_element_type_table_consistency;
 
 // Re-exports from redefine
 pub use redefine::apply_redefine;

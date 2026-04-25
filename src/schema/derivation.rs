@@ -962,6 +962,19 @@ fn validate_complex_restriction(
 
                 validate_content_particle_restriction(schema_set, type_def, base_type)?;
 
+                // XSD 1.1 §3.4.6.4 / cos-element-consistent (extended for
+                // all-group restrictions): when a derived all-group restricts
+                // a base all-group and removes a base local element, any
+                // wildcard in the derived that admits the removed element's
+                // QName must resolve to a governing type that's substitutable
+                // for the base local's type. This is the schema-time analog of
+                // dynamic EDC, applied where the all-group's unordered
+                // matching makes the conflict structurally inevitable
+                // (wild069 — the corresponding xs:sequence case wild068 is
+                // covered by runtime dynamic EDC instead).
+                #[cfg(feature = "xsd11")]
+                validate_all_group_restriction_edc(schema_set, type_def, base_type)?;
+
                 // XSD 1.1: Validate open-content compatibility
                 #[cfg(feature = "xsd11")]
                 validate_open_content_restriction(schema_set, type_def, base_type)?;
@@ -2437,10 +2450,32 @@ fn try_count_based_subsumption(
             return None;
         }
 
-        let bucket_idx = find_subsumption_bucket(schema_set, derived, base_particles)?;
-        match bucket_idx {
-            Some(idx) => buckets[idx].push((derived.min_occurs, derived.max_occurs)),
-            None => return Some(false),
+        match find_subsumption_bucket(schema_set, derived, base_particles)? {
+            BucketAssignment::Single(idx) => {
+                buckets[idx].push((derived.min_occurs, derived.max_occurs))
+            }
+            BucketAssignment::Partition(idxs) => {
+                // Each base bucket the partition spans must be emptiable
+                // (b_min = 0) since derived elements may not land in it,
+                // and derived's max must fit each spanned base's max
+                // (worst case: all elements land in one bucket).
+                for &i in &idxs {
+                    let base = &base_particles[i];
+                    if base.min_occurs > 0 {
+                        return Some(false);
+                    }
+                    if !occurs_max_fits(derived.max_occurs, base.max_occurs) {
+                        return Some(false);
+                    }
+                }
+                // Contribute (0, derived.max) to each spanned bucket — the
+                // total never exceeds the partition's d_max in any one
+                // bucket, but might be 0.
+                for &i in &idxs {
+                    buckets[i].push((0, derived.max_occurs));
+                }
+            }
+            BucketAssignment::None => return Some(false),
         }
     }
 
@@ -2513,12 +2548,27 @@ fn expand_top_level_choices_for_unordered(
     Some(result)
 }
 
-/// Find which base particle bucket the derived particle should be assigned to.
+/// How a derived particle is assigned to base particle bucket(s).
+#[derive(Debug, Clone)]
+enum BucketAssignment {
+    /// derived maps to a single base particle.
+    Single(usize),
+    /// derived (necessarily a wildcard) partitions across multiple base
+    /// wildcards — its admissible (ns, name) set is covered by the union of
+    /// the listed base wildcards.
+    Partition(Vec<usize>),
+    /// derived has no matching base particle (restriction is invalid).
+    None,
+}
+
+/// Find which base particle bucket(s) the derived particle should be assigned
+/// to.
 ///
 /// Returns:
-/// - `Some(Some(idx))` — derived maps to base particle `idx`.
-/// - `Some(None)` — derived has no matching base particle (restriction is
-///   invalid).
+/// - `Some(BucketAssignment::Single(idx))` — derived maps to base particle `idx`.
+/// - `Some(BucketAssignment::Partition(idxs))` — derived wildcard partitions
+///   across multiple base wildcards (wild049-style restriction).
+/// - `Some(BucketAssignment::None)` — derived has no matching base particle.
 /// - `None` — derived is a nested group that can't be bucketed (caller
 ///   should fall back to bipartite matching).
 ///
@@ -2527,11 +2577,12 @@ fn expand_top_level_choices_for_unordered(
 /// 2. Substitution group head match.
 /// 3. Element fitting a base wildcard.
 /// 4. Wildcard subset of a base wildcard.
+/// 5. Wildcard subset of the union of multiple base wildcards (partition).
 fn find_subsumption_bucket(
     schema_set: &SchemaSet,
     derived: &NormalizedParticle,
     base_particles: &[NormalizedParticle],
-) -> Option<Option<usize>> {
+) -> Option<BucketAssignment> {
     match &derived.term {
         NormalizedParticleTerm::Element(d_elem) => {
             // 1. Direct name match
@@ -2541,7 +2592,7 @@ fn find_subsumption_bucket(
                         && d_elem.namespace == b_elem.namespace
                         && name_and_type_ok_no_occurs(schema_set, d_elem, b_elem)
                     {
-                        return Some(Some(i));
+                        return Some(BucketAssignment::Single(i));
                     }
                 }
             }
@@ -2554,7 +2605,7 @@ fn find_subsumption_bucket(
                     if derived_element_substitutes_base(schema_set, d_elem, b_elem)
                         && name_and_type_ok_no_occurs(schema_set, d_elem, b_elem)
                     {
-                        return Some(Some(i));
+                        return Some(BucketAssignment::Single(i));
                     }
                 }
             }
@@ -2562,24 +2613,70 @@ fn find_subsumption_bucket(
             for (i, base) in base_particles.iter().enumerate() {
                 if let NormalizedParticleTerm::Wildcard(b_wc) = &base.term {
                     if wildcard_allows_element(d_elem, b_wc) {
-                        return Some(Some(i));
+                        return Some(BucketAssignment::Single(i));
                     }
                 }
             }
-            Some(None)
+            Some(BucketAssignment::None)
         }
         NormalizedParticleTerm::Wildcard(d_wc) => {
             // 4. Wildcard subset of base wildcard
             for (i, base) in base_particles.iter().enumerate() {
                 if let NormalizedParticleTerm::Wildcard(b_wc) = &base.term {
                     if wildcard_restricts(d_wc, b_wc) {
-                        return Some(Some(i));
+                        return Some(BucketAssignment::Single(i));
                     }
                 }
             }
-            Some(None)
+            // 5. Wildcard subset of the union of multiple base wildcards.
+            // Collect all base wildcard indices and check coverage. Only
+            // consider buckets that share the derived processContents
+            // strictness or stronger.
+            let candidate_idxs: Vec<usize> = base_particles
+                .iter()
+                .enumerate()
+                .filter_map(|(i, base)| {
+                    let NormalizedParticleTerm::Wildcard(b_wc) = &base.term else {
+                        return None;
+                    };
+                    if process_contents_strictness(d_wc.wildcard.process_contents)
+                        < process_contents_strictness(b_wc.wildcard.process_contents)
+                    {
+                        return None;
+                    }
+                    Some(i)
+                })
+                .collect();
+            if candidate_idxs.len() >= 2 {
+                let bases: Vec<&NormalizedWildcard> = candidate_idxs
+                    .iter()
+                    .map(|&i| match &base_particles[i].term {
+                        NormalizedParticleTerm::Wildcard(b_wc) => b_wc.as_ref(),
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                if let Some(spanned) = wildcard_subset_of_union(d_wc, &bases) {
+                    let idxs: Vec<usize> = spanned
+                        .into_iter()
+                        .map(|local_idx| candidate_idxs[local_idx])
+                        .collect();
+                    return Some(BucketAssignment::Partition(idxs));
+                }
+            }
+            Some(BucketAssignment::None)
         }
         NormalizedParticleTerm::Group(_) => None,
+    }
+}
+
+/// Return the smallest occurs-max that fits both `derived_max` and
+/// `base_max`, treating `None` as unbounded. `derived_max` must fit within
+/// `base_max`.
+fn occurs_max_fits(derived_max: Option<u32>, base_max: Option<u32>) -> bool {
+    match (derived_max, base_max) {
+        (_, None) => true,
+        (None, Some(_)) => false,
+        (Some(d), Some(b)) => d <= b,
     }
 }
 
@@ -2702,6 +2799,245 @@ fn wildcard_restricts(derived: &NormalizedWildcard, base: &NormalizedWildcard) -
         base.target_namespace,
     ) && process_contents_strictness(derived.wildcard.process_contents)
         >= process_contents_strictness(base.wildcard.process_contents)
+}
+
+/// Check whether the derived wildcard's admissible (namespace, name) set is
+/// covered by the union of the given base wildcards. Returns the indices of
+/// the bases that participate in the partition (those that admit at least
+/// one (ns, name) admitted by derived); returns `None` if the union doesn't
+/// cover derived.
+///
+/// Implements the partition extension of NSSubset (§3.10.6.2): a single
+/// derived wildcard restricts a base content model if every (ns, name)
+/// admitted by derived is admitted by some base wildcard. Used for cases
+/// like wild049 where the base type's xs:all has multiple wildcards
+/// partitioning the namespace space, and the derived sequence has a single
+/// wildcard whose admissions span both base wildcards.
+fn wildcard_subset_of_union(
+    derived: &NormalizedWildcard,
+    bases: &[&NormalizedWildcard],
+) -> Option<Vec<usize>> {
+    use crate::parser::frames::NotQNameItem;
+
+    let derived_target = derived.target_namespace;
+
+    // Collect all explicit namespace witnesses from both sides.
+    let mut explicit_namespaces: Vec<Option<NameId>> = Vec::new();
+    let push_ns = |ns: Option<NameId>, out: &mut Vec<Option<NameId>>| {
+        if !out.contains(&ns) {
+            out.push(ns);
+        }
+    };
+
+    let collect_namespaces = |wc: &NormalizedWildcard, out: &mut Vec<Option<NameId>>| {
+        let target = wc.target_namespace;
+        match &wc.wildcard.namespace {
+            WildcardNamespace::TargetNamespace => {
+                if !out.contains(&target) {
+                    out.push(target);
+                }
+            }
+            WildcardNamespace::Local => {
+                if !out.contains(&None) {
+                    out.push(None);
+                }
+            }
+            WildcardNamespace::List(tokens) => {
+                for t in tokens {
+                    let ns = t.resolve(target);
+                    if !out.contains(&ns) {
+                        out.push(ns);
+                    }
+                }
+            }
+            _ => {}
+        }
+        for t in &wc.wildcard.not_namespace {
+            let ns = t.resolve(target);
+            if !out.contains(&ns) {
+                out.push(ns);
+            }
+        }
+        for item in &wc.wildcard.not_qname {
+            if let NotQNameItem::QName { namespace, .. } = item {
+                if !out.contains(namespace) {
+                    out.push(*namespace);
+                }
+            }
+        }
+    };
+
+    collect_namespaces(derived, &mut explicit_namespaces);
+    for base in bases {
+        collect_namespaces(base, &mut explicit_namespaces);
+    }
+    push_ns(derived_target, &mut explicit_namespaces);
+    for base in bases {
+        push_ns(base.target_namespace, &mut explicit_namespaces);
+    }
+    push_ns(None, &mut explicit_namespaces);
+
+    let mut spanned: Vec<usize> = Vec::new();
+
+    let check_namespace = |ns: Option<NameId>,
+                           is_explicit_ns: bool,
+                           bases: &[&NormalizedWildcard],
+                           spanned: &mut Vec<usize>|
+     -> bool {
+        if !wildcard_admits_ns(derived, ns) {
+            return true;
+        }
+        // Find admitting bases (their indices in `bases`).
+        let admitting: Vec<usize> = (0..bases.len())
+            .filter(|&i| wildcard_admits_ns(bases[i], ns))
+            .collect();
+        if admitting.is_empty() {
+            return false;
+        }
+        // For each name witness in this namespace, check coverage.
+        let mut name_witnesses: Vec<NameId> = Vec::new();
+        let push_name = |n: NameId, out: &mut Vec<NameId>| {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        };
+        for item in &derived.wildcard.not_qname {
+            if let NotQNameItem::QName { namespace, local_name } = item {
+                if *namespace == ns {
+                    push_name(*local_name, &mut name_witnesses);
+                }
+            }
+        }
+        for &i in &admitting {
+            for item in &bases[i].wildcard.not_qname {
+                if let NotQNameItem::QName { namespace, local_name } = item {
+                    if *namespace == ns {
+                        push_name(*local_name, &mut name_witnesses);
+                    }
+                }
+            }
+        }
+        for name in &name_witnesses {
+            if !wildcard_admits_qname(derived, ns, *name) {
+                continue;
+            }
+            let any_admits = admitting
+                .iter()
+                .any(|&i| wildcard_admits_qname(bases[i], ns, *name));
+            if !any_admits {
+                return false;
+            }
+        }
+        // "Any other name" witness: derived admits some name not in the
+        // explicit witness set if and only if no `##defined`/`##definedSibling`
+        // entry catches it. If derived admits this symbolic case, at least
+        // one base must too.
+        let derived_admits_other = wildcard_admits_qname_symbolic_other(derived, ns);
+        if derived_admits_other {
+            let any_admits_other = admitting
+                .iter()
+                .any(|&i| wildcard_admits_qname_symbolic_other(bases[i], ns));
+            if !any_admits_other {
+                return false;
+            }
+        }
+        // Record participating bases. For explicit-namespace witnesses, we
+        // know derived admits at least one name in this namespace, so each
+        // admitting base participates; for the symbolic "any-other-namespace"
+        // sentinel we'd over-count, so the caller marks those separately.
+        if is_explicit_ns {
+            for &i in &admitting {
+                if !spanned.contains(&i) {
+                    spanned.push(i);
+                }
+            }
+        }
+        true
+    };
+
+    // Check each explicit namespace witness.
+    for ns in &explicit_namespaces {
+        if !check_namespace(*ns, true, bases, &mut spanned) {
+            return None;
+        }
+    }
+
+    // Symbolic "fresh namespace" witness: a namespace not in any explicit
+    // set. Use a sentinel NameId guaranteed not to appear (NameId::MAX).
+    let fresh_ns = Some(NameId(u32::MAX));
+    let derived_admits_fresh = wildcard_admits_ns(derived, fresh_ns)
+        || wildcard_admits_ns(derived, None);
+    if derived_admits_fresh {
+        // The "fresh ns" sentinel covers any unmentioned namespace; we need
+        // at least one base to admit it for partition coverage to work.
+        let mut fresh_bases: Vec<usize> = (0..bases.len())
+            .filter(|&i| wildcard_admits_ns(bases[i], fresh_ns))
+            .collect();
+        if wildcard_admits_ns(derived, fresh_ns) && fresh_bases.is_empty() {
+            return None;
+        }
+        for &i in &fresh_bases {
+            if !spanned.contains(&i) {
+                spanned.push(i);
+            }
+        }
+        fresh_bases.clear();
+    }
+
+    if spanned.is_empty() {
+        // Derived admits nothing — degenerate, treat as covered by no bases.
+        return Some(spanned);
+    }
+    Some(spanned)
+}
+
+/// Whether the wildcard admits `ns` in its `{namespace constraint}` after
+/// applying `notNamespace`.
+fn wildcard_admits_ns(wc: &NormalizedWildcard, ns: Option<NameId>) -> bool {
+    if !wildcard_namespace_matches(&wc.wildcard.namespace, ns, wc.target_namespace) {
+        return false;
+    }
+    !wc.wildcard
+        .not_namespace
+        .iter()
+        .any(|t| t.resolve(wc.target_namespace) == ns)
+}
+
+/// Whether the wildcard admits the QName `(ns, name)` after applying
+/// `notNamespace` and `notQName`. `##defined` and `##definedSibling` are
+/// treated pessimistically — if either appears, the QName is rejected, since
+/// at schema-time we cannot resolve which names they catch.
+fn wildcard_admits_qname(
+    wc: &NormalizedWildcard,
+    ns: Option<NameId>,
+    name: NameId,
+) -> bool {
+    use crate::parser::frames::NotQNameItem;
+    if !wildcard_admits_ns(wc, ns) {
+        return false;
+    }
+    !wc.wildcard.not_qname.iter().any(|item| match item {
+        NotQNameItem::QName { namespace, local_name } => *namespace == ns && *local_name == name,
+        NotQNameItem::Defined | NotQNameItem::DefinedSibling => true,
+    })
+}
+
+/// Whether the wildcard admits a "symbolic other name" in `ns` — i.e., some
+/// name that doesn't appear in any explicit `notQName` entry. The check
+/// fails only if `##defined`/`##definedSibling` would catch any name, since
+/// concrete QName entries match only specific names.
+fn wildcard_admits_qname_symbolic_other(
+    wc: &NormalizedWildcard,
+    ns: Option<NameId>,
+) -> bool {
+    use crate::parser::frames::NotQNameItem;
+    if !wildcard_admits_ns(wc, ns) {
+        return false;
+    }
+    !wc.wildcard
+        .not_qname
+        .iter()
+        .any(|item| matches!(item, NotQNameItem::Defined | NotQNameItem::DefinedSibling))
 }
 
 fn wildcard_allows_element(
@@ -2928,10 +3264,29 @@ fn is_wildcard_ns_subset(
         }
     }
 
-    // notQName: derived must exclude at least everything base excludes
+    // notQName: derived must exclude at least everything base excludes that
+    // derived's namespace constraint actually admits. If derived's
+    // {namespace constraint} ∪ notNamespace already excludes the QName's
+    // namespace, base's exclusion is moot for the subset check.
     for item in &base.not_qname {
-        if !derived.not_qname.contains(item) {
-            return false;
+        match item {
+            crate::parser::frames::NotQNameItem::QName { namespace, .. } => {
+                let derived_admits_ns = wildcard_namespace_matches(
+                    &derived.namespace, *namespace, derived_target_ns,
+                ) && !derived
+                    .not_namespace
+                    .iter()
+                    .any(|t| t.resolve(derived_target_ns) == *namespace);
+                if derived_admits_ns && !derived.not_qname.contains(item) {
+                    return false;
+                }
+            }
+            crate::parser::frames::NotQNameItem::Defined
+            | crate::parser::frames::NotQNameItem::DefinedSibling => {
+                if !derived.not_qname.contains(item) {
+                    return false;
+                }
+            }
         }
     }
 
@@ -3430,7 +3785,159 @@ fn base_content_single_wildcard<'a>(
     }
 }
 
-/// Validate open-content compatibility for complex type restriction (derivation-ok-restriction).
+/// XSD 1.1 §3.4.6.4 schema-time EDC for all-group restrictions
+/// (cvc-complex-type rule 5 / cos-element-consistent extended). When a
+/// derived all-group restricts a base all-group and removes a base local
+/// element, the derived's wildcard can structurally admit elements with the
+/// removed QName. The "tighter EDC rule" of XSD 1.1 (Saxon test category
+/// `xsd1_1-Wildcards-TighterMatchingRuleForEDC`, e.g. wild069) demands the
+/// schema be invalid if the wildcard's governing type for that QName is not
+/// validly substitutable for the base local's declared type.
+///
+/// The xs:sequence variant of the same construct (wild068) is intentionally
+/// not subject to this check: the position constraint of sequence keeps the
+/// conflict from arising structurally, leaving runtime dynamic EDC as the
+/// catcher.
+#[cfg(feature = "xsd11")]
+fn validate_all_group_restriction_edc(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base: &crate::arenas::ComplexTypeDefData,
+) -> SchemaResult<()> {
+    use crate::parser::frames::ProcessContents;
+
+    let derived_particle = complex_content_particle(&derived.content);
+    let (effective_base, base_particle) = effective_base_content_particle(schema_set, base);
+
+    let (Some(derived_p), Some(base_p)) = (derived_particle, base_particle) else {
+        return Ok(());
+    };
+
+    let derived_norm = match normalize_type_particle(schema_set, derived, derived_p) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+    let base_norm = match normalize_type_particle(schema_set, effective_base, base_p) {
+        Ok(n) => n,
+        Err(_) => return Ok(()),
+    };
+
+    // Trigger only when both top-level groups are xs:all.
+    if !is_top_all_group(&derived_norm) || !is_top_all_group(&base_norm) {
+        return Ok(());
+    }
+
+    // Collect derived's local element QNames and wildcards (top-level only —
+    // an all-group's particles are flat).
+    let mut derived_local_qnames: Vec<(Option<NameId>, NameId)> = Vec::new();
+    let mut derived_wildcards: Vec<&NormalizedWildcard> = Vec::new();
+    if let NormalizedParticleTerm::Group(group) = &derived_norm.term {
+        for p in &group.particles {
+            match &p.term {
+                NormalizedParticleTerm::Element(elem) => {
+                    derived_local_qnames.push((elem.namespace, elem.name));
+                }
+                NormalizedParticleTerm::Wildcard(wc) => {
+                    derived_wildcards.push(wc.as_ref());
+                }
+                NormalizedParticleTerm::Group(_) => {}
+            }
+        }
+    }
+
+    if derived_wildcards.is_empty() {
+        return Ok(());
+    }
+
+    // Walk base's local elements (top-level all-group particles).
+    let base_locals: Vec<(Option<NameId>, NameId, TypeKey)> =
+        if let NormalizedParticleTerm::Group(group) = &base_norm.term {
+            group
+                .particles
+                .iter()
+                .filter_map(|p| match &p.term {
+                    NormalizedParticleTerm::Element(elem) => {
+                        Some((elem.namespace, elem.name, elem.type_key))
+                    }
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+    let (location, type_name) = type_error_context(schema_set, derived);
+    let base_name = format_type_name(schema_set, base.name, base.target_namespace);
+
+    for (l_ns, l_name, l_type) in &base_locals {
+        // Skip if derived also has this local element.
+        if derived_local_qnames.contains(&(*l_ns, *l_name)) {
+            continue;
+        }
+
+        for wc in &derived_wildcards {
+            if !wildcard_admits_qname(wc, *l_ns, *l_name) {
+                continue;
+            }
+
+            let pc = wc.wildcard.process_contents;
+            if matches!(pc, ProcessContents::Skip) {
+                continue;
+            }
+
+            let global_key = schema_set.lookup_element(*l_ns, *l_name);
+            let governing_type = global_key
+                .and_then(|k| schema_set.arenas.elements.get(k))
+                .and_then(|d| d.resolved_type);
+
+            match (pc, governing_type) {
+                (ProcessContents::Strict, None) => {
+                    // strict + no global: instance with this QName fails strict
+                    // wildcard validation, so derived rejects. No conflict.
+                    continue;
+                }
+                (ProcessContents::Lax, None) => {
+                    // lax + no global: wildcard skip-validates, so derived
+                    // admits arbitrary content for this QName. Base local
+                    // would enforce its type — derived broader → reject.
+                }
+                (_, Some(gov_type)) => {
+                    if schema_set.is_type_derived_from(gov_type, *l_type, DerivationSet::empty()) {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+
+            return Err(SchemaError::structural(
+                "cos-element-consistent",
+                format!(
+                    "Complex type '{}' restricts '{}' (xs:all) by removing local element \
+                     while keeping a wildcard that admits the same QName; the wildcard's \
+                     governing type is not validly substitutable for the base local element's \
+                     type (cvc-complex-type rule 5 / tighter EDC for xs:all restriction)",
+                    type_name, base_name,
+                ),
+                location.clone(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether a normalized particle is a top-level xs:all group (with min/max
+/// = 1, since xs:all allows minOccurs ∈ {0,1} and maxOccurs = 1).
+#[cfg(feature = "xsd11")]
+fn is_top_all_group(particle: &NormalizedParticle) -> bool {
+    matches!(
+        &particle.term,
+        NormalizedParticleTerm::Group(group) if group.compositor == Compositor::All
+    )
+}
+
+/// Validate open-content compatibility for complex type restriction
+/// (derivation-ok-restriction).
 ///
 /// Rules:
 /// - If base has no OC, derived must not add OC — **unless** the derived
@@ -5685,6 +6192,261 @@ pub fn validate_wildcard_disallowed_names(schema_set: &SchemaSet) -> SchemaResul
     }
 
     Ok(())
+}
+
+/// XSD 1.1 §3.8.6.3 / cos-element-consistent (second clause): when a complex
+/// type's content model contains both a local element declaration with
+/// expanded name Q AND a strict/lax wildcard that admits Q, AND a top-level
+/// element declaration G with expanded name Q exists, then the type tables
+/// of the local element and G must be either both absent or both present
+/// and equivalent.
+///
+/// Closes wild078/079 (local has no type table, global has one) and wild081
+/// (local has a type table, global doesn't).
+#[cfg(feature = "xsd11")]
+pub fn validate_wildcard_element_type_table_consistency(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::parser::frames::AlternativeResult;
+
+    if !schema_set.is_xsd11() {
+        return Ok(());
+    }
+
+    /// Walk a particle tree using the parallel `local_keys`/`flat_idx` scheme
+    /// from `allocate_content_particle_elements`. For each local element
+    /// particle, look up its allocated arena key (where post-resolution
+    /// alternatives live) instead of relying on the stale parser-frame copy.
+    #[allow(clippy::too_many_arguments)]
+    fn walk_collect<'a>(
+        particle: &'a ParticleResult,
+        target_ns: Option<NameId>,
+        schema_set: &'a SchemaSet,
+        local_keys: &[Option<ElementKey>],
+        flat_idx: &mut usize,
+        local_elems: &mut Vec<(Option<NameId>, NameId, ElementKey, Option<SourceRef>)>,
+        wildcards: &mut Vec<&'a WildcardResult>,
+        depth: usize,
+    ) {
+        if depth > 100 {
+            return;
+        }
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                if let Some(ref_qn) = &elem.ref_name {
+                    // ref slot: increment flat_idx but no local key.
+                    *flat_idx += 1;
+                    let _ = ref_qn;
+                } else if let Some(name) = elem.name {
+                    let ns = elem.target_namespace.or(target_ns);
+                    let idx = *flat_idx;
+                    *flat_idx += 1;
+                    if let Some(key) = local_keys.get(idx).copied().flatten() {
+                        local_elems.push((ns, name, key, elem.source.clone()));
+                    }
+                }
+            }
+            ParticleTerm::Any(wc) => {
+                wildcards.push(wc);
+            }
+            ParticleTerm::Group(group) => {
+                if let Some(ref_qn) = &group.ref_name {
+                    if let Some(group_key) =
+                        schema_set.lookup_model_group(ref_qn.namespace, ref_qn.local_name)
+                    {
+                        let mg = &schema_set.arenas.model_groups[group_key];
+                        let mg_ns = mg.target_namespace.or(target_ns);
+                        let mut group_flat_idx = 0usize;
+                        for child in &mg.particles {
+                            walk_collect(
+                                child,
+                                mg_ns,
+                                schema_set,
+                                &mg.resolved_particle_elements,
+                                &mut group_flat_idx,
+                                local_elems,
+                                wildcards,
+                                depth + 1,
+                            );
+                        }
+                    }
+                    // Group refs do not advance the outer flat_idx (mirrors
+                    // collect_content_particle_elements_recursive).
+                } else {
+                    for child in &group.particles {
+                        walk_collect(
+                            child,
+                            target_ns,
+                            schema_set,
+                            local_keys,
+                            flat_idx,
+                            local_elems,
+                            wildcards,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve an alternative's effective type — fall back to looking up the
+    /// QName via `schema_set.lookup_type` when the parser-frame copy hasn't
+    /// been resolved yet (which is the case for local element alternatives
+    /// allocated post-`resolve_all_references`).
+    fn alt_effective_type(
+        alt: &AlternativeResult,
+        schema_set: &SchemaSet,
+    ) -> Option<TypeKey> {
+        use crate::parser::frames::TypeRefResult;
+        if let Some(t) = alt.resolved_type {
+            return Some(t);
+        }
+        if let Some(TypeRefResult::QName(qname)) = &alt.type_ref {
+            return schema_set
+                .lookup_type(qname.namespace, qname.local_name)
+                .or_else(|| {
+                    schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                });
+        }
+        None
+    }
+
+    fn alternatives_equivalent(
+        a: &[AlternativeResult],
+        b: &[AlternativeResult],
+        schema_set: &SchemaSet,
+    ) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        for (x, y) in a.iter().zip(b.iter()) {
+            if x.test != y.test {
+                return false;
+            }
+            if alt_effective_type(x, schema_set) != alt_effective_type(y, schema_set) {
+                return false;
+            }
+        }
+        true
+    }
+
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        let target_ns = ct.target_namespace;
+        let ComplexContentResult::Complex(cc) = &ct.content else {
+            continue;
+        };
+        let Some(particle) = cc.particle.as_ref() else {
+            continue;
+        };
+
+        let mut local_elems: Vec<(Option<NameId>, NameId, ElementKey, Option<SourceRef>)> =
+            Vec::new();
+        let mut wildcards: Vec<&WildcardResult> = Vec::new();
+        let mut flat_idx = 0usize;
+        walk_collect(
+            particle,
+            target_ns,
+            schema_set,
+            &ct.resolved_content_particle_elements,
+            &mut flat_idx,
+            &mut local_elems,
+            &mut wildcards,
+            0,
+        );
+
+        // Open-content wildcards also count.
+        if let Some(oc) = cc.open_content.as_ref() {
+            if let Some(wc) = oc.wildcard.as_ref() {
+                wildcards.push(wc);
+            }
+        }
+
+        if wildcards.is_empty() {
+            continue;
+        }
+
+        for (l_ns, l_name, l_key, l_source) in &local_elems {
+            let global_key = schema_set.lookup_element(*l_ns, *l_name);
+            let Some(g_key) = global_key else {
+                continue;
+            };
+            // If the local declaration is the global itself (e.g., a ref'd
+            // element resolving back to the same arena key), skip — there's
+            // only one declaration so no inconsistency is possible.
+            if *l_key == g_key {
+                continue;
+            }
+            let l_decl = &schema_set.arenas.elements[*l_key];
+            let g_decl = &schema_set.arenas.elements[g_key];
+
+            // The wildcard must be lax/strict (skip wildcards bypass the EDC
+            // per wild080) AND admit (l_ns, l_name).
+            let admitted = wildcards.iter().any(|wc| {
+                if matches!(wc.process_contents, ProcessContents::Skip) {
+                    return false;
+                }
+                wildcard_result_admits_qname(wc, target_ns, *l_ns, *l_name)
+            });
+            if !admitted {
+                continue;
+            }
+
+            if !alternatives_equivalent(&l_decl.alternatives, &g_decl.alternatives, schema_set) {
+                let location = schema_set
+                    .locate(l_source.as_ref())
+                    .or_else(|| schema_set.locate(ct.source.as_ref()));
+                let qname = match l_ns {
+                    Some(ns) => format!(
+                        "{{{}}}:{}",
+                        schema_set.name_table.resolve_ref(*ns),
+                        schema_set.name_table.resolve_ref(*l_name),
+                    ),
+                    None => schema_set.name_table.resolve_ref(*l_name).to_string(),
+                };
+                return Err(SchemaError::structural(
+                    "cos-element-consistent",
+                    format!(
+                        "Local element '{}' is in the same content model as a strict/lax \
+                         wildcard that admits its expanded name; the local element's type \
+                         table is not equivalent to that of the top-level declaration of \
+                         the same name (§3.8.6.3 / cos-element-consistent)",
+                        qname
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Whether the wildcard's namespace constraint and notQName admit the QName
+/// `(ns, name)`. Treats `##defined` and `##definedSibling` pessimistically
+/// (rejects).
+#[cfg(feature = "xsd11")]
+fn wildcard_result_admits_qname(
+    wc: &WildcardResult,
+    target_ns: Option<NameId>,
+    ns: Option<NameId>,
+    name: NameId,
+) -> bool {
+    use crate::parser::frames::NotQNameItem;
+    if !wildcard_namespace_matches(&wc.namespace, ns, target_ns) {
+        return false;
+    }
+    if wc
+        .not_namespace
+        .iter()
+        .any(|t| t.resolve(target_ns) == ns)
+    {
+        return false;
+    }
+    !wc.not_qname.iter().any(|item| match item {
+        NotQNameItem::QName { namespace, local_name } => *namespace == ns && *local_name == name,
+        NotQNameItem::Defined | NotQNameItem::DefinedSibling => true,
+    })
 }
 
 /// XSD 1.0 §3.2.17 lexical check for `xs:anyURI` source attributes on

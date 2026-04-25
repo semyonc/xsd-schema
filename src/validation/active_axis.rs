@@ -135,6 +135,29 @@ impl ActiveAxis {
         self.scope_match_flag
     }
 
+    /// Advance depth tracking for an element opening inside a
+    /// processContents="skip" wildcard subtree, without attempting any
+    /// selector / field matches. Pushes an empty match context so descendant
+    /// axes can't expand into the skipped content. Used by IC processing in
+    /// XSD 1.1 to honour wildcard attribution: skipped elements are outside
+    /// the schema's validation scope and must not contribute to keys/uniques
+    /// or keyrefs (see wild101..103).
+    pub(crate) fn move_to_skipped_element(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.current_depth += 1;
+        self.last_entered_match = false;
+        for state in &mut self.path_states {
+            state.context_stack.push(MatchContext {
+                active_steps: Vec::new(),
+                matched_here: Vec::new(),
+                awaiting_attribute: false,
+                try_from_start: false,
+            });
+        }
+    }
+
     /// Advance matching on an element open event.
     ///
     /// Returns `true` if any path completed (or attribute-pending) a match at

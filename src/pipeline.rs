@@ -305,6 +305,14 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
+        // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
+        // wildcard + global element with same QName ⇒ type tables must agree.
+        // Runs AFTER allocate_content_particle_elements because it reads each
+        // CT's `resolved_content_particle_elements` to pick up post-resolution
+        // alternatives stored on the arena entry rather than the stale
+        // parser-frame copy.
+        #[cfg(feature = "xsd11")]
+        crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
         validate_all_group_outer_occurs(schema_set)?;
         validate_all_group_content(schema_set)?;
         validate_all_particle_occurs(schema_set)?;
@@ -398,6 +406,14 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
+    // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
+    // wildcard + global element with same QName ⇒ type tables must agree.
+    // Runs AFTER allocate_content_particle_elements because it reads each CT's
+    // `resolved_content_particle_elements` to pick up post-resolution
+    // alternatives stored on the arena entry rather than the stale parser-frame
+    // copy.
+    #[cfg(feature = "xsd11")]
+    crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
     validate_all_group_content(schema_set)?;
     validate_all_particle_occurs(schema_set)?;
@@ -763,6 +779,14 @@ pub async fn load_and_process_schema_async(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
+        // §3.8.6.3 cos-element-consistent (extended): local element + lax/strict
+        // wildcard + global element with same QName ⇒ type tables must agree.
+        // Runs AFTER allocate_content_particle_elements because it reads each
+        // CT's `resolved_content_particle_elements` to pick up post-resolution
+        // alternatives stored on the arena entry rather than the stale
+        // parser-frame copy.
+        #[cfg(feature = "xsd11")]
+        crate::schema::validate_wildcard_element_type_table_consistency(schema_set)?;
     }
 
     Ok(stats)

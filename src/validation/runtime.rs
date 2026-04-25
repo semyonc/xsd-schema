@@ -666,7 +666,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.content_state = ContentValidatorState::Simple;
         ev_state.validity = SchemaValidity::NotKnown;
         self.push_element(ev_state);
-        self.advance_constraints_start_element(local_name, namespace, None);
+        self.advance_constraints_start_element_skipped(local_name, namespace);
         #[cfg(feature = "xsd11")]
         self.detect_assertions_on_element(None, local_name, namespace);
         SchemaInfo::empty()
@@ -3154,23 +3154,54 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
         element_key: Option<ElementKey>,
     ) {
+        self.advance_constraints_start_element_inner(local_name, namespace, element_key, false);
+    }
+
+    /// Variant of [`advance_constraints_start_element`] used when the element
+    /// is inside a wildcard `processContents="skip"` subtree. Bumps depth
+    /// tracking on existing IC selectors / fields without admitting new
+    /// matches, and never activates element-attached identity constraints:
+    /// per XSD 1.1 §3.11.4 (and the W3C wild101..103 fixtures), skipped
+    /// content is outside the schema's validation scope.
+    fn advance_constraints_start_element_skipped(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+    ) {
+        self.advance_constraints_start_element_inner(local_name, namespace, None, true);
+    }
+
+    fn advance_constraints_start_element_inner(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        element_key: Option<ElementKey>,
+        skipped: bool,
+    ) {
         let ns = namespace.unwrap_or(NameId(0));
 
         // 1. Advance existing active constraints
         for cs in &mut self.active_constraints {
-            cs.start_element(local_name, ns);
+            if skipped {
+                cs.start_element_skipped(local_name, ns);
+            } else {
+                cs.start_element(local_name, ns);
+            }
         }
 
-        // 2. Activate new constraints from element declaration
-        if let Some(ek) = element_key {
-            let ic_keys: Vec<IdentityConstraintKey> =
-                self.schema_set.arenas.elements[ek].identity_constraints.clone();
-            for ic_key in ic_keys {
-                if self.ensure_compiled(ic_key) {
-                    let compiled = self.compiled_constraints[&ic_key].as_ref().unwrap();
-                    let mut cs = ConstraintStruct::new(compiled);
-                    cs.activate();
-                    self.active_constraints.push(cs);
+        // 2. Activate new constraints from element declaration (only when
+        //    NOT in skip mode — skipped elements have no element_key).
+        if !skipped {
+            if let Some(ek) = element_key {
+                let ic_keys: Vec<IdentityConstraintKey> =
+                    self.schema_set.arenas.elements[ek].identity_constraints.clone();
+                for ic_key in ic_keys {
+                    if self.ensure_compiled(ic_key) {
+                        let compiled = self.compiled_constraints[&ic_key].as_ref().unwrap();
+                        let mut cs = ConstraintStruct::new(compiled);
+                        cs.activate();
+                        self.active_constraints.push(cs);
+                    }
                 }
             }
         }
