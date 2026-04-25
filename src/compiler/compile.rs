@@ -874,6 +874,21 @@ impl<'a> CompileContext<'a> {
                     if let Some(ref_name) = &elem.ref_name {
                         // Element reference — use the ref's resolved QName
                         result.push((ref_name.namespace, ref_name.local_name));
+                        // §3.10.6.1 ##definedSibling also excludes substitution-
+                        // group members of any sibling element declaration.
+                        // Local elements cannot be substitution heads (members
+                        // must be globally declared per §3.3.3), so this only
+                        // applies to refs.
+                        if let Some(head_key) = self
+                            .schema_set
+                            .lookup_element(ref_name.namespace, ref_name.local_name)
+                        {
+                            collect_substitution_members(
+                                self.schema_set,
+                                head_key,
+                                &mut result,
+                            );
+                        }
                     } else if let Some(name) = elem.name {
                         // Local element — resolve namespace through form/elementFormDefault
                         let source = p.source.as_ref().or(elem.source.as_ref());
@@ -899,6 +914,44 @@ impl<'a> CompileContext<'a> {
             }
         }
         result
+    }
+}
+
+/// Push QNames of every element that may substitute for `head_key` into `out`,
+/// honoring the head's `block`/`final` restrictions and walking transitively
+/// through nested substitution chains. Used for `##definedSibling` expansion.
+fn collect_substitution_members(
+    schema_set: &SchemaSet,
+    head_key: ElementKey,
+    out: &mut Vec<(Option<NameId>, NameId)>,
+) {
+    // Resolve through ref to get the canonical head decl.
+    let head_key = schema_set
+        .arenas
+        .elements
+        .get(head_key)
+        .and_then(|e| e.resolved_ref)
+        .unwrap_or(head_key);
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = vec![head_key];
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        for (member_key, member) in schema_set.arenas.elements.iter() {
+            if member_key == current {
+                continue;
+            }
+            if member.resolved_substitution_groups.contains(&current) {
+                if let Some(name) = member.name {
+                    let entry = (member.target_namespace, name);
+                    if !out.contains(&entry) {
+                        out.push(entry);
+                    }
+                }
+                stack.push(member_key);
+            }
+        }
     }
 }
 
@@ -1145,7 +1198,7 @@ fn compile_content_model_matcher_impl(
                         type_def.source.as_ref(),
                     );
 
-                    return Ok(attach_open_content(base_matcher, open_content));
+                    return Ok(attach_open_content(schema_set, base_matcher, open_content));
                 }
 
                 // Named group ref resolving to all-group
@@ -1179,7 +1232,7 @@ fn compile_content_model_matcher_impl(
                         type_def.source.as_ref(),
                     );
 
-                    return Ok(attach_open_content(base_matcher, open_content));
+                    return Ok(attach_open_content(schema_set, base_matcher, open_content));
                 }
             }
         }
@@ -1207,7 +1260,7 @@ fn compile_content_model_matcher_impl(
                 None => {
                     // Extension adds only attributes — return base AllGroup directly
                     let matcher = ContentModelMatcher::AllGroup(base_all_model);
-                    return Ok(attach_open_content(matcher, open_content));
+                    return Ok(attach_open_content(schema_set, matcher, open_content));
                 }
                 Some(particle) => {
                     // Check if extension's own particle is an inline all-group
@@ -1258,7 +1311,7 @@ fn compile_content_model_matcher_impl(
                         let mut merged = AllGroupModel::new(merged_particles);
                         merged.outer_optional = merged_outer_optional;
                         let matcher = ContentModelMatcher::AllGroup(merged);
-                        return Ok(attach_open_content(matcher, open_content));
+                        return Ok(attach_open_content(schema_set, matcher, open_content));
                     }
 
                     // Extension is sequence/choice/group-ref — invalid per
@@ -1321,7 +1374,7 @@ fn compile_content_model_matcher_impl(
                             type_def.open_content.as_ref(),
                             type_def.source.as_ref(),
                         );
-                        return Ok(attach_open_content(base_matcher, open_content));
+                        return Ok(attach_open_content(schema_set, base_matcher, open_content));
                     }
                     // Extension has own particles — convert AllGroup to NFA for concat
                     // (XSD 1.0 path; XSD 1.1 is handled above via compile_base_all_group)
@@ -1374,7 +1427,7 @@ fn compile_content_model_matcher_impl(
         type_def.source.as_ref(),
     );
 
-    Ok(attach_open_content(base_matcher, open_content))
+    Ok(attach_open_content(schema_set, base_matcher, open_content))
 }
 
 /// §3.4.2.3 clauses 5–6: effective open content for an XSD 1.1 extension type.
@@ -1517,6 +1570,7 @@ fn empty_nfa() -> NfaTable {
 }
 
 fn attach_open_content(
+    schema_set: &SchemaSet,
     matcher: ContentModelMatcher,
     open_content: Option<OpenContent>,
 ) -> ContentModelMatcher {
@@ -1529,7 +1583,7 @@ fn attach_open_content(
         ContentModelMatcher::Nfa(nfa) => {
             let wildcard = open_content.wildcard.map(|mut w| {
                 if w.has_defined_sibling {
-                    w.not_qnames.extend(collect_nfa_element_qnames(&nfa));
+                    w.not_qnames.extend(collect_nfa_element_qnames(schema_set, &nfa));
                     w.has_defined_sibling = false;
                 }
                 w
@@ -1543,7 +1597,7 @@ fn attach_open_content(
         ContentModelMatcher::AllGroup(mut model) => {
             if let Some(mut wildcard_ref) = open_content.wildcard {
                 if wildcard_ref.has_defined_sibling {
-                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(&model));
+                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(schema_set, &model));
                     wildcard_ref.has_defined_sibling = false;
                 }
                 let mode = match open_content.mode {
@@ -1565,8 +1619,8 @@ fn attach_open_content(
             if let Some(mut wildcard_ref) = open_content.wildcard {
                 if wildcard_ref.has_defined_sibling {
                     // Collect siblings from both the base all-group and extension NFA
-                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(&base_model));
-                    wildcard_ref.not_qnames.extend(collect_nfa_element_qnames(&extension_nfa));
+                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(schema_set, &base_model));
+                    wildcard_ref.not_qnames.extend(collect_nfa_element_qnames(schema_set, &extension_nfa));
                     wildcard_ref.has_defined_sibling = false;
                 }
                 let mode = match open_content.mode {
@@ -1666,28 +1720,42 @@ fn expand_defined_element_qnames(schema_set: &SchemaSet) -> Vec<(Option<NameId>,
         .collect()
 }
 
-/// Collect all element QNames from an NFA content model (for ##definedSibling expansion).
-fn collect_nfa_element_qnames(nfa: &NfaTable) -> Vec<(Option<NameId>, NameId)> {
+/// Collect all element QNames from an NFA content model (for ##definedSibling
+/// expansion). Includes substitution-group members of each declared element.
+fn collect_nfa_element_qnames(
+    schema_set: &SchemaSet,
+    nfa: &NfaTable,
+) -> Vec<(Option<NameId>, NameId)> {
     let mut result = Vec::new();
     for state in &nfa.states {
-        if let Some(NfaTerm::Element { namespace, name, .. }) = &state.term {
+        if let Some(NfaTerm::Element { namespace, name, element_key, .. }) = &state.term {
             let qname = (*namespace, *name);
             if !result.contains(&qname) {
                 result.push(qname);
+            }
+            if let Some(head_key) = element_key {
+                collect_substitution_members(schema_set, *head_key, &mut result);
             }
         }
     }
     result
 }
 
-/// Collect all element QNames from an all-group model (for ##definedSibling expansion).
-fn collect_all_group_element_qnames(model: &AllGroupModel) -> Vec<(Option<NameId>, NameId)> {
+/// Collect all element QNames from an all-group model (for ##definedSibling
+/// expansion). Includes substitution-group members of each declared element.
+fn collect_all_group_element_qnames(
+    schema_set: &SchemaSet,
+    model: &AllGroupModel,
+) -> Vec<(Option<NameId>, NameId)> {
     let mut result = Vec::new();
     for particle in &model.particles {
-        if let NfaTerm::Element { namespace, name, .. } = &particle.term {
+        if let NfaTerm::Element { namespace, name, element_key, .. } = &particle.term {
             let qname = (*namespace, *name);
             if !result.contains(&qname) {
                 result.push(qname);
+            }
+            if let Some(head_key) = element_key {
+                collect_substitution_members(schema_set, *head_key, &mut result);
             }
         }
     }

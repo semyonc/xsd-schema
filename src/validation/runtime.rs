@@ -672,6 +672,45 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         SchemaInfo::empty()
     }
 
+    /// XSD 1.1 dynamic EDC (§3.4.6.4 / cvc-complex-type rule 5): when a
+    /// wildcard accepts an element and resolves it to a governing type/decl,
+    /// that governing binding must be consistent with any locally declared
+    /// element binding for the same QName in the same content model. Returns
+    /// `Some(reason)` on violation; the caller should mark the child invalid
+    /// and emit a `cvc-complex-type.5` error after push.
+    #[cfg(feature = "xsd11")]
+    fn dynamic_edc_violation_reason(
+        &self,
+        matched_via_wildcard: bool,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        governing_type: Option<TypeKey>,
+        governing_decl: Option<ElementKey>,
+    ) -> Option<String> {
+        if !matched_via_wildcard || !self.schema_set.is_xsd11() {
+            return None;
+        }
+        let parent_ct = match self
+            .validation_stack
+            .last()
+            .and_then(|p| p.schema_type)
+        {
+            Some(TypeKey::Complex(ct_key)) => ct_key,
+            _ => return None,
+        };
+        match crate::schema::edc::check_dynamic_edc(
+            self.schema_set,
+            self.subst_groups.as_ref(),
+            parent_ct,
+            (namespace, local_name),
+            governing_type,
+            governing_decl,
+        ) {
+            crate::schema::edc::EdcOutcome::Mismatch { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
     /// Validate an element start event (NameId fast-path)
     pub fn validate_element_by_id(
         &mut self,
@@ -770,6 +809,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // 3. Look up element declaration: prefer content model match, fall back to global
         let matched_elem_key = match_info.and_then(|i| i.element_key);
         let matched_type = match_info.and_then(|i| i.resolved_type);
+
+        // Was this element matched via a content-model wildcard (or open content)?
+        // Set when the matched particle was a wildcard, regardless of strict/lax/skip.
+        // §3.4.6.4 dynamic EDC fires only on wildcard matches.
+        #[cfg(feature = "xsd11")]
+        let matched_via_wildcard = match_info
+            .as_ref()
+            .and_then(|i| i.process_contents)
+            .is_some();
 
         // Determine process_contents before element_key lookup: a skip wildcard
         // must suppress the global declaration lookup (§3.10.4 cvc-wildcard).
@@ -878,6 +926,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
                     && ev_state.process_contents != ContentProcessing::Skip;
+                // §3.4.6.4 dynamic EDC for the no-element-key wildcard branch:
+                // even without a governing global declaration, an xsi:type may
+                // supply a governing type whose binding must agree with any
+                // QName-equal local element declaration in the parent CT.
+                #[cfg(feature = "xsd11")]
+                let edc_violation_b = self.dynamic_edc_violation_reason(
+                    matched_via_wildcard,
+                    local_name,
+                    namespace,
+                    ev_state.schema_type,
+                    None,
+                );
+                #[cfg(feature = "xsd11")]
+                if edc_violation_b.is_some() {
+                    ev_state.validity = SchemaValidity::Invalid;
+                }
                 let schema_type = ev_state.schema_type;
                 let content_type = ev_state.content_type;
                 let validity = ev_state.validity;
@@ -885,6 +949,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let needs_undeclared_error = process_contents == ContentProcessing::Strict
                     && schema_type.is_none();
                 self.push_element(ev_state);
+                #[cfg(feature = "xsd11")]
+                if let Some(reason) = edc_violation_b {
+                    let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
+                    self.report_error(
+                        "cvc-complex-type.5",
+                        format!(
+                            "Element '{}' matched a wildcard but its governing type is \
+                             inconsistent with the local element declaration in the \
+                             parent's content model: {}",
+                            elem_name, reason,
+                        ),
+                    );
+                }
                 // Emit deferred xsi:type errors now that the child is on the stack
                 self.emit_deferred_xsi_type_errors(wildcard_xsi_type_errors);
                 if needs_undeclared_error {
@@ -1035,6 +1112,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // 8. Initialize content model and determine ContentType
         let (content_state, content_type) = self.init_content_model(type_key);
 
+        // §3.4.6.4 dynamic EDC: when this element was matched by a wildcard
+        // (not directly by an element particle), the resolved governing decl
+        // and effective type must be consistent with any QName-equal local
+        // element declaration in the parent CT.
+        #[cfg(feature = "xsd11")]
+        let edc_violation_a = self.dynamic_edc_violation_reason(
+            matched_via_wildcard,
+            local_name,
+            namespace,
+            type_key,
+            Some(elem_key),
+        );
+
         // 9. Push ElementValidationState
         let mut ev_state = ElementValidationState::new(local_name, namespace);
                 ev_state.ns_context = Some(ns_context.clone());
@@ -1049,6 +1139,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             SchemaValidity::Valid
         };
+        #[cfg(feature = "xsd11")]
+        if edc_violation_a.is_some() {
+            ev_state.validity = SchemaValidity::Invalid;
+        }
         ev_state.process_contents = process_contents;
         // Strictly assessed: has governing declaration or type, and not skipped
         ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
@@ -1059,6 +1153,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .alternatives.is_empty();
         }
         self.push_element(ev_state);
+        #[cfg(feature = "xsd11")]
+        if let Some(reason) = edc_violation_a.as_ref() {
+            let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
+            self.report_error(
+                "cvc-complex-type.5",
+                format!(
+                    "Element '{}' matched a wildcard but its governing element declaration \
+                     is inconsistent with the local element declaration in the parent's \
+                     content model: {}",
+                    elem_name, reason,
+                ),
+            );
+        }
 
         // Emit deferred xsi:type errors now that the child is on the stack
         self.emit_deferred_xsi_type_errors(xsi_type_deferred_errors);
@@ -1098,11 +1205,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.detect_assertions_on_element(type_key, local_name, namespace);
 
         // 10. Return SchemaInfo
-        let validity = if xsi_type_invalid || abstract_type_invalid {
+        #[allow(unused_mut)]
+        let mut validity = if xsi_type_invalid || abstract_type_invalid {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid
         };
+        #[cfg(feature = "xsd11")]
+        if edc_violation_a.is_some() {
+            validity = SchemaValidity::Invalid;
+        }
         SchemaInfo {
             element_decl: Some(elem_key),
             attribute_decl: None,

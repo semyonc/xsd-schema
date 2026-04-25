@@ -29,6 +29,8 @@ pub mod derivation;
 pub mod redefine;
 #[cfg(feature = "xsd11")]
 pub mod override_dir;
+#[cfg(feature = "xsd11")]
+pub mod edc;
 
 // Re-exports from model
 pub use model::{

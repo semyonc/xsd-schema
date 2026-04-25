@@ -607,6 +607,7 @@ fn test_attach_open_content_all_group() {
         NamespaceConstraint, ProcessContents as TypesProcessContents,
     };
 
+    let schema_set = SchemaSet::with_version(XsdVersion::V1_0);
     let a_name = NameId(1);
     let model = AllGroupModel::new(vec![
         AllParticle::new(
@@ -629,7 +630,7 @@ fn test_attach_open_content_all_group() {
         source: None,
     };
 
-    let result = attach_open_content(matcher, Some(oc));
+    let result = attach_open_content(&schema_set, matcher, Some(oc));
     match result {
         ContentModelMatcher::AllGroup(model) => {
             assert!(model.open_content.is_some(), "open content should be populated");
@@ -1116,7 +1117,7 @@ fn test_defined_sibling_open_content_nfa() {
     // has_defined_sibling should be set
     assert!(oc.wildcard.as_ref().unwrap().has_defined_sibling);
 
-    let result = attach_open_content(matcher, Some(oc));
+    let result = attach_open_content(&schema_set, matcher, Some(oc));
     match result {
         ContentModelMatcher::WithOpenContent { wildcard, .. } => {
             let wref = wildcard.expect("wildcard should be present");
@@ -1179,7 +1180,7 @@ fn test_defined_sibling_open_content_all_group() {
     };
     let oc = open_content_from_result(&oc_result, &schema_set, None).unwrap();
 
-    let result = attach_open_content(matcher, Some(oc));
+    let result = attach_open_content(&schema_set, matcher, Some(oc));
     match result {
         ContentModelMatcher::AllGroup(model) => {
             let oc_wc = model.open_content.expect("open content should be present");
