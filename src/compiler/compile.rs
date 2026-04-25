@@ -1212,7 +1212,34 @@ fn compile_content_model_matcher_impl(
                 Some(particle) => {
                     // Check if extension's own particle is an inline all-group
                     if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
-                        // Merge: base all-group + extension all-group → single AllGroup
+                        // §3.4.2.3 / cos-ct-extends: when both base and extension
+                        // are all-groups, their outer {min occurs} must match.
+                        let base_outer_optional = base_all_model.outer_optional;
+                        let ext_outer_optional = particle.min_occurs == 0;
+                        if base_outer_optional != ext_outer_optional {
+                            return Err(NfaCompileError::InvalidAllGroupOccurs {
+                                reason: format!(
+                                    "cos-ct-extends: when extending an xs:all base with an xs:all, \
+                                     the outer minOccurs must match (base minOccurs={}, \
+                                     extension minOccurs={})",
+                                    if base_outer_optional { 0 } else { 1 },
+                                    particle.min_occurs,
+                                ),
+                                location: particle.source.clone().or_else(|| ext_source.cloned()),
+                            });
+                        }
+
+                        // Reject extending an empty xs:all — there is no
+                        // base content to extend and the resulting type would
+                        // collapse to the extension's own all-group, which is
+                        // not a true extension. (W3C bug 6202; Saxon allows
+                        // this but conformance tests treat it as invalid.)
+                        if base_all_model.particles.is_empty() {
+                            return Err(NfaCompileError::InvalidAllGroupContent {
+                                location: particle.source.clone().or_else(|| ext_source.cloned()),
+                            });
+                        }
+
                         let mut ctx = if upa_mode {
                             CompileContext::new_for_upa(schema_set, type_def.target_namespace)
                         } else {
@@ -1225,31 +1252,22 @@ fn compile_content_model_matcher_impl(
                         ctx.content_flat_idx = Some(0);
                         let ext_model = ctx.compile_all_group_model(ext_particles, ext_source)?;
 
+                        let merged_outer_optional = base_outer_optional && ext_outer_optional;
                         let mut merged_particles = base_all_model.particles;
                         merged_particles.extend(ext_model.particles);
-                        let merged = AllGroupModel::new(merged_particles);
+                        let mut merged = AllGroupModel::new(merged_particles);
+                        merged.outer_optional = merged_outer_optional;
                         let matcher = ContentModelMatcher::AllGroup(merged);
                         return Ok(attach_open_content(matcher, open_content));
                     }
 
-                    // Extension is sequence/choice — compile as NFA, return composite
-                    let mut ctx = if upa_mode {
-                        CompileContext::new_for_upa(schema_set, type_def.target_namespace)
-                    } else {
-                        CompileContext::new(schema_set, type_def.target_namespace)
-                    };
-                    ctx.resolved_particle_types =
-                        type_def.resolved_content_particle_types.to_vec();
-                    ctx.resolved_particle_elements =
-                        type_def.resolved_content_particle_elements.to_vec();
-                    ctx.content_flat_idx = Some(0);
-                    let ext_nfa = ctx.compile_particle(particle)?;
-
-                    let matcher = ContentModelMatcher::AllGroupExtension {
-                        base_model: base_all_model,
-                        extension_nfa: ext_nfa,
-                    };
-                    return Ok(attach_open_content(matcher, open_content));
+                    // Extension is sequence/choice/group-ref — invalid per
+                    // cos-all-limited.1.2: an xs:all may only appear at the top
+                    // of a content model. Wrapping the base's all-group inside
+                    // a sequence(base, extension) violates that constraint.
+                    return Err(NfaCompileError::InvalidAllGroupContent {
+                        location: particle.source.clone(),
+                    });
                 }
             }
         }

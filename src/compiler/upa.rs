@@ -21,6 +21,7 @@ use crate::parser::location::SourceRef;
 use crate::schema::model::{SchemaSet, XsdVersion};
 use crate::types::complex::{NamespaceConstraint, not_qnames_exclude, other_matches_namespace};
 
+use super::all_group::AllGroupModel;
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{build_substitution_group_map, SubstitutionGroupMap};
 
@@ -587,6 +588,67 @@ pub fn check_upa(
         {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
+    }
+
+    Ok(())
+}
+
+/// Check UPA constraints for an all-group content model (XSD 1.1).
+///
+/// XSD 1.0 forbids wildcards in `xs:all`, so only element-element conflicts
+/// matter; the no-wildcards check is enforced separately by
+/// `validate_all_group_constraints`. XSD 1.1 allows wildcards but requires:
+///
+/// - Element-element conflicts (same name or substitution group overlap):
+///   always an error.
+/// - Wildcard-wildcard conflicts (overlapping namespace constraints): always
+///   an error.
+/// - Element-wildcard conflicts: allowed in XSD 1.1 (element wins by
+///   §3.8.6.4 Particle Subsumption priority).
+///
+/// All-group particles are independent (not part of an NFA), so the check
+/// runs over the particle list directly without epsilon-closure analysis.
+pub fn check_all_group_upa(
+    model: &AllGroupModel,
+    schema_set: &SchemaSet,
+    target_namespace: Option<NameId>,
+) -> SchemaResult<()> {
+    let xsd_version = schema_set.xsd_version;
+    let substitution_sets = build_substitution_group_map(schema_set);
+
+    let mut elements: Vec<ReachableTerm> = Vec::new();
+    let mut wildcards: Vec<ReachableTerm> = Vec::new();
+    for particle in &model.particles {
+        let reachable = ReachableTerm {
+            term: particle.term.clone(),
+            origin: particle.source.clone(),
+        };
+        match &particle.term {
+            NfaTerm::Element { .. } => elements.push(reachable),
+            NfaTerm::Wildcard { .. } => wildcards.push(reachable),
+        }
+    }
+
+    // Sentinel state ID since all-groups don't have NFA states. Used only
+    // for error reporting context.
+    const ALL_GROUP_STATE_ID: StateId = 0;
+
+    if let Err(error) = check_element_element_conflicts(
+        &elements,
+        ALL_GROUP_STATE_ID,
+        schema_set,
+        &substitution_sets,
+    ) {
+        return Err(upa_error_to_schema_error(schema_set, error));
+    }
+
+    if let Err(error) = check_wildcard_wildcard_conflicts(
+        &wildcards,
+        ALL_GROUP_STATE_ID,
+        target_namespace,
+        xsd_version,
+    ) {
+        return Err(upa_error_to_schema_error(schema_set, error));
     }
 
     Ok(())

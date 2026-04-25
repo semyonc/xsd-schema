@@ -2330,14 +2330,38 @@ fn merge_duplicate_elements(particles: &[NormalizedParticle]) -> Vec<NormalizedP
     merged
 }
 
-/// RecurseUnordered: order-independent bipartite matching of particles.
-/// Each derived particle must match some base particle (one-to-one),
-/// and unmatched base particles must be emptiable.
+/// RecurseUnordered: order-independent matching of derived particles against
+/// the base all-group's particles. Combines two strategies:
+///
+/// 1. **Count-based bucket subsumption** (preferred — handles substitution
+///    groups, wildcard partition, and choice expansion). Each derived
+///    particle is assigned to a base "bucket" (by name match, substitution
+///    group head, or wildcard subset). For each bucket the summed derived
+///    occurrence range must fit within the base particle's range; unassigned
+///    base particles must be emptiable.
+///
+/// 2. **Bipartite 1-to-1 matching** (fallback for derived particles that
+///    contain nested groups not handled by the bucket approach). Each derived
+///    particle must restrict some base particle; unmatched base particles
+///    must be emptiable.
 fn recurse_unordered(
     schema_set: &SchemaSet,
     derived_particles: &[NormalizedParticle],
     base_particles: &[NormalizedParticle],
 ) -> bool {
+    // Try count-based bucket subsumption first — it handles substitution
+    // group merging, wildcard partition, and choice distribution.
+    if let Some(result) = try_count_based_subsumption(schema_set, derived_particles, base_particles) {
+        if result {
+            return true;
+        }
+        // Bucket said "no" — but for the failure path we still try bipartite
+        // because it can recover via different particle wirings (e.g. when
+        // a derived particle could fit either an element or wildcard bucket
+        // but the bucket heuristic picked the wrong one).
+    }
+
+    // Fallback: bipartite 1-to-1 matching with same-name merge.
     fn backtrack(
         schema_set: &SchemaSet,
         derived_particles: &[NormalizedParticle],
@@ -2381,6 +2405,244 @@ fn recurse_unordered(
 
     let mut used = vec![false; base_particles.len()];
     backtrack(schema_set, derived_particles, base_particles, &mut used, 0)
+}
+
+/// Count-based subsumption: bucket each derived particle by the base particle
+/// it maps to, sum derived occurrence ranges per bucket, and check that the
+/// summed range fits the base range. Unassigned base particles must be
+/// emptiable.
+///
+/// Returns:
+/// - `Some(true)` — the derived particles validly restrict the base under
+///   count-based subsumption (substitution groups, wildcard partition, and
+///   top-level derived choices are all handled).
+/// - `Some(false)` — every derived particle was bucket-able but the
+///   per-bucket sum exceeded the base range or an unassigned base particle
+///   is not emptiable.
+/// - `None` — at least one derived particle is a nested model group; the
+///   caller should fall back to bipartite matching.
+fn try_count_based_subsumption(
+    schema_set: &SchemaSet,
+    derived_particles: &[NormalizedParticle],
+    base_particles: &[NormalizedParticle],
+) -> Option<bool> {
+    // Step 1: Expand top-level choices into optional alternatives.
+    let expanded = expand_top_level_choices_for_unordered(derived_particles)?;
+
+    // Step 2: Bucket each expanded derived particle to a base index.
+    let mut buckets: Vec<Vec<(u32, Option<u32>)>> = vec![Vec::new(); base_particles.len()];
+    for derived in &expanded {
+        // Nested groups are not bucket-able here.
+        if matches!(&derived.term, NormalizedParticleTerm::Group(_)) {
+            return None;
+        }
+
+        let bucket_idx = find_subsumption_bucket(schema_set, derived, base_particles)?;
+        match bucket_idx {
+            Some(idx) => buckets[idx].push((derived.min_occurs, derived.max_occurs)),
+            None => return Some(false),
+        }
+    }
+
+    // Step 3: Check each bucket's summed range fits the base range; unmatched
+    // base particles must be emptiable.
+    for (i, ranges) in buckets.iter().enumerate() {
+        let base = &base_particles[i];
+        if ranges.is_empty() {
+            if !particle_is_emptiable(base) {
+                return Some(false);
+            }
+        } else {
+            let (sum_min, sum_max) = ranges.iter().fold(
+                (0u32, Some(0u32)),
+                |(amin, amax), &(min, max)| {
+                    (amin.saturating_add(min), add_optional_occurs(amax, max))
+                },
+            );
+            if !occurs_range_is_subset(sum_min, sum_max, base.min_occurs, base.max_occurs) {
+                return Some(false);
+            }
+        }
+    }
+
+    Some(true)
+}
+
+/// Expand top-level derived choices into a flat list of element/wildcard
+/// particles, treating each branch as an optional alternative. This enables
+/// the count-based subsumption to handle cases like all234 where a derived
+/// sequence contains a `<xs:choice>` that distributes across base all-group
+/// particles.
+///
+/// Returns `None` if any derived particle contains a nested group whose
+/// shape can't be flattened (the caller falls back to bipartite matching).
+fn expand_top_level_choices_for_unordered(
+    particles: &[NormalizedParticle],
+) -> Option<Vec<NormalizedParticle>> {
+    let mut result = Vec::with_capacity(particles.len());
+    for p in particles {
+        match &p.term {
+            NormalizedParticleTerm::Group(group) if group.compositor == Compositor::Choice => {
+                // Each branch becomes a particle with min=0 (might not be picked)
+                // and max = outer_max * branch_max.
+                let outer_max = p.max_occurs;
+                for branch in &group.particles {
+                    if matches!(&branch.term, NormalizedParticleTerm::Group(_)) {
+                        // Nested group inside choice — bail to bipartite.
+                        return None;
+                    }
+                    let new_max = match (outer_max, branch.max_occurs) {
+                        (Some(om), Some(bm)) => Some(om.saturating_mul(bm)),
+                        _ => None,
+                    };
+                    result.push(NormalizedParticle {
+                        term: branch.term.clone(),
+                        min_occurs: 0,
+                        max_occurs: new_max,
+                        source: branch.source.clone(),
+                    });
+                }
+            }
+            NormalizedParticleTerm::Group(_) => {
+                // Other nested groups (Sequence, All) — bail to bipartite.
+                return None;
+            }
+            _ => result.push(p.clone()),
+        }
+    }
+    Some(result)
+}
+
+/// Find which base particle bucket the derived particle should be assigned to.
+///
+/// Returns:
+/// - `Some(Some(idx))` — derived maps to base particle `idx`.
+/// - `Some(None)` — derived has no matching base particle (restriction is
+///   invalid).
+/// - `None` — derived is a nested group that can't be bucketed (caller
+///   should fall back to bipartite matching).
+///
+/// Search order:
+/// 1. Direct element name + namespace match (NameAndTypeOK without occurs).
+/// 2. Substitution group head match.
+/// 3. Element fitting a base wildcard.
+/// 4. Wildcard subset of a base wildcard.
+fn find_subsumption_bucket(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base_particles: &[NormalizedParticle],
+) -> Option<Option<usize>> {
+    match &derived.term {
+        NormalizedParticleTerm::Element(d_elem) => {
+            // 1. Direct name match
+            for (i, base) in base_particles.iter().enumerate() {
+                if let NormalizedParticleTerm::Element(b_elem) = &base.term {
+                    if d_elem.name == b_elem.name
+                        && d_elem.namespace == b_elem.namespace
+                        && name_and_type_ok_no_occurs(schema_set, d_elem, b_elem)
+                    {
+                        return Some(Some(i));
+                    }
+                }
+            }
+            // 2. Substitution group head match
+            for (i, base) in base_particles.iter().enumerate() {
+                if let NormalizedParticleTerm::Element(b_elem) = &base.term {
+                    if d_elem.name == b_elem.name && d_elem.namespace == b_elem.namespace {
+                        continue; // already tried
+                    }
+                    if derived_element_substitutes_base(schema_set, d_elem, b_elem)
+                        && name_and_type_ok_no_occurs(schema_set, d_elem, b_elem)
+                    {
+                        return Some(Some(i));
+                    }
+                }
+            }
+            // 3. Element fits base wildcard
+            for (i, base) in base_particles.iter().enumerate() {
+                if let NormalizedParticleTerm::Wildcard(b_wc) = &base.term {
+                    if wildcard_allows_element(d_elem, b_wc) {
+                        return Some(Some(i));
+                    }
+                }
+            }
+            Some(None)
+        }
+        NormalizedParticleTerm::Wildcard(d_wc) => {
+            // 4. Wildcard subset of base wildcard
+            for (i, base) in base_particles.iter().enumerate() {
+                if let NormalizedParticleTerm::Wildcard(b_wc) = &base.term {
+                    if wildcard_restricts(d_wc, b_wc) {
+                        return Some(Some(i));
+                    }
+                }
+            }
+            Some(None)
+        }
+        NormalizedParticleTerm::Group(_) => None,
+    }
+}
+
+/// NameAndTypeOK clauses 3, 4, 6, 7 (everything except clause 2 — the
+/// occurrence range subset check). Used by count-based subsumption where
+/// the occurrence check is performed at the bucket aggregate level.
+fn name_and_type_ok_no_occurs(
+    schema_set: &SchemaSet,
+    derived: &NormalizedElement,
+    base: &NormalizedElement,
+) -> bool {
+    // Clause 3: derived nillable only if base nillable.
+    if derived.nillable && !base.nillable {
+        return false;
+    }
+    // Clause 4: fixed value.
+    match (&base.fixed_value, &derived.fixed_value) {
+        (None, _) => {}
+        (Some(_), None) => return false,
+        (Some(base_fixed), Some(derived_fixed)) => {
+            if !crate::validation::simple::fixed_values_equal(
+                derived_fixed,
+                base_fixed,
+                Some(derived.type_key),
+                schema_set,
+            ) {
+                return false;
+            }
+        }
+    }
+    // Clause 6: block superset (masked to element bits).
+    if !derived
+        .block
+        .element_block_mask()
+        .contains(base.block.element_block_mask())
+    {
+        return false;
+    }
+    // Clause 7: type derivation.
+    schema_set.is_type_derived_from(derived.type_key, base.type_key, DerivationSet::extension())
+}
+
+/// Check whether the derived element is a substitution group member of the
+/// base element. Looks up the global element by name when the derived
+/// element_key is None (local declaration), per W3C bug 5296 — a local
+/// element can match a substitution group via its global namesake.
+fn derived_element_substitutes_base(
+    schema_set: &SchemaSet,
+    derived: &NormalizedElement,
+    base: &NormalizedElement,
+) -> bool {
+    let d_key = derived
+        .element_key
+        .or_else(|| schema_set.lookup_element(derived.namespace, derived.name));
+    let b_key = base
+        .element_key
+        .or_else(|| schema_set.lookup_element(base.namespace, base.name));
+    match (d_key, b_key) {
+        (Some(d), Some(b)) => {
+            crate::compiler::substitution::is_element_substitutable_for(schema_set, b, d)
+        }
+        _ => false,
+    }
 }
 
 /// True when two or more element particles in the slice share the same

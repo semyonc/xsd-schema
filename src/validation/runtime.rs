@@ -1695,22 +1695,30 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                     _ => {}
                 }
+            }
 
-                // 2. Check xsi:nil
-                if ev_state.is_nil {
-                    let elem_name = self
-                        .schema_set
-                        .name_table
-                        .resolve(ev_state.local_name)
-                        .to_string();
-                    pending_errors.push((
-                        "cvc-elt.3.1",
-                        format!(
-                            "Element '{}' is nilled but has non-empty text content",
-                            elem_name,
-                        ),
-                    ));
-                }
+            // 2. Check xsi:nil — per cvc-elt.3.2.1 (XSD 1.1 §3.3.4.3),
+            // a nilled element's children must be empty: no element info items
+            // and no character info items. For mixed content this includes
+            // whitespace, which is otherwise significant (only ignorable in
+            // element-only content).
+            if ev_state.is_nil
+                && (has_non_ws
+                    || matches!(ev_state.content_type, Some(ContentType::Mixed)))
+                && !text.is_empty()
+            {
+                let elem_name = self
+                    .schema_set
+                    .name_table
+                    .resolve(ev_state.local_name)
+                    .to_string();
+                pending_errors.push((
+                    "cvc-elt.3.2.1",
+                    format!(
+                        "Element '{}' is nilled but has non-empty content",
+                        elem_name,
+                    ),
+                ));
             }
 
             // 3. Accumulate text
@@ -1749,11 +1757,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return;
         }
 
+        let mut nil_violation: Option<String> = None;
         if let Some(ev_state) = self.validation_stack.last_mut() {
-            // Check xsi:nil for non-empty whitespace
-            if ev_state.is_nil && !text.is_empty() {
-                // Whitespace in nilled element is borderline; for now, accumulate but
-                // the final check is done in end_element for non-empty text_content
+            // cvc-elt.3.2.1: a nilled element must have empty content. For
+            // mixed and text-only content whitespace is significant, so any
+            // text (including whitespace) is invalid. Element-only and empty
+            // content treat whitespace as ignorable, so it stays accepted.
+            if ev_state.is_nil
+                && !text.is_empty()
+                && matches!(
+                    ev_state.content_type,
+                    Some(ContentType::TextOnly) | Some(ContentType::Mixed)
+                )
+            {
+                let elem_name = self
+                    .schema_set
+                    .name_table
+                    .resolve(ev_state.local_name)
+                    .to_string();
+                nil_violation = Some(format!(
+                    "Element '{}' is nilled but has non-empty content",
+                    elem_name,
+                ));
             }
 
             // Accumulate (may be needed for TextOnly simple type validation)
@@ -1764,6 +1789,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ev_state.text_content.push_str(text);
                 ev_state.has_text = true;
             }
+        }
+
+        if let Some(msg) = nil_violation {
+            self.report_error("cvc-elt.3.2.1", msg);
         }
 
         // Forward whitespace to assertion fragment builder (XSD 1.1)

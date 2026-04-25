@@ -586,13 +586,18 @@ fn test_extension_from_all_group_base_with_own_particles() {
     ext_type.derivation_method = Some(DerivationMethod::Extension);
     ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
 
-    let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
+    let result = compile_content_model_matcher(&schema_set, &ext_type);
     // XSD 1.0: AllGroup converted to NFA, concat with own → Nfa
-    // XSD 1.1: AllGroup base + sequence extension → AllGroupExtension
+    // XSD 1.1: extending an xs:all base with a non-all particle violates
+    // cos-all-limited.1.2 (an xs:all may only appear at the top of a content
+    // model). The compiler rejects with InvalidAllGroupContent.
     #[cfg(not(feature = "xsd11"))]
-    assert!(matches!(matcher, ContentModelMatcher::Nfa(_)));
+    assert!(matches!(result.unwrap(), ContentModelMatcher::Nfa(_)));
     #[cfg(feature = "xsd11")]
-    assert!(matches!(matcher, ContentModelMatcher::AllGroupExtension { .. }));
+    assert!(matches!(
+        result,
+        Err(crate::compiler::NfaCompileError::InvalidAllGroupContent { .. })
+    ));
 }
 
 #[test]
@@ -752,13 +757,14 @@ fn test_extension_all_group_base_with_sequence() {
     ext_type.derivation_method = Some(DerivationMethod::Extension);
     ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
 
-    let matcher = compile_content_model_matcher(&schema_set, &ext_type).unwrap();
-    match &matcher {
-        ContentModelMatcher::AllGroupExtension { base_model, .. } => {
-            assert_eq!(base_model.particle_count(), 2);
-        }
-        other => panic!("expected AllGroupExtension, got {:?}", other),
-    }
+    // XSD 1.1: extending an xs:all base with a non-all particle violates
+    // cos-all-limited.1.2 — the result would wrap the all-group inside a
+    // sequence, which the spec forbids.
+    let result = compile_content_model_matcher(&schema_set, &ext_type);
+    assert!(matches!(
+        result,
+        Err(crate::compiler::NfaCompileError::InvalidAllGroupContent { .. })
+    ));
 }
 
 // ========================================================================
