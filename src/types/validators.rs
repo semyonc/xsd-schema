@@ -869,6 +869,14 @@ fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
     day_secs(a) == day_secs(b)
 }
 
+fn year_month_duration_value_eq(a: &YearMonthDurationValue, b: &YearMonthDurationValue) -> bool {
+    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
+fn day_time_duration_value_eq(a: &DayTimeDurationValue, b: &DayTimeDurationValue) -> bool {
+    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
 // ============================================================================
 // ---------------------------------------------------------------------------
 // Date/time bound checking helper
@@ -3151,8 +3159,12 @@ impl TypeValidator for YearMonthDurationValidator {
             validate_bounds(dur, facets, "yearMonthDuration", value, |s| {
                 parse_year_month_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(dur, parse_year_month_duration, |a, b| year_month_duration_value_eq(a, &b)),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 
@@ -3187,8 +3199,12 @@ impl TypeValidator for DayTimeDurationValidator {
             validate_bounds(dur, facets, "dayTimeDuration", value, |s| {
                 parse_day_time_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(dur, parse_day_time_duration, |a, b| day_time_duration_value_eq(a, &b)),
+                value,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
+        facets.validate_patterns_only(value)?;
         Ok(result)
     }
 

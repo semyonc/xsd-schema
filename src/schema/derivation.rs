@@ -214,7 +214,7 @@ fn validate_applicable_facets(
             // (§4.1.5 / Table F.1 of Datatypes). Walk up the base chain to the
             // closest built-in primitive and check each facet kind against it.
             if let Some(primitive_code) = primitive_type_code(schema_set, type_def) {
-                use crate::types::facets::{facet_applicable_for_type, FacetApplicability, FacetKind};
+                use crate::types::facets::{facet_applicable_for_type, ExplicitTimezone, FacetApplicability, FacetKind, WhitespaceMode};
                 let facets = &type_def.facets;
                 let mut bad: Vec<&'static str> = Vec::new();
                 let mut check = |present: bool, kind: FacetKind| {
@@ -238,6 +238,30 @@ fn validate_applicable_facets(
                 check(facets.total_digits.is_some(), FacetKind::TotalDigits);
                 check(facets.fraction_digits.is_some(), FacetKind::FractionDigits);
                 check(facets.explicit_timezone.is_some(), FacetKind::ExplicitTimezone);
+                if let Some(ws) = &facets.whitespace {
+                    if !matches!(primitive_code,
+                        crate::types::XmlTypeCode::String
+                            | crate::types::XmlTypeCode::NormalizedString
+                            | crate::types::XmlTypeCode::Token
+                            | crate::types::XmlTypeCode::Language
+                            | crate::types::XmlTypeCode::NmToken
+                            | crate::types::XmlTypeCode::Name
+                            | crate::types::XmlTypeCode::NCName
+                            | crate::types::XmlTypeCode::Id
+                            | crate::types::XmlTypeCode::IdRef
+                            | crate::types::XmlTypeCode::Entity)
+                        && ws.value != WhitespaceMode::Collapse
+                    {
+                        bad.push(FacetKind::Whitespace.name());
+                    }
+                }
+                if let Some(tz) = &facets.explicit_timezone {
+                    if primitive_code == crate::types::XmlTypeCode::DateTimeStamp
+                        && tz.value != ExplicitTimezone::Required
+                    {
+                        bad.push(FacetKind::ExplicitTimezone.name());
+                    }
+                }
                 if !bad.is_empty() {
                     let (location, type_name) = type_error_context(schema_set, type_def);
                     return Err(SchemaError::structural(
@@ -3364,7 +3388,139 @@ fn validate_facet_values_against_base_type(
         check_bound(&f.value, "maxExclusive-valid-restriction", FacetKind::MaxExclusive)?;
     }
 
+    validate_typed_bound_consistency(schema_set, &type_def.facets, base_key, &type_name, &location)?;
+
     Ok(())
+}
+
+fn validate_typed_bound_consistency(
+    schema_set: &SchemaSet,
+    facets: &FacetSet,
+    base_key: TypeKey,
+    type_name: &str,
+    location: &Option<SourceLocation>,
+) -> SchemaResult<()> {
+    let check_pair = |lower: Option<&str>,
+                      upper: Option<&str>,
+                      lower_name: &'static str,
+                      upper_name: &'static str,
+                      allow_equal: bool|
+     -> SchemaResult<()> {
+        let (Some(lower), Some(upper)) = (lower, upper) else { return Ok(()); };
+        let Some(cmp) = compare_bound_literals(schema_set, base_key, lower, upper) else {
+            return Ok(());
+        };
+        let valid = if allow_equal {
+            matches!(cmp, std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+        } else {
+            cmp == std::cmp::Ordering::Less
+        };
+        if valid {
+            return Ok(());
+        }
+        Err(SchemaError::structural(
+            "cos-st-restricts",
+            format!(
+                "{} value '{}' is not below {} value '{}' in type '{}'",
+                lower_name, lower, upper_name, upper, type_name
+            ),
+            location.clone(),
+        ))
+    };
+
+    check_pair(
+        facets.min_inclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_inclusive.as_ref().map(|f| f.value.as_str()),
+        "minInclusive",
+        "maxInclusive",
+        true,
+    )?;
+    check_pair(
+        facets.min_exclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_exclusive.as_ref().map(|f| f.value.as_str()),
+        "minExclusive",
+        "maxExclusive",
+        false,
+    )?;
+    check_pair(
+        facets.min_inclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_exclusive.as_ref().map(|f| f.value.as_str()),
+        "minInclusive",
+        "maxExclusive",
+        false,
+    )?;
+    check_pair(
+        facets.min_exclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_inclusive.as_ref().map(|f| f.value.as_str()),
+        "minExclusive",
+        "maxInclusive",
+        false,
+    )
+}
+
+fn compare_bound_literals(
+    schema_set: &SchemaSet,
+    base_key: TypeKey,
+    lower: &str,
+    upper: &str,
+) -> Option<std::cmp::Ordering> {
+    let parse_base = bound_comparison_base(schema_set, base_key);
+    let lower = crate::validation::simple::validate_simple_type(lower, parse_base, schema_set).ok()?;
+    let upper = crate::validation::simple::validate_simple_type(upper, parse_base, schema_set).ok()?;
+    compare_xml_values(&lower.typed_value, &upper.typed_value)
+}
+
+fn bound_comparison_base(schema_set: &SchemaSet, key: TypeKey) -> TypeKey {
+    let mut current = key;
+    for _ in 0..100 {
+        let TypeKey::Simple(sk) = current else { return current; };
+        let Some(st) = schema_set.arenas.simple_types.get(sk) else { return current; };
+        let has_bounds_or_enum = st.facets.enumeration.is_some()
+            || st.facets.min_inclusive.is_some()
+            || st.facets.min_exclusive.is_some()
+            || st.facets.max_inclusive.is_some()
+            || st.facets.max_exclusive.is_some();
+        if !has_bounds_or_enum {
+            return current;
+        }
+        let Some(base) = st.resolved_base_type else { return current; };
+        current = base;
+    }
+    current
+}
+
+fn compare_xml_values(
+    lower: &crate::types::value::XmlValue,
+    upper: &crate::types::value::XmlValue,
+) -> Option<std::cmp::Ordering> {
+    use crate::types::value::XmlValueKind;
+    match (&lower.value, &upper.value) {
+        (XmlValueKind::Atomic(a), XmlValueKind::Atomic(b)) => compare_xml_atomic_values(a, b),
+        (XmlValueKind::Union(a), _) => compare_xml_values(a, upper),
+        (_, XmlValueKind::Union(b)) => compare_xml_values(lower, b),
+        _ => None,
+    }
+}
+
+fn compare_xml_atomic_values(
+    lower: &crate::types::value::XmlAtomicValue,
+    upper: &crate::types::value::XmlAtomicValue,
+) -> Option<std::cmp::Ordering> {
+    use crate::types::value::XmlAtomicValue;
+    match (lower, upper) {
+        (XmlAtomicValue::DateTime(a), XmlAtomicValue::DateTime(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::Date(a), XmlAtomicValue::Date(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::Time(a), XmlAtomicValue::Time(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::Duration(a), XmlAtomicValue::Duration(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::YearMonthDuration(a), XmlAtomicValue::YearMonthDuration(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::DayTimeDuration(a), XmlAtomicValue::DayTimeDuration(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::GYearMonth(a), XmlAtomicValue::GYearMonth(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::GYear(a), XmlAtomicValue::GYear(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::GMonthDay(a), XmlAtomicValue::GMonthDay(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::GDay(a), XmlAtomicValue::GDay(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::GMonth(a), XmlAtomicValue::GMonth(b)) => a.partial_cmp(b),
+        _ => None,
+    }
 }
 
 fn get_type_facets(schema_set: &SchemaSet, type_key: TypeKey) -> SchemaResult<Option<FacetSet>> {
