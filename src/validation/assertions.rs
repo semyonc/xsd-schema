@@ -11,13 +11,15 @@
 
 use crate::document::buffer::BufferDocument;
 use crate::document::navigator::BufferDocNavigator;
+use crate::navigator::{DomNavigator, TypedValue};
 use crate::ids::{ComplexTypeKey, NameId, TypeKey};
-use crate::parser::frames::AssertResult;
+use crate::parser::frames::{AssertResult, ComplexContentResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
 use crate::validation::errors::{self, ValidationError};
+use crate::validation::simple::validate_simple_type;
 use crate::xpath::api::XPathExpr;
-use crate::xpath::functions::effective_boolean_value;
+use crate::xpath::functions::{effective_boolean_value, XPathValue};
 use crate::xpath::XPathContext;
 
 use crate::arenas::SchemaArenas;
@@ -141,6 +143,44 @@ fn resolve_ct_assertion_default_ns(
 }
 
 // ---------------------------------------------------------------------------
+// compute_dollar_value — XSD 1.1 §3.13.4.1 clause 2.3 binding
+// ---------------------------------------------------------------------------
+
+/// Compute the value of `$value` for an assertion.
+///
+/// Per §3.13.4.1 clause 2.3, `$value` is bound from **E's governing
+/// type definition** (the most-derived type for the element), not from
+/// each inherited assertion's owner. So this is computed once per
+/// element and reused across all assertions in the inheritance chain:
+/// - Governing type's content variety **simple**, element not nilled,
+///   simple-type validation succeeds → the typed value.
+/// - Otherwise → empty sequence (clause 2.3.2).
+///
+/// The partial-PSVI `[validity]` is unavailable here, so any
+/// simple-type-validation failure falls into the empty-sequence branch.
+fn compute_dollar_value<'doc>(
+    doc: &'doc BufferDocument<'doc>,
+    element_ref: u32,
+    governing_ct_key: ComplexTypeKey,
+    schema_set: &SchemaSet,
+) -> XPathValue<BufferDocNavigator<'doc>> {
+    let ct = &schema_set.arenas.complex_types[governing_ct_key];
+    if !matches!(ct.content, ComplexContentResult::Simple(_)) {
+        return XPathValue::empty();
+    }
+
+    let nav = BufferDocNavigator::new(doc, element_ref);
+    if matches!(nav.typed_value(), TypedValue::Nilled) {
+        return XPathValue::empty();
+    }
+
+    match validate_simple_type(&nav.value(), TypeKey::Complex(governing_ct_key), schema_set) {
+        Ok(result) => XPathValue::from_atomic(result.typed_value),
+        Err(_) => XPathValue::empty(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // evaluate_complex_type_assertions — core evaluation
 // ---------------------------------------------------------------------------
 
@@ -156,6 +196,11 @@ pub(crate) fn evaluate_complex_type_assertions(
 ) -> Vec<ValidationError> {
     let assertions = collect_inherited_assertions(ct_key, &schema_set.arenas);
     let mut errors = Vec::new();
+
+    // §3.13.4.1 clause 2.3 ties `$value` to E's governing type
+    // (the parameter `ct_key`), so it is identical across all
+    // inherited assertions. Compute once and clone per evaluation.
+    let dollar_value = compute_dollar_value(doc, element_ref, ct_key, schema_set);
 
     for (assertion, owner_key) in assertions {
         if assertion.test.is_empty() {
@@ -176,8 +221,9 @@ pub(crate) fn evaluate_complex_type_assertions(
             ctx
         };
 
-        // Compile XPath expression (no $value variable for complex-type assertions)
-        let expr = match XPathExpr::compile(&assertion.test, &ctx) {
+        // §3.13.4.1 clause 2.2: `$value` is in scope for every assertion.
+        // Declared unconditionally so XPath that references it compiles.
+        let expr = match XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]) {
             Ok(e) => e,
             Err(e) => {
                 errors.push(errors::error(
@@ -192,11 +238,15 @@ pub(crate) fn evaluate_complex_type_assertions(
             }
         };
 
-        // Create navigator with context node = the element
         let nav = BufferDocNavigator::new(doc, element_ref);
+        let value_for_eval = dollar_value.clone();
 
-        // Evaluate
-        let result = match expr.evaluator(&ctx).run_with_node(nav) {
+        let result = match expr
+            .evaluator(&ctx)
+            .run_with_node_and_setup(Some(nav), |eval| {
+                eval.set_variable_by_name("value", value_for_eval)
+                    .expect("$value declared via compile_with_vars");
+            }) {
             Ok(r) => r,
             Err(e) => {
                 errors.push(errors::error(

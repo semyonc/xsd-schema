@@ -1225,6 +1225,15 @@ fn validate_instance_pass(
     let flags = xsd_schema::validation::ValidationFlags::default()
         | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
 
+    // XSD 1.1 `xs:assert` evaluation requires the fragment-buffer validator;
+    // `SchemaValidator::new` silently strips PROCESS_ASSERTIONS and disables
+    // assertion evaluation. XSD 1.0 schemas have no assertions, so the
+    // fragment-buffer mode is a no-op for them (has_inherited_assertions
+    // returns false everywhere → zero buffering, zero XPath compiles).
+    #[cfg(feature = "xsd11")]
+    let validator =
+        xsd_schema::validation::SchemaValidator::new_fragment_buffer(schema_set, flags);
+    #[cfg(not(feature = "xsd11"))]
     let validator = xsd_schema::validation::SchemaValidator::new(schema_set, flags);
     let mut errors = Vec::new();
     let mut warnings = Vec::new();

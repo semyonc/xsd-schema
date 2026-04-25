@@ -317,10 +317,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Field declaration order guarantees fragment_builder drops before fragment_arena.
         let arena_ref: &'a Bump = unsafe { &*(&**arena_box as *const Bump) };
         let names_ref: &'a crate::namespace::table::NameTable = &self.schema_set.name_table;
+        // Pass the SchemaSet through so navigator.typed_value() can resolve
+        // bindings against the schema arenas. Without it the navigator
+        // short-circuits to TypedValue::Untyped (navigator.rs:683-686),
+        // and assertion XPath sees every typed attribute/element as
+        // xs:untypedAtomic — value-comparison operators then fail with
+        // "op:eq is not defined for xs:untypedAtomic and ...".
         match BufferDocumentBuilder::new(
             arena_ref,
             names_ref,
-            None,
+            Some(self.schema_set),
             BufferDocumentOptions::fragment(),
         ) {
             Ok(builder) => {
@@ -351,6 +357,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if let Some(arena) = self.fragment_arena.as_mut() {
             arena.reset();
         }
+    }
+
+    /// Unified message format for assertion-fragment-buffer aborts.
+    #[cfg(feature = "xsd11")]
+    fn abort_assertion_buffer_op(&mut self, context: &str, e: impl std::fmt::Display) {
+        self.abort_assertion_buffering(format!(
+            "Assertion fragment buffer error ({}): {}",
+            context, e
+        ));
+    }
+
+    /// Install a schema binding on a buffered fragment node, aborting
+    /// the buffer with a labelled error on failure. Returns `false` if
+    /// the buffer was aborted, so callers can short-circuit.
+    #[cfg(feature = "xsd11")]
+    fn install_fragment_binding(
+        &mut self,
+        node_ref: u32,
+        binding: crate::document::type_remap::NodeSchemaBinding,
+        context: &str,
+    ) -> bool {
+        let Some(builder) = self.fragment_builder.as_mut() else {
+            return true;
+        };
+        if let Err(e) = builder.set_node_binding(node_ref, binding) {
+            self.abort_assertion_buffer_op(context, e);
+            return false;
+        }
+        true
     }
 
     /// Called after every `push_element()`. Detects whether the element's
@@ -401,13 +436,38 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 Err(e) => {
                     self.report_error(
                         "cvc-assertion",
-                        format!("Assertion fragment buffer error: {}", e),
+                        format!("Assertion fragment buffer error (start_element): {}", e),
                     );
                     return;
                 }
             },
             None => return, // builder was not created (error already reported)
         };
+
+        // Install schema binding for descendant elements so assertion
+        // XPath sees their declared type. The asserter element itself
+        // is left unbound — per §3.13.4.1 (note around clause 2.3.1.3),
+        // it has annotation `anyType`, so `data(.)` and `string(.)`
+        // yield xs:untypedAtomic; the typed value is exposed via
+        // `$value`. Observable in saxonData/Assert/assert014–017.
+        if has_assertions.is_none() {
+            if let Some(tk) = type_key {
+                let (element_decl, content_type) = self
+                    .validation_stack
+                    .last()
+                    .map(|ev| (ev.element_decl, ev.content_type))
+                    .unwrap_or((None, None));
+                let binding = crate::document::type_remap::NodeSchemaBinding {
+                    type_key: tk,
+                    element_decl,
+                    attribute_decl: None,
+                    content_type,
+                };
+                if !self.install_fragment_binding(element_ref, binding, "element binding") {
+                    return;
+                }
+            }
+        }
 
         // Save element_ref for potential CTA re-detection
         if let Some(ev) = self.validation_stack.last_mut() {
@@ -516,10 +576,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     .as_mut()
                     .map(|b| b.attribute(&local, &ns_str, "", value));
                 if let Some(Err(e)) = result {
-                    self.abort_assertion_buffering(format!(
-                        "Assertion fragment buffer error (attribute replay): {}",
-                        e
-                    ));
+                    self.abort_assertion_buffer_op("attribute replay", e);
                     return;
                 }
             }
@@ -1104,25 +1161,34 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return SchemaInfo::invalid();
         }
 
-        // Forward attribute to assertion fragment builder (XSD 1.1)
+        // Forward attribute to assertion fragment builder (XSD 1.1).
         // Done before ev_state borrow to avoid borrow conflict.
+        // The returned attr_ref is stashed so we can install the schema
+        // binding (type/decl/content_type) once validation has resolved
+        // the attribute's type — without a binding, navigator.typed_value()
+        // returns Untyped and assertion XPath value-comparisons reject the
+        // attribute as xs:untypedAtomic (§3.13.4.1, §3.5).
         #[cfg(feature = "xsd11")]
-        if self.is_buffering_assertions() {
+        let fragment_attr_ref: Option<u32> = if self.is_buffering_assertions() {
             let local = self.schema_set.name_table.resolve(local_name);
             let ns = namespace
                 .map(|id| self.schema_set.name_table.resolve(id).to_string())
                 .unwrap_or_default();
-            let result = self
+            let attempt = self
                 .fragment_builder
                 .as_mut()
                 .map(|b| b.attribute(&local, &ns, "", value));
-            if let Some(Err(e)) = result {
-                self.abort_assertion_buffering(format!(
-                    "Assertion fragment buffer error (attribute): {}",
-                    e
-                ));
+            match attempt {
+                Some(Ok(r)) => Some(r),
+                Some(Err(e)) => {
+                    self.abort_assertion_buffer_op("attribute", e);
+                    None
+                }
+                None => None,
             }
-        }
+        } else {
+            None
+        };
 
         // Detect xml:base unconditionally (regardless of ALLOW_XML_ATTRIBUTES)
         // and update the current element's base URI for schema-location hints.
@@ -1194,6 +1260,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // @* on an element with both schema and xsi: attributes correctly
             // detects the multi-node condition (cvc-identity-constraint.4.2.1).
             self.post_process_attribute(local_name, namespace, value, &result);
+            #[cfg(feature = "xsd11")]
+            self.bind_fragment_attribute(fragment_attr_ref, &result);
             return result;
         }
 
@@ -1289,7 +1357,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
         }
+        #[cfg(feature = "xsd11")]
+        self.bind_fragment_attribute(fragment_attr_ref, &result);
         result
+    }
+
+    /// Install a schema binding (type/decl) on the buffered fragment
+    /// attribute node so navigator.typed_value() returns the declared
+    /// atomic type during XSD 1.1 assertion XPath evaluation. No-op
+    /// when no fragment buffering is active or no type was resolved.
+    #[cfg(feature = "xsd11")]
+    fn bind_fragment_attribute(&mut self, attr_ref: Option<u32>, info: &SchemaInfo) {
+        let Some(attr_ref) = attr_ref else { return };
+        let Some(type_key) = info.schema_type else { return };
+        let binding = crate::document::type_remap::NodeSchemaBinding {
+            type_key,
+            element_decl: None,
+            attribute_decl: info.attribute_decl,
+            content_type: None,
+        };
+        let _ = self.install_fragment_binding(attr_ref, binding, "attr binding");
     }
 
     /// Signal end of attributes; checks for missing required attributes
@@ -1887,10 +1974,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // Forward end_element to builder
             if let Some(builder) = self.fragment_builder.as_mut() {
                 if let Err(e) = builder.end_element() {
-                    self.abort_assertion_buffering(format!(
-                        "Assertion fragment buffer error (end_element): {}",
-                        e
-                    ));
+                    self.abort_assertion_buffer_op("end_element", e);
                     ev_state.validity = SchemaValidity::Invalid;
                     break 'assertion_eval;
                 }

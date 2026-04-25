@@ -177,7 +177,7 @@ with `-`, and test with `.contains(...)`.
 | `PROCESS_IDENTITY_CONSTRAINTS` | off | Evaluate `xs:key`, `xs:unique`, and `xs:keyref` during instance validation. Declarations are always *parsed*; this bit controls whether their constraints are *enforced*. Leave off when you only need type-level validation — saves the per-element key/keyref bookkeeping. |
 | `ALLOW_XML_ATTRIBUTES` | off | Accept every attribute in the reserved `http://www.w3.org/XML/1998/namespace` namespace (`xml:lang`, `xml:space`, `xml:base`, `xml:id`) **without** checking the element's complex type for an allowing declaration or wildcard. This is a lenient-parser convenience and is **not** XSD-conformant: the spec requires every attribute (including those in the xml namespace) to be matched by a declared `{attribute use}` or an `{attribute wildcard}` whose namespace constraint admits the xml namespace. Set this bit when you want `xml:lang` to "just work" against schemas that don't explicitly import the xml namespace; leave it clear for strict conformance (e.g. when running the W3C XSD test suite). `xml:base` base-URI tracking for `xsi:schemaLocation` hint resolution happens **regardless** of this flag — the flag only affects whether the attribute itself participates in type-level attribute validation. |
 | `STRICT_MODE` | off | Promote warnings to errors. Combine with `REPORT_WARNINGS`. |
-| `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. Requires a fragment-buffering validator constructed via `SchemaValidator::new_fragment_buffer(...)`; setting the bit on a plain `SchemaValidator::new(...)` will panic at run start to surface the misconfiguration. |
+| `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. **Must** be paired with a fragment-buffering validator constructed via `SchemaValidator::new_fragment_buffer(...)` — that constructor sets the bit for you. Passing `PROCESS_ASSERTIONS` to plain `SchemaValidator::new(...)` does **not** error; the flag is silently stripped (the constructor ensures the flag and `AssertionSource::Disabled` agree), so assertions will not run. If you build XSD 1.1 instance validation by hand and forget to use `new_fragment_buffer`, every `xs:assert` is skipped — negative instances will appear valid. |
 
 The default — `ValidationFlags::default()` — enables only `REPORT_WARNINGS`.
 This matches the strict-conformance posture: identity constraints, `xml:*`
@@ -199,16 +199,30 @@ let lenient = ValidationFlags::default()
 ```
 
 For XSD 1.1 assertion-backed types, use the fragment-buffering validator
-constructor and add `PROCESS_ASSERTIONS`:
+constructor. `new_fragment_buffer` sets `PROCESS_ASSERTIONS` for you:
 
 ```rust,ignore
 use xsd_schema::validation::{SchemaValidator, ValidationFlags};
 
 let flags = ValidationFlags::default()
-    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
-    | ValidationFlags::PROCESS_ASSERTIONS;
+    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+// new_fragment_buffer adds PROCESS_ASSERTIONS internally; pass-through
+// works equally well, but the plain `SchemaValidator::new(...)`
+// constructor silently strips it — assertions would then never run.
 let validator = SchemaValidator::new_fragment_buffer(&schema_set, flags);
 ```
+
+The trap to know about: `SchemaValidator::new(&schema_set, flags)` removes
+`PROCESS_ASSERTIONS` without erroring. A schema with `<xs:assert>` will then
+load and validate every instance as if the assertion did not exist —
+negative instances appear valid. Always pick a constructor explicitly when
+you ship XSD 1.1 validation:
+
+| Goal | Constructor |
+| --- | --- |
+| XSD 1.0, or XSD 1.1 without `xs:assert` | `SchemaValidator::new(...)` |
+| XSD 1.1 with `xs:assert` evaluation, streaming | `SchemaValidator::new_fragment_buffer(...)` |
+| XSD 1.1 with `xs:assert` against an external `BufferDocument` | `SchemaValidator::new_main_document(...)` |
 
 Minimal `quick-xml` integration:
 
