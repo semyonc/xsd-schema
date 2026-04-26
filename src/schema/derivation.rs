@@ -104,12 +104,97 @@ pub fn validate_all_derivations(
     validate_all_redefine_group_restrictions(schema_set, &mut errors, &mut stats);
     validate_all_redefine_attribute_group_restrictions(schema_set, &mut errors, &mut stats);
 
+    // src-attribute_group circularity: an attribute group cannot transitively
+    // reference itself in XSD 1.0. XSD 1.1 explicitly relaxed this — circular
+    // attribute groups are permitted (W3C Bugzilla 15795). Walks `resolved_ref`
+    // and `resolved_attribute_groups` for each group via DFS and flags any
+    // back-edge in XSD 1.0 mode only.
+    if schema_set.is_xsd10() {
+        validate_attribute_group_no_circular(schema_set, &mut errors);
+    }
+
     // Return first error if any
     if let Some(first_error) = errors.into_iter().next() {
         return Err(first_error);
     }
 
     Ok(stats)
+}
+
+/// Walk the attribute-group reference DAG and report cycles.
+///
+/// Each `xs:attributeGroup` definition references zero or more nested
+/// attribute groups (including self via `ref` or `<attributeGroup ref=...>`
+/// children). The schema-for-schemas does not allow circular references —
+/// `src-attribute_group` constraint 3 in XSD 1.0 / §3.6.3 in XSD 1.1 forbid
+/// any group from transitively referencing itself.
+fn validate_attribute_group_no_circular(
+    schema_set: &SchemaSet,
+    errors: &mut Vec<SchemaError>,
+) {
+    use std::collections::HashSet;
+
+    // Iterate every attribute group key once.
+    let keys: Vec<_> = schema_set.arenas.attribute_groups.keys().collect();
+
+    for start in keys {
+        let mut path: Vec<AttributeGroupKey> = Vec::new();
+        let mut visited: HashSet<AttributeGroupKey> = HashSet::new();
+        if let Some(cycle_key) = find_attribute_group_cycle(schema_set, start, &mut path, &mut visited) {
+            let location = schema_set
+                .arenas
+                .attribute_groups
+                .get(cycle_key)
+                .and_then(|ag| ag.source.as_ref())
+                .and_then(|s| schema_set.source_maps.locate(s));
+            errors.push(SchemaError::structural(
+                "src-attribute_group",
+                "Circular attribute group reference detected",
+                location,
+            ));
+        }
+    }
+}
+
+/// DFS helper for `validate_attribute_group_no_circular`. Returns the key
+/// involved in the cycle (the first repeated node on the stack) when one is
+/// found.
+fn find_attribute_group_cycle(
+    schema_set: &SchemaSet,
+    key: AttributeGroupKey,
+    path: &mut Vec<AttributeGroupKey>,
+    visited: &mut std::collections::HashSet<AttributeGroupKey>,
+) -> Option<AttributeGroupKey> {
+    if path.contains(&key) {
+        return Some(key);
+    }
+    if !visited.insert(key) {
+        return None;
+    }
+    path.push(key);
+
+    let result = if let Some(ag) = schema_set.arenas.attribute_groups.get(key) {
+        let mut found: Option<AttributeGroupKey> = None;
+        if let Some(ref_key) = ag.resolved_ref {
+            if let Some(c) = find_attribute_group_cycle(schema_set, ref_key, path, visited) {
+                found = Some(c);
+            }
+        }
+        if found.is_none() {
+            for &nested_key in &ag.resolved_attribute_groups {
+                if let Some(c) = find_attribute_group_cycle(schema_set, nested_key, path, visited) {
+                    found = Some(c);
+                    break;
+                }
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    path.pop();
+    result
 }
 
 /// Validate a simple type definition
@@ -4432,6 +4517,7 @@ struct EffectiveAttributeUse {
     use_kind: AttributeUseKind,
     resolved_type: Option<TypeKey>,
     fixed_value: Option<String>,
+    default_value: Option<String>,
     /// XSD 1.1 §3.5.1 / §3.2.2.3: the use-level `{inheritable}` is the local
     /// `inheritable` attribute when present; for `ref`-based uses without an
     /// own `inheritable` it falls back to the resolved declaration's
@@ -4484,6 +4570,13 @@ fn resolve_single_attribute_use(
             .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
             .and_then(|decl| decl.fixed_value.clone())
     });
+    // For default_value: use the inline default, or the resolved global decl's default.
+    let default_value = attr_use.attribute.default_value.clone().or_else(|| {
+        resolved
+            .and_then(|r| r.resolved_ref)
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
+            .and_then(|decl| decl.default_value.clone())
+    });
 
     // {inheritable} per §3.2.2.3: the actual value of the use's
     // `inheritable` attribute (default false). For ref-based uses, the
@@ -4510,6 +4603,7 @@ fn resolve_single_attribute_use(
         use_kind: attr_use.use_kind,
         resolved_type,
         fixed_value,
+        default_value,
         inheritable,
     })
 }
@@ -5407,6 +5501,63 @@ fn validate_attribute_restriction(
         }
     }
 
+    // §3.4.6.3 derivation-ok-restriction value-constraint check: when the
+    // base attribute use has a `fixed` value, the derived attribute use
+    // (when re-declared) must also have a `fixed` value equal to the base's.
+    // A derived `default` or no value constraint over a base `fixed` is
+    // invalid because it loosens the constraint.
+    for base_attr in &base_attrs {
+        let Some(base_fixed) = base_attr.fixed_value.as_deref() else {
+            continue;
+        };
+        // Find re-declared derived attr matching this base attr.
+        let Some(derived_attr) = derived_attrs.iter().find(|a| {
+            a.name == base_attr.name && a.target_namespace == base_attr.target_namespace
+        }) else {
+            // Inherited unchanged: OK.
+            continue;
+        };
+        match derived_attr.fixed_value.as_deref() {
+            Some(d_fixed)
+                if crate::validation::simple::fixed_values_equal(
+                    d_fixed,
+                    base_fixed,
+                    base_attr.resolved_type,
+                    schema_set,
+                ) => {}
+            Some(d_fixed) => {
+                let attr_name_str = schema_set.name_table.resolve(derived_attr.name);
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': attribute '{}' \
+                         changes 'fixed' value from '{}' to '{}'",
+                        type_name, base_name, attr_name_str, base_fixed, d_fixed,
+                    ),
+                    location,
+                ));
+            }
+            None => {
+                // Derived has no fixed value (either default or nothing) — too
+                // loose under base's fixed constraint.
+                let attr_name_str = schema_set.name_table.resolve(derived_attr.name);
+                let what = if derived_attr.default_value.is_some() {
+                    "uses 'default' (cannot weaken base 'fixed')"
+                } else {
+                    "drops the 'fixed' value constraint"
+                };
+                return Err(SchemaError::structural(
+                    "derivation-ok-restriction",
+                    format!(
+                        "Complex type '{}' restricting '{}': attribute '{}' {}",
+                        type_name, base_name, attr_name_str, what,
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
     // §3.4.6.3 clause 3 / "subsumes" clause 5.3 (XSD 1.1 only):
     // for each attribute use that exists in both the base and the derived
     // type, the base's {inheritable} must equal the derived's. The default
@@ -5828,6 +5979,114 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
     Ok(())
 }
 
+/// `a-props-correct.3`: validate that attribute `default`/`fixed` values
+/// are type-valid for the declared type.
+///
+/// Walks every globally-declared attribute and every attribute use inside
+/// complex types and rejects when the value constraint cannot be parsed
+/// against the attribute's declared simple type.
+pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    // Top-level attribute declarations
+    for (_key, attr) in schema_set.arenas.attributes.iter() {
+        if attr.source.is_none() {
+            // Built-in xsi:* attributes have `source: None`; skip them.
+            continue;
+        }
+        let (value, is_fixed) = match (&attr.default_value, &attr.fixed_value) {
+            (Some(v), _) => (v.as_str(), false),
+            (_, Some(v)) => (v.as_str(), true),
+            (None, None) => continue,
+        };
+        let Some(type_key @ TypeKey::Simple(_)) = attr.resolved_type else {
+            continue;
+        };
+        if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err() {
+            let attr_name = attr
+                .name
+                .map(|n| schema_set.name_table.resolve(n).to_string())
+                .unwrap_or_else(|| "(anonymous)".to_string());
+            let constraint = if is_fixed { "fixed" } else { "default" };
+            return Err(SchemaError::structural(
+                "a-props-correct",
+                format!(
+                    "Attribute '{}' {} value '{}' is not valid for its declared type",
+                    attr_name, constraint, value
+                ),
+                schema_set.locate(attr.source.as_ref()),
+            ));
+        }
+    }
+
+    // Attribute uses inside complex types
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        for (i, attr_use) in ct.attributes.iter().enumerate() {
+            if attr_use.use_kind == AttributeUseKind::Prohibited {
+                continue;
+            }
+            let resolved = ct.resolved_attributes.get(i);
+            let ref_decl = resolved
+                .and_then(|r| r.resolved_ref)
+                .and_then(|k| schema_set.arenas.attributes.get(k));
+
+            // Use the local (override) value-constraint when present;
+            // otherwise the global declaration's. au-props-correct.2 says
+            // a use's fixed must equal the declaration's, but here we only
+            // need to check that *some* effective value-constraint parses.
+            let value_constraint: Option<(&str, bool)> = attr_use
+                .attribute
+                .fixed_value
+                .as_deref()
+                .map(|v| (v, true))
+                .or_else(|| attr_use.attribute.default_value.as_deref().map(|v| (v, false)))
+                .or_else(|| ref_decl.and_then(|d| {
+                    d.fixed_value
+                        .as_deref()
+                        .map(|v| (v, true))
+                        .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
+                }));
+            let Some((value, is_fixed)) = value_constraint else {
+                continue;
+            };
+
+            let attr_type = resolved
+                .and_then(|r| r.resolved_type)
+                .or_else(|| ref_decl.and_then(|d| d.resolved_type));
+            let Some(type_key @ TypeKey::Simple(_)) = attr_type else {
+                continue;
+            };
+            if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err() {
+                let attr_name = attr_use
+                    .attribute
+                    .name
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .or_else(|| {
+                        ref_decl
+                            .and_then(|d| d.name)
+                            .map(|n| schema_set.name_table.resolve(n).to_string())
+                    })
+                    .unwrap_or_else(|| "(anonymous)".to_string());
+                let constraint = if is_fixed { "fixed" } else { "default" };
+                let location = attr_use
+                    .attribute
+                    .source
+                    .as_ref()
+                    .or(ct.source.as_ref())
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                return Err(SchemaError::structural(
+                    "a-props-correct",
+                    format!(
+                        "Attribute '{}' {} value '{}' is not valid for its declared type",
+                        attr_name, constraint, value
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// `e-props-correct.2` and `e-props-correct.4`: validate that element
 /// `default`/`fixed` values are type-valid for the declared type.
 ///
@@ -5835,6 +6094,7 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
 /// - `e-props-correct.4`: if the type is (or derives from) xs:ID, no value
 ///   constraint is allowed.
 pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::parser::frames::ComplexContentResult;
     use crate::types::XmlTypeCode;
 
     let id_key = schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id);
@@ -5864,6 +6124,28 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
         };
         let location = || schema_set.locate(elem.source.as_ref());
         let constraint = if is_fixed { "fixed" } else { "default" };
+
+        // src-element §3.3.3 clause 3.2: when an element declaration has a
+        // `default` or `fixed` value, the type definition must be either a
+        // simple type, a complex type with simple content, or a complex
+        // type with mixed=true. Anything else (complex non-simple, non-mixed
+        // content) is invalid.
+        if let TypeKey::Complex(ct_key) = type_key {
+            if let Some(ct) = schema_set.arenas.complex_types.get(ct_key) {
+                let simple_content = matches!(ct.content, ComplexContentResult::Simple(_));
+                if !simple_content && !ct.mixed {
+                    return Err(SchemaError::structural(
+                        "src-element",
+                        format!(
+                            "Element '{}' has '{}' value but its type is a complex type \
+                             with non-mixed, non-simple content",
+                            elem_name(), constraint
+                        ),
+                        location(),
+                    ));
+                }
+            }
+        }
 
         // e-props-correct.4: xs:ID (or derived) cannot have a value constraint.
         // XSD 1.1 §3.3.6.1 removes this restriction (it has no analogous clause);

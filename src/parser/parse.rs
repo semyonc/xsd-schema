@@ -50,7 +50,8 @@ use crate::parser::structure::{
     validate_extension_structure,
     validate_key_unique_structure, validate_keyref_structure,
     validate_group_structure, validate_attribute_group_structure,
-    validate_notation_structure, validate_include_structure, validate_redefine_structure,
+    validate_notation_structure, validate_include_structure, validate_import_structure,
+    validate_redefine_structure, validate_schema_structure,
 };
 use crate::schema::annotation::ForeignAttribute;
 use crate::schema::model::XsdVersion;
@@ -348,6 +349,26 @@ pub fn parse_schema_with_chameleon(
     // Record the declared targetNamespace before chameleon adoption.
     let declared_target_namespace = root_schema.target_namespace;
 
+    // src-include §4.2.3 clause 2.1: when included via `<xs:include>` from a
+    // schema with a `targetNamespace`, the included document's declared
+    // `targetNamespace`, when present, must equal the includer's.
+    if let Some(includer_ns) = chameleon_namespace {
+        if let Some(declared) = declared_target_namespace {
+            if declared != includer_ns {
+                return Err(SchemaError::structural(
+                    "src-include",
+                    format!(
+                        "Included schema's targetNamespace '{}' does not match \
+                         including schema's targetNamespace '{}'",
+                        schema_set.name_table.resolve(declared),
+                        schema_set.name_table.resolve(includer_ns),
+                    ),
+                    None,
+                ));
+            }
+        }
+    }
+
     // Chameleon pre-processing (§4.2.3 clause 2.3): if the parsed document
     // has no targetNamespace and the includer specifies one, adopt it.
     if root_schema.target_namespace.is_none() {
@@ -387,7 +408,9 @@ fn validate_element_attributes(
         xsd_names::ATTRIBUTE_GROUP => validate_attribute_group_structure(attrs, name_table, ctx),
         xsd_names::NOTATION => validate_notation_structure(attrs, name_table, ctx),
         xsd_names::INCLUDE => validate_include_structure(attrs, name_table),
+        xsd_names::IMPORT => validate_import_structure(attrs, name_table),
         xsd_names::REDEFINE => validate_redefine_structure(attrs, name_table),
+        xsd_names::SCHEMA => validate_schema_structure(attrs, name_table),
         xsd_names::KEY | xsd_names::UNIQUE => validate_key_unique_structure(attrs, name_table),
         xsd_names::KEYREF => validate_keyref_structure(attrs, name_table),
         xsd_names::EXTENSION => validate_extension_structure(attrs, name_table),
@@ -552,7 +575,7 @@ fn handle_start_element(
     let is_in_xsd_ns = state.is_in_xsd_namespace(element_ns);
 
     // Check if current frame allows this child and handle skip frames
-    let (allows_child, has_frame, in_skip_frame) = {
+    let (allows_child, has_frame, in_skip_frame, accepts_foreign) = {
         if let Some(frame) = state.current_frame() {
             let mut allowed = frame.allows(local_name, state.ns_context.name_table());
             // Reject duplicate annotations: each XSD element allows at most one annotation
@@ -563,9 +586,10 @@ fn handle_start_element(
                 allowed,
                 true,
                 frame.is_skip_frame(),
+                frame.accepts_foreign_children(),
             )
         } else {
-            (true, false, false)
+            (true, false, false, false)
         }
     };
 
@@ -581,8 +605,24 @@ fn handle_start_element(
         }
 
         if !is_in_xsd_ns {
-            // Non-XSD element - could be in annotation or skip
-            // For now, skip it by pushing a skip frame
+            // Non-XSD child element. Frames like `xs:appinfo`/`xs:documentation`
+            // explicitly accept arbitrary foreign content; everywhere else the
+            // schema-for-schemas content model forbids foreign elements
+            // (sch-props-correct). Surface a structural error and (in error
+            // recovery mode) skip the subtree so subsequent valid content can
+            // still be parsed.
+            if !accepts_foreign {
+                let location = source_ref.as_ref().map(|s| s.to_location(state.source_map));
+                state.recover_or_fail(SchemaError::structural(
+                    "sch-props-correct",
+                    format!(
+                        "Foreign-namespace element '{}' is not allowed here",
+                        local_name
+                    ),
+                    location,
+                ))?;
+            }
+            // For appinfo/documentation (or under recovery), skip it.
             push_skip_frame(state, source_ref, foreign_attrs)?;
             return Ok(());
         }
@@ -629,6 +669,35 @@ fn handle_start_element(
     // Perform element-specific structural validation
     if let Err(e) = validate_element_attributes(local_name, &attr_map, state.ns_context.name_table(), &validation_ctx) {
         state.recover_or_fail(e)?;
+    }
+
+    // §3.13.2 / xs:annotation: xml:lang on documentation/appinfo, when present,
+    // must be a valid xs:language value. Empty / whitespace-only values are
+    // rejected by the language regex.
+    if matches!(local_name, xsd_names::DOCUMENTATION | xsd_names::APPINFO) {
+        let xml_ns = state.ns_context.name_table().get(crate::namespace::XML_NAMESPACE);
+        let lang_local = state.ns_context.name_table().get("lang");
+        if let (Some(xml_ns), Some(lang_local)) = (xml_ns, lang_local) {
+            for fa in &foreign_attrs {
+                if fa.namespace == Some(xml_ns) && fa.local_name == lang_local
+                    && !crate::types::validators::is_valid_language(
+                        &crate::types::facets::normalize_whitespace(
+                            &fa.value,
+                            crate::types::facets::WhitespaceMode::Collapse,
+                        ),
+                    )
+                {
+                    state.recover_or_fail(SchemaError::structural(
+                        "s4s-att-invalid-value",
+                        format!(
+                            "'{}' xml:lang value '{}' is not a valid xs:language",
+                            local_name, fa.value
+                        ),
+                        source_ref.as_ref().map(|s| s.to_location(state.source_map)),
+                    ))?;
+                }
+            }
+        }
     }
 
     // Validate XSD version for individual attributes
@@ -791,16 +860,27 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
 fn handle_text(
     state: &mut ParserState,
     text: &quick_xml::events::BytesText,
-    _span: SourceSpan,
+    span: SourceSpan,
 ) -> SchemaResult<()> {
     let text_content = text.unescape().map_err(|e| {
         SchemaError::xml(format!("Text content error: {}", e), None)
     })?;
 
-    // Pass text to current frame if it accepts text content
+    // Pass text to current frame if it accepts text content; otherwise reject
+    // any non-whitespace text. XSD elements like xs:notation, xs:complexType,
+    // xs:sequence, etc. only allow inter-element whitespace as text content
+    // (sch-props-correct / element-specific content models).
     if let Some(mut frame) = state.frame_stack.pop() {
         if frame.accepts_text() {
             frame.on_text(&text_content);
+        } else if !frame.is_skip_frame() && !text_content.trim().is_empty() {
+            let source_ref = state.source_ref(span);
+            state.frame_stack.push(frame);
+            return state.recover_or_fail(SchemaError::structural(
+                "sch-props-correct",
+                "Non-whitespace text is not allowed here",
+                Some(source_ref.to_location(state.source_map)),
+            ));
         }
         state.frame_stack.push(frame);
     }
@@ -812,7 +892,7 @@ fn handle_text(
 fn handle_cdata(
     state: &mut ParserState,
     cdata: &quick_xml::events::BytesCData,
-    _span: SourceSpan,
+    span: SourceSpan,
 ) -> SchemaResult<()> {
     // CDATA is similar to text, typically in annotations
     if let Some(mut frame) = state.frame_stack.pop() {
@@ -820,6 +900,22 @@ fn handle_cdata(
             // Convert CDATA to string
             if let Ok(cdata_str) = std::str::from_utf8(cdata.as_ref()) {
                 frame.on_cdata(cdata_str);
+            }
+        } else if !frame.is_skip_frame() {
+            // CDATA content is significant — even whitespace-only CDATA represents
+            // intentional text. In an XSD element that doesn't allow text content,
+            // this is invalid.
+            let cdata_is_whitespace = std::str::from_utf8(cdata.as_ref())
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(false);
+            if !cdata_is_whitespace {
+                let source_ref = state.source_ref(span);
+                state.frame_stack.push(frame);
+                return state.recover_or_fail(SchemaError::structural(
+                    "sch-props-correct",
+                    "Non-whitespace CDATA is not allowed here",
+                    Some(source_ref.to_location(state.source_map)),
+                ));
             }
         }
         state.frame_stack.push(frame);

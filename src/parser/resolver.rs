@@ -1340,14 +1340,37 @@ pub fn resolve_all_directives(
         ) {
             Ok(ref outcome) => {
                 match outcome {
-                    LoadOutcome::Loaded(id) => {
-                        result.loaded.push(*id);
+                    LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) => {
                         schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
-                    }
-                    LoadOutcome::AlreadyLoaded(id) => {
-                        // Already processed — record doc_id but don't add to loaded
-                        // to avoid re-processing in recursive directive resolution.
-                        schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
+                        if matches!(outcome, LoadOutcome::Loaded(_)) {
+                            result.loaded.push(*id);
+                        }
+                        // src-include §4.2.3 clause 2.2: when the including schema
+                        // has no `targetNamespace`, the included schema must also
+                        // have absent `targetNamespace`.
+                        if target_namespace.is_none() {
+                            let included_declared = schema_set
+                                .documents
+                                .get(*id as usize)
+                                .and_then(|d| d.declared_target_namespace);
+                            if let Some(declared) = included_declared {
+                                let location = include
+                                    .source
+                                    .as_ref()
+                                    .and_then(|s| schema_set.source_maps.locate(s));
+                                let declared_str = schema_set.name_table.resolve(declared).to_string();
+                                result.errors.push(SchemaError::structural(
+                                    "src-include",
+                                    format!(
+                                        "Included schema has targetNamespace '{}' \
+                                         but the including schema has no \
+                                         targetNamespace",
+                                        declared_str
+                                    ),
+                                    location,
+                                ));
+                            }
+                        }
                     }
                     _ => {
                         result.skipped.push(include.schema_location.clone());
@@ -1364,6 +1387,27 @@ pub fn resolve_all_directives(
 
     // Process imports
     for (i, import) in imports.iter().enumerate() {
+        // src-import §4.2.3 (XSD 1.0): the namespace of an `<xs:import>`
+        // must not be the same as the enclosing schema's targetNamespace.
+        // XSD 1.1 explicitly relaxed this — own-namespace imports are
+        // permitted (errata, W3C bug 4126 / cleanup).
+        if schema_set.is_xsd10() {
+            if let Some(import_ns_str) = import.namespace.as_deref() {
+                let tns_str = target_namespace.map(|n| schema_set.name_table.resolve(n));
+                if Some(import_ns_str) == tns_str.as_deref() {
+                    result.errors.push(SchemaError::structural(
+                        "src-import",
+                        format!(
+                            "xs:import namespace '{}' must not equal the enclosing \
+                             schema's targetNamespace in XSD 1.0",
+                            import_ns_str
+                        ),
+                        import.source.as_ref().and_then(|s| schema_set.source_maps.locate(s)),
+                    ));
+                    continue;
+                }
+            }
+        }
         match resolver.process_import(
             import.namespace.as_deref(),
             import.schema_location.as_deref(),

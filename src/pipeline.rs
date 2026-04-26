@@ -37,6 +37,7 @@ use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
     assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
     build_dependency_graph, validate_all_derivations, validate_attribute_id_constraints,
+    validate_attribute_value_constraints,
     validate_element_value_constraints, compile_all_patterns,
 };
 use crate::SchemaSet;
@@ -273,6 +274,7 @@ pub fn load_and_process_schema(
     // and e-props-correct.2 / .4 (element default/fixed values).
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
+        validate_attribute_value_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
         #[cfg(feature = "xsd11")]
         xsd11_pre_resolution_validations(schema_set)?;
@@ -384,6 +386,9 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
 
     // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     validate_attribute_id_constraints(schema_set)?;
+
+    // a-props-correct.3 — validate attribute default/fixed values are type-valid
+    validate_attribute_value_constraints(schema_set)?;
 
     // e-props-correct.2 / e-props-correct.4 — validate element default/fixed values
     validate_element_value_constraints(schema_set)?;
@@ -811,6 +816,7 @@ pub async fn load_and_process_schema_async(
     // and e-props-correct.2 / .4 (element default/fixed values).
     if config.resolve_references {
         validate_attribute_id_constraints(schema_set)?;
+        validate_attribute_value_constraints(schema_set)?;
         validate_element_value_constraints(schema_set)?;
         #[cfg(feature = "xsd11")]
         xsd11_pre_resolution_validations(schema_set)?;

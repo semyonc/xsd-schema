@@ -789,6 +789,13 @@ pub trait Frame {
         false
     }
 
+    /// Returns true if this frame accepts foreign-namespace child elements.
+    /// Defaults to false: only `xs:appinfo` and `xs:documentation` (and skip
+    /// frames during error recovery) accept arbitrary foreign content.
+    fn accepts_foreign_children(&self) -> bool {
+        false
+    }
+
     /// Handle text content (for annotation content like appinfo/documentation)
     fn on_text(&mut self, _text: &str) {}
 

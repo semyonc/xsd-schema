@@ -1272,7 +1272,13 @@ fn test_xsd11_alternative_rejected_in_10_mode() {
 
 #[test]
 fn test_skip_unknown_subtree() {
-    // Unknown element nested under schema should be skipped, parser continues
+    // Foreign-namespace elements at top level violate `sch-props-correct`
+    // (XSD's schema-for-schemas only allows the well-known XSD elements
+    // there; ad-hoc metadata belongs in `xs:appinfo`/`xs:documentation`).
+    // The pipeline rejects such schemas with a structural error, but the
+    // error-recovery parser still skips the subtree and walks the rest of
+    // the document so the remaining declarations are visible in the partial
+    // schema set.
     let mut schema_set = SchemaSet::new();
     let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
         <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
@@ -1283,12 +1289,22 @@ fn test_skip_unknown_subtree() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should skip unknown elements and continue parsing: {:?}", result);
+    let err = result.expect_err("Foreign element at schema level must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("Foreign-namespace element") || msg.contains("sch-props-correct"),
+        "Expected sch-props-correct foreign-element error, got: {}",
+        msg
+    );
 
-    // The valid element should be parsed
+    // The valid element should still have been parsed before the structural
+    // error surfaced — error recovery keeps walking past the skipped subtree.
     let valid_name = schema_set.name_table.get("valid").unwrap();
     let elem_key = schema_set.lookup_element(None, valid_name);
-    assert!(elem_key.is_some(), "Valid element should be parsed after unknown subtree");
+    assert!(
+        elem_key.is_some(),
+        "Valid element should still be parsed after the unknown subtree is skipped"
+    );
 }
 
 // ========================================================================

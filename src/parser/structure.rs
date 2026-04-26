@@ -32,6 +32,15 @@ use crate::namespace::{NameTable, is_ncname};
 use crate::parser::attrs::AttributeMap;
 use crate::parser::location::SourceRef;
 use crate::schema::XsdVersion;
+use crate::types::facets::{WhitespaceMode, normalize_whitespace};
+
+/// Apply XSD whitespace=collapse to an attribute value before NCName/QName validation.
+/// XSD attribute types like xs:NCName have whiteSpace=collapse semantics — leading,
+/// trailing, and runs of internal whitespace are normalized away before the value
+/// is interpreted lexically.
+fn collapsed(value: &str) -> String {
+    normalize_whitespace(value, WhitespaceMode::Collapse)
+}
 
 /// Validation context for structural checks
 #[derive(Debug, Clone)]
@@ -91,6 +100,17 @@ pub fn validate_element_structure(
 ) -> SchemaResult<()> {
     let has_name = attrs.get_value_by_name(name_table, "name").is_some();
     let has_ref = attrs.get_value_by_name(name_table, "ref").is_some();
+
+    // src-element.1: the name must be a valid NCName.
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-element",
+                format!("Element 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
 
     if ctx.is_top_level {
         // Top-level element validation
@@ -159,6 +179,21 @@ pub fn validate_element_structure(
                 }
             }
         }
+
+        // src-element clause 3: `final`, `abstract`, `substitutionGroup` are
+        // restricted to global declarations.
+        for prohibited in &["final", "abstract", "substitutionGroup"] {
+            if attrs.get_value_by_name(name_table, prohibited).is_some() {
+                return Err(SchemaError::structural(
+                    "src-element",
+                    format!(
+                        "Local element declaration cannot have '{}' attribute",
+                        prohibited
+                    ),
+                    None,
+                ));
+            }
+        }
     }
 
     // Validate default XOR fixed
@@ -172,6 +207,48 @@ pub fn validate_element_structure(
         ));
     }
 
+    // §3.3.2 element XML representation: `final` allows only `extension|restriction|#all`.
+    // (Substitution is permitted in `block`, but NOT `final`.)
+    if let Some(final_val) = attrs.get_value_by_name(name_table, "final") {
+        validate_derivation_set_tokens(final_val, &["extension", "restriction"], "final", "element")?;
+    }
+    // §3.3.2 element/@block allows `extension|restriction|substitution|#all`.
+    if let Some(block_val) = attrs.get_value_by_name(name_table, "block") {
+        validate_derivation_set_tokens(
+            block_val,
+            &["extension", "restriction", "substitution"],
+            "block",
+            "element",
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validate that a `block`/`final`-style attribute value contains only the
+/// derivation tokens permitted in the given context (plus `#all`).
+fn validate_derivation_set_tokens(
+    value: &str,
+    allowed: &[&str],
+    attr: &str,
+    elem: &str,
+) -> SchemaResult<()> {
+    let trimmed = value.trim();
+    if trimmed == "#all" {
+        return Ok(());
+    }
+    for token in trimmed.split_whitespace() {
+        if !allowed.contains(&token) {
+            return Err(SchemaError::structural(
+                "sch-props-correct",
+                format!(
+                    "'{}' on '{}' does not allow derivation method '{}'",
+                    attr, elem, token
+                ),
+                None,
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -199,10 +276,20 @@ pub fn validate_attribute_structure(
 
     // src-attribute.1 / src-element.1: the name must be a valid NCName.
     if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
-        if !is_ncname(name_val) {
+        let collapsed_name = collapsed(name_val);
+        if !is_ncname(&collapsed_name) {
             return Err(SchemaError::structural(
                 "src-attribute",
                 format!("Attribute 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+        // no-xmlns (§3.2.6.2): attribute declarations must not use the local
+        // name "xmlns".
+        if collapsed_name == "xmlns" {
+            return Err(SchemaError::structural(
+                "no-xmlns",
+                "Attribute declaration name must not be 'xmlns'",
                 None,
             ));
         }
@@ -287,16 +374,25 @@ pub fn validate_attribute_structure(
         ));
     }
 
-    // Validate use="prohibited" conflicts
-    if let Some(use_val) = attrs.get_value_by_name(name_table, "use") {
-        if use_val == "prohibited" {
-            if has_default {
+    // src-attribute §3.2.3 clause 2: If default and use are both present, use must be "optional".
+    if has_default {
+        if let Some(use_val) = attrs.get_value_by_name(name_table, "use") {
+            if use_val != "optional" {
                 return Err(SchemaError::structural(
                     "src-attribute",
-                    "Prohibited attribute cannot have 'default' attribute",
+                    format!(
+                        "Attribute with 'default' must have use='optional' (got '{}')",
+                        use_val
+                    ),
                     None,
                 ));
             }
+        }
+    }
+
+    // Validate use="prohibited" conflicts
+    if let Some(use_val) = attrs.get_value_by_name(name_table, "use") {
+        if use_val == "prohibited" {
             // src-attribute §3.2.3 clause 5: use="prohibited" + fixed is only an error in XSD 1.1.
             // In XSD 1.0 the combination is syntactically odd but not explicitly forbidden.
             if has_fixed && ctx.xsd_version == XsdVersion::V1_1 {
@@ -344,6 +440,26 @@ pub fn validate_simple_type_structure(
         ));
     }
 
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-simple-type",
+                format!("simpleType 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
+
+    // §3.14.2 simpleType/@final allows `restriction|list|union|extension|#all`.
+    if let Some(final_val) = attrs.get_value_by_name(name_table, "final") {
+        validate_derivation_set_tokens(
+            final_val,
+            &["restriction", "list", "union", "extension"],
+            "final",
+            "simpleType",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -372,6 +488,34 @@ pub fn validate_complex_type_structure(
             "Inline complexType cannot have 'name' attribute",
             None,
         ));
+    }
+
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-ct",
+                format!("complexType 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
+
+    // §3.4.2 complexType/@final and @block allow `extension|restriction|#all`.
+    if let Some(final_val) = attrs.get_value_by_name(name_table, "final") {
+        validate_derivation_set_tokens(
+            final_val,
+            &["extension", "restriction"],
+            "final",
+            "complexType",
+        )?;
+    }
+    if let Some(block_val) = attrs.get_value_by_name(name_table, "block") {
+        validate_derivation_set_tokens(
+            block_val,
+            &["extension", "restriction"],
+            "block",
+            "complexType",
+        )?;
     }
 
     Ok(())
@@ -503,6 +647,16 @@ pub fn validate_key_unique_structure(
         ));
     }
 
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-identity-constraint",
+                format!("identity constraint 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -535,6 +689,16 @@ pub fn validate_keyref_structure(
             "Keyref must have 'refer' attribute",
             None,
         ));
+    }
+
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-identity-constraint",
+                format!("keyref 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
     }
 
     Ok(())
@@ -571,18 +735,40 @@ pub fn validate_group_structure(
                 None,
             ));
         }
+        // Top-level (named) group has no minOccurs/maxOccurs in its XML representation.
+        for prohibited in &["minOccurs", "maxOccurs"] {
+            if attrs.get_value_by_name(name_table, prohibited).is_some() {
+                return Err(SchemaError::structural(
+                    "mgd-props-correct",
+                    format!("Top-level group cannot have '{}' attribute", prohibited),
+                    None,
+                ));
+            }
+        }
     } else {
-        if has_name && has_ref {
+        // Non-top-level group: only `ref` is allowed; `name` is prohibited
+        // (XML Representation of <group>: ref form has no `name`).
+        if has_name {
             return Err(SchemaError::structural(
                 "mgd-props-correct",
-                "Group cannot have both 'name' and 'ref' attributes",
+                "Non-top-level group must use 'ref', not 'name'",
                 None,
             ));
         }
-        if !has_name && !has_ref {
+        if !has_ref {
             return Err(SchemaError::structural(
                 "mgd-props-correct",
-                "Group must have either 'name' or 'ref' attribute",
+                "Non-top-level group must have 'ref' attribute",
+                None,
+            ));
+        }
+    }
+
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "mgd-props-correct",
+                format!("group 'name' value '{}' is not a valid NCName", name_val),
                 None,
             ));
         }
@@ -619,17 +805,29 @@ pub fn validate_attribute_group_structure(
             ));
         }
     } else {
-        if has_name && has_ref {
+        // Non-top-level attributeGroup: only `ref` is allowed; `name` is prohibited
+        // (XML Representation of <attributeGroup>: ref form has no `name`).
+        if has_name {
             return Err(SchemaError::structural(
                 "src-attribute_group",
-                "AttributeGroup cannot have both 'name' and 'ref' attributes",
+                "Non-top-level attributeGroup must use 'ref', not 'name'",
                 None,
             ));
         }
-        if !has_name && !has_ref {
+        if !has_ref {
             return Err(SchemaError::structural(
                 "src-attribute_group",
-                "AttributeGroup must have either 'name' or 'ref' attribute",
+                "Non-top-level attributeGroup must have 'ref' attribute",
+                None,
+            ));
+        }
+    }
+
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "src-attribute_group",
+                format!("attributeGroup 'name' value '{}' is not a valid NCName", name_val),
                 None,
             ));
         }
@@ -746,6 +944,16 @@ pub fn validate_notation_structure(
         ));
     }
 
+    if let Some(name_val) = attrs.get_value_by_name(name_table, "name") {
+        if !is_ncname(&collapsed(name_val)) {
+            return Err(SchemaError::structural(
+                "n-props-correct",
+                format!("notation 'name' value '{}' is not a valid NCName", name_val),
+                None,
+            ));
+        }
+    }
+
     match ctx.xsd_version {
         XsdVersion::V1_0 => {
             if !has_public {
@@ -797,12 +1005,50 @@ pub fn validate_include_structure(
 /// Validate import directive structure
 ///
 /// - `schemaLocation` is optional
-/// - `namespace` is optional but recommended
+/// - `namespace`, when present, must not be the empty string (§4.2.6.2 / §4.2.3
+///   src-import constraint 1.2 in XSD 1.1; §4.2.3 in XSD 1.0). Empty namespace is
+///   forbidden because absent and "" denote different things in XSD.
 pub fn validate_import_structure(
-    _attrs: &AttributeMap,
-    _name_table: &NameTable,
+    attrs: &AttributeMap,
+    name_table: &NameTable,
 ) -> SchemaResult<()> {
-    // Import has no required attributes
+    if let Some(ns) = attrs.get_value_by_name(name_table, "namespace") {
+        if ns.is_empty() {
+            return Err(SchemaError::structural(
+                "src-import",
+                "xs:import 'namespace' must not be the empty string",
+                None,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate xs:schema document structure
+///
+/// - `targetNamespace`, when present, must not be the empty string
+///   (Schema Representation Constraint: targetNamespace cannot be empty per
+///   §3.1.6 / §3.1.5).
+///
+/// Note: schema `targetNamespace = XSI namespace` is technically reserved per
+/// §3.16.2 but the MS suite includes both `valid` (`attKb018`) and `invalid`
+/// (`attKb018a`) outcomes for the same schema. The narrower check —
+/// rejecting individual attribute declarations in the XSI namespace — is
+/// implemented in `validate_no_xsi_attribute_declarations` and that aligns
+/// with both interpretations.
+pub fn validate_schema_structure(
+    attrs: &AttributeMap,
+    name_table: &NameTable,
+) -> SchemaResult<()> {
+    if let Some(tns) = attrs.get_value_by_name(name_table, "targetNamespace") {
+        if tns.is_empty() {
+            return Err(SchemaError::structural(
+                "sch-props-correct",
+                "xs:schema 'targetNamespace' must not be the empty string",
+                None,
+            ));
+        }
+    }
     Ok(())
 }
 

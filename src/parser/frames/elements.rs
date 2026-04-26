@@ -139,6 +139,13 @@ impl Frame for ElementFrame {
         #[cfg(not(feature = "xsd11"))]
         let is_xsd11_element = false;
 
+        // src-element clause 3: when `ref` is present, only annotation is allowed
+        // (no inline simpleType/complexType, no identity constraints).
+        if self.ref_name.is_some() {
+            return local_name == xsd_names::ANNOTATION
+                && self.phase == ElementPhase::Annotation;
+        }
+
         match self.phase {
             ElementPhase::Annotation => matches!(
                 local_name,
@@ -300,6 +307,8 @@ pub struct AttributeFrame {
     inheritable: bool,
     id: Option<String>,
     annotation: Option<Annotation>,
+    /// True once a non-annotation child has been seen — annotation must come first.
+    past_annotation: bool,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
 }
@@ -367,6 +376,7 @@ impl AttributeFrame {
             inheritable,
             id,
             annotation: None,
+            past_annotation: false,
             source,
             foreign_attributes: Vec::new(),
         })
@@ -375,6 +385,15 @@ impl AttributeFrame {
 
 impl Frame for AttributeFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
+        // Annotation must precede the inline simpleType; only one inline
+        // simpleType is permitted (xs:attribute content model:
+        // (annotation?, simpleType?)).
+        if local_name == xsd_names::ANNOTATION && self.past_annotation {
+            return false;
+        }
+        if local_name == xsd_names::SIMPLE_TYPE && self.inline_type.is_some() {
+            return false;
+        }
         matches!(local_name, xsd_names::ANNOTATION | xsd_names::SIMPLE_TYPE)
     }
 
@@ -394,7 +413,11 @@ impl Frame for AttributeFrame {
         )
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name != xsd_names::ANNOTATION {
+            self.past_annotation = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {

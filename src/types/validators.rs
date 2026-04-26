@@ -2284,7 +2284,7 @@ fn is_valid_ncname(s: &str) -> bool {
 }
 
 /// Validate a language tag (RFC 3066 / BCP 47 simplified)
-fn is_valid_language(s: &str) -> bool {
+pub fn is_valid_language(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }

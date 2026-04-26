@@ -152,6 +152,10 @@ impl Frame for AppinfoFrame {
         true
     }
 
+    fn accepts_foreign_children(&self) -> bool {
+        true
+    }
+
     fn on_text(&mut self, _text: &str) {
         // Content is captured via XmlFragment span, not accumulated text
     }
@@ -247,6 +251,10 @@ impl Frame for DocumentationFrame {
     }
 
     fn accepts_text(&self) -> bool {
+        true
+    }
+
+    fn accepts_foreign_children(&self) -> bool {
         true
     }
 

@@ -148,6 +148,10 @@ impl Frame for ModelGroupFrame {
         }))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -222,6 +226,11 @@ impl Frame for GroupFrame {
         // Annotation must come first (before compositor)
         if local_name == xsd_names::ANNOTATION && self.past_annotation {
             return false;
+        }
+        // xs:group ref-form content model: (annotation?). The compositor is
+        // only allowed in the named (top-level) form.
+        if self.ref_name.is_some() {
+            return local_name == xsd_names::ANNOTATION;
         }
         // xs:group content model: (annotation?, (all | choice | sequence)?) — at most one compositor
         if self.compositor.is_some()
@@ -317,6 +326,10 @@ impl Frame for GroupFrame {
         }))))
     }
 
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
+    }
+
     fn source(&self) -> Option<&SourceRef> {
         self.source.as_ref()
     }
@@ -386,6 +399,11 @@ impl Frame for AttributeGroupFrame {
         if local_name == xsd_names::ANNOTATION && self.past_annotation {
             return false;
         }
+        // When `ref` is present, only annotation is allowed (ref-form has no
+        // attribute or wildcard children — XML Representation of <attributeGroup>).
+        if self.ref_name.is_some() {
+            return local_name == xsd_names::ANNOTATION;
+        }
         matches!(
             local_name,
             xsd_names::ANNOTATION
@@ -451,6 +469,10 @@ impl Frame for AttributeGroupFrame {
             annotation,
             source: self.source,
         }))))
+    }
+
+    fn has_annotation(&self) -> bool {
+        self.annotation.is_some()
     }
 
     fn source(&self) -> Option<&SourceRef> {

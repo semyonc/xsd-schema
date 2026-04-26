@@ -94,6 +94,7 @@ pub use dependencies::{
 // Re-exports from derivation
 pub use derivation::{
     validate_all_derivations, validate_attribute_id_constraints,
+    validate_attribute_value_constraints,
     validate_element_value_constraints,
     validate_complex_type_attribute_uniqueness,
     validate_local_decl_target_namespace,
