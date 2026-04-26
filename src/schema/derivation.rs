@@ -6895,6 +6895,373 @@ pub fn validate_xsd10_annotation_source_anyuri(
     Ok(())
 }
 
+/// Validate `xsi:` Not Allowed (§3.2.6.4 / `no-xsi`): the `{target namespace}`
+/// of a *user-declared* attribute must not match the XML Schema instance
+/// namespace. The four pre-defined XSI attributes (`type`, `nil`,
+/// `schemaLocation`, `noNamespaceSchemaLocation`) are seeded into the
+/// attributes arena with `source: None`; that absence is the marker we use
+/// to skip them.
+pub fn validate_no_xsi_attribute_declarations(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::namespace::table::well_known;
+
+    for (_key, attr) in schema_set.arenas.attributes.iter() {
+        if attr.source.is_none() {
+            // Built-in xsi:type / xsi:nil / xsi:schemaLocation /
+            // xsi:noNamespaceSchemaLocation are seeded in
+            // `types::builtin::initialize_xsi_attributes` with no source.
+            continue;
+        }
+        let Some(ns) = attr.target_namespace else {
+            continue;
+        };
+        if ns != well_known::XSI_NAMESPACE {
+            continue;
+        }
+        let attr_name = attr
+            .name
+            .map(|n| schema_set.name_table.resolve_ref(n).to_string())
+            .unwrap_or_else(|| "(anonymous)".to_string());
+        let location = schema_set.locate(attr.source.as_ref());
+        return Err(SchemaError::structural(
+            "no-xsi",
+            format!(
+                "Attribute declaration '{}' has target namespace \
+                 'http://www.w3.org/2001/XMLSchema-instance', which is \
+                 reserved (no-xsi, §3.2.6.4)",
+                attr_name
+            ),
+            location,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate src-element §3.3.3 clause 4.3 / src-attribute §3.2.3 clause 6.3:
+/// a local `<element>` or `<attribute>` declaring an explicit
+/// `targetNamespace` attribute that differs from the schema's own
+/// `targetNamespace` is permitted only when there is a `<restriction>`
+/// ancestor (between the local declaration and its nearest `<complexType>`
+/// ancestor) whose base does not match `xs:anyType`.
+///
+/// Implementation: per complex type, treat the declaration's "nearest
+/// `<complexType>` ancestor" as this complex type. The clause is satisfied
+/// iff the type's `derivation_method` is `Restriction` and its
+/// `resolved_base_type` is not `xs:anyType`. In every other case (extension,
+/// no derivation, or restriction of `xs:anyType`), any local element /
+/// attribute carrying a divergent `targetNamespace` is invalid.
+///
+/// Closes saxon `target002` (element case) and `target004` (attribute case);
+/// `target001`/`target003` (the matching `valid` cases) keep passing because
+/// they use `restriction` of a non-`anyType` base.
+pub fn validate_local_decl_target_namespace(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::parser::frames::{ComplexContentResult, ParticleResult, ParticleTerm};
+
+    fn find_divergent_local_element<'a>(
+        schema_set: &'a SchemaSet,
+        particle: &'a ParticleResult,
+        schema_tns: Option<NameId>,
+        depth: usize,
+    ) -> Option<(Option<SourceRef>, String)> {
+        if depth > 100 {
+            return None;
+        }
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                if elem.ref_name.is_some() {
+                    return None;
+                }
+                if let Some(ns) = elem.target_namespace {
+                    if Some(ns) != schema_tns {
+                        let name_str = elem
+                            .name
+                            .map(|n| schema_set.name_table.resolve_ref(n).to_string())
+                            .unwrap_or_default();
+                        return Some((elem.source.clone(), name_str));
+                    }
+                }
+            }
+            ParticleTerm::Group(group) => {
+                // Only descend into inline groups (no ref_name); a group ref
+                // points at a top-level group whose own decls are validated
+                // independently when their containing context is examined.
+                if group.ref_name.is_none() {
+                    for child in &group.particles {
+                        if let Some(found) =
+                            find_divergent_local_element(schema_set, child, schema_tns, depth + 1)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            ParticleTerm::Any(_) => {}
+        }
+        None
+    }
+
+    for (_, ct) in schema_set.arenas.complex_types.iter() {
+        let schema_tns = ct.target_namespace;
+        let restriction_of_non_any = match (ct.derivation_method, ct.resolved_base_type) {
+            (Some(crate::parser::frames::DerivationMethod::Restriction), Some(base_key)) => {
+                !schema_set.is_any_type(base_key)
+            }
+            _ => false,
+        };
+        if restriction_of_non_any {
+            continue;
+        }
+
+        // Walk content particles for local elements with divergent
+        // targetNamespace.
+        let particle_opt = match &ct.content {
+            ComplexContentResult::Complex(def) => def.particle.as_ref(),
+            _ => None,
+        };
+        if let Some(particle) = particle_opt {
+            if let Some((src, name)) =
+                find_divergent_local_element(schema_set, particle, schema_tns, 0)
+            {
+                let location = schema_set
+                    .locate(src.as_ref())
+                    .or_else(|| schema_set.locate(ct.source.as_ref()));
+                return Err(SchemaError::structural(
+                    "src-element",
+                    format!(
+                        "Local element '{}' has an explicit targetNamespace differing from the \
+                         schema's, but is not inside a <restriction> of a non-anyType base \
+                         (src-element §3.3.3 clause 4.3)",
+                        name
+                    ),
+                    location,
+                ));
+            }
+        }
+
+        // Check direct attribute uses for divergent targetNamespace.
+        for au in &ct.attributes {
+            let attr = &au.attribute;
+            if attr.ref_name.is_some() {
+                continue;
+            }
+            let Some(ns) = attr.target_namespace else {
+                continue;
+            };
+            if Some(ns) == schema_tns {
+                continue;
+            }
+            let name = attr
+                .name
+                .map(|n| schema_set.name_table.resolve_ref(n).to_string())
+                .unwrap_or_default();
+            let location = schema_set
+                .locate(attr.source.as_ref())
+                .or_else(|| schema_set.locate(ct.source.as_ref()));
+            return Err(SchemaError::structural(
+                "src-attribute",
+                format!(
+                    "Local attribute '{}' has an explicit targetNamespace differing from the \
+                     schema's, but is not inside a <restriction> of a non-anyType base \
+                     (src-attribute §3.2.3 clause 6.3)",
+                    name
+                ),
+                location,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate cos-element-consistent (§3.8.6.3) for the substitution-group
+/// case: a content model that contains both a local element with QName Q
+/// AND an element ref whose substitution-group expansion includes another
+/// declaration with the same QName Q must agree on `{type definition}`.
+///
+/// The base XSD 1.1 EDC machinery (`validate_local_element_type_table_*`)
+/// only compares type *tables*; this pass also covers the type-definition
+/// rule that makes saxon `subsgroup901.bad.xsd` invalid (a CT containing
+/// local `n: xs:date` plus `<xs:element ref="appendixContent">`, where the
+/// global `n: xs:string` substitutes for `appendixContent`).
+///
+/// Active for both XSD 1.0 and 1.1.
+pub fn validate_substitution_group_element_consistency(
+    schema_set: &SchemaSet,
+) -> SchemaResult<()> {
+    use crate::parser::frames::{ComplexContentResult, ParticleResult, ParticleTerm};
+    use std::collections::HashMap;
+
+    type Entry = (TypeKey, Option<SourceRef>);
+
+    // head → direct substitution members. Built once so the per-ref expansion
+    // is O(direct members) instead of an O(elements) arena scan per ref.
+    let mut subst_index: HashMap<ElementKey, Vec<ElementKey>> = HashMap::new();
+    for (mk, m) in schema_set.arenas.elements.iter() {
+        for &head in &m.resolved_substitution_groups {
+            subst_index.entry(head).or_default().push(mk);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn walk_particle(
+        schema_set: &SchemaSet,
+        particle: &ParticleResult,
+        target_ns: Option<NameId>,
+        local_keys: &[Option<ElementKey>],
+        flat_idx: &mut usize,
+        subst_index: &HashMap<ElementKey, Vec<ElementKey>>,
+        out: &mut HashMap<(Option<NameId>, NameId), Vec<Entry>>,
+        depth: usize,
+    ) {
+        if depth > 100 {
+            return;
+        }
+        match &particle.term {
+            ParticleTerm::Element(elem) => {
+                if let Some(ref_qn) = &elem.ref_name {
+                    *flat_idx += 1;
+                    // The head itself contributes only when non-abstract;
+                    // otherwise only its substitution members can appear.
+                    let Some(head_key) = schema_set
+                        .lookup_element(ref_qn.namespace, ref_qn.local_name)
+                    else {
+                        return;
+                    };
+                    let mut visited: std::collections::HashSet<ElementKey> =
+                        std::collections::HashSet::new();
+                    let mut stack = vec![head_key];
+                    while let Some(current) = stack.pop() {
+                        if !visited.insert(current) {
+                            continue;
+                        }
+                        let Some(decl) = schema_set.arenas.elements.get(current) else {
+                            continue;
+                        };
+                        if !decl.is_abstract {
+                            if let (Some(name), Some(t)) = (decl.name, decl.resolved_type) {
+                                out.entry((decl.target_namespace, name))
+                                    .or_default()
+                                    .push((t, particle.source.clone()));
+                            }
+                        }
+                        if let Some(members) = subst_index.get(&current) {
+                            stack.extend(members.iter().copied());
+                        }
+                    }
+                } else {
+                    let idx = *flat_idx;
+                    *flat_idx += 1;
+                    if let Some(Some(elem_key)) = local_keys.get(idx) {
+                        if let Some(decl) = schema_set.arenas.elements.get(*elem_key) {
+                            if let (Some(name), Some(t)) = (decl.name, decl.resolved_type) {
+                                // Arena's `target_namespace` is already the effective
+                                // namespace (form + elementFormDefault applied during
+                                // allocate_content_particle_elements), so we use it
+                                // directly instead of falling back to the outer CT's
+                                // target_ns.
+                                let ns = decl.target_namespace;
+                                out.entry((ns, name))
+                                    .or_default()
+                                    .push((t, decl.source.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+            ParticleTerm::Group(group) => {
+                if let Some(ref_qn) = &group.ref_name {
+                    // Group refs don't advance the outer flat_idx; the
+                    // model-group arena owns its own resolved_particle_elements.
+                    if let Some(group_key) =
+                        schema_set.lookup_model_group(ref_qn.namespace, ref_qn.local_name)
+                    {
+                        let mg = &schema_set.arenas.model_groups[group_key];
+                        let inner_ns = mg.target_namespace.or(target_ns);
+                        let mut inner_idx = 0usize;
+                        for child in &mg.particles {
+                            walk_particle(
+                                schema_set,
+                                child,
+                                inner_ns,
+                                &mg.resolved_particle_elements,
+                                &mut inner_idx,
+                                subst_index,
+                                out,
+                                depth + 1,
+                            );
+                        }
+                    }
+                } else {
+                    for child in &group.particles {
+                        walk_particle(
+                            schema_set,
+                            child,
+                            target_ns,
+                            local_keys,
+                            flat_idx,
+                            subst_index,
+                            out,
+                            depth + 1,
+                        );
+                    }
+                }
+            }
+            ParticleTerm::Any(_) => {}
+        }
+    }
+
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        let ComplexContentResult::Complex(cc) = &ct.content else {
+            continue;
+        };
+        let Some(particle) = cc.particle.as_ref() else {
+            continue;
+        };
+        let mut entries: HashMap<(Option<NameId>, NameId), Vec<Entry>> = HashMap::new();
+        let mut flat_idx = 0usize;
+        walk_particle(
+            schema_set,
+            particle,
+            ct.target_namespace,
+            &ct.resolved_content_particle_elements,
+            &mut flat_idx,
+            &subst_index,
+            &mut entries,
+            0,
+        );
+
+        for ((ns, name), list) in &entries {
+            if list.len() < 2 {
+                continue;
+            }
+            let first_type = list[0].0;
+            for (other_type, other_src) in &list[1..] {
+                if *other_type == first_type {
+                    continue;
+                }
+                let qn_str = format_type_name(schema_set, Some(*name), *ns);
+                let location = schema_set
+                    .locate(other_src.as_ref())
+                    .or_else(|| schema_set.locate(list[0].1.as_ref()))
+                    .or_else(|| schema_set.locate(ct.source.as_ref()));
+                return Err(SchemaError::structural(
+                    "cos-element-consistent",
+                    format!(
+                        "Element declarations for '{}' in the same content model \
+                         (counting substitution-group expansion) have different \
+                         {{type definition}}s (§3.8.6.3 / cos-element-consistent)",
+                        qn_str
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // §src-redefine 6.2.2 / 7.2.2 — deferred restriction validation for redefines
 // ---------------------------------------------------------------------------

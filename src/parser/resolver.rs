@@ -660,6 +660,13 @@ impl SchemaResolver {
     /// Returns `Ok(None)` only when there is no `schemaLocation` and no
     /// catalog match (namespace-only import). All other paths return
     /// `Ok(Some(LoadOutcome))`.
+    ///
+    /// Per src-import (§4.2.6.1) the loaded schema's `targetNamespace` is
+    /// validated against the directive's `namespace` attribute:
+    /// 1.1 (`namespace` absent) — the imported schema must have an absent
+    ///     `targetNamespace`.
+    /// 1.2 (`namespace` present) — the imported schema's `targetNamespace`
+    ///     must equal the directive's `namespace` value.
     pub fn process_import(
         &mut self,
         namespace: Option<&str>,
@@ -669,32 +676,63 @@ impl SchemaResolver {
     ) -> SchemaResult<Option<LoadOutcome>> {
         // Import does not do chameleon namespace adoption.
         //
-        // Catalog takes priority: if the namespace has a catalog entry, use it
-        // instead of the schemaLocation hint.  This follows standard XML Catalog
-        // semantics and lets embedded/local schemas override remote HTTP URLs.
-        if let Some(ns) = namespace {
-            if let Some(location) = self.catalog.lookup(ns) {
-                let location = location.to_string();
-                let catalog_already_loaded = self
-                    .resolve_location(&location, base_uri)
-                    .ok()
-                    .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
-                if !catalog_already_loaded {
-                    return Ok(Some(self.load_schema(&location, base_uri, schema_set, None)?));
+        // Resolution order:
+        //   1. Explicit `schemaLocation` (when loadable). The user's hint wins
+        //      over a catalog entry whenever the file can actually be read,
+        //      which is what saxon `over030` (xml-namespace overlay) relies
+        //      on.
+        //   2. Catalog redirect (used when no schemaLocation is given OR the
+        //      schemaLocation cannot be loaded — typically because it points
+        //      at a remote URL with network access disabled). This keeps
+        //      embedded `xml`/`xlink` schemas in play for the W3C suite's
+        //      `xsts.xsd` harness, which references `http://...xlink.xsd`.
+        //   3. Namespace-only import (relies on the namespace being loaded
+        //      elsewhere or provided externally).
+        if let Some(location) = schema_location {
+            match self.load_schema(location, base_uri, schema_set, None) {
+                Ok(outcome) => {
+                    validate_import_target_namespace(schema_set, &outcome, namespace)?;
+                    return Ok(Some(outcome));
                 }
-                // Catalog entry already loaded — done.
-                return Ok(None);
+                Err(load_err) => {
+                    if let Some(cat_loc) = namespace.and_then(|ns| self.catalog.lookup(ns)) {
+                        let cat_loc = cat_loc.to_string();
+                        return self.try_catalog_load(&cat_loc, base_uri, namespace, schema_set);
+                    }
+                    return Err(load_err);
+                }
             }
         }
 
-        // No catalog match — try schemaLocation if provided.
-        if let Some(location) = schema_location {
-            return Ok(Some(self.load_schema(location, base_uri, schema_set, None)?));
+        if let Some(cat_loc) = namespace.and_then(|ns| self.catalog.lookup(ns)) {
+            let cat_loc = cat_loc.to_string();
+            return self.try_catalog_load(&cat_loc, base_uri, namespace, schema_set);
         }
 
         // Import without schemaLocation and no catalog entry is allowed
         // (the namespace might already be loaded or provided externally)
         Ok(None)
+    }
+
+    /// Load a catalog-resolved import target, validating namespace match.
+    /// Returns `Ok(None)` when the catalog entry is already loaded.
+    fn try_catalog_load(
+        &mut self,
+        catalog_location: &str,
+        base_uri: &str,
+        namespace: Option<&str>,
+        schema_set: &mut SchemaSet,
+    ) -> SchemaResult<Option<LoadOutcome>> {
+        let already_loaded = self
+            .resolve_location(catalog_location, base_uri)
+            .ok()
+            .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
+        if already_loaded {
+            return Ok(None);
+        }
+        let outcome = self.load_schema(catalog_location, base_uri, schema_set, None)?;
+        validate_import_target_namespace(schema_set, &outcome, namespace)?;
+        Ok(Some(outcome))
     }
 
     /// Process a redefine directive.
@@ -731,6 +769,56 @@ impl Default for SchemaResolver {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Validate that an `<xs:import>` directive's `namespace` attribute matches
+/// the loaded schema's `targetNamespace`, per src-import (§4.2.6.1):
+///
+/// - 1.1: `namespace` absent ⇒ imported schema must have absent
+///   `targetNamespace`.
+/// - 1.2: `namespace` present ⇒ imported schema must have a `targetNamespace`
+///   equal to that value.
+///
+/// Re-checks both freshly `Loaded` and `AlreadyLoaded` outcomes so a stale
+/// duplicate import that disagrees with a previously-loaded document fails
+/// the same way as the first import would.
+fn validate_import_target_namespace(
+    schema_set: &SchemaSet,
+    outcome: &LoadOutcome,
+    namespace: Option<&str>,
+) -> SchemaResult<()> {
+    let doc_id = match outcome {
+        LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) => *id,
+        LoadOutcome::Cycle(_) => return Ok(()),
+    };
+    let Some(doc) = schema_set.documents.get(doc_id as usize) else {
+        return Ok(());
+    };
+    let imported_tns = doc
+        .target_namespace
+        .map(|n| schema_set.name_table.resolve_ref(n));
+    if namespace == imported_tns {
+        return Ok(());
+    }
+    let msg = match (namespace, imported_tns) {
+        (None, Some(tns)) => format!(
+            "Import directive has no namespace attribute, but imported schema has \
+             targetNamespace='{}' (src-import clause 1.1 requires absent targetNamespace)",
+            tns
+        ),
+        (Some(ns), None) => format!(
+            "Import directive namespace='{}' does not match imported schema's absent \
+             targetNamespace (src-import clause 1.2)",
+            ns
+        ),
+        (Some(ns), Some(tns)) => format!(
+            "Import directive namespace='{}' does not match imported schema's \
+             targetNamespace='{}' (src-import clause 1.2)",
+            ns, tns
+        ),
+        (None, None) => unreachable!("handled by early return above"),
+    };
+    Err(SchemaError::structural("src-import", msg, None))
 }
 
 // ============================================================================

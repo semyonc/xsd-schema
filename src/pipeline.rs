@@ -399,11 +399,28 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // effective attribute uses must be unique by (namespace, name).
     crate::schema::validate_complex_type_attribute_uniqueness(schema_set)?;
 
+    // src-element §3.3.3 clause 4.3 / src-attribute §3.2.3 clause 6.3:
+    // a local element/attribute's explicit `targetNamespace` may differ from
+    // the schema's only inside a <complexContent>/<restriction> of a non-
+    // anyType base.
+    crate::schema::validate_local_decl_target_namespace(schema_set)?;
+
+    // §3.2.6.4 (`no-xsi`): user-declared attributes must not live in the
+    // XML Schema instance namespace.
+    crate::schema::validate_no_xsi_attribute_declarations(schema_set)?;
+
     // Validate substitution group membership constraints (e-props-correct.4)
     crate::compiler::substitution::validate_all_substitution_groups(schema_set)?;
 
     allocate_content_particle_elements(schema_set)?;
     allocate_model_group_particle_elements(schema_set)?;
+
+    // §3.8.6.3 (cos-element-consistent): when a content model contains a
+    // local element with QName Q and an element ref whose substitution-
+    // group expansion includes another declaration of Q, both must agree
+    // on `{type definition}`. Runs after particle-element allocation so
+    // local elements are tracked through their ElementKey.
+    crate::schema::validate_substitution_group_element_consistency(schema_set)?;
     // XSD 1.1: assemble inline alternative types attached to local
     // elements (which only acquired their ElementKey above).
     #[cfg(feature = "xsd11")]
