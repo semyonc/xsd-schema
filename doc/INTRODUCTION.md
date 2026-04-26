@@ -184,7 +184,7 @@ This matches the strict-conformance posture: identity constraints, `xml:*`
 leniency, and strict-mode warning promotion are all opt-in. Two common
 recipes:
 
-```rust,ignore
+```rust
 use xsd_schema::validation::ValidationFlags;
 
 // Strict XSD conformance with key/unique/keyref enforcement:
@@ -201,7 +201,7 @@ let lenient = ValidationFlags::default()
 For XSD 1.1 assertion-backed types, use the fragment-buffering validator
 constructor. `new_fragment_buffer` sets `PROCESS_ASSERTIONS` for you:
 
-```rust,ignore
+```rust
 use xsd_schema::validation::{SchemaValidator, ValidationFlags};
 
 let flags = ValidationFlags::default()
@@ -332,7 +332,7 @@ when DTD information is available. To bridge this gap without coupling the
 validator to a DTD parser, `ValidationRuntime` accepts an optional set of
 declared unparsed entity names via `set_unparsed_entities()`:
 
-```rust,ignore
+```rust
 use std::collections::HashSet;
 
 let mut entities = HashSet::new();
@@ -377,13 +377,13 @@ Schema-location hints are accumulated during a validation run. Each hint
 carries the instance document's base URI for correct relative URI resolution.
 Set the base URI before starting validation:
 
-```rust,ignore
+```rust
 runtime.set_instance_base_uri("/absolute/path/to/instance.xml");
 ```
 
 Retrieve hints afterwards:
 
-```rust,ignore
+```rust
 let sl_hints = runtime.schema_location_hints();    // &[SchemaLocationHint]
 let nnsl_hints = runtime.no_namespace_schema_location_hints(); // &[NoNamespaceSchemaLocationHint]
 ```
@@ -403,7 +403,7 @@ for a second pass.
 The simplest approach is `enrich_schema_set`, which re-loads the original
 schemas and adds the hinted ones in a single call:
 
-```rust,ignore
+```rust
 use xsd_schema::enrich_schema_set;
 
 // First pass: validate and collect hints
@@ -426,7 +426,7 @@ original schema file paths yourself.
 
 For more control, use the builder directly:
 
-```rust,ignore
+```rust
 use xsd_schema::{SchemaSetBuilder, load_hints_into_builder};
 
 let mut builder = SchemaSetBuilder::new();

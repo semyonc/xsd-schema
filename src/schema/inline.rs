@@ -684,11 +684,22 @@ pub(crate) fn validate_keyref_refers(
                         if ic_data.name != refer_name {
                             return false;
                         }
-                        let ic_ns = ic_data
+                        // Resolve the IC's namespace via its source document.
+                        // If the document is not yet in `documents` (current
+                        // schema being assembled — `documents.push` happens
+                        // after `assemble_schema` returns), fall back to the
+                        // assembler's `target_namespace`. Distinguish "doc
+                        // missing" from "doc.target_namespace is None" so
+                        // genuinely no-namespace ICs are not coerced.
+                        let ic_ns = match ic_data
                             .source
                             .as_ref()
-                            .and_then(|s| documents.get(s.doc_id as usize))
-                            .and_then(|d| d.target_namespace);
+                            .map(|s| documents.get(s.doc_id as usize))
+                        {
+                            Some(Some(d)) => d.target_namespace,
+                            Some(None) => target_namespace,
+                            None => None,
+                        };
                         effective_refer_ns == ic_ns
                     });
                     match global_target {

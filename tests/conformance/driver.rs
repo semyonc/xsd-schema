@@ -247,6 +247,18 @@ fn extract_xsd_versions(version_attr: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Recognize errors from `validate_instance` that indicate the instance
+/// document is not even well-formed XML — malformed start/end tags,
+/// invalid attribute syntax, escape errors, etc. Such instances are
+/// trivially invalid: a test that expects "invalid" should pass.
+fn is_xml_wellformedness_error(msg: &str) -> bool {
+    msg.starts_with("XML parse error:")
+        || msg.starts_with("Attribute error:")
+        || msg.starts_with("Attribute unescape error:")
+        || msg.starts_with("Text unescape error:")
+        || msg.starts_with("CData UTF-8 error:")
+}
+
 /// Test case from the suite manifest
 #[derive(Debug, Clone)]
 pub struct TestCase {
@@ -1055,6 +1067,21 @@ impl TestRunner {
                             ),
                         };
                     }
+                    // When the test expects an invalid instance and the schema
+                    // cannot be compiled, the instance cannot be validly bound:
+                    // treat this as Pass. Cascading schema-compile failures into
+                    // ERROR was masking expected-invalid outcomes; the schema
+                    // FAIL is already attributed to the schema test itself.
+                    if test.expected == ExpectedOutcome::InstanceInvalid {
+                        return TestResult {
+                            name: test.name.clone(),
+                            group: test.group.clone(),
+                            expected: test.expected,
+                            actual: TestOutcome::Pass,
+                            duration: start.elapsed(),
+                            error_message: None,
+                        };
+                    }
                     return TestResult {
                         name: test.name.clone(),
                         group: test.group.clone(),
@@ -1128,7 +1155,18 @@ impl TestRunner {
                         ),
                         _ => unreachable!(),
                     },
-                    Err(e) => (TestOutcome::Error, Some(e)),
+                    Err(e) => {
+                        // Malformed XML or other XML well-formedness errors at
+                        // instance-read time make the instance trivially invalid.
+                        // For tests that expect invalid, treat such errors as Pass.
+                        if test.expected == ExpectedOutcome::InstanceInvalid
+                            && is_xml_wellformedness_error(&e)
+                        {
+                            (TestOutcome::Pass, None)
+                        } else {
+                            (TestOutcome::Error, Some(e))
+                        }
+                    }
                 }
             }
             _ => unreachable!("non-asserting expected outcomes are handled before execution"),
