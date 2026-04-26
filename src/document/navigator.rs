@@ -30,6 +30,14 @@ pub struct BufferDocNavigator<'a> {
     doc: &'a BufferDocument<'a>,
     /// Current node position in the main node array.
     current: u32,
+    /// Hide the synthetic root's children for XSD assertion absolute paths.
+    assertion_absolute_root: bool,
+    /// In assertion scope, the asserter element (the visible "fragment root").
+    /// `NULL` outside assertion scope. Reverse axes that need a forward
+    /// document-order starting point (e.g. `preceding`) use this so they walk
+    /// inside the visible subtree instead of getting stuck at the synthetic
+    /// root, whose children `move_to_first_child` deliberately hides.
+    assertion_fragment_root: u32,
     /// Non-NULL when positioned on an attribute or namespace (= owning element).
     virtual_parent: u32,
     /// Non-NULL when positioned on a namespace node.
@@ -46,10 +54,25 @@ impl<'a> BufferDocNavigator<'a> {
         Self {
             doc,
             current: node,
+            assertion_absolute_root: false,
+            assertion_fragment_root: NULL,
             virtual_parent: NULL,
             current_ns: NsRef::NULL,
             attr_index: 0,
             ns_list: Vec::new(),
+        }
+    }
+
+    /// Creates a navigator for XSD 1.1 assertion evaluation.
+    ///
+    /// The assertion context item is the asserted element, so relative paths
+    /// such as `.//x` traverse its subtree. Leading `/` and `//` are rooted at
+    /// the assertion XDM root, which exposes no synthetic child axis.
+    pub fn new_assertion(doc: &'a BufferDocument<'a>, node: u32) -> Self {
+        Self {
+            assertion_absolute_root: true,
+            assertion_fragment_root: node,
+            ..Self::new(doc, node)
         }
     }
 
@@ -94,7 +117,13 @@ impl<'a> BufferDocNavigator<'a> {
     }
 
     /// Restore cursor state from saved values (for position-unchanged-on-false).
-    fn restore_cursor(&mut self, current: u32, virtual_parent: u32, current_ns: NsRef, attr_index: u16) {
+    fn restore_cursor(
+        &mut self,
+        current: u32,
+        virtual_parent: u32,
+        current_ns: NsRef,
+        attr_index: u16,
+    ) {
         self.current = current;
         self.virtual_parent = virtual_parent;
         self.current_ns = current_ns;
@@ -230,11 +259,7 @@ impl<'a> BufferDocNavigator<'a> {
     /// - **All**: All in-scope namespaces including inherited, plus the
     ///   implicit `xml:` binding.
     /// - **ExcludeXml**: Like All but without the `xml:` namespace.
-    fn collect_namespaces(
-        &self,
-        elem: u32,
-        scope: NamespaceAxisScope,
-    ) -> Vec<NsRef> {
+    fn collect_namespaces(&self, elem: u32, scope: NamespaceAxisScope) -> Vec<NsRef> {
         match scope {
             NamespaceAxisScope::Local => {
                 let node = self.doc.nodes.get(elem);
@@ -261,8 +286,7 @@ impl<'a> BufferDocNavigator<'a> {
                 let mut cursor = elem;
                 loop {
                     let node = self.doc.nodes.get(cursor);
-                    if node.node_type() == NodeType::Element
-                        && node.has_flag(Node::HAS_NMSP_DECLS)
+                    if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS)
                     {
                         if let Some(&ns_head) = self.doc.element_namespaces.get(&cursor) {
                             let mut ns_ref = ns_head;
@@ -270,8 +294,7 @@ impl<'a> BufferDocNavigator<'a> {
                                 let ns_node = self.doc.namespace_pages.get(ns_ref);
                                 if seen_prefixes.insert(ns_node.prefix) {
                                     if scope == NamespaceAxisScope::ExcludeXml {
-                                        let prefix_str =
-                                            self.doc.names.resolve_ref(ns_node.prefix);
+                                        let prefix_str = self.doc.names.resolve_ref(ns_node.prefix);
                                         if prefix_str == "xml" {
                                             ns_ref = ns_node.next;
                                             continue;
@@ -455,6 +478,8 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
     fn move_to(&mut self, other: &Self) -> bool {
         self.current = other.current;
+        self.assertion_absolute_root = other.assertion_absolute_root;
+        self.assertion_fragment_root = other.assertion_fragment_root;
         self.virtual_parent = other.virtual_parent;
         self.current_ns = other.current_ns;
         self.attr_index = other.attr_index;
@@ -464,6 +489,15 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
     fn move_to_root(&mut self) {
         self.current = self.doc.root;
+        self.clear_virtual();
+    }
+
+    fn move_to_visible_root(&mut self) {
+        if self.assertion_absolute_root && self.assertion_fragment_root != NULL {
+            self.current = self.assertion_fragment_root;
+        } else {
+            self.current = self.doc.root;
+        }
         self.clear_virtual();
     }
 
@@ -483,6 +517,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
     fn move_to_first_child(&mut self) -> bool {
         if self.virtual_parent != NULL {
+            return false;
+        }
+        if self.assertion_absolute_root && self.current == self.doc.root {
             return false;
         }
         if let Some(child) = self.doc.first_content_child_of(self.current) {
@@ -625,7 +662,12 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
                 break;
             }
             if !self.move_to_parent() {
-                self.restore_cursor(saved_current, saved_virtual_parent, saved_current_ns, saved_attr_index);
+                self.restore_cursor(
+                    saved_current,
+                    saved_virtual_parent,
+                    saved_current_ns,
+                    saved_attr_index,
+                );
                 return false;
             }
         }
@@ -635,7 +677,12 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         loop {
             if self.matches_kind(kind) {
                 if self.past_end(end) {
-                    self.restore_cursor(saved_current, saved_virtual_parent, saved_current_ns, saved_attr_index);
+                    self.restore_cursor(
+                        saved_current,
+                        saved_virtual_parent,
+                        saved_current_ns,
+                        saved_attr_index,
+                    );
                     return false;
                 }
                 return true;
@@ -649,7 +696,12 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             }
             loop {
                 if !self.move_to_parent() {
-                    self.restore_cursor(saved_current, saved_virtual_parent, saved_current_ns, saved_attr_index);
+                    self.restore_cursor(
+                        saved_current,
+                        saved_virtual_parent,
+                        saved_current_ns,
+                        saved_attr_index,
+                    );
                     return false;
                 }
                 if self.move_to_next_sibling() {
@@ -825,10 +877,12 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
-        Ok(self
-            .doc
-            .get_element_by_id(id)
-            .map(|r| BufferDocNavigator::new(self.doc, r)))
+        Ok(self.doc.get_element_by_id(id).map(|r| {
+            let mut nav = BufferDocNavigator::new(self.doc, r);
+            nav.assertion_absolute_root = self.assertion_absolute_root;
+            nav.assertion_fragment_root = self.assertion_fragment_root;
+            nav
+        }))
     }
 }
 
@@ -838,14 +892,43 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 mod tests {
     use super::*;
     use crate::namespace::NameTable;
+    use crate::xpath::context::XPathContext;
+    use crate::xpath::XPathExpr;
     use bumpalo::Bump;
 
-    fn build_doc<'a>(
-        xml: &str,
-        arena: &'a Bump,
-        names: &'a NameTable,
-    ) -> BufferDocument<'a> {
+    fn build_doc<'a>(xml: &str, arena: &'a Bump, names: &'a NameTable) -> BufferDocument<'a> {
         BufferDocument::from_reader_default(xml.as_bytes(), arena, names).unwrap()
+    }
+
+    fn first_ele2<'a>(doc: &'a BufferDocument<'a>) -> u32 {
+        let mut nav = BufferDocNavigator::new(doc, doc.root());
+        assert!(nav.move_to_first_child()); // root
+        assert!(nav.move_to_first_child()); // ele1
+        assert!(nav.move_to_first_child()); // subElement1
+        assert!(nav.move_to_first_child()); // ele2
+        nav.current_ref()
+    }
+
+    #[test]
+    fn assertion_navigator_keeps_absolute_double_slash_empty() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            "<root><ele1 attr1=\"1\"><subElement1><ele2><subElement2><ele1 attr1=\"2\"/></subElement2></ele2></subElement1></ele1></root>",
+            &arena,
+            &names,
+        );
+        let ele2 = first_ele2(&doc);
+        let ctx = XPathContext::new(&names);
+        let nav = BufferDocNavigator::new_assertion(&doc, ele2);
+        let expr = XPathExpr::compile(
+            "empty(//ele1) and count(.//ele1) eq 1 and empty(//@attr1) and count(.//@attr1) eq 1",
+            &ctx,
+        )
+        .unwrap();
+
+        let result = expr.evaluator(&ctx).run_with_node(nav).unwrap();
+        assert_eq!(result.as_bool(), Some(true));
     }
 
     // ── 1. Basic navigation ──────────────────────────────────────────
@@ -898,11 +981,7 @@ mod tests {
     fn attribute_navigation() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            r#"<root attr1="v1" attr2="v2"/>"#,
-            &arena,
-            &names,
-        );
+        let doc = build_doc(r#"<root attr1="v1" attr2="v2"/>"#, &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
 
@@ -953,11 +1032,7 @@ mod tests {
     fn namespace_all_includes_xml() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            r#"<root xmlns:p="http://prefixed"/>"#,
-            &arena,
-            &names,
-        );
+        let doc = build_doc(r#"<root xmlns:p="http://prefixed"/>"#, &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
 
@@ -983,11 +1058,7 @@ mod tests {
     fn namespace_exclude_xml() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            r#"<root xmlns:p="http://prefixed"/>"#,
-            &arena,
-            &names,
-        );
+        let doc = build_doc(r#"<root xmlns:p="http://prefixed"/>"#, &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
 
@@ -1052,11 +1123,7 @@ mod tests {
     fn element_value_concatenated_text() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root>Hello <b>World</b>!</root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root>Hello <b>World</b>!</root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child();
 
@@ -1081,11 +1148,7 @@ mod tests {
     fn pi_value() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><?target data?></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><?target data?></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // PI
@@ -1122,11 +1185,7 @@ mod tests {
     fn move_to_following_elements() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><a><b/></a><c/></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><a><b/></a><c/></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1144,11 +1203,7 @@ mod tests {
     fn move_to_following_skips_descendants() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><a><d/><e/></a><b/><c/></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><a><d/><e/></a><b/><c/></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1167,11 +1222,7 @@ mod tests {
     fn move_to_following_from_deep_node() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><a><b><d/></b></a><c/></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><a><b><d/></b></a><c/></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1188,11 +1239,7 @@ mod tests {
     fn move_to_following_preserves_position_on_false() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><a/></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><a/></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1230,11 +1277,7 @@ mod tests {
     fn compare_position_attr_vs_element() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            r#"<root x="1"><child/></root>"#,
-            &arena,
-            &names,
-        );
+        let doc = build_doc(r#"<root x="1"><child/></root>"#, &arena, &names);
         let mut nav_attr = doc.create_navigator();
         let mut nav_child = doc.create_navigator();
 
@@ -1245,10 +1288,7 @@ mod tests {
         nav_child.move_to_first_child(); // child
 
         // Attribute of root should come before child of root
-        assert_eq!(
-            nav_attr.compare_position(&nav_child),
-            XmlNodeOrder::Before
-        );
+        assert_eq!(nav_attr.compare_position(&nav_child), XmlNodeOrder::Before);
     }
 
     // ── 9. is_same_position / move_to ────────────────────────────────
@@ -1394,11 +1434,7 @@ mod tests {
     fn namespace_parent_returns_element() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            r#"<root xmlns:p="http://example.com"/>"#,
-            &arena,
-            &names,
-        );
+        let doc = build_doc(r#"<root xmlns:p="http://example.com"/>"#, &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_namespace(NamespaceAxisScope::Local);
@@ -1474,11 +1510,7 @@ mod tests {
     fn mixed_content_value() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root>a<b>c</b>d</root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root>a<b>c</b>d</root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child();
 
@@ -1489,11 +1521,7 @@ mod tests {
     fn comment_node() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><!-- comment --></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><!-- comment --></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // comment
@@ -1543,11 +1571,7 @@ mod tests {
     fn move_to_root_from_deep_node() {
         let arena = Bump::new();
         let names = NameTable::new();
-        let doc = build_doc(
-            "<root><a><b><c/></b></a></root>",
-            &arena,
-            &names,
-        );
+        let doc = build_doc("<root><a><b><c/></b></a></root>", &arena, &names);
         let mut nav = doc.create_navigator();
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a

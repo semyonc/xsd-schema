@@ -6,8 +6,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use std::io::BufRead;
 
-use crate::parser::location::SourceSpan;
 use crate::error::{SchemaError, SchemaResult};
+use crate::parser::location::SourceSpan;
 
 /// XML event with source span
 #[derive(Debug)]
@@ -200,10 +200,7 @@ mod tests {
             split_qname(b"xs:element"),
             (&b"element"[..], Some(&b"xs"[..]))
         );
-        assert_eq!(
-            split_qname(b"xsi:nil"),
-            (&b"nil"[..], Some(&b"xsi"[..]))
-        );
+        assert_eq!(split_qname(b"xsi:nil"), (&b"nil"[..], Some(&b"xsi"[..])));
     }
 
     #[test]

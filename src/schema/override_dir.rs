@@ -22,12 +22,11 @@ use std::collections::HashSet;
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
 use crate::parser::frames::{
-    ComplexContentResult, ComplexTypeResult, ElementFrameResult,
-    ParticleResult, ParticleTerm, TypeFrameResult,
+    ComplexContentResult, ComplexTypeResult, ElementFrameResult, ParticleResult, ParticleTerm,
+    TypeFrameResult,
 };
 use crate::schema::composition::{
-    CompositionEdgeKind, ComponentKey, ComponentKind,
-    record_provenance, overridden_action,
+    overridden_action, record_provenance, ComponentKey, ComponentKind, CompositionEdgeKind,
 };
 use crate::schema::model::{DerivationSet, OverrideComponent, OverrideDirective};
 use crate::schema::SchemaSet;
@@ -144,12 +143,9 @@ pub fn validate_override_directives(schema_set: &SchemaSet) -> SchemaResult<()> 
                 Some(id) => compute_target_set(schema_set, id),
                 None => HashSet::new(),
             };
-            let mut in_block: HashSet<(ComponentKind, Option<NameId>, NameId)> =
-                HashSet::new();
+            let mut in_block: HashSet<(ComponentKind, Option<NameId>, NameId)> = HashSet::new();
             for component in &directive.components {
-                let Some(identity) =
-                    override_component_identity(schema_set, component)
-                else {
+                let Some(identity) = override_component_identity(schema_set, component) else {
                     continue;
                 };
                 if !in_block.insert(identity) {
@@ -225,9 +221,7 @@ fn target_set_has_identity(
             ComponentKind::Element => idx.lookup_element(namespace, name).is_some(),
             ComponentKind::Attribute => idx.lookup_attribute(namespace, name).is_some(),
             ComponentKind::ModelGroup => idx.lookup_model_group(namespace, name).is_some(),
-            ComponentKind::AttributeGroup => {
-                idx.lookup_attribute_group(namespace, name).is_some()
-            }
+            ComponentKind::AttributeGroup => idx.lookup_attribute_group(namespace, name).is_some(),
             ComponentKind::Notation => idx.lookup_notation(namespace, name).is_some(),
             ComponentKind::IdentityConstraint => false,
         }
@@ -315,31 +309,72 @@ pub fn apply_override(
     for component in &override_dir.components {
         match component {
             OverrideComponent::SimpleType(key) => {
-                override_simple_type(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_simple_type(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::ComplexType(key) => {
-                override_complex_type(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_complex_type(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::Group(key) => {
-                override_model_group(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_model_group(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::AttributeGroup(key) => {
-                override_attribute_group(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_attribute_group(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::Element(key) => {
-                override_element(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_element(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::Attribute(key) => {
-                override_attribute(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_attribute(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
             OverrideComponent::Notation(key) => {
-                override_notation(schema_set, *key, target_doc_id, &target_set, overriding_doc_id)?;
+                override_notation(
+                    schema_set,
+                    *key,
+                    target_doc_id,
+                    &target_set,
+                    overriding_doc_id,
+                )?;
             }
         }
     }
     Ok(())
 }
-
 
 /// Apply the overridden document's (D2) schema-level defaults to override
 /// children per F.2 transformation semantics.
@@ -427,7 +462,10 @@ fn apply_d2_defaults(
 }
 
 /// Set `schema_defaults_doc` on a single source reference.
-fn set_defaults_doc(source: &mut Option<crate::parser::location::SourceRef>, doc_id: Option<DocumentId>) {
+fn set_defaults_doc(
+    source: &mut Option<crate::parser::location::SourceRef>,
+    doc_id: Option<DocumentId>,
+) {
     if let (Some(ref mut src), Some(id)) = (source, doc_id) {
         src.schema_defaults_doc = Some(id);
     }
@@ -545,8 +583,17 @@ fn override_simple_type(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Simple(new_key)),
-        ComponentKind::SimpleType, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::SimpleType, name, namespace, target_doc_id),
+        ComponentKind::SimpleType,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::SimpleType,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -586,8 +633,17 @@ fn override_complex_type(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Complex(new_key)),
-        ComponentKind::ComplexType, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::ComplexType, name, namespace, target_doc_id),
+        ComponentKind::ComplexType,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::ComplexType,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -627,8 +683,17 @@ fn override_model_group(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::ModelGroup(new_key),
-        ComponentKind::ModelGroup, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::ModelGroup, name, namespace, target_doc_id),
+        ComponentKind::ModelGroup,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::ModelGroup,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -668,8 +733,17 @@ fn override_attribute_group(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::AttributeGroup(new_key),
-        ComponentKind::AttributeGroup, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::AttributeGroup, name, namespace, target_doc_id),
+        ComponentKind::AttributeGroup,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::AttributeGroup,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -690,11 +764,7 @@ fn override_element(
         .ok_or_else(|| SchemaError::internal("Override: element not found"))?;
 
     let name = new_elem.name.ok_or_else(|| {
-        SchemaError::structural(
-            "src-override",
-            "Overriding element must have a name",
-            None,
-        )
+        SchemaError::structural("src-override", "Overriding element must have a name", None)
     })?;
     let namespace = new_elem.target_namespace;
 
@@ -709,8 +779,17 @@ fn override_element(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Element(new_key),
-        ComponentKind::Element, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::Element, name, namespace, target_doc_id),
+        ComponentKind::Element,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::Element,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -750,8 +829,17 @@ fn override_attribute(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Attribute(new_key),
-        ComponentKind::Attribute, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::Attribute, name, namespace, target_doc_id),
+        ComponentKind::Attribute,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::Attribute,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -785,8 +873,17 @@ fn override_notation(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Notation(new_key),
-        ComponentKind::Notation, namespace, name, overriding_doc_id,
-        overridden_action(overriding_doc_id, ComponentKind::Notation, name, namespace, target_doc_id),
+        ComponentKind::Notation,
+        namespace,
+        name,
+        overriding_doc_id,
+        overridden_action(
+            overriding_doc_id,
+            ComponentKind::Notation,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -845,8 +942,9 @@ mod tests {
             .expect("MyElem should be in global namespace table from doc_a");
 
         // Create a replacement element in the arena
-        let replacement_key = schema_set.arenas.alloc_element(
-            crate::arenas::ElementDeclData {
+        let replacement_key = schema_set
+            .arenas
+            .alloc_element(crate::arenas::ElementDeclData {
                 name: Some(my_elem_name),
                 target_namespace: None,
                 ref_name: None,
@@ -871,8 +969,7 @@ mod tests {
                 resolved_type: None,
                 resolved_ref: None,
                 resolved_substitution_groups: Vec::new(),
-            },
-        );
+            });
 
         // Override targeting doc_b (which does NOT have MyElem)
         let override_dir = OverrideDirective {
@@ -964,7 +1061,10 @@ mod tests {
         // Verify the target set includes both base and helper
         let main_doc = &schema_set.documents[doc_id as usize];
         let override_target = main_doc.overrides[0].resolved_doc_id;
-        assert!(override_target.is_some(), "Override should have resolved_doc_id");
+        assert!(
+            override_target.is_some(),
+            "Override should have resolved_doc_id"
+        );
 
         let target_set = compute_target_set(&schema_set, override_target.unwrap());
         assert!(
@@ -1023,7 +1123,10 @@ mod tests {
         );
 
         let mut schema_set = SchemaSet::xsd11();
-        let main_path = tmp.join("ovr_d1_block_main.xsd").to_string_lossy().to_string();
+        let main_path = tmp
+            .join("ovr_d1_block_main.xsd")
+            .to_string_lossy()
+            .to_string();
         let doc_id = parse_schema(main_xsd.as_bytes(), &main_path, &mut schema_set).unwrap();
 
         let mut resolver = SchemaResolver::new();
@@ -1100,7 +1203,10 @@ mod tests {
         );
 
         let mut schema_set = SchemaSet::xsd11();
-        let main_path = tmp.join("ovr_defaults_main.xsd").to_string_lossy().to_string();
+        let main_path = tmp
+            .join("ovr_defaults_main.xsd")
+            .to_string_lossy()
+            .to_string();
         let doc_id = parse_schema(main_xsd.as_bytes(), &main_path, &mut schema_set).unwrap();
 
         let mut resolver = SchemaResolver::new();
@@ -1112,7 +1218,8 @@ mod tests {
 
         // Get D2's doc_id from the override's resolved_doc_id
         let main_doc = &schema_set.documents[doc_id as usize];
-        let d2_doc_id = main_doc.overrides[0].resolved_doc_id
+        let d2_doc_id = main_doc.overrides[0]
+            .resolved_doc_id
             .expect("Override should have resolved_doc_id");
 
         // Apply composition
@@ -1129,11 +1236,13 @@ mod tests {
             let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
             let src = ct.source.as_ref().expect("Complex type should have source");
             assert_eq!(
-                src.schema_defaults_doc, Some(d2_doc_id),
+                src.schema_defaults_doc,
+                Some(d2_doc_id),
                 "Override complex type's schema_defaults_doc should be D2's doc_id"
             );
             assert_eq!(
-                src.defaults_doc(), d2_doc_id,
+                src.defaults_doc(),
+                d2_doc_id,
                 "defaults_doc() should return D2's doc_id"
             );
 
@@ -1153,7 +1262,9 @@ mod tests {
                             // sequence/all/choice wraps elements in a group
                             for p in &group.particles {
                                 if let ParticleTerm::Element(ref elem) = p.term {
-                                    let elem_src = elem.source.as_ref()
+                                    let elem_src = elem
+                                        .source
+                                        .as_ref()
                                         .expect("Inline element should have source");
                                     assert_eq!(
                                         elem_src.schema_defaults_doc, Some(d2_doc_id),
@@ -1163,7 +1274,9 @@ mod tests {
                             }
                         }
                         ParticleTerm::Element(ref elem) => {
-                            let elem_src = elem.source.as_ref()
+                            let elem_src = elem
+                                .source
+                                .as_ref()
                                 .expect("Inline element should have source");
                             assert_eq!(
                                 elem_src.schema_defaults_doc, Some(d2_doc_id),

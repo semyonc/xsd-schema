@@ -319,8 +319,8 @@ impl TestSuiteParser {
         path: &Path,
         inherited_version: Option<&str>,
     ) -> Result<Vec<TestCase>, String> {
-        let raw = fs::read(path)
-            .map_err(|e| format!("Failed to read manifest {:?}: {}", path, e))?;
+        let raw =
+            fs::read(path).map_err(|e| format!("Failed to read manifest {:?}: {}", path, e))?;
         let content = xsd_schema::decode_xml_bytes(raw)
             .map_err(|e| format!("Failed to decode manifest {:?}: {}", path, e))?;
 
@@ -1302,8 +1302,7 @@ fn validate_instance_pass(
     // fragment-buffer mode is a no-op for them (has_inherited_assertions
     // returns false everywhere → zero buffering, zero XPath compiles).
     #[cfg(feature = "xsd11")]
-    let validator =
-        xsd_schema::validation::SchemaValidator::new_fragment_buffer(schema_set, flags);
+    let validator = xsd_schema::validation::SchemaValidator::new_fragment_buffer(schema_set, flags);
     #[cfg(not(feature = "xsd11"))]
     let validator = xsd_schema::validation::SchemaValidator::new(schema_set, flags);
     let mut errors = Vec::new();
@@ -1854,9 +1853,7 @@ fn parse_entity_declarations(subset: &str) -> HashMap<String, String> {
         let quote_char = quote as char;
         pos += 1;
 
-        let val_end = subset[pos..]
-            .find(quote_char)
-            .unwrap_or(subset.len() - pos);
+        let val_end = subset[pos..].find(quote_char).unwrap_or(subset.len() - pos);
         let value = subset[pos..pos + val_end].to_string();
         pos += val_end + 1;
 

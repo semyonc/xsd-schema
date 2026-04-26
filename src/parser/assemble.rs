@@ -14,14 +14,13 @@ use crate::ids::{
     AttributeGroupKey, AttributeKey, DocumentId, ElementKey, IdentityConstraintKey, ModelGroupKey,
     NameId, NotationKey, TypeKey,
 };
+use crate::namespace::QualifiedName;
 use crate::parser::frames::{
     AttributeFrameResult, AttributeGroupDefResult, ComplexContentResult, ComplexTypeResult,
-    DirectiveResult, FrameResult, GroupFrameResult, ModelGroupDefResult,
-    NotationResult, OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult,
-    TypeFrameResult,
+    DirectiveResult, FrameResult, GroupFrameResult, ModelGroupDefResult, NotationResult,
+    OverrideResult, RedefineComponent, SchemaFrameResult, SimpleTypeResult, TypeFrameResult,
 };
 use crate::parser::location::SourceRef;
-use crate::namespace::QualifiedName;
 use crate::schema::composition::{
     ComponentIdentity, ComponentKey, ComponentKind, DocumentComponentIndex,
 };
@@ -29,7 +28,9 @@ use crate::schema::model::{
     FormChoice, ImportDirective, IncludeDirective, OverrideComponent, OverrideDirective,
     RedefineDirective, SchemaDocument,
 };
-use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint, ProcessContents as SchemaProcessContents};
+use crate::schema::wildcard::{
+    ElementWildcard, NamespaceConstraint, ProcessContents as SchemaProcessContents,
+};
 use crate::validation::asttree::Asttree;
 use crate::SchemaSet;
 
@@ -82,7 +83,8 @@ impl<'a> SchemaAssembler<'a> {
         doc_id: DocumentId,
         base_uri: &str,
     ) -> SchemaResult<SchemaDocument> {
-        let mut doc = build_schema_document(&schema, doc_id, base_uri, &mut self.schema_set.name_table)?;
+        let mut doc =
+            build_schema_document(&schema, doc_id, base_uri, &mut self.schema_set.name_table)?;
 
         let directives = schema.directives;
         let components = schema.components;
@@ -141,7 +143,9 @@ impl<'a> SchemaAssembler<'a> {
                 // final="" explicitly overrides finalDefault; None (absent) inherits it.
                 let final_derivation = final_derivation.unwrap_or(self.final_default);
                 let source_ref = source.clone();
-                let name = name.ok_or_else(|| missing_name("simpleType", source_ref.as_ref(), self.schema_set))?;
+                let name = name.ok_or_else(|| {
+                    missing_name("simpleType", source_ref.as_ref(), self.schema_set)
+                })?;
                 let data = SimpleTypeDefData {
                     name: Some(name),
                     target_namespace: self.target_namespace,
@@ -203,7 +207,9 @@ impl<'a> SchemaAssembler<'a> {
                     ComplexContentResult::Empty => Vec::new(),
                 };
                 let source_ref = source.clone();
-                let name = name.ok_or_else(|| missing_name("complexType", source_ref.as_ref(), self.schema_set))?;
+                let name = name.ok_or_else(|| {
+                    missing_name("complexType", source_ref.as_ref(), self.schema_set)
+                })?;
                 let data = ComplexTypeDefData {
                     name: Some(name),
                     target_namespace: self.target_namespace,
@@ -245,7 +251,11 @@ impl<'a> SchemaAssembler<'a> {
         }
     }
 
-    fn assemble_element(&mut self, result: crate::parser::frames::ElementFrameResult, register: bool) -> SchemaResult<ElementKey> {
+    fn assemble_element(
+        &mut self,
+        result: crate::parser::frames::ElementFrameResult,
+        register: bool,
+    ) -> SchemaResult<ElementKey> {
         let crate::parser::frames::ElementFrameResult {
             name,
             ref_name,
@@ -270,7 +280,8 @@ impl<'a> SchemaAssembler<'a> {
             source,
         } = result;
         let source_ref = source.clone();
-        let name = name.ok_or_else(|| missing_name("element", source_ref.as_ref(), self.schema_set))?;
+        let name =
+            name.ok_or_else(|| missing_name("element", source_ref.as_ref(), self.schema_set))?;
         let target_namespace = local_namespace.or(self.target_namespace);
         // final="" explicitly overrides finalDefault; None (absent) inherits it.
         // block="" explicitly overrides blockDefault; None (absent) inherits it.
@@ -295,7 +306,10 @@ impl<'a> SchemaAssembler<'a> {
                 let name_str = self.schema_set.name_table.resolve(ic.name);
                 return Err(SchemaError::structural(
                     "ic-unique",
-                    format!("Duplicate identity constraint name '{}' in schema document", name_str),
+                    format!(
+                        "Duplicate identity constraint name '{}' in schema document",
+                        name_str
+                    ),
                     location,
                 ));
             }
@@ -318,7 +332,10 @@ impl<'a> SchemaAssembler<'a> {
                 let location = self.schema_set.locate(ic.source.as_ref());
                 return Err(SchemaError::structural(
                     "src-identity-constraint",
-                    format!("Identity constraint '{}': invalid selector XPath '{}': {}", ic_name, ic.selector.xpath, e),
+                    format!(
+                        "Identity constraint '{}': invalid selector XPath '{}': {}",
+                        ic_name, ic.selector.xpath, e
+                    ),
                     location,
                 ));
             }
@@ -337,7 +354,10 @@ impl<'a> SchemaAssembler<'a> {
                     let location = self.schema_set.locate(ic.source.as_ref());
                     return Err(SchemaError::structural(
                         "src-identity-constraint",
-                        format!("Identity constraint '{}': invalid field XPath '{}': {}", ic_name, field.xpath, e),
+                        format!(
+                            "Identity constraint '{}': invalid field XPath '{}': {}",
+                            ic_name, field.xpath, e
+                        ),
                         location,
                     ));
                 }
@@ -360,17 +380,20 @@ impl<'a> SchemaAssembler<'a> {
             .into_iter()
             .map(|ic| {
                 let ic_name = ic.name;
-                let key = self.schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
-                    kind: ic.kind,
-                    name: ic.name,
-                    ref_name: ic.ref_name,
-                    refer: ic.refer,
-                    selector: ic.selector,
-                    fields: ic.fields,
-                    id: ic.id,
-                    annotation: ic.annotation,
-                    source: ic.source,
-                });
+                let key =
+                    self.schema_set
+                        .arenas
+                        .alloc_identity_constraint(IdentityConstraintData {
+                            kind: ic.kind,
+                            name: ic.name,
+                            ref_name: ic.ref_name,
+                            refer: ic.refer,
+                            selector: ic.selector,
+                            fields: ic.fields,
+                            id: ic.id,
+                            annotation: ic.annotation,
+                            source: ic.source,
+                        });
                 // Register in namespace table for @ref resolution
                 let ns_table = self.schema_set.get_or_create_namespace(target_namespace);
                 ns_table.identity_constraints.insert(ic_name, key);
@@ -420,7 +443,11 @@ impl<'a> SchemaAssembler<'a> {
         Ok(key)
     }
 
-    fn assemble_attribute(&mut self, result: AttributeFrameResult, register: bool) -> SchemaResult<AttributeKey> {
+    fn assemble_attribute(
+        &mut self,
+        result: AttributeFrameResult,
+        register: bool,
+    ) -> SchemaResult<AttributeKey> {
         let AttributeFrameResult {
             name,
             ref_name,
@@ -437,7 +464,8 @@ impl<'a> SchemaAssembler<'a> {
             source,
         } = result;
         let source_ref = source.clone();
-        let name = name.ok_or_else(|| missing_name("attribute", source_ref.as_ref(), self.schema_set))?;
+        let name =
+            name.ok_or_else(|| missing_name("attribute", source_ref.as_ref(), self.schema_set))?;
         let target_namespace = local_namespace.or(self.target_namespace);
         let data = AttributeDeclData {
             name: Some(name),
@@ -483,7 +511,8 @@ impl<'a> SchemaAssembler<'a> {
                     source,
                 } = *group;
                 let source_ref = source.clone();
-                let name = name.ok_or_else(|| missing_name("group", source_ref.as_ref(), self.schema_set))?;
+                let name = name
+                    .ok_or_else(|| missing_name("group", source_ref.as_ref(), self.schema_set))?;
                 let data = ModelGroupData {
                     name: Some(name),
                     target_namespace: self.target_namespace,
@@ -521,7 +550,9 @@ impl<'a> SchemaAssembler<'a> {
                     source,
                 } = *group;
                 let source_ref = source.clone();
-                let name = name.ok_or_else(|| missing_name("attributeGroup", source_ref.as_ref(), self.schema_set))?;
+                let name = name.ok_or_else(|| {
+                    missing_name("attributeGroup", source_ref.as_ref(), self.schema_set)
+                })?;
                 let data = AttributeGroupData {
                     name: Some(name),
                     target_namespace: self.target_namespace,
@@ -548,7 +579,11 @@ impl<'a> SchemaAssembler<'a> {
         }
     }
 
-    fn assemble_notation(&mut self, result: NotationResult, register: bool) -> SchemaResult<NotationKey> {
+    fn assemble_notation(
+        &mut self,
+        result: NotationResult,
+        register: bool,
+    ) -> SchemaResult<NotationKey> {
         let NotationResult {
             name,
             public,
@@ -558,7 +593,8 @@ impl<'a> SchemaAssembler<'a> {
             source,
         } = result;
         let source_ref = source.clone();
-        let name = name.ok_or_else(|| missing_name("notation", source_ref.as_ref(), self.schema_set))?;
+        let name =
+            name.ok_or_else(|| missing_name("notation", source_ref.as_ref(), self.schema_set))?;
         let data = NotationData {
             name,
             target_namespace: self.target_namespace,
@@ -583,7 +619,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_type(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -619,7 +657,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_element(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -639,7 +679,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_attribute(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -659,7 +701,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_model_group(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -667,7 +711,11 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
-        self.record_component(ComponentKind::ModelGroup, name, ComponentKey::ModelGroup(key));
+        self.record_component(
+            ComponentKind::ModelGroup,
+            name,
+            ComponentKey::ModelGroup(key),
+        );
         Ok(())
     }
 
@@ -679,7 +727,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_attribute_group(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -687,7 +737,11 @@ impl<'a> SchemaAssembler<'a> {
                 location,
             ));
         }
-        self.record_component(ComponentKind::AttributeGroup, name, ComponentKey::AttributeGroup(key));
+        self.record_component(
+            ComponentKind::AttributeGroup,
+            name,
+            ComponentKey::AttributeGroup(key),
+        );
         Ok(())
     }
 
@@ -699,7 +753,9 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self.schema_set.get_or_create_namespace(self.target_namespace);
+        let ns_table = self
+            .schema_set
+            .get_or_create_namespace(self.target_namespace);
         if ns_table.register_notation(name, key).is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
@@ -756,7 +812,9 @@ pub fn build_schema_document(
     }
 
     if let Some(xpath_ns) = result.xpath_default_namespace.as_deref() {
-        doc.xpath_default_namespace = name_table.get(xpath_ns).or_else(|| Some(name_table.add(xpath_ns)));
+        doc.xpath_default_namespace = name_table
+            .get(xpath_ns)
+            .or_else(|| Some(name_table.add(xpath_ns)));
     }
 
     if let Some(doc_result) = &result.default_open_content {
@@ -847,7 +905,8 @@ pub fn convert_directives(
                                     ));
                                 }
                             }
-                            let key = assembler.assemble_type(TypeFrameResult::Simple(st), false)?;
+                            let key =
+                                assembler.assemble_type(TypeFrameResult::Simple(st), false)?;
                             if let TypeKey::Simple(simple) = key {
                                 simple_types.push(simple);
                             }
@@ -863,7 +922,8 @@ pub fn convert_directives(
                                     ));
                                 }
                             }
-                            let key = assembler.assemble_type(TypeFrameResult::Complex(ct), false)?;
+                            let key =
+                                assembler.assemble_type(TypeFrameResult::Complex(ct), false)?;
                             if let TypeKey::Complex(complex) = key {
                                 complex_types.push(complex);
                             }
@@ -879,8 +939,8 @@ pub fn convert_directives(
                                     ));
                                 }
                             }
-                            if let GroupKeyResult::Model(key) = assembler
-                                .assemble_group(GroupFrameResult::Model(group), false)?
+                            if let GroupKeyResult::Model(key) =
+                                assembler.assemble_group(GroupFrameResult::Model(group), false)?
                             {
                                 groups.push(key);
                             }
@@ -985,15 +1045,15 @@ fn convert_override_body(
     for group in override_result.groups {
         match group {
             GroupFrameResult::Model(model) => {
-                if let GroupKeyResult::Model(key) = assembler
-                    .assemble_group(GroupFrameResult::Model(model), false)?
+                if let GroupKeyResult::Model(key) =
+                    assembler.assemble_group(GroupFrameResult::Model(model), false)?
                 {
                     components.push(OverrideComponent::Group(key));
                 }
             }
             GroupFrameResult::Attribute(group) => {
-                if let GroupKeyResult::Attribute(key) = assembler
-                    .assemble_group(GroupFrameResult::Attribute(group), false)?
+                if let GroupKeyResult::Attribute(key) =
+                    assembler.assemble_group(GroupFrameResult::Attribute(group), false)?
                 {
                     components.push(OverrideComponent::AttributeGroup(key));
                 }
@@ -1003,8 +1063,8 @@ fn convert_override_body(
 
     for group in override_result.attribute_groups {
         if let GroupFrameResult::Attribute(group) = group {
-            if let GroupKeyResult::Attribute(key) = assembler
-                .assemble_group(GroupFrameResult::Attribute(group), false)?
+            if let GroupKeyResult::Attribute(key) =
+                assembler.assemble_group(GroupFrameResult::Attribute(group), false)?
             {
                 components.push(OverrideComponent::AttributeGroup(key));
             }
@@ -1048,31 +1108,37 @@ fn convert_element_wildcard(
         crate::parser::frames::WildcardNamespace::Local => {
             NamespaceConstraint::Enumeration(vec![None])
         }
-        crate::parser::frames::WildcardNamespace::List(list) => {
-            NamespaceConstraint::Enumeration(
-                list.iter().map(|t| t.resolve(target_namespace)).collect()
-            )
-        }
+        crate::parser::frames::WildcardNamespace::List(list) => NamespaceConstraint::Enumeration(
+            list.iter().map(|t| t.resolve(target_namespace)).collect(),
+        ),
     };
 
     // notNamespace → NamespaceConstraint::Not(...)
     if !wildcard.not_namespace.is_empty() {
-        let excluded: Vec<Option<NameId>> = wildcard.not_namespace.iter()
+        let excluded: Vec<Option<NameId>> = wildcard
+            .not_namespace
+            .iter()
             .map(|t| t.resolve(target_namespace))
             .collect();
         result.namespace_constraint = NamespaceConstraint::Not(excluded);
     }
 
     // notQName → not_qnames
-    result.not_qnames = wildcard.not_qname.iter().map(|item| {
-        match item {
-            crate::parser::frames::NotQNameItem::QName { namespace, local_name } => {
-                QNameDisallowed::QName { namespace: *namespace, local_name: *local_name }
-            }
+    result.not_qnames = wildcard
+        .not_qname
+        .iter()
+        .map(|item| match item {
+            crate::parser::frames::NotQNameItem::QName {
+                namespace,
+                local_name,
+            } => QNameDisallowed::QName {
+                namespace: *namespace,
+                local_name: *local_name,
+            },
             crate::parser::frames::NotQNameItem::Defined => QNameDisallowed::Defined,
             crate::parser::frames::NotQNameItem::DefinedSibling => QNameDisallowed::DefinedSibling,
-        }
-    }).collect();
+        })
+        .collect();
 
     result.process_contents = match wildcard.process_contents {
         crate::parser::frames::ProcessContents::Strict => SchemaProcessContents::Strict,
@@ -1084,11 +1150,7 @@ fn convert_element_wildcard(
     result
 }
 
-fn missing_name(
-    kind: &str,
-    source: Option<&SourceRef>,
-    schema_set: &SchemaSet,
-) -> SchemaError {
+fn missing_name(kind: &str, source: Option<&SourceRef>, schema_set: &SchemaSet) -> SchemaError {
     let location = source.and_then(|s| schema_set.source_maps.locate(s));
     SchemaError::structural(
         "src-resolve",

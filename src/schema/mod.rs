@@ -16,68 +16,58 @@
 //! - `redefine` - xs:redefine processing
 //! - `override_dir` - xs:override processing (XSD 1.1)
 
-pub mod model;
-pub mod decl;
-pub mod group;
-pub mod wildcard;
 pub mod annotation;
 pub mod composition;
-pub mod resolver;
-pub mod inline;
-pub mod dependencies;
-pub mod derivation;
-pub mod redefine;
-#[cfg(feature = "xsd11")]
-pub mod override_dir;
-#[cfg(feature = "xsd11")]
-pub mod edc;
 #[cfg(feature = "xsd11")]
 pub mod cta;
+pub mod decl;
+pub mod dependencies;
+pub mod derivation;
+#[cfg(feature = "xsd11")]
+pub mod edc;
+pub mod group;
+pub mod inline;
+pub mod model;
+#[cfg(feature = "xsd11")]
+pub mod override_dir;
+pub mod redefine;
+pub mod resolver;
+pub mod wildcard;
 
 // Re-exports from model
 pub use model::{
-    SchemaSet, SchemaDocument, NamespaceTable,
-    XsdVersion, DerivationSet, FormChoice,
-    IncludeDirective, ImportDirective, RedefineDirective, OverrideDirective,
-    DefaultOpenContent, OpenContentMode,
+    DefaultOpenContent, DerivationSet, FormChoice, ImportDirective, IncludeDirective,
+    NamespaceTable, OpenContentMode, OverrideDirective, RedefineDirective, SchemaDocument,
+    SchemaSet, XsdVersion,
 };
 
 // Re-exports from decl
 pub use decl::{
-    ElementDecl, AttributeDecl, NotationDecl,
-    DeclarationScope, ValueConstraint, TypeReference, FormKind,
+    AttributeDecl, DeclarationScope, ElementDecl, FormKind, NotationDecl, TypeReference,
+    ValueConstraint,
 };
 
 // Re-exports from group
-pub use group::{
-    ModelGroupDef, AttributeGroupDef,
-    ModelGroupRef, AttributeGroupRef, Occurrence,
-};
+pub use group::{AttributeGroupDef, AttributeGroupRef, ModelGroupDef, ModelGroupRef, Occurrence};
 
 // Re-exports from wildcard
-pub use wildcard::{
-    ElementWildcard,
-    NamespaceConstraint, ProcessContents,
-};
+pub use wildcard::{ElementWildcard, NamespaceConstraint, ProcessContents};
 
 // Re-exports from composition
 pub use composition::{
-    CompositionEdge, CompositionEdgeKind,
-    ComponentKind, ComponentIdentity, ComponentOrigin,
-    ComponentKey, DocumentComponentIndex,
-    CompositionAction, EffectiveComponent,
+    ComponentIdentity, ComponentKey, ComponentKind, ComponentOrigin, CompositionAction,
+    CompositionEdge, CompositionEdgeKind, DocumentComponentIndex, EffectiveComponent,
 };
 
 // Re-exports from annotation
 pub use annotation::{
-    Annotation, AnnotationItem, AppInfoElement, DocumentationElement,
-    XmlFragment, ForeignAttribute,
+    Annotation, AnnotationItem, AppInfoElement, DocumentationElement, ForeignAttribute, XmlFragment,
 };
 
 // Re-exports from resolver
 pub use resolver::{
-    ReferenceResolver, finalize_pending_ic_refs, resolve_all_references,
-    ResolvedReferences, ResolutionStats,
+    finalize_pending_ic_refs, resolve_all_references, ReferenceResolver, ResolutionStats,
+    ResolvedReferences,
 };
 
 // Re-exports from inline
@@ -87,36 +77,30 @@ pub use inline::{
 };
 
 // Re-exports from dependencies
-pub use dependencies::{
-    DependencyGraph, DependencyStats, build_dependency_graph,
-};
+pub use dependencies::{build_dependency_graph, DependencyGraph, DependencyStats};
 
 // Re-exports from derivation
-pub use derivation::{
-    validate_all_derivations, validate_attribute_id_constraints,
-    validate_attribute_value_constraints,
-    validate_element_value_constraints,
-    validate_complex_type_attribute_uniqueness,
-    validate_local_decl_target_namespace,
-    validate_no_xsi_attribute_declarations,
-    validate_substitution_group_element_consistency,
-    validate_xsd10_annotation_source_anyuri,
-    DerivationStats as DerivationValidationStats,
-};
+#[cfg(feature = "xsd11")]
+pub use cta::validate_cta_substitutability;
+#[cfg(feature = "xsd11")]
+pub use cta::validate_cta_xpath;
 #[cfg(feature = "xsd11")]
 pub use derivation::validate_element_type_alternatives;
-#[cfg(feature = "xsd11")]
-pub use derivation::validate_wildcard_disallowed_names;
-#[cfg(feature = "xsd11")]
-pub use derivation::validate_wildcard_element_type_table_consistency;
 #[cfg(feature = "xsd11")]
 pub use derivation::validate_local_element_type_table_consistency;
 #[cfg(feature = "xsd11")]
 pub use derivation::validate_restriction_local_element_type_table_consistency;
 #[cfg(feature = "xsd11")]
-pub use cta::validate_cta_xpath;
+pub use derivation::validate_wildcard_disallowed_names;
 #[cfg(feature = "xsd11")]
-pub use cta::validate_cta_substitutability;
+pub use derivation::validate_wildcard_element_type_table_consistency;
+pub use derivation::{
+    validate_all_derivations, validate_attribute_id_constraints,
+    validate_attribute_value_constraints, validate_complex_type_attribute_uniqueness,
+    validate_element_value_constraints, validate_local_decl_target_namespace,
+    validate_no_xsi_attribute_declarations, validate_substitution_group_element_consistency,
+    validate_xsd10_annotation_source_anyuri, DerivationStats as DerivationValidationStats,
+};
 
 // Re-exports from redefine
 pub use redefine::apply_redefine;
@@ -141,9 +125,9 @@ pub fn compile_all_patterns(schema_set: &mut SchemaSet) -> SchemaResult<()> {
         let type_def = &mut schema_set.arenas.simple_types[key];
         if let Err(facet_err) = type_def.facets.compile_patterns(xsd_version) {
             let source = type_def.source.clone();
-            let location = source.as_ref().and_then(|src| {
-                schema_set.source_maps.locate(src)
-            });
+            let location = source
+                .as_ref()
+                .and_then(|src| schema_set.source_maps.locate(src));
             return Err(SchemaError::structural(
                 "pattern-valid",
                 facet_err.to_string(),
@@ -244,9 +228,9 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
 /// (which is valid: `D₁`'s redefine of `D₂`'s c finds `c` via `D₂ → D₃`,
 /// and the path `D₂ → D₃` does not loop back through `D₁`).
 fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()> {
-    use std::collections::HashSet;
     use crate::ids::{DocumentId, NameId};
     use crate::schema::composition::ComponentKind;
+    use std::collections::HashSet;
 
     // DFS over the redefine subgraph. `visiting` is a stack-scoped cycle
     // break: callers seed it with documents that must NOT be revisited
@@ -268,18 +252,22 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
                 return false;
             };
             let direct = match kind {
-                ComponentKind::SimpleType => {
-                    doc.component_index.lookup_simple_type(namespace, name).is_some()
-                }
-                ComponentKind::ComplexType => {
-                    doc.component_index.lookup_complex_type(namespace, name).is_some()
-                }
-                ComponentKind::ModelGroup => {
-                    doc.component_index.lookup_model_group(namespace, name).is_some()
-                }
-                ComponentKind::AttributeGroup => {
-                    doc.component_index.lookup_attribute_group(namespace, name).is_some()
-                }
+                ComponentKind::SimpleType => doc
+                    .component_index
+                    .lookup_simple_type(namespace, name)
+                    .is_some(),
+                ComponentKind::ComplexType => doc
+                    .component_index
+                    .lookup_complex_type(namespace, name)
+                    .is_some(),
+                ComponentKind::ModelGroup => doc
+                    .component_index
+                    .lookup_model_group(namespace, name)
+                    .is_some(),
+                ComponentKind::AttributeGroup => doc
+                    .component_index
+                    .lookup_attribute_group(namespace, name)
+                    .is_some(),
                 _ => false,
             };
             if direct {
@@ -339,19 +327,39 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
             // diagnostics; the rest drives the chain walk.
             let simples = redefine.simple_types.iter().filter_map(|&k| {
                 let st = schema_set.arenas.simple_types.get(k)?;
-                Some((ComponentKind::SimpleType, st.target_namespace, st.name?, "simple type"))
+                Some((
+                    ComponentKind::SimpleType,
+                    st.target_namespace,
+                    st.name?,
+                    "simple type",
+                ))
             });
             let complexes = redefine.complex_types.iter().filter_map(|&k| {
                 let ct = schema_set.arenas.complex_types.get(k)?;
-                Some((ComponentKind::ComplexType, ct.target_namespace, ct.name?, "complex type"))
+                Some((
+                    ComponentKind::ComplexType,
+                    ct.target_namespace,
+                    ct.name?,
+                    "complex type",
+                ))
             });
             let groups = redefine.groups.iter().filter_map(|&k| {
                 let g = schema_set.arenas.model_groups.get(k)?;
-                Some((ComponentKind::ModelGroup, g.target_namespace, g.name?, "model group"))
+                Some((
+                    ComponentKind::ModelGroup,
+                    g.target_namespace,
+                    g.name?,
+                    "model group",
+                ))
             });
             let attr_groups = redefine.attribute_groups.iter().filter_map(|&k| {
                 let ag = schema_set.arenas.attribute_groups.get(k)?;
-                Some((ComponentKind::AttributeGroup, ag.target_namespace, ag.name?, "attribute group"))
+                Some((
+                    ComponentKind::AttributeGroup,
+                    ag.target_namespace,
+                    ag.name?,
+                    "attribute group",
+                ))
             });
 
             // Pre-seed the visiting set with the redefining document so
@@ -362,9 +370,16 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
             let mut visiting: HashSet<DocumentId> = HashSet::with_capacity(4);
             visiting.insert(doc.id);
 
-            for (kind, namespace, name, label) in simples.chain(complexes).chain(groups).chain(attr_groups) {
+            for (kind, namespace, name, label) in
+                simples.chain(complexes).chain(groups).chain(attr_groups)
+            {
                 if !lookup_via_redefine_chain(
-                    schema_set, target_doc_id, kind, namespace, name, &mut visiting,
+                    schema_set,
+                    target_doc_id,
+                    kind,
+                    namespace,
+                    name,
+                    &mut visiting,
                 ) {
                     return Err(make_err(schema_set, doc, redefine, label, name));
                 }
@@ -408,9 +423,9 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
 fn topologically_ordered_redefines(
     schema_set: &SchemaSet,
 ) -> Vec<crate::schema::model::RedefineDirective> {
-    use std::collections::{HashMap, HashSet};
     use crate::ids::DocumentId;
     use crate::schema::model::{RedefineDirective, SchemaDocument};
+    use std::collections::{HashMap, HashSet};
 
     fn depth(
         doc_id: DocumentId,
@@ -459,7 +474,12 @@ fn topologically_ordered_redefines(
 
     let mut cache: HashMap<DocumentId, usize> = HashMap::new();
     for doc in &schema_set.documents {
-        depth(doc.id, &schema_set.documents, &mut cache, &mut HashSet::new());
+        depth(
+            doc.id,
+            &schema_set.documents,
+            &mut cache,
+            &mut HashSet::new(),
+        );
     }
 
     // Tag each redefine with its source doc's depth, then stable-sort ascending.
@@ -488,9 +508,9 @@ fn topologically_ordered_redefines(
 fn topologically_ordered_overrides(
     schema_set: &SchemaSet,
 ) -> Vec<crate::schema::model::OverrideDirective> {
-    use std::collections::{HashMap, HashSet};
     use crate::ids::DocumentId;
     use crate::schema::model::{OverrideDirective, SchemaDocument};
+    use std::collections::{HashMap, HashSet};
 
     fn depth(
         doc_id: DocumentId,
@@ -536,7 +556,12 @@ fn topologically_ordered_overrides(
 
     let mut cache: HashMap<DocumentId, usize> = HashMap::new();
     for doc in &schema_set.documents {
-        depth(doc.id, &schema_set.documents, &mut cache, &mut HashSet::new());
+        depth(
+            doc.id,
+            &schema_set.documents,
+            &mut cache,
+            &mut HashSet::new(),
+        );
     }
 
     let mut tagged: Vec<(usize, OverrideDirective)> = schema_set
@@ -564,9 +589,9 @@ fn topologically_ordered_overrides(
 /// detection will be added when namespace tables are rebuilt from
 /// effective components (future step).
 fn collect_declared_components(schema_set: &mut SchemaSet) {
-    use std::collections::HashMap;
     use crate::ids::DocumentId;
     use crate::schema::composition::CompositionEdgeKind;
+    use std::collections::HashMap;
 
     // Build set of (target_doc → source_doc) for Include edges.
     let mut included_from: HashMap<DocumentId, DocumentId> = HashMap::new();
@@ -591,7 +616,14 @@ fn collect_declared_components(schema_set: &mut SchemaSet) {
             } else {
                 CompositionAction::Declared
             };
-            effective.insert(identity, EffectiveComponent { key, origin, action });
+            effective.insert(
+                identity,
+                EffectiveComponent {
+                    key,
+                    origin,
+                    action,
+                },
+            );
         }
     }
 

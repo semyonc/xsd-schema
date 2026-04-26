@@ -4,10 +4,10 @@
 
 use quick_xml::events::attributes::Attribute;
 
-use crate::ids::NameId;
 use crate::error::{SchemaError, SchemaResult};
-use crate::parser::location::SourceRef;
+use crate::ids::NameId;
 use crate::namespace::{NameTable, NamespaceContext, XS_NAMESPACE};
+use crate::parser::location::SourceRef;
 use crate::schema::annotation::ForeignAttribute;
 
 /// Parsed attribute value
@@ -29,7 +29,8 @@ impl ParsedAttribute {
     /// Check if this is a namespace declaration (xmlns or xmlns:prefix)
     pub fn is_namespace_decl(&self, xmlns_prefix_id: NameId, xmlns_ns_id: NameId) -> bool {
         // xmlns:foo or xmlns
-        self.prefix == Some(xmlns_prefix_id) || self.local_name == xmlns_prefix_id
+        self.prefix == Some(xmlns_prefix_id)
+            || self.local_name == xmlns_prefix_id
             || self.namespace == Some(xmlns_ns_id)
     }
 
@@ -68,21 +69,18 @@ pub fn parse_attributes<'a>(
         let (local_name_bytes, prefix_bytes) = crate::parser::reader::split_qname(name);
 
         let name_table = ns_context.name_table_mut();
-        let local_name_str = std::str::from_utf8(local_name_bytes).map_err(|e| {
-            SchemaError::XmlError {
+        let local_name_str =
+            std::str::from_utf8(local_name_bytes).map_err(|e| SchemaError::XmlError {
                 message: format!("Invalid UTF-8 in attribute name: {}", e),
                 location: None,
-            }
-        })?;
+            })?;
         let local_name = name_table.add(local_name_str);
 
         let prefix = match prefix_bytes {
             Some(p) => {
-                let prefix_str = std::str::from_utf8(p).map_err(|e| {
-                    SchemaError::XmlError {
-                        message: format!("Invalid UTF-8 in prefix: {}", e),
-                        location: None,
-                    }
+                let prefix_str = std::str::from_utf8(p).map_err(|e| SchemaError::XmlError {
+                    message: format!("Invalid UTF-8 in prefix: {}", e),
+                    location: None,
                 })?;
                 Some(name_table.add(prefix_str))
             }
@@ -263,7 +261,8 @@ pub fn parse_use(value: &str) -> Result<crate::types::complex::AttributeUseKind,
 
 /// Parse a processContents attribute
 pub fn parse_process_contents(value: &str) -> Result<crate::schema::ProcessContents, String> {
-    value.parse()
+    value
+        .parse()
         .map_err(|_| format!("Invalid processContents value: '{}'", value))
 }
 
@@ -310,7 +309,10 @@ mod tests {
     #[test]
     fn test_parse_process_contents() {
         use crate::schema::ProcessContents;
-        assert_eq!(parse_process_contents("strict"), Ok(ProcessContents::Strict));
+        assert_eq!(
+            parse_process_contents("strict"),
+            Ok(ProcessContents::Strict)
+        );
         assert_eq!(parse_process_contents("lax"), Ok(ProcessContents::Lax));
         assert_eq!(parse_process_contents("skip"), Ok(ProcessContents::Skip));
         assert!(parse_process_contents("invalid").is_err());
@@ -354,15 +356,13 @@ mod tests {
 
     #[test]
     fn test_attribute_map_take() {
-        let attrs = vec![
-            ParsedAttribute {
-                namespace: None,
-                local_name: NameId(1),
-                prefix: None,
-                value: "value1".to_string(),
-                source: None,
-            },
-        ];
+        let attrs = vec![ParsedAttribute {
+            namespace: None,
+            local_name: NameId(1),
+            prefix: None,
+            value: "value1".to_string(),
+            source: None,
+        }];
 
         let mut map = AttributeMap::new(attrs);
         assert!(!map.is_empty());

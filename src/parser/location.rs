@@ -52,7 +52,11 @@ pub struct SourceRef {
 
 impl SourceRef {
     pub fn new(doc_id: DocumentId, span: SourceSpan) -> Self {
-        Self { doc_id, span, schema_defaults_doc: None }
+        Self {
+            doc_id,
+            span,
+            schema_defaults_doc: None,
+        }
     }
 
     /// The document ID to use for schema-level defaults lookup.
@@ -283,10 +287,7 @@ impl SourceMapStorage {
     /// Saves ~90% memory but loses ability to extract source text spans.
     pub fn compact(&mut self) {
         if let SourceMapStorage::Full(maps) = self {
-            let compact_maps = maps
-                .drain(..)
-                .map(|map| map.into_compact())
-                .collect();
+            let compact_maps = maps.drain(..).map(|map| map.into_compact()).collect();
             *self = SourceMapStorage::Compact(compact_maps);
         }
     }

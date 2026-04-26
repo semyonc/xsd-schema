@@ -4,9 +4,9 @@
 //! - InvalidLexical (FORG0001): Malformed QName syntax
 //! - UndefinedPrefix (XPST0081): Prefix not in scope
 
-use crate::ids::NameId;
 use super::context::{NamespaceContext, NamespaceContextSnapshot};
 use super::table::NameTable;
+use crate::ids::NameId;
 use std::fmt;
 
 /// Qualified name with interned strings via NameTable
@@ -318,14 +318,15 @@ fn is_name_start_char(c: char) -> bool {
 
 /// Check if a character is a valid NameChar (per XML spec, excluding ':')
 fn is_name_char(c: char) -> bool {
-    is_name_start_char(c) || matches!(c,
-        '-' |
-        '.' |
-        '0'..='9' |
-        '\u{B7}' |
-        '\u{0300}'..='\u{036F}' |
-        '\u{203F}'..='\u{2040}'
-    )
+    is_name_start_char(c)
+        || matches!(c,
+            '-' |
+            '.' |
+            '0'..='9' |
+            '\u{B7}' |
+            '\u{0300}'..='\u{036F}' |
+            '\u{203F}'..='\u{2040}'
+        )
 }
 
 #[cfg(test)]
@@ -410,7 +411,10 @@ mod tests {
         assert_eq!(table.resolve(result.local_name), "localName");
         assert!(result.prefix.is_none());
         assert!(result.namespace_uri.is_some());
-        assert_eq!(table.resolve(result.namespace_uri.unwrap()), "http://default.com");
+        assert_eq!(
+            table.resolve(result.namespace_uri.unwrap()),
+            "http://default.com"
+        );
     }
 
     #[test]

@@ -26,18 +26,20 @@
 //! - `derivation-ok-restriction` - Complex Type Derivation OK (Restriction)
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::ids::{AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey};
+use crate::ids::{
+    AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, NameId, SimpleTypeKey, TypeKey,
+};
 use crate::parser::frames::{
-    AttributeUseKind, ComplexContentResult, Compositor, DerivationMethod,
-    ElementFrameResult, ModelGroupDefResult, ParticleResult, ParticleTerm, ProcessContents,
-    SimpleTypeVariety, WildcardNamespace, WildcardResult,
+    AttributeUseKind, ComplexContentResult, Compositor, DerivationMethod, ElementFrameResult,
+    ModelGroupDefResult, ParticleResult, ParticleTerm, ProcessContents, SimpleTypeVariety,
+    WildcardNamespace, WildcardResult,
 };
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::{OpenContentMode, OpenContentResult};
 use crate::parser::location::{SourceLocation, SourceRef};
 use crate::schema::dependencies::DependencyGraph;
-use crate::schema::SchemaSet;
 use crate::schema::model::DerivationSet;
+use crate::schema::SchemaSet;
 use crate::types::facets::{FacetKind, FacetSet};
 
 /// Statistics from derivation validation
@@ -111,6 +113,15 @@ pub fn validate_all_derivations(
     // back-edge in XSD 1.0 mode only.
     if schema_set.is_xsd10() {
         validate_attribute_group_no_circular(schema_set, &mut errors);
+    } else {
+        // XSD 1.1: circular attribute groups are allowed in general, but a
+        // schema-level `defaultAttributes` group cannot itself participate in
+        // a cycle — `resolve_all_references` injects the resolved group into
+        // every applicable complex type, so a cycle here would imply the
+        // schema-for-schemas validity rule §3.6.3 (no cycles via the
+        // defaulting closure). Targeted DFS only on each document's selected
+        // defaultAttributes group avoids re-enabling the global ban.
+        validate_default_attribute_groups_no_circular(schema_set, &mut errors);
     }
 
     // Return first error if any
@@ -128,10 +139,7 @@ pub fn validate_all_derivations(
 /// children). The schema-for-schemas does not allow circular references —
 /// `src-attribute_group` constraint 3 in XSD 1.0 / §3.6.3 in XSD 1.1 forbid
 /// any group from transitively referencing itself.
-fn validate_attribute_group_no_circular(
-    schema_set: &SchemaSet,
-    errors: &mut Vec<SchemaError>,
-) {
+fn validate_attribute_group_no_circular(schema_set: &SchemaSet, errors: &mut Vec<SchemaError>) {
     use std::collections::HashSet;
 
     // Iterate every attribute group key once.
@@ -140,7 +148,9 @@ fn validate_attribute_group_no_circular(
     for start in keys {
         let mut path: Vec<AttributeGroupKey> = Vec::new();
         let mut visited: HashSet<AttributeGroupKey> = HashSet::new();
-        if let Some(cycle_key) = find_attribute_group_cycle(schema_set, start, &mut path, &mut visited) {
+        if let Some(cycle_key) =
+            find_attribute_group_cycle(schema_set, start, &mut path, &mut visited)
+        {
             let location = schema_set
                 .arenas
                 .attribute_groups
@@ -197,6 +207,48 @@ fn find_attribute_group_cycle(
     result
 }
 
+/// XSD 1.1: Validate that the schema-level `defaultAttributes` selected groups
+/// are not part of a circular reference chain. Targeted to the defaultAttributes
+/// closure only — XSD 1.1 (W3C Bugzilla 15795) permits circular AGs in general,
+/// but the defaulting injection in `resolver::resolve_all_references` would
+/// loop forever if its starting group were itself cyclic.
+fn validate_default_attribute_groups_no_circular(
+    schema_set: &SchemaSet,
+    errors: &mut Vec<SchemaError>,
+) {
+    use std::collections::HashSet;
+    let mut seen_starts: HashSet<AttributeGroupKey> = HashSet::new();
+    for doc in &schema_set.documents {
+        let Some(ref qname) = doc.default_attributes else {
+            continue;
+        };
+        let Some(start) = schema_set.lookup_attribute_group(qname.namespace_uri, qname.local_name)
+        else {
+            continue; // unresolvable defaultAttributes already reported elsewhere
+        };
+        if !seen_starts.insert(start) {
+            continue;
+        }
+        let mut path: Vec<AttributeGroupKey> = Vec::new();
+        let mut visited: HashSet<AttributeGroupKey> = HashSet::new();
+        if let Some(cycle_key) =
+            find_attribute_group_cycle(schema_set, start, &mut path, &mut visited)
+        {
+            let location = schema_set
+                .arenas
+                .attribute_groups
+                .get(cycle_key)
+                .and_then(|ag| ag.source.as_ref())
+                .and_then(|s| schema_set.source_maps.locate(s));
+            errors.push(SchemaError::structural(
+                "src-attribute_group",
+                "Circular attribute group reference detected via defaultAttributes",
+                location,
+            ));
+        }
+    }
+}
+
 /// Validate a simple type definition
 fn validate_simple_type(
     schema_set: &SchemaSet,
@@ -249,17 +301,14 @@ fn validate_facets_against_resolved_base(
         return Ok(());
     };
     if let Some(base_facets) = get_type_facets(schema_set, base_key)? {
-        type_def
-            .facets
-            .merge_with_base(&base_facets)
-            .map_err(|e| {
-                let (location, type_name) = type_error_context(schema_set, type_def);
-                SchemaError::structural(
-                    "cos-st-restricts",
-                    format!("Simple type '{}' has invalid restriction: {}", type_name, e),
-                    location,
-                )
-            })?;
+        type_def.facets.merge_with_base(&base_facets).map_err(|e| {
+            let (location, type_name) = type_error_context(schema_set, type_def);
+            SchemaError::structural(
+                "cos-st-restricts",
+                format!("Simple type '{}' has invalid restriction: {}", type_name, e),
+                location,
+            )
+        })?;
     }
     validate_facet_values_against_base_type(schema_set, type_def, base_key)?;
     Ok(())
@@ -332,7 +381,10 @@ fn validate_applicable_facets(
             // (§4.1.5 / Table F.1 of Datatypes). Walk up the base chain to the
             // closest built-in primitive and check each facet kind against it.
             if let Some(primitive_code) = primitive_type_code(schema_set, type_def) {
-                use crate::types::facets::{facet_applicable_for_type, ExplicitTimezone, FacetApplicability, FacetKind, WhitespaceMode};
+                use crate::types::facets::{
+                    facet_applicable_for_type, ExplicitTimezone, FacetApplicability, FacetKind,
+                    WhitespaceMode,
+                };
                 let facets = &type_def.facets;
                 let mut bad: Vec<&'static str> = Vec::new();
                 let mut check = |present: bool, kind: FacetKind| {
@@ -355,9 +407,13 @@ fn validate_applicable_facets(
                 check(facets.max_exclusive.is_some(), FacetKind::MaxExclusive);
                 check(facets.total_digits.is_some(), FacetKind::TotalDigits);
                 check(facets.fraction_digits.is_some(), FacetKind::FractionDigits);
-                check(facets.explicit_timezone.is_some(), FacetKind::ExplicitTimezone);
+                check(
+                    facets.explicit_timezone.is_some(),
+                    FacetKind::ExplicitTimezone,
+                );
                 if let Some(ws) = &facets.whitespace {
-                    if !matches!(primitive_code,
+                    if !matches!(
+                        primitive_code,
                         crate::types::XmlTypeCode::String
                             | crate::types::XmlTypeCode::NormalizedString
                             | crate::types::XmlTypeCode::Token
@@ -367,8 +423,8 @@ fn validate_applicable_facets(
                             | crate::types::XmlTypeCode::NCName
                             | crate::types::XmlTypeCode::Id
                             | crate::types::XmlTypeCode::IdRef
-                            | crate::types::XmlTypeCode::Entity)
-                        && ws.value != WhitespaceMode::Collapse
+                            | crate::types::XmlTypeCode::Entity
+                    ) && ws.value != WhitespaceMode::Collapse
                     {
                         bad.push(FacetKind::Whitespace.name());
                     }
@@ -412,7 +468,9 @@ fn primitive_type_code(
     let builtin = schema_set.builtin_types();
     let mut current_base = type_def.resolved_base_type;
     for _ in 0..64 {
-        let Some(TypeKey::Simple(k)) = current_base else { return None; };
+        let Some(TypeKey::Simple(k)) = current_base else {
+            return None;
+        };
         if let Some(code) = builtin.get_type_code(k) {
             return Some(code);
         }
@@ -452,30 +510,66 @@ fn reject_any_atomic_type(
 /// List inapplicable facet names for list types
 fn list_inapplicable_facets_for_list(facets: &FacetSet) -> String {
     let mut names = Vec::new();
-    if facets.min_inclusive.is_some() { names.push("minInclusive"); }
-    if facets.max_inclusive.is_some() { names.push("maxInclusive"); }
-    if facets.min_exclusive.is_some() { names.push("minExclusive"); }
-    if facets.max_exclusive.is_some() { names.push("maxExclusive"); }
-    if facets.total_digits.is_some() { names.push("totalDigits"); }
-    if facets.fraction_digits.is_some() { names.push("fractionDigits"); }
-    if facets.explicit_timezone.is_some() { names.push("explicitTimezone"); }
+    if facets.min_inclusive.is_some() {
+        names.push("minInclusive");
+    }
+    if facets.max_inclusive.is_some() {
+        names.push("maxInclusive");
+    }
+    if facets.min_exclusive.is_some() {
+        names.push("minExclusive");
+    }
+    if facets.max_exclusive.is_some() {
+        names.push("maxExclusive");
+    }
+    if facets.total_digits.is_some() {
+        names.push("totalDigits");
+    }
+    if facets.fraction_digits.is_some() {
+        names.push("fractionDigits");
+    }
+    if facets.explicit_timezone.is_some() {
+        names.push("explicitTimezone");
+    }
     names.join(", ")
 }
 
 /// List inapplicable facet names for union types
 fn list_inapplicable_facets_for_union(facets: &FacetSet) -> String {
     let mut names = Vec::new();
-    if facets.length.is_some() { names.push("length"); }
-    if facets.min_length.is_some() { names.push("minLength"); }
-    if facets.max_length.is_some() { names.push("maxLength"); }
-    if facets.whitespace.is_some() { names.push("whiteSpace"); }
-    if facets.min_inclusive.is_some() { names.push("minInclusive"); }
-    if facets.max_inclusive.is_some() { names.push("maxInclusive"); }
-    if facets.min_exclusive.is_some() { names.push("minExclusive"); }
-    if facets.max_exclusive.is_some() { names.push("maxExclusive"); }
-    if facets.total_digits.is_some() { names.push("totalDigits"); }
-    if facets.fraction_digits.is_some() { names.push("fractionDigits"); }
-    if facets.explicit_timezone.is_some() { names.push("explicitTimezone"); }
+    if facets.length.is_some() {
+        names.push("length");
+    }
+    if facets.min_length.is_some() {
+        names.push("minLength");
+    }
+    if facets.max_length.is_some() {
+        names.push("maxLength");
+    }
+    if facets.whitespace.is_some() {
+        names.push("whiteSpace");
+    }
+    if facets.min_inclusive.is_some() {
+        names.push("minInclusive");
+    }
+    if facets.max_inclusive.is_some() {
+        names.push("maxInclusive");
+    }
+    if facets.min_exclusive.is_some() {
+        names.push("minExclusive");
+    }
+    if facets.max_exclusive.is_some() {
+        names.push("maxExclusive");
+    }
+    if facets.total_digits.is_some() {
+        names.push("totalDigits");
+    }
+    if facets.fraction_digits.is_some() {
+        names.push("fractionDigits");
+    }
+    if facets.explicit_timezone.is_some() {
+        names.push("explicitTimezone");
+    }
     names.join(", ")
 }
 
@@ -504,7 +598,13 @@ fn validate_simple_restriction(
     }
 
     if let TypeKey::Simple(base_simple_key) = base_key {
-        reject_any_atomic_type(schema_set, type_def, base_simple_key, "cos-st-restricts", "restrict")?;
+        reject_any_atomic_type(
+            schema_set,
+            type_def,
+            base_simple_key,
+            "cos-st-restricts",
+            "restrict",
+        )?;
     }
 
     stats.restrictions_validated += 1;
@@ -514,7 +614,8 @@ fn validate_simple_restriction(
         if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
             if base_type.final_derivation.contains_restriction() {
                 let (location, type_name) = type_error_context(schema_set, type_def);
-                let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                let base_name =
+                    format_type_name(schema_set, base_type.name, base_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
                     format!(
@@ -533,17 +634,14 @@ fn validate_simple_restriction(
     // Validate that derived facets are more restrictive
     if let Some(ref base_facets) = base_facets {
         // FacetSet.merge_with_base validates derivation rules
-        type_def
-            .facets
-            .merge_with_base(base_facets)
-            .map_err(|e| {
-                let (location, type_name) = type_error_context(schema_set, type_def);
-                SchemaError::structural(
-                    "cos-st-restricts",
-                    format!("Simple type '{}' has invalid restriction: {}", type_name, e),
-                    location,
-                )
-            })?;
+        type_def.facets.merge_with_base(base_facets).map_err(|e| {
+            let (location, type_name) = type_error_context(schema_set, type_def);
+            SchemaError::structural(
+                "cos-st-restricts",
+                format!("Simple type '{}' has invalid restriction: {}", type_name, e),
+                location,
+            )
+        })?;
     }
 
     // Validate that facet values are in the base type's value space
@@ -565,7 +663,8 @@ fn validate_simple_list(
         if let Some(item_type) = schema_set.arenas.simple_types.get(item_simple_key) {
             if item_type.final_derivation.contains_list() {
                 let (location, type_name) = type_error_context(schema_set, type_def);
-                let item_name = format_type_name(schema_set, item_type.name, item_type.target_namespace);
+                let item_name =
+                    format_type_name(schema_set, item_type.name, item_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
                     format!(
@@ -583,7 +682,8 @@ fn validate_simple_list(
         if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
             if base_type.final_derivation.contains_list() {
                 let (location, type_name) = type_error_context(schema_set, type_def);
-                let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                let base_name =
+                    format_type_name(schema_set, base_type.name, base_type.target_namespace);
                 return Err(SchemaError::structural(
                     "cos-st-restricts",
                     format!(
@@ -608,7 +708,13 @@ fn validate_simple_list(
     // Item type must be atomic (not a list, not a union containing lists)
     match item_key {
         TypeKey::Simple(simple_key) => {
-            reject_any_atomic_type(schema_set, type_def, simple_key, "cos-list-of-atomic", "use as list item type")?;
+            reject_any_atomic_type(
+                schema_set,
+                type_def,
+                simple_key,
+                "cos-list-of-atomic",
+                "use as list item type",
+            )?;
             if let Some(item_type) = schema_set.arenas.simple_types.get(simple_key) {
                 match item_type.variety {
                     SimpleTypeVariety::Atomic => {
@@ -619,7 +725,10 @@ fn validate_simple_list(
                         let (location, type_name) = type_error_context(schema_set, type_def);
                         return Err(SchemaError::structural(
                             "cos-list-of-atomic",
-                            format!("List type '{}' has list item type, which is not allowed", type_name),
+                            format!(
+                                "List type '{}' has list item type, which is not allowed",
+                                type_name
+                            ),
                             location,
                         ));
                     }
@@ -629,7 +738,10 @@ fn validate_simple_list(
                             let (location, type_name) = type_error_context(schema_set, type_def);
                             return Err(SchemaError::structural(
                                 "cos-list-of-atomic",
-                                format!("List type '{}' has union item type containing list member", type_name),
+                                format!(
+                                    "List type '{}' has union item type containing list member",
+                                    type_name
+                                ),
                                 location,
                             ));
                         }
@@ -642,7 +754,10 @@ fn validate_simple_list(
             let (location, type_name) = type_error_context(schema_set, type_def);
             return Err(SchemaError::structural(
                 "cos-list-of-atomic",
-                format!("List type '{}' has complex item type, which is not allowed", type_name),
+                format!(
+                    "List type '{}' has complex item type, which is not allowed",
+                    type_name
+                ),
                 location,
             ));
         }
@@ -687,7 +802,11 @@ fn validate_simple_union(
             if let Some(member_type) = schema_set.arenas.simple_types.get(*simple_key) {
                 if member_type.final_derivation.contains_union() {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let member_name = format_type_name(schema_set, member_type.name, member_type.target_namespace);
+                    let member_name = format_type_name(
+                        schema_set,
+                        member_type.name,
+                        member_type.target_namespace,
+                    );
                     return Err(SchemaError::structural(
                         "cos-st-restricts",
                         format!(
@@ -718,7 +837,10 @@ fn validate_simple_union(
                 let (location, type_name) = type_error_context(schema_set, type_def);
                 return Err(SchemaError::structural(
                     "cos-union-memberTypes",
-                    format!("Union type '{}' has complex member type, which is not allowed", type_name),
+                    format!(
+                        "Union type '{}' has complex member type, which is not allowed",
+                        type_name
+                    ),
                     location,
                 ));
             }
@@ -766,8 +888,7 @@ fn validate_complex_type(
 /// Constraint: cos-ct-extends (Complex Type Derivation OK - Extension)
 fn validate_complex_extension(
     schema_set: &SchemaSet,
-    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))]
-    derived_key: ComplexTypeKey,
+    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))] derived_key: ComplexTypeKey,
     type_def: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     // Get base type
@@ -797,7 +918,8 @@ fn validate_complex_extension(
             if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
                 if base_type.final_derivation.contains_extension() {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    let base_name =
+                        format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "cos-ct-extends",
                         format!(
@@ -814,7 +936,8 @@ fn validate_complex_extension(
                 // Check that base type is not final for extension
                 if base_type.final_derivation.contains_extension() {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    let base_name =
+                        format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "cos-ct-extends",
                         format!(
@@ -835,7 +958,8 @@ fn validate_complex_extension(
                     && !matches!(base_type.content, ComplexContentResult::Simple(_))
                 {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    let base_name =
+                        format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "src-ct",
                         format!(
@@ -856,7 +980,11 @@ fn validate_complex_extension(
                     if let ComplexContentResult::Complex(ref complex) = type_def.content {
                         if complex.particle.is_some() || schema_set.is_xsd11() {
                             let (location, type_name) = type_error_context(schema_set, type_def);
-                            let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                            let base_name = format_type_name(
+                                schema_set,
+                                base_type.name,
+                                base_type.target_namespace,
+                            );
                             return Err(SchemaError::structural(
                                 "cos-ct-extends",
                                 format!(
@@ -886,7 +1014,8 @@ fn validate_complex_extension(
                 // skip this check.
                 if let ComplexContentResult::Complex(ref base_complex) = base_type.content {
                     if let Some(ref base_particle) = base_complex.particle {
-                        if let ComplexContentResult::Complex(ref derived_complex) = type_def.content {
+                        if let ComplexContentResult::Complex(ref derived_complex) = type_def.content
+                        {
                             if let Some(ref ext_particle) = derived_complex.particle {
                                 let ext_compositor = match &ext_particle.term {
                                     ParticleTerm::Group(mg) => mg.compositor,
@@ -1018,11 +1147,12 @@ fn validate_complex_restriction(
             // ct-props-correct.2: If the base type is a simple type definition,
             // the derivation method must be extension (not restriction).
             let (location, type_name) = type_error_context(schema_set, type_def);
-            let base_name = if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
-                format_type_name(schema_set, base_type.name, base_type.target_namespace)
-            } else {
-                "(unknown)".to_string()
-            };
+            let base_name =
+                if let Some(base_type) = schema_set.arenas.simple_types.get(base_simple_key) {
+                    format_type_name(schema_set, base_type.name, base_type.target_namespace)
+                } else {
+                    "(unknown)".to_string()
+                };
             return Err(SchemaError::structural(
                 "ct-props-correct",
                 format!(
@@ -1038,7 +1168,8 @@ fn validate_complex_restriction(
                 // Check that base type is not final for restriction
                 if base_type.final_derivation.contains_restriction() {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    let base_name =
+                        format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "derivation-ok-restriction",
                         format!(
@@ -1065,7 +1196,8 @@ fn validate_complex_restriction(
                     && !is_valid_simple_content_restriction_base(schema_set, base_type)
                 {
                     let (location, type_name) = type_error_context(schema_set, type_def);
-                    let base_name = format_type_name(schema_set, base_type.name, base_type.target_namespace);
+                    let base_name =
+                        format_type_name(schema_set, base_type.name, base_type.target_namespace);
                     return Err(SchemaError::structural(
                         "src-ct",
                         format!(
@@ -1160,7 +1292,11 @@ fn validate_extension_mixed_parity(
              (cos-ct-extends clause 1.4.3.2.2.4.1)",
             type_name,
             base_name,
-            if derived_mixed { "mixed" } else { "element-only" },
+            if derived_mixed {
+                "mixed"
+            } else {
+                "element-only"
+            },
             if base_mixed { "mixed" } else { "element-only" },
         ),
         location,
@@ -1189,12 +1325,10 @@ fn is_valid_simple_content_restriction_base(
             match &complex.particle {
                 // Absent particle ≡ empty sequence ≡ emptiable.
                 None => true,
-                Some(particle) => {
-                    match normalize_type_particle(schema_set, base, particle) {
-                        Ok(normalized) => particle_is_emptiable(&normalized),
-                        Err(_) => false,
-                    }
-                }
+                Some(particle) => match normalize_type_particle(schema_set, base, particle) {
+                    Ok(normalized) => particle_is_emptiable(&normalized),
+                    Err(_) => false,
+                },
             }
         }
         // Short-form complex type without <simpleContent>/<complexContent>:
@@ -1271,7 +1405,10 @@ impl<'a> ParticleNormalizer<'a> {
         }
     }
 
-    fn normalize_particle(&mut self, particle: &ParticleResult) -> SchemaResult<NormalizedParticle> {
+    fn normalize_particle(
+        &mut self,
+        particle: &ParticleResult,
+    ) -> SchemaResult<NormalizedParticle> {
         if self.depth >= MAX_PARTICLE_RESTRICTION_DEPTH {
             return Err(SchemaError::internal(
                 "particle restriction normalization exceeded recursion limit",
@@ -1437,10 +1574,7 @@ impl<'a> ParticleNormalizer<'a> {
     }
 }
 
-fn resolve_element_type_ref(
-    schema_set: &SchemaSet,
-    elem: &ElementFrameResult,
-) -> Option<TypeKey> {
+fn resolve_element_type_ref(schema_set: &SchemaSet, elem: &ElementFrameResult) -> Option<TypeKey> {
     match &elem.type_ref {
         Some(crate::parser::frames::TypeRefResult::QName(qname)) => schema_set
             .lookup_type(qname.namespace, qname.local_name)
@@ -1541,7 +1675,6 @@ fn validate_content_particle_restriction(
     }
 }
 
-
 /// Check if a normalized particle is an empty group (all children removed as pointless).
 fn is_empty_group(particle: &NormalizedParticle) -> bool {
     matches!(&particle.term, NormalizedParticleTerm::Group(group) if group.particles.is_empty())
@@ -1566,7 +1699,10 @@ fn complex_content_particle(content: &ComplexContentResult) -> Option<&ParticleR
 fn effective_base_content_particle<'a>(
     schema_set: &'a SchemaSet,
     base: &'a crate::arenas::ComplexTypeDefData,
-) -> (&'a crate::arenas::ComplexTypeDefData, Option<&'a ParticleResult>) {
+) -> (
+    &'a crate::arenas::ComplexTypeDefData,
+    Option<&'a ParticleResult>,
+) {
     let mut current = base;
     let mut depth = 0;
     loop {
@@ -1628,9 +1764,9 @@ fn normalize_model_group_as_particle(
     schema_set: &SchemaSet,
     group_data: &crate::arenas::ModelGroupData,
 ) -> SchemaResult<NormalizedParticle> {
-    let compositor = group_data.compositor.ok_or_else(|| {
-        SchemaError::internal("redefined named model group missing compositor")
-    })?;
+    let compositor = group_data
+        .compositor
+        .ok_or_else(|| SchemaError::internal("redefined named model group missing compositor"))?;
 
     let mut normalizer = ParticleNormalizer::new(
         schema_set,
@@ -1764,8 +1900,7 @@ fn can_collapse_single_child_group(
         return true;
     }
 
-    occurs_is_unit(group_min_occurs, group_max_occurs)
-        || child.max_occurs == Some(1)
+    occurs_is_unit(group_min_occurs, group_max_occurs) || child.max_occurs == Some(1)
 }
 
 fn occurs_is_unit(min_occurs: u32, max_occurs: Option<u32>) -> bool {
@@ -1869,8 +2004,7 @@ fn particle_restricts(
             // like addB118 where the derived choice is optional (min=0) but
             // no single base choice branch is emptiable AND accepts the
             // derived's elements — the union of branches covers it.
-            let base_has_emptiable_branch =
-                base_branches.iter().any(particle_is_emptiable);
+            let base_has_emptiable_branch = base_branches.iter().any(particle_is_emptiable);
             return derived_branches.iter().all(|branch| {
                 if base_branches
                     .iter()
@@ -1886,9 +2020,9 @@ fn particle_restricts(
                         // alone is covered, no non-empty form to check.
                         return true;
                     }
-                    return base_branches.iter().any(|candidate| {
-                        particle_restricts(schema_set, &non_empty, candidate)
-                    });
+                    return base_branches
+                        .iter()
+                        .any(|candidate| particle_restricts(schema_set, &non_empty, candidate));
                 }
                 false
             });
@@ -2009,14 +2143,11 @@ fn particle_restricts(
         (
             NormalizedParticleTerm::Group(derived_group),
             NormalizedParticleTerm::Wildcard(base_wildcard),
-        ) => {
-            group_particle_restricts_wildcard(derived, derived_group, base, base_wildcard)
-        }
+        ) => group_particle_restricts_wildcard(derived, derived_group, base, base_wildcard),
         (
             NormalizedParticleTerm::Group(derived_group),
             NormalizedParticleTerm::Group(base_group),
-        ) if derived_group.compositor == base_group.compositor =>
-        {
+        ) if derived_group.compositor == base_group.compositor => {
             if !occurs_range_is_subset(
                 derived.min_occurs,
                 derived.max_occurs,
@@ -2026,16 +2157,16 @@ fn particle_restricts(
                 return false;
             }
             match derived_group.compositor {
-                Compositor::Sequence => {
-                    sequence_particles_restrict(
-                        schema_set,
-                        &derived_group.particles,
-                        &base_group.particles,
-                    )
-                }
-                Compositor::All => {
-                    all_particles_restrict(schema_set, &derived_group.particles, &base_group.particles)
-                }
+                Compositor::Sequence => sequence_particles_restrict(
+                    schema_set,
+                    &derived_group.particles,
+                    &base_group.particles,
+                ),
+                Compositor::All => all_particles_restrict(
+                    schema_set,
+                    &derived_group.particles,
+                    &base_group.particles,
+                ),
                 Compositor::Choice => unreachable!("choice particles are handled earlier"),
             }
         }
@@ -2060,10 +2191,10 @@ fn particle_restricts(
         }
         // recurseAsIfGroup: wrap derived element/wildcard in an implicit group{1,1}
         // and check outer occurs before delegating to sequence/all matching.
-        (NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
-         NormalizedParticleTerm::Group(base_group))
-            if base_group.compositor == Compositor::Sequence =>
-        {
+        (
+            NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
+            NormalizedParticleTerm::Group(base_group),
+        ) if base_group.compositor == Compositor::Sequence => {
             occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
                 && sequence_particles_restrict(
                     schema_set,
@@ -2071,10 +2202,10 @@ fn particle_restricts(
                     &base_group.particles,
                 )
         }
-        (NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
-         NormalizedParticleTerm::Group(base_group))
-            if base_group.compositor == Compositor::All =>
-        {
+        (
+            NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
+            NormalizedParticleTerm::Group(base_group),
+        ) if base_group.compositor == Compositor::All => {
             occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
                 && all_particles_restrict(
                     schema_set,
@@ -2151,16 +2282,18 @@ fn particle_total_occurrence_range(particle: &NormalizedParticle) -> (u32, Optio
     let (term_min, term_max) = match &particle.term {
         NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => (1, Some(1)),
         NormalizedParticleTerm::Group(group) => match group.compositor {
-            Compositor::Sequence | Compositor::All => group.particles.iter().fold(
-                (0u32, Some(0u32)),
-                |(acc_min, acc_max), child| {
-                    let (child_min, child_max) = particle_total_occurrence_range(child);
-                    (
-                        acc_min.saturating_add(child_min),
-                        add_optional_occurs(acc_max, child_max),
-                    )
-                },
-            ),
+            Compositor::Sequence | Compositor::All => {
+                group
+                    .particles
+                    .iter()
+                    .fold((0u32, Some(0u32)), |(acc_min, acc_max), child| {
+                        let (child_min, child_max) = particle_total_occurrence_range(child);
+                        (
+                            acc_min.saturating_add(child_min),
+                            add_optional_occurs(acc_max, child_max),
+                        )
+                    })
+            }
             Compositor::Choice => {
                 let mut min_total: Option<u32> = None;
                 let mut max_total: Option<Option<u32>> = None;
@@ -2206,10 +2339,7 @@ fn group_particles_fit_wildcard(
         .all(|particle| particle_fits_wildcard(particle, wildcard))
 }
 
-fn particle_fits_wildcard(
-    particle: &NormalizedParticle,
-    wildcard: &NormalizedWildcard,
-) -> bool {
+fn particle_fits_wildcard(particle: &NormalizedParticle, wildcard: &NormalizedWildcard) -> bool {
     if let Some(branches) = expand_choice_branches(particle) {
         return branches
             .iter()
@@ -2218,8 +2348,12 @@ fn particle_fits_wildcard(
 
     match &particle.term {
         NormalizedParticleTerm::Element(element) => wildcard_allows_element(element, wildcard),
-        NormalizedParticleTerm::Wildcard(derived_wildcard) => wildcard_restricts(derived_wildcard, wildcard),
-        NormalizedParticleTerm::Group(group) => group_particles_fit_wildcard(&group.particles, wildcard),
+        NormalizedParticleTerm::Wildcard(derived_wildcard) => {
+            wildcard_restricts(derived_wildcard, wildcard)
+        }
+        NormalizedParticleTerm::Group(group) => {
+            group_particles_fit_wildcard(&group.particles, wildcard)
+        }
     }
 }
 
@@ -2333,8 +2467,7 @@ fn sequence_particles_restrict(
             //    unit's children.  This keeps the unit atomic — either the
             //    full slice matches or we fall through.
             if let NormalizedParticleTerm::Group(base_group) = &base.term {
-                if base_group.compositor == Compositor::Sequence
-                    && !base_group.particles.is_empty()
+                if base_group.compositor == Compositor::Sequence && !base_group.particles.is_empty()
                 {
                     let unit_len = base_group.particles.len();
                     let remaining = derived_particles.len() - derived_index;
@@ -2357,9 +2490,7 @@ fn sequence_particles_restrict(
             //    Each branch must independently work from the current base position
             //    for the entire remaining derived + base suffix.
             if schema_set.is_xsd11() {
-                if let Some(branches) =
-                    expand_choice_branches(&derived_particles[derived_index])
-                {
+                if let Some(branches) = expand_choice_branches(&derived_particles[derived_index]) {
                     let all_ok = branches.iter().all(|branch| {
                         let mut remaining = vec![branch.clone()];
                         remaining.extend_from_slice(&derived_particles[derived_index + 1..]);
@@ -2380,9 +2511,7 @@ fn sequence_particles_restrict(
             //    sequence{1,1}(a, b, c, ...) at derived can be inlined into
             //    the parent sequence and matched element-by-element against base.
             if schema_set.is_xsd11() {
-                if let NormalizedParticleTerm::Group(dg) =
-                    &derived_particles[derived_index].term
-                {
+                if let NormalizedParticleTerm::Group(dg) = &derived_particles[derived_index].term {
                     if dg.compositor == Compositor::Sequence
                         && occurs_is_unit(
                             derived_particles[derived_index].min_occurs,
@@ -2482,7 +2611,8 @@ fn recurse_unordered(
 ) -> bool {
     // Try count-based bucket subsumption first — it handles substitution
     // group merging, wildcard partition, and choice distribution.
-    if let Some(result) = try_count_based_subsumption(schema_set, derived_particles, base_particles) {
+    if let Some(result) = try_count_based_subsumption(schema_set, derived_particles, base_particles)
+    {
         if result {
             return true;
         }
@@ -2508,11 +2638,19 @@ fn recurse_unordered(
         }
 
         for (base_index, base_particle) in base_particles.iter().enumerate() {
-            if used[base_index] || !particle_restricts(schema_set, &derived_particles[derived_index], base_particle) {
+            if used[base_index]
+                || !particle_restricts(schema_set, &derived_particles[derived_index], base_particle)
+            {
                 continue;
             }
             used[base_index] = true;
-            if backtrack(schema_set, derived_particles, base_particles, used, derived_index + 1) {
+            if backtrack(
+                schema_set,
+                derived_particles,
+                base_particles,
+                used,
+                derived_index + 1,
+            ) {
                 return true;
             }
             used[base_index] = false;
@@ -2524,9 +2662,10 @@ fn recurse_unordered(
     // Merge duplicate-name element particles in the derived side: unordered
     // matching counts total occurrences per element, not particle positions.
     let merged_owned;
-    let derived_particles = if derived_particles.iter().any(|p| {
-        matches!(&p.term, NormalizedParticleTerm::Element(_))
-    }) && has_duplicate_element_names(derived_particles)
+    let derived_particles = if derived_particles
+        .iter()
+        .any(|p| matches!(&p.term, NormalizedParticleTerm::Element(_)))
+        && has_duplicate_element_names(derived_particles)
     {
         merged_owned = merge_duplicate_elements(derived_particles);
         &merged_owned[..]
@@ -2606,12 +2745,12 @@ fn try_count_based_subsumption(
                 return Some(false);
             }
         } else {
-            let (sum_min, sum_max) = ranges.iter().fold(
-                (0u32, Some(0u32)),
-                |(amin, amax), &(min, max)| {
-                    (amin.saturating_add(min), add_optional_occurs(amax, max))
-                },
-            );
+            let (sum_min, sum_max) =
+                ranges
+                    .iter()
+                    .fold((0u32, Some(0u32)), |(amin, amax), &(min, max)| {
+                        (amin.saturating_add(min), add_optional_occurs(amax, max))
+                    });
             if !occurs_range_is_subset(sum_min, sum_max, base.min_occurs, base.max_occurs) {
                 return Some(false);
             }
@@ -3020,7 +3159,11 @@ fn wildcard_subset_of_union(
             }
         };
         for item in &derived.wildcard.not_qname {
-            if let NotQNameItem::QName { namespace, local_name } = item {
+            if let NotQNameItem::QName {
+                namespace,
+                local_name,
+            } = item
+            {
                 if *namespace == ns {
                     push_name(*local_name, &mut name_witnesses);
                 }
@@ -3028,7 +3171,11 @@ fn wildcard_subset_of_union(
         }
         for &i in &admitting {
             for item in &bases[i].wildcard.not_qname {
-                if let NotQNameItem::QName { namespace, local_name } = item {
+                if let NotQNameItem::QName {
+                    namespace,
+                    local_name,
+                } = item
+                {
                     if *namespace == ns {
                         push_name(*local_name, &mut name_witnesses);
                     }
@@ -3083,8 +3230,8 @@ fn wildcard_subset_of_union(
     // Symbolic "fresh namespace" witness: a namespace not in any explicit
     // set. Use a sentinel NameId guaranteed not to appear (NameId::MAX).
     let fresh_ns = Some(NameId(u32::MAX));
-    let derived_admits_fresh = wildcard_admits_ns(derived, fresh_ns)
-        || wildcard_admits_ns(derived, None);
+    let derived_admits_fresh =
+        wildcard_admits_ns(derived, fresh_ns) || wildcard_admits_ns(derived, None);
     if derived_admits_fresh {
         // The "fresh ns" sentinel covers any unmentioned namespace; we need
         // at least one base to admit it for partition coverage to work.
@@ -3125,17 +3272,16 @@ fn wildcard_admits_ns(wc: &NormalizedWildcard, ns: Option<NameId>) -> bool {
 /// `notNamespace` and `notQName`. `##defined` and `##definedSibling` are
 /// treated pessimistically — if either appears, the QName is rejected, since
 /// at schema-time we cannot resolve which names they catch.
-fn wildcard_admits_qname(
-    wc: &NormalizedWildcard,
-    ns: Option<NameId>,
-    name: NameId,
-) -> bool {
+fn wildcard_admits_qname(wc: &NormalizedWildcard, ns: Option<NameId>, name: NameId) -> bool {
     use crate::parser::frames::NotQNameItem;
     if !wildcard_admits_ns(wc, ns) {
         return false;
     }
     !wc.wildcard.not_qname.iter().any(|item| match item {
-        NotQNameItem::QName { namespace, local_name } => *namespace == ns && *local_name == name,
+        NotQNameItem::QName {
+            namespace,
+            local_name,
+        } => *namespace == ns && *local_name == name,
         NotQNameItem::Defined | NotQNameItem::DefinedSibling => true,
     })
 }
@@ -3144,10 +3290,7 @@ fn wildcard_admits_qname(
 /// name that doesn't appear in any explicit `notQName` entry. The check
 /// fails only if `##defined`/`##definedSibling` would catch any name, since
 /// concrete QName entries match only specific names.
-fn wildcard_admits_qname_symbolic_other(
-    wc: &NormalizedWildcard,
-    ns: Option<NameId>,
-) -> bool {
+fn wildcard_admits_qname_symbolic_other(wc: &NormalizedWildcard, ns: Option<NameId>) -> bool {
     use crate::parser::frames::NotQNameItem;
     if !wildcard_admits_ns(wc, ns) {
         return false;
@@ -3158,10 +3301,7 @@ fn wildcard_admits_qname_symbolic_other(
         .any(|item| matches!(item, NotQNameItem::Defined | NotQNameItem::DefinedSibling))
 }
 
-fn wildcard_allows_element(
-    element: &NormalizedElement,
-    wildcard: &NormalizedWildcard,
-) -> bool {
+fn wildcard_allows_element(element: &NormalizedElement, wildcard: &NormalizedWildcard) -> bool {
     if !wildcard_namespace_matches(
         &wildcard.wildcard.namespace,
         element.namespace,
@@ -3180,7 +3320,11 @@ fn wildcard_allows_element(
         return false;
     }
 
-    !wildcard_not_qname_excludes(&wildcard.wildcard.not_qname, element.namespace, element.name)
+    !wildcard_not_qname_excludes(
+        &wildcard.wildcard.not_qname,
+        element.namespace,
+        element.name,
+    )
 }
 
 fn wildcard_namespace_matches(
@@ -3190,7 +3334,9 @@ fn wildcard_namespace_matches(
 ) -> bool {
     match namespace {
         WildcardNamespace::Any => true,
-        WildcardNamespace::Other => !other_exclusion_set(target_namespace).contains(&element_namespace),
+        WildcardNamespace::Other => {
+            !other_exclusion_set(target_namespace).contains(&element_namespace)
+        }
         WildcardNamespace::TargetNamespace => element_namespace == target_namespace,
         WildcardNamespace::Local => element_namespace.is_none(),
         WildcardNamespace::List(tokens) => tokens
@@ -3312,16 +3458,15 @@ fn is_namespace_subset(
                     // Finite positive set — every allowed ns must not be in
                     // base's exclusion set.
                     match resolve_ns_set(derived, derived_target_ns) {
-                        Some(resolved) => {
-                            resolved.iter().all(|ns| !base_excluded.contains(ns))
-                        }
+                        Some(resolved) => resolved.iter().all(|ns| !base_excluded.contains(ns)),
                         None => false,
                     }
                 }
             }
         }
 
-        WildcardNamespace::TargetNamespace | WildcardNamespace::Local
+        WildcardNamespace::TargetNamespace
+        | WildcardNamespace::Local
         | WildcardNamespace::List(_) => {
             // Base is a finite positive set — resolve both sides and check
             // set inclusion.
@@ -3358,8 +3503,10 @@ fn is_wildcard_ns_subset(
 ) -> bool {
     // Namespace constraint must be a subset
     if !is_namespace_subset(
-        &derived.namespace, derived_target_ns,
-        &base.namespace, base_target_ns,
+        &derived.namespace,
+        derived_target_ns,
+        &base.namespace,
+        base_target_ns,
     ) {
         return false;
     }
@@ -3371,12 +3518,12 @@ fn is_wildcard_ns_subset(
     // finite List whose members don't overlap base's notNamespace set).
     for base_excl in &base.not_namespace {
         let base_ns = base_excl.resolve(base_target_ns);
-        let derived_allows = wildcard_namespace_matches(
-            &derived.namespace, base_ns, derived_target_ns,
-        ) && !derived
-            .not_namespace
-            .iter()
-            .any(|d| d.resolve(derived_target_ns) == base_ns);
+        let derived_allows =
+            wildcard_namespace_matches(&derived.namespace, base_ns, derived_target_ns)
+                && !derived
+                    .not_namespace
+                    .iter()
+                    .any(|d| d.resolve(derived_target_ns) == base_ns);
         if derived_allows {
             return false;
         }
@@ -3389,12 +3536,12 @@ fn is_wildcard_ns_subset(
     for item in &base.not_qname {
         match item {
             crate::parser::frames::NotQNameItem::QName { namespace, .. } => {
-                let derived_admits_ns = wildcard_namespace_matches(
-                    &derived.namespace, *namespace, derived_target_ns,
-                ) && !derived
-                    .not_namespace
-                    .iter()
-                    .any(|t| t.resolve(derived_target_ns) == *namespace);
+                let derived_admits_ns =
+                    wildcard_namespace_matches(&derived.namespace, *namespace, derived_target_ns)
+                        && !derived
+                            .not_namespace
+                            .iter()
+                            .any(|t| t.resolve(derived_target_ns) == *namespace);
                 if derived_admits_ns && !derived.not_qname.contains(item) {
                     return false;
                 }
@@ -3435,7 +3582,9 @@ fn validate_open_content_extension(
     let eot = compute_effective_open_content(schema_set, derived_key);
 
     // Clause 1.4.3.2.2.3.1: if BOT is absent, extension is unconstrained wrt OC.
-    let Some(bot) = bot else { return Ok(()); };
+    let Some(bot) = bot else {
+        return Ok(());
+    };
 
     let (location, type_name) = type_error_context(schema_set, derived);
     let base_name = format_type_name(schema_set, base.name, base.target_namespace);
@@ -3476,8 +3625,10 @@ fn validate_open_content_extension(
     // Clause 1.4.3.2.2.4: BOT.{wildcard}.{namespace constraint} ⊆ EOT.{wildcard}.
     if let (Some(bot_wc), Some(eot_wc)) = (bot.wildcard.as_ref(), eot.wildcard.as_ref()) {
         if !is_wildcard_ns_subset(
-            bot_wc, base.target_namespace,
-            eot_wc, derived.target_namespace,
+            bot_wc,
+            base.target_namespace,
+            eot_wc,
+            derived.target_namespace,
         ) {
             return Err(SchemaError::structural(
                 "cos-ct-extends",
@@ -3540,11 +3691,15 @@ fn compute_effective_open_content_bounded(
     // @mode — a literal `mode="none"` still "corresponds" to the element per
     // the spec.  The clause-6.1 mode=none branch below handles that case,
     // short-circuiting the defaultOpenContent fallback that 5.2 would apply.
-    let own_oc: Option<EffectiveOpenContent> = type_data.open_content.as_ref().map(|oc| EffectiveOpenContent {
-        mode: oc.mode,
-        wildcard: oc.wildcard.clone(),
-        target_namespace: target_ns,
-    });
+    let own_oc: Option<EffectiveOpenContent> =
+        type_data
+            .open_content
+            .as_ref()
+            .map(|oc| EffectiveOpenContent {
+                mode: oc.mode,
+                wildcard: oc.wildcard.clone(),
+                target_namespace: target_ns,
+            });
 
     let wildcard_element: Option<EffectiveOpenContent> = if own_oc.is_some() {
         // Clause 5.1
@@ -3584,7 +3739,9 @@ fn compute_effective_open_content_bounded(
     };
 
     // Clause 6.1: absent / mode=None wildcard element → inherit base.
-    let Some(we) = wildcard_element else { return base_oc; };
+    let Some(we) = wildcard_element else {
+        return base_oc;
+    };
     if we.mode == OpenContentMode::None {
         return base_oc;
     }
@@ -3600,7 +3757,11 @@ fn compute_effective_open_content_bounded(
         (None, None) => None,
     };
 
-    Some(EffectiveOpenContent { mode: we.mode, wildcard, target_namespace: target_ns })
+    Some(EffectiveOpenContent {
+        mode: we.mode,
+        wildcard,
+        target_namespace: target_ns,
+    })
 }
 
 /// Determine whether a complex type's *explicit content type* is empty per
@@ -3623,7 +3784,10 @@ fn explicit_content_is_empty(
     if !type_data.content.explicit_content_type_is_empty() {
         return false;
     }
-    if matches!(type_data.derivation_method, Some(DerivationMethod::Extension)) {
+    if matches!(
+        type_data.derivation_method,
+        Some(DerivationMethod::Extension)
+    ) {
         if let Some(TypeKey::Complex(base_key)) = type_data.resolved_base_type {
             if let Some(base_data) = schema_set.arenas.complex_types.get(base_key) {
                 return explicit_content_is_empty(schema_set, base_data, depth + 1);
@@ -3649,11 +3813,12 @@ fn default_open_content_to_effective(
     if mode == OpenContentMode::None {
         return None;
     }
-    let wildcard = default
-        .wildcard
-        .as_ref()
-        .map(element_wildcard_to_result);
-    Some(EffectiveOpenContent { mode, wildcard, target_namespace: target_ns })
+    let wildcard = default.wildcard.as_ref().map(element_wildcard_to_result);
+    Some(EffectiveOpenContent {
+        mode,
+        wildcard,
+        target_namespace: target_ns,
+    })
 }
 
 /// Convert a schema-model `ElementWildcard` to a parser-form `WildcardResult`
@@ -3686,7 +3851,10 @@ fn element_wildcard_to_result(ew: &crate::schema::wildcard::ElementWildcard) -> 
         .not_qnames
         .iter()
         .map(|q| match q {
-            QNameDisallowed::QName { namespace, local_name } => NotQNameItem::QName {
+            QNameDisallowed::QName {
+                namespace,
+                local_name,
+            } => NotQNameItem::QName {
                 namespace: *namespace,
                 local_name: *local_name,
             },
@@ -3724,10 +3892,8 @@ fn wildcard_to_ns_form(
     not_namespace: &[crate::parser::frames::NamespaceToken],
     target_ns: Option<NameId>,
 ) -> NsForm {
-    let resolved_not: Vec<Option<NameId>> = not_namespace
-        .iter()
-        .map(|t| t.resolve(target_ns))
-        .collect();
+    let resolved_not: Vec<Option<NameId>> =
+        not_namespace.iter().map(|t| t.resolve(target_ns)).collect();
     match ns {
         WildcardNamespace::Any => NsForm::Neg(resolved_not),
         WildcardNamespace::Other => {
@@ -3772,7 +3938,10 @@ fn wildcard_to_ns_form(
 #[cfg(feature = "xsd11")]
 fn ns_form_to_wildcard(
     form: NsForm,
-) -> (WildcardNamespace, Vec<crate::parser::frames::NamespaceToken>) {
+) -> (
+    WildcardNamespace,
+    Vec<crate::parser::frames::NamespaceToken>,
+) {
     use crate::parser::frames::NamespaceToken;
     match form {
         NsForm::Pos(list) => {
@@ -4140,8 +4309,10 @@ fn validate_open_content_restriction(
         (base_oc.wildcard.as_ref(), derived_oc.wildcard.as_ref())
     {
         if !is_wildcard_ns_subset(
-            derived_wc, derived.target_namespace,
-            base_wc, base.target_namespace,
+            derived_wc,
+            derived.target_namespace,
+            base_wc,
+            base.target_namespace,
         ) {
             return Err(SchemaError::structural(
                 "derivation-ok-restriction",
@@ -4175,7 +4346,9 @@ fn validate_open_content_restriction(
 
 /// Check if a type derives from NOTATION or QName.
 fn is_notation_or_qname_base(schema_set: &SchemaSet, key: TypeKey) -> bool {
-    let TypeKey::Simple(sk) = key else { return false };
+    let TypeKey::Simple(sk) = key else {
+        return false;
+    };
     let bt = schema_set.builtin_types();
     schema_set.derives_from(sk, bt.notation) || schema_set.derives_from(sk, bt.qname)
 }
@@ -4254,7 +4427,9 @@ fn validate_facet_values_against_base_type(
     if let Some(ref enum_facet) = type_def.facets.enumeration {
         let enum_base = base_without_enumeration(schema_set, base_key);
         for value in &enum_facet.values {
-            if crate::validation::simple::validate_simple_type(value, enum_base, schema_set).is_err() {
+            if crate::validation::simple::validate_simple_type(value, enum_base, schema_set)
+                .is_err()
+            {
                 return Err(SchemaError::structural(
                     "enumeration-valid-restriction",
                     format!(
@@ -4270,7 +4445,10 @@ fn validate_facet_values_against_base_type(
     // Validate bound facet values. XSD Part 2 §4.3.9 permits a derived bound
     // to equal the base's same-kind bound (boundary equality), even though
     // that base value is not in the base's own value space.
-    let check_bound = |value: &str, constraint: &'static str, kind: FacetKind| -> SchemaResult<()> {
+    let check_bound = |value: &str,
+                       constraint: &'static str,
+                       kind: FacetKind|
+     -> SchemaResult<()> {
         match crate::validation::simple::validate_simple_type(value, base_key, schema_set) {
             Ok(_) => Ok(()),
             Err(err) if is_bound_self_violation(&err, kind, schema_set, base_key, value) => Ok(()),
@@ -4278,7 +4456,9 @@ fn validate_facet_values_against_base_type(
                 constraint,
                 format!(
                     "{} value '{}' in type '{}' is not in the value space of the base type",
-                    kind.name(), value, type_name
+                    kind.name(),
+                    value,
+                    type_name
                 ),
                 location.clone(),
             )),
@@ -4286,19 +4466,41 @@ fn validate_facet_values_against_base_type(
     };
 
     if let Some(ref f) = type_def.facets.min_inclusive {
-        check_bound(&f.value, "minInclusive-valid-restriction", FacetKind::MinInclusive)?;
+        check_bound(
+            &f.value,
+            "minInclusive-valid-restriction",
+            FacetKind::MinInclusive,
+        )?;
     }
     if let Some(ref f) = type_def.facets.max_inclusive {
-        check_bound(&f.value, "maxInclusive-valid-restriction", FacetKind::MaxInclusive)?;
+        check_bound(
+            &f.value,
+            "maxInclusive-valid-restriction",
+            FacetKind::MaxInclusive,
+        )?;
     }
     if let Some(ref f) = type_def.facets.min_exclusive {
-        check_bound(&f.value, "minExclusive-valid-restriction", FacetKind::MinExclusive)?;
+        check_bound(
+            &f.value,
+            "minExclusive-valid-restriction",
+            FacetKind::MinExclusive,
+        )?;
     }
     if let Some(ref f) = type_def.facets.max_exclusive {
-        check_bound(&f.value, "maxExclusive-valid-restriction", FacetKind::MaxExclusive)?;
+        check_bound(
+            &f.value,
+            "maxExclusive-valid-restriction",
+            FacetKind::MaxExclusive,
+        )?;
     }
 
-    validate_typed_bound_consistency(schema_set, &type_def.facets, base_key, &type_name, &location)?;
+    validate_typed_bound_consistency(
+        schema_set,
+        &type_def.facets,
+        base_key,
+        &type_name,
+        &location,
+    )?;
 
     Ok(())
 }
@@ -4316,7 +4518,9 @@ fn validate_typed_bound_consistency(
                       upper_name: &'static str,
                       allow_equal: bool|
      -> SchemaResult<()> {
-        let (Some(lower), Some(upper)) = (lower, upper) else { return Ok(()); };
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            return Ok(());
+        };
         let Some(cmp) = compare_bound_literals(schema_set, base_key, lower, upper) else {
             return Ok(());
         };
@@ -4375,16 +4579,22 @@ fn compare_bound_literals(
     upper: &str,
 ) -> Option<std::cmp::Ordering> {
     let parse_base = bound_comparison_base(schema_set, base_key);
-    let lower = crate::validation::simple::validate_simple_type(lower, parse_base, schema_set).ok()?;
-    let upper = crate::validation::simple::validate_simple_type(upper, parse_base, schema_set).ok()?;
+    let lower =
+        crate::validation::simple::validate_simple_type(lower, parse_base, schema_set).ok()?;
+    let upper =
+        crate::validation::simple::validate_simple_type(upper, parse_base, schema_set).ok()?;
     compare_xml_values(&lower.typed_value, &upper.typed_value)
 }
 
 fn bound_comparison_base(schema_set: &SchemaSet, key: TypeKey) -> TypeKey {
     let mut current = key;
     for _ in 0..100 {
-        let TypeKey::Simple(sk) = current else { return current; };
-        let Some(st) = schema_set.arenas.simple_types.get(sk) else { return current; };
+        let TypeKey::Simple(sk) = current else {
+            return current;
+        };
+        let Some(st) = schema_set.arenas.simple_types.get(sk) else {
+            return current;
+        };
         let has_bounds_or_enum = st.facets.enumeration.is_some()
             || st.facets.min_inclusive.is_some()
             || st.facets.min_exclusive.is_some()
@@ -4393,7 +4603,9 @@ fn bound_comparison_base(schema_set: &SchemaSet, key: TypeKey) -> TypeKey {
         if !has_bounds_or_enum {
             return current;
         }
-        let Some(base) = st.resolved_base_type else { return current; };
+        let Some(base) = st.resolved_base_type else {
+            return current;
+        };
         current = base;
     }
     current
@@ -4422,8 +4634,12 @@ fn compare_xml_atomic_values(
         (XmlAtomicValue::Date(a), XmlAtomicValue::Date(b)) => a.partial_cmp(b),
         (XmlAtomicValue::Time(a), XmlAtomicValue::Time(b)) => a.partial_cmp(b),
         (XmlAtomicValue::Duration(a), XmlAtomicValue::Duration(b)) => a.partial_cmp(b),
-        (XmlAtomicValue::YearMonthDuration(a), XmlAtomicValue::YearMonthDuration(b)) => a.partial_cmp(b),
-        (XmlAtomicValue::DayTimeDuration(a), XmlAtomicValue::DayTimeDuration(b)) => a.partial_cmp(b),
+        (XmlAtomicValue::YearMonthDuration(a), XmlAtomicValue::YearMonthDuration(b)) => {
+            a.partial_cmp(b)
+        }
+        (XmlAtomicValue::DayTimeDuration(a), XmlAtomicValue::DayTimeDuration(b)) => {
+            a.partial_cmp(b)
+        }
         (XmlAtomicValue::GYearMonth(a), XmlAtomicValue::GYearMonth(b)) => a.partial_cmp(b),
         (XmlAtomicValue::GYear(a), XmlAtomicValue::GYear(b)) => a.partial_cmp(b),
         (XmlAtomicValue::GMonthDay(a), XmlAtomicValue::GMonthDay(b)) => a.partial_cmp(b),
@@ -4485,15 +4701,27 @@ pub(crate) trait TypeDefForError {
 }
 
 impl TypeDefForError for crate::arenas::SimpleTypeDefData {
-    fn error_name(&self) -> Option<NameId> { self.name }
-    fn error_target_namespace(&self) -> Option<NameId> { self.target_namespace }
-    fn error_source(&self) -> Option<&SourceRef> { self.source.as_ref() }
+    fn error_name(&self) -> Option<NameId> {
+        self.name
+    }
+    fn error_target_namespace(&self) -> Option<NameId> {
+        self.target_namespace
+    }
+    fn error_source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
 }
 
 impl TypeDefForError for crate::arenas::ComplexTypeDefData {
-    fn error_name(&self) -> Option<NameId> { self.name }
-    fn error_target_namespace(&self) -> Option<NameId> { self.target_namespace }
-    fn error_source(&self) -> Option<&SourceRef> { self.source.as_ref() }
+    fn error_name(&self) -> Option<NameId> {
+        self.name
+    }
+    fn error_target_namespace(&self) -> Option<NameId> {
+        self.target_namespace
+    }
+    fn error_source(&self) -> Option<&SourceRef> {
+        self.source.as_ref()
+    }
 }
 
 /// Returns `(location, type_name)` for error construction on a type component.
@@ -4505,7 +4733,11 @@ pub(crate) fn type_error_context<T: TypeDefForError>(
 ) -> (Option<SourceLocation>, String) {
     (
         schema_set.locate(type_def.error_source()),
-        format_type_name(schema_set, type_def.error_name(), type_def.error_target_namespace()),
+        format_type_name(
+            schema_set,
+            type_def.error_name(),
+            type_def.error_target_namespace(),
+        ),
     )
 }
 
@@ -4537,7 +4769,10 @@ fn resolve_single_attribute_use(
     let (name, target_namespace) = if let Some(ref_name) = &attr_use.attribute.ref_name {
         if let Some(resolved_attr) = resolved.and_then(|r| r.resolved_ref) {
             let decl = schema_set.arenas.attributes.get(resolved_attr);
-            (decl.and_then(|d| d.name)?, decl.and_then(|d| d.target_namespace))
+            (
+                decl.and_then(|d| d.name)?,
+                decl.and_then(|d| d.target_namespace),
+            )
         } else {
             (ref_name.local_name, ref_name.namespace)
         }
@@ -4555,13 +4790,12 @@ fn resolve_single_attribute_use(
     };
 
     // Prefer the use's resolved_type; fall back to the global declaration's type.
-    let resolved_type = resolved.and_then(|r| r.resolved_type)
-        .or_else(|| {
-            resolved
-                .and_then(|r| r.resolved_ref)
-                .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
-                .and_then(|decl| decl.resolved_type)
-        });
+    let resolved_type = resolved.and_then(|r| r.resolved_type).or_else(|| {
+        resolved
+            .and_then(|r| r.resolved_ref)
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
+            .and_then(|decl| decl.resolved_type)
+    });
 
     // For fixed_value: use the inline fixed, or the resolved global decl's fixed.
     let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
@@ -4921,10 +5155,9 @@ fn combine_effective_wildcards(
     match (local, w.is_empty()) {
         (None, true) => None,
         (Some(l), true) => Some(l),
-        (Some(l), false) => Some(
-            w.into_iter()
-                .fold(l, |acc, wi| intersect_effective_attribute_wildcards(&acc, &wi)),
-        ),
+        (Some(l), false) => Some(w.into_iter().fold(l, |acc, wi| {
+            intersect_effective_attribute_wildcards(&acc, &wi)
+        })),
         (None, false) => {
             let mut it = w.into_iter();
             let first = it.next().expect("w is non-empty");
@@ -5035,9 +5268,7 @@ fn compute_runtime_attribute_wildcard_bounded(
 /// Pull the type's "own" attribute wildcard out of either the top-level
 /// field or the SimpleContent / ComplexContent derivation arm where the
 /// `<xs:anyAttribute>` legitimately lives.
-fn own_attribute_wildcard_ref(
-    ct: &crate::arenas::ComplexTypeDefData,
-) -> Option<&WildcardResult> {
+fn own_attribute_wildcard_ref(ct: &crate::arenas::ComplexTypeDefData) -> Option<&WildcardResult> {
     if let Some(wc) = ct.attribute_wildcard.as_ref() {
         return Some(wc);
     }
@@ -5072,35 +5303,35 @@ fn union_effective_attribute_wildcards(
     // intersection rule applies.
     let mut not_qname: Vec<NotQNameItem> = Vec::new();
 
-    let mut consider = |item: &NotQNameItem, other: &EffectiveAttributeWildcard| {
-        match item {
-            NotQNameItem::QName { namespace, local_name } => {
-                let admitted_by_other_ns = match &other.namespace {
-                    CanonicalNs::Any => true,
-                    CanonicalNs::Enum(set) => set.contains(namespace),
-                    CanonicalNs::Not(set) => !set.contains(namespace),
-                };
-                let excluded_by_other_qname = other.not_qname.iter().any(|o| match o {
-                    NotQNameItem::QName { namespace: ons, local_name: oln } => {
-                        ons == namespace && oln == local_name
-                    }
-                    NotQNameItem::Defined | NotQNameItem::DefinedSibling => false,
-                });
-                if (!admitted_by_other_ns || excluded_by_other_qname)
-                    && !not_qname.contains(item)
-                {
-                    not_qname.push(item.clone());
-                }
+    let mut consider = |item: &NotQNameItem, other: &EffectiveAttributeWildcard| match item {
+        NotQNameItem::QName {
+            namespace,
+            local_name,
+        } => {
+            let admitted_by_other_ns = match &other.namespace {
+                CanonicalNs::Any => true,
+                CanonicalNs::Enum(set) => set.contains(namespace),
+                CanonicalNs::Not(set) => !set.contains(namespace),
+            };
+            let excluded_by_other_qname = other.not_qname.iter().any(|o| match o {
+                NotQNameItem::QName {
+                    namespace: ons,
+                    local_name: oln,
+                } => ons == namespace && oln == local_name,
+                NotQNameItem::Defined | NotQNameItem::DefinedSibling => false,
+            });
+            if (!admitted_by_other_ns || excluded_by_other_qname) && !not_qname.contains(item) {
+                not_qname.push(item.clone());
             }
-            NotQNameItem::Defined | NotQNameItem::DefinedSibling => {
-                if other
-                    .not_qname
-                    .iter()
-                    .any(|o| std::mem::discriminant(o) == std::mem::discriminant(item))
-                    && !not_qname.contains(item)
-                {
-                    not_qname.push(item.clone());
-                }
+        }
+        NotQNameItem::Defined | NotQNameItem::DefinedSibling => {
+            if other
+                .not_qname
+                .iter()
+                .any(|o| std::mem::discriminant(o) == std::mem::discriminant(item))
+                && !not_qname.contains(item)
+            {
+                not_qname.push(item.clone());
             }
         }
     };
@@ -5234,13 +5465,12 @@ fn effective_attribute_wildcard_restricts(
     // exclusion, and `##defined` (with schema lookup) in one pass.
     for item in &base.not_qname {
         match item {
-            NotQNameItem::QName { namespace, local_name } => {
-                if effective_wildcard_allows_attribute(
-                    schema_set,
-                    derived,
-                    *namespace,
-                    *local_name,
-                ) {
+            NotQNameItem::QName {
+                namespace,
+                local_name,
+            } => {
+                if effective_wildcard_allows_attribute(schema_set, derived, *namespace, *local_name)
+                {
                     return Err(
                         "notQName exclusions do not cover the base wildcard's disallowed names",
                     );
@@ -5248,7 +5478,11 @@ fn effective_attribute_wildcard_restricts(
             }
             // Clause 2: `##defined` requires literal containment.
             NotQNameItem::Defined => {
-                if !derived.not_qname.iter().any(|d| matches!(d, NotQNameItem::Defined)) {
+                if !derived
+                    .not_qname
+                    .iter()
+                    .any(|d| matches!(d, NotQNameItem::Defined))
+                {
                     return Err("base wildcard excludes ##defined but derived does not");
                 }
             }
@@ -5301,7 +5535,10 @@ pub(crate) fn effective_wildcard_allows_attribute(
     // not_qname exclusions, including ##defined schema lookup.
     for item in &wc.not_qname {
         match item {
-            crate::parser::frames::NotQNameItem::QName { namespace: qns, local_name } => {
+            crate::parser::frames::NotQNameItem::QName {
+                namespace: qns,
+                local_name,
+            } => {
                 if *qns == attr_namespace && *local_name == attr_name {
                     return false;
                 }
@@ -5357,11 +5594,7 @@ fn collect_attribute_group_uses(
 }
 
 /// Delegate to `SchemaSet::is_type_derived_from` with no method exclusions.
-fn is_type_derived_from(
-    schema_set: &SchemaSet,
-    derived_key: TypeKey,
-    base_key: TypeKey,
-) -> bool {
+fn is_type_derived_from(schema_set: &SchemaSet, derived_key: TypeKey, base_key: TypeKey) -> bool {
     schema_set.is_type_derived_from(derived_key, base_key, DerivationSet::empty())
 }
 
@@ -5475,13 +5708,17 @@ fn validate_attribute_restriction(
 
     // Check clause 4: attribute type derivation
     for derived_attr in &derived_attrs {
-        let Some(derived_type_key) = derived_attr.resolved_type else { continue };
+        let Some(derived_type_key) = derived_attr.resolved_type else {
+            continue;
+        };
 
-        let base_attr = base_attrs
-            .iter()
-            .find(|a| a.name == derived_attr.name && a.target_namespace == derived_attr.target_namespace);
+        let base_attr = base_attrs.iter().find(|a| {
+            a.name == derived_attr.name && a.target_namespace == derived_attr.target_namespace
+        });
         let Some(base_attr) = base_attr else { continue };
-        let Some(base_type_key) = base_attr.resolved_type else { continue };
+        let Some(base_type_key) = base_attr.resolved_type else {
+            continue;
+        };
 
         if derived_type_key == base_type_key {
             continue;
@@ -5511,9 +5748,10 @@ fn validate_attribute_restriction(
             continue;
         };
         // Find re-declared derived attr matching this base attr.
-        let Some(derived_attr) = derived_attrs.iter().find(|a| {
-            a.name == base_attr.name && a.target_namespace == base_attr.target_namespace
-        }) else {
+        let Some(derived_attr) = derived_attrs
+            .iter()
+            .find(|a| a.name == base_attr.name && a.target_namespace == base_attr.target_namespace)
+        else {
             // Inherited unchanged: OK.
             continue;
         };
@@ -5811,9 +6049,7 @@ fn validate_simple_content_restriction(
 
     // Get the base simple type's variety
     let base_variety = match base_simple_key {
-        TypeKey::Simple(sk) => {
-            schema_set.arenas.simple_types.get(sk).map(|st| st.variety)
-        }
+        TypeKey::Simple(sk) => schema_set.arenas.simple_types.get(sk).map(|st| st.variety),
         TypeKey::Complex(_) => None,
     };
 
@@ -5905,7 +6141,11 @@ pub fn validate_attribute_id_constraints(schema_set: &SchemaSet) -> SchemaResult
                     .name
                     .map(|n| schema_set.name_table.resolve(n).to_string())
                     .unwrap_or_else(|| "(anonymous)".to_string());
-                let constraint = if attr_data.default_value.is_some() { "default" } else { "fixed" };
+                let constraint = if attr_data.default_value.is_some() {
+                    "default"
+                } else {
+                    "fixed"
+                };
                 return Err(SchemaError::structural(
                     "cos-attribute-decl",
                     format!(
@@ -6037,13 +6277,21 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                 .fixed_value
                 .as_deref()
                 .map(|v| (v, true))
-                .or_else(|| attr_use.attribute.default_value.as_deref().map(|v| (v, false)))
-                .or_else(|| ref_decl.and_then(|d| {
-                    d.fixed_value
+                .or_else(|| {
+                    attr_use
+                        .attribute
+                        .default_value
                         .as_deref()
-                        .map(|v| (v, true))
-                        .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
-                }));
+                        .map(|v| (v, false))
+                })
+                .or_else(|| {
+                    ref_decl.and_then(|d| {
+                        d.fixed_value
+                            .as_deref()
+                            .map(|v| (v, true))
+                            .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
+                    })
+                });
             let Some((value, is_fixed)) = value_constraint else {
                 continue;
             };
@@ -6054,7 +6302,8 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             let Some(type_key @ TypeKey::Simple(_)) = attr_type else {
                 continue;
             };
-            if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err() {
+            if crate::validation::simple::validate_simple_type(value, type_key, schema_set).is_err()
+            {
                 let attr_name = attr_use
                     .attribute
                     .name
@@ -6139,7 +6388,8 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
                         format!(
                             "Element '{}' has '{}' value but its type is a complex type \
                              with non-mixed, non-simple content",
-                            elem_name(), constraint
+                            elem_name(),
+                            constraint
                         ),
                         location(),
                     ));
@@ -6181,7 +6431,9 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
                     "e-props-correct.2",
                     format!(
                         "Element '{}' {} value '{}' is not valid for its declared type",
-                        elem_name(), constraint, value
+                        elem_name(),
+                        constraint,
+                        value
                     ),
                     location(),
                 ));
@@ -6245,9 +6497,7 @@ pub fn validate_element_type_alternatives(schema_set: &SchemaSet) -> SchemaResul
 /// `<attribute ref="x:foo"/>` reference and once via a redefined
 /// `<attributeGroup ref="x:red"/>` whose members include a local
 /// `<attribute name="foo"/>`.
-pub fn validate_complex_type_attribute_uniqueness(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_complex_type_attribute_uniqueness(schema_set: &SchemaSet) -> SchemaResult<()> {
     use std::collections::{HashMap, HashSet};
 
     // Stable identity of an attribute declaration. Variants:
@@ -6337,7 +6587,13 @@ pub fn validate_complex_type_attribute_uniqueness(
             if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
                 if let Some(base) = schema_set.arenas.complex_types.get(base_key) {
                     collect_with_dedup(
-                        schema_set, base, base_key, depth + 1, visiting_groups, seen, out,
+                        schema_set,
+                        base,
+                        base_key,
+                        depth + 1,
+                        visiting_groups,
+                        seen,
+                        out,
                     );
                 }
             }
@@ -6382,13 +6638,13 @@ pub fn validate_complex_type_attribute_uniqueness(
         attrs.retain(|eau| eau.use_kind != AttributeUseKind::Prohibited);
 
         for attr in &attrs {
-            if by_name.insert((attr.target_namespace, attr.name), ()).is_some() {
+            if by_name
+                .insert((attr.target_namespace, attr.name), ())
+                .is_some()
+            {
                 let attr_name_str = schema_set.name_table.resolve(attr.name);
-                let type_name = format_type_name(
-                    schema_set,
-                    type_def.name,
-                    type_def.target_namespace,
-                );
+                let type_name =
+                    format_type_name(schema_set, type_def.name, type_def.target_namespace);
                 let location = type_def
                     .source
                     .as_ref()
@@ -6419,11 +6675,8 @@ pub fn validate_complex_type_attribute_uniqueness(
             if let (Some(first), Some(second)) = (id_attrs.next(), id_attrs.next()) {
                 let first_name = schema_set.name_table.resolve(first.name);
                 let second_name = schema_set.name_table.resolve(second.name);
-                let type_name = format_type_name(
-                    schema_set,
-                    type_def.name,
-                    type_def.target_namespace,
-                );
+                let type_name =
+                    format_type_name(schema_set, type_def.name, type_def.target_namespace);
                 let location = type_def
                     .source
                     .as_ref()
@@ -6472,15 +6725,18 @@ pub fn validate_wildcard_disallowed_names(schema_set: &SchemaSet) -> SchemaResul
         use crate::parser::frames::NotQNameItem;
 
         for item in &wc.not_qname {
-            let NotQNameItem::QName { namespace: q_ns, local_name } = item else {
+            let NotQNameItem::QName {
+                namespace: q_ns,
+                local_name,
+            } = item
+            else {
                 continue;
             };
             // The QName must satisfy the wildcard's namespace constraint
             // (cvc-wildcard-namespace §3.10.4.3): it must be admitted by
             // the positive constraint AND not be excluded by notNamespace.
-            let admitted_by_constraint = wildcard_namespace_matches(
-                &wc.namespace, *q_ns, target_ns,
-            );
+            let admitted_by_constraint =
+                wildcard_namespace_matches(&wc.namespace, *q_ns, target_ns);
             let excluded_by_not_namespace = wc
                 .not_namespace
                 .iter()
@@ -6493,10 +6749,7 @@ pub fn validate_wildcard_disallowed_names(schema_set: &SchemaSet) -> SchemaResul
                         schema_set.name_table.resolve_ref(*ns),
                         schema_set.name_table.resolve_ref(*local_name),
                     ),
-                    None => schema_set
-                        .name_table
-                        .resolve_ref(*local_name)
-                        .to_string(),
+                    None => schema_set.name_table.resolve_ref(*local_name).to_string(),
                 };
                 return Err(SchemaError::structural(
                     "w-props-correct",
@@ -6686,10 +6939,7 @@ pub fn validate_wildcard_element_type_table_consistency(
     /// QName via `schema_set.lookup_type` when the parser-frame copy hasn't
     /// been resolved yet (which is the case for local element alternatives
     /// allocated post-`resolve_all_references`).
-    fn alt_effective_type(
-        alt: &AlternativeResult,
-        schema_set: &SchemaSet,
-    ) -> Option<TypeKey> {
+    fn alt_effective_type(alt: &AlternativeResult, schema_set: &SchemaSet) -> Option<TypeKey> {
         use crate::parser::frames::TypeRefResult;
         if let Some(t) = alt.resolved_type {
             return Some(t);
@@ -6932,9 +7182,7 @@ fn alternatives_equivalent(
 /// with the same expanded QName in the same complex-type content model must
 /// have equivalent type tables (or both have no type table).
 #[cfg(feature = "xsd11")]
-pub fn validate_local_element_type_table_consistency(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_local_element_type_table_consistency(schema_set: &SchemaSet) -> SchemaResult<()> {
     use std::collections::HashMap;
 
     if !schema_set.is_xsd11() {
@@ -7098,15 +7346,14 @@ fn wildcard_result_admits_qname(
     if !wildcard_namespace_matches(&wc.namespace, ns, target_ns) {
         return false;
     }
-    if wc
-        .not_namespace
-        .iter()
-        .any(|t| t.resolve(target_ns) == ns)
-    {
+    if wc.not_namespace.iter().any(|t| t.resolve(target_ns) == ns) {
         return false;
     }
     !wc.not_qname.iter().any(|item| match item {
-        NotQNameItem::QName { namespace, local_name } => *namespace == ns && *local_name == name,
+        NotQNameItem::QName {
+            namespace,
+            local_name,
+        } => *namespace == ns && *local_name == name,
         NotQNameItem::Defined | NotQNameItem::DefinedSibling => true,
     })
 }
@@ -7128,9 +7375,7 @@ fn wildcard_result_admits_qname(
 /// The annotation source values are the only unambiguously-malformed
 /// anyURIs in the fixture, and they alone are sufficient to make the
 /// schema fail per the W3C "one or more invalid anyURIs" ruling.
-pub fn validate_xsd10_annotation_source_anyuri(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_xsd10_annotation_source_anyuri(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::schema::annotation::{Annotation, AnnotationItem};
     use crate::types::validators::is_strict_xsd10_anyuri;
 
@@ -7232,9 +7477,7 @@ pub fn validate_xsd10_annotation_source_anyuri(
 /// `schemaLocation`, `noNamespaceSchemaLocation`) are seeded into the
 /// attributes arena with `source: None`; that absence is the marker we use
 /// to skip them.
-pub fn validate_no_xsi_attribute_declarations(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_no_xsi_attribute_declarations(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::namespace::table::well_known;
 
     for (_key, attr) in schema_set.arenas.attributes.iter() {
@@ -7286,9 +7529,7 @@ pub fn validate_no_xsi_attribute_declarations(
 /// Closes saxon `target002` (element case) and `target004` (attribute case);
 /// `target001`/`target003` (the matching `valid` cases) keep passing because
 /// they use `restriction` of a non-`anyType` base.
-pub fn validate_local_decl_target_namespace(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_local_decl_target_namespace(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::parser::frames::{ComplexContentResult, ParticleResult, ParticleTerm};
 
     fn find_divergent_local_element<'a>(
@@ -7418,9 +7659,7 @@ pub fn validate_local_decl_target_namespace(
 /// global `n: xs:string` substitutes for `appendixContent`).
 ///
 /// Active for both XSD 1.0 and 1.1.
-pub fn validate_substitution_group_element_consistency(
-    schema_set: &SchemaSet,
-) -> SchemaResult<()> {
+pub fn validate_substitution_group_element_consistency(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::parser::frames::{ComplexContentResult, ParticleResult, ParticleTerm};
     use std::collections::HashMap;
 
@@ -7455,8 +7694,8 @@ pub fn validate_substitution_group_element_consistency(
                     *flat_idx += 1;
                     // The head itself contributes only when non-abstract;
                     // otherwise only its substitution members can appear.
-                    let Some(head_key) = schema_set
-                        .lookup_element(ref_qn.namespace, ref_qn.local_name)
+                    let Some(head_key) =
+                        schema_set.lookup_element(ref_qn.namespace, ref_qn.local_name)
                     else {
                         return;
                     };
@@ -7836,10 +8075,8 @@ fn validate_all_redefine_attribute_group_restrictions(
                 // be relaxed to (default, V), nor removed entirely. The W3C
                 // `schM10` fixture exercises the fixed→default relaxation.
                 if let Some(ref base_fixed) = ba.fixed_value {
-                    let derived_matches = da
-                        .fixed_value
-                        .as_ref()
-                        .is_some_and(|dv| dv == base_fixed);
+                    let derived_matches =
+                        da.fixed_value.as_ref().is_some_and(|dv| dv == base_fixed);
                     if !derived_matches {
                         let attr_name_str = schema_set.name_table.resolve(da.name).to_string();
                         errors.push(make_redefine_attr_group_restriction_error(
@@ -7978,7 +8215,10 @@ mod tests {
     use crate::parser::frames::ComplexContentResult;
     use crate::schema::model::DerivationSet;
 
-    fn create_simple_type_data(name: Option<NameId>, variety: SimpleTypeVariety) -> SimpleTypeDefData {
+    fn create_simple_type_data(
+        name: Option<NameId>,
+        variety: SimpleTypeVariety,
+    ) -> SimpleTypeDefData {
         SimpleTypeDefData {
             name,
             target_namespace: None,
@@ -8353,7 +8593,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8361,7 +8603,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Extension);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Suffix,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8385,7 +8629,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8393,7 +8639,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Extension);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8416,7 +8664,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8429,7 +8679,11 @@ mod tests {
         let mut stats = DerivationStats::default();
         let result = validate_complex_type(&schema_set, derived_key, &mut stats);
 
-        assert!(result.is_ok(), "derived inherits BOT per clause 6.1: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "derived inherits BOT per clause 6.1: {:?}",
+            result
+        );
     }
 
     #[cfg(feature = "xsd11")]
@@ -8447,7 +8701,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Extension);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8471,7 +8727,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Restriction);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8495,7 +8753,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8523,7 +8783,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Suffix,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8531,7 +8793,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Restriction);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8553,7 +8817,9 @@ mod tests {
 
         let mut base_data = create_complex_type_data(None);
         base_data.open_content = Some(make_open_content(
-            OpenContentMode::Interleave, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Interleave,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let base_key = schema_set.arenas.alloc_complex_type(base_data);
 
@@ -8561,7 +8827,9 @@ mod tests {
         derived_data.derivation_method = Some(DerivationMethod::Restriction);
         derived_data.resolved_base_type = Some(TypeKey::Complex(base_key));
         derived_data.open_content = Some(make_open_content(
-            OpenContentMode::Suffix, WildcardNamespace::Any, ProcessContents::Lax,
+            OpenContentMode::Suffix,
+            WildcardNamespace::Any,
+            ProcessContents::Lax,
         ));
         let derived_key = schema_set.arenas.alloc_complex_type(derived_data);
 
@@ -8589,10 +8857,15 @@ mod tests {
         let urn_a = schema_set.name_table.add("urn:a");
 
         let result = is_namespace_subset(
-            &WildcardNamespace::Local, None,
-            &WildcardNamespace::Other, Some(urn_a),
+            &WildcardNamespace::Local,
+            None,
+            &WildcardNamespace::Other,
+            Some(urn_a),
         );
-        assert!(!result, "##local must NOT be a subset of ##other (absent is excluded)");
+        assert!(
+            !result,
+            "##local must NOT be a subset of ##other (absent is excluded)"
+        );
     }
 
     #[cfg(feature = "xsd11")]
@@ -8607,10 +8880,15 @@ mod tests {
         let urn_a = schema_set.name_table.add("urn:a");
 
         let result = is_namespace_subset(
-            &WildcardNamespace::Other, None,
-            &WildcardNamespace::Other, Some(urn_a),
+            &WildcardNamespace::Other,
+            None,
+            &WildcardNamespace::Other,
+            Some(urn_a),
         );
-        assert!(!result, "##other(tns=None) must NOT be a subset of ##other(tns=urn:a)");
+        assert!(
+            !result,
+            "##other(tns=None) must NOT be a subset of ##other(tns=urn:a)"
+        );
     }
 
     #[cfg(feature = "xsd11")]
@@ -8625,10 +8903,15 @@ mod tests {
         let urn_a = schema_set.name_table.add("urn:a");
 
         let result = is_namespace_subset(
-            &WildcardNamespace::Other, Some(urn_a),
-            &WildcardNamespace::Other, None,
+            &WildcardNamespace::Other,
+            Some(urn_a),
+            &WildcardNamespace::Other,
+            None,
         );
-        assert!(result, "##other(tns=urn:a) MUST be a subset of ##other(tns=None)");
+        assert!(
+            result,
+            "##other(tns=urn:a) MUST be a subset of ##other(tns=None)"
+        );
     }
 
     #[cfg(feature = "xsd11")]
@@ -8649,7 +8932,10 @@ mod tests {
             &WildcardNamespace::Other,
             Some(urn_a),
         );
-        assert!(!result, "List containing base's target ns must NOT be a subset of ##other");
+        assert!(
+            !result,
+            "List containing base's target ns must NOT be a subset of ##other"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -9118,7 +9404,8 @@ mod tests {
             process_contents: ProcessContents::Strict,
         };
         assert!(
-            effective_attribute_wildcard_restricts(&schema_set, &derived, &base_undeclared).is_err(),
+            effective_attribute_wildcard_restricts(&schema_set, &derived, &base_undeclared)
+                .is_err(),
             "derived ##defined must NOT cover a base QName exclusion \
              when the attribute is not globally declared"
         );
@@ -9171,10 +9458,7 @@ mod tests {
         s2.insert(Some(ns_b));
         s2.insert(Some(ns_c));
 
-        let result = intersect_canonical_ns(
-            &CanonicalNs::Enum(s1),
-            &CanonicalNs::Enum(s2),
-        );
+        let result = intersect_canonical_ns(&CanonicalNs::Enum(s1), &CanonicalNs::Enum(s2));
         match result {
             CanonicalNs::Enum(set) => {
                 assert_eq!(set.len(), 1);
@@ -9196,10 +9480,7 @@ mod tests {
         let mut n = std::collections::HashSet::new();
         n.insert(Some(ns_b));
 
-        let result = intersect_canonical_ns(
-            &CanonicalNs::Enum(s),
-            &CanonicalNs::Not(n),
-        );
+        let result = intersect_canonical_ns(&CanonicalNs::Enum(s), &CanonicalNs::Not(n));
         match result {
             CanonicalNs::Enum(set) => {
                 assert_eq!(set.len(), 1);
@@ -9220,10 +9501,7 @@ mod tests {
         let mut n2 = std::collections::HashSet::new();
         n2.insert(Some(ns_b));
 
-        let result = intersect_canonical_ns(
-            &CanonicalNs::Not(n1),
-            &CanonicalNs::Not(n2),
-        );
+        let result = intersect_canonical_ns(&CanonicalNs::Not(n1), &CanonicalNs::Not(n2));
         match result {
             CanonicalNs::Not(set) => {
                 assert_eq!(set.len(), 2);
@@ -9249,11 +9527,20 @@ mod tests {
 
         // Anything ⊆ Any
         assert!(canonical_ns_subset(&CanonicalNs::Any, &CanonicalNs::Any));
-        assert!(canonical_ns_subset(&CanonicalNs::Enum(s_a.clone()), &CanonicalNs::Any));
-        assert!(canonical_ns_subset(&CanonicalNs::Not(s_a.clone()), &CanonicalNs::Any));
+        assert!(canonical_ns_subset(
+            &CanonicalNs::Enum(s_a.clone()),
+            &CanonicalNs::Any
+        ));
+        assert!(canonical_ns_subset(
+            &CanonicalNs::Not(s_a.clone()),
+            &CanonicalNs::Any
+        ));
 
         // Any ⊄ non-Any
-        assert!(!canonical_ns_subset(&CanonicalNs::Any, &CanonicalNs::Enum(s_a.clone())));
+        assert!(!canonical_ns_subset(
+            &CanonicalNs::Any,
+            &CanonicalNs::Enum(s_a.clone())
+        ));
 
         // Enum(s) ⊆ Enum(t) iff s ⊆ t
         assert!(canonical_ns_subset(
@@ -9358,13 +9645,8 @@ mod tests {
             annotation: None,
             source: None,
         };
-        let result = effective_attribute_wildcard(
-            &schema_set,
-            Some(&local),
-            None,
-            &[group_key],
-        )
-        .unwrap();
+        let result =
+            effective_attribute_wildcard(&schema_set, Some(&local), None, &[group_key]).unwrap();
         let eff = result.expect("expected Some");
         match eff.namespace {
             CanonicalNs::Enum(set) => {
@@ -9426,7 +9708,10 @@ mod tests {
             process_contents: ProcessContents::Strict,
         };
         assert!(effective_wildcard_allows_attribute(
-            &schema_set, &any_eff, Some(ns_a), name,
+            &schema_set,
+            &any_eff,
+            Some(ns_a),
+            name,
         ));
 
         let mut s = std::collections::HashSet::new();
@@ -9437,10 +9722,16 @@ mod tests {
             process_contents: ProcessContents::Strict,
         };
         assert!(effective_wildcard_allows_attribute(
-            &schema_set, &enum_eff, Some(ns_a), name,
+            &schema_set,
+            &enum_eff,
+            Some(ns_a),
+            name,
         ));
         assert!(!effective_wildcard_allows_attribute(
-            &schema_set, &enum_eff, None, name,
+            &schema_set,
+            &enum_eff,
+            None,
+            name,
         ));
     }
 
@@ -9467,8 +9758,14 @@ mod tests {
             process_contents: ProcessContents::Strict,
         };
 
-        assert!(effective_attribute_wildcard_restricts(&schema_set, &derived_narrow, &base_wide).is_ok());
-        assert!(effective_attribute_wildcard_restricts(&schema_set, &base_wide, &derived_narrow).is_err());
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &derived_narrow, &base_wide)
+                .is_ok()
+        );
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &base_wide, &derived_narrow)
+                .is_err()
+        );
     }
 
     #[test]
@@ -9485,9 +9782,13 @@ mod tests {
             process_contents: ProcessContents::Strict,
         };
         // Strict restricts Skip (tightening).
-        assert!(effective_attribute_wildcard_restricts(&schema_set, &strict_eff, &skip_eff).is_ok());
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &strict_eff, &skip_eff).is_ok()
+        );
         // Skip cannot restrict Strict (loosening).
-        assert!(effective_attribute_wildcard_restricts(&schema_set, &skip_eff, &strict_eff).is_err());
+        assert!(
+            effective_attribute_wildcard_restricts(&schema_set, &skip_eff, &strict_eff).is_err()
+        );
     }
 
     #[test]
@@ -9507,7 +9808,12 @@ mod tests {
         let base_ref = schema_set.arenas.complex_types.get(base_key).unwrap();
         let result = validate_attribute_restriction(&schema_set, derived_ref, base_ref);
         assert!(result.is_err());
-        if let Err(SchemaError::StructuralError { constraint, message, .. }) = result {
+        if let Err(SchemaError::StructuralError {
+            constraint,
+            message,
+            ..
+        }) = result
+        {
             assert_eq!(constraint, "derivation-ok-restriction");
             assert!(
                 message.contains("wildcard"),
@@ -9622,7 +9928,11 @@ mod tests {
             "expected a src-redefine.7.2.2 error for broader derived wildcard"
         );
         let msg = match &errors[0] {
-            SchemaError::StructuralError { constraint, message, .. } => {
+            SchemaError::StructuralError {
+                constraint,
+                message,
+                ..
+            } => {
                 assert_eq!(*constraint, "src-redefine.7.2.2");
                 message.clone()
             }

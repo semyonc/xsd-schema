@@ -5,30 +5,32 @@
 
 use crate::arenas::{ComplexTypeDefData, ModelGroupData};
 use crate::ids::ModelGroupKey;
-use crate::parser::frames::DerivationMethod;
 use crate::ids::{ElementKey, NameId, TypeKey};
+use crate::parser::frames::DerivationMethod;
 use crate::parser::frames::{
-    Compositor, ComplexContentResult, ElementFrameResult, ModelGroupDefResult, NamespaceToken,
-    NotQNameItem, OpenContentResult, ParticleResult, ParticleTerm,
-    ProcessContents, QNameRef, TypeRefResult, WildcardNamespace, WildcardResult,
+    ComplexContentResult, Compositor, ElementFrameResult, ModelGroupDefResult, NamespaceToken,
+    NotQNameItem, OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef,
+    TypeRefResult, WildcardNamespace, WildcardResult,
 };
 use crate::parser::location::SourceRef;
 use crate::schema::model::{DefaultOpenContent, XsdVersion};
 use crate::schema::wildcard::{ElementWildcard, NamespaceConstraint as SchemaNamespaceConstraint};
-use crate::schema::SchemaSet;
 #[cfg(test)]
 use crate::schema::FormChoice;
+use crate::schema::SchemaSet;
 use crate::types::complex::{
     NamespaceConstraint, OpenContent, OpenContentMode as TypesOpenContentMode,
     ProcessContents as TypesProcessContents, WildcardRef,
 };
 
-use super::all_group::{AllGroupModel, AllParticle, OpenContentWildcard, OpenContentMode as AllGroupOpenContentMode};
+use super::all_group::{
+    AllGroupModel, AllParticle, OpenContentMode as AllGroupOpenContentMode, OpenContentWildcard,
+};
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 use super::nfa::{NfaTable, NfaTerm};
-use super::ContentModelMatcher;
 use super::particle::{apply_occurs, MaxOccurs};
+use super::ContentModelMatcher;
 
 /// Maximum recursion depth for compiling nested groups
 const MAX_RECURSION_DEPTH: usize = 100;
@@ -142,11 +144,8 @@ impl<'a> CompileContext<'a> {
         let term_fragment = self.compile_term(&particle.term, particle.source.as_ref())?;
 
         // Apply occurrence constraints
-        let fragment = self.apply_occurrences(
-            term_fragment,
-            particle.min_occurs,
-            particle.max_occurs,
-        );
+        let fragment =
+            self.apply_occurrences(term_fragment, particle.min_occurs, particle.max_occurs);
 
         Ok(fragment)
     }
@@ -228,7 +227,10 @@ impl<'a> CompileContext<'a> {
         let resolved_type = if element_key.is_none() {
             // First: check context for resolved type
             let type_from_context = if let Some(flat_idx) = current_flat_idx {
-                self.resolved_particle_types.get(flat_idx).copied().flatten()
+                self.resolved_particle_types
+                    .get(flat_idx)
+                    .copied()
+                    .flatten()
             } else {
                 self.current_particle_idx
                     .and_then(|idx| self.resolved_particle_types.get(idx).copied().flatten())
@@ -239,7 +241,12 @@ impl<'a> CompileContext<'a> {
             None // Elements with key get type from element declaration via arena
         };
 
-        Ok(NfaTerm::element_with_type(name, namespace, element_key, resolved_type))
+        Ok(NfaTerm::element_with_type(
+            name,
+            namespace,
+            element_key,
+            resolved_type,
+        ))
     }
 
     /// Compile an element to a fragment
@@ -255,14 +262,13 @@ impl<'a> CompileContext<'a> {
     /// Resolve a local element's QName type reference to a TypeKey
     fn resolve_element_type_ref(&self, elem: &ElementFrameResult) -> Option<TypeKey> {
         match &elem.type_ref {
-            Some(TypeRefResult::QName(qname)) => {
-                self.schema_set
-                    .lookup_type(qname.namespace, qname.local_name)
-                    .or_else(|| {
-                        self.schema_set
-                            .get_built_in_type_by_qname(qname.namespace, qname.local_name)
-                    })
-            }
+            Some(TypeRefResult::QName(qname)) => self
+                .schema_set
+                .lookup_type(qname.namespace, qname.local_name)
+                .or_else(|| {
+                    self.schema_set
+                        .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                }),
             _ => None, // Inline types not resolved at compile time
         }
     }
@@ -284,20 +290,21 @@ impl<'a> CompileContext<'a> {
         // Expand notQName items — use current_sibling_elements for ##definedSibling
         let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
 
-        let nfa_term = NfaTerm::wildcard_with_not_qnames(namespace_constraint, process_contents, not_qnames);
+        let nfa_term =
+            NfaTerm::wildcard_with_not_qnames(namespace_constraint, process_contents, not_qnames);
         Ok(self.builder.single_term(nfa_term, source.cloned()))
     }
 
     /// Expand NotQNameItems into concrete (namespace, local_name) pairs.
     /// Uses `self.current_sibling_elements` for ##definedSibling expansion.
-    fn expand_not_qnames(
-        &self,
-        items: &[NotQNameItem],
-    ) -> Vec<(Option<NameId>, NameId)> {
+    fn expand_not_qnames(&self, items: &[NotQNameItem]) -> Vec<(Option<NameId>, NameId)> {
         let mut result = Vec::new();
         for item in items {
             match item {
-                NotQNameItem::QName { namespace, local_name } => {
+                NotQNameItem::QName {
+                    namespace,
+                    local_name,
+                } => {
                     result.push((*namespace, *local_name));
                 }
                 NotQNameItem::Defined => {
@@ -362,10 +369,7 @@ impl<'a> CompileContext<'a> {
 
         // Set sibling elements for ##definedSibling expansion in wildcards
         let new_siblings = self.collect_sibling_element_qnames(particles);
-        let saved_siblings = std::mem::replace(
-            &mut self.current_sibling_elements,
-            new_siblings,
-        );
+        let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         let mut result = self.compile_particle_with_index(&particles[0], 0)?;
         for (i, particle) in particles[1..].iter().enumerate() {
@@ -385,10 +389,7 @@ impl<'a> CompileContext<'a> {
 
         // Set sibling elements for ##definedSibling expansion in wildcards
         let new_siblings = self.collect_sibling_element_qnames(particles);
-        let saved_siblings = std::mem::replace(
-            &mut self.current_sibling_elements,
-            new_siblings,
-        );
+        let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         let mut result = self.compile_particle_with_index(&particles[0], 0)?;
         for (i, particle) in particles[1..].iter().enumerate() {
@@ -455,10 +456,7 @@ impl<'a> CompileContext<'a> {
     ) -> NfaCompileResult<AllGroupModel> {
         // Set sibling elements for ##definedSibling expansion in wildcards
         let new_siblings = self.collect_sibling_element_qnames(particles);
-        let saved_siblings = std::mem::replace(
-            &mut self.current_sibling_elements,
-            new_siblings,
-        );
+        let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
         let mut all_particles = Vec::with_capacity(particles.len());
 
@@ -548,22 +546,23 @@ impl<'a> CompileContext<'a> {
         self.check_recursion(source)?;
         self.depth += 1;
 
-        let ref_name = group.ref_name.as_ref().expect("caller checked ref_name is Some");
+        let ref_name = group
+            .ref_name
+            .as_ref()
+            .expect("caller checked ref_name is Some");
 
         // Resolve the group ref (redefine-aware)
-        let group_key = self
-            .resolve_model_group_key(ref_name)
-            .ok_or_else(|| {
-                let name = format!(
-                    "{}:{}",
-                    ref_name
-                        .namespace
-                        .map(|n| format!("{:?}", n))
-                        .unwrap_or_default(),
-                    ref_name.local_name.0
-                );
-                NfaCompileError::unresolved_group(name, source.cloned())
-            })?;
+        let group_key = self.resolve_model_group_key(ref_name).ok_or_else(|| {
+            let name = format!(
+                "{}:{}",
+                ref_name
+                    .namespace
+                    .map(|n| format!("{:?}", n))
+                    .unwrap_or_default(),
+                ref_name.local_name.0
+            );
+            NfaCompileError::unresolved_group(name, source.cloned())
+        })?;
 
         let group_data = self
             .schema_set
@@ -596,11 +595,7 @@ impl<'a> CompileContext<'a> {
         self.content_flat_idx = Some(0);
 
         // Compile each inner particle
-        let result = self.flatten_all_group_particles(
-            &group_data.particles,
-            source,
-            all_particles,
-        );
+        let result = self.flatten_all_group_particles(&group_data.particles, source, all_particles);
 
         // Restore context
         self.content_flat_idx = saved_flat_idx;
@@ -682,19 +677,17 @@ impl<'a> CompileContext<'a> {
         self.depth += 1;
 
         // Look up the referenced group (redefine-aware)
-        let group_key = self
-            .resolve_model_group_key(ref_name)
-            .ok_or_else(|| {
-                let name = format!(
-                    "{}:{}",
-                    ref_name
-                        .namespace
-                        .map(|n| format!("{:?}", n))
-                        .unwrap_or_default(),
-                    ref_name.local_name.0
-                );
-                NfaCompileError::unresolved_group(name, source.cloned())
-            })?;
+        let group_key = self.resolve_model_group_key(ref_name).ok_or_else(|| {
+            let name = format!(
+                "{}:{}",
+                ref_name
+                    .namespace
+                    .map(|n| format!("{:?}", n))
+                    .unwrap_or_default(),
+                ref_name.local_name.0
+            );
+            NfaCompileError::unresolved_group(name, source.cloned())
+        })?;
 
         // Get the group data from arenas
         let group_data = self
@@ -808,21 +801,25 @@ impl<'a> CompileContext<'a> {
             WildcardNamespace::Other => NamespaceConstraint::Other,
             WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
             WildcardNamespace::Local => NamespaceConstraint::Local,
-            WildcardNamespace::List(list) => {
-                NamespaceConstraint::List(
-                    list.iter().map(|t| t.resolve(self.target_namespace)).collect()
-                )
-            }
+            WildcardNamespace::List(list) => NamespaceConstraint::List(
+                list.iter()
+                    .map(|t| t.resolve(self.target_namespace))
+                    .collect(),
+            ),
         }
     }
 
     /// Convert WildcardResult's not_namespace to NamespaceConstraint::Not if non-empty.
     /// Returns None if not_namespace is empty (no override).
-    fn convert_not_namespace(&self, not_namespace: &[NamespaceToken]) -> Option<NamespaceConstraint> {
+    fn convert_not_namespace(
+        &self,
+        not_namespace: &[NamespaceToken],
+    ) -> Option<NamespaceConstraint> {
         if not_namespace.is_empty() {
             return None;
         }
-        let excluded: Vec<Option<NameId>> = not_namespace.iter()
+        let excluded: Vec<Option<NameId>> = not_namespace
+            .iter()
             .map(|t| t.resolve(self.target_namespace))
             .collect();
         Some(NamespaceConstraint::Not(excluded))
@@ -854,7 +851,10 @@ impl<'a> CompileContext<'a> {
     /// namespace resolution (element refs, form attribute, elementFormDefault).
     /// Used for ##definedSibling expansion. Recurses into group refs to
     /// include elements from referenced groups.
-    fn collect_sibling_element_qnames(&self, particles: &[ParticleResult]) -> Vec<(Option<NameId>, NameId)> {
+    fn collect_sibling_element_qnames(
+        &self,
+        particles: &[ParticleResult],
+    ) -> Vec<(Option<NameId>, NameId)> {
         self.collect_sibling_element_qnames_inner(particles, 0)
     }
 
@@ -883,11 +883,7 @@ impl<'a> CompileContext<'a> {
                             .schema_set
                             .lookup_element(ref_name.namespace, ref_name.local_name)
                         {
-                            collect_substitution_members(
-                                self.schema_set,
-                                head_key,
-                                &mut result,
-                            );
+                            collect_substitution_members(self.schema_set, head_key, &mut result);
                         }
                     } else if let Some(name) = elem.name {
                         // Local element — resolve namespace through form/elementFormDefault
@@ -900,12 +896,10 @@ impl<'a> CompileContext<'a> {
                     if let Some(ref_name) = &group.ref_name {
                         if let Some(key) = self.resolve_model_group_key(ref_name) {
                             if let Some(data) = self.schema_set.arenas.get_model_group(key) {
-                                result.extend(
-                                    self.collect_sibling_element_qnames_inner(
-                                        &data.particles,
-                                        depth + 1,
-                                    ),
-                                );
+                                result.extend(self.collect_sibling_element_qnames_inner(
+                                    &data.particles,
+                                    depth + 1,
+                                ));
                             }
                         }
                     }
@@ -1004,7 +998,9 @@ pub fn compile_model_group(
 /// Returns the all-group's particles and source if the particle's term is a
 /// group with `compositor == All` and no `ref_name` (i.e., an inline definition,
 /// not a named model group reference).
-pub(crate) fn is_top_level_all_group(particle: &ParticleResult) -> Option<(&[ParticleResult], Option<&SourceRef>)> {
+pub(crate) fn is_top_level_all_group(
+    particle: &ParticleResult,
+) -> Option<(&[ParticleResult], Option<&SourceRef>)> {
     if let ParticleTerm::Group(group) = &particle.term {
         if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
             return Some((&group.particles, group.source.as_ref()));
@@ -1172,7 +1168,10 @@ fn compile_content_model_matcher_impl(
     } else {
         CompileContext::new(schema_set, target_namespace)
     };
-    let is_extension = matches!(type_def.derivation_method, Some(DerivationMethod::Extension));
+    let is_extension = matches!(
+        type_def.derivation_method,
+        Some(DerivationMethod::Extension)
+    );
 
     // Try the all-group path for non-extension types with an inline xs:all
     if !is_extension {
@@ -1180,8 +1179,7 @@ fn compile_content_model_matcher_impl(
             if let Some(particle) = &def.particle {
                 if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
                     validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
-                    ctx.resolved_particle_types =
-                        type_def.resolved_content_particle_types.to_vec();
+                    ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
                     ctx.resolved_particle_elements =
                         type_def.resolved_content_particle_elements.to_vec();
                     ctx.content_flat_idx = Some(0);
@@ -1330,8 +1328,7 @@ fn compile_content_model_matcher_impl(
     let own_nfa = match &type_def.content {
         ComplexContentResult::Complex(def) => match &def.particle {
             Some(particle) => {
-                ctx.resolved_particle_types =
-                    type_def.resolved_content_particle_types.to_vec();
+                ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
                 ctx.resolved_particle_elements =
                     type_def.resolved_content_particle_elements.to_vec();
                 ctx.content_flat_idx = Some(0);
@@ -1353,13 +1350,26 @@ fn compile_content_model_matcher_impl(
         if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
             let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
             #[cfg(feature = "xsd11")]
-            { base_target_ns = base_type_def.target_namespace; }
-            let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
+            {
+                base_target_ns = base_type_def.target_namespace;
+            }
+            let base_matcher =
+                compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
             match base_matcher {
                 ContentModelMatcher::Nfa(nfa) => Some(nfa),
-                ContentModelMatcher::WithOpenContent { nfa, mode, wildcard } => {
+                ContentModelMatcher::WithOpenContent {
+                    nfa,
+                    mode,
+                    wildcard,
+                } => {
                     #[cfg(feature = "xsd11")]
-                    { inherited_oc = Some(OpenContent { mode, wildcard, source: None }); }
+                    {
+                        inherited_oc = Some(OpenContent {
+                            mode,
+                            wildcard,
+                            source: None,
+                        });
+                    }
                     #[cfg(not(feature = "xsd11"))]
                     let _ = (mode, wildcard);
                     Some(nfa)
@@ -1454,14 +1464,21 @@ fn effective_open_content_for_extension(
             };
             let derived_target_ns = type_def.target_namespace;
             let unioned_wildcard = match (own.wildcard.as_ref(), base_oc.wildcard.as_ref()) {
-                (Some(own_wc), Some(base_wc)) => {
-                    Some(wildcard_ref_union(base_wc, base_target_ns, own_wc, derived_target_ns))
-                }
+                (Some(own_wc), Some(base_wc)) => Some(wildcard_ref_union(
+                    base_wc,
+                    base_target_ns,
+                    own_wc,
+                    derived_target_ns,
+                )),
                 (Some(own_wc), None) => Some(own_wc.clone()),
                 (None, Some(base_wc)) => Some(base_wc.clone()),
                 (None, None) => None,
             };
-            Some(OpenContent { mode: own.mode, wildcard: unioned_wildcard, source: own.source })
+            Some(OpenContent {
+                mode: own.mode,
+                wildcard: unioned_wildcard,
+                source: own.source,
+            })
         }
     }
 }
@@ -1500,7 +1517,10 @@ fn wildcard_ref_union(
 
 /// Expand token-form namespace constraints (Other/TargetNamespace/Local) to explicit sets.
 #[cfg(feature = "xsd11")]
-fn expand_ns_constraint(nc: &NamespaceConstraint, target_ns: Option<NameId>) -> NamespaceConstraint {
+fn expand_ns_constraint(
+    nc: &NamespaceConstraint,
+    target_ns: Option<NameId>,
+) -> NamespaceConstraint {
     match nc {
         NamespaceConstraint::Other => NamespaceConstraint::Not(vec![target_ns, None]),
         NamespaceConstraint::TargetNamespace => NamespaceConstraint::List(vec![target_ns]),
@@ -1511,7 +1531,10 @@ fn expand_ns_constraint(nc: &NamespaceConstraint, target_ns: Option<NameId>) -> 
 
 /// §3.10.6.3 set union. Callers must pre-expand token forms via `expand_ns_constraint`.
 #[cfg(feature = "xsd11")]
-fn namespace_constraint_union(c1: NamespaceConstraint, c2: NamespaceConstraint) -> NamespaceConstraint {
+fn namespace_constraint_union(
+    c1: NamespaceConstraint,
+    c2: NamespaceConstraint,
+) -> NamespaceConstraint {
     match (c1, c2) {
         // Any ∪ X = Any
         (NamespaceConstraint::Any, _) | (_, NamespaceConstraint::Any) => NamespaceConstraint::Any,
@@ -1544,10 +1567,18 @@ fn namespace_constraint_union(c1: NamespaceConstraint, c2: NamespaceConstraint) 
             NamespaceConstraint::List(a)
         }
         // Token forms should be pre-expanded; widen to Any defensively.
-        (NamespaceConstraint::Other | NamespaceConstraint::TargetNamespace | NamespaceConstraint::Local, _)
-        | (_, NamespaceConstraint::Other | NamespaceConstraint::TargetNamespace | NamespaceConstraint::Local) => {
-            NamespaceConstraint::Any
-        }
+        (
+            NamespaceConstraint::Other
+            | NamespaceConstraint::TargetNamespace
+            | NamespaceConstraint::Local,
+            _,
+        )
+        | (
+            _,
+            NamespaceConstraint::Other
+            | NamespaceConstraint::TargetNamespace
+            | NamespaceConstraint::Local,
+        ) => NamespaceConstraint::Any,
     }
 }
 
@@ -1558,8 +1589,12 @@ fn less_restrictive_process_contents(
     b: TypesProcessContents,
 ) -> TypesProcessContents {
     match (a, b) {
-        (TypesProcessContents::Skip, _) | (_, TypesProcessContents::Skip) => TypesProcessContents::Skip,
-        (TypesProcessContents::Lax, _) | (_, TypesProcessContents::Lax) => TypesProcessContents::Lax,
+        (TypesProcessContents::Skip, _) | (_, TypesProcessContents::Skip) => {
+            TypesProcessContents::Skip
+        }
+        (TypesProcessContents::Lax, _) | (_, TypesProcessContents::Lax) => {
+            TypesProcessContents::Lax
+        }
         _ => TypesProcessContents::Strict,
     }
 }
@@ -1583,7 +1618,8 @@ fn attach_open_content(
         ContentModelMatcher::Nfa(nfa) => {
             let wildcard = open_content.wildcard.map(|mut w| {
                 if w.has_defined_sibling {
-                    w.not_qnames.extend(collect_nfa_element_qnames(schema_set, &nfa));
+                    w.not_qnames
+                        .extend(collect_nfa_element_qnames(schema_set, &nfa));
                     w.has_defined_sibling = false;
                 }
                 w
@@ -1597,7 +1633,9 @@ fn attach_open_content(
         ContentModelMatcher::AllGroup(mut model) => {
             if let Some(mut wildcard_ref) = open_content.wildcard {
                 if wildcard_ref.has_defined_sibling {
-                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(schema_set, &model));
+                    wildcard_ref
+                        .not_qnames
+                        .extend(collect_all_group_element_qnames(schema_set, &model));
                     wildcard_ref.has_defined_sibling = false;
                 }
                 let mode = match open_content.mode {
@@ -1615,12 +1653,19 @@ fn attach_open_content(
             ContentModelMatcher::AllGroup(model)
         }
         #[cfg(feature = "xsd11")]
-        ContentModelMatcher::AllGroupExtension { mut base_model, extension_nfa } => {
+        ContentModelMatcher::AllGroupExtension {
+            mut base_model,
+            extension_nfa,
+        } => {
             if let Some(mut wildcard_ref) = open_content.wildcard {
                 if wildcard_ref.has_defined_sibling {
                     // Collect siblings from both the base all-group and extension NFA
-                    wildcard_ref.not_qnames.extend(collect_all_group_element_qnames(schema_set, &base_model));
-                    wildcard_ref.not_qnames.extend(collect_nfa_element_qnames(schema_set, &extension_nfa));
+                    wildcard_ref
+                        .not_qnames
+                        .extend(collect_all_group_element_qnames(schema_set, &base_model));
+                    wildcard_ref
+                        .not_qnames
+                        .extend(collect_nfa_element_qnames(schema_set, &extension_nfa));
                     wildcard_ref.has_defined_sibling = false;
                 }
                 let mode = match open_content.mode {
@@ -1635,7 +1680,10 @@ fn attach_open_content(
                     not_qnames: wildcard_ref.not_qnames,
                 });
             }
-            ContentModelMatcher::AllGroupExtension { base_model, extension_nfa }
+            ContentModelMatcher::AllGroupExtension {
+                base_model,
+                extension_nfa,
+            }
         }
         other => other,
     }
@@ -1658,7 +1706,10 @@ fn resolve_open_content(
         return open_content_from_result(explicit, schema_set, target_namespace);
     }
 
-    if !matches!(content, ComplexContentResult::Complex(_) | ComplexContentResult::Empty) {
+    if !matches!(
+        content,
+        ComplexContentResult::Complex(_) | ComplexContentResult::Empty
+    ) {
         return None;
     }
 
@@ -1696,7 +1747,10 @@ fn open_content_from_result(
 
     Some(OpenContent {
         mode,
-        wildcard: result.wildcard.as_ref().map(|w| wildcard_ref_from_result(w, schema_set, target_namespace)),
+        wildcard: result
+            .wildcard
+            .as_ref()
+            .map(|w| wildcard_ref_from_result(w, schema_set, target_namespace)),
         source: result.source.clone(),
     })
 }
@@ -1712,17 +1766,20 @@ fn open_content_from_default(
 
     Some(OpenContent {
         mode,
-        wildcard: default.wildcard.as_ref().map(|w| wildcard_ref_from_default(w, schema_set)),
+        wildcard: default
+            .wildcard
+            .as_ref()
+            .map(|w| wildcard_ref_from_default(w, schema_set)),
         source: default.source.clone(),
     })
 }
 
 /// Expand all globally declared element QNames from the schema set.
 fn expand_defined_element_qnames(schema_set: &SchemaSet) -> Vec<(Option<NameId>, NameId)> {
-    schema_set.namespaces.iter()
-        .flat_map(|(ns, table)| {
-            table.elements.keys().map(move |name| (*ns, *name))
-        })
+    schema_set
+        .namespaces
+        .iter()
+        .flat_map(|(ns, table)| table.elements.keys().map(move |name| (*ns, *name)))
         .collect()
 }
 
@@ -1734,7 +1791,13 @@ fn collect_nfa_element_qnames(
 ) -> Vec<(Option<NameId>, NameId)> {
     let mut result = Vec::new();
     for state in &nfa.states {
-        if let Some(NfaTerm::Element { namespace, name, element_key, .. }) = &state.term {
+        if let Some(NfaTerm::Element {
+            namespace,
+            name,
+            element_key,
+            ..
+        }) = &state.term
+        {
             let qname = (*namespace, *name);
             if !result.contains(&qname) {
                 result.push(qname);
@@ -1755,7 +1818,13 @@ fn collect_all_group_element_qnames(
 ) -> Vec<(Option<NameId>, NameId)> {
     let mut result = Vec::new();
     for particle in &model.particles {
-        if let NfaTerm::Element { namespace, name, element_key, .. } = &particle.term {
+        if let NfaTerm::Element {
+            namespace,
+            name,
+            element_key,
+            ..
+        } = &particle.term
+        {
             let qname = (*namespace, *name);
             if !result.contains(&qname) {
                 result.push(qname);
@@ -1779,15 +1848,15 @@ fn wildcard_ref_from_result(
         WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
         WildcardNamespace::Local => NamespaceConstraint::Local,
         WildcardNamespace::List(list) => {
-            NamespaceConstraint::List(
-                list.iter().map(|t| t.resolve(target_namespace)).collect()
-            )
+            NamespaceConstraint::List(list.iter().map(|t| t.resolve(target_namespace)).collect())
         }
     };
 
     // Override with notNamespace if present
     if !wildcard.not_namespace.is_empty() {
-        let excluded: Vec<Option<NameId>> = wildcard.not_namespace.iter()
+        let excluded: Vec<Option<NameId>> = wildcard
+            .not_namespace
+            .iter()
             .map(|t| t.resolve(target_namespace))
             .collect();
         namespace_constraint = NamespaceConstraint::Not(excluded);
@@ -1798,7 +1867,10 @@ fn wildcard_ref_from_result(
     let mut has_defined_sibling = false;
     for item in &wildcard.not_qname {
         match item {
-            NotQNameItem::QName { namespace, local_name } => {
+            NotQNameItem::QName {
+                namespace,
+                local_name,
+            } => {
                 not_qnames.push((*namespace, *local_name));
             }
             NotQNameItem::Defined => {
@@ -1827,10 +1899,7 @@ fn wildcard_ref_from_result(
     }
 }
 
-fn wildcard_ref_from_default(
-    wildcard: &ElementWildcard,
-    schema_set: &SchemaSet,
-) -> WildcardRef {
+fn wildcard_ref_from_default(wildcard: &ElementWildcard, schema_set: &SchemaSet) -> WildcardRef {
     let namespace_constraint = match &wildcard.namespace_constraint {
         SchemaNamespaceConstraint::Any => NamespaceConstraint::Any,
         SchemaNamespaceConstraint::Other => NamespaceConstraint::Other,
@@ -1843,7 +1912,10 @@ fn wildcard_ref_from_default(
     let mut has_defined_sibling = false;
     for item in &wildcard.not_qnames {
         match item {
-            crate::schema::wildcard::QNameDisallowed::QName { namespace, local_name } => {
+            crate::schema::wildcard::QNameDisallowed::QName {
+                namespace,
+                local_name,
+            } => {
                 not_qnames.push((*namespace, *local_name));
             }
             crate::schema::wildcard::QNameDisallowed::Defined => {

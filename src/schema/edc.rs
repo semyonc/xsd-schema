@@ -71,9 +71,8 @@ pub fn check_dynamic_edc(
         let Some(local_type) = resolved_type else {
             return EdcOutcome::Subsumes;
         };
-        let gov_type = governing_type.or_else(|| {
-            governing_decl.and_then(|k| schema_set.arenas.elements[k].resolved_type)
-        });
+        let gov_type = governing_type
+            .or_else(|| governing_decl.and_then(|k| schema_set.arenas.elements[k].resolved_type));
         let Some(gov_type) = gov_type else {
             return EdcOutcome::Subsumes;
         };
@@ -174,10 +173,11 @@ fn walk_particle(
             let Some(binding_key) = key else { return };
 
             // Insert if absent: derived bindings shadow base bindings.
-            out.entry((qname_ns, qname_local)).or_insert(DefaultBinding::Element {
-                key: binding_key,
-                resolved_type,
-            });
+            out.entry((qname_ns, qname_local))
+                .or_insert(DefaultBinding::Element {
+                    key: binding_key,
+                    resolved_type,
+                });
 
             // Substitution-group members: their own QName resolves to the
             // head's binding (head's resolved_type).
@@ -187,10 +187,11 @@ fn walk_particle(
                         if (member_ns, member_name) == (qname_ns, qname_local) {
                             continue;
                         }
-                        out.entry((member_ns, member_name)).or_insert(DefaultBinding::Element {
-                            key: binding_key,
-                            resolved_type,
-                        });
+                        out.entry((member_ns, member_name))
+                            .or_insert(DefaultBinding::Element {
+                                key: binding_key,
+                                resolved_type,
+                            });
                     }
                 }
             }

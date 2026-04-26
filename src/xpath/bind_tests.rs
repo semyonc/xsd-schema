@@ -56,7 +56,10 @@ fn test_bind_function_call_default_ns() {
 
     // Verify the function call has function_handle set
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::Concat)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::Concat))
+        );
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -76,7 +79,10 @@ fn test_bind_true_false() {
     bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
 
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::True)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::True))
+        );
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -89,7 +95,10 @@ fn test_bind_true_false() {
     bind_node(&mut arena, root, &ctx, &mut binder).expect("bind failed");
 
     if let AstNode::FunctionCall(func) = arena.get(func_id) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::False)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::False))
+        );
     } else {
         panic!("Expected FunctionCall node");
     }
@@ -150,12 +159,18 @@ fn test_bind_nested_function() {
 
     // The outer function should be upper-case
     if let AstNode::FunctionCall(func) = arena.get(outer_func) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::UpperCase)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::UpperCase))
+        );
     }
 
     // The inner function should be concat
     if let AstNode::FunctionCall(func) = arena.get(inner_func) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::Concat)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::Concat))
+        );
     }
 }
 
@@ -181,7 +196,10 @@ fn test_bind_if_expression() {
 
     // Verify the condition function was bound
     if let AstNode::FunctionCall(func) = arena.get(test_func) {
-        assert_eq!(func.function_handle, Some(FunctionHandle::from(FunctionId::True)));
+        assert_eq!(
+            func.function_handle,
+            Some(FunctionHandle::from(FunctionId::True))
+        );
     }
 }
 
@@ -205,8 +223,7 @@ fn test_bind_literal() {
 
 /// Helper to parse, bind, and evaluate an XPath expression without context item
 fn eval_xpath(expr: &str) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
-    let mut parsed =
-        parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
+    let mut parsed = parser::parse(expr).map_err(|e| XPathError::syntax_error(e.to_string()))?;
 
     let names = NameTable::new();
     let ctx = XPathContext::new(&names);
@@ -229,7 +246,10 @@ fn test_parse_bind_eval_concat() {
 #[test]
 fn test_parse_bind_eval_string_length() {
     let result = eval_xpath("string-length('hello')").unwrap();
-    assert_eq!(result.as_integer().map(|i| i.to_string()), Some("5".to_string()));
+    assert_eq!(
+        result.as_integer().map(|i| i.to_string()),
+        Some("5".to_string())
+    );
 }
 
 #[test]
@@ -264,7 +284,10 @@ fn test_parse_bind_eval_sequence_functions() {
     assert_eq!(eval_xpath("empty(())").unwrap().as_bool(), Some(true));
     assert_eq!(eval_xpath("exists(1)").unwrap().as_bool(), Some(true));
     assert_eq!(
-        eval_xpath("count((1, 2, 3))").unwrap().as_integer().map(|i| i.to_string()),
+        eval_xpath("count((1, 2, 3))")
+            .unwrap()
+            .as_integer()
+            .map(|i| i.to_string()),
         Some("3".to_string())
     );
 }
@@ -278,7 +301,10 @@ fn test_arithmetic_precedence() {
     // Multiplication has higher precedence than addition
     let result = eval_xpath("1 + 2 * 3").unwrap();
     // Should be 7 (1 + (2*3)), not 9 ((1+2)*3)
-    assert_eq!(result.as_integer().map(|i| i.to_string()), Some("7".to_string()));
+    assert_eq!(
+        result.as_integer().map(|i| i.to_string()),
+        Some("7".to_string())
+    );
 }
 
 #[test]
@@ -287,9 +313,18 @@ fn test_for_expression() {
     // Result should be sequence (2, 4, 6)
     if let XPathValue::Sequence(seq) = result {
         assert_eq!(seq.len(), 3);
-        assert_eq!(seq[0].as_integer().map(|i| i.to_string()), Some("2".to_string()));
-        assert_eq!(seq[1].as_integer().map(|i| i.to_string()), Some("4".to_string()));
-        assert_eq!(seq[2].as_integer().map(|i| i.to_string()), Some("6".to_string()));
+        assert_eq!(
+            seq[0].as_integer().map(|i| i.to_string()),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            seq[1].as_integer().map(|i| i.to_string()),
+            Some("4".to_string())
+        );
+        assert_eq!(
+            seq[2].as_integer().map(|i| i.to_string()),
+            Some("6".to_string())
+        );
     } else {
         panic!("Expected sequence result");
     }

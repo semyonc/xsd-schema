@@ -121,8 +121,10 @@ pub(crate) fn evaluate_type_alternatives(
             ns_strings.push((String::new(), uri));
         }
     }
-    let ns_decls: Vec<(&str, &str)> =
-        ns_strings.iter().map(|(p, u)| (p.as_str(), u.as_str())).collect();
+    let ns_decls: Vec<(&str, &str)> = ns_strings
+        .iter()
+        .map(|(p, u)| (p.as_str(), u.as_str()))
+        .collect();
 
     // Start element
     let local_str = schema_set.name_table.resolve(elem_local_name);
@@ -271,7 +273,8 @@ mod tests {
         );
         let elem_key = find_elem_key(&schema_set, "root");
         let local_name = schema_set.name_table.add("root");
-        let result = evaluate_type_alternatives(elem_key, local_name, None, &[], None, None, &schema_set);
+        let result =
+            evaluate_type_alternatives(elem_key, local_name, None, &[], None, None, &schema_set);
         assert!(result.is_none());
     }
 
@@ -354,7 +357,15 @@ mod tests {
 
         // kind='A' -> typeA
         let attrs_a = vec![(None, kind_name, "A".to_string())];
-        let result_a = evaluate_type_alternatives(elem_key, local_name, None, &attrs_a, None, None, &schema_set);
+        let result_a = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_a,
+            None,
+            None,
+            &schema_set,
+        );
         let type_a = find_type_key(&schema_set, "typeA");
         assert_eq!(result_a, Some(type_a));
 
@@ -363,7 +374,9 @@ mod tests {
         // and is suspected of breaking attribute-value comparison in CTA.
         let mut snapshot = NamespaceContextSnapshot::default();
         let xml_prefix = schema_set.name_table.add("xml");
-        let xml_uri = schema_set.name_table.add("http://www.w3.org/XML/1998/namespace");
+        let xml_uri = schema_set
+            .name_table
+            .add("http://www.w3.org/XML/1998/namespace");
         snapshot.bindings.push((xml_prefix, xml_uri));
         let result_a_with_ns = evaluate_type_alternatives(
             elem_key,
@@ -401,18 +414,50 @@ mod tests {
 
         // Three sequential calls (mirroring three polygons in typeAlternatives_001_2)
         let attrs_a2 = vec![(None, kind_name, "A".to_string())];
-        let r1 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_a2, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        let r1 = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_a2,
+            Some(&snapshot),
+            Some("file:///x.xml"),
+            &schema_set,
+        );
         let attrs_b2 = vec![(None, kind_name, "B".to_string())];
-        let r2 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_b2, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        let r2 = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_b2,
+            Some(&snapshot),
+            Some("file:///x.xml"),
+            &schema_set,
+        );
         let attrs_x = vec![(None, kind_name, "X".to_string())];
-        let r3 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_x, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        let r3 = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_x,
+            Some(&snapshot),
+            Some("file:///x.xml"),
+            &schema_set,
+        );
         assert_eq!(r1, Some(type_a), "first sequential CTA: expected typeA");
         assert_eq!(r2, Some(type_b), "second sequential CTA: expected typeB");
         assert_eq!(r3, None, "third sequential CTA: expected no match");
 
         // kind='B' -> typeB
         let attrs_b = vec![(None, kind_name, "B".to_string())];
-        let result_b = evaluate_type_alternatives(elem_key, local_name, None, &attrs_b, None, None, &schema_set);
+        let result_b = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_b,
+            None,
+            None,
+            &schema_set,
+        );
         let type_b = find_type_key(&schema_set, "typeB");
         assert_eq!(result_b, Some(type_b));
     }
@@ -443,7 +488,8 @@ mod tests {
 
         // kind='X' -> no match, no default -> None
         let attrs = vec![(None, kind_name, "X".to_string())];
-        let result = evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result =
+            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
         assert!(result.is_none());
     }
 
@@ -479,7 +525,8 @@ mod tests {
 
         // kind='X' -> no test match -> default fallback
         let attrs = vec![(None, kind_name, "X".to_string())];
-        let result = evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result =
+            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
         let default_type = find_type_key(&schema_set, "defaultType");
         assert_eq!(result, Some(default_type));
     }
@@ -515,7 +562,8 @@ mod tests {
         let local_name = schema_set.name_table.add("root");
         let mode_name = schema_set.name_table.add("mode");
         let attrs = vec![(None, mode_name, "simple".to_string())];
-        let result = evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
+        let result =
+            evaluate_type_alternatives(elem_key, local_name, None, &attrs, None, None, &schema_set);
         assert!(result.is_some());
         assert_eq!(result, elem.alternatives[0].resolved_type);
     }
@@ -575,7 +623,10 @@ mod tests {
         };
         let alt_ct = &schema_set.arenas.complex_types[alt_ct_key];
         let isbn = schema_set.name_table.get("ISBN").expect("ISBN interned");
-        let publisher = schema_set.name_table.get("Publisher").expect("Publisher interned");
+        let publisher = schema_set
+            .name_table
+            .get("Publisher")
+            .expect("Publisher interned");
 
         let mut found_isbn = false;
         let mut found_publisher = false;
@@ -594,7 +645,8 @@ mod tests {
             "inline alternative extension type should have ISBN and Publisher \
              in resolved_content_particle_elements (found_isbn={}, \
              found_publisher={})",
-            found_isbn, found_publisher
+            found_isbn,
+            found_publisher
         );
     }
 
@@ -684,15 +736,29 @@ mod tests {
 
         // size=5 -> smallType
         let attrs_small = vec![(None, size_name, "5".to_string())];
-        let result_small =
-            evaluate_type_alternatives(elem_key, local_name, None, &attrs_small, None, None, &schema_set);
+        let result_small = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_small,
+            None,
+            None,
+            &schema_set,
+        );
         let small_type = find_type_key(&schema_set, "smallType");
         assert_eq!(result_small, Some(small_type));
 
         // size=100 -> largeType
         let attrs_large = vec![(None, size_name, "100".to_string())];
-        let result_large =
-            evaluate_type_alternatives(elem_key, local_name, None, &attrs_large, None, None, &schema_set);
+        let result_large = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_large,
+            None,
+            None,
+            &schema_set,
+        );
         let large_type = find_type_key(&schema_set, "largeType");
         assert_eq!(result_large, Some(large_type));
     }

@@ -21,11 +21,11 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
+use crate::parser::frames::SimpleTypeVariety;
 use crate::parser::frames::{QNameRef, TypeRefResult};
 use crate::parser::location::SourceRef;
 use crate::schema::composition::ComponentKind;
 use crate::schema::SchemaSet;
-use crate::parser::frames::SimpleTypeVariety;
 
 /// Reference resolver for QName → component ID resolution
 ///
@@ -62,10 +62,7 @@ impl<'a> ReferenceResolver<'a> {
         }
 
         // 2. Look up in namespace table
-        if let Some(type_key) = self
-            .schema_set
-            .lookup_type(namespace, qname.local_name)
-        {
+        if let Some(type_key) = self.schema_set.lookup_type(namespace, qname.local_name) {
             return Ok(type_key);
         }
 
@@ -153,7 +150,13 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ElementKey> {
-        self.resolve_ref(qname, source, "Element", ComponentKind::Element, SchemaSet::lookup_element)
+        self.resolve_ref(
+            qname,
+            source,
+            "Element",
+            ComponentKind::Element,
+            SchemaSet::lookup_element,
+        )
     }
 
     /// Resolve an attribute reference (QName → AttributeKey)
@@ -162,7 +165,13 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeKey> {
-        self.resolve_ref(qname, source, "Attribute", ComponentKind::Attribute, SchemaSet::lookup_attribute)
+        self.resolve_ref(
+            qname,
+            source,
+            "Attribute",
+            ComponentKind::Attribute,
+            SchemaSet::lookup_attribute,
+        )
     }
 
     /// Resolve a model group reference (QName → ModelGroupKey)
@@ -171,7 +180,13 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<ModelGroupKey> {
-        self.resolve_ref(qname, source, "Group", ComponentKind::ModelGroup, SchemaSet::lookup_model_group)
+        self.resolve_ref(
+            qname,
+            source,
+            "Group",
+            ComponentKind::ModelGroup,
+            SchemaSet::lookup_model_group,
+        )
     }
 
     /// Resolve an attribute group reference (QName → AttributeGroupKey)
@@ -180,7 +195,13 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<AttributeGroupKey> {
-        self.resolve_ref(qname, source, "Attribute group", ComponentKind::AttributeGroup, SchemaSet::lookup_attribute_group)
+        self.resolve_ref(
+            qname,
+            source,
+            "Attribute group",
+            ComponentKind::AttributeGroup,
+            SchemaSet::lookup_attribute_group,
+        )
     }
 
     /// Resolve a notation reference (QName → NotationKey)
@@ -189,12 +210,22 @@ impl<'a> ReferenceResolver<'a> {
         qname: &QNameRef,
         source: Option<&SourceRef>,
     ) -> SchemaResult<NotationKey> {
-        self.resolve_ref(qname, source, "Notation", ComponentKind::Notation, SchemaSet::lookup_notation)
+        self.resolve_ref(
+            qname,
+            source,
+            "Notation",
+            ComponentKind::Notation,
+            SchemaSet::lookup_notation,
+        )
     }
 
     /// Format a QName for error messages
     fn format_qname(&self, qname: &QNameRef) -> String {
-        format_resolved_qname(&self.schema_set.name_table, qname.namespace, qname.local_name)
+        format_resolved_qname(
+            &self.schema_set.name_table,
+            qname.namespace,
+            qname.local_name,
+        )
     }
 }
 
@@ -278,7 +309,11 @@ fn drain_pending_ic_refs_for(
     let mut still_pending = Vec::new();
     for (kind, ref_name, source) in pending {
         match crate::schema::inline::resolve_ic_ref(
-            kind, &ref_name, source.as_ref(), target_ns, schema_set,
+            kind,
+            &ref_name,
+            source.as_ref(),
+            target_ns,
+            schema_set,
         ) {
             Ok(target_key) => {
                 schema_set.arenas.elements[key]
@@ -481,10 +516,9 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         Vec::with_capacity(schema_set.documents.len());
     for doc in &schema_set.documents {
         if let Some(ref qname) = doc.default_attributes {
-            if let Some(key) = schema_set.lookup_attribute_group(
-                qname.namespace_uri,
-                qname.local_name,
-            ) {
+            if let Some(key) =
+                schema_set.lookup_attribute_group(qname.namespace_uri, qname.local_name)
+            {
                 doc_default_attr_groups.push(Some(key));
                 stats.attribute_groups_resolved += 1;
             } else {
@@ -625,7 +659,10 @@ fn resolve_element_references(
     // Resolve alternative type references (XSD 1.1)
     #[cfg(feature = "xsd11")]
     let resolved_alt_types = {
-        let elem = schema_set.arenas.elements.get(key)
+        let elem = schema_set
+            .arenas
+            .elements
+            .get(key)
             .ok_or_else(|| SchemaError::internal("Element not found in arena"))?;
         let mut alt_types: Vec<Option<TypeKey>> = Vec::with_capacity(elem.alternatives.len());
         for alt in &elem.alternatives {
@@ -683,7 +720,12 @@ fn resolve_attribute_references(
             _ => None,
         };
 
-        (type_qname, attr.ref_name.clone(), attr.source.clone(), attr.resolved_type)
+        (
+            type_qname,
+            attr.ref_name.clone(),
+            attr.source.clone(),
+            attr.resolved_type,
+        )
     };
 
     // Create resolver
@@ -727,7 +769,18 @@ fn resolve_simple_type_references(
 ) -> SchemaResult<()> {
     // First pass: extract QName references we need to resolve
     // Also get already resolved types from assembly (for inline types)
-    let (base_qname, item_qname, member_qnames, source, already_resolved_base, already_resolved_item, already_resolved_members, redefine_original, type_name, type_ns) = {
+    let (
+        base_qname,
+        item_qname,
+        member_qnames,
+        source,
+        already_resolved_base,
+        already_resolved_item,
+        already_resolved_members,
+        redefine_original,
+        type_name,
+        type_ns,
+    ) = {
         let type_def = schema_set
             .arenas
             .simple_types
@@ -844,16 +897,23 @@ fn resolve_simple_type_references(
     if let Some(TypeKey::Simple(base_sk)) = resolved_base {
         let (base_variety, base_members, base_item) = {
             if let Some(base_def) = schema_set.arenas.simple_types.get(base_sk) {
-                (base_def.variety, base_def.resolved_member_types.clone(), base_def.resolved_item_type)
+                (
+                    base_def.variety,
+                    base_def.resolved_member_types.clone(),
+                    base_def.resolved_item_type,
+                )
             } else {
                 (SimpleTypeVariety::Atomic, Vec::new(), None)
             }
         };
         if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
-            if type_def.variety == SimpleTypeVariety::Atomic && base_variety != SimpleTypeVariety::Atomic {
+            if type_def.variety == SimpleTypeVariety::Atomic
+                && base_variety != SimpleTypeVariety::Atomic
+            {
                 type_def.variety = base_variety;
             }
-            if base_variety == SimpleTypeVariety::Union && type_def.resolved_member_types.is_empty() {
+            if base_variety == SimpleTypeVariety::Union && type_def.resolved_member_types.is_empty()
+            {
                 type_def.resolved_member_types = base_members;
             }
             if base_variety == SimpleTypeVariety::List && type_def.resolved_item_type.is_none() {
@@ -875,7 +935,17 @@ fn resolve_complex_type_references(
 
     // First pass: extract QName references we need to resolve
     // Also get already resolved base type from assembly (for inline types)
-    let (base_qname, attribute_groups, attribute_uses, source, already_resolved_base, redefine_original, type_name, type_ns, already_resolved_attrs) = {
+    let (
+        base_qname,
+        attribute_groups,
+        attribute_uses,
+        source,
+        already_resolved_base,
+        redefine_original,
+        type_name,
+        type_ns,
+        already_resolved_attrs,
+    ) = {
         let type_def = schema_set
             .arenas
             .complex_types
@@ -889,13 +959,21 @@ fn resolve_complex_type_references(
         };
 
         // Extract attribute use info for resolution
-        let attribute_uses: Vec<_> = type_def.attributes.iter().map(|attr_use| {
-            let type_qname = match &attr_use.attribute.type_ref {
-                Some(TypeRefResult::QName(qname)) => Some(qname.clone()),
-                _ => None,
-            };
-            (attr_use.attribute.ref_name.clone(), type_qname, attr_use.attribute.source.clone())
-        }).collect();
+        let attribute_uses: Vec<_> = type_def
+            .attributes
+            .iter()
+            .map(|attr_use| {
+                let type_qname = match &attr_use.attribute.type_ref {
+                    Some(TypeRefResult::QName(qname)) => Some(qname.clone()),
+                    _ => None,
+                };
+                (
+                    attr_use.attribute.ref_name.clone(),
+                    type_qname,
+                    attr_use.attribute.source.clone(),
+                )
+            })
+            .collect();
 
         // Preserve resolved_attributes from inline type assembly (Phase 3)
         let already_resolved_attrs = type_def.resolved_attributes.clone();
@@ -1011,8 +1089,10 @@ fn resolve_model_group_references(
     let existing_particle_types = group.resolved_particle_types.clone();
 
     // Extract particle info for resolution
-    let particle_info: Vec<_> = group.particles.iter().map(|p| {
-        match &p.term {
+    let particle_info: Vec<_> = group
+        .particles
+        .iter()
+        .map(|p| match &p.term {
             ParticleTerm::Element(elem) => {
                 let type_qname = match &elem.type_ref {
                     Some(TypeRefResult::QName(qname)) => Some(qname.clone()),
@@ -1020,14 +1100,10 @@ fn resolve_model_group_references(
                 };
                 (0, elem.ref_name.clone(), type_qname, p.source.clone())
             }
-            ParticleTerm::Group(grp) => {
-                (1, grp.ref_name.clone(), None, p.source.clone())
-            }
-            ParticleTerm::Any(_) => {
-                (2, None, None, p.source.clone())
-            }
-        }
-    }).collect();
+            ParticleTerm::Group(grp) => (1, grp.ref_name.clone(), None, p.source.clone()),
+            ParticleTerm::Any(_) => (2, None, None, p.source.clone()),
+        })
+        .collect();
 
     // Create resolver
     let resolver = ReferenceResolver::new(schema_set);
@@ -1043,12 +1119,18 @@ fn resolve_model_group_references(
 
     // Resolve particle references
     let mut resolved_particles = Vec::with_capacity(particle_info.len());
-    for (i, (kind, elem_or_group_ref, type_qname, particle_source)) in particle_info.iter().enumerate() {
+    for (i, (kind, elem_or_group_ref, type_qname, particle_source)) in
+        particle_info.iter().enumerate()
+    {
         match kind {
             0 => {
                 // Element particle — preserve inline-resolved type from Phase 3
                 let already_resolved_type = existing_resolved.get(i).and_then(|rp| {
-                    if let ResolvedParticleTerm::Element { resolved_type: Some(key), .. } = rp {
+                    if let ResolvedParticleTerm::Element {
+                        resolved_type: Some(key),
+                        ..
+                    } = rp
+                    {
                         Some(*key)
                     } else {
                         None
@@ -1203,13 +1285,21 @@ fn resolve_attribute_group_references(
     let group_ns = group.target_namespace;
 
     // Extract attribute use info for resolution
-    let attribute_uses: Vec<_> = group.attributes.iter().map(|attr_use| {
-        let type_qname = match &attr_use.attribute.type_ref {
-            Some(TypeRefResult::QName(qname)) => Some(qname.clone()),
-            _ => None,
-        };
-        (attr_use.attribute.ref_name.clone(), type_qname, attr_use.attribute.source.clone())
-    }).collect();
+    let attribute_uses: Vec<_> = group
+        .attributes
+        .iter()
+        .map(|attr_use| {
+            let type_qname = match &attr_use.attribute.type_ref {
+                Some(TypeRefResult::QName(qname)) => Some(qname.clone()),
+                _ => None,
+            };
+            (
+                attr_use.attribute.ref_name.clone(),
+                type_qname,
+                attr_use.attribute.source.clone(),
+            )
+        })
+        .collect();
 
     // Preserve resolved_attributes from inline type assembly (Phase 3)
     let already_resolved_attrs = group.resolved_attributes.clone();
@@ -1696,10 +1786,7 @@ mod tests {
             } => {
                 assert_eq!(*key, string_key, "Inline-resolved type should be preserved");
             }
-            other => panic!(
-                "Expected Element with pre-resolved type, got {:?}",
-                other
-            ),
+            other => panic!("Expected Element with pre-resolved type, got {:?}", other),
         }
     }
 
@@ -1707,7 +1794,11 @@ mod tests {
     /// Returns (schema_set, complex_type_key, attribute_group_key).
     fn setup_default_attrs_test(
         default_attributes_apply: bool,
-    ) -> (SchemaSet, crate::ids::ComplexTypeKey, crate::ids::AttributeGroupKey) {
+    ) -> (
+        SchemaSet,
+        crate::ids::ComplexTypeKey,
+        crate::ids::AttributeGroupKey,
+    ) {
         use crate::arenas::{AttributeGroupData, ComplexTypeDefData};
         use crate::namespace::QualifiedName;
         use crate::parser::frames::ComplexContentResult;

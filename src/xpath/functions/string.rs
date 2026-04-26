@@ -9,8 +9,11 @@ use crate::xpath::iterator::XmlItem;
 use crate::xpath::string_ops;
 use crate::xpath::DomNavigator;
 
+use super::{
+    atomize_to_double, atomize_to_string, atomize_to_string_opt, atomize_to_string_required,
+    atomize_to_string_strict, atomize_to_string_strict_opt, XPathValue,
+};
 use crate::xpath::context::DynamicContext;
-use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, atomize_to_string_strict, atomize_to_string_strict_opt, atomize_to_double, XPathValue};
 
 /// Default collation URI (codepoint collation).
 const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
@@ -37,12 +40,14 @@ pub fn concat<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 {
-        return Err(XPathError::wrong_number_of_arguments("concat", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "concat",
+            2,
+            args.len(),
+        ));
     }
 
-    let strings: Result<Vec<String>, _> = args.into_iter()
-        .map(atomize_to_string)
-        .collect();
+    let strings: Result<Vec<String>, _> = args.into_iter().map(atomize_to_string).collect();
     let strings = strings?;
     let refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
     let result = string_ops::concat(&refs);
@@ -57,14 +62,19 @@ pub fn string_join<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("string-join", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "string-join",
+            2,
+            args.len(),
+        ));
     }
 
     let separator = atomize_to_string_required(args.pop().unwrap())?;
     let sequence = args.pop().unwrap();
 
     // Collect all string values from the sequence
-    let strings: Result<Vec<String>, XPathError> = sequence.into_vec()
+    let strings: Result<Vec<String>, XPathError> = sequence
+        .into_vec()
         .into_iter()
         .map(|item| match item {
             XmlItem::Atomic(v) => Ok(v.to_string_value()),
@@ -86,7 +96,11 @@ pub fn substring<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("substring", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "substring",
+            2,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string(args.remove(0))?;
@@ -110,7 +124,11 @@ pub fn string_length<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() > 1 {
-        return Err(XPathError::wrong_number_of_arguments("string-length", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "string-length",
+            1,
+            args.len(),
+        ));
     }
 
     let source = if args.is_empty() {
@@ -120,9 +138,11 @@ pub fn string_length<N: DomNavigator>(
                 XmlItem::Atomic(v) => v.to_string_value(),
                 XmlItem::Node(n) => n.value(),
             },
-            None => return Err(XPathError::XPDY0002 {
-                message: "Context item is absent".to_string(),
-            }),
+            None => {
+                return Err(XPathError::XPDY0002 {
+                    message: "Context item is absent".to_string(),
+                })
+            }
         }
     } else {
         atomize_to_string(args.into_iter().next().unwrap())?
@@ -141,7 +161,11 @@ pub fn normalize_space<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() > 1 {
-        return Err(XPathError::wrong_number_of_arguments("normalize-space", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "normalize-space",
+            1,
+            args.len(),
+        ));
     }
 
     let source = if args.is_empty() {
@@ -151,9 +175,11 @@ pub fn normalize_space<N: DomNavigator>(
                 XmlItem::Atomic(v) => v.to_string_value(),
                 XmlItem::Node(n) => n.value(),
             },
-            None => return Err(XPathError::XPDY0002 {
-                message: "Context item is absent".to_string(),
-            }),
+            None => {
+                return Err(XPathError::XPDY0002 {
+                    message: "Context item is absent".to_string(),
+                })
+            }
         }
     } else {
         atomize_to_string(args.into_iter().next().unwrap())?
@@ -172,7 +198,11 @@ pub fn normalize_unicode<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
-        return Err(XPathError::wrong_number_of_arguments("normalize-unicode", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "normalize-unicode",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict(args.remove(0))?;
@@ -185,9 +215,11 @@ pub fn normalize_unicode<N: DomNavigator>(
         } else {
             match string_ops::UnicodeNormalizationForm::parse(trimmed) {
                 Some(f) => Some(f),
-                None => return Err(XPathError::FOCH0003 {
-                    normalization_form: form_str,
-                }),
+                None => {
+                    return Err(XPathError::FOCH0003 {
+                        normalization_form: form_str,
+                    })
+                }
             }
         }
     } else {
@@ -212,7 +244,11 @@ pub fn upper_case<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("upper-case", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "upper-case",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string(args.remove(0))?;
@@ -228,7 +264,11 @@ pub fn lower_case<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("lower-case", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "lower-case",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string(args.remove(0))?;
@@ -244,7 +284,11 @@ pub fn translate<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 3 {
-        return Err(XPathError::wrong_number_of_arguments("translate", 3, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "translate",
+            3,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict(args.remove(0))?;
@@ -263,7 +307,11 @@ pub fn encode_for_uri<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("encode-for-uri", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "encode-for-uri",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict(args.remove(0))?;
@@ -279,7 +327,11 @@ pub fn iri_to_uri<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("iri-to-uri", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "iri-to-uri",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict(args.remove(0))?;
@@ -295,7 +347,11 @@ pub fn escape_html_uri<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("escape-html-uri", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "escape-html-uri",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict(args.remove(0))?;
@@ -312,7 +368,11 @@ pub fn contains<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("contains", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "contains",
+            2,
+            args.len(),
+        ));
     }
 
     if args.len() == 3 {
@@ -335,7 +395,11 @@ pub fn starts_with<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("starts-with", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "starts-with",
+            2,
+            args.len(),
+        ));
     }
 
     if args.len() == 3 {
@@ -358,7 +422,11 @@ pub fn ends_with<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("ends-with", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "ends-with",
+            2,
+            args.len(),
+        ));
     }
 
     if args.len() == 3 {
@@ -381,7 +449,11 @@ pub fn substring_before<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("substring-before", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "substring-before",
+            2,
+            args.len(),
+        ));
     }
 
     if args.len() == 3 {
@@ -404,7 +476,11 @@ pub fn substring_after<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("substring-after", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "substring-after",
+            2,
+            args.len(),
+        ));
     }
 
     if args.len() == 3 {
@@ -426,7 +502,11 @@ pub fn string_to_codepoints<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("string-to-codepoints", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "string-to-codepoints",
+            1,
+            args.len(),
+        ));
     }
 
     let source = atomize_to_string_strict_opt(args.remove(0))?;
@@ -454,7 +534,11 @@ pub fn codepoints_to_string<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("codepoints-to-string", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "codepoints-to-string",
+            1,
+            args.len(),
+        ));
     }
 
     let sequence = args.remove(0);
@@ -559,7 +643,11 @@ pub fn compare<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("compare", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "compare",
+            2,
+            args.len(),
+        ));
     }
 
     // Validate collation if provided (third argument)
@@ -587,7 +675,11 @@ pub fn codepoint_equal<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("codepoint-equal", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "codepoint-equal",
+            2,
+            args.len(),
+        ));
     }
 
     let s1 = atomize_to_string_strict_opt(args.remove(0))?;
@@ -707,7 +799,10 @@ mod tests {
     #[test]
     fn test_contains() {
         let (_, mut ctx) = make_context();
-        let args = vec![XPathValue::string("hello world"), XPathValue::string("world")];
+        let args = vec![
+            XPathValue::string("hello world"),
+            XPathValue::string("world"),
+        ];
         let result = contains(&mut ctx, args).unwrap();
         match result {
             XPathValue::Item(XmlItem::Atomic(v)) => {
@@ -807,9 +902,7 @@ mod tests {
     fn test_codepoints_to_string_fractional_double_fails() {
         let (_, mut ctx) = make_context();
         // Use a double with a fractional part - should fail
-        let seq = XPathValue::from_sequence(vec![
-            XmlItem::Atomic(XmlValue::double(65.5)),
-        ]);
+        let seq = XPathValue::from_sequence(vec![XmlItem::Atomic(XmlValue::double(65.5))]);
         let args = vec![seq];
         let result = codepoints_to_string(&mut ctx, args);
         assert!(result.is_err());

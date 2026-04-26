@@ -9,9 +9,9 @@ use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
 
 use super::{atomize_to_string_opt, XPathValue};
-use crate::xpath::iterator::XmlItem;
-use crate::types::value::{XmlValue, XmlValueKind, XmlAtomicValue};
+use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use crate::xpath::iterator::XmlItem;
 
 /// fn:resolve-uri($relative as xs:string?, $base as xs:string?) as xs:anyURI?
 ///
@@ -28,7 +28,11 @@ pub fn resolve_uri<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
-        return Err(XPathError::wrong_number_of_arguments("resolve-uri", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "resolve-uri",
+            2,
+            args.len(),
+        ));
     }
 
     let is_one_arg_form = args.len() == 1;
@@ -108,7 +112,11 @@ pub fn static_base_uri<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("static-base-uri", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "static-base-uri",
+            0,
+            args.len(),
+        ));
     }
 
     match &context.base_uri {
@@ -149,7 +157,9 @@ fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
         return Ok(format!(
             "{}{}{}",
             base_scheme.unwrap_or_default(),
-            base_authority.map(|a| format!("//{}", a)).unwrap_or_default(),
+            base_authority
+                .map(|a| format!("//{}", a))
+                .unwrap_or_default(),
             resolved_path
         ));
     }
@@ -162,7 +172,9 @@ fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
     // If relative starts with ?, it's a query reference
     if relative.starts_with('?') {
         let (base_without_query, _) = base.split_once('?').unwrap_or((base, ""));
-        let (base_without_fragment, _) = base_without_query.split_once('#').unwrap_or((base_without_query, ""));
+        let (base_without_fragment, _) = base_without_query
+            .split_once('#')
+            .unwrap_or((base_without_query, ""));
         return Ok(format!("{}{}", base_without_fragment, relative));
     }
 
@@ -173,17 +185,15 @@ fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
     }
 
     // Otherwise, merge paths
-    let merged_path = merge_paths(
-        base_authority.is_some(),
-        base_path.unwrap_or(""),
-        relative,
-    );
+    let merged_path = merge_paths(base_authority.is_some(), base_path.unwrap_or(""), relative);
     let resolved_path = remove_dot_segments(&merged_path);
 
     Ok(format!(
         "{}{}{}",
         base_scheme.unwrap_or_default(),
-        base_authority.map(|a| format!("//{}", a)).unwrap_or_default(),
+        base_authority
+            .map(|a| format!("//{}", a))
+            .unwrap_or_default(),
         resolved_path
     ))
 }
@@ -198,7 +208,8 @@ fn is_absolute_uri(uri: &str) -> bool {
             let mut chars = scheme.chars();
             if let Some(first) = chars.next() {
                 if first.is_ascii_alphabetic() {
-                    return chars.all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
+                    return chars
+                        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-' || c == '.');
                 }
             }
         }
@@ -207,7 +218,12 @@ fn is_absolute_uri(uri: &str) -> bool {
 }
 
 /// URI components tuple: (scheme, authority, path, query)
-type UriComponents<'a> = (Option<String>, Option<&'a str>, Option<&'a str>, Option<&'a str>);
+type UriComponents<'a> = (
+    Option<String>,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
 
 /// Parse URI into components (scheme, authority, path, query).
 fn parse_uri_components(uri: &str) -> Result<UriComponents<'_>, ()> {
@@ -227,14 +243,21 @@ fn parse_uri_components(uri: &str) -> Result<UriComponents<'_>, ()> {
     // Extract authority
     if rest.starts_with("//") {
         rest = &rest[2..];
-        let auth_end = rest.find('/').or_else(|| rest.find('?')).or_else(|| rest.find('#')).unwrap_or(rest.len());
+        let auth_end = rest
+            .find('/')
+            .or_else(|| rest.find('?'))
+            .or_else(|| rest.find('#'))
+            .unwrap_or(rest.len());
         authority = Some(&rest[..auth_end]);
         rest = &rest[auth_end..];
     }
 
     // Extract query and fragment
     let (path_and_query, _fragment) = rest.split_once('#').unwrap_or((rest, ""));
-    let (path, query) = path_and_query.split_once('?').map(|(p, q)| (Some(p), Some(q))).unwrap_or((Some(path_and_query), None));
+    let (path, query) = path_and_query
+        .split_once('?')
+        .map(|(p, q)| (Some(p), Some(q)))
+        .unwrap_or((Some(path_and_query), None));
 
     Ok((scheme, authority, path, query))
 }
@@ -285,7 +308,10 @@ fn remove_dot_segments(path: &str) -> String {
         // E: move the first path segment (including initial "/" if any) to output
         else {
             let start = if input.starts_with('/') { 1 } else { 0 };
-            let end = input[start..].find('/').map(|i| i + start).unwrap_or(input.len());
+            let end = input[start..]
+                .find('/')
+                .map(|i| i + start)
+                .unwrap_or(input.len());
             output.push(input[..end].to_string());
             input = input[end..].to_string();
         }
@@ -311,7 +337,8 @@ fn is_valid_uri_reference(uri: &str) -> bool {
 
     // For relative references: the first path segment must not contain ':'
     // (to avoid ambiguity with scheme). RFC 3986 §4.2
-    if uri.starts_with("//") || uri.starts_with('/') || uri.starts_with('?') || uri.starts_with('#') {
+    if uri.starts_with("//") || uri.starts_with('/') || uri.starts_with('?') || uri.starts_with('#')
+    {
         return true;
     }
 
@@ -363,7 +390,10 @@ mod tests {
     use crate::xpath::context::XPathContext;
     use crate::xpath::RoXmlNavigator;
 
-    fn create_context<'a>(names: &'a NameTable, base_uri: Option<&str>) -> DynamicContext<'a, RoXmlNavigator<'a>> {
+    fn create_context<'a>(
+        names: &'a NameTable,
+        base_uri: Option<&str>,
+    ) -> DynamicContext<'a, RoXmlNavigator<'a>> {
         let mut static_ctx = XPathContext::new(names);
         if let Some(uri) = base_uri {
             static_ctx = static_ctx.with_base_uri(uri);
@@ -406,7 +436,8 @@ mod tests {
                 XPathValue::string("http://other.com/path"),
                 XPathValue::string("http://example.com/ignored"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         match result {
             XPathValue::Item(XmlItem::Atomic(value)) => {
@@ -427,11 +458,15 @@ mod tests {
                 XPathValue::string("path/file.xml"),
                 XPathValue::string("http://example.com/base/"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         match result {
             XPathValue::Item(XmlItem::Atomic(value)) => {
-                assert_eq!(value.to_string_value(), "http://example.com/base/path/file.xml");
+                assert_eq!(
+                    value.to_string_value(),
+                    "http://example.com/base/path/file.xml"
+                );
             }
             _ => panic!("Expected anyURI"),
         }
@@ -442,10 +477,7 @@ mod tests {
         let names = NameTable::new();
         let mut ctx = create_context(&names, Some("http://example.com/base/"));
 
-        let result = resolve_uri(
-            &mut ctx,
-            vec![XPathValue::Empty],
-        ).unwrap();
+        let result = resolve_uri(&mut ctx, vec![XPathValue::Empty]).unwrap();
 
         assert!(matches!(result, XPathValue::Empty));
     }
@@ -461,11 +493,15 @@ mod tests {
                 XPathValue::string("../other/file.xml"),
                 XPathValue::string("http://example.com/base/subdir/"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         match result {
             XPathValue::Item(XmlItem::Atomic(value)) => {
-                assert_eq!(value.to_string_value(), "http://example.com/base/other/file.xml");
+                assert_eq!(
+                    value.to_string_value(),
+                    "http://example.com/base/other/file.xml"
+                );
             }
             _ => panic!("Expected anyURI"),
         }
@@ -477,10 +513,7 @@ mod tests {
         let mut ctx = create_context(&names, None);
 
         // 1-arg form with no base URI should fail
-        let result = resolve_uri(
-            &mut ctx,
-            vec![XPathValue::string("path/file.xml")],
-        );
+        let result = resolve_uri(&mut ctx, vec![XPathValue::string("path/file.xml")]);
 
         assert!(result.is_err());
         if let Err(XPathError::FONS0005) = result {

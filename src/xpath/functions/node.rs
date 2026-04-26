@@ -818,7 +818,10 @@ mod tests {
     fn test_resolve_uri_absolute_path() {
         // Absolute path resolved against host
         assert_eq!(
-            resolve_uri("/absolute/path.xml", Some("http://example.com/dir/base.xml")),
+            resolve_uri(
+                "/absolute/path.xml",
+                Some("http://example.com/dir/base.xml")
+            ),
             "http://example.com/absolute/path.xml"
         );
     }
@@ -871,9 +874,9 @@ mod tests {
 
     #[test]
     fn test_collect_id_tokens_sequence() {
-        use crate::xpath::RoXmlNavigator;
-        use crate::xpath::iterator::XmlItem;
         use crate::types::value::XmlValue;
+        use crate::xpath::iterator::XmlItem;
+        use crate::xpath::RoXmlNavigator;
 
         let items = vec![
             XmlItem::Atomic(XmlValue::string("a1 a2")),

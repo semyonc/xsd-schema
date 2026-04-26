@@ -19,7 +19,10 @@ use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::tree_comparer::TreeComparer;
 use crate::xpath::DomNavigator;
 
-use super::{atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt, atomize_to_string_opt, materialize, XPathValue};
+use super::{
+    atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt,
+    atomize_to_string_opt, materialize, XPathValue,
+};
 
 /// Default collation URI (codepoint collation).
 const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
@@ -48,7 +51,11 @@ pub fn index_of<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("index-of", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "index-of",
+            2,
+            args.len(),
+        ));
     }
 
     // Get the sequence (arg 0) and search value (arg 1)
@@ -222,7 +229,11 @@ pub fn reverse<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("reverse", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "reverse",
+            1,
+            args.len(),
+        ));
     }
 
     let mut items = materialize(args.remove(0));
@@ -242,7 +253,11 @@ pub fn zero_or_one<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("zero-or-one", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "zero-or-one",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -264,7 +279,11 @@ pub fn one_or_more<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("one-or-more", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "one-or-more",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -286,7 +305,11 @@ pub fn exactly_one<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("exactly-one", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "exactly-one",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -309,7 +332,11 @@ pub fn distinct_values<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
-        return Err(XPathError::wrong_number_of_arguments("distinct-values", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "distinct-values",
+            1,
+            args.len(),
+        ));
     }
 
     let seq = args.remove(0);
@@ -326,17 +353,16 @@ pub fn distinct_values<N: DomNavigator>(
     // (treats NaN as equal to NaN, unlike value comparison)
     let mut distinct: Vec<XmlValue> = Vec::new();
     for value in values {
-        let is_duplicate = distinct.iter().any(|existing| distinct_values_equal(existing, &value));
+        let is_duplicate = distinct
+            .iter()
+            .any(|existing| distinct_values_equal(existing, &value));
         if !is_duplicate {
             distinct.push(value);
         }
     }
 
     // Convert back to XPathValue
-    let items: Vec<XmlItem<N>> = distinct
-        .into_iter()
-        .map(XmlItem::Atomic)
-        .collect();
+    let items: Vec<XmlItem<N>> = distinct.into_iter().map(XmlItem::Atomic).collect();
 
     Ok(XPathValue::from_sequence(items))
 }
@@ -355,7 +381,11 @@ pub fn remove<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("remove", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "remove",
+            2,
+            args.len(),
+        ));
     }
 
     let target = args.remove(0);
@@ -400,7 +430,11 @@ pub fn insert_before<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 3 {
-        return Err(XPathError::wrong_number_of_arguments("insert-before", 3, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "insert-before",
+            3,
+            args.len(),
+        ));
     }
 
     let target = args.remove(0);
@@ -460,7 +494,11 @@ pub fn subsequence<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("subsequence", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "subsequence",
+            2,
+            args.len(),
+        ));
     }
 
     let source = args.remove(0);
@@ -553,7 +591,8 @@ pub fn subsequence<N: DomNavigator>(
     }
 
     // Extract subsequence
-    let result: Vec<XmlItem<N>> = items.into_iter()
+    let result: Vec<XmlItem<N>> = items
+        .into_iter()
         .skip(start_idx)
         .take(end_idx.saturating_sub(start_idx))
         .collect();
@@ -586,7 +625,11 @@ pub fn unordered<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("unordered", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "unordered",
+            1,
+            args.len(),
+        ));
     }
 
     // Simply return the input unchanged
@@ -607,7 +650,11 @@ pub fn deep_equal<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("deep-equal", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "deep-equal",
+            2,
+            args.len(),
+        ));
     }
 
     // Validate collation if provided (third argument)
@@ -639,9 +686,9 @@ pub fn deep_equal<N: DomNavigator>(
 mod tests {
     use super::*;
     use crate::namespace::table::NameTable;
-    use crate::xpath::RoXmlNavigator;
     use crate::xpath::context::XPathContext;
     use crate::xpath::iterator::XmlItem;
+    use crate::xpath::RoXmlNavigator;
 
     fn make_context<'a>() -> DynamicContext<'a, RoXmlNavigator<'a>> {
         let table = Box::leak(Box::new(NameTable::new()));
@@ -1075,7 +1122,7 @@ mod tests {
             XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
             XmlItem::Atomic(XmlValue::double(2.0)),
             XmlItem::Atomic(XmlValue::integer(BigInt::from(1))), // duplicate of 1
-            XmlItem::Atomic(XmlValue::double(2.0)), // duplicate of 2.0
+            XmlItem::Atomic(XmlValue::double(2.0)),              // duplicate of 2.0
             XmlItem::Atomic(XmlValue::integer(BigInt::from(3))),
         ];
         let seq = XPathValue::from_sequence(items);

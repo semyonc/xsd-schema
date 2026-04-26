@@ -12,34 +12,34 @@
 //! lookup at bind time. Function dispatch uses a match on `FunctionId` to call
 //! the appropriate implementation.
 
-pub mod signature;
-pub mod registry;
-pub mod extensible;
-pub mod string;
-pub mod numeric;
-pub mod sequence;
 pub mod aggregate;
-pub mod node;
 pub mod datetime;
+pub mod extensible;
+pub mod node;
+pub mod numeric;
 pub mod qname;
-pub mod uri;
 pub mod regex;
+pub mod registry;
+pub mod sequence;
+pub mod signature;
 pub mod special;
+pub mod string;
+pub mod uri;
 
-pub use signature::{FunctionArity, FunctionSignature, FN_NAMESPACE, FN_2010_NAMESPACE};
-pub use registry::{FunctionRegistry, FunctionEntry, FunctionKey, FUNCTION_REGISTRY};
 pub use extensible::{
     BuiltinCatalog, BuiltinEvaluator, CustomFn, DynamicFunctionSignature, FunctionCatalog,
     FunctionEvaluator, FunctionHandle, FunctionSet, XPath10Catalog, XPath10Evaluator,
 };
+pub use registry::{FunctionEntry, FunctionKey, FunctionRegistry, FUNCTION_REGISTRY};
+pub use signature::{FunctionArity, FunctionSignature, FN_2010_NAMESPACE, FN_NAMESPACE};
 
 use num_bigint::BigInt;
 
 use crate::types::value::XmlValue;
 use crate::types::XmlTypeCode;
+use crate::xpath::atomize;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::XmlItem;
-use crate::xpath::atomize;
 use crate::xpath::DomNavigator;
 
 use super::context::DynamicContext;
@@ -485,7 +485,9 @@ pub fn atomize_to_string<N: DomNavigator>(value: XPathValue<N>) -> Result<String
 /// Atomize a value and convert to required string.
 ///
 /// Returns error if the value is empty or contains more than one item.
-pub fn atomize_to_string_required<N: DomNavigator>(value: XPathValue<N>) -> Result<String, XPathError> {
+pub fn atomize_to_string_required<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<String, XPathError> {
     match value {
         XPathValue::Empty => Err(XPathError::XPTY0004 {
             expected: "xs:string".to_string(),
@@ -500,7 +502,9 @@ pub fn atomize_to_string_required<N: DomNavigator>(value: XPathValue<N>) -> Resu
 /// Per XPath 2.0, only xs:string, xs:untypedAtomic, and xs:anyURI can be
 /// promoted to xs:string. Other types (e.g., xs:integer) raise XPTY0004.
 /// Empty value returns empty string.
-pub fn atomize_to_string_strict<N: DomNavigator>(value: XPathValue<N>) -> Result<String, XPathError> {
+pub fn atomize_to_string_strict<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<String, XPathError> {
     match value {
         XPathValue::Empty => Ok(String::new()),
         XPathValue::Item(item) => item_to_string_strict(item),
@@ -517,7 +521,9 @@ pub fn atomize_to_string_strict<N: DomNavigator>(value: XPathValue<N>) -> Result
 /// Atomize a value and convert to optional string with strict type checking.
 ///
 /// Returns None for empty sequences.
-pub fn atomize_to_string_strict_opt<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<String>, XPathError> {
+pub fn atomize_to_string_strict_opt<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Option<String>, XPathError> {
     match value {
         XPathValue::Empty => Ok(None),
         other => atomize_to_string_strict(other).map(Some),
@@ -528,28 +534,24 @@ pub fn atomize_to_string_strict_opt<N: DomNavigator>(value: XPathValue<N>) -> Re
 /// Only xs:string, xs:untypedAtomic, and xs:anyURI types are accepted.
 fn item_to_string_strict<N: DomNavigator>(item: XmlItem<N>) -> Result<String, XPathError> {
     match item {
-        XmlItem::Atomic(value) => {
-            match value.type_code {
-                XmlTypeCode::String
-                | XmlTypeCode::UntypedAtomic
-                | XmlTypeCode::AnyUri
-                | XmlTypeCode::NormalizedString
-                | XmlTypeCode::Token
-                | XmlTypeCode::Language
-                | XmlTypeCode::NmToken
-                | XmlTypeCode::Name
-                | XmlTypeCode::NCName
-                | XmlTypeCode::Id
-                | XmlTypeCode::IdRef
-                | XmlTypeCode::Entity => {
-                    Ok(atomize::string_value(&value))
-                }
-                _ => Err(XPathError::XPTY0004 {
-                    expected: "xs:string".to_string(),
-                    found: crate::xpath::type_info::type_code_to_name(value.type_code).to_string(),
-                }),
-            }
-        }
+        XmlItem::Atomic(value) => match value.type_code {
+            XmlTypeCode::String
+            | XmlTypeCode::UntypedAtomic
+            | XmlTypeCode::AnyUri
+            | XmlTypeCode::NormalizedString
+            | XmlTypeCode::Token
+            | XmlTypeCode::Language
+            | XmlTypeCode::NmToken
+            | XmlTypeCode::Name
+            | XmlTypeCode::NCName
+            | XmlTypeCode::Id
+            | XmlTypeCode::IdRef
+            | XmlTypeCode::Entity => Ok(atomize::string_value(&value)),
+            _ => Err(XPathError::XPTY0004 {
+                expected: "xs:string".to_string(),
+                found: crate::xpath::type_info::type_code_to_name(value.type_code).to_string(),
+            }),
+        },
         XmlItem::Node(nav) => Ok(nav.value()),
     }
 }
@@ -557,7 +559,9 @@ fn item_to_string_strict<N: DomNavigator>(item: XmlItem<N>) -> Result<String, XP
 /// Atomize a value and convert to optional string.
 ///
 /// Returns None for empty sequences.
-pub fn atomize_to_string_opt<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<String>, XPathError> {
+pub fn atomize_to_string_opt<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Option<String>, XPathError> {
     match value {
         XPathValue::Empty => Ok(None),
         other => atomize_to_string(other).map(Some),
@@ -624,7 +628,9 @@ pub fn atomize_to_single<N: DomNavigator>(value: XPathValue<N>) -> Result<XmlVal
 }
 
 /// Atomize a value to an optional XmlValue.
-pub fn atomize_to_single_opt<N: DomNavigator>(value: XPathValue<N>) -> Result<Option<XmlValue>, XPathError> {
+pub fn atomize_to_single_opt<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Option<XmlValue>, XPathError> {
     match value {
         XPathValue::Empty => Ok(None),
         other => atomize_to_single(other).map(Some),
@@ -646,7 +652,9 @@ fn item_to_atomic<N: DomNavigator>(item: XmlItem<N>) -> Result<XmlValue, XPathEr
 /// Atomize all items in a value to a sequence of XmlValues.
 ///
 /// Nilled elements (which atomize to `None`) are silently skipped.
-pub fn atomize_sequence<N: DomNavigator>(value: XPathValue<N>) -> Result<Vec<XmlValue>, XPathError> {
+pub fn atomize_sequence<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Vec<XmlValue>, XPathError> {
     match value {
         XPathValue::Empty => Ok(Vec::new()),
         XPathValue::Item(item) => match item {
@@ -834,7 +842,9 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::SecondsFromTime => datetime::seconds_from_time(context, args),
         FunctionId::TimezoneFromTime => datetime::timezone_from_time(context, args),
         // Timezone adjustment
-        FunctionId::AdjustDateTimeToTimezone => datetime::adjust_datetime_to_timezone(context, args),
+        FunctionId::AdjustDateTimeToTimezone => {
+            datetime::adjust_datetime_to_timezone(context, args)
+        }
         FunctionId::AdjustDateToTimezone => datetime::adjust_date_to_timezone(context, args),
         FunctionId::AdjustTimeToTimezone => datetime::adjust_time_to_timezone(context, args),
 
@@ -884,7 +894,11 @@ fn eval_not<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<
 
 fn eval_empty<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("empty", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "empty",
+            1,
+            args.len(),
+        ));
     }
     let arg = args.remove(0);
     Ok(XPathValue::boolean(arg.is_empty()))
@@ -892,7 +906,11 @@ fn eval_empty<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValu
 
 fn eval_exists<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("exists", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "exists",
+            1,
+            args.len(),
+        ));
     }
     let arg = args.remove(0);
     Ok(XPathValue::boolean(!arg.is_empty()))
@@ -900,7 +918,11 @@ fn eval_exists<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathVal
 
 fn eval_count<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("count", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "count",
+            1,
+            args.len(),
+        ));
     }
     let arg = args.remove(0);
     Ok(XPathValue::integer(arg.len() as i64))
@@ -925,7 +947,11 @@ fn eval_fn_string<N: DomNavigator>(
             let s = atomize_to_string(arg)?;
             Ok(XPathValue::string(s))
         }
-        _ => Err(XPathError::wrong_number_of_arguments("string", 1, args.len())),
+        _ => Err(XPathError::wrong_number_of_arguments(
+            "string",
+            1,
+            args.len(),
+        )),
     }
 }
 
@@ -951,13 +977,23 @@ fn eval_fn_number<N: DomNavigator>(
             let d = atomize_to_double(arg)?;
             Ok(XPathValue::double(d))
         }
-        _ => Err(XPathError::wrong_number_of_arguments("number", 1, args.len())),
+        _ => Err(XPathError::wrong_number_of_arguments(
+            "number",
+            1,
+            args.len(),
+        )),
     }
 }
 
-fn eval_boolean<N: DomNavigator>(mut args: Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError> {
+fn eval_boolean<N: DomNavigator>(
+    mut args: Vec<XPathValue<N>>,
+) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("boolean", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "boolean",
+            1,
+            args.len(),
+        ));
     }
     let arg = args.remove(0);
     let ebv = effective_boolean_value(&arg)?;
@@ -980,7 +1016,9 @@ pub fn effective_boolean_value<N: DomNavigator>(value: &XPathValue<N>) -> Result
             } else {
                 // Sequence of multiple atomics is an error
                 Err(XPathError::FORG0006 {
-                    message: "Effective boolean value not defined for sequence of multiple atomic values".to_string(),
+                    message:
+                        "Effective boolean value not defined for sequence of multiple atomic values"
+                            .to_string(),
                 })
             }
         }

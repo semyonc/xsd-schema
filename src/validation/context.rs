@@ -9,9 +9,9 @@ use std::collections::HashSet;
 #[cfg(feature = "xsd11")]
 use std::collections::HashMap;
 
-use crate::ids::{ElementKey, NameId, TypeKey};
 #[cfg(feature = "xsd11")]
 use crate::ids::AttributeKey;
+use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
@@ -246,10 +246,7 @@ impl ValidatorState {
 
     /// Check if `validate_end_of_attributes` can be called in this state
     pub fn can_end_attributes(&self) -> bool {
-        matches!(
-            self,
-            ValidatorState::Element | ValidatorState::Attribute
-        )
+        matches!(self, ValidatorState::Element | ValidatorState::Attribute)
     }
 
     /// Check if `validate_text` / `validate_whitespace` can be called in this state

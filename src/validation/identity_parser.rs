@@ -43,8 +43,7 @@ impl<'a> IdXPathParser<'a> {
         name_table: &'a NameTable,
         unprefixed_ns: NamespaceMatch,
     ) -> Result<Self, IdentityXPathError> {
-        let tokens: Vec<_> = IdXPathLexer::new(input)
-            .collect::<Result<Vec<_>, _>>()?;
+        let tokens: Vec<_> = IdXPathLexer::new(input).collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             tokens,
             pos: 0,
@@ -71,12 +70,7 @@ impl<'a> IdXPathParser<'a> {
         self.tokens
             .get(self.pos)
             .map(|(start, _, _)| *start)
-            .unwrap_or_else(|| {
-                self.tokens
-                    .last()
-                    .map(|(_, _, end)| *end)
-                    .unwrap_or(0)
-            })
+            .unwrap_or_else(|| self.tokens.last().map(|(_, _, end)| *end).unwrap_or(0))
     }
 
     /// Advance past the current token, returning it.
@@ -91,7 +85,10 @@ impl<'a> IdXPathParser<'a> {
     }
 
     /// Consume the current token if it matches `expected`, or return an error.
-    fn eat(&mut self, expected: IdXPathToken<'_>) -> Result<IdXPathSpanned<'a>, IdentityXPathError> {
+    fn eat(
+        &mut self,
+        expected: IdXPathToken<'_>,
+    ) -> Result<IdXPathSpanned<'a>, IdentityXPathError> {
         if self.peek() == Some(&expected) {
             Ok(self.advance().unwrap())
         } else {
@@ -110,12 +107,12 @@ impl<'a> IdXPathParser<'a> {
     /// Resolve a prefix string to a namespace NameId.
     fn resolve_prefix(&self, prefix: &str, pos: usize) -> Result<NameId, IdentityXPathError> {
         let prefix_id = self.name_table.add(prefix);
-        self.ns_snapshot
-            .resolve_prefix(prefix_id)
-            .ok_or_else(|| IdentityXPathError::UnboundPrefix {
+        self.ns_snapshot.resolve_prefix(prefix_id).ok_or_else(|| {
+            IdentityXPathError::UnboundPrefix {
                 prefix: prefix.to_string(),
                 position: pos,
-            })
+            }
+        })
     }
 
     // --- Grammar productions ---
@@ -202,9 +199,7 @@ impl<'a> IdXPathParser<'a> {
                     });
                 }
                 _ = pos;
-            } else if self.peek_at(1).is_none()
-                || self.peek_at(1) == Some(&IdXPathToken::Pipe)
-            {
+            } else if self.peek_at(1).is_none() || self.peek_at(1) == Some(&IdXPathToken::Pipe) {
                 // Bare '.' — self node
                 self.advance(); // consume '.'
                 steps.push(AstStep::SelfNode);
@@ -304,10 +299,7 @@ impl<'a> IdXPathParser<'a> {
     }
 
     /// Parse an explicit axis step: `child::NameTest` or `attribute::NameTest`.
-    fn parse_explicit_axis(
-        &mut self,
-        allow_attr: bool,
-    ) -> Result<AstStep, IdentityXPathError> {
+    fn parse_explicit_axis(&mut self, allow_attr: bool) -> Result<AstStep, IdentityXPathError> {
         let (pos, tok, _) = self.advance().unwrap(); // consume axis name NCName
         let axis_name = match tok {
             IdXPathToken::NCName(name) => name,
@@ -365,7 +357,8 @@ impl<'a> IdXPathParser<'a> {
                     let (colon_start, _, colon_end) = self.tokens[self.pos];
                     if colon_start != ncname_end {
                         return Err(IdentityXPathError::Parse {
-                            message: "whitespace is not allowed between namespace prefix and `:`".into(),
+                            message: "whitespace is not allowed between namespace prefix and `:`"
+                                .into(),
                             position: ncname_end,
                         });
                     }
@@ -390,7 +383,8 @@ impl<'a> IdXPathParser<'a> {
                             let (local_start, _, _) = self.tokens[self.pos];
                             if local_start != colon_end {
                                 return Err(IdentityXPathError::Parse {
-                                    message: "whitespace is not allowed between `:` and local name".into(),
+                                    message: "whitespace is not allowed between `:` and local name"
+                                        .into(),
                                     position: colon_end,
                                 });
                             }
@@ -536,8 +530,16 @@ mod tests {
         use crate::schema::model::XsdVersion;
         let table = NameTable::new();
         let snapshot = snapshot_with_prefix(&table, "ns", "http://example.com");
-        let tree =
-            Asttree::compile_selector("ns:*", &snapshot, &table, None, None, None, XsdVersion::V1_1).unwrap();
+        let tree = Asttree::compile_selector(
+            "ns:*",
+            &snapshot,
+            &table,
+            None,
+            None,
+            None,
+            XsdVersion::V1_1,
+        )
+        .unwrap();
         assert!(matches!(
             &tree.paths[0].steps[0],
             AstStep::Child(NameTest::NamespaceWildcard(_))
@@ -550,8 +552,16 @@ mod tests {
         let table = NameTable::new();
         let snapshot = snapshot_with_prefix(&table, "ns", "http://example.com");
         let ns_id = table.add("http://example.com");
-        let tree =
-            Asttree::compile_selector("ns:foo", &snapshot, &table, None, None, None, XsdVersion::V1_1).unwrap();
+        let tree = Asttree::compile_selector(
+            "ns:foo",
+            &snapshot,
+            &table,
+            None,
+            None,
+            None,
+            XsdVersion::V1_1,
+        )
+        .unwrap();
         match &tree.paths[0].steps[0] {
             AstStep::Child(NameTest::QName {
                 namespace: NamespaceMatch::Exact(ns),

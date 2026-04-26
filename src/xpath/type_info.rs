@@ -87,9 +87,9 @@ pub fn get_result_type(type_code: XmlTypeCode) -> XPath2ResultType {
         | XmlTypeCode::GDay => XPath2ResultType::DateTime,
 
         // Duration types
-        XmlTypeCode::Duration
-        | XmlTypeCode::YearMonthDuration
-        | XmlTypeCode::DayTimeDuration => XPath2ResultType::Duration,
+        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration => {
+            XPath2ResultType::Duration
+        }
 
         // QName
         XmlTypeCode::QName | XmlTypeCode::Notation => XPath2ResultType::QName,
@@ -317,12 +317,30 @@ mod tests {
 
     #[test]
     fn test_get_result_type() {
-        assert_eq!(get_result_type(XmlTypeCode::String), XPath2ResultType::String);
-        assert_eq!(get_result_type(XmlTypeCode::Boolean), XPath2ResultType::Boolean);
-        assert_eq!(get_result_type(XmlTypeCode::Integer), XPath2ResultType::Number);
-        assert_eq!(get_result_type(XmlTypeCode::DateTime), XPath2ResultType::DateTime);
-        assert_eq!(get_result_type(XmlTypeCode::Duration), XPath2ResultType::Duration);
-        assert_eq!(get_result_type(XmlTypeCode::Element), XPath2ResultType::Navigator);
+        assert_eq!(
+            get_result_type(XmlTypeCode::String),
+            XPath2ResultType::String
+        );
+        assert_eq!(
+            get_result_type(XmlTypeCode::Boolean),
+            XPath2ResultType::Boolean
+        );
+        assert_eq!(
+            get_result_type(XmlTypeCode::Integer),
+            XPath2ResultType::Number
+        );
+        assert_eq!(
+            get_result_type(XmlTypeCode::DateTime),
+            XPath2ResultType::DateTime
+        );
+        assert_eq!(
+            get_result_type(XmlTypeCode::Duration),
+            XPath2ResultType::Duration
+        );
+        assert_eq!(
+            get_result_type(XmlTypeCode::Element),
+            XPath2ResultType::Navigator
+        );
     }
 
     #[test]

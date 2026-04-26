@@ -10,38 +10,36 @@
 
 pub mod buffer;
 pub mod builder;
+pub mod element_index;
 pub mod error;
+pub mod namespace;
 pub mod navigator;
 pub mod node;
 pub mod page;
 pub mod qname;
+pub mod source_spans;
 pub mod strings;
 pub mod type_remap;
 pub mod typed_builder;
-pub mod namespace;
-pub mod element_index;
-pub mod source_spans;
 
+pub use buffer::BufferDocument;
+pub use builder::BufferDocumentBuilder;
+pub use element_index::ElementIndex;
 pub use error::BufferDocumentError;
+pub use namespace::{
+    NamespaceChain, NamespaceNode, NamespacePageFactory, NsRef, NS_PAGE_MASK, NS_PAGE_SHIFT,
+    NS_PAGE_SIZE,
+};
+pub use navigator::BufferDocNavigator;
 pub use node::{
-    Node, NodeType,
-    PAGE_SHIFT, PAGE_SIZE, PAGE_MASK, NULL,
-    page_of, slot_of, node_ref_from,
+    node_ref_from, page_of, slot_of, Node, NodeType, NULL, PAGE_MASK, PAGE_SHIFT, PAGE_SIZE,
 };
 pub use page::NodePages;
 pub use qname::{QNameAtom, QNameTable, EMPTY_QNAME};
+pub use source_spans::NodeSourceSpans;
 pub use strings::StringStore;
 pub use type_remap::{BindingRemapTable, NodeSchemaBinding};
-pub use namespace::{
-    NamespaceChain, NamespaceNode, NamespacePageFactory, NsRef,
-    NS_PAGE_MASK, NS_PAGE_SHIFT, NS_PAGE_SIZE,
-};
-pub use element_index::ElementIndex;
-pub use source_spans::NodeSourceSpans;
-pub use buffer::BufferDocument;
-pub use builder::BufferDocumentBuilder;
-pub use typed_builder::{SilentValidationSink, build_typed_document};
-pub use navigator::BufferDocNavigator;
+pub use typed_builder::{build_typed_document, SilentValidationSink};
 
 /// Whether the document is a complete XML document or a validation fragment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -16,8 +16,11 @@
 
 use num_bigint::BigInt;
 
-use crate::types::{XmlTypeCode, value::{XmlValue, XmlValueKind, XmlAtomicValue}};
 use super::error::XPathError;
+use crate::types::{
+    value::{XmlAtomicValue, XmlValue, XmlValueKind},
+    XmlTypeCode,
+};
 
 /// Compute the effective boolean value of an atomic XmlValue.
 ///
@@ -171,7 +174,9 @@ pub fn is_string_like_type(type_code: XmlTypeCode) -> bool {
 
 /// Check if a type code supports effective boolean value.
 pub fn supports_ebv(type_code: XmlTypeCode) -> bool {
-    type_code == XmlTypeCode::Boolean || is_numeric_type(type_code) || is_string_like_type(type_code)
+    type_code == XmlTypeCode::Boolean
+        || is_numeric_type(type_code)
+        || is_string_like_type(type_code)
 }
 
 /// Format a type code for error messages.
@@ -219,9 +224,9 @@ fn format_type_for_error(type_code: XmlTypeCode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::XmlTypeCode;
     use num_bigint::BigInt;
     use rust_decimal::Decimal;
-    use crate::types::XmlTypeCode;
 
     #[test]
     fn test_boolean_ebv() {
@@ -245,23 +250,13 @@ mod tests {
     #[test]
     fn test_numeric_ebv() {
         // Integer
-        assert!(
-            !effective_boolean_value(&XmlValue::integer(BigInt::from(0))).unwrap()
-        );
-        assert!(
-            effective_boolean_value(&XmlValue::integer(BigInt::from(42))).unwrap()
-        );
-        assert!(
-            effective_boolean_value(&XmlValue::integer(BigInt::from(-1))).unwrap()
-        );
+        assert!(!effective_boolean_value(&XmlValue::integer(BigInt::from(0))).unwrap());
+        assert!(effective_boolean_value(&XmlValue::integer(BigInt::from(42))).unwrap());
+        assert!(effective_boolean_value(&XmlValue::integer(BigInt::from(-1))).unwrap());
 
         // Decimal
-        assert!(
-            !effective_boolean_value(&XmlValue::decimal(Decimal::ZERO)).unwrap()
-        );
-        assert!(
-            effective_boolean_value(&XmlValue::decimal(Decimal::new(123, 2))).unwrap()
-        );
+        assert!(!effective_boolean_value(&XmlValue::decimal(Decimal::ZERO)).unwrap());
+        assert!(effective_boolean_value(&XmlValue::decimal(Decimal::new(123, 2))).unwrap());
 
         // Double
         assert!(!effective_boolean_value(&XmlValue::double(0.0)).unwrap());

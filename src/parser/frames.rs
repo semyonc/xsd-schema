@@ -10,16 +10,16 @@
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{NameId, TypeKey};
-use crate::namespace::{NameTable, is_ncname};
+use crate::namespace::context::NamespaceContextSnapshot;
+use crate::namespace::{is_ncname, NameTable};
 use crate::parser::attrs::{parse_boolean, parse_form, parse_occurs, parse_use, AttributeMap};
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::{
-    Annotation, AnnotationItem, AppInfoElement, DocumentationElement, ForeignAttribute, XmlFragment,
-    merge_foreign_attributes,
+    merge_foreign_attributes, Annotation, AnnotationItem, AppInfoElement, DocumentationElement,
+    ForeignAttribute, XmlFragment,
 };
-use crate::namespace::context::NamespaceContextSnapshot;
 use crate::schema::model::DerivationSet;
-use crate::types::facets::{FacetSet, ExplicitTimezone};
+use crate::types::facets::{ExplicitTimezone, FacetSet};
 
 include!("frames/xsd_names.rs");
 include!("frames/core.rs");

@@ -34,9 +34,9 @@ use quick_xml::events::Event;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
-use crate::namespace::{NamespaceContext, NameTable, XS_NAMESPACE, is_ncname};
-use crate::parser::attrs::{parse_attributes, categorize_attributes, AttributeMap};
+use crate::namespace::{is_ncname, NameTable, NamespaceContext, XS_NAMESPACE};
 use crate::parser::assemble::assemble_schema;
+use crate::parser::attrs::{categorize_attributes, parse_attributes, AttributeMap};
 use crate::parser::frames::{
     create_frame, create_frame_recovering, xsd_names, Frame, FrameResult, SchemaFrameResult,
     SkipFrame,
@@ -44,14 +44,12 @@ use crate::parser::frames::{
 use crate::parser::location::{SourceLocation, SourceMap, SourceRef, SourceSpan};
 use crate::parser::reader::{split_qname, TrackedReader};
 use crate::parser::structure::{
-    ValidationContext, validate_xsd_version_element, validate_xsd_version_attribute,
-    validate_element_structure, validate_attribute_structure,
-    validate_simple_type_structure, validate_complex_type_structure,
-    validate_extension_structure,
-    validate_key_unique_structure, validate_keyref_structure,
-    validate_group_structure, validate_attribute_group_structure,
-    validate_notation_structure, validate_include_structure, validate_import_structure,
-    validate_redefine_structure, validate_schema_structure,
+    validate_attribute_group_structure, validate_attribute_structure,
+    validate_complex_type_structure, validate_element_structure, validate_extension_structure,
+    validate_group_structure, validate_import_structure, validate_include_structure,
+    validate_key_unique_structure, validate_keyref_structure, validate_notation_structure,
+    validate_redefine_structure, validate_schema_structure, validate_simple_type_structure,
+    validate_xsd_version_attribute, validate_xsd_version_element, ValidationContext,
 };
 use crate::schema::annotation::ForeignAttribute;
 use crate::schema::model::XsdVersion;
@@ -207,9 +205,11 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
         // Walk the frame stack to detect a `<complexType>` lexical ancestor.
         // Stop walking when we hit a frame whose children are top-level
         // (schema/redefine/override) — there's nothing more to look at.
-        let inside_complex_type = self.frame_stack.iter().rev().any(|f| {
-            f.children_inside_complex_type()
-        });
+        let inside_complex_type = self
+            .frame_stack
+            .iter()
+            .rev()
+            .any(|f| f.children_inside_complex_type());
         ValidationContext {
             xsd_version: self.config.xsd_version,
             is_top_level,
@@ -346,9 +346,10 @@ pub fn parse_schema_with_chameleon(
     // surfaced later (e.g. when process_loaded_schemas runs).
     let parsing_errors = std::mem::take(&mut state.errors);
 
-    let mut root_schema = state.root_schema.take().ok_or_else(|| {
-        SchemaError::internal("No schema result produced during parsing")
-    })?;
+    let mut root_schema = state
+        .root_schema
+        .take()
+        .ok_or_else(|| SchemaError::internal("No schema result produced during parsing"))?;
     drop(state);
 
     schema_set.parsing_errors.extend(parsing_errors);
@@ -427,11 +428,7 @@ fn validate_element_attributes(
     }
 }
 
-fn intern_attribute_values(
-    local_name: &str,
-    attrs: &AttributeMap,
-    name_table: &mut NameTable,
-) {
+fn intern_attribute_values(local_name: &str, attrs: &AttributeMap, name_table: &mut NameTable) {
     fn add_if_present(attrs: &AttributeMap, name_table: &mut NameTable, attr: &str) {
         if let Some(value) = attrs.get_value_by_name(name_table, attr) {
             name_table.add(value);
@@ -484,14 +481,13 @@ fn handle_start_element(
 
     // First, process namespace declarations from attributes
     for attr_result in element.attributes() {
-        let attr = attr_result.map_err(|e| {
-            SchemaError::xml(format!("Attribute error: {}", e), None)
-        })?;
+        let attr =
+            attr_result.map_err(|e| SchemaError::xml(format!("Attribute error: {}", e), None))?;
 
         let attr_name = attr.key.as_ref();
-        let attr_value = attr.unescape_value().map_err(|e| {
-            SchemaError::xml(format!("Attribute value error: {}", e), None)
-        })?;
+        let attr_value = attr
+            .unescape_value()
+            .map_err(|e| SchemaError::xml(format!("Attribute value error: {}", e), None))?;
 
         // Check for xmlns declarations
         if attr_name == b"xmlns" {
@@ -520,10 +516,7 @@ fn handle_start_element(
         if local_name != xsd_names::SCHEMA || !state.is_in_xsd_namespace(element_ns) {
             return Err(SchemaError::structural(
                 "sch-props-correct",
-                format!(
-                    "Root element must be xs:schema, found '{}'",
-                    local_name
-                ),
+                format!("Root element must be xs:schema, found '{}'", local_name),
                 None,
             ));
         }
@@ -536,7 +529,8 @@ fn handle_start_element(
         &mut state.ns_context,
         source_ref.clone(),
     )?;
-    let (xsd_attrs, foreign_attrs) = categorize_attributes(parsed_attrs, state.ns_context.name_table());
+    let (xsd_attrs, foreign_attrs) =
+        categorize_attributes(parsed_attrs, state.ns_context.name_table());
     let attr_map = AttributeMap::new(xsd_attrs);
 
     // Chameleon include (§4.2.3 clause 2.3): if this is the root `<xs:schema>`
@@ -557,7 +551,9 @@ fn handle_start_element(
                 .is_some();
             let default_is_null = state.ns_context.default_namespace().is_none();
             if !has_own_tns && default_is_null {
-                state.ns_context.set_default_namespace_id(Some(chameleon_ns));
+                state
+                    .ns_context
+                    .set_default_namespace_id(Some(chameleon_ns));
             }
         }
     }
@@ -567,7 +563,12 @@ fn handle_start_element(
         false
     } else {
         let ns_snapshot = state.ns_context.snapshot();
-        should_skip_for_vc(&foreign_attrs, state.ns_context.name_table(), &ns_snapshot, state.config.xsd_version)?
+        should_skip_for_vc(
+            &foreign_attrs,
+            state.ns_context.name_table(),
+            &ns_snapshot,
+            state.config.xsd_version,
+        )?
     };
     if state.frame_stack.is_empty() {
         if vc_excluded {
@@ -674,7 +675,12 @@ fn handle_start_element(
     }
 
     // Perform element-specific structural validation
-    if let Err(e) = validate_element_attributes(local_name, &attr_map, state.ns_context.name_table(), &validation_ctx) {
+    if let Err(e) = validate_element_attributes(
+        local_name,
+        &attr_map,
+        state.ns_context.name_table(),
+        &validation_ctx,
+    ) {
         state.recover_or_fail(e)?;
     }
 
@@ -682,11 +688,15 @@ fn handle_start_element(
     // must be a valid xs:language value. Empty / whitespace-only values are
     // rejected by the language regex.
     if matches!(local_name, xsd_names::DOCUMENTATION | xsd_names::APPINFO) {
-        let xml_ns = state.ns_context.name_table().get(crate::namespace::XML_NAMESPACE);
+        let xml_ns = state
+            .ns_context
+            .name_table()
+            .get(crate::namespace::XML_NAMESPACE);
         let lang_local = state.ns_context.name_table().get("lang");
         if let (Some(xml_ns), Some(lang_local)) = (xml_ns, lang_local) {
             for fa in &foreign_attrs {
-                if fa.namespace == Some(xml_ns) && fa.local_name == lang_local
+                if fa.namespace == Some(xml_ns)
+                    && fa.local_name == lang_local
                     && !crate::types::validators::is_valid_language(
                         &crate::types::facets::normalize_whitespace(
                             &fa.value,
@@ -711,7 +721,8 @@ fn handle_start_element(
     if is_in_xsd_ns {
         for attr_name_id in attr_map.names() {
             let attr_name = state.ns_context.name_table().resolve(attr_name_id);
-            if let Err(e) = validate_xsd_version_attribute(&attr_name, local_name, &validation_ctx) {
+            if let Err(e) = validate_xsd_version_attribute(&attr_name, local_name, &validation_ctx)
+            {
                 state.recover_or_fail(e)?;
             }
         }
@@ -813,9 +824,7 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
     let frame = match state.frame_stack.pop() {
         Some(f) => f,
         None => {
-            return Err(SchemaError::internal(
-                "End element with no frame on stack",
-            ));
+            return Err(SchemaError::internal("End element with no frame on stack"));
         }
     };
 
@@ -869,9 +878,9 @@ fn handle_text(
     text: &quick_xml::events::BytesText,
     span: SourceSpan,
 ) -> SchemaResult<()> {
-    let text_content = text.unescape().map_err(|e| {
-        SchemaError::xml(format!("Text content error: {}", e), None)
-    })?;
+    let text_content = text
+        .unescape()
+        .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
 
     // Pass text to current frame if it accepts text content; otherwise reject
     // any non-whitespace text. XSD elements like xs:notation, xs:complexType,
@@ -962,7 +971,8 @@ fn should_skip_for_vc(
                         if xsd_version == XsdVersion::V1_1 {
                             return Err(err_versioning(format!(
                                 "Invalid vc:{} value '{}': must be a valid xs:decimal",
-                                local, attr.value.trim()
+                                local,
+                                attr.value.trim()
                             )));
                         }
                         // XSD 1.0: vc: attributes are informational only; ignore invalid values
@@ -987,7 +997,14 @@ fn should_skip_for_vc(
                 let mut total_count = 0usize;
                 for token in attr.value.split_whitespace() {
                     total_count += 1;
-                    if vc_token_available(token, local, is_type_check, ns_snapshot, name_table, xsd_version)? {
+                    if vc_token_available(
+                        token,
+                        local,
+                        is_type_check,
+                        ns_snapshot,
+                        name_table,
+                        xsd_version,
+                    )? {
                         available_count += 1;
                     }
                 }
@@ -1244,7 +1261,10 @@ mod tests {
         );
         assert!(default_attrs.namespace_uri.is_none());
 
-        let default_open = doc.default_open_content.as_ref().expect("defaultOpenContent");
+        let default_open = doc
+            .default_open_content
+            .as_ref()
+            .expect("defaultOpenContent");
         assert_eq!(default_open.mode, OpenContentMode::Suffix);
         let wildcard = default_open.wildcard.as_ref().expect("wildcard");
         assert!(matches!(
@@ -1269,11 +1289,15 @@ mod tests {
         let root = schema_set.arenas.get_element(root_key).unwrap();
         assert_eq!(root.substitution_group.len(), 2);
         assert_eq!(
-            schema_set.name_table.resolve(root.substitution_group[0].local_name),
+            schema_set
+                .name_table
+                .resolve(root.substitution_group[0].local_name),
             "head1"
         );
         assert_eq!(
-            schema_set.name_table.resolve(root.substitution_group[1].local_name),
+            schema_set
+                .name_table
+                .resolve(root.substitution_group[1].local_name),
             "head2"
         );
 
@@ -1369,7 +1393,10 @@ mod tests {
             _ => panic!("expected complex type for Base"),
         }
 
-        let simple_id = schema_set.name_table.get("Simple").expect("name id for Simple");
+        let simple_id = schema_set
+            .name_table
+            .get("Simple")
+            .expect("name id for Simple");
         let simple_key = ns_table.types.get(&simple_id).expect("type key for Simple");
         match simple_key {
             TypeKey::Simple(key) => {
@@ -1416,51 +1443,99 @@ mod tests {
         // Element: final="" → empty (NOT restriction)
         let unlocked_id = schema_set.name_table.get("unlocked").expect("unlocked");
         let unlocked_key = ns_table.elements.get(&unlocked_id).expect("element key");
-        let unlocked = schema_set.arenas.elements.get(*unlocked_key).expect("element");
-        assert!(unlocked.final_derivation.is_empty(),
-            "final=\"\" must produce empty set, not inherit finalDefault");
+        let unlocked = schema_set
+            .arenas
+            .elements
+            .get(*unlocked_key)
+            .expect("element");
+        assert!(
+            unlocked.final_derivation.is_empty(),
+            "final=\"\" must produce empty set, not inherit finalDefault"
+        );
 
         // Element: absent final → restriction (from finalDefault)
         let inherited_id = schema_set.name_table.get("inherited").expect("inherited");
         let inherited_key = ns_table.elements.get(&inherited_id).expect("element key");
-        let inherited = schema_set.arenas.elements.get(*inherited_key).expect("element");
-        assert!(inherited.final_derivation.contains_restriction(),
-            "absent final= must inherit finalDefault=restriction");
+        let inherited = schema_set
+            .arenas
+            .elements
+            .get(*inherited_key)
+            .expect("element");
+        assert!(
+            inherited.final_derivation.contains_restriction(),
+            "absent final= must inherit finalDefault=restriction"
+        );
 
         // ComplexType: final="" → empty
-        let ut_id = schema_set.name_table.get("UnlockedType").expect("UnlockedType");
+        let ut_id = schema_set
+            .name_table
+            .get("UnlockedType")
+            .expect("UnlockedType");
         let ut_key = ns_table.types.get(&ut_id).expect("type key");
         if let crate::ids::TypeKey::Complex(key) = ut_key {
-            let ct = schema_set.arenas.complex_types.get(*key).expect("complex type");
-            assert!(ct.final_derivation.is_empty(),
-                "complexType final=\"\" must not inherit finalDefault");
+            let ct = schema_set
+                .arenas
+                .complex_types
+                .get(*key)
+                .expect("complex type");
+            assert!(
+                ct.final_derivation.is_empty(),
+                "complexType final=\"\" must not inherit finalDefault"
+            );
         }
 
         // ComplexType: absent final → restriction
-        let it_id = schema_set.name_table.get("InheritedType").expect("InheritedType");
+        let it_id = schema_set
+            .name_table
+            .get("InheritedType")
+            .expect("InheritedType");
         let it_key = ns_table.types.get(&it_id).expect("type key");
         if let crate::ids::TypeKey::Complex(key) = it_key {
-            let ct = schema_set.arenas.complex_types.get(*key).expect("complex type");
-            assert!(ct.final_derivation.contains_restriction(),
-                "complexType absent final= must inherit finalDefault");
+            let ct = schema_set
+                .arenas
+                .complex_types
+                .get(*key)
+                .expect("complex type");
+            assert!(
+                ct.final_derivation.contains_restriction(),
+                "complexType absent final= must inherit finalDefault"
+            );
         }
 
         // SimpleType: final="" → empty
-        let us_id = schema_set.name_table.get("UnlockedSimple").expect("UnlockedSimple");
+        let us_id = schema_set
+            .name_table
+            .get("UnlockedSimple")
+            .expect("UnlockedSimple");
         let us_key = ns_table.types.get(&us_id).expect("type key");
         if let crate::ids::TypeKey::Simple(key) = us_key {
-            let st = schema_set.arenas.simple_types.get(*key).expect("simple type");
-            assert!(st.final_derivation.is_empty(),
-                "simpleType final=\"\" must not inherit finalDefault");
+            let st = schema_set
+                .arenas
+                .simple_types
+                .get(*key)
+                .expect("simple type");
+            assert!(
+                st.final_derivation.is_empty(),
+                "simpleType final=\"\" must not inherit finalDefault"
+            );
         }
 
         // SimpleType: absent final → restriction
-        let is_id = schema_set.name_table.get("InheritedSimple").expect("InheritedSimple");
+        let is_id = schema_set
+            .name_table
+            .get("InheritedSimple")
+            .expect("InheritedSimple");
         let is_key = ns_table.types.get(&is_id).expect("type key");
         if let crate::ids::TypeKey::Simple(key) = is_key {
-            let st = schema_set.arenas.simple_types.get(*key).expect("simple type");
-            assert!(st.final_derivation.contains_restriction(),
-                "simpleType absent final= must inherit finalDefault");
+            let st = schema_set
+                .arenas
+                .simple_types
+                .get(*key)
+                .expect("simple type");
+            assert!(
+                st.final_derivation.contains_restriction(),
+                "simpleType absent final= must inherit finalDefault"
+            );
         }
     }
 
@@ -1473,9 +1548,10 @@ mod tests {
         </xs:schema>"#;
         let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
         assert!(result.is_ok());
-        assert!(schema_set.parsing_errors.iter().any(|e| {
-            e.to_string().contains("Duplicate xs:ID value 'foo123'")
-        }));
+        assert!(schema_set
+            .parsing_errors
+            .iter()
+            .any(|e| { e.to_string().contains("Duplicate xs:ID value 'foo123'") }));
     }
 
     #[test]
@@ -1498,8 +1574,9 @@ mod tests {
         </xs:schema>"#;
         let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
         assert!(result.is_ok());
-        assert!(schema_set.parsing_errors.iter().any(|e| {
-            e.to_string().contains("not a valid xs:ID")
-        }));
+        assert!(schema_set
+            .parsing_errors
+            .iter()
+            .any(|e| { e.to_string().contains("not a valid xs:ID") }));
     }
 }

@@ -306,14 +306,12 @@ impl XPathComparer {
         y: &XmlItem<N>,
     ) -> Result<Ordering, XPathError> {
         match (x, y) {
-            (XmlItem::Node(nav1), XmlItem::Node(nav2)) => {
-                match nav1.compare_position(nav2) {
-                    XmlNodeOrder::Before => Ok(Ordering::Less),
-                    XmlNodeOrder::After => Ok(Ordering::Greater),
-                    XmlNodeOrder::Same => Ok(Ordering::Equal),
-                    XmlNodeOrder::Unknown => Ok(Ordering::Equal),
-                }
-            }
+            (XmlItem::Node(nav1), XmlItem::Node(nav2)) => match nav1.compare_position(nav2) {
+                XmlNodeOrder::Before => Ok(Ordering::Less),
+                XmlNodeOrder::After => Ok(Ordering::Greater),
+                XmlNodeOrder::Same => Ok(Ordering::Equal),
+                XmlNodeOrder::Unknown => Ok(Ordering::Equal),
+            },
             _ => Err(XPathError::XPTY0004 {
                 expected: "node".to_string(),
                 found: "atomic value".to_string(),

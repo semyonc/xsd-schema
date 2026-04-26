@@ -402,7 +402,11 @@ impl<N: DomNavigator> FunctionSet<N> {
     ///     Ok(XPathValue::double(d * 2.0))
     /// });
     /// ```
-    pub fn register<F>(&mut self, signature: DynamicFunctionSignature, implementation: F) -> FunctionHandle
+    pub fn register<F>(
+        &mut self,
+        signature: DynamicFunctionSignature,
+        implementation: F,
+    ) -> FunctionHandle
     where
         F: Fn(&mut DynamicContext<'_, N>, Vec<XPathValue<N>>) -> Result<XPathValue<N>, XPathError>
             + Send
@@ -422,11 +426,13 @@ impl<N: DomNavigator> FunctionSet<N> {
             }
             FunctionArity::Range(min, max) => {
                 for arity in min..=max {
-                    self.lookup.insert((ns.clone(), local.clone(), arity), handle);
+                    self.lookup
+                        .insert((ns.clone(), local.clone(), arity), handle);
                 }
             }
             FunctionArity::Variadic(min) => {
-                self.variadic_lookup.insert((ns.clone(), local.clone()), (handle, min));
+                self.variadic_lookup
+                    .insert((ns.clone(), local.clone()), (handle, min));
             }
         }
 
@@ -491,7 +497,9 @@ impl<N: DomNavigator> FunctionCatalog for FunctionSet<N> {
     fn get_signature(&self, handle: FunctionHandle) -> Option<DynamicFunctionSignature> {
         if let Some(index) = handle.custom_index() {
             // Custom function
-            self.custom_functions.get(index).map(|e| e.signature.clone())
+            self.custom_functions
+                .get(index)
+                .map(|e| e.signature.clone())
         } else {
             // Built-in function
             FUNCTION_REGISTRY
@@ -528,13 +536,33 @@ impl<N: DomNavigator> FunctionEvaluator<N> for FunctionSet<N> {
 
 /// Static list of XPath 1.0 core function names (27 functions).
 const XPATH10_FUNCTIONS: &[&str] = &[
-    "last", "position", "count", "id",
-    "name", "local-name", "namespace-uri", "lang",
-    "string", "concat", "starts-with", "contains",
-    "substring-before", "substring-after", "substring",
-    "string-length", "normalize-space", "translate",
-    "boolean", "not", "true", "false",
-    "number", "sum", "floor", "ceiling", "round",
+    "last",
+    "position",
+    "count",
+    "id",
+    "name",
+    "local-name",
+    "namespace-uri",
+    "lang",
+    "string",
+    "concat",
+    "starts-with",
+    "contains",
+    "substring-before",
+    "substring-after",
+    "substring",
+    "string-length",
+    "normalize-space",
+    "translate",
+    "boolean",
+    "not",
+    "true",
+    "false",
+    "number",
+    "sum",
+    "floor",
+    "ceiling",
+    "round",
 ];
 
 /// Catalog that restricts available functions to the XPath 1.0 core set.
@@ -619,7 +647,11 @@ impl<N: DomNavigator> FunctionEvaluator<N> for XPath10Evaluator {
                         let s = atomize::to_string_10(&args[0]);
                         Ok(XPathValue::string(s))
                     }
-                    _ => Err(XPathError::wrong_number_of_arguments("string", 1, args.len())),
+                    _ => Err(XPathError::wrong_number_of_arguments(
+                        "string",
+                        1,
+                        args.len(),
+                    )),
                 }
             }
 
@@ -642,7 +674,11 @@ impl<N: DomNavigator> FunctionEvaluator<N> for XPath10Evaluator {
                         let d = atomize::to_number_10(&args[0]);
                         Ok(XPathValue::double(d))
                     }
-                    _ => Err(XPathError::wrong_number_of_arguments("number", 1, args.len())),
+                    _ => Err(XPathError::wrong_number_of_arguments(
+                        "number",
+                        1,
+                        args.len(),
+                    )),
                 }
             }
 
@@ -656,10 +692,7 @@ impl<N: DomNavigator> FunctionEvaluator<N> for XPath10Evaluator {
             }
 
             // Numeric functions — ensure double result in 1.0
-            FunctionId::Sum
-            | FunctionId::Floor
-            | FunctionId::Ceiling
-            | FunctionId::Round => {
+            FunctionId::Sum | FunctionId::Floor | FunctionId::Ceiling | FunctionId::Round => {
                 let result = eval_function(id, ctx, args)?;
                 Ok(wrap_as_double(result))
             }
@@ -746,9 +779,7 @@ mod tests {
             SequenceType::string(),
         );
 
-        let handle = functions.register(sig, |_ctx, _args| {
-            Ok(XPathValue::string("custom result"))
-        });
+        let handle = functions.register(sig, |_ctx, _args| Ok(XPathValue::string("custom result")));
 
         assert!(handle.is_custom());
         assert_eq!(functions.custom_count(), 1);
@@ -859,9 +890,9 @@ mod tests {
     #[test]
     fn test_function_set_eval_builtin() {
         use crate::namespace::table::NameTable;
+        use crate::types::value::XmlValue;
         use crate::xpath::context::{DynamicContext, XPathContext};
         use crate::xpath::iterator::XmlItem;
-        use crate::types::value::XmlValue;
 
         let functions: FunctionSet<RoXmlNavigator<'static>> = FunctionSet::with_builtins();
 
@@ -886,7 +917,10 @@ mod tests {
 
         // Evaluate
         let result = functions.eval(handle, &mut dyn_ctx, args).unwrap();
-        assert_eq!(result.as_integer().map(|i| i.to_string()), Some("3".to_string()));
+        assert_eq!(
+            result.as_integer().map(|i| i.to_string()),
+            Some("3".to_string())
+        );
     }
 
     #[test]
@@ -899,22 +933,38 @@ mod tests {
             "multi",
             1,
             3,
-            vec![SequenceType::string(), SequenceType::string(), SequenceType::string()],
+            vec![
+                SequenceType::string(),
+                SequenceType::string(),
+                SequenceType::string(),
+            ],
             SequenceType::string(),
         );
 
-        let handle = functions.register(sig, |_ctx, args| {
-            Ok(XPathValue::integer(args.len() as i64))
-        });
+        let handle =
+            functions.register(sig, |_ctx, args| Ok(XPathValue::integer(args.len() as i64)));
 
         // Should match arities 1, 2, and 3
-        assert_eq!(functions.lookup("http://example.com/ext", "multi", 1), Some(handle));
-        assert_eq!(functions.lookup("http://example.com/ext", "multi", 2), Some(handle));
-        assert_eq!(functions.lookup("http://example.com/ext", "multi", 3), Some(handle));
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "multi", 1),
+            Some(handle)
+        );
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "multi", 2),
+            Some(handle)
+        );
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "multi", 3),
+            Some(handle)
+        );
 
         // Should not match arity 0 or 4
-        assert!(functions.lookup("http://example.com/ext", "multi", 0).is_none());
-        assert!(functions.lookup("http://example.com/ext", "multi", 4).is_none());
+        assert!(functions
+            .lookup("http://example.com/ext", "multi", 0)
+            .is_none());
+        assert!(functions
+            .lookup("http://example.com/ext", "multi", 4)
+            .is_none());
     }
 
     #[test]
@@ -930,18 +980,30 @@ mod tests {
             SequenceType::integer(),
         );
 
-        let handle = functions.register(sig, |_ctx, args| {
-            Ok(XPathValue::integer(args.len() as i64))
-        });
+        let handle =
+            functions.register(sig, |_ctx, args| Ok(XPathValue::integer(args.len() as i64)));
 
         // Should match arities >= 2
-        assert_eq!(functions.lookup("http://example.com/ext", "varargs", 2), Some(handle));
-        assert_eq!(functions.lookup("http://example.com/ext", "varargs", 5), Some(handle));
-        assert_eq!(functions.lookup("http://example.com/ext", "varargs", 100), Some(handle));
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "varargs", 2),
+            Some(handle)
+        );
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "varargs", 5),
+            Some(handle)
+        );
+        assert_eq!(
+            functions.lookup("http://example.com/ext", "varargs", 100),
+            Some(handle)
+        );
 
         // Should not match arities < 2
-        assert!(functions.lookup("http://example.com/ext", "varargs", 0).is_none());
-        assert!(functions.lookup("http://example.com/ext", "varargs", 1).is_none());
+        assert!(functions
+            .lookup("http://example.com/ext", "varargs", 0)
+            .is_none());
+        assert!(functions
+            .lookup("http://example.com/ext", "varargs", 1)
+            .is_none());
     }
 
     // ========================================================================
@@ -978,17 +1040,42 @@ mod tests {
         let catalog = XPath10Catalog;
         // Verify all 27 core functions resolve
         let functions_with_arity: &[(&str, usize)] = &[
-            ("last", 0), ("position", 0), ("count", 1), ("id", 1),
-            ("name", 0), ("local-name", 0), ("namespace-uri", 0), ("lang", 1),
-            ("string", 0), ("concat", 2), ("starts-with", 2), ("contains", 2),
-            ("substring-before", 2), ("substring-after", 2), ("substring", 2),
-            ("string-length", 0), ("normalize-space", 0), ("translate", 3),
-            ("boolean", 1), ("not", 1), ("true", 0), ("false", 0),
-            ("number", 0), ("sum", 1), ("floor", 1), ("ceiling", 1), ("round", 1),
+            ("last", 0),
+            ("position", 0),
+            ("count", 1),
+            ("id", 1),
+            ("name", 0),
+            ("local-name", 0),
+            ("namespace-uri", 0),
+            ("lang", 1),
+            ("string", 0),
+            ("concat", 2),
+            ("starts-with", 2),
+            ("contains", 2),
+            ("substring-before", 2),
+            ("substring-after", 2),
+            ("substring", 2),
+            ("string-length", 0),
+            ("normalize-space", 0),
+            ("translate", 3),
+            ("boolean", 1),
+            ("not", 1),
+            ("true", 0),
+            ("false", 0),
+            ("number", 0),
+            ("sum", 1),
+            ("floor", 1),
+            ("ceiling", 1),
+            ("round", 1),
         ];
         for (name, arity) in functions_with_arity {
             let handle = catalog.lookup("", name, *arity);
-            assert!(handle.is_some(), "XPath 1.0 function '{}' with arity {} not found", name, arity);
+            assert!(
+                handle.is_some(),
+                "XPath 1.0 function '{}' with arity {} not found",
+                name,
+                arity
+            );
         }
     }
 
@@ -999,9 +1086,9 @@ mod tests {
     #[test]
     fn test_xpath10_evaluator_count_returns_double() {
         use crate::namespace::table::NameTable;
+        use crate::types::value::XmlValue;
         use crate::xpath::context::{DynamicContext, XPathContext};
         use crate::xpath::iterator::XmlItem;
-        use crate::types::value::XmlValue;
 
         let evaluator = XPath10Evaluator;
 
@@ -1046,10 +1133,7 @@ mod tests {
         let mut dyn_ctx = DynamicContext::new(&static_ctx, 0);
 
         // Sequence of two nodes — XPath 1.0 string() should use first node
-        let node_seq = XPathValue::from_sequence(vec![
-            XmlItem::Node(nav_a),
-            XmlItem::Node(nav_b),
-        ]);
+        let node_seq = XPathValue::from_sequence(vec![XmlItem::Node(nav_a), XmlItem::Node(nav_b)]);
         let args = vec![node_seq];
         let handle = FunctionHandle::from(FunctionId::String);
 

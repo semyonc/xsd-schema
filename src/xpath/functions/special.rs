@@ -28,7 +28,11 @@ pub fn position<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("position", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "position",
+            0,
+            args.len(),
+        ));
     }
     // Context must be defined for position()
     if context.context_item.is_none() && context.context_position == 0 {
@@ -72,7 +76,11 @@ pub fn trace<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
-        return Err(XPathError::wrong_number_of_arguments("trace", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "trace",
+            2,
+            args.len(),
+        ));
     }
 
     // Get optional label (second argument)
@@ -140,10 +148,7 @@ pub fn data<N: DomNavigator>(
     let atomized = atomize_sequence(arg)?;
 
     // Convert back to XPathValue
-    let items: Vec<XmlItem<N>> = atomized
-        .into_iter()
-        .map(XmlItem::Atomic)
-        .collect();
+    let items: Vec<XmlItem<N>> = atomized.into_iter().map(XmlItem::Atomic).collect();
 
     Ok(XPathValue::from_sequence(items))
 }
@@ -157,7 +162,11 @@ pub fn default_collation<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("default-collation", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "default-collation",
+            0,
+            args.len(),
+        ));
     }
     Ok(XPathValue::string(DEFAULT_COLLATION))
 }
@@ -166,16 +175,15 @@ pub fn default_collation<N: DomNavigator>(
 mod tests {
     use super::*;
     use crate::namespace::table::NameTable;
+    use crate::types::value::XmlValue;
     use crate::xpath::context::XPathContext;
     use crate::xpath::RoXmlNavigator;
-    use crate::types::value::XmlValue;
 
     fn create_context<'a>(names: &'a NameTable) -> DynamicContext<'a, RoXmlNavigator<'a>> {
         let static_ctx = XPathContext::new(names);
         // Use Box::leak for tests only to get 'a lifetime
         let static_ctx = Box::leak(Box::new(static_ctx));
-        DynamicContext::new(static_ctx, 0)
-            .with_position(3, 10)
+        DynamicContext::new(static_ctx, 0).with_position(3, 10)
     }
 
     #[test]
@@ -186,7 +194,10 @@ mod tests {
 
         let result = position(&mut ctx, vec![]).unwrap();
         if let XPathValue::Item(XmlItem::Atomic(value)) = result {
-            assert_eq!(value.as_integer().map(|i| i.to_string()), Some("5".to_string()));
+            assert_eq!(
+                value.as_integer().map(|i| i.to_string()),
+                Some("5".to_string())
+            );
         } else {
             panic!("Expected integer");
         }
@@ -200,7 +211,10 @@ mod tests {
 
         let result = last(&mut ctx, vec![]).unwrap();
         if let XPathValue::Item(XmlItem::Atomic(value)) = result {
-            assert_eq!(value.as_integer().map(|i| i.to_string()), Some("10".to_string()));
+            assert_eq!(
+                value.as_integer().map(|i| i.to_string()),
+                Some("10".to_string())
+            );
         } else {
             panic!("Expected integer");
         }

@@ -159,16 +159,23 @@ pub fn record_provenance(
     acting_doc_id: Option<DocumentId>,
     action: CompositionAction,
 ) {
-    let identity = ComponentIdentity { kind, name, namespace };
+    let identity = ComponentIdentity {
+        kind,
+        name,
+        namespace,
+    };
     let origin = ComponentOrigin {
         owner_doc: acting_doc_id,
         identity,
     };
-    effective_components.insert(identity, EffectiveComponent {
-        key,
-        origin,
-        action,
-    });
+    effective_components.insert(
+        identity,
+        EffectiveComponent {
+            key,
+            origin,
+            action,
+        },
+    );
 }
 
 /// Build a [`CompositionAction::Redefined`] action.
@@ -179,10 +186,17 @@ pub fn redefined_action(
     namespace: Option<NameId>,
     target_doc_id: Option<DocumentId>,
 ) -> CompositionAction {
-    let identity = ComponentIdentity { kind, name, namespace };
+    let identity = ComponentIdentity {
+        kind,
+        name,
+        namespace,
+    };
     CompositionAction::Redefined {
         from_doc: redefining_doc_id,
-        replaced: ComponentOrigin { owner_doc: target_doc_id, identity },
+        replaced: ComponentOrigin {
+            owner_doc: target_doc_id,
+            identity,
+        },
     }
 }
 
@@ -195,10 +209,17 @@ pub fn overridden_action(
     namespace: Option<NameId>,
     target_doc_id: Option<DocumentId>,
 ) -> CompositionAction {
-    let identity = ComponentIdentity { kind, name, namespace };
+    let identity = ComponentIdentity {
+        kind,
+        name,
+        namespace,
+    };
     CompositionAction::Overridden {
         from_doc: overriding_doc_id,
-        replaced: ComponentOrigin { owner_doc: target_doc_id, identity },
+        replaced: ComponentOrigin {
+            owner_doc: target_doc_id,
+            identity,
+        },
     }
 }
 
@@ -222,19 +243,35 @@ impl DocumentComponentIndex {
     }
 
     /// Raw lookup by kind, namespace, and name.
-    fn get(&self, kind: ComponentKind, namespace: Option<NameId>, name: NameId) -> Option<&ComponentKey> {
-        self.index.get(&ComponentIdentity { kind, name, namespace })
+    fn get(
+        &self,
+        kind: ComponentKind,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<&ComponentKey> {
+        self.index.get(&ComponentIdentity {
+            kind,
+            name,
+            namespace,
+        })
     }
 
     /// Look up a type by namespace and local name (both simple and complex).
     pub fn lookup_type(&self, namespace: Option<NameId>, name: NameId) -> Option<TypeKey> {
         self.lookup_simple_type(namespace, name)
             .map(TypeKey::Simple)
-            .or_else(|| self.lookup_complex_type(namespace, name).map(TypeKey::Complex))
+            .or_else(|| {
+                self.lookup_complex_type(namespace, name)
+                    .map(TypeKey::Complex)
+            })
     }
 
     /// Look up a simple type by namespace and local name.
-    pub fn lookup_simple_type(&self, namespace: Option<NameId>, name: NameId) -> Option<SimpleTypeKey> {
+    pub fn lookup_simple_type(
+        &self,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<SimpleTypeKey> {
         match self.get(ComponentKind::SimpleType, namespace, name) {
             Some(&ComponentKey::Type(TypeKey::Simple(key))) => Some(key),
             _ => None,
@@ -242,7 +279,11 @@ impl DocumentComponentIndex {
     }
 
     /// Look up a complex type by namespace and local name.
-    pub fn lookup_complex_type(&self, namespace: Option<NameId>, name: NameId) -> Option<ComplexTypeKey> {
+    pub fn lookup_complex_type(
+        &self,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<ComplexTypeKey> {
         match self.get(ComponentKind::ComplexType, namespace, name) {
             Some(&ComponentKey::Type(TypeKey::Complex(key))) => Some(key),
             _ => None,
@@ -258,7 +299,11 @@ impl DocumentComponentIndex {
     }
 
     /// Look up an attribute by namespace and local name.
-    pub fn lookup_attribute(&self, namespace: Option<NameId>, name: NameId) -> Option<AttributeKey> {
+    pub fn lookup_attribute(
+        &self,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<AttributeKey> {
         match self.get(ComponentKind::Attribute, namespace, name) {
             Some(&ComponentKey::Attribute(key)) => Some(key),
             _ => None,
@@ -266,7 +311,11 @@ impl DocumentComponentIndex {
     }
 
     /// Look up a model group by namespace and local name.
-    pub fn lookup_model_group(&self, namespace: Option<NameId>, name: NameId) -> Option<ModelGroupKey> {
+    pub fn lookup_model_group(
+        &self,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<ModelGroupKey> {
         match self.get(ComponentKind::ModelGroup, namespace, name) {
             Some(&ComponentKey::ModelGroup(key)) => Some(key),
             _ => None,
@@ -274,7 +323,11 @@ impl DocumentComponentIndex {
     }
 
     /// Look up an attribute group by namespace and local name.
-    pub fn lookup_attribute_group(&self, namespace: Option<NameId>, name: NameId) -> Option<AttributeGroupKey> {
+    pub fn lookup_attribute_group(
+        &self,
+        namespace: Option<NameId>,
+        name: NameId,
+    ) -> Option<AttributeGroupKey> {
         match self.get(ComponentKind::AttributeGroup, namespace, name) {
             Some(&ComponentKey::AttributeGroup(key)) => Some(key),
             _ => None,

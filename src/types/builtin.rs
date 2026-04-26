@@ -18,15 +18,15 @@
 
 use std::collections::HashMap;
 
+use super::{BuiltInType, XmlTypeCode};
+use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
 use crate::ids::{AttributeKey, ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
 use crate::namespace::table::well_known;
-use crate::schema::model::{SchemaSet, XsdVersion};
-use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
 use crate::parser::frames::{
     ComplexContentDefResult, ComplexContentResult, DerivationMethod, ParticleResult, ParticleTerm,
     ProcessContents, WildcardNamespace, WildcardResult,
 };
-use super::{XmlTypeCode, BuiltInType};
+use crate::schema::model::{SchemaSet, XsdVersion};
 
 /// Well-known built-in type IDs for fast access.
 ///
@@ -357,19 +357,25 @@ impl BuiltinTypes {
         let entities = create_type(BuiltInType::ENTITIES);
 
         // XSD 1.1 types (only if XSD 1.1 mode)
-        let (any_atomic_type, untyped_atomic, year_month_duration, day_time_duration, datetime_stamp, error) =
-            if xsd_version == XsdVersion::V1_1 {
-                (
-                    Some(create_type(BuiltInType::AnyAtomicType)),
-                    Some(create_type(BuiltInType::UntypedAtomic)),
-                    Some(create_type(BuiltInType::YearMonthDuration)),
-                    Some(create_type(BuiltInType::DayTimeDuration)),
-                    Some(create_type(BuiltInType::DateTimeStamp)),
-                    Some(create_type(BuiltInType::XsError)),
-                )
-            } else {
-                (None, None, None, None, None, None)
-            };
+        let (
+            any_atomic_type,
+            untyped_atomic,
+            year_month_duration,
+            day_time_duration,
+            datetime_stamp,
+            error,
+        ) = if xsd_version == XsdVersion::V1_1 {
+            (
+                Some(create_type(BuiltInType::AnyAtomicType)),
+                Some(create_type(BuiltInType::UntypedAtomic)),
+                Some(create_type(BuiltInType::YearMonthDuration)),
+                Some(create_type(BuiltInType::DayTimeDuration)),
+                Some(create_type(BuiltInType::DateTimeStamp)),
+                Some(create_type(BuiltInType::XsError)),
+            )
+        } else {
+            (None, None, None, None, None, None)
+        };
 
         // Anonymous list(anyURI) for xsi:schemaLocation built-in attribute type.
         // Created after `create_type` closure is no longer needed.
@@ -493,83 +499,102 @@ impl BuiltinTypes {
 
         // Allocate built-in XSI attribute declarations (§3.2.7)
         let xsi_ns = Some(well_known::XSI_NAMESPACE);
-        let xsi_type_attr = schema_set.arenas.alloc_attribute(crate::arenas::AttributeDeclData {
-            name: Some(well_known::XSI_TYPE),
-            target_namespace: xsi_ns,
-            ref_name: None,
-            type_ref: None,
-            inline_type: None,
-            default_value: None,
-            fixed_value: None,
-            use_kind: None,
-            form: None,
-            inheritable: false,
-            id: None,
-            annotation: None,
-            source: None,
-            resolved_type: Some(TypeKey::Simple(qname)),
-            resolved_ref: None,
-        });
-        let xsi_nil_attr = schema_set.arenas.alloc_attribute(crate::arenas::AttributeDeclData {
-            name: Some(well_known::XSI_NIL),
-            target_namespace: xsi_ns,
-            ref_name: None,
-            type_ref: None,
-            inline_type: None,
-            default_value: None,
-            fixed_value: None,
-            use_kind: None,
-            form: None,
-            inheritable: false,
-            id: None,
-            annotation: None,
-            source: None,
-            resolved_type: Some(TypeKey::Simple(boolean)),
-            resolved_ref: None,
-        });
-        let xsi_schema_location_attr = schema_set.arenas.alloc_attribute(crate::arenas::AttributeDeclData {
-            name: Some(well_known::XSI_SCHEMA_LOCATION),
-            target_namespace: xsi_ns,
-            ref_name: None,
-            type_ref: None,
-            inline_type: None,
-            default_value: None,
-            fixed_value: None,
-            use_kind: None,
-            form: None,
-            inheritable: false,
-            id: None,
-            annotation: None,
-            source: None,
-            resolved_type: Some(TypeKey::Simple(xsi_schema_location_type)),
-            resolved_ref: None,
-        });
-        let xsi_no_namespace_schema_location_attr = schema_set.arenas.alloc_attribute(crate::arenas::AttributeDeclData {
-            name: Some(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION),
-            target_namespace: xsi_ns,
-            ref_name: None,
-            type_ref: None,
-            inline_type: None,
-            default_value: None,
-            fixed_value: None,
-            use_kind: None,
-            form: None,
-            inheritable: false,
-            id: None,
-            annotation: None,
-            source: None,
-            resolved_type: Some(TypeKey::Simple(any_uri)),
-            resolved_ref: None,
-        });
+        let xsi_type_attr = schema_set
+            .arenas
+            .alloc_attribute(crate::arenas::AttributeDeclData {
+                name: Some(well_known::XSI_TYPE),
+                target_namespace: xsi_ns,
+                ref_name: None,
+                type_ref: None,
+                inline_type: None,
+                default_value: None,
+                fixed_value: None,
+                use_kind: None,
+                form: None,
+                inheritable: false,
+                id: None,
+                annotation: None,
+                source: None,
+                resolved_type: Some(TypeKey::Simple(qname)),
+                resolved_ref: None,
+            });
+        let xsi_nil_attr = schema_set
+            .arenas
+            .alloc_attribute(crate::arenas::AttributeDeclData {
+                name: Some(well_known::XSI_NIL),
+                target_namespace: xsi_ns,
+                ref_name: None,
+                type_ref: None,
+                inline_type: None,
+                default_value: None,
+                fixed_value: None,
+                use_kind: None,
+                form: None,
+                inheritable: false,
+                id: None,
+                annotation: None,
+                source: None,
+                resolved_type: Some(TypeKey::Simple(boolean)),
+                resolved_ref: None,
+            });
+        let xsi_schema_location_attr =
+            schema_set
+                .arenas
+                .alloc_attribute(crate::arenas::AttributeDeclData {
+                    name: Some(well_known::XSI_SCHEMA_LOCATION),
+                    target_namespace: xsi_ns,
+                    ref_name: None,
+                    type_ref: None,
+                    inline_type: None,
+                    default_value: None,
+                    fixed_value: None,
+                    use_kind: None,
+                    form: None,
+                    inheritable: false,
+                    id: None,
+                    annotation: None,
+                    source: None,
+                    resolved_type: Some(TypeKey::Simple(xsi_schema_location_type)),
+                    resolved_ref: None,
+                });
+        let xsi_no_namespace_schema_location_attr =
+            schema_set
+                .arenas
+                .alloc_attribute(crate::arenas::AttributeDeclData {
+                    name: Some(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION),
+                    target_namespace: xsi_ns,
+                    ref_name: None,
+                    type_ref: None,
+                    inline_type: None,
+                    default_value: None,
+                    fixed_value: None,
+                    use_kind: None,
+                    form: None,
+                    inheritable: false,
+                    id: None,
+                    annotation: None,
+                    source: None,
+                    resolved_type: Some(TypeKey::Simple(any_uri)),
+                    resolved_ref: None,
+                });
 
         // Register XSI attribute declarations in the XSI namespace table
         // so that lookup_attribute(XSI_NAMESPACE, name) finds them.
         {
             let xsi_ns_table = schema_set.get_or_create_namespace(Some(well_known::XSI_NAMESPACE));
-            xsi_ns_table.attributes.insert(well_known::XSI_TYPE, xsi_type_attr);
-            xsi_ns_table.attributes.insert(well_known::XSI_NIL, xsi_nil_attr);
-            xsi_ns_table.attributes.insert(well_known::XSI_SCHEMA_LOCATION, xsi_schema_location_attr);
-            xsi_ns_table.attributes.insert(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION, xsi_no_namespace_schema_location_attr);
+            xsi_ns_table
+                .attributes
+                .insert(well_known::XSI_TYPE, xsi_type_attr);
+            xsi_ns_table
+                .attributes
+                .insert(well_known::XSI_NIL, xsi_nil_attr);
+            xsi_ns_table
+                .attributes
+                .insert(well_known::XSI_SCHEMA_LOCATION, xsi_schema_location_attr);
+            xsi_ns_table.attributes.insert(
+                well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION,
+                xsi_no_namespace_schema_location_attr,
+            );
         }
 
         Self {

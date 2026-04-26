@@ -268,7 +268,10 @@ impl XPathExpr {
     ///     .run_number::<RoXmlNavigator<'static>>().unwrap();
     /// assert_eq!(result, 42.0);
     /// ```
-    pub fn evaluator<'a, 'ctx>(&'a self, ctx: &'ctx XPathContext<'ctx>) -> XPathEvaluator<'a, 'ctx> {
+    pub fn evaluator<'a, 'ctx>(
+        &'a self,
+        ctx: &'ctx XPathContext<'ctx>,
+    ) -> XPathEvaluator<'a, 'ctx> {
         XPathEvaluator::new(self, ctx)
     }
 }
@@ -756,9 +759,9 @@ fn parse_variable_name(name: &str, ctx: &XPathContext<'_>) -> Result<QualifiedNa
         let local_id = ctx.names.add(local);
 
         // Resolve prefix to namespace
-        let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
-            XPathError::undefined_prefix(prefix)
-        })?;
+        let ns_id = ctx
+            .resolve_prefix_id(prefix_id)
+            .ok_or_else(|| XPathError::undefined_prefix(prefix))?;
 
         Ok(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id)))
     } else {
@@ -886,7 +889,10 @@ mod tests {
         let ctx = XPathContext::new(&names);
 
         let expr = XPathExpr::compile("1 + 2", &ctx).unwrap();
-        let result = expr.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_number::<RoXmlNavigator<'static>>()
+            .unwrap();
 
         assert_eq!(result, 3.0);
     }
@@ -912,7 +918,12 @@ mod tests {
         let names = NameTable::new();
         let ctx = XPathContext::new(&names);
 
-        let expr = XPathExpr::compile_with_vars("concat($greeting, ' ', $name)", &ctx, &["greeting", "name"]).unwrap();
+        let expr = XPathExpr::compile_with_vars(
+            "concat($greeting, ' ', $name)",
+            &ctx,
+            &["greeting", "name"],
+        )
+        .unwrap();
         let result = expr
             .evaluator(&ctx)
             .with_variable("greeting", "Hello")
@@ -931,11 +942,17 @@ mod tests {
         let ctx = XPathContext::new(&names);
 
         let expr = XPathExpr::compile("1 < 2", &ctx).unwrap();
-        let result = expr.evaluator(&ctx).run_bool::<RoXmlNavigator<'static>>().unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_bool::<RoXmlNavigator<'static>>()
+            .unwrap();
         assert!(result);
 
         let expr = XPathExpr::compile("2 < 1", &ctx).unwrap();
-        let result = expr.evaluator(&ctx).run_bool::<RoXmlNavigator<'static>>().unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_bool::<RoXmlNavigator<'static>>()
+            .unwrap();
         assert!(!result);
     }
 
@@ -945,7 +962,10 @@ mod tests {
         let ctx = XPathContext::new(&names);
 
         let expr = XPathExpr::compile("2.5", &ctx).unwrap();
-        let result = expr.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_number::<RoXmlNavigator<'static>>()
+            .unwrap();
         assert!((result - 2.5).abs() < 0.001);
     }
 
@@ -1012,8 +1032,14 @@ mod tests {
         let expr2 = expr1.clone();
 
         // Both should evaluate to the same result
-        let result1 = expr1.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
-        let result2 = expr2.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
+        let result1 = expr1
+            .evaluator(&ctx)
+            .run_number::<RoXmlNavigator<'static>>()
+            .unwrap();
+        let result2 = expr2
+            .evaluator(&ctx)
+            .run_number::<RoXmlNavigator<'static>>()
+            .unwrap();
 
         assert_eq!(result1, result2);
     }
@@ -1131,7 +1157,10 @@ mod tests {
             .unwrap();
 
         // count() should return 3
-        assert_eq!(result.as_integer().map(|i| i.to_string()), Some("3".to_string()));
+        assert_eq!(
+            result.as_integer().map(|i| i.to_string()),
+            Some("3".to_string())
+        );
     }
 
     #[test]
@@ -1145,7 +1174,8 @@ mod tests {
         let result = expr
             .evaluator(&ctx)
             .run_with::<RoXmlNavigator<'static>, _>(|eval| {
-                eval.set_variable_by_name("items", XPathValue::empty()).unwrap();
+                eval.set_variable_by_name("items", XPathValue::empty())
+                    .unwrap();
             })
             .unwrap();
 

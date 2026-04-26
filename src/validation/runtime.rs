@@ -7,11 +7,12 @@
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
-#[cfg(feature = "xsd11")]
-use bumpalo::Bump;
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
-use crate::ids::{AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId, NotationKey, TypeKey};
+use crate::ids::{
+    AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId,
+    NotationKey, TypeKey,
+};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
@@ -20,25 +21,27 @@ use crate::parser::location::SourceLocation;
 use crate::schema::model::DerivationSet;
 use crate::schema::resolver::format_resolved_qname;
 use crate::schema::SchemaSet;
-use crate::types::XmlTypeCode;
 use crate::types::value::XmlValue;
+use crate::types::XmlTypeCode;
+#[cfg(feature = "xsd11")]
+use bumpalo::Bump;
 
 use super::content::ContentValidatorState;
-use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
+#[cfg(feature = "xsd11")]
+use super::info::{AssertionOutcome, InheritedAttribute};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
     NoNamespaceSchemaLocationHint, SchemaInfo, SchemaLocationHint, SchemaValidity, TypeSource,
     ValidationAttempted, ValidationFlags,
 };
-#[cfg(feature = "xsd11")]
-use super::info::{AssertionOutcome, InheritedAttribute};
+use crate::types::complex::ProcessContents as TypesProcessContents;
 
 #[cfg(feature = "xsd11")]
 use super::assertions::{
-    AssertionBufferFrame, evaluate_complex_type_assertions, has_inherited_assertions,
+    evaluate_complex_type_assertions, has_inherited_assertions, AssertionBufferFrame,
 };
 #[cfg(feature = "xsd11")]
 use super::validator::AssertionSource;
@@ -180,8 +183,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         subst_groups: &'a Option<SubstitutionGroupMap>,
         flags: ValidationFlags,
         sink: S,
-        #[cfg(feature = "xsd11")]
-        assertion_source: AssertionSource,
+        #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
     ) -> Self {
         ValidationRuntime {
             schema_set,
@@ -293,7 +295,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             "fragment_arena_mut() called while fragment_builder is active — \
              would invalidate the builder's borrow"
         );
-        self.fragment_arena.get_or_insert_with(|| Box::new(Bump::new()))
+        self.fragment_arena
+            .get_or_insert_with(|| Box::new(Bump::new()))
     }
 
     // -----------------------------------------------------------------------
@@ -311,7 +314,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// encountered. Returns `false` if builder creation fails.
     #[cfg(feature = "xsd11")]
     fn begin_assertion_buffering(&mut self) -> bool {
-        let arena_box = self.fragment_arena.get_or_insert_with(|| Box::new(Bump::new()));
+        let arena_box = self
+            .fragment_arena
+            .get_or_insert_with(|| Box::new(Bump::new()));
         // SAFETY: Box<Bump> is heap-allocated — stable address across struct moves.
         // The builder will be dropped (via .take()) before the arena is reset or dropped.
         // Field declaration order guarantees fragment_builder drops before fragment_arena.
@@ -714,11 +719,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if !matched_via_wildcard || !self.schema_set.is_xsd11() {
             return None;
         }
-        let parent_ct = match self
-            .validation_stack
-            .last()
-            .and_then(|p| p.schema_type)
-        {
+        let parent_ct = match self.validation_stack.last().and_then(|p| p.schema_type) {
             Some(TypeKey::Complex(ct_key)) => ct_key,
             _ => return None,
         };
@@ -865,8 +866,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let element_key = if matched_type.is_some() || process_contents == ContentProcessing::Skip {
             matched_elem_key
         } else {
-            matched_elem_key
-                .or_else(|| self.schema_set.lookup_element(namespace, local_name))
+            matched_elem_key.or_else(|| self.schema_set.lookup_element(namespace, local_name))
         };
 
         if element_key.is_none() {
@@ -889,7 +889,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // PATH B1: xsi:type override for local elements with resolved type
                     let mut b1_type_source = TypeSource::Declaration;
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, Some(type_key), DerivationSet::empty(), ns_context, &mut wildcard_xsi_type_errors) {
+                        match self.resolve_xsi_type(
+                            xsi_type_str,
+                            Some(type_key),
+                            DerivationSet::empty(),
+                            ns_context,
+                            &mut wildcard_xsi_type_errors,
+                        ) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 type_key = overridden;
                                 b1_type_source = TypeSource::XsiType;
@@ -911,7 +917,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Try xsi:type first — it can supply a governing type even
                     // without a declaration.
                     if let Some(xsi_type_str) = xsi_type {
-                        match self.resolve_xsi_type(xsi_type_str, None, DerivationSet::empty(), ns_context, &mut wildcard_xsi_type_errors) {
+                        match self.resolve_xsi_type(
+                            xsi_type_str,
+                            None,
+                            DerivationSet::empty(),
+                            ns_context,
+                            &mut wildcard_xsi_type_errors,
+                        ) {
                             XsiTypeOutcome::Applied(overridden) => {
                                 let (content_state, content_type) =
                                     self.init_content_model(Some(overridden));
@@ -948,7 +960,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                 }
 
-                ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
+                ev_state.strictly_assessed = (ev_state.element_decl.is_some()
+                    || ev_state.schema_type.is_some())
                     && ev_state.process_contents != ContentProcessing::Skip;
                 // §3.4.6.4 dynamic EDC for the no-element-key wildcard branch:
                 // even without a governing global declaration, an xsi:type may
@@ -970,8 +983,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let content_type = ev_state.content_type;
                 let validity = ev_state.validity;
                 let type_source = ev_state.type_source;
-                let needs_undeclared_error = process_contents == ContentProcessing::Strict
-                    && schema_type.is_none();
+                let needs_undeclared_error =
+                    process_contents == ContentProcessing::Strict && schema_type.is_none();
                 self.push_element(ev_state);
                 #[cfg(feature = "xsd11")]
                 if let Some(reason) = edc_violation_b {
@@ -1025,7 +1038,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ContentProcessing::Skip => {
                     // Skip validation entirely
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
-                ev_state.ns_context = Some(ns_context.clone());
+                    ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Skip;
                     ev_state.content_state = ContentValidatorState::Simple; // accept anything
                     ev_state.validity = SchemaValidity::NotKnown;
@@ -1038,7 +1051,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ContentProcessing::Lax => {
                     // Lax: no declaration found — lax assessment via xs:anyType
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
-                ev_state.ns_context = Some(ns_context.clone());
+                    ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Lax;
                     let (content_state, content_type) = self.lax_assessment_content_model();
                     ev_state.content_state = content_state;
@@ -1053,7 +1066,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
                 ContentProcessing::Strict => {
                     let mut ev_state = ElementValidationState::new(local_name, namespace);
-                ev_state.ns_context = Some(ns_context.clone());
+                    ev_state.ns_context = Some(ns_context.clone());
                     ev_state.validity = SchemaValidity::Invalid;
                     // Lax assessment for content (same PSVI as lax when no declaration found)
                     let (content_state, content_type) = self.lax_assessment_content_model();
@@ -1086,8 +1099,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 6. xsi:type override
         // Errors are deferred and emitted after push so they land on the child element.
-        let (effective_block, _) =
-            crate::compiler::substitution::effective_element_constraints(self.schema_set, elem_data);
+        let (effective_block, _) = crate::compiler::substitution::effective_element_constraints(
+            self.schema_set,
+            elem_data,
+        );
         // Mask to element-relevant bits only (extension, restriction, substitution)
         // to avoid spuriously blocking list/union derivation steps.
         let effective_block = effective_block.element_block_mask();
@@ -1096,8 +1111,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut type_source = TypeSource::Declaration;
         if let Some(xsi_type_str) = xsi_type {
             // Default to anyType when no explicit type is declared (cvc-elt.4.3 still applies)
-            let declared_for_xsi = type_key.or(Some(TypeKey::Complex(self.schema_set.any_type_key())));
-            match self.resolve_xsi_type(xsi_type_str, declared_for_xsi, effective_block, ns_context, &mut xsi_type_deferred_errors) {
+            let declared_for_xsi =
+                type_key.or(Some(TypeKey::Complex(self.schema_set.any_type_key())));
+            match self.resolve_xsi_type(
+                xsi_type_str,
+                declared_for_xsi,
+                effective_block,
+                ns_context,
+                &mut xsi_type_deferred_errors,
+            ) {
                 XsiTypeOutcome::Applied(overridden) => {
                     type_key = Some(overridden);
                     type_source = TypeSource::XsiType;
@@ -1111,18 +1133,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // §3.3.4.4 cvc-type clause 2: if T is a complex type definition, T.{abstract} must be false.
         // Hoist the complex-type fetch once so the cvc-type.2 error path below can
         // reuse the name/target_namespace without re-resolving the arena entry.
-        let abstract_ct_info: Option<(Option<NameId>, Option<NameId>)> =
-            if !xsi_type_invalid {
-                if let Some(TypeKey::Complex(k)) = type_key {
-                    self.schema_set.arenas.complex_types.get(k)
-                        .filter(|ct| ct.is_abstract)
-                        .map(|ct| (ct.name, ct.target_namespace))
-                } else {
-                    None
-                }
+        let abstract_ct_info: Option<(Option<NameId>, Option<NameId>)> = if !xsi_type_invalid {
+            if let Some(TypeKey::Complex(k)) = type_key {
+                self.schema_set
+                    .arenas
+                    .complex_types
+                    .get(k)
+                    .filter(|ct| ct.is_abstract)
+                    .map(|ct| (ct.name, ct.target_namespace))
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
         let abstract_type_invalid = abstract_ct_info.is_some();
 
         // 7. xsi:nil
@@ -1151,7 +1175,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 9. Push ElementValidationState
         let mut ev_state = ElementValidationState::new(local_name, namespace);
-                ev_state.ns_context = Some(ns_context.clone());
+        ev_state.ns_context = Some(ns_context.clone());
         ev_state.element_decl = Some(elem_key);
         ev_state.schema_type = type_key;
         ev_state.type_source = Some(type_source);
@@ -1169,12 +1193,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
         ev_state.process_contents = process_contents;
         // Strictly assessed: has governing declaration or type, and not skipped
-        ev_state.strictly_assessed = (ev_state.element_decl.is_some() || ev_state.schema_type.is_some())
+        ev_state.strictly_assessed = (ev_state.element_decl.is_some()
+            || ev_state.schema_type.is_some())
             && process_contents != ContentProcessing::Skip;
         #[cfg(feature = "xsd11")]
         {
             ev_state.has_type_alternatives = !self.schema_set.arenas.elements[elem_key]
-                .alternatives.is_empty();
+                .alternatives
+                .is_empty();
         }
         self.push_element(ev_state);
         #[cfg(feature = "xsd11")]
@@ -1199,16 +1225,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let elem_name = self.schema_set.name_table.resolve(local_name);
             self.report_error(
                 "cvc-elt.2",
-                format!("Element '{}' is abstract and cannot appear in instances", elem_name),
+                format!(
+                    "Element '{}' is abstract and cannot appear in instances",
+                    elem_name
+                ),
             );
         }
         if let Some((ct_name, ct_ns)) = abstract_ct_info {
-            let type_name = crate::schema::derivation::format_type_name(
-                self.schema_set, ct_name, ct_ns,
-            );
+            let type_name =
+                crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
             self.report_error(
                 "cvc-type.2",
-                format!("Type '{}' is abstract and cannot be used to validate an element", type_name),
+                format!(
+                    "Type '{}' is abstract and cannot be used to validate an element",
+                    type_name
+                ),
             );
         }
         if nillable_violation {
@@ -1438,11 +1469,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Only collect the attribute data and perform type-independent checks.
         #[cfg(feature = "xsd11")]
         if ev_state.has_type_alternatives {
-            ev_state.collected_attributes.push((namespace, local_name, value.to_string()));
+            ev_state
+                .collected_attributes
+                .push((namespace, local_name, value.to_string()));
             self.current_state = ValidatorState::Attribute;
             // Post-process without type info (IC field matching still works;
             // ID/IDREF will be handled during deferred validation).
-            return SchemaInfo { deferred_by_cta: true, ..SchemaInfo::empty() };
+            return SchemaInfo {
+                deferred_by_cta: true,
+                ..SchemaInfo::empty()
+            };
         }
 
         // Determine effective type for attribute validation.
@@ -1495,7 +1531,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         self.current_state = ValidatorState::Attribute;
         // Snapshot error_codes so we can extract attribute-specific codes
-        let ec_snapshot = self.validation_stack.last().map_or(0, |ev| ev.error_codes.len());
+        let ec_snapshot = self
+            .validation_stack
+            .last()
+            .map_or(0, |ev| ev.error_codes.len());
         let mut result = self.validate_attribute_against_type(ct_key, local_name, namespace, value);
         // Slice attribute-specific error codes and remove from parent
         if let Some(ev) = self.validation_stack.last_mut() {
@@ -1505,8 +1544,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             // Track attribute [validation attempted] on parent element
             match result.validation_attempted {
-                ValidationAttempted::Full => { ev.any_attr_not_none = true; }
-                ValidationAttempted::None => { ev.any_attr_not_full = true; }
+                ValidationAttempted::Full => {
+                    ev.any_attr_not_none = true;
+                }
+                ValidationAttempted::None => {
+                    ev.any_attr_not_full = true;
+                }
                 ValidationAttempted::Partial => {
                     ev.any_attr_not_full = true;
                     ev.any_attr_not_none = true;
@@ -1525,7 +1568,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     #[cfg(feature = "xsd11")]
     fn bind_fragment_attribute(&mut self, attr_ref: Option<u32>, info: &SchemaInfo) {
         let Some(attr_ref) = attr_ref else { return };
-        let Some(type_key) = info.schema_type else { return };
+        let Some(type_key) = info.schema_type else {
+            return;
+        };
         let binding = crate::document::type_remap::NodeSchemaBinding {
             type_key,
             element_decl: None,
@@ -1576,10 +1621,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // Use incoming_inherited (the PSVI view) with the
                     // CTA-specific same-name exclusion.
                     let mut cta_attrs = ev_state.collected_attributes.clone();
-                    let explicit_names: HashSet<(Option<NameId>, NameId)> = cta_attrs
-                        .iter()
-                        .map(|(ns, name, _)| (*ns, *name))
-                        .collect();
+                    let explicit_names: HashSet<(Option<NameId>, NameId)> =
+                        cta_attrs.iter().map(|(ns, name, _)| (*ns, *name)).collect();
                     for ((ns, name), val) in &ev_state.incoming_inherited {
                         if !explicit_names.contains(&(*ns, *name)) {
                             cta_attrs.push((*ns, *name, val.value.clone()));
@@ -1665,7 +1708,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
             let ct_data = &self.schema_set.arenas.complex_types[ct_key];
             let empty_seen = HashSet::new();
-            let seen = self.validation_stack.last()
+            let seen = self
+                .validation_stack
+                .last()
                 .map(|s| &s.seen_attributes)
                 .unwrap_or(&empty_seen);
             let has_ic = !self.active_constraints.is_empty();
@@ -1688,12 +1733,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     continue;
                 }
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
-                let ref_decl = attr_key
-                    .and_then(|k| self.schema_set.arenas.attributes.get(k));
-                let value = attr_use.attribute.default_value.as_deref()
+                let ref_decl = attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k));
+                let value = attr_use
+                    .attribute
+                    .default_value
+                    .as_deref()
                     .or(attr_use.attribute.fixed_value.as_deref())
                     .or_else(|| {
-                        ref_decl.and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
+                        ref_decl
+                            .and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
                     });
                 let Some(v) = value else { continue };
                 if has_ic {
@@ -1701,12 +1749,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
                 // Check if this attribute's type is ID/IDREF/IDREFS/ENTITY/ENTITIES
                 // (need to validate defaults for these types).
-                let attr_type = resolved.and_then(|r| r.resolved_type)
+                let attr_type = resolved
+                    .and_then(|r| r.resolved_type)
                     .or_else(|| ref_decl.and_then(|d| d.resolved_type));
                 let needs_default_validation = match attr_type {
-                    Some(TypeKey::Simple(sk)) =>
-                        id_key == Some(sk) || idref_key == Some(sk) || idrefs_key == Some(sk)
-                        || entity_key == Some(sk) || entities_key == Some(sk),
+                    Some(TypeKey::Simple(sk)) => {
+                        id_key == Some(sk)
+                            || idref_key == Some(sk)
+                            || idrefs_key == Some(sk)
+                            || entity_key == Some(sk)
+                            || entities_key == Some(sk)
+                    }
                     _ => false,
                 };
                 if needs_default_validation {
@@ -1729,7 +1782,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
             for (constraint_name, field_idx) in multi_node_defaults {
-                let cname = self.schema_set.name_table.resolve(constraint_name).to_string();
+                let cname = self
+                    .schema_set
+                    .name_table
+                    .resolve(constraint_name)
+                    .to_string();
                 self.report_error(
                     "cvc-identity-constraint.4.2.1",
                     format!(
@@ -1741,10 +1798,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             // Validate and collect ID/IDREF values from absent defaults.
             // Owner is the current element (attributes bind to their element).
-            let default_owner = self.validation_stack.last()
-                .map(|e| e.element_serial).unwrap_or(0);
+            let default_owner = self
+                .validation_stack
+                .last()
+                .map(|e| e.element_serial)
+                .unwrap_or(0);
             for (value, type_key) in id_defaults {
-                if let Ok(result) = super::simple::validate_simple_type(&value, type_key, self.schema_set) {
+                if let Ok(result) =
+                    super::simple::validate_simple_type(&value, type_key, self.schema_set)
+                {
                     self.collect_id_idref(&result.typed_value, &value, default_owner);
                     self.check_entity_declared(&result.typed_value);
                 }
@@ -1767,9 +1829,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if cta_switched {
             let ev = self.validation_stack.last();
             let content_type = ev.and_then(|s| s.content_type);
-            let validity = ev
-                .map(|s| s.validity)
-                .unwrap_or(SchemaValidity::NotKnown);
+            let validity = ev.map(|s| s.validity).unwrap_or(SchemaValidity::NotKnown);
             return SchemaInfo {
                 schema_type,
                 content_type,
@@ -1786,9 +1846,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if cta_selected {
             let ev = self.validation_stack.last();
             let content_type = ev.and_then(|s| s.content_type);
-            let validity = ev
-                .map(|s| s.validity)
-                .unwrap_or(SchemaValidity::NotKnown);
+            let validity = ev.map(|s| s.validity).unwrap_or(SchemaValidity::NotKnown);
             return SchemaInfo {
                 schema_type,
                 content_type,
@@ -1861,8 +1919,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // whitespace, which is otherwise significant (only ignorable in
             // element-only content).
             if ev_state.is_nil
-                && (has_non_ws
-                    || matches!(ev_state.content_type, Some(ContentType::Mixed)))
+                && (has_non_ws || matches!(ev_state.content_type, Some(ContentType::Mixed)))
                 && !text.is_empty()
             {
                 let elem_name = self
@@ -1922,9 +1979,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // information item must have *no* character information items,
             // including whitespace. Element-only content still treats
             // whitespace as insignificant.
-            if !text.is_empty()
-                && matches!(ev_state.content_type, Some(ContentType::Empty))
-            {
+            if !text.is_empty() && matches!(ev_state.content_type, Some(ContentType::Empty)) {
                 let elem_name = self
                     .schema_set
                     .name_table
@@ -2015,8 +2070,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             match ev_state.content_type {
                 Some(ContentType::ElementOnly) | Some(ContentType::Mixed) => {
                     if !ev_state.content_state.is_complete() {
-                        let elem_name =
-                            self.schema_set.name_table.resolve(ev_state.local_name);
+                        let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
                         let err = errors::error(
                             "cvc-complex-type.2.4",
                             format!(
@@ -2096,8 +2150,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         )
                     };
                     if !matches {
-                        let elem_name =
-                            self.schema_set.name_table.resolve(ev_state.local_name);
+                        let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
                         let err = errors::error(
                             "cvc-elt.5.2.2",
                             format!(
@@ -2219,8 +2272,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     match builder.finalize() {
                         Ok(doc) => {
                             // Evaluate nested (deferred) frames first
-                            let pending =
-                                std::mem::take(&mut self.pending_assertion_frames);
+                            let pending = std::mem::take(&mut self.pending_assertion_frames);
                             for pf in &pending {
                                 let errs = evaluate_complex_type_assertions(
                                     &doc,
@@ -2255,10 +2307,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.pending_assertion_frames.clear();
                             let err = errors::error(
                                 "cvc-assertion",
-                                format!(
-                                    "Failed to finalize assertion fragment: {}",
-                                    e
-                                ),
+                                format!("Failed to finalize assertion fragment: {}", e),
                                 self.current_location.clone(),
                             );
                             self.report_validation_error_to(err, &mut ev_state.error_codes);
@@ -2343,15 +2392,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 });
                 match target {
                     Some(target_table) => {
-                        let errs =
-                            keyref_table.check_keyref_against(target_table, name_table);
+                        let errs = keyref_table.check_keyref_against(target_table, name_table);
                         deferred_errors.extend(errs);
                     }
                     None => {
                         if scope_empty {
                             // Root element closed — no more ancestors to try
-                            let keyref_name =
-                                name_table.resolve(keyref_table.constraint_name);
+                            let keyref_name = name_table.resolve(keyref_table.constraint_name);
                             let refer_display = self
                                 .compiled_constraints
                                 .get(&keyref_table.ic_key)
@@ -2361,7 +2408,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                         let refer_ns =
                                             refer.namespace.or(compiled.target_namespace);
                                         format_resolved_qname(
-                                            name_table, refer_ns, refer.local_name,
+                                            name_table,
+                                            refer_ns,
+                                            refer.local_name,
                                         )
                                     })
                                 })
@@ -2394,7 +2443,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // element that has the ID-typed child in its [children].
         // ev_state is the popped child; the parent is now the stack top.
         if let Some(ref tv) = ev_state.typed_value {
-            let parent_serial = self.validation_stack.last()
+            let parent_serial = self
+                .validation_stack
+                .last()
                 .map(|e| e.element_serial)
                 .unwrap_or(ev_state.element_serial); // root: no parent, use self
             self.collect_id_idref(tv, &ev_state.text_content, parent_serial);
@@ -2421,8 +2472,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Propagate to parent
         if let Some(parent) = self.validation_stack.last_mut() {
             match validation_attempted {
-                ValidationAttempted::Full => { parent.any_child_not_none = true; }
-                ValidationAttempted::None => { parent.any_child_not_full = true; }
+                ValidationAttempted::Full => {
+                    parent.any_child_not_none = true;
+                }
+                ValidationAttempted::None => {
+                    parent.any_child_not_full = true;
+                }
                 ValidationAttempted::Partial => {
                     parent.any_child_not_full = true;
                     parent.any_child_not_none = true;
@@ -2526,16 +2581,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         };
 
         match &ev_state.content_state {
-            ContentValidatorState::Nfa { nfa, active_states, .. } => {
-                active_states.expected_element_terms(nfa)
-                    .into_iter()
-                    .map(|(name, namespace, element_key)| ExpectedElement {
-                        local_name: name,
-                        namespace,
-                        element_key,
-                    })
-                    .collect()
-            }
+            ContentValidatorState::Nfa {
+                nfa, active_states, ..
+            } => active_states
+                .expected_element_terms(nfa)
+                .into_iter()
+                .map(|(name, namespace, element_key)| ExpectedElement {
+                    local_name: name,
+                    namespace,
+                    element_key,
+                })
+                .collect(),
             ContentValidatorState::AllGroup { model, state, .. } => {
                 let mut result = Vec::new();
                 for (i, particle) in model.particles.iter().enumerate() {
@@ -2559,7 +2615,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             #[cfg(feature = "xsd11")]
             ContentValidatorState::AllGroupExtension {
-                model, state, extension_nfa, phase,
+                model,
+                state,
+                extension_nfa,
+                phase,
             } => {
                 use super::content::AllGroupExtPhase;
 
@@ -2587,7 +2646,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // If all-group is satisfied, also include extension NFA elements
                         if state.is_satisfied(model) {
                             let initial = crate::compiler::ActiveStates::from_nfa(extension_nfa);
-                            for (name, namespace, element_key) in initial.expected_element_terms(extension_nfa) {
+                            for (name, namespace, element_key) in
+                                initial.expected_element_terms(extension_nfa)
+                            {
                                 result.push(ExpectedElement {
                                     local_name: name,
                                     namespace,
@@ -2597,7 +2658,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         }
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
-                        for (name, namespace, element_key) in active_states.expected_element_terms(extension_nfa) {
+                        for (name, namespace, element_key) in
+                            active_states.expected_element_terms(extension_nfa)
+                        {
                             result.push(ExpectedElement {
                                 local_name: name,
                                 namespace,
@@ -2816,11 +2879,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if len >= 2 {
                 let parent_pc = self.validation_stack[len - 2].process_contents;
                 let child_pc = self.validation_stack[len - 1].process_contents;
-                if parent_pc != ContentProcessing::Skip
-                    && child_pc != ContentProcessing::Skip
-                {
-                    let from_parent =
-                        self.validation_stack[len - 2].outgoing_inherited.clone();
+                if parent_pc != ContentProcessing::Skip && child_pc != ContentProcessing::Skip {
+                    let from_parent = self.validation_stack[len - 2].outgoing_inherited.clone();
                     self.validation_stack[len - 1].incoming_inherited = from_parent.clone();
                     self.validation_stack[len - 1].outgoing_inherited = from_parent;
                 }
@@ -2888,11 +2948,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Enrich `err` with current location/path and report it to an explicit
     /// `codes` target (e.g. during `validate_end_element` after the element
     /// has been popped off the stack).
-    fn report_validation_error_to(
-        &mut self,
-        err: ValidationError,
-        codes: &mut Vec<&'static str>,
-    ) {
+    fn report_validation_error_to(&mut self, err: ValidationError, codes: &mut Vec<&'static str>) {
         let err = self.enrich(err);
         self.emit_error_to(err, codes);
     }
@@ -2963,11 +3019,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Unknown `xsi:*` attributes go through normal wildcard validation.
-    fn validate_unknown_xsi_attribute(
-        &mut self,
-        local_name: NameId,
-        value: &str,
-    ) -> SchemaInfo {
+    fn validate_unknown_xsi_attribute(&mut self, local_name: NameId, value: &str) -> SchemaInfo {
         let ct_key = match self.validation_stack.last() {
             Some(ev) => match ev.schema_type {
                 Some(TypeKey::Complex(ct)) => ct,
@@ -3175,8 +3227,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if compiled.kind == IdentityKind::Keyref {
                     if let Some(refer) = &compiled.refer {
                         let refer_ns = refer.namespace.or(compiled.target_namespace);
-                        compiled.refer_key =
-                            self.resolve_refer_key(refer.local_name, refer_ns);
+                        compiled.refer_key = self.resolve_refer_key(refer.local_name, refer_ns);
                         if compiled.refer_key.is_none() {
                             let name = self.schema_set.name_table.resolve(ic_name);
                             let refer_display = format_resolved_qname(
@@ -3261,8 +3312,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         //    NOT in skip mode — skipped elements have no element_key).
         if !skipped {
             if let Some(ek) = element_key {
-                let ic_keys: Vec<IdentityConstraintKey> =
-                    self.schema_set.arenas.elements[ek].identity_constraints.clone();
+                let ic_keys: Vec<IdentityConstraintKey> = self.schema_set.arenas.elements[ek]
+                    .identity_constraints
+                    .clone();
                 for ic_key in ic_keys {
                     if self.ensure_compiled(ic_key) {
                         let compiled = self.compiled_constraints[&ic_key].as_ref().unwrap();
@@ -3341,9 +3393,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         scope_map
                             .entry(ic_key)
                             .and_modify(|existing| {
-                                existing
-                                    .sequences
-                                    .extend(cs.key_table.sequences.clone())
+                                existing.sequences.extend(cs.key_table.sequences.clone())
                             })
                             .or_insert(cs.key_table);
                     }
@@ -3418,9 +3468,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // custom <xs:list itemType="xs:ENTITY"> which has type_code=Entity
         // but XmlValueKind::List.
         if let XmlValueKind::List { item_type, items } = &typed_value.value {
-            if *item_type == XmlTypeCode::Entity
-                || typed_value.type_code == XmlTypeCode::Entities
-            {
+            if *item_type == XmlTypeCode::Entity || typed_value.type_code == XmlTypeCode::Entities {
                 for item in items {
                     let name = item.to_string();
                     if !entities.contains(&name) {
@@ -3452,10 +3500,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         match self.id_values.get(&value) {
             Some(&existing_serial) => {
                 if !(self.schema_set.is_xsd11() && existing_serial == owner_serial) {
-                    self.report_error(
-                        "cvc-id.2",
-                        format!("Duplicate ID value '{}'", value),
-                    );
+                    self.report_error("cvc-id.2", format!("Duplicate ID value '{}'", value));
                 }
             }
             None => {
@@ -3499,9 +3544,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .filter(|item_tk| self.union_has_id_idref(*item_tk));
             if let Some(item_type_key) = union_resolved {
                 for token in value_str.split_whitespace() {
-                    if let Ok(result) = super::simple::validate_simple_type(
-                        token, item_type_key, self.schema_set,
-                    ) {
+                    if let Ok(result) =
+                        super::simple::validate_simple_type(token, item_type_key, self.schema_set)
+                    {
                         match result.typed_value.type_code {
                             XmlTypeCode::Id => {
                                 self.register_id_value(token.to_string(), owner_serial);
@@ -3614,11 +3659,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let found = match found {
             AttributeLookup::Prohibited => {
                 let wc = crate::schema::derivation::compute_runtime_attribute_wildcard(
-                    self.schema_set, ct_key,
+                    self.schema_set,
+                    ct_key,
                 );
                 let rescued = match wc.as_ref() {
                     Some(w) => crate::schema::derivation::effective_wildcard_allows_attribute(
-                        self.schema_set, w, namespace, local_name,
+                        self.schema_set,
+                        w,
+                        namespace,
+                        local_name,
                     ),
                     None => false,
                 };
@@ -3677,7 +3726,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(fixed) = fixed_value {
                     let matches = if let Some(ref tv) = typed_value {
-                        super::simple::fixed_matches_typed(value, tv, &fixed, attr_type, self.schema_set)
+                        super::simple::fixed_matches_typed(
+                            value,
+                            tv,
+                            &fixed,
+                            attr_type,
+                            self.schema_set,
+                        )
                     } else {
                         super::simple::fixed_values_equal(value, &fixed, attr_type, self.schema_set)
                     };
@@ -3748,24 +3803,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             AttributeLookup::NotFound => {
                 let effective_wildcard = wildcard_cache.unwrap_or_else(|| {
                     crate::schema::derivation::compute_runtime_attribute_wildcard(
-                        self.schema_set, ct_key,
+                        self.schema_set,
+                        ct_key,
                     )
                 });
                 if let Some(ref wildcard) = effective_wildcard {
                     if crate::schema::derivation::effective_wildcard_allows_attribute(
-                        self.schema_set, wildcard, namespace, local_name,
+                        self.schema_set,
+                        wildcard,
+                        namespace,
+                        local_name,
                     ) {
                         let result = match wildcard.process_contents {
                             ProcessContents::Skip => SchemaInfo::empty(),
-                            ProcessContents::Strict => {
-                                self.validate_wildcard_attribute_strict(
-                                    local_name, namespace, value,
-                                )
-                            }
+                            ProcessContents::Strict => self
+                                .validate_wildcard_attribute_strict(local_name, namespace, value),
                             ProcessContents::Lax => {
-                                self.validate_wildcard_attribute_lax(
-                                    local_name, namespace, value,
-                                )
+                                self.validate_wildcard_attribute_lax(local_name, namespace, value)
                             }
                         };
                         // Wildcard-backed inheritance (XSD 1.1 §3.3.5.6 clause 3.2):
@@ -3774,9 +3828,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // governing declaration (attribute_decl is None).
                         #[cfg(feature = "xsd11")]
                         if let Some(attr_key) = result.attribute_decl {
-                            if let Some(decl) =
-                                self.schema_set.arenas.attributes.get(attr_key)
-                            {
+                            if let Some(decl) = self.schema_set.arenas.attributes.get(attr_key) {
                                 if decl.inheritable {
                                     if let Some(ev) = self.validation_stack.last_mut() {
                                         use super::context::InheritedAttributeValue;
@@ -3803,12 +3855,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 let matches = cs.matching_fields(local_name, ns);
                                 for field_idx in matches {
                                     if cs.increment_field_match_count(field_idx) {
-                                        multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                                        multi_node_ic
+                                            .push((cs.key_table.constraint_name, field_idx));
                                     }
                                 }
                             }
                             for (constraint_name, field_idx) in multi_node_ic {
-                                let name = self.schema_set.name_table.resolve(constraint_name).to_string();
+                                let name = self
+                                    .schema_set
+                                    .name_table
+                                    .resolve(constraint_name)
+                                    .to_string();
                                 self.report_error(
                                     "cvc-identity-constraint.4.2.1",
                                     format!(
@@ -3827,10 +3884,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let attr_name = self.schema_set.name_table.resolve(local_name);
                 self.report_error(
                     "cvc-complex-type.3.2.2",
-                    format!(
-                        "Attribute '{}' is not allowed for this element",
-                        attr_name
-                    ),
+                    format!("Attribute '{}' is not allowed for this element", attr_name),
                 );
                 self.mark_current_invalid();
                 SchemaInfo::invalid()
@@ -3843,10 +3897,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Called from `validate_end_of_attributes()` after the type alternative
     /// has been selected.
     #[cfg(feature = "xsd11")]
-    fn validate_deferred_attributes(
-        &mut self,
-        schema_type: Option<TypeKey>,
-    ) {
+    fn validate_deferred_attributes(&mut self, schema_type: Option<TypeKey>) {
         self.deferred_attribute_results.clear();
 
         let collected = match self.validation_stack.last_mut() {
@@ -3868,8 +3919,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         };
 
         for (namespace, local_name, value) in &collected {
-            let ec_snapshot = self.validation_stack.last().map_or(0, |ev| ev.error_codes.len());
-            let mut info = self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            let ec_snapshot = self
+                .validation_stack
+                .last()
+                .map_or(0, |ev| ev.error_codes.len());
+            let mut info =
+                self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
             if let Some(ev) = self.validation_stack.last_mut() {
                 if ev.error_codes.len() > ec_snapshot {
                     info.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
@@ -3877,8 +3932,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
                 // Track attribute [validation attempted] on parent element
                 match info.validation_attempted {
-                    ValidationAttempted::Full => { ev.any_attr_not_none = true; }
-                    ValidationAttempted::None => { ev.any_attr_not_full = true; }
+                    ValidationAttempted::Full => {
+                        ev.any_attr_not_none = true;
+                    }
+                    ValidationAttempted::None => {
+                        ev.any_attr_not_full = true;
+                    }
                     ValidationAttempted::Partial => {
                         ev.any_attr_not_full = true;
                         ev.any_attr_not_none = true;
@@ -3910,10 +3969,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let ns = namespace.unwrap_or(NameId(0));
 
         // Identity constraint: check field attribute matches
-        let ns_ctx = self.validation_stack.last().and_then(|ev| ev.ns_context.as_ref());
+        let ns_ctx = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref());
         let ic_typed_value = Self::resolve_ic_qname_value(
-            &result.typed_value, value, ns_ctx, &self.schema_set.name_table,
-        ).or_else(|| result.typed_value.clone());
+            &result.typed_value,
+            value,
+            ns_ctx,
+            &self.schema_set.name_table,
+        )
+        .or_else(|| result.typed_value.clone());
         let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
         for cs in &mut self.active_constraints {
             let matches = cs.matching_fields(local_name, ns);
@@ -3926,7 +3992,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
         for (constraint_name, field_idx) in multi_node_ic {
-            let name = self.schema_set.name_table.resolve(constraint_name).to_string();
+            let name = self
+                .schema_set
+                .name_table
+                .resolve(constraint_name)
+                .to_string();
             self.report_error(
                 "cvc-identity-constraint.4.2.1",
                 format!(
@@ -3939,15 +4009,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // ID/IDREF/ENTITY collection — owner is current element (attribute binding)
         if let Some(ref tv) = result.typed_value {
-            let owner = self.validation_stack.last()
-                .map(|e| e.element_serial).unwrap_or(0);
+            let owner = self
+                .validation_stack
+                .last()
+                .map(|e| e.element_serial)
+                .unwrap_or(0);
             self.collect_id_idref(tv, value, owner);
             self.check_entity_declared(tv);
 
             // NOTATION tracking (§3.14.5): set [notation] on parent element
             if tv.type_code == XmlTypeCode::Notation {
                 // Resolve before borrowing the stack to avoid borrow conflict
-                let notation = self.validation_stack.last()
+                let notation = self
+                    .validation_stack
+                    .last()
                     .filter(|ev| ev.notation.is_none())
                     .and_then(|ev| ev.ns_context.as_ref())
                     .and_then(|ctx| self.resolve_notation_qname(value, ctx));
@@ -3968,13 +4043,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         value: &str,
         ns_context: &NamespaceContextSnapshot,
     ) -> Option<NotationKey> {
-        let qn = parse_qname_with_snapshot(
-            value,
-            ns_context,
-            &self.schema_set.name_table,
-            true,
-        ).ok()?;
-        self.schema_set.lookup_notation(qn.namespace_uri, qn.local_name)
+        let qn =
+            parse_qname_with_snapshot(value, ns_context, &self.schema_set.name_table, true).ok()?;
+        self.schema_set
+            .lookup_notation(qn.namespace_uri, qn.local_name)
     }
 
     /// Resolve a QName/NOTATION attribute's typed value against the current
@@ -3994,7 +4066,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         value: &str,
     ) -> Result<Option<XmlValue>, String> {
         use crate::types::value::{XmlAtomicValue, XmlValueKind};
-        let Some(tv) = typed_value else { return Ok(None) };
+        let Some(tv) = typed_value else {
+            return Ok(None);
+        };
         if tv.type_code != XmlTypeCode::QName && tv.type_code != XmlTypeCode::Notation {
             return Ok(None);
         }
@@ -4064,7 +4138,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Initialize content model and ContentType from a TypeKey
-    fn init_content_model(&self, type_key: Option<TypeKey>) -> (ContentValidatorState, ContentType) {
+    fn init_content_model(
+        &self,
+        type_key: Option<TypeKey>,
+    ) -> (ContentValidatorState, ContentType) {
         match type_key {
             Some(TypeKey::Complex(ct_key)) => {
                 let ct_data = &self.schema_set.arenas.complex_types[ct_key];
@@ -4129,8 +4206,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // historically rely on `def.particle.is_none()` strictness.
                 let particle_empty = match &def.particle {
                     None => true,
-                    Some(p) => self.schema_set.is_xsd11()
-                        && crate::parser::frames::particle_is_explicit_empty(p),
+                    Some(p) => {
+                        self.schema_set.is_xsd11()
+                            && crate::parser::frames::particle_is_explicit_empty(p)
+                    }
                 };
                 let has_open_content = self.type_has_effective_open_content(ct_data, def);
                 if particle_empty && !ct_data.mixed && !def.mixed && !has_open_content {
@@ -4162,10 +4241,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// `appliesToEmpty` half of `type_has_effective_open_content` for the
     /// shorter syntax CTs that don't carry a `ComplexContentDefResult`.
     #[cfg(feature = "xsd11")]
-    fn empty_ct_has_applicable_default_open_content(
-        &self,
-        ct_data: &ComplexTypeDefData,
-    ) -> bool {
+    fn empty_ct_has_applicable_default_open_content(&self, ct_data: &ComplexTypeDefData) -> bool {
         let doc = ct_data
             .source
             .as_ref()
@@ -4237,7 +4313,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             Err(e) => {
                 let msg = match e {
                     QNameError::UndefinedPrefix(p) => {
-                        format!("Undeclared prefix '{}' in xsi:type value '{}'", p, xsi_type_str)
+                        format!(
+                            "Undeclared prefix '{}' in xsi:type value '{}'",
+                            p, xsi_type_str
+                        )
                     }
                     _ => format!("Invalid xsi:type value '{}': {}", xsi_type_str, e),
                 };
@@ -4279,7 +4358,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // {prohibited substitutions} into a single exclusion mask.
                     let mut combined_block = block;
                     if let TypeKey::Complex(declared_ct_key) = declared {
-                        if let Some(declared_ct) = self.schema_set.arenas.complex_types.get(declared_ct_key) {
+                        if let Some(declared_ct) =
+                            self.schema_set.arenas.complex_types.get(declared_ct_key)
+                        {
                             combined_block |= declared_ct.block.element_block_mask();
                         }
                     }
@@ -4352,11 +4433,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(
-                        value,
-                        type_key,
-                        self.schema_set,
-                    ) {
+                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
@@ -4374,9 +4451,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(fixed_val) = fixed {
                     let matches = if let Some(ref tv) = typed_value {
-                        super::simple::fixed_matches_typed(value, tv, &fixed_val, attr_type, self.schema_set)
+                        super::simple::fixed_matches_typed(
+                            value,
+                            tv,
+                            &fixed_val,
+                            attr_type,
+                            self.schema_set,
+                        )
                     } else {
-                        super::simple::fixed_values_equal(value, &fixed_val, attr_type, self.schema_set)
+                        super::simple::fixed_values_equal(
+                            value,
+                            &fixed_val,
+                            attr_type,
+                            self.schema_set,
+                        )
                     };
                     if !matches {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
@@ -4454,11 +4542,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(
-                        value,
-                        type_key,
-                        self.schema_set,
-                    ) {
+                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
@@ -4476,9 +4560,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(fixed_val) = fixed {
                     let matches = if let Some(ref tv) = typed_value {
-                        super::simple::fixed_matches_typed(value, tv, &fixed_val, attr_type, self.schema_set)
+                        super::simple::fixed_matches_typed(
+                            value,
+                            tv,
+                            &fixed_val,
+                            attr_type,
+                            self.schema_set,
+                        )
                     } else {
-                        super::simple::fixed_values_equal(value, &fixed_val, attr_type, self.schema_set)
+                        super::simple::fixed_values_equal(
+                            value,
+                            &fixed_val,
+                            attr_type,
+                            self.schema_set,
+                        )
                     };
                     if !matches {
                         let attr_name = self.schema_set.name_table.resolve(local_name);
@@ -4525,10 +4620,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Collect all attribute uses from resolved attribute groups (recursively).
-    fn collect_group_attributes(
-        &self,
-        ct_data: &ComplexTypeDefData,
-    ) -> Vec<GroupAttribute> {
+    fn collect_group_attributes(&self, ct_data: &ComplexTypeDefData) -> Vec<GroupAttribute> {
         let mut result = Vec::new();
         let mut visited = HashSet::new();
         for &group_key in &ct_data.resolved_attribute_groups {
@@ -4560,13 +4652,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // (the W3C `xsd003b` fixture exercises this through a redefined
             // `simpleType` whose enum-restricted facet must be applied to
             // an attribute reached via an attribute group).
-            let attr_type = resolved
-                .and_then(|r| r.resolved_type)
-                .or_else(|| {
-                    attr_key
-                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                        .and_then(|d| d.resolved_type)
-                });
+            let attr_type = resolved.and_then(|r| r.resolved_type).or_else(|| {
+                attr_key
+                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                    .and_then(|d| d.resolved_type)
+            });
             let (name, namespace) =
                 self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
             let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
@@ -4652,24 +4742,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
             if attr_name == local_name && attr_ns == namespace {
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
-                let attr_type = resolved
-                    .and_then(|r| r.resolved_type)
-                    .or_else(|| {
-                        attr_key
-                            .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                            .and_then(|d| d.resolved_type)
-                    });
+                let attr_type = resolved.and_then(|r| r.resolved_type).or_else(|| {
+                    attr_key
+                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                        .and_then(|d| d.resolved_type)
+                });
 
                 // Get fixed value from the attribute use or from the attribute declaration
-                let fixed = attr_use
-                    .attribute
-                    .fixed_value
-                    .clone()
-                    .or_else(|| {
-                        attr_key
-                            .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                            .and_then(|d| d.fixed_value.clone())
-                    });
+                let fixed = attr_use.attribute.fixed_value.clone().or_else(|| {
+                    attr_key
+                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
+                        .and_then(|d| d.fixed_value.clone())
+                });
 
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
                     // In XSD 1.0, use="prohibited" combined with fixed=X is a valid
@@ -4702,7 +4786,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let inheritable = ga.inheritable;
                 #[cfg(not(feature = "xsd11"))]
                 let inheritable = false;
-                return AttributeLookup::Found(ga.attr_key, ga.type_key, ga.fixed_value, inheritable);
+                return AttributeLookup::Found(
+                    ga.attr_key,
+                    ga.type_key,
+                    ga.fixed_value,
+                    inheritable,
+                );
             }
         }
 
@@ -4750,11 +4839,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .or_else(|| {
                     attr_key
                         .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                        .and_then(|d| {
-                            d.default_value
-                                .as_deref()
-                                .or(d.fixed_value.as_deref())
-                        })
+                        .and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
                 });
             if let Some(val) = value {
                 candidates.push((ns, name, val.to_string(), attr_key));
@@ -4766,10 +4851,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if ga.use_kind == AttributeUseKind::Prohibited || !ga.inheritable {
                 continue;
             }
-            let value = ga
-                .default_value
-                .as_deref()
-                .or(ga.fixed_value.as_deref());
+            let value = ga.default_value.as_deref().or(ga.fixed_value.as_deref());
             if let Some(val) = value {
                 candidates.push((ga.namespace, ga.name, val.to_string(), ga.attr_key));
             }
@@ -4915,9 +4997,7 @@ fn resolve_base_uri(xml_base: &str, inherited: &str) -> String {
     }
     // Resolve relative against inherited base directory.
     // Find the last path separator (handles both / and \ for Windows paths).
-    let last_sep = inherited
-        .rfind('/')
-        .or_else(|| inherited.rfind('\\'));
+    let last_sep = inherited.rfind('/').or_else(|| inherited.rfind('\\'));
     let base_dir = match last_sep {
         Some(pos) => &inherited[..=pos],
         None => "",

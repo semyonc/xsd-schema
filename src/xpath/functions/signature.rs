@@ -3,7 +3,7 @@
 //! This module provides types for describing function signatures,
 //! including parameter types and arity constraints.
 
-use crate::types::sequence::{SequenceType, ItemType};
+use crate::types::sequence::{ItemType, SequenceType};
 
 /// XPath function namespace (default for unprefixed function calls)
 pub const FN_NAMESPACE: &str = "http://www.w3.org/2005/xpath-functions";
@@ -145,10 +145,7 @@ impl FunctionSignature {
 // Convenience constructors for common signature patterns
 
 /// Create a signature for fn:xxx() with no arguments
-pub fn sig_0(
-    local_name: &'static str,
-    return_type: SequenceType,
-) -> FunctionSignature {
+pub fn sig_0(local_name: &'static str, return_type: SequenceType) -> FunctionSignature {
     FunctionSignature::new(FN_NAMESPACE, local_name, vec![], return_type)
 }
 
@@ -179,7 +176,12 @@ pub fn sig_3(
     arg3: SequenceType,
     return_type: SequenceType,
 ) -> FunctionSignature {
-    FunctionSignature::new(FN_NAMESPACE, local_name, vec![arg1, arg2, arg3], return_type)
+    FunctionSignature::new(
+        FN_NAMESPACE,
+        local_name,
+        vec![arg1, arg2, arg3],
+        return_type,
+    )
 }
 
 /// Create common sequence types for function signatures
@@ -343,12 +345,16 @@ pub mod types {
 
     /// xs:dayTimeDuration
     pub fn day_time_duration() -> SequenceType {
-        SequenceType::one(ItemType::AtomicType(crate::types::XmlTypeCode::DayTimeDuration))
+        SequenceType::one(ItemType::AtomicType(
+            crate::types::XmlTypeCode::DayTimeDuration,
+        ))
     }
 
     /// xs:dayTimeDuration?
     pub fn day_time_duration_opt() -> SequenceType {
-        SequenceType::optional(ItemType::AtomicType(crate::types::XmlTypeCode::DayTimeDuration))
+        SequenceType::optional(ItemType::AtomicType(
+            crate::types::XmlTypeCode::DayTimeDuration,
+        ))
     }
 
     /// element()

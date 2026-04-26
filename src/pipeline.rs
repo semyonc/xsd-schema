@@ -30,15 +30,18 @@
 use crate::error::SchemaResult;
 use crate::ids::DocumentId;
 use crate::parser::parse::{parse_schema_with_config, ParserConfig};
-use crate::parser::resolver::{resolve_all_directives, fixup_composition_edges, ResolverConfig, SchemaResolver, ResolutionResult};
 #[cfg(feature = "async")]
 use crate::parser::resolver::resolve_all_directives_async;
+use crate::parser::resolver::{
+    fixup_composition_edges, resolve_all_directives, ResolutionResult, ResolverConfig,
+    SchemaResolver,
+};
 use crate::schema::{
     allocate_content_particle_elements, allocate_model_group_particle_elements,
-    assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
-    build_dependency_graph, validate_all_derivations, validate_attribute_id_constraints,
-    validate_attribute_value_constraints,
-    validate_element_value_constraints, compile_all_patterns,
+    assemble_inline_types, build_dependency_graph, compile_all_patterns, resolve_all_references,
+    validate_all_derivations, validate_attribute_id_constraints,
+    validate_attribute_value_constraints, validate_element_value_constraints, InlineAssemblyStats,
+    ResolutionStats,
 };
 use crate::SchemaSet;
 
@@ -199,16 +202,19 @@ pub fn load_and_process_schema(
         while !pending_docs.is_empty() {
             let current_batch: Vec<_> = std::mem::take(&mut pending_docs);
             for loaded_doc_id in current_batch {
-                let nested_result = resolve_all_directives(loaded_doc_id, &mut resolver, schema_set);
-                stats.loaded_docs.extend(nested_result.loaded.iter().copied());
+                let nested_result =
+                    resolve_all_directives(loaded_doc_id, &mut resolver, schema_set);
+                stats
+                    .loaded_docs
+                    .extend(nested_result.loaded.iter().copied());
                 pending_docs.extend(nested_result.loaded.iter().copied());
 
                 // Accumulate stats
                 if let Some(ref mut dir_stats) = stats.directive_result {
                     dir_stats.loaded_count += nested_result.loaded.len();
                     dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count += nested_result.errors.len()
-                        + nested_result.import_errors.len();
+                    dir_stats.error_count +=
+                        nested_result.errors.len() + nested_result.import_errors.len();
                 }
                 directive_errors.extend(nested_result.errors);
                 import_errors.extend(nested_result.import_errors);
@@ -220,7 +226,8 @@ pub fn load_and_process_schema(
 
         // Propagate schema-content errors from directive resolution.
         // Resolution/IO errors are non-fatal for all directive types.
-        if let Some(err) = directive_errors.into_iter()
+        if let Some(err) = directive_errors
+            .into_iter()
             .chain(import_errors)
             .find(|e| e.is_schema_content_error())
         {
@@ -342,7 +349,9 @@ pub fn parse_schema_only(
 ///
 /// **Precondition**: All participating schemas — including redefine/override targets —
 /// must have been parsed and loaded into the schema set before calling this function.
-pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
+pub fn process_loaded_schemas(
+    schema_set: &mut SchemaSet,
+) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     // Fail early if parsing collected structural errors (error-recovery mode)
     if !schema_set.parsing_errors.is_empty() {
         let errors = std::mem::take(&mut schema_set.parsing_errors);
@@ -422,8 +431,7 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     // (which only acquired their ElementKey in the allocation pass).
     #[cfg(feature = "xsd11")]
     {
-        let new_alt_types =
-            crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
+        let new_alt_types = crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
         if !new_alt_types.is_empty() {
             resolve_all_references(schema_set)?;
             allocate_content_particle_elements(schema_set)?;
@@ -496,13 +504,14 @@ fn xsd11_element_consistency_checks(schema_set: &SchemaSet) -> SchemaResult<()> 
 /// complex type independently of UPA validation.
 fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::compiler::{
-        is_top_level_all_group, resolve_top_level_all_group_ref,
-        validate_outer_all_group_occurs,
+        is_top_level_all_group, resolve_top_level_all_group_ref, validate_outer_all_group_occurs,
     };
 
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
         let Some(particle) = (match &type_def.content {
-            crate::parser::frames::ComplexContentResult::Complex(content) => content.particle.as_ref(),
+            crate::parser::frames::ComplexContentResult::Complex(content) => {
+                content.particle.as_ref()
+            }
             crate::parser::frames::ComplexContentResult::Empty
             | crate::parser::frames::ComplexContentResult::Simple(_) => None,
         }) else {
@@ -519,11 +528,7 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
             let location = error
                 .location()
                 .and_then(|source| schema_set.source_maps.locate(source));
-            crate::error::SchemaError::structural(
-                "cos-all-limited",
-                format!("{}", error),
-                location,
-            )
+            crate::error::SchemaError::structural("cos-all-limited", format!("{}", error), location)
         })?;
     }
 
@@ -536,7 +541,7 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
 /// `allModel` group is `(annotation?, element*)`). Wildcards (`xs:any`) are forbidden.
 /// XSD 1.1 relaxes this to allow `xs:any` and group references in all groups.
 fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
-    use crate::parser::frames::{Compositor, ComplexContentResult};
+    use crate::parser::frames::{ComplexContentResult, Compositor};
 
     if !schema_set.is_xsd10() {
         return Ok(());
@@ -653,7 +658,9 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
         }
 
         let Some(_particle) = (match &type_def.content {
-            crate::parser::frames::ComplexContentResult::Complex(content) => content.particle.as_ref(),
+            crate::parser::frames::ComplexContentResult::Complex(content) => {
+                content.particle.as_ref()
+            }
             crate::parser::frames::ComplexContentResult::Empty
             | crate::parser::frames::ComplexContentResult::Simple(_) => None,
         }) else {
@@ -669,7 +676,10 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                     .and_then(|source| schema_set.source_maps.locate(source));
                 crate::error::SchemaError::structural(
                     "cos-nonambig",
-                    format!("Failed to compile content model for UPA checking: {}", error),
+                    format!(
+                        "Failed to compile content model for UPA checking: {}",
+                        error
+                    ),
                     location,
                 )
             })?;
@@ -696,11 +706,7 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                     schema_set,
                     type_def.target_namespace,
                 )?;
-                crate::compiler::check_upa(
-                    &extension_nfa,
-                    schema_set,
-                    type_def.target_namespace,
-                )?;
+                crate::compiler::check_upa(&extension_nfa, schema_set, type_def.target_namespace)?;
             }
         }
     }
@@ -756,14 +762,16 @@ pub async fn load_and_process_schema_async(
             for loaded_doc_id in current_batch {
                 let nested_result =
                     resolve_all_directives_async(loaded_doc_id, &mut resolver, schema_set).await;
-                stats.loaded_docs.extend(nested_result.loaded.iter().copied());
+                stats
+                    .loaded_docs
+                    .extend(nested_result.loaded.iter().copied());
                 pending_docs.extend(nested_result.loaded.iter().copied());
 
                 if let Some(ref mut dir_stats) = stats.directive_result {
                     dir_stats.loaded_count += nested_result.loaded.len();
                     dir_stats.skipped_count += nested_result.skipped.len();
-                    dir_stats.error_count += nested_result.errors.len()
-                        + nested_result.import_errors.len();
+                    dir_stats.error_count +=
+                        nested_result.errors.len() + nested_result.import_errors.len();
                 }
                 directive_errors.extend(nested_result.errors);
                 import_errors.extend(nested_result.import_errors);
@@ -774,7 +782,8 @@ pub async fn load_and_process_schema_async(
         fixup_composition_edges(schema_set);
 
         // Propagate schema-content errors from directive resolution
-        if let Some(err) = directive_errors.into_iter()
+        if let Some(err) = directive_errors
+            .into_iter()
             .chain(import_errors)
             .find(|e| e.is_schema_content_error())
         {

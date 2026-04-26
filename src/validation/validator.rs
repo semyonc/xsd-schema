@@ -295,9 +295,7 @@ mod assertion_source_tests {
         );
         // Use new_fragment_buffer to get PROCESS_ASSERTIONS set, then
         // attempt to switch to Disabled — should panic.
-        let mut v = SchemaValidator::new_fragment_buffer(
-            &schema_set, ValidationFlags::default(),
-        );
+        let mut v = SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         v.set_assertion_source(AssertionSource::Disabled);
     }
 
@@ -311,9 +309,7 @@ mod assertion_source_tests {
         );
         // Use new_fragment_buffer to get PROCESS_ASSERTIONS set, then
         // attempt to switch to MainDocument — should panic.
-        let mut v = SchemaValidator::new_fragment_buffer(
-            &schema_set, ValidationFlags::default(),
-        );
+        let mut v = SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         v.set_assertion_source(AssertionSource::MainDocument);
     }
 

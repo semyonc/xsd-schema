@@ -5,11 +5,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use super::substitution::SubstitutionGroupMap;
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::location::SourceRef;
 use crate::schema::model::XsdVersion;
-use crate::types::complex::{NamespaceConstraint, ProcessContents, not_qnames_exclude};
-use super::substitution::SubstitutionGroupMap;
+use crate::types::complex::{not_qnames_exclude, NamespaceConstraint, ProcessContents};
 
 /// Unique identifier for NFA states within a table
 pub type StateId = u32;
@@ -309,7 +309,11 @@ pub enum NfaTerm {
 
 impl NfaTerm {
     /// Create an element term
-    pub fn element(name: NameId, namespace: Option<NameId>, element_key: Option<ElementKey>) -> Self {
+    pub fn element(
+        name: NameId,
+        namespace: Option<NameId>,
+        element_key: Option<ElementKey>,
+    ) -> Self {
         NfaTerm::Element {
             name,
             namespace,
@@ -334,7 +338,10 @@ impl NfaTerm {
     }
 
     /// Create a wildcard term
-    pub fn wildcard(namespace_constraint: NamespaceConstraint, process_contents: ProcessContents) -> Self {
+    pub fn wildcard(
+        namespace_constraint: NamespaceConstraint,
+        process_contents: ProcessContents,
+    ) -> Self {
         NfaTerm::Wildcard {
             namespace_constraint,
             process_contents,
@@ -441,7 +448,10 @@ pub fn epsilon_closure(
     nfa: &NfaTable,
     start_states: impl IntoIterator<Item = StateId>,
 ) -> HashSet<StateId> {
-    debug_assert!(!nfa.has_counters(), "epsilon_closure called on counted NFA; use ActiveStates instead");
+    debug_assert!(
+        !nfa.has_counters(),
+        "epsilon_closure called on counted NFA; use ActiveStates instead"
+    );
     let mut closure = HashSet::new();
     let mut stack: Vec<StateId> = start_states.into_iter().collect();
 
@@ -699,19 +709,18 @@ impl HybridKey {
     /// Writes 0 into the old ranged slot, zeros the new ranged slot (sentinel).
     /// Returns `(new_key, extracted_scalar_value)` where `extracted_scalar_value`
     /// is the value that was in the new ranged slot (to become a `CounterRange`).
-    fn repacked(
-        &self,
-        old_ranged_idx: usize,
-        new_ranged_idx: usize,
-    ) -> (Self, u32) {
+    fn repacked(&self, old_ranged_idx: usize, new_ranged_idx: usize) -> (Self, u32) {
         let scalar_val = self.counters[new_ranged_idx];
         let mut new_counters = self.counters.clone();
         new_counters[old_ranged_idx] = 0;
         new_counters[new_ranged_idx] = 0; // new sentinel
-        (Self {
-            state_id: self.state_id,
-            counters: new_counters,
-        }, scalar_val)
+        (
+            Self {
+                state_id: self.state_id,
+                counters: new_counters,
+            },
+            scalar_val,
+        )
     }
 }
 
@@ -744,7 +753,10 @@ fn ranged_single_epsilon_closure(
             }
             // Merge (union) — contiguity invariant guarantees this is safe.
             let merged = existing.union(range);
-            debug_assert!(merged.lo <= merged.hi, "contiguity invariant violated at state {state_id}");
+            debug_assert!(
+                merged.lo <= merged.hi,
+                "contiguity invariant violated at state {state_id}"
+            );
             map.insert(state_id, merged);
         } else {
             map.insert(state_id, range);
@@ -763,7 +775,11 @@ fn ranged_single_epsilon_closure(
                     }
                     TransitionKind::CounterMaxGuard(_) => {
                         let clamped = range.intersect_below(counter_def.max);
-                        if clamped.is_empty() { None } else { Some(clamped) }
+                        if clamped.is_empty() {
+                            None
+                        } else {
+                            Some(clamped)
+                        }
                     }
                     TransitionKind::CounterMinGuard(_) => {
                         let passed = range.intersect_above(counter_def.min);
@@ -778,7 +794,8 @@ fn ranged_single_epsilon_closure(
                 };
                 if let Some(next_range) = next {
                     // Only push if not already subsumed by existing map entry.
-                    let dominated = map.get(&trans.target)
+                    let dominated = map
+                        .get(&trans.target)
                         .is_some_and(|r| r.subsumes(next_range));
                     if !dominated {
                         worklist.push_back((trans.target, next_range));
@@ -788,7 +805,10 @@ fn ranged_single_epsilon_closure(
         }
     }
 
-    ActiveStates::RangedSingle { state_ranges: map, counter_def }
+    ActiveStates::RangedSingle {
+        state_ranges: map,
+        counter_def,
+    }
 }
 
 /// Hybrid epsilon closure for multi-counter NFAs with one ranged counter.
@@ -832,9 +852,7 @@ fn hybrid_epsilon_closure(
         if let Some(state) = nfa.get_state(key.state_id) {
             for trans in &state.transitions {
                 let next: Option<(HybridKey, CounterRange)> = match trans.kind {
-                    TransitionKind::Epsilon => {
-                        Some((key.with_state(trans.target), range))
-                    }
+                    TransitionKind::Epsilon => Some((key.with_state(trans.target), range)),
 
                     // --- Ranged counter operations (range arithmetic) ---
                     TransitionKind::CounterReset(c) if c == ranged_id => {
@@ -849,7 +867,9 @@ fn hybrid_epsilon_closure(
                     }
                     TransitionKind::CounterMaxGuard(c) if c == ranged_id => {
                         let clamped = range.intersect_below(ranged_def.max);
-                        if clamped.is_empty() { None } else {
+                        if clamped.is_empty() {
+                            None
+                        } else {
                             Some((key.with_state(trans.target), clamped))
                         }
                     }
@@ -864,12 +884,10 @@ fn hybrid_epsilon_closure(
                     }
 
                     // --- Scalar counter operations ---
-                    TransitionKind::CounterReset(c) => {
-                        Some((
-                            key.with_scalar_counter(trans.target, c, 0, ranged_counter_idx),
-                            range,
-                        ))
-                    }
+                    TransitionKind::CounterReset(c) => Some((
+                        key.with_scalar_counter(trans.target, c, 0, ranged_counter_idx),
+                        range,
+                    )),
                     TransitionKind::CounterIncrement(c) => {
                         let val = key.counter(c) + 1;
                         Some((
@@ -900,8 +918,7 @@ fn hybrid_epsilon_closure(
                 };
 
                 if let Some((next_key, next_range)) = next {
-                    let dominated = map.get(&next_key)
-                        .is_some_and(|r| r.subsumes(next_range));
+                    let dominated = map.get(&next_key).is_some_and(|r| r.subsumes(next_range));
                     if !dominated {
                         worklist.push_back((next_key, next_range));
                     }
@@ -978,7 +995,9 @@ impl ActiveStates {
             // On equal max, prefer the lowest index — for sequential loops this
             // ranges the first loop's counter, keeping later counters at scalar 0.
             if nfa.counter_defs.len() > 1 {
-                let best_nullable = nfa.counter_defs.iter()
+                let best_nullable = nfa
+                    .counter_defs
+                    .iter()
                     .enumerate()
                     .filter(|(_, def)| def.body_nullable)
                     .max_by_key(|(idx, def)| (def.max, std::cmp::Reverse(*idx)));
@@ -1043,10 +1062,11 @@ impl ActiveStates {
     /// Compute epsilon closure (including counter transitions for Counted path).
     pub fn epsilon_closure(self, nfa: &NfaTable) -> Self {
         match self {
-            ActiveStates::Simple(states) => {
-                ActiveStates::Simple(epsilon_closure(nfa, states))
-            }
-            ActiveStates::Counted { configs, num_counters } => {
+            ActiveStates::Simple(states) => ActiveStates::Simple(epsilon_closure(nfa, states)),
+            ActiveStates::Counted {
+                configs,
+                num_counters,
+            } => {
                 let mut result: HashSet<ActiveConfig> = HashSet::new();
                 let mut stack: Vec<ActiveConfig> = configs.into_iter().collect();
 
@@ -1057,9 +1077,7 @@ impl ActiveStates {
                     if let Some(state) = nfa.get_state(config.state_id) {
                         for trans in &state.transitions {
                             let next = match trans.kind {
-                                TransitionKind::Epsilon => {
-                                    Some(config.with_state(trans.target))
-                                }
+                                TransitionKind::Epsilon => Some(config.with_state(trans.target)),
                                 TransitionKind::CounterReset(c) => {
                                     Some(config.with_counter_set(trans.target, c, 0))
                                 }
@@ -1068,14 +1086,18 @@ impl ActiveStates {
                                     Some(config.with_counter_set(trans.target, c, val))
                                 }
                                 TransitionKind::CounterMaxGuard(c) => {
-                                    if config.counters[c as usize] < nfa.counter_defs[c as usize].max {
+                                    if config.counters[c as usize]
+                                        < nfa.counter_defs[c as usize].max
+                                    {
                                         Some(config.with_state(trans.target))
                                     } else {
                                         None
                                     }
                                 }
                                 TransitionKind::CounterMinGuard(c) => {
-                                    if config.counters[c as usize] >= nfa.counter_defs[c as usize].min {
+                                    if config.counters[c as usize]
+                                        >= nfa.counter_defs[c as usize].min
+                                    {
                                         // Canonicalize: zero out counter on exit to collapse
                                         // configs that left the loop at different counter values.
                                         Some(config.with_counter_set(trans.target, c, 0))
@@ -1093,14 +1115,20 @@ impl ActiveStates {
                         }
                     }
                 }
-                ActiveStates::Counted { configs: result, num_counters }
+                ActiveStates::Counted {
+                    configs: result,
+                    num_counters,
+                }
             }
-            ActiveStates::RangedSingle { state_ranges, counter_def } => {
-                ranged_single_epsilon_closure(nfa, state_ranges, counter_def)
-            }
-            ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters } => {
-                hybrid_epsilon_closure(nfa, configs, ranged_counter_idx, num_counters)
-            }
+            ActiveStates::RangedSingle {
+                state_ranges,
+                counter_def,
+            } => ranged_single_epsilon_closure(nfa, state_ranges, counter_def),
+            ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            } => hybrid_epsilon_closure(nfa, configs, ranged_counter_idx, num_counters),
         }
     }
 
@@ -1114,13 +1142,22 @@ impl ActiveStates {
     fn maybe_switch_ranged_counter(self, nfa: &NfaTable) -> Self {
         use super::particle::COUNTED_THRESHOLD;
 
-        let ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters } = self else {
+        let ActiveStates::Hybrid {
+            configs,
+            ranged_counter_idx,
+            num_counters,
+        } = self
+        else {
             return self;
         };
 
         let dead = CounterRange::single(0);
         if configs.is_empty() || !configs.values().all(|r| *r == dead) {
-            return ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters };
+            return ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            };
         }
 
         // Single pass: collect per-counter min/max across all configs.
@@ -1147,16 +1184,19 @@ impl ActiveStates {
                 continue;
             }
             let spread = max_vals[idx] - min_vals[idx] + 1;
-            let dominated = best.is_some_and(|(_, bs, bm)| {
-                spread < bs || (spread == bs && def.max <= bm)
-            });
+            let dominated =
+                best.is_some_and(|(_, bs, bm)| spread < bs || (spread == bs && def.max <= bm));
             if !dominated {
                 best = Some((idx, spread, def.max));
             }
         }
 
         let Some((new_ranged_idx, _, _)) = best else {
-            return ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters };
+            return ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            };
         };
 
         // Guarded repack: track (range, count) per key, then verify that
@@ -1164,23 +1204,28 @@ impl ActiveStates {
         let mut new_configs: HashMap<HybridKey, (CounterRange, u32)> =
             HashMap::with_capacity(configs.len());
         for old_key in configs.keys() {
-            let (new_key, scalar_val) =
-                old_key.repacked(ranged_counter_idx, new_ranged_idx);
+            let (new_key, scalar_val) = old_key.repacked(ranged_counter_idx, new_ranged_idx);
             let new_range = CounterRange::single(scalar_val);
-            new_configs.entry(new_key)
-                .and_modify(|(r, count)| { *r = r.union(new_range); *count += 1; })
+            new_configs
+                .entry(new_key)
+                .and_modify(|(r, count)| {
+                    *r = r.union(new_range);
+                    *count += 1;
+                })
                 .or_insert((new_range, 1));
         }
 
         for (range, count) in new_configs.values() {
             if range.hi - range.lo + 1 != *count {
-                return ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters };
+                return ActiveStates::Hybrid {
+                    configs,
+                    ranged_counter_idx,
+                    num_counters,
+                };
             }
         }
 
-        let repacked = new_configs.into_iter()
-            .map(|(k, (r, _))| (k, r))
-            .collect();
+        let repacked = new_configs.into_iter().map(|(k, (r, _))| (k, r)).collect();
 
         ActiveStates::Hybrid {
             configs: repacked,
@@ -1200,21 +1245,33 @@ impl ActiveStates {
         xsd_version: XsdVersion,
     ) -> Self {
         match self {
-            ActiveStates::Simple(states) => {
-                ActiveStates::Simple(advance_states(
-                    nfa, states, element_name, element_namespace,
-                    target_namespace, substitution_groups, xsd_version,
-                ))
-            }
-            ActiveStates::Counted { configs, num_counters } => {
+            ActiveStates::Simple(states) => ActiveStates::Simple(advance_states(
+                nfa,
+                states,
+                element_name,
+                element_namespace,
+                target_namespace,
+                substitution_groups,
+                xsd_version,
+            )),
+            ActiveStates::Counted {
+                configs,
+                num_counters,
+            } => {
                 // Configs are already closure-closed (invariant).
                 // Find matching terms and follow Consume transitions.
                 let mut next_configs = HashSet::new();
                 for config in &configs {
                     if let Some(state) = nfa.get_state(config.state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         next_configs.insert(config.with_state(trans.target));
@@ -1224,19 +1281,32 @@ impl ActiveStates {
                         }
                     }
                 }
-                let result = ActiveStates::Counted { configs: next_configs, num_counters };
+                let result = ActiveStates::Counted {
+                    configs: next_configs,
+                    num_counters,
+                };
                 result.epsilon_closure(nfa)
             }
-            ActiveStates::RangedSingle { state_ranges, counter_def } => {
+            ActiveStates::RangedSingle {
+                state_ranges,
+                counter_def,
+            } => {
                 let mut next_seeds: HashMap<StateId, CounterRange> = HashMap::new();
                 for (&state_id, &range) in &state_ranges {
                     if let Some(state) = nfa.get_state(state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
-                                        next_seeds.entry(trans.target)
+                                        next_seeds
+                                            .entry(trans.target)
                                             .and_modify(|r| *r = r.union(range))
                                             .or_insert(range);
                                     }
@@ -1245,20 +1315,34 @@ impl ActiveStates {
                         }
                     }
                 }
-                let result = ActiveStates::RangedSingle { state_ranges: next_seeds, counter_def };
+                let result = ActiveStates::RangedSingle {
+                    state_ranges: next_seeds,
+                    counter_def,
+                };
                 result.epsilon_closure(nfa)
             }
-            ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters } => {
+            ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            } => {
                 let mut next_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
                 for (key, &range) in &configs {
                     if let Some(state) = nfa.get_state(key.state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         let new_key = key.with_state(trans.target);
-                                        next_configs.entry(new_key)
+                                        next_configs
+                                            .entry(new_key)
                                             .and_modify(|r| *r = r.union(range))
                                             .or_insert(range);
                                     }
@@ -1268,7 +1352,9 @@ impl ActiveStates {
                     }
                 }
                 let result = ActiveStates::Hybrid {
-                    configs: next_configs, ranged_counter_idx, num_counters,
+                    configs: next_configs,
+                    ranged_counter_idx,
+                    num_counters,
                 };
                 result.epsilon_closure(nfa)
             }
@@ -1286,21 +1372,33 @@ impl ActiveStates {
         xsd_version: XsdVersion,
     ) -> Self {
         match self {
-            ActiveStates::Simple(states) => {
-                ActiveStates::Simple(advance_with_priority(
-                    nfa, states, element_name, element_namespace,
-                    target_namespace, substitution_groups, xsd_version,
-                ))
-            }
-            ActiveStates::Counted { configs, num_counters } => {
+            ActiveStates::Simple(states) => ActiveStates::Simple(advance_with_priority(
+                nfa,
+                states,
+                element_name,
+                element_namespace,
+                target_namespace,
+                substitution_groups,
+                xsd_version,
+            )),
+            ActiveStates::Counted {
+                configs,
+                num_counters,
+            } => {
                 let mut element_configs = HashSet::new();
                 let mut wildcard_configs = HashSet::new();
 
                 for config in &configs {
                     if let Some(state) = nfa.get_state(config.state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 let target_set = match term_val {
                                     NfaTerm::Element { .. } => &mut element_configs,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_configs,
@@ -1321,25 +1419,38 @@ impl ActiveStates {
                     wildcard_configs
                 };
 
-                let result = ActiveStates::Counted { configs: next, num_counters };
+                let result = ActiveStates::Counted {
+                    configs: next,
+                    num_counters,
+                };
                 result.epsilon_closure(nfa)
             }
-            ActiveStates::RangedSingle { state_ranges, counter_def } => {
+            ActiveStates::RangedSingle {
+                state_ranges,
+                counter_def,
+            } => {
                 let mut element_seeds: HashMap<StateId, CounterRange> = HashMap::new();
                 let mut wildcard_seeds: HashMap<StateId, CounterRange> = HashMap::new();
 
                 for (&state_id, &range) in &state_ranges {
                     if let Some(state) = nfa.get_state(state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 let target_map = match term_val {
                                     NfaTerm::Element { .. } => &mut element_seeds,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_seeds,
                                 };
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
-                                        target_map.entry(trans.target)
+                                        target_map
+                                            .entry(trans.target)
                                             .and_modify(|r| *r = r.union(range))
                                             .or_insert(range);
                                     }
@@ -1355,18 +1466,31 @@ impl ActiveStates {
                     wildcard_seeds
                 };
 
-                let result = ActiveStates::RangedSingle { state_ranges: next, counter_def };
+                let result = ActiveStates::RangedSingle {
+                    state_ranges: next,
+                    counter_def,
+                };
                 result.epsilon_closure(nfa)
             }
-            ActiveStates::Hybrid { configs, ranged_counter_idx, num_counters } => {
+            ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            } => {
                 let mut element_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
                 let mut wildcard_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
 
                 for (key, &range) in &configs {
                     if let Some(state) = nfa.get_state(key.state_id) {
                         if let Some(ref term_val) = state.term {
-                            if term_matches(term_val, element_name, element_namespace,
-                                target_namespace, substitution_groups, xsd_version) {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
                                 let target_map = match term_val {
                                     NfaTerm::Element { .. } => &mut element_configs,
                                     NfaTerm::Wildcard { .. } => &mut wildcard_configs,
@@ -1374,7 +1498,8 @@ impl ActiveStates {
                                 for trans in &state.transitions {
                                     if trans.kind == TransitionKind::Consume {
                                         let new_key = key.with_state(trans.target);
-                                        target_map.entry(new_key)
+                                        target_map
+                                            .entry(new_key)
                                             .and_modify(|r| *r = r.union(range))
                                             .or_insert(range);
                                     }
@@ -1391,7 +1516,9 @@ impl ActiveStates {
                 };
 
                 let result = ActiveStates::Hybrid {
-                    configs: next, ranged_counter_idx, num_counters,
+                    configs: next,
+                    ranged_counter_idx,
+                    num_counters,
                 };
                 result.epsilon_closure(nfa)
             }
@@ -1417,32 +1544,69 @@ impl ActiveStates {
                 // Delegate to existing function (it does epsilon_closure internally,
                 // which is redundant but harmless since states are already closed)
                 let closure = epsilon_closure(nfa, states.iter().copied());
-                find_match_info_in_states(nfa, closure.iter().copied(), name, namespace, target_ns, subst_groups, xsd_version)
+                find_match_info_in_states(
+                    nfa,
+                    closure.iter().copied(),
+                    name,
+                    namespace,
+                    target_ns,
+                    subst_groups,
+                    xsd_version,
+                )
             }
             ActiveStates::Counted { configs, .. } => {
                 // Configs are closure-closed — iterate directly
-                find_match_info_in_states(nfa, configs.iter().map(|c| c.state_id), name, namespace, target_ns, subst_groups, xsd_version)
+                find_match_info_in_states(
+                    nfa,
+                    configs.iter().map(|c| c.state_id),
+                    name,
+                    namespace,
+                    target_ns,
+                    subst_groups,
+                    xsd_version,
+                )
             }
-            ActiveStates::RangedSingle { state_ranges, .. } => {
-                find_match_info_in_states(nfa, state_ranges.keys().copied(), name, namespace, target_ns, subst_groups, xsd_version)
-            }
-            ActiveStates::Hybrid { configs, .. } => {
-                find_match_info_in_states(nfa, configs.keys().map(|k| k.state_id), name, namespace, target_ns, subst_groups, xsd_version)
-            }
+            ActiveStates::RangedSingle { state_ranges, .. } => find_match_info_in_states(
+                nfa,
+                state_ranges.keys().copied(),
+                name,
+                namespace,
+                target_ns,
+                subst_groups,
+                xsd_version,
+            ),
+            ActiveStates::Hybrid { configs, .. } => find_match_info_in_states(
+                nfa,
+                configs.keys().map(|k| k.state_id),
+                name,
+                namespace,
+                target_ns,
+                subst_groups,
+                xsd_version,
+            ),
         }
     }
 
     /// Collect expected element terms from reachable states (for error messages).
     ///
     /// Returns (local_name, namespace, element_key) for each reachable Element term.
-    pub fn expected_element_terms(&self, nfa: &NfaTable) -> Vec<(NameId, Option<NameId>, Option<ElementKey>)> {
+    pub fn expected_element_terms(
+        &self,
+        nfa: &NfaTable,
+    ) -> Vec<(NameId, Option<NameId>, Option<ElementKey>)> {
         let mut result = Vec::new();
         match self {
             ActiveStates::Simple(states) => {
                 let closure = epsilon_closure(nfa, states.iter().copied());
                 for state_id in closure {
                     if let Some(state) = nfa.get_state(state_id) {
-                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                        if let Some(NfaTerm::Element {
+                            name,
+                            namespace,
+                            element_key,
+                            ..
+                        }) = &state.term
+                        {
                             result.push((*name, *namespace, *element_key));
                         }
                     }
@@ -1455,7 +1619,13 @@ impl ActiveStates {
                         continue; // Skip duplicate state IDs
                     }
                     if let Some(state) = nfa.get_state(config.state_id) {
-                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                        if let Some(NfaTerm::Element {
+                            name,
+                            namespace,
+                            element_key,
+                            ..
+                        }) = &state.term
+                        {
                             result.push((*name, *namespace, *element_key));
                         }
                     }
@@ -1464,7 +1634,13 @@ impl ActiveStates {
             ActiveStates::RangedSingle { state_ranges, .. } => {
                 for &state_id in state_ranges.keys() {
                     if let Some(state) = nfa.get_state(state_id) {
-                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                        if let Some(NfaTerm::Element {
+                            name,
+                            namespace,
+                            element_key,
+                            ..
+                        }) = &state.term
+                        {
                             result.push((*name, *namespace, *element_key));
                         }
                     }
@@ -1477,7 +1653,13 @@ impl ActiveStates {
                         continue;
                     }
                     if let Some(state) = nfa.get_state(key.state_id) {
-                        if let Some(NfaTerm::Element { name, namespace, element_key, .. }) = &state.term {
+                        if let Some(NfaTerm::Element {
+                            name,
+                            namespace,
+                            element_key,
+                            ..
+                        }) = &state.term
+                        {
                             result.push((*name, *namespace, *element_key));
                         }
                     }
@@ -1541,7 +1723,9 @@ fn find_match_info_in_states(
                                 }
                             };
                         }
-                        NfaTerm::Wildcard { process_contents, .. } => {
+                        NfaTerm::Wildcard {
+                            process_contents, ..
+                        } => {
                             // Keep first wildcard as fallback
                             if wildcard_info.is_none() {
                                 wildcard_info = Some(MatchInfo {
@@ -1805,15 +1989,13 @@ mod tests {
 
         // Build a simple NFA: start --[head]--> accept
         let builder = crate::compiler::fragment::FragmentBuilder::new();
-        let frag = builder.single_term(
-            NfaTerm::element(head_name, None, Some(head_key)),
-            None,
-        );
+        let frag = builder.single_term(NfaTerm::element(head_name, None, Some(head_key)), None);
         let nfa = crate::compiler::fragment::fragment_to_table(frag);
         let active = ActiveStates::from_nfa(&nfa);
 
         // Match with member name — should return element_key: None
-        let mi = active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
+        let mi =
+            active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi.element_key.is_none(),
             "substitution match should not return head's element_key"
@@ -1822,7 +2004,8 @@ mod tests {
 
         // Abstract head's own name doesn't match (excluded from subst map,
         // and subst map lookup short-circuits before direct name comparison)
-        let mi_head = active.find_match_info(&nfa, head_name, None, None, Some(&map), XsdVersion::V1_0);
+        let mi_head =
+            active.find_match_info(&nfa, head_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi_head.element_key.is_none(),
             "abstract head should not match its own name via subst map"
@@ -1852,10 +2035,7 @@ mod tests {
         let map = build_substitution_group_map(&schema_set);
 
         let builder = crate::compiler::fragment::FragmentBuilder::new();
-        let frag = builder.single_term(
-            NfaTerm::element(head_name, None, Some(head_key)),
-            None,
-        );
+        let frag = builder.single_term(NfaTerm::element(head_name, None, Some(head_key)), None);
         let nfa = crate::compiler::fragment::fragment_to_table(frag);
         let active = ActiveStates::from_nfa(&nfa);
 
@@ -1868,7 +2048,8 @@ mod tests {
         );
 
         // Substitution match with member name — should return None
-        let mi_member = active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
+        let mi_member =
+            active.find_match_info(&nfa, member_name, None, None, Some(&map), XsdVersion::V1_0);
         assert!(
             mi_member.element_key.is_none(),
             "substitution match should not return head's element_key"
@@ -1879,7 +2060,7 @@ mod tests {
     // Counted NFA tests
     // -----------------------------------------------------------------------
 
-    use crate::compiler::fragment::{FragmentBuilder, fragment_to_table};
+    use crate::compiler::fragment::{fragment_to_table, FragmentBuilder};
 
     /// Build a counted NFA for element `a{min,max}` and return (nfa, name_id).
     fn make_counted_element_nfa(min: u32, max: u32) -> (NfaTable, NameId) {
@@ -2046,12 +2227,16 @@ mod tests {
 
         // Single counter + nullable body → should use RangedSingle
         let initial = ActiveStates::from_nfa(&nfa);
-        assert!(matches!(&initial, ActiveStates::RangedSingle { .. }),
-            "Expected RangedSingle for nullable body counted NFA");
+        assert!(
+            matches!(&initial, ActiveStates::RangedSingle { .. }),
+            "Expected RangedSingle for nullable body counted NFA"
+        );
 
         // Initial state should be complete (min=0 loop can be skipped)
         // After advancing with b (skipping the loop entirely), should accept
-        let after_b = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
+        let after_b = initial
+            .clone()
+            .advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(after_b.contains_accept(&nfa));
 
         // With RangedSingle, the state map has O(states) entries, not O(200).
@@ -2079,7 +2264,11 @@ mod tests {
         // Should use counted path (has counters for the prefix)
         assert!(nfa.has_counters());
         // Should be compact — NOT 17*2 = 34 states from unrolling
-        assert!(nfa.state_count() < 15, "expected compact NFA, got {} states", nfa.state_count());
+        assert!(
+            nfa.state_count() < 15,
+            "expected compact NFA, got {} states",
+            nfa.state_count()
+        );
 
         // 16 occurrences: not complete (min=17)
         let s16 = advance_n(ActiveStates::from_nfa(&nfa), &nfa, a, 16);
@@ -2114,8 +2303,14 @@ mod tests {
             TransitionKind::CounterIncrement(2).offset_counter(5),
             TransitionKind::CounterIncrement(7)
         );
-        assert_eq!(TransitionKind::Epsilon.offset_counter(10), TransitionKind::Epsilon);
-        assert_eq!(TransitionKind::Consume.offset_counter(10), TransitionKind::Consume);
+        assert_eq!(
+            TransitionKind::Epsilon.offset_counter(10),
+            TransitionKind::Epsilon
+        );
+        assert_eq!(
+            TransitionKind::Consume.offset_counter(10),
+            TransitionKind::Consume
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2139,12 +2334,18 @@ mod tests {
         assert_eq!(u, CounterRange::new(2, 5));
 
         // intersect_below
-        assert_eq!(CounterRange::new(1, 5).intersect_below(4), CounterRange::new(1, 3));
+        assert_eq!(
+            CounterRange::new(1, 5).intersect_below(4),
+            CounterRange::new(1, 3)
+        );
         assert!(CounterRange::new(5, 8).intersect_below(5).is_empty());
         assert!(CounterRange::new(0, 10).intersect_below(0).is_empty());
 
         // intersect_above
-        assert_eq!(CounterRange::new(1, 5).intersect_above(3), CounterRange::new(3, 5));
+        assert_eq!(
+            CounterRange::new(1, 5).intersect_above(3),
+            CounterRange::new(3, 5)
+        );
         assert!(CounterRange::new(1, 3).intersect_above(5).is_empty());
     }
 
@@ -2233,15 +2434,22 @@ mod tests {
         assert!(matches!(&initial, ActiveStates::RangedSingle { .. }));
 
         if let ActiveStates::RangedSingle { state_ranges, .. } = &initial {
-            assert!(state_ranges.len() <= 15,
-                "Expected O(states) entries, got {}", state_ranges.len());
+            assert!(
+                state_ranges.len() <= 15,
+                "Expected O(states) entries, got {}",
+                state_ranges.len()
+            );
         }
 
         // Accepts "a", "b", "ab", ""
         assert!(initial.contains_accept(&nfa));
-        let s_a = initial.clone().advance(&nfa, a, None, None, None, XsdVersion::V1_0);
+        let s_a = initial
+            .clone()
+            .advance(&nfa, a, None, None, None, XsdVersion::V1_0);
         assert!(s_a.contains_accept(&nfa));
-        let s_b = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
+        let s_b = initial
+            .clone()
+            .advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s_b.contains_accept(&nfa));
     }
 
@@ -2279,8 +2487,10 @@ mod tests {
 
         assert_eq!(nfa.counter_defs.len(), 2);
         let initial = ActiveStates::from_nfa(&nfa);
-        assert!(matches!(&initial, ActiveStates::Counted { .. }),
-            "Multi-counter NFA should use Counted, not RangedSingle");
+        assert!(
+            matches!(&initial, ActiveStates::Counted { .. }),
+            "Multi-counter NFA should use Counted, not RangedSingle"
+        );
     }
 
     #[test]
@@ -2295,9 +2505,11 @@ mod tests {
 
         assert_eq!(nfa.counter_defs.len(), 2);
         let initial = ActiveStates::from_nfa(&nfa);
-        assert!(matches!(&initial, ActiveStates::Hybrid { .. }),
+        assert!(
+            matches!(&initial, ActiveStates::Hybrid { .. }),
             "Nested nullable counted NFA should use Hybrid, got {:?}",
-            std::mem::discriminant(&initial));
+            std::mem::discriminant(&initial)
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2352,7 +2564,9 @@ mod tests {
             assert!(
                 configs.len() <= max_expected,
                 "Expected at most {} entries, got {} (state_count={})",
-                max_expected, configs.len(), nfa.state_count()
+                max_expected,
+                configs.len(),
+                nfa.state_count()
             );
         } else {
             panic!("Expected Hybrid variant");
@@ -2383,11 +2597,15 @@ mod tests {
         assert!(initial.contains_accept(&nfa));
 
         // "a": accepted
-        let s = initial.clone().advance(&nfa, a, None, None, None, XsdVersion::V1_0);
+        let s = initial
+            .clone()
+            .advance(&nfa, a, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // "b": accepted
-        let s = initial.clone().advance(&nfa, b, None, None, None, XsdVersion::V1_0);
+        let s = initial
+            .clone()
+            .advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert!(s.contains_accept(&nfa));
 
         // "a"*1000 + "b"*1000: accepted
@@ -2422,9 +2640,14 @@ mod tests {
         assert!(matches!(&initial, ActiveStates::Hybrid { .. }));
 
         // Verify ranged counter is counter 0 (the nullable one)
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &initial {
-            assert_eq!(*ranged_counter_idx, 0,
-                "Should range the nullable counter (index 0)");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &initial
+        {
+            assert_eq!(
+                *ranged_counter_idx, 0,
+                "Should range the nullable counter (index 0)"
+            );
         }
 
         // Empty: accepted (both min=0)
@@ -2456,11 +2679,17 @@ mod tests {
 
         // Boundary: exactly 100 a's per iteration, 50 iterations = 5000 total
         let s = advance_n(initial.clone(), &nfa, a, 5000);
-        assert!(s.contains_accept(&nfa), "5000 a's should be accepted (50*100)");
+        assert!(
+            s.contains_accept(&nfa),
+            "5000 a's should be accepted (50*100)"
+        );
 
         // Boundary: 101 a's — requires second outer iteration (first handles 100, second 1)
         let s = advance_n(initial.clone(), &nfa, a, 101);
-        assert!(s.contains_accept(&nfa), "101 a's should be accepted (needs 2 outer iterations)");
+        assert!(
+            s.contains_accept(&nfa),
+            "101 a's should be accepted (needs 2 outer iterations)"
+        );
 
         // Boundary: 0 a's
         assert!(initial.contains_accept(&nfa), "0 a's should be accepted");
@@ -2486,12 +2715,20 @@ mod tests {
         assert_eq!(nfa.counter_defs.len(), 2);
         let initial = ActiveStates::from_nfa(&nfa);
         // counter 0 max=10 (below COUNTED_THRESHOLD=16 — but counter 1 max=1000 qualifies)
-        assert!(matches!(&initial, ActiveStates::Hybrid { .. }),
-            "Expected Hybrid, got {:?}", std::mem::discriminant(&initial));
+        assert!(
+            matches!(&initial, ActiveStates::Hybrid { .. }),
+            "Expected Hybrid, got {:?}",
+            std::mem::discriminant(&initial)
+        );
 
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &initial {
-            assert_eq!(*ranged_counter_idx, 1,
-                "Should range counter 1 (max=1000), not counter 0 (max=10)");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &initial
+        {
+            assert_eq!(
+                *ranged_counter_idx, 1,
+                "Should range counter 1 (max=1000), not counter 0 (max=10)"
+            );
         }
 
         // Correctness: "a"*10 + "b"*1000 accepted
@@ -2519,9 +2756,11 @@ mod tests {
 
         assert_eq!(nfa.counter_defs.len(), 2);
         let initial = ActiveStates::from_nfa(&nfa);
-        assert!(matches!(&initial, ActiveStates::Counted { .. }),
+        assert!(
+            matches!(&initial, ActiveStates::Counted { .. }),
             "Small-max nullable counters should stay Counted, got {:?}",
-            std::mem::discriminant(&initial));
+            std::mem::discriminant(&initial)
+        );
     }
 
     #[test]
@@ -2555,7 +2794,10 @@ mod tests {
 
         // advance_with_priority for 'a': element branch exists, so wildcard
         // should not be chosen.  The result should be non-empty.
-        let next = initial.clone().advance_with_priority(&nfa, a, None, None, None, XsdVersion::V1_1);
+        let next =
+            initial
+                .clone()
+                .advance_with_priority(&nfa, a, None, None, None, XsdVersion::V1_1);
         assert!(!next.is_empty());
         assert!(next.contains_accept(&nfa));
 
@@ -2583,9 +2825,14 @@ mod tests {
         let nfa = fragment_to_table(seq);
 
         let initial = ActiveStates::from_nfa(&nfa);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &initial {
-            assert_eq!(*ranged_counter_idx, 0,
-                "Equal max: should prefer first counter (index 0)");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &initial
+        {
+            assert_eq!(
+                *ranged_counter_idx, 0,
+                "Equal max: should prefer first counter (index 0)"
+            );
         } else {
             panic!("Expected Hybrid variant");
         }
@@ -2610,13 +2857,24 @@ mod tests {
         let after_a = advance_n(initial, &nfa, a, 1000);
         let after_b = after_a.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
 
-        if let ActiveStates::Hybrid { ranged_counter_idx, configs, .. } = &after_b {
-            assert_eq!(*ranged_counter_idx, 1,
-                "Should have dynamically switched to counter 1");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx,
+            configs,
+            ..
+        } = &after_b
+        {
+            assert_eq!(
+                *ranged_counter_idx, 1,
+                "Should have dynamically switched to counter 1"
+            );
             // Config count should be O(states), not O(1000 * states)
             let max_expected = nfa.state_count() * 2;
-            assert!(configs.len() <= max_expected,
-                "Expected <= {} configs after switch, got {}", max_expected, configs.len());
+            assert!(
+                configs.len() <= max_expected,
+                "Expected <= {} configs after switch, got {}",
+                max_expected,
+                configs.len()
+            );
         } else {
             panic!("Expected Hybrid variant");
         }
@@ -2653,18 +2911,28 @@ mod tests {
         let after_a = advance_n(initial, &nfa, a, 500);
         assert!(after_a.contains_accept(&nfa));
         let after_b1 = after_a.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_b1 {
-            assert_eq!(*ranged_counter_idx, 1,
-                "Should switch to counter 1 after first loop exits");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &after_b1
+        {
+            assert_eq!(
+                *ranged_counter_idx, 1,
+                "Should switch to counter 1 after first loop exits"
+            );
         }
 
         // After 500 b's + 1 c → switch to counter 2
         let after_b = advance_n(after_b1, &nfa, b, 499);
         assert!(after_b.contains_accept(&nfa));
         let after_c1 = after_b.advance(&nfa, c, None, None, None, XsdVersion::V1_0);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_c1 {
-            assert_eq!(*ranged_counter_idx, 2,
-                "Should switch to counter 2 after second loop exits");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &after_c1
+        {
+            assert_eq!(
+                *ranged_counter_idx, 2,
+                "Should switch to counter 2 after second loop exits"
+            );
         }
 
         // 500 c's accepted, 501 rejected
@@ -2690,9 +2958,14 @@ mod tests {
 
         let initial = ActiveStates::from_nfa(&nfa);
         let after_5a = advance_n(initial, &nfa, a, 5);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_5a {
-            assert_eq!(*ranged_counter_idx, 0,
-                "Should NOT switch while first loop is still active");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &after_5a
+        {
+            assert_eq!(
+                *ranged_counter_idx, 0,
+                "Should NOT switch while first loop is still active"
+            );
         }
     }
 
@@ -2712,9 +2985,14 @@ mod tests {
         let initial = ActiveStates::from_nfa(&nfa);
         // Feed b's to exit first loop (counter 0 dead) and enter second
         let after_b = advance_n(initial, &nfa, b, 100);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_b {
-            assert_eq!(*ranged_counter_idx, 0,
-                "Should NOT switch: counter 1 is not nullable");
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &after_b
+        {
+            assert_eq!(
+                *ranged_counter_idx, 0,
+                "Should NOT switch: counter 1 is not nullable"
+            );
         }
 
         // Correctness: b*1000 accepted
@@ -2736,13 +3014,23 @@ mod tests {
         // During active processing, the ranged counter should not switch
         let initial = ActiveStates::from_nfa(&nfa);
         let after_a = advance_n(initial.clone(), &nfa, a, 50);
-        if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &after_a {
+        if let ActiveStates::Hybrid {
+            ranged_counter_idx, ..
+        } = &after_a
+        {
             // The initial ranged counter (inner, max=100) should stay
-            let initial_idx = if let ActiveStates::Hybrid { ranged_counter_idx, .. } = &initial {
+            let initial_idx = if let ActiveStates::Hybrid {
+                ranged_counter_idx, ..
+            } = &initial
+            {
                 *ranged_counter_idx
-            } else { unreachable!() };
-            assert_eq!(*ranged_counter_idx, initial_idx,
-                "Should NOT switch while processing nested loops");
+            } else {
+                unreachable!()
+            };
+            assert_eq!(
+                *ranged_counter_idx, initial_idx,
+                "Should NOT switch while processing nested loops"
+            );
         }
     }
 
@@ -2763,13 +3051,23 @@ mod tests {
         let initial = ActiveStates::from_nfa(&nfa);
         // Feed one 'b': exits first loop, enters second loop
         let after_b = initial.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
-        if let ActiveStates::Hybrid { configs, ranged_counter_idx, .. } = &after_b {
-            assert_eq!(*ranged_counter_idx, 1,
-                "Should switch to counter 1 after 'b'");
+        if let ActiveStates::Hybrid {
+            configs,
+            ranged_counter_idx,
+            ..
+        } = &after_b
+        {
+            assert_eq!(
+                *ranged_counter_idx, 1,
+                "Should switch to counter 1 after 'b'"
+            );
             // After switch, configs should be compact: O(states) not O(1000*states)
-            assert!(configs.len() < nfa.state_count() * 2,
+            assert!(
+                configs.len() < nfa.state_count() * 2,
                 "Config count {} should be << state_count {} after switch",
-                configs.len(), nfa.state_count());
+                configs.len(),
+                nfa.state_count()
+            );
         }
     }
 
@@ -2798,7 +3096,8 @@ mod tests {
         let counted = ActiveStates::Counted {
             configs: counted_configs,
             num_counters: nfa.counter_defs.len(),
-        }.epsilon_closure(&nfa);
+        }
+        .epsilon_closure(&nfa);
 
         // Compare: feed a*50, then b*50, checking at each step
         let mut h = hybrid;
@@ -2806,18 +3105,30 @@ mod tests {
         for _ in 0..50 {
             h = h.advance(&nfa, a, None, None, None, XsdVersion::V1_0);
             c = c.advance(&nfa, a, None, None, None, XsdVersion::V1_0);
-            assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa),
-                "Hybrid/Counted disagree on accept during a-feeding");
-            assert_eq!(h.is_empty(), c.is_empty(),
-                "Hybrid/Counted disagree on empty during a-feeding");
+            assert_eq!(
+                h.contains_accept(&nfa),
+                c.contains_accept(&nfa),
+                "Hybrid/Counted disagree on accept during a-feeding"
+            );
+            assert_eq!(
+                h.is_empty(),
+                c.is_empty(),
+                "Hybrid/Counted disagree on empty during a-feeding"
+            );
         }
         for _ in 0..50 {
             h = h.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
             c = c.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
-            assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa),
-                "Hybrid/Counted disagree on accept during b-feeding");
-            assert_eq!(h.is_empty(), c.is_empty(),
-                "Hybrid/Counted disagree on empty during b-feeding");
+            assert_eq!(
+                h.contains_accept(&nfa),
+                c.contains_accept(&nfa),
+                "Hybrid/Counted disagree on accept during b-feeding"
+            );
+            assert_eq!(
+                h.is_empty(),
+                c.is_empty(),
+                "Hybrid/Counted disagree on empty during b-feeding"
+            );
         }
         // Both should accept after a*50 + b*50
         assert!(h.contains_accept(&nfa));

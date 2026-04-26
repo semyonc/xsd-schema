@@ -14,11 +14,11 @@ use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
 use crate::xpath::{DomNodeType, NamespaceAxisScope};
 
-use super::{atomize_to_string_opt, atomize_to_single_opt, XPathValue};
-use crate::xpath::iterator::XmlItem;
-use crate::types::value::{XmlValue, XmlValueKind, XmlAtomicValue};
-use crate::types::XmlTypeCode;
+use super::{atomize_to_single_opt, atomize_to_string_opt, XPathValue};
 use crate::namespace::qname::{is_ncname, QualifiedName};
+use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::XmlTypeCode;
+use crate::xpath::iterator::XmlItem;
 
 /// fn:resolve-QName($qname as xs:string?, $element as element()) as xs:QName?
 ///
@@ -32,7 +32,11 @@ pub fn resolve_qname<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("resolve-QName", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "resolve-QName",
+            2,
+            args.len(),
+        ));
     }
 
     let element = get_element_arg(&mut args)?;
@@ -56,7 +60,12 @@ pub fn resolve_qname<N: DomNavigator>(
     let namespace_uri = lookup_namespace_for_prefix(&element, prefix.as_deref())?;
 
     // Create the QName value
-    let qn = create_qname_value(context, namespace_uri.as_deref(), &local_name, prefix.as_deref());
+    let qn = create_qname_value(
+        context,
+        namespace_uri.as_deref(),
+        &local_name,
+        prefix.as_deref(),
+    );
     Ok(qn)
 }
 
@@ -73,7 +82,11 @@ pub fn qname_constructor<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("QName", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "QName",
+            2,
+            args.len(),
+        ));
     }
 
     let local_arg = args.pop().unwrap();
@@ -94,13 +107,16 @@ pub fn qname_constructor<N: DomNavigator>(
 
     // Check constraint: if prefix is present, namespace must be non-empty
     if prefix.is_some() && namespace_uri.is_none() {
-        return Err(XPathError::FOCA0002 {
-            qname: param_qname,
-        });
+        return Err(XPathError::FOCA0002 { qname: param_qname });
     }
 
     // Create the QName value
-    let qn = create_qname_value(context, namespace_uri.as_deref(), &local_name, prefix.as_deref());
+    let qn = create_qname_value(
+        context,
+        namespace_uri.as_deref(),
+        &local_name,
+        prefix.as_deref(),
+    );
     Ok(qn)
 }
 
@@ -112,7 +128,11 @@ pub fn prefix_from_qname<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("prefix-from-QName", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "prefix-from-QName",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -120,20 +140,21 @@ pub fn prefix_from_qname<N: DomNavigator>(
 
     match qname {
         None => Ok(XPathValue::Empty),
-        Some(qn) => {
-            match qn.prefix {
-                None => Ok(XPathValue::Empty),
-                Some(prefix_id) => {
-                    let prefix = context.static_context.names.try_resolve(prefix_id)
-                        .unwrap_or_default();
-                    if prefix.is_empty() {
-                        Ok(XPathValue::Empty)
-                    } else {
-                        Ok(XPathValue::string(prefix))
-                    }
+        Some(qn) => match qn.prefix {
+            None => Ok(XPathValue::Empty),
+            Some(prefix_id) => {
+                let prefix = context
+                    .static_context
+                    .names
+                    .try_resolve(prefix_id)
+                    .unwrap_or_default();
+                if prefix.is_empty() {
+                    Ok(XPathValue::Empty)
+                } else {
+                    Ok(XPathValue::string(prefix))
                 }
             }
-        }
+        },
     }
 }
 
@@ -145,7 +166,11 @@ pub fn local_name_from_qname<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("local-name-from-QName", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "local-name-from-QName",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -154,7 +179,10 @@ pub fn local_name_from_qname<N: DomNavigator>(
     match qname {
         None => Ok(XPathValue::Empty),
         Some(qn) => {
-            let local = context.static_context.names.try_resolve(qn.local_name)
+            let local = context
+                .static_context
+                .names
+                .try_resolve(qn.local_name)
                 .unwrap_or_default();
             Ok(XPathValue::string(local))
         }
@@ -169,7 +197,11 @@ pub fn namespace_uri_from_qname<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("namespace-uri-from-QName", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "namespace-uri-from-QName",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -184,7 +216,10 @@ pub fn namespace_uri_from_qname<N: DomNavigator>(
                     Ok(make_any_uri(""))
                 }
                 Some(ns_id) => {
-                    let ns = context.static_context.names.try_resolve(ns_id)
+                    let ns = context
+                        .static_context
+                        .names
+                        .try_resolve(ns_id)
                         .unwrap_or_default();
                     Ok(make_any_uri(&ns))
                 }
@@ -204,7 +239,11 @@ pub fn namespace_uri_for_prefix<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("namespace-uri-for-prefix", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "namespace-uri-for-prefix",
+            2,
+            args.len(),
+        ));
     }
 
     let element = get_element_arg(&mut args)?;
@@ -239,7 +278,11 @@ pub fn in_scope_prefixes<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("in-scope-prefixes", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "in-scope-prefixes",
+            1,
+            args.len(),
+        ));
     }
 
     let element = get_element_arg(&mut args)?;
@@ -321,9 +364,9 @@ pub fn parse_lexical_qname(qname: &str) -> Result<(Option<String>, String), XPat
 
 /// Get an element node from the arguments list.
 fn get_element_arg<N: DomNavigator>(args: &mut Vec<XPathValue<N>>) -> Result<N, XPathError> {
-    let arg = args.pop().ok_or_else(|| {
-        XPathError::type_mismatch("element()", "empty-sequence()")
-    })?;
+    let arg = args
+        .pop()
+        .ok_or_else(|| XPathError::type_mismatch("element()", "empty-sequence()"))?;
 
     match arg {
         XPathValue::Item(XmlItem::Node(nav)) => {
@@ -361,7 +404,10 @@ fn atomize_to_qname<N: DomNavigator>(
             if let Some(qn) = value.as_qname() {
                 Ok(Some(qn.clone()))
             } else {
-                Err(XPathError::type_mismatch("xs:QName", format!("{:?}", value.type_code)))
+                Err(XPathError::type_mismatch(
+                    "xs:QName",
+                    format!("{:?}", value.type_code),
+                ))
             }
         }
     }
@@ -475,7 +521,8 @@ mod tests {
                 XPathValue::string("http://example.com"),
                 XPathValue::string("p:local"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Now extract the components
         // prefix-from-QName should return "p"
@@ -515,7 +562,8 @@ mod tests {
                 XPathValue::Empty, // No namespace
                 XPathValue::string("localonly"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         // prefix-from-QName should return empty sequence
         let prefix_result = prefix_from_qname(&mut ctx, vec![qname_result.clone()]).unwrap();

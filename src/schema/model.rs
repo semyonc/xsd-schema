@@ -5,20 +5,20 @@
 //! - `SchemaDocument` - Individual schema document (root or included/imported)
 //! - `NamespaceTable` - Per-namespace component lookup
 
-use std::collections::HashMap;
 use bitflags::bitflags;
+use std::collections::HashMap;
 
+use crate::arenas::SchemaArenas;
 use crate::ids::*;
-use crate::namespace::NameTable;
 use crate::namespace::table::well_known;
-use crate::parser::location::{SourceLocation, SourceMapStorage, SourceRef};
+use crate::namespace::NameTable;
 use crate::namespace::QualifiedName;
+use crate::parser::location::{SourceLocation, SourceMapStorage, SourceRef};
 use crate::schema::annotation::Annotation;
 use crate::schema::composition::{
-    ComponentKind, CompositionEdge, ComponentIdentity, DocumentComponentIndex, EffectiveComponent,
+    ComponentIdentity, ComponentKind, CompositionEdge, DocumentComponentIndex, EffectiveComponent,
 };
 use crate::schema::wildcard::ElementWildcard;
-use crate::arenas::SchemaArenas;
 use crate::types::{BuiltinTypes, XmlTypeCode};
 
 /// XSD version mode
@@ -256,8 +256,16 @@ impl SchemaSet {
     }
 
     /// Look up an attribute group by namespace and name
-    pub fn lookup_attribute_group(&self, ns: Option<NameId>, name: NameId) -> Option<AttributeGroupKey> {
-        self.namespaces.get(&ns)?.attribute_groups.get(&name).copied()
+    pub fn lookup_attribute_group(
+        &self,
+        ns: Option<NameId>,
+        name: NameId,
+    ) -> Option<AttributeGroupKey> {
+        self.namespaces
+            .get(&ns)?
+            .attribute_groups
+            .get(&name)
+            .copied()
     }
 
     /// Look up a notation by namespace and name
@@ -377,7 +385,8 @@ impl SchemaSet {
             // Get the simple type data
             if let Some(type_def) = self.arenas.simple_types.get(current) {
                 // Check the resolved base type
-                if let Some(crate::ids::TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
+                if let Some(crate::ids::TypeKey::Simple(simple_base)) = type_def.resolved_base_type
+                {
                     if simple_base == base {
                         return true;
                     }
@@ -456,9 +465,7 @@ impl SchemaSet {
 
             // Case 3: Simple derives from Complex
             // All simple types derive from anyType (via anySimpleType).
-            (TypeKey::Simple(_), TypeKey::Complex(_)) => {
-                false
-            }
+            (TypeKey::Simple(_), TypeKey::Complex(_)) => false,
 
             // Case 4: Complex derives from Simple
             // Complex types with simpleContent can derive from simple types
@@ -661,7 +668,11 @@ impl SchemaSet {
     ) -> String {
         use crate::schema::composition::CompositionAction;
 
-        let identity = ComponentIdentity { kind, name, namespace };
+        let identity = ComponentIdentity {
+            kind,
+            name,
+            namespace,
+        };
         match self.effective_components.get(&identity) {
             Some(eff) => match &eff.action {
                 CompositionAction::Redefined { from_doc, replaced } => {
@@ -687,7 +698,10 @@ impl SchemaSet {
                         .and_then(|id| self.documents.get(id as usize))
                         .map(|d| d.base_uri.as_str())
                         .unwrap_or("unknown");
-                    format!(" (originally in {}, overridden by {})", target_uri, from_uri)
+                    format!(
+                        " (originally in {}, overridden by {})",
+                        target_uri, from_uri
+                    )
                 }
                 CompositionAction::Included { from_doc } => {
                     let uri = self
@@ -915,12 +929,20 @@ impl NamespaceTable {
     }
 
     /// Register a model group in this namespace
-    pub fn register_model_group(&mut self, name: NameId, key: ModelGroupKey) -> Option<ModelGroupKey> {
+    pub fn register_model_group(
+        &mut self,
+        name: NameId,
+        key: ModelGroupKey,
+    ) -> Option<ModelGroupKey> {
         self.model_groups.insert(name, key)
     }
 
     /// Register an attribute group in this namespace
-    pub fn register_attribute_group(&mut self, name: NameId, key: AttributeGroupKey) -> Option<AttributeGroupKey> {
+    pub fn register_attribute_group(
+        &mut self,
+        name: NameId,
+        key: AttributeGroupKey,
+    ) -> Option<AttributeGroupKey> {
         self.attribute_groups.insert(name, key)
     }
 
@@ -1023,7 +1045,9 @@ mod tests {
         assert_eq!(set.xsd_version, XsdVersion::V1_0);
         assert!(set.documents.is_empty());
         // XSI namespace is pre-populated with built-in attribute declarations
-        assert!(set.namespaces.contains_key(&Some(crate::namespace::table::well_known::XSI_NAMESPACE)));
+        assert!(set
+            .namespaces
+            .contains_key(&Some(crate::namespace::table::well_known::XSI_NAMESPACE)));
     }
 
     #[test]
@@ -1318,8 +1342,13 @@ mod tests {
 
         // Find myUnion by name
         let union_name = set.name_table.add("myUnion");
-        let union_key = set.namespaces.get(&None).unwrap()
-            .types.get(&union_name).copied()
+        let union_key = set
+            .namespaces
+            .get(&None)
+            .unwrap()
+            .types
+            .get(&union_name)
+            .copied()
             .expect("myUnion should exist");
 
         // xs:integer is a member of myUnion → should be "derived" via 2.2.4
@@ -1362,8 +1391,13 @@ mod tests {
             .expect("schema should parse");
 
         let outer_name = set.name_table.add("outerUnion");
-        let outer_key = set.namespaces.get(&None).unwrap()
-            .types.get(&outer_name).copied()
+        let outer_key = set
+            .namespaces
+            .get(&None)
+            .unwrap()
+            .types
+            .get(&outer_name)
+            .copied()
             .expect("outerUnion should exist");
 
         // xs:boolean is in innerUnion which is in outerUnion → transitive

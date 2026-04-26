@@ -9,8 +9,7 @@ use crate::schema::model::XsdVersion;
 /// Namespace constraint for wildcards
 ///
 /// Specifies which namespaces are allowed by a wildcard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NamespaceConstraint {
     /// Any namespace allowed (##any)
     #[default]
@@ -54,7 +53,12 @@ impl NamespaceConstraint {
     }
 
     /// Check if this constraint allows a given namespace
-    pub fn allows(&self, ns: Option<NameId>, target_ns: Option<NameId>, xsd_version: XsdVersion) -> bool {
+    pub fn allows(
+        &self,
+        ns: Option<NameId>,
+        target_ns: Option<NameId>,
+        xsd_version: XsdVersion,
+    ) -> bool {
         match self {
             NamespaceConstraint::Any => true,
             NamespaceConstraint::Other => {
@@ -65,7 +69,6 @@ impl NamespaceConstraint {
         }
     }
 }
-
 
 /// Process contents directive
 ///
@@ -97,7 +100,6 @@ impl std::str::FromStr for ProcessContents {
 }
 
 impl ProcessContents {
-
     /// Convert to string
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -266,9 +268,9 @@ mod tests {
 
         assert!(!constraint.allows(target, target, XsdVersion::V1_0)); // Same as target - not allowed
         assert!(constraint.allows(Some(NameId(2)), target, XsdVersion::V1_0)); // Different - allowed
-        // XSD 1.0 and 1.1: absent namespace is NOT allowed by ##other
-        // (§3.10.4: when the schema has a target namespace, ##other excludes
-        // both the target ns and the absent ns).
+                                                                               // XSD 1.0 and 1.1: absent namespace is NOT allowed by ##other
+                                                                               // (§3.10.4: when the schema has a target namespace, ##other excludes
+                                                                               // both the target ns and the absent ns).
         assert!(!constraint.allows(None, target, XsdVersion::V1_0));
         assert!(!constraint.allows(None, target, XsdVersion::V1_1));
     }
@@ -311,5 +313,4 @@ mod tests {
         let wildcard = AttributeWildcard::new();
         assert_eq!(wildcard.process_contents, ProcessContents::Strict);
     }
-
 }

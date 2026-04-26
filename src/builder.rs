@@ -26,7 +26,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::DocumentId;
 use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
-    resolve_all_directives, fixup_composition_edges, ResolverConfig, SchemaLoader, SchemaResolver,
+    fixup_composition_edges, resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
 };
 #[cfg(feature = "async")]
 use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
@@ -345,7 +345,9 @@ impl SchemaSetBuilder {
         // for all directive types — the target may be unavailable.
         // Schema-content errors (structural, XML parse, namespace) mean the
         // target was found but is invalid — those are always fatal.
-        if let Some(err) = self.errors.into_iter()
+        if let Some(err) = self
+            .errors
+            .into_iter()
             .chain(self.import_errors)
             .find(|e| e.is_schema_content_error())
         {
@@ -437,7 +439,9 @@ impl SchemaSetBuilder {
         fixup_composition_edges(&mut self.schema_set);
 
         // Propagate schema-content errors from directive resolution
-        if let Some(err) = self.errors.into_iter()
+        if let Some(err) = self
+            .errors
+            .into_iter()
             .chain(self.import_errors)
             .find(|e| e.is_schema_content_error())
         {

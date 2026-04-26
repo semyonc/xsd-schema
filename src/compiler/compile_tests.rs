@@ -1,7 +1,9 @@
 use super::*;
 use crate::parser::frames::OpenContentMode;
 use crate::parser::location::{SourceRef, SourceSpan};
-use crate::schema::model::{DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion};
+use crate::schema::model::{
+    DefaultOpenContent, OpenContentMode as SchemaOpenContentMode, XsdVersion,
+};
 use crate::schema::wildcard::ElementWildcard;
 use crate::schema::SchemaDocument;
 
@@ -247,7 +249,10 @@ fn test_invalid_occurrence() {
     };
 
     let result = compile_particle(&schema_set, &particle, None);
-    assert!(matches!(result, Err(NfaCompileError::InvalidOccurrence { .. })));
+    assert!(matches!(
+        result,
+        Err(NfaCompileError::InvalidOccurrence { .. })
+    ));
 }
 
 #[test]
@@ -404,9 +409,7 @@ fn make_all_particle_with_occurs(
     }
 }
 
-fn make_complex_type_with_content(
-    content: ComplexContentResult,
-) -> ComplexTypeDefData {
+fn make_complex_type_with_content(content: ComplexContentResult) -> ComplexTypeDefData {
     make_complex_type_data(None, content)
 }
 
@@ -542,9 +545,7 @@ fn test_extension_from_all_group_base_with_own_particles() {
     let mut schema_set = SchemaSet::new();
 
     // Create base type with all-group
-    let base_all = make_all_particle(vec![
-        make_element_particle(NameId(1), 1, Some(1)),
-    ]);
+    let base_all = make_all_particle(vec![make_element_particle(NameId(1), 1, Some(1))]);
     let base_content = ComplexContentResult::Complex(ComplexContentDefResult {
         particle: Some(base_all),
         derivation: DerivationMethod::Restriction,
@@ -564,9 +565,7 @@ fn test_extension_from_all_group_base_with_own_particles() {
     let base_key = schema_set.arenas.alloc_complex_type(base_ct);
 
     // Create extension type with its own sequence particle
-    let ext_seq = make_sequence_particle(vec![
-        make_element_particle(NameId(3), 1, Some(1)),
-    ]);
+    let ext_seq = make_sequence_particle(vec![make_element_particle(NameId(3), 1, Some(1))]);
     let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
         particle: Some(ext_seq),
         derivation: DerivationMethod::Extension,
@@ -603,20 +602,18 @@ fn test_extension_from_all_group_base_with_own_particles() {
 #[test]
 fn test_attach_open_content_all_group() {
     use crate::types::complex::{
-        OpenContent, OpenContentMode as TypesOpenContentMode, WildcardRef,
-        NamespaceConstraint, ProcessContents as TypesProcessContents,
+        NamespaceConstraint, OpenContent, OpenContentMode as TypesOpenContentMode,
+        ProcessContents as TypesProcessContents, WildcardRef,
     };
 
     let schema_set = SchemaSet::with_version(XsdVersion::V1_0);
     let a_name = NameId(1);
-    let model = AllGroupModel::new(vec![
-        AllParticle::new(
-            NfaTerm::element(a_name, None, None),
-            1,
-            MaxOccurs::Bounded(1),
-            None,
-        ),
-    ]);
+    let model = AllGroupModel::new(vec![AllParticle::new(
+        NfaTerm::element(a_name, None, None),
+        1,
+        MaxOccurs::Bounded(1),
+        None,
+    )]);
     let matcher = ContentModelMatcher::AllGroup(model);
     let oc = OpenContent {
         mode: TypesOpenContentMode::Interleave,
@@ -633,7 +630,10 @@ fn test_attach_open_content_all_group() {
     let result = attach_open_content(&schema_set, matcher, Some(oc));
     match result {
         ContentModelMatcher::AllGroup(model) => {
-            assert!(model.open_content.is_some(), "open content should be populated");
+            assert!(
+                model.open_content.is_some(),
+                "open content should be populated"
+            );
             let oc = model.open_content.unwrap();
             assert_eq!(oc.mode, crate::compiler::OpenContentMode::Interleave);
         }
@@ -736,9 +736,7 @@ fn test_extension_all_group_base_with_sequence() {
     let base_key = schema_set.arenas.alloc_complex_type(base_ct);
 
     // Extension type: sequence(C)
-    let ext_seq = make_sequence_particle(vec![
-        make_element_particle(NameId(3), 1, Some(1)),
-    ]);
+    let ext_seq = make_sequence_particle(vec![make_element_particle(NameId(3), 1, Some(1))]);
     let ext_content = ComplexContentResult::Complex(ComplexContentDefResult {
         particle: Some(ext_seq),
         derivation: DerivationMethod::Extension,
@@ -798,7 +796,11 @@ fn test_wildcard_ref_from_result_resolves_target_namespace_in_list() {
     match &wref.namespace_constraint {
         NamespaceConstraint::List(list) => {
             assert_eq!(list.len(), 3);
-            assert_eq!(list[0], Some(target_ns), "##targetNamespace should resolve to target_ns");
+            assert_eq!(
+                list[0],
+                Some(target_ns),
+                "##targetNamespace should resolve to target_ns"
+            );
             assert_eq!(list[1], Some(other_ns));
             assert_eq!(list[2], None, "##local should resolve to None");
         }
@@ -827,7 +829,11 @@ fn test_wildcard_ref_from_result_resolves_target_namespace_in_not_namespace() {
     match &wref.namespace_constraint {
         NamespaceConstraint::Not(excluded) => {
             assert_eq!(excluded.len(), 1);
-            assert_eq!(excluded[0], Some(target_ns), "##targetNamespace in notNamespace should resolve to target_ns");
+            assert_eq!(
+                excluded[0],
+                Some(target_ns),
+                "##targetNamespace in notNamespace should resolve to target_ns"
+            );
         }
         other => panic!("expected Not, got {:?}", other),
     }
@@ -840,7 +846,12 @@ fn test_wildcard_ref_from_result_expands_defined() {
     let elem_name = schema_set.name_table.add("foo");
 
     // Register a globally declared element in the schema
-    schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+    schema_set
+        .namespaces
+        .entry(Some(ns))
+        .or_default()
+        .elements
+        .insert(elem_name, Default::default());
 
     use NotQNameItem;
 
@@ -870,7 +881,12 @@ fn test_wildcard_ref_from_default_expands_defined() {
     let elem_name = schema_set.name_table.add("bar");
 
     // Register a globally declared element
-    schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+    schema_set
+        .namespaces
+        .entry(Some(ns))
+        .or_default()
+        .elements
+        .insert(elem_name, Default::default());
 
     let mut wildcard = ElementWildcard::any_lax();
     wildcard.not_qnames = vec![QNameDisallowed::Defined];
@@ -933,7 +949,12 @@ fn test_default_open_content_e2e_with_defined() {
     let elem_name = schema_set.name_table.add("globalElem");
 
     // Register a globally declared element
-    schema_set.namespaces.entry(Some(ns)).or_default().elements.insert(elem_name, Default::default());
+    schema_set
+        .namespaces
+        .entry(Some(ns))
+        .or_default()
+        .elements
+        .insert(elem_name, Default::default());
 
     let doc_id = schema_set.documents.len() as u32;
     let mut doc = SchemaDocument::new(doc_id, "test.xsd".to_string());
@@ -1121,7 +1142,10 @@ fn test_defined_sibling_open_content_nfa() {
     match result {
         ContentModelMatcher::WithOpenContent { wildcard, .. } => {
             let wref = wildcard.expect("wildcard should be present");
-            assert!(!wref.has_defined_sibling, "has_defined_sibling should be resolved");
+            assert!(
+                !wref.has_defined_sibling,
+                "has_defined_sibling should be resolved"
+            );
             assert!(
                 wref.not_qnames.contains(&(None, elem_a)),
                 "##definedSibling should exclude sibling element 'a'"
@@ -1336,7 +1360,11 @@ fn test_group_ref_to_all_inside_all() {
     let matcher = compile_all_type(&schema_set, all_particle).unwrap();
     match &matcher {
         ContentModelMatcher::AllGroup(model) => {
-            assert_eq!(model.particle_count(), 3, "should flatten to 3 particles: a, b, c");
+            assert_eq!(
+                model.particle_count(),
+                3,
+                "should flatten to 3 particles: a, b, c"
+            );
         }
         other => panic!("expected AllGroup, got {:?}", other),
     }
@@ -1385,7 +1413,11 @@ fn test_nested_group_refs_in_all() {
     let matcher = compile_all_type(&schema_set, all_particle).unwrap();
     match &matcher {
         ContentModelMatcher::AllGroup(model) => {
-            assert_eq!(model.particle_count(), 4, "should flatten to 4 particles: a, b, c, d");
+            assert_eq!(
+                model.particle_count(),
+                4,
+                "should flatten to 4 particles: a, b, c, d"
+            );
         }
         other => panic!("expected AllGroup, got {:?}", other),
     }
@@ -1423,7 +1455,10 @@ fn test_group_ref_with_optional_inner_particles() {
             assert_eq!(model.particle_count(), 3);
             // Check that inner particle b kept its optional nature
             let optional_count = model.particles.iter().filter(|p| p.is_optional()).count();
-            assert_eq!(optional_count, 1, "b should remain optional after flattening");
+            assert_eq!(
+                optional_count, 1,
+                "b should remain optional after flattening"
+            );
         }
         other => panic!("expected AllGroup, got {:?}", other),
     }
@@ -1470,12 +1505,14 @@ fn test_group_ref_alongside_wildcard() {
         ContentModelMatcher::AllGroup(model) => {
             assert_eq!(model.particle_count(), 2, "wildcard + flattened element a");
             // One should be element, one should be wildcard
-            let has_wildcard = model.particles.iter().any(|p| {
-                matches!(p.term, NfaTerm::Wildcard { .. })
-            });
-            let has_element = model.particles.iter().any(|p| {
-                matches!(p.term, NfaTerm::Element { .. })
-            });
+            let has_wildcard = model
+                .particles
+                .iter()
+                .any(|p| matches!(p.term, NfaTerm::Wildcard { .. }));
+            let has_element = model
+                .particles
+                .iter()
+                .any(|p| matches!(p.term, NfaTerm::Element { .. }));
             assert!(has_wildcard, "should have wildcard particle");
             assert!(has_element, "should have element particle from group ref");
         }
@@ -1518,10 +1555,7 @@ fn test_defined_sibling_includes_group_ref_elements() {
     };
 
     let all_particle = make_all_with_group_ref(
-        vec![
-            make_element_particle(a, 1, Some(1)),
-            wildcard_particle,
-        ],
+        vec![make_element_particle(a, 1, Some(1)), wildcard_particle],
         vec![make_group_ref_particle(None, g_name, 1, Some(1))],
     );
 
@@ -1529,9 +1563,11 @@ fn test_defined_sibling_includes_group_ref_elements() {
     match &matcher {
         ContentModelMatcher::AllGroup(model) => {
             // Find the wildcard particle and verify not_qnames
-            let wc = model.particles.iter().find(|p| {
-                matches!(p.term, NfaTerm::Wildcard { .. })
-            }).expect("should have wildcard particle");
+            let wc = model
+                .particles
+                .iter()
+                .find(|p| matches!(p.term, NfaTerm::Wildcard { .. }))
+                .expect("should have wildcard particle");
             if let NfaTerm::Wildcard { not_qnames, .. } = &wc.term {
                 assert!(
                     not_qnames.contains(&(None, a)),
@@ -1619,9 +1655,7 @@ fn test_group_ref_to_sequence_in_all_error() {
         vec![make_element_particle(a, 1, Some(1))],
     );
 
-    let all_particle = make_all_particle(vec![
-        make_group_ref_particle(None, g_name, 1, Some(1)),
-    ]);
+    let all_particle = make_all_particle(vec![make_group_ref_particle(None, g_name, 1, Some(1))]);
 
     let result = compile_all_type(&schema_set, all_particle);
     assert!(
@@ -1646,9 +1680,7 @@ fn test_group_ref_to_choice_in_all_error() {
         vec![make_element_particle(a, 1, Some(1))],
     );
 
-    let all_particle = make_all_particle(vec![
-        make_group_ref_particle(None, g_name, 1, Some(1)),
-    ]);
+    let all_particle = make_all_particle(vec![make_group_ref_particle(None, g_name, 1, Some(1))]);
 
     let result = compile_all_type(&schema_set, all_particle);
     assert!(
@@ -1772,7 +1804,7 @@ fn test_all_group_outer_min_gt_max_rejected() {
             make_element_particle(NameId(1), 1, Some(1)),
             make_element_particle(NameId(2), 1, Some(1)),
         ],
-        1, // minOccurs=1
+        1,       // minOccurs=1
         Some(0), // maxOccurs=0
     );
 
@@ -1873,7 +1905,10 @@ fn test_all_group_outer_optional_accepted() {
     let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
     match &matcher {
         ContentModelMatcher::AllGroup(model) => {
-            assert!(model.outer_optional, "minOccurs=0 should set outer_optional");
+            assert!(
+                model.outer_optional,
+                "minOccurs=0 should set outer_optional"
+            );
             assert_eq!(model.particle_count(), 2);
         }
         other => panic!("expected AllGroup, got {:?}", other),
@@ -1910,7 +1945,10 @@ fn test_all_group_default_not_outer_optional() {
     let matcher = compile_content_model_matcher(&schema_set, &type_def).unwrap();
     match &matcher {
         ContentModelMatcher::AllGroup(model) => {
-            assert!(!model.outer_optional, "default should not be outer_optional");
+            assert!(
+                !model.outer_optional,
+                "default should not be outer_optional"
+            );
         }
         other => panic!("expected AllGroup, got {:?}", other),
     }

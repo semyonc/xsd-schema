@@ -12,8 +12,8 @@ use crate::xpath::ast::{ItemTypeNode, KindTest};
 use crate::xpath::cast::type_matches;
 use crate::xpath::iterator::XmlItem;
 
-use super::{DomNavigator, DomNodeType};
 use super::context::XPathContext;
+use super::{DomNavigator, DomNodeType};
 
 /// Unified node test for axis iterators.
 #[derive(Debug, Clone)]
@@ -261,11 +261,7 @@ fn match_document_with_inner<N: DomNavigator>(
     false
 }
 
-fn qname_matches<N: DomNavigator>(
-    qname: &QualifiedName,
-    nav: &N,
-    ctx: &XPathContext<'_>,
-) -> bool {
+fn qname_matches<N: DomNavigator>(qname: &QualifiedName, nav: &N, ctx: &XPathContext<'_>) -> bool {
     let local = match ctx.resolve_name(qname.local_name) {
         Some(local) => local,
         None => return false,
@@ -337,11 +333,7 @@ pub fn matches_item_type_node<N: DomNavigator>(
 }
 
 /// Check if an atomic value matches a resolved atomic type QualifiedName.
-fn matches_atomic_type(
-    value: &XmlValue,
-    qname: &QualifiedName,
-    ctx: &XPathContext<'_>,
-) -> bool {
+fn matches_atomic_type(value: &XmlValue, qname: &QualifiedName, ctx: &XPathContext<'_>) -> bool {
     use crate::namespace::table::well_known;
     use crate::xpath::cast::resolved_type_to_type_code;
 
@@ -374,12 +366,8 @@ pub fn matches_kind_test<N: DomNavigator>(
             // node() matches any node
             true
         }
-        KindTest::Text => {
-            nav.node_type().is_text_like()
-        }
-        KindTest::Comment => {
-            nav.node_type() == DomNodeType::Comment
-        }
+        KindTest::Text => nav.node_type().is_text_like(),
+        KindTest::Comment => nav.node_type() == DomNodeType::Comment,
         KindTest::ProcessingInstruction(target) => {
             if nav.node_type() != DomNodeType::ProcessingInstruction {
                 return false;

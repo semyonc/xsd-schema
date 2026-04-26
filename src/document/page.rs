@@ -3,7 +3,7 @@ use std::cell::Cell;
 use bumpalo::Bump;
 
 use super::error::BufferDocumentError;
-use super::node::{Node, PAGE_SIZE, page_of, slot_of};
+use super::node::{page_of, slot_of, Node, PAGE_SIZE};
 
 /// Page-based flat node array using `Cell<Node>` for interior mutability.
 ///
@@ -103,8 +103,8 @@ impl<'a> NodePages<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::node::{NodeType, NULL, PAGE_SIZE};
+    use super::*;
 
     #[test]
     fn first_alloc_returns_zero() {
@@ -175,7 +175,13 @@ mod tests {
             let idx = pages.alloc().unwrap();
             assert_eq!(idx, i);
             // Write a distinguishing value
-            pages.set(idx, Node { value: i, ..Node::default() });
+            pages.set(
+                idx,
+                Node {
+                    value: i,
+                    ..Node::default()
+                },
+            );
         }
 
         assert_eq!(pages.len(), count);
@@ -241,9 +247,6 @@ mod tests {
         let mut pages = NodePages::new(&arena);
         // Force len to u32::MAX so the next alloc hits the overflow guard.
         pages.len = u32::MAX;
-        assert!(matches!(
-            pages.alloc(),
-            Err(BufferDocumentError::Overflow)
-        ));
+        assert!(matches!(pages.alloc(), Err(BufferDocumentError::Overflow)));
     }
 }

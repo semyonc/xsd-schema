@@ -15,8 +15,8 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
 use crate::types::value::{
-    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue,
-    TimezoneOffset, XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue, TimezoneOffset,
+    XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
@@ -54,9 +54,7 @@ fn timezone_to_day_time_duration(tz: TimezoneOffset) -> DayTimeDurationValue {
 /// - The offset is outside the valid range (+-14:00)
 /// - The duration has non-zero day components
 /// - The duration has non-zero or fractional seconds
-fn day_time_duration_to_timezone(
-    dur: &DayTimeDurationValue,
-) -> Result<TimezoneOffset, XPathError> {
+fn day_time_duration_to_timezone(dur: &DayTimeDurationValue) -> Result<TimezoneOffset, XPathError> {
     // XPath 2.0 spec: timezone must be an integral number of minutes with no days
     // and must be in the range -PT14H to PT14H inclusive.
 
@@ -251,7 +249,11 @@ pub fn current_datetime<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("current-dateTime", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "current-dateTime",
+            0,
+            args.len(),
+        ));
     }
 
     // Use cached value or create new one
@@ -270,8 +272,7 @@ pub fn current_datetime<N: DomNavigator>(
         let secs = now.format("%S").to_string().parse::<u32>().unwrap_or(0);
         let nanos = now.timestamp_subsec_nanos();
         // Convert to Decimal: seconds + nanoseconds/1_000_000_000
-        let second = Decimal::from(secs)
-            + Decimal::from(nanos) / Decimal::from(1_000_000_000u64);
+        let second = Decimal::from(secs) + Decimal::from(nanos) / Decimal::from(1_000_000_000u64);
 
         let dt = DateTimeValue {
             year: now.format("%Y").to_string().parse().unwrap_or(2000),
@@ -295,7 +296,11 @@ pub fn current_date<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("current-date", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "current-date",
+            0,
+            args.len(),
+        ));
     }
 
     // Get current-dateTime and extract date portion
@@ -329,7 +334,11 @@ pub fn current_time<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("current-time", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "current-time",
+            0,
+            args.len(),
+        ));
     }
 
     // Get current-dateTime and extract time portion
@@ -363,7 +372,11 @@ pub fn implicit_timezone<N: DomNavigator>(
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
-        return Err(XPathError::wrong_number_of_arguments("implicit-timezone", 0, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "implicit-timezone",
+            0,
+            args.len(),
+        ));
     }
 
     let tz = context
@@ -383,7 +396,11 @@ pub fn implicit_timezone<N: DomNavigator>(
 fn normalized_years_from_ym(years: u32, months: u32, negative: bool) -> i64 {
     let total_months = years as i64 * 12 + months as i64;
     let years_component = total_months / 12;
-    if negative { -years_component } else { years_component }
+    if negative {
+        -years_component
+    } else {
+        years_component
+    }
 }
 
 /// Helper: Normalize year-month duration to total months, then extract months component.
@@ -391,53 +408,106 @@ fn normalized_years_from_ym(years: u32, months: u32, negative: bool) -> i64 {
 fn normalized_months_from_ym(years: u32, months: u32, negative: bool) -> i64 {
     let total_months = years as i64 * 12 + months as i64;
     let months_component = total_months % 12;
-    if negative { -months_component } else { months_component }
+    if negative {
+        -months_component
+    } else {
+        months_component
+    }
 }
 
 /// Helper: Normalize day-time duration to total seconds, then extract days component.
-fn normalized_days_from_dt(days: u32, hours: u32, minutes: u32, seconds: Decimal, negative: bool) -> i64 {
+fn normalized_days_from_dt(
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: Decimal,
+    negative: bool,
+) -> i64 {
     let total_seconds = Decimal::from(days) * Decimal::from(86400)
         + Decimal::from(hours) * Decimal::from(3600)
         + Decimal::from(minutes) * Decimal::from(60)
         + seconds;
     // Integer division for days
-    let days_component = (total_seconds / Decimal::from(86400)).floor().to_i64().unwrap_or(0);
-    if negative { -days_component } else { days_component }
+    let days_component = (total_seconds / Decimal::from(86400))
+        .floor()
+        .to_i64()
+        .unwrap_or(0);
+    if negative {
+        -days_component
+    } else {
+        days_component
+    }
 }
 
 /// Helper: Normalize day-time duration to total seconds, then extract hours component (0-23).
-fn normalized_hours_from_dt(days: u32, hours: u32, minutes: u32, seconds: Decimal, negative: bool) -> i64 {
+fn normalized_hours_from_dt(
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: Decimal,
+    negative: bool,
+) -> i64 {
     let total_seconds = Decimal::from(days) * Decimal::from(86400)
         + Decimal::from(hours) * Decimal::from(3600)
         + Decimal::from(minutes) * Decimal::from(60)
         + seconds;
     // Remainder after removing days, then integer divide by 3600
     let remainder_after_days = total_seconds % Decimal::from(86400);
-    let hours_component = (remainder_after_days / Decimal::from(3600)).floor().to_i64().unwrap_or(0);
-    if negative { -hours_component } else { hours_component }
+    let hours_component = (remainder_after_days / Decimal::from(3600))
+        .floor()
+        .to_i64()
+        .unwrap_or(0);
+    if negative {
+        -hours_component
+    } else {
+        hours_component
+    }
 }
 
 /// Helper: Normalize day-time duration to total seconds, then extract minutes component (0-59).
-fn normalized_minutes_from_dt(days: u32, hours: u32, minutes: u32, seconds: Decimal, negative: bool) -> i64 {
+fn normalized_minutes_from_dt(
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: Decimal,
+    negative: bool,
+) -> i64 {
     let total_seconds = Decimal::from(days) * Decimal::from(86400)
         + Decimal::from(hours) * Decimal::from(3600)
         + Decimal::from(minutes) * Decimal::from(60)
         + seconds;
     // Remainder after removing days and hours, then integer divide by 60
     let remainder_after_hours = total_seconds % Decimal::from(3600);
-    let minutes_component = (remainder_after_hours / Decimal::from(60)).floor().to_i64().unwrap_or(0);
-    if negative { -minutes_component } else { minutes_component }
+    let minutes_component = (remainder_after_hours / Decimal::from(60))
+        .floor()
+        .to_i64()
+        .unwrap_or(0);
+    if negative {
+        -minutes_component
+    } else {
+        minutes_component
+    }
 }
 
 /// Helper: Normalize day-time duration to total seconds, then extract seconds component (0-59.xxx).
-fn normalized_seconds_from_dt(days: u32, hours: u32, minutes: u32, seconds: Decimal, negative: bool) -> Decimal {
+fn normalized_seconds_from_dt(
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: Decimal,
+    negative: bool,
+) -> Decimal {
     let total_seconds = Decimal::from(days) * Decimal::from(86400)
         + Decimal::from(hours) * Decimal::from(3600)
         + Decimal::from(minutes) * Decimal::from(60)
         + seconds;
     // Remainder after removing minutes (keep fractional part)
     let seconds_component = total_seconds % Decimal::from(60);
-    if negative { -seconds_component } else { seconds_component }
+    if negative {
+        -seconds_component
+    } else {
+        seconds_component
+    }
 }
 
 /// Implements fn:years-from-duration($arg) - extracts years from a duration.
@@ -446,7 +516,11 @@ pub fn years_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("years-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "years-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -484,7 +558,11 @@ pub fn months_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("months-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "months-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -521,7 +599,11 @@ pub fn days_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("days-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "days-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -558,7 +640,11 @@ pub fn hours_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("hours-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "hours-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -595,7 +681,11 @@ pub fn minutes_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("minutes-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "minutes-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -632,7 +722,11 @@ pub fn seconds_from_duration<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("seconds-from-duration", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "seconds-from-duration",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -673,7 +767,11 @@ pub fn year_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("year-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "year-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -696,7 +794,11 @@ pub fn month_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("month-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "month-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -719,7 +821,11 @@ pub fn day_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("day-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "day-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -742,7 +848,11 @@ pub fn hours_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("hours-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "hours-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -765,7 +875,11 @@ pub fn minutes_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("minutes-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "minutes-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -788,7 +902,11 @@ pub fn seconds_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("seconds-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "seconds-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -811,7 +929,11 @@ pub fn timezone_from_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("timezone-from-dateTime", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "timezone-from-dateTime",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -844,7 +966,11 @@ pub fn year_from_date<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("year-from-date", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "year-from-date",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -867,7 +993,11 @@ pub fn month_from_date<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("month-from-date", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "month-from-date",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -890,7 +1020,11 @@ pub fn day_from_date<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("day-from-date", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "day-from-date",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -913,7 +1047,11 @@ pub fn timezone_from_date<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("timezone-from-date", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "timezone-from-date",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -946,7 +1084,11 @@ pub fn hours_from_time<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("hours-from-time", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "hours-from-time",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -969,7 +1111,11 @@ pub fn minutes_from_time<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("minutes-from-time", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "minutes-from-time",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -992,7 +1138,11 @@ pub fn seconds_from_time<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("seconds-from-time", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "seconds-from-time",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -1015,7 +1165,11 @@ pub fn timezone_from_time<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("timezone-from-time", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "timezone-from-time",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -1050,7 +1204,11 @@ pub fn create_datetime<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 2 {
-        return Err(XPathError::wrong_number_of_arguments("dateTime", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "dateTime",
+            2,
+            args.len(),
+        ));
     }
 
     let time_arg = args.remove(1);
@@ -1434,7 +1592,8 @@ fn adjust_date_by_minutes(
         (resulting_time - 1439) / 1440
     };
 
-    let (new_year, new_month, new_day) = add_days_to_date(date.year, date.month, date.day, day_delta)?;
+    let (new_year, new_month, new_day) =
+        add_days_to_date(date.year, date.month, date.day, day_delta)?;
 
     Ok(DateValue {
         year: new_year,
@@ -1472,7 +1631,12 @@ fn adjust_time_by_minutes(
 }
 
 /// Add days to a date, handling month/year rollovers.
-fn add_days_to_date(year: i32, month: u8, day: u8, delta: i32) -> Result<(i32, u8, u8), XPathError> {
+fn add_days_to_date(
+    year: i32,
+    month: u8,
+    day: u8,
+    delta: i32,
+) -> Result<(i32, u8, u8), XPathError> {
     if delta == 0 {
         return Ok((year, month, day));
     }
@@ -1550,35 +1714,74 @@ mod tests {
     }
 
     fn make_datetime_value(
-        year: i32, month: u8, day: u8,
-        hour: u8, minute: u8, second: Decimal,
-        timezone: Option<TimezoneOffset>
+        year: i32,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: Decimal,
+        timezone: Option<TimezoneOffset>,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let dt = DateTimeValue { year, month, day, hour, minute, second, timezone };
+        let dt = DateTimeValue {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            timezone,
+        };
         XPathValue::from_atomic(xml_datetime(dt))
     }
 
     fn make_date_value(
-        year: i32, month: u8, day: u8,
-        timezone: Option<TimezoneOffset>
+        year: i32,
+        month: u8,
+        day: u8,
+        timezone: Option<TimezoneOffset>,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let d = DateValue { year, month, day, timezone };
+        let d = DateValue {
+            year,
+            month,
+            day,
+            timezone,
+        };
         XPathValue::from_atomic(xml_date(d))
     }
 
     fn make_time_value(
-        hour: u8, minute: u8, second: Decimal,
-        timezone: Option<TimezoneOffset>
+        hour: u8,
+        minute: u8,
+        second: Decimal,
+        timezone: Option<TimezoneOffset>,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let t = TimeValue { hour, minute, second, timezone };
+        let t = TimeValue {
+            hour,
+            minute,
+            second,
+            timezone,
+        };
         XPathValue::from_atomic(xml_time(t))
     }
 
     fn make_duration_value(
-        negative: bool, years: u32, months: u32, days: u32,
-        hours: u32, minutes: u32, seconds: Decimal
+        negative: bool,
+        years: u32,
+        months: u32,
+        days: u32,
+        hours: u32,
+        minutes: u32,
+        seconds: Decimal,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let d = DurationValue { negative, years, months, days, hours, minutes, seconds };
+        let d = DurationValue {
+            negative,
+            years,
+            months,
+            days,
+            hours,
+            minutes,
+            seconds,
+        };
         XPathValue::from_atomic(XmlValue {
             type_code: XmlTypeCode::Duration,
             schema_type: None,
@@ -1587,9 +1790,15 @@ mod tests {
     }
 
     fn make_year_month_duration(
-        negative: bool, years: u32, months: u32
+        negative: bool,
+        years: u32,
+        months: u32,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let d = YearMonthDurationValue { negative, years, months };
+        let d = YearMonthDurationValue {
+            negative,
+            years,
+            months,
+        };
         XPathValue::from_atomic(XmlValue {
             type_code: XmlTypeCode::YearMonthDuration,
             schema_type: None,
@@ -1598,9 +1807,19 @@ mod tests {
     }
 
     fn make_day_time_duration(
-        negative: bool, days: u32, hours: u32, minutes: u32, seconds: Decimal
+        negative: bool,
+        days: u32,
+        hours: u32,
+        minutes: u32,
+        seconds: Decimal,
     ) -> XPathValue<RoXmlNavigator<'static>> {
-        let d = DayTimeDurationValue { negative, days, hours, minutes, seconds };
+        let d = DayTimeDurationValue {
+            negative,
+            days,
+            hours,
+            minutes,
+            seconds,
+        };
         XPathValue::from_atomic(xml_day_time_duration(d))
     }
 
@@ -1772,7 +1991,15 @@ mod tests {
     #[test]
     fn test_timezone_from_datetime_with_tz() {
         let mut ctx = make_context();
-        let dt = make_datetime_value(2024, 3, 15, 10, 30, Decimal::from(0), Some(TimezoneOffset(-300)));
+        let dt = make_datetime_value(
+            2024,
+            3,
+            15,
+            10,
+            30,
+            Decimal::from(0),
+            Some(TimezoneOffset(-300)),
+        );
         let result = timezone_from_datetime(&mut ctx, vec![dt]).unwrap();
         assert!(!result.is_empty());
     }
@@ -1868,7 +2095,12 @@ mod tests {
     fn test_create_datetime_mismatched_tz() {
         let mut ctx = make_context();
         let d = make_date_value(2024, 3, 15, Some(TimezoneOffset::from_hm(5, 0)));
-        let t = make_time_value(10, 30, Decimal::from(0), Some(TimezoneOffset::from_hm(-5, 0)));
+        let t = make_time_value(
+            10,
+            30,
+            Decimal::from(0),
+            Some(TimezoneOffset::from_hm(-5, 0)),
+        );
         let result = create_datetime(&mut ctx, vec![d, t]);
         assert!(matches!(result, Err(XPathError::FORG0008)));
     }
@@ -1890,7 +2122,15 @@ mod tests {
     #[test]
     fn test_adjust_datetime_to_timezone_strip_tz() {
         let mut ctx = make_context();
-        let dt = make_datetime_value(2024, 3, 15, 10, 30, Decimal::from(0), Some(TimezoneOffset::UTC));
+        let dt = make_datetime_value(
+            2024,
+            3,
+            15,
+            10,
+            30,
+            Decimal::from(0),
+            Some(TimezoneOffset::UTC),
+        );
         let result = adjust_datetime_to_timezone(&mut ctx, vec![dt, XPathValue::Empty]).unwrap();
         // Should have no timezone
         assert!(!result.is_empty());

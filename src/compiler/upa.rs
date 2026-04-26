@@ -19,13 +19,12 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::NameId;
 use crate::parser::location::SourceRef;
 use crate::schema::model::{SchemaSet, XsdVersion};
-use crate::types::complex::{NamespaceConstraint, not_qnames_exclude, other_matches_namespace};
+use crate::types::complex::{not_qnames_exclude, other_matches_namespace, NamespaceConstraint};
 
 use super::all_group::AllGroupModel;
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{
-    build_substitution_group_map, build_substitution_group_map_with_abstract,
-    SubstitutionGroupMap,
+    build_substitution_group_map, build_substitution_group_map_with_abstract, SubstitutionGroupMap,
 };
 
 /// Result type for internal UPA checking operations
@@ -36,7 +35,9 @@ type UpaResult<T> = Result<T, Box<UpaError>>;
 #[allow(clippy::enum_variant_names)]
 enum UpaError {
     /// Two element particles can match the same element
-    #[error("UPA violation: elements '{first_name}' and '{second_name}' conflict at state {state_id}")]
+    #[error(
+        "UPA violation: elements '{first_name}' and '{second_name}' conflict at state {state_id}"
+    )]
     ElementElementConflict {
         first_name: String,
         second_name: String,
@@ -77,7 +78,9 @@ impl UpaError {
     pub fn first_location(&self) -> Option<&SourceRef> {
         match self {
             UpaError::ElementElementConflict { first_location, .. } => first_location.as_ref(),
-            UpaError::ElementWildcardConflict { element_location, .. } => element_location.as_ref(),
+            UpaError::ElementWildcardConflict {
+                element_location, ..
+            } => element_location.as_ref(),
             UpaError::WildcardWildcardConflict { first_location, .. } => first_location.as_ref(),
         }
     }
@@ -85,12 +88,17 @@ impl UpaError {
     /// Get the second source location if available
     pub fn second_location(&self) -> Option<&SourceRef> {
         match self {
-            UpaError::ElementElementConflict { second_location, .. } => second_location.as_ref(),
-            UpaError::ElementWildcardConflict { wildcard_location, .. } => wildcard_location.as_ref(),
-            UpaError::WildcardWildcardConflict { second_location, .. } => second_location.as_ref(),
+            UpaError::ElementElementConflict {
+                second_location, ..
+            } => second_location.as_ref(),
+            UpaError::ElementWildcardConflict {
+                wildcard_location, ..
+            } => wildcard_location.as_ref(),
+            UpaError::WildcardWildcardConflict {
+                second_location, ..
+            } => second_location.as_ref(),
         }
     }
-
 }
 
 fn upa_error_to_schema_error(schema_set: &SchemaSet, error: Box<UpaError>) -> SchemaError {
@@ -283,19 +291,13 @@ fn wildcards_overlap(
         (Not(_), Other) | (Other, Not(_)) => true,
 
         // Not(a) vs TargetNamespace: overlaps if target ns is not excluded
-        (Not(a), TargetNamespace) | (TargetNamespace, Not(a)) => {
-            !a.contains(&target_namespace)
-        }
+        (Not(a), TargetNamespace) | (TargetNamespace, Not(a)) => !a.contains(&target_namespace),
 
         // Not(a) vs Local: overlaps if absent ns is not excluded
-        (Not(a), Local) | (Local, Not(a)) => {
-            !a.contains(&None)
-        }
+        (Not(a), Local) | (Local, Not(a)) => !a.contains(&None),
 
         // Not(a) vs List(b): overlaps if any ns in list is not excluded
-        (Not(a), List(b)) | (List(b), Not(a)) => {
-            b.iter().any(|ns| !a.contains(ns))
-        }
+        (Not(a), List(b)) | (List(b), Not(a)) => b.iter().any(|ns| !a.contains(ns)),
 
         // Any matches everything, so overlaps with anything
         (Any, _) | (_, Any) => true,
@@ -313,11 +315,9 @@ fn wildcards_overlap(
         }
 
         // ##other vs list: overlap if list has any ns other than target
-        (Other, List(ns_list)) | (List(ns_list), Other) => {
-            ns_list
-                .iter()
-                .any(|ns| other_matches_namespace(*ns, target_namespace, xsd_version))
-        }
+        (Other, List(ns_list)) | (List(ns_list), Other) => ns_list
+            .iter()
+            .any(|ns| other_matches_namespace(*ns, target_namespace, xsd_version)),
 
         // ##targetNamespace vs ##targetNamespace: overlap (both match target ns)
         (TargetNamespace, TargetNamespace) => true,
@@ -337,9 +337,7 @@ fn wildcards_overlap(
         (Local, List(ns_list)) | (List(ns_list), Local) => ns_list.contains(&None),
 
         // List vs list: overlap if any namespace is in both lists
-        (List(ns_list1), List(ns_list2)) => {
-            ns_list1.iter().any(|ns| ns_list2.contains(ns))
-        }
+        (List(ns_list1), List(ns_list2)) => ns_list1.iter().any(|ns| ns_list2.contains(ns)),
     }
 }
 
@@ -567,8 +565,7 @@ pub fn check_upa(
             state.id,
             schema_set,
             &substitution_sets,
-        )
-        {
+        ) {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
 
@@ -588,14 +585,12 @@ pub fn check_upa(
         }
 
         // Check wildcard-wildcard conflicts (always an error)
-        if let Err(error) =
-            check_wildcard_wildcard_conflicts(
-                &reachable.wildcards,
-                state.id,
-                target_namespace,
-                xsd_version,
-            )
-        {
+        if let Err(error) = check_wildcard_wildcard_conflicts(
+            &reachable.wildcards,
+            state.id,
+            target_namespace,
+            xsd_version,
+        ) {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
     }

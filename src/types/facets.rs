@@ -22,11 +22,11 @@
 use crate::error::{FacetError, FacetResult};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::location::SourceRef;
-#[cfg(not(feature = "xsd11"))]
-use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 #[cfg(feature = "xsd11")]
 use crate::regex_convert::rewrite_xsd10_category_escapes;
 use crate::regex_convert::validate_xml_pattern_syntax;
+#[cfg(not(feature = "xsd11"))]
+use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use crate::schema::model::XsdVersion;
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
@@ -38,8 +38,7 @@ use std::sync::Arc;
 use super::XmlTypeCode;
 
 /// Fixed vs default facet values
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FacetFixed {
     /// Value can be further restricted
     #[default]
@@ -47,7 +46,6 @@ pub enum FacetFixed {
     /// Value cannot be changed by derived types
     Fixed,
 }
-
 
 /// Whitespace handling mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -133,9 +131,11 @@ impl PatternFacet {
     pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
             if xsd_version == XsdVersion::V1_0 {
-                validate_xml_pattern_syntax(&self.value).map_err(|message| FacetError::InvalidPattern {
-                    pattern: self.value.clone(),
-                    message,
+                validate_xml_pattern_syntax(&self.value).map_err(|message| {
+                    FacetError::InvalidPattern {
+                        pattern: self.value.clone(),
+                        message,
+                    }
                 })?;
             }
             let opts = match xsd_version {
@@ -157,32 +157,46 @@ impl PatternFacet {
     pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
         if self.compiled.is_none() {
             if xsd_version == XsdVersion::V1_0 {
-                validate_xml_pattern_syntax(&self.value).map_err(|message| FacetError::InvalidPattern {
-                    pattern: self.value.clone(),
-                    message,
+                validate_xml_pattern_syntax(&self.value).map_err(|message| {
+                    FacetError::InvalidPattern {
+                        pattern: self.value.clone(),
+                        message,
+                    }
                 })?;
             }
             // Validate against XSD regex rules first. Intentional two-pass:
             // xsd() rejects XPath-only constructs (e.g. `^$`, backrefs, `(?:...)`)
-            // that xpath() would otherwise accept.
-            regexml::Regex::xsd(&self.value, "").map_err(|e| FacetError::InvalidPattern {
-                pattern: self.value.clone(),
-                message: format!("{:?}", e),
-            })?;
+            // that xpath() would otherwise accept. For XSD 1.1, an unrecognized
+            // `\p{IsX}` block name is treated as matching every character (W3C
+            // bug 13670 / XSD 1.1 Datatypes §G.4.2.3); the rewrite happens here
+            // because regexml 0.2 does not yet honour `allow_unknown_block_names`.
+            let xsd_validated: std::borrow::Cow<'_, str> = match xsd_version {
+                XsdVersion::V1_0 => {
+                    regexml::Regex::xsd(&self.value, "").map_err(|e| {
+                        FacetError::InvalidPattern {
+                            pattern: self.value.clone(),
+                            message: format!("{:?}", e),
+                        }
+                    })?;
+                    std::borrow::Cow::Borrowed(&self.value)
+                }
+                XsdVersion::V1_1 => validate_xsd11_pattern_with_block_fallback(&self.value)?,
+            };
             // Under XSD 1.0 the \p{X} rewrite produces a new String; under 1.1
-            // we borrow self.value directly — no allocation.
+            // we use the (possibly block-rewritten) validated value.
             let pinned: std::borrow::Cow<'_, str> = match xsd_version {
-                XsdVersion::V1_0 => std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&self.value)),
-                XsdVersion::V1_1 => std::borrow::Cow::Borrowed(&self.value),
+                XsdVersion::V1_0 => {
+                    std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&self.value))
+                }
+                XsdVersion::V1_1 => xsd_validated,
             };
             // Compile with explicit anchoring for full-string matching
             let anchored = format!("^(?:{})$", pinned);
-            let compiled = regexml::Regex::xpath(&anchored, "").map_err(|e| {
-                FacetError::InvalidPattern {
+            let compiled =
+                regexml::Regex::xpath(&anchored, "").map_err(|e| FacetError::InvalidPattern {
                     pattern: self.value.clone(),
                     message: format!("{:?}", e),
-                }
-            })?;
+                })?;
             self.compiled = Some(Arc::new(compiled));
         }
         Ok(())
@@ -196,7 +210,9 @@ impl PatternFacet {
             None => {
                 // Defensive fallback: compile on-the-fly using XSD 1.1 defaults.
                 // Reached only if a facet was never compiled via `compile_patterns`.
-                if let Ok(rust_pattern) = std::panic::catch_unwind(|| convert_xml_pattern(&self.value, ConvertOptions::xsd())) {
+                if let Ok(rust_pattern) = std::panic::catch_unwind(|| {
+                    convert_xml_pattern(&self.value, ConvertOptions::xsd())
+                }) {
                     if let Ok(regex) = Regex::new(&rust_pattern) {
                         return regex.is_match(value);
                     }
@@ -215,8 +231,8 @@ impl PatternFacet {
                 // Defensive fallback: validate and compile on-the-fly with XSD 1.1
                 // defaults. Reached only if a facet was never compiled via
                 // `compile_patterns`.
-                if regexml::Regex::xsd(&self.value, "").is_ok() {
-                    let anchored = format!("^(?:{})$", self.value);
+                if let Ok(rewritten) = validate_xsd11_pattern_with_block_fallback(&self.value) {
+                    let anchored = format!("^(?:{})$", rewritten);
                     if let Ok(regex) = regexml::Regex::xpath(&anchored, "") {
                         return regex.is_match(value);
                     }
@@ -224,6 +240,131 @@ impl PatternFacet {
                 false
             }
         }
+    }
+}
+
+/// Validate an XSD 1.1 pattern with regexml's strict XSD parser, rewriting any
+/// unknown `\p{IsX}` / `\P{IsX}` block names to a match-everything expression
+/// per W3C bug 13670 / XSD 1.1 Datatypes §G.4.2.3 (unrecognized block names are
+/// allowed and match every character). Returns the (possibly rewritten) pattern
+/// or a `FacetError` if a non-block-name error remains after up to 16 rewrites.
+#[cfg(feature = "xsd11")]
+fn validate_xsd11_pattern_with_block_fallback(
+    value: &str,
+) -> FacetResult<std::borrow::Cow<'_, str>> {
+    let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(value);
+    for _ in 0..16 {
+        let err = match regexml::Regex::xsd(&current, "") {
+            Ok(_) => return Ok(current),
+            Err(e) => format!("{:?}", e),
+        };
+        const PREFIX: &str = "Unknown Unicode block: ";
+        let Some(start) = err.find(PREFIX) else {
+            return Err(FacetError::InvalidPattern {
+                pattern: value.to_string(),
+                message: err,
+            });
+        };
+        let after = &err[start + PREFIX.len()..];
+        let end = after
+            .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != ' ')
+            .unwrap_or(after.len());
+        let block = after[..end].trim();
+        if block.is_empty() {
+            return Err(FacetError::InvalidPattern {
+                pattern: value.to_string(),
+                message: err,
+            });
+        }
+        match rewrite_pattern_isblock_token(&current, block) {
+            Some(rewritten) => current = std::borrow::Cow::Owned(rewritten),
+            None => {
+                return Err(FacetError::InvalidPattern {
+                    pattern: value.to_string(),
+                    message: err,
+                });
+            }
+        }
+    }
+    // Loop bound exceeded; surface the final error if any.
+    if let Err(e) = regexml::Regex::xsd(&current, "") {
+        return Err(FacetError::InvalidPattern {
+            pattern: value.to_string(),
+            message: format!("{:?}", e),
+        });
+    }
+    Ok(current)
+}
+
+/// Rewrite every `\p{Is<block>}` / `\P{Is<block>}` token in `pattern` to a
+/// match-everything expression. Uses `[\s\S]` at atom position and `\s\S`
+/// inside a character class so the rewritten token is structurally valid in
+/// either context. Returns `None` if no rewrite happened.
+#[cfg(feature = "xsd11")]
+fn rewrite_pattern_isblock_token(pattern: &str, block_name: &str) -> Option<String> {
+    let inner_p = format!("p{{Is{}}}", block_name);
+    let inner_cap = format!("P{{Is{}}}", block_name);
+    let token_len = 1 + inner_p.len();
+    if !pattern.contains(&format!("\\{}", inner_p))
+        && !pattern.contains(&format!("\\{}", inner_cap))
+    {
+        return None;
+    }
+    let bytes = pattern.as_bytes();
+    let mut result = String::with_capacity(pattern.len());
+    let mut i = 0;
+    let mut in_class = false;
+    let mut found = false;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + token_len <= bytes.len() {
+            // Tokens are pure ASCII, so byte-slice comparison is safe here.
+            let candidate = &pattern[i + 1..i + token_len];
+            if candidate == inner_p || candidate == inner_cap {
+                if in_class {
+                    result.push_str("\\s\\S");
+                } else {
+                    result.push_str("[\\s\\S]");
+                }
+                i += token_len;
+                found = true;
+                continue;
+            }
+        }
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            let next_len = pattern[i + 1..]
+                .chars()
+                .next()
+                .map(|ch| ch.len_utf8())
+                .unwrap_or(1);
+            result.push_str(&pattern[i..i + 1 + next_len]);
+            i += 1 + next_len;
+            continue;
+        }
+        if c == b'[' {
+            in_class = true;
+            result.push('[');
+            i += 1;
+            continue;
+        }
+        if c == b']' {
+            in_class = false;
+            result.push(']');
+            i += 1;
+            continue;
+        }
+        let next_len = pattern[i..]
+            .chars()
+            .next()
+            .map(|ch| ch.len_utf8())
+            .unwrap_or(1);
+        result.push_str(&pattern[i..i + next_len]);
+        i += next_len;
+    }
+    if found {
+        Some(result)
+    } else {
+        None
     }
 }
 
@@ -385,17 +526,29 @@ impl FacetSet {
 
     /// Set length facet
     pub fn set_length(&mut self, value: u64, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.length = Some(LengthFacet { value, fixed, source });
+        self.length = Some(LengthFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set minLength facet
     pub fn set_min_length(&mut self, value: u64, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.min_length = Some(MinLengthFacet { value, fixed, source });
+        self.min_length = Some(MinLengthFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set maxLength facet
     pub fn set_max_length(&mut self, value: u64, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.max_length = Some(MaxLengthFacet { value, fixed, source });
+        self.max_length = Some(MaxLengthFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Add a pattern facet (compiles the pattern)
@@ -412,7 +565,8 @@ impl FacetSet {
 
     /// Add a pattern facet without compiling (for deferred validation)
     pub fn add_pattern_unchecked(&mut self, value: String, source: Option<SourceRef>) {
-        self.patterns.push(PatternFacet::new_unchecked(value, source));
+        self.patterns
+            .push(PatternFacet::new_unchecked(value, source));
     }
 
     /// Compile all uncompiled patterns. Returns the first error encountered.
@@ -436,38 +590,96 @@ impl FacetSet {
     }
 
     /// Set whitespace facet
-    pub fn set_whitespace(&mut self, value: WhitespaceMode, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.whitespace = Some(WhitespaceFacet { value, fixed, source });
+    pub fn set_whitespace(
+        &mut self,
+        value: WhitespaceMode,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.whitespace = Some(WhitespaceFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set minInclusive facet
-    pub fn set_min_inclusive(&mut self, value: String, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.min_inclusive = Some(MinInclusiveFacet { value, fixed, source });
+    pub fn set_min_inclusive(
+        &mut self,
+        value: String,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.min_inclusive = Some(MinInclusiveFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set maxInclusive facet
-    pub fn set_max_inclusive(&mut self, value: String, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.max_inclusive = Some(MaxInclusiveFacet { value, fixed, source });
+    pub fn set_max_inclusive(
+        &mut self,
+        value: String,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.max_inclusive = Some(MaxInclusiveFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set minExclusive facet
-    pub fn set_min_exclusive(&mut self, value: String, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.min_exclusive = Some(MinExclusiveFacet { value, fixed, source });
+    pub fn set_min_exclusive(
+        &mut self,
+        value: String,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.min_exclusive = Some(MinExclusiveFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set maxExclusive facet
-    pub fn set_max_exclusive(&mut self, value: String, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.max_exclusive = Some(MaxExclusiveFacet { value, fixed, source });
+    pub fn set_max_exclusive(
+        &mut self,
+        value: String,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.max_exclusive = Some(MaxExclusiveFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set totalDigits facet
     pub fn set_total_digits(&mut self, value: u32, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.total_digits = Some(TotalDigitsFacet { value, fixed, source });
+        self.total_digits = Some(TotalDigitsFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Set fractionDigits facet
-    pub fn set_fraction_digits(&mut self, value: u32, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.fraction_digits = Some(FractionDigitsFacet { value, fixed, source });
+    pub fn set_fraction_digits(
+        &mut self,
+        value: u32,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.fraction_digits = Some(FractionDigitsFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Add an assertion facet (XSD 1.1)
@@ -487,8 +699,17 @@ impl FacetSet {
     }
 
     /// Set explicitTimezone facet (XSD 1.1)
-    pub fn set_explicit_timezone(&mut self, value: ExplicitTimezone, fixed: FacetFixed, source: Option<SourceRef>) {
-        self.explicit_timezone = Some(ExplicitTimezoneFacet { value, fixed, source });
+    pub fn set_explicit_timezone(
+        &mut self,
+        value: ExplicitTimezone,
+        fixed: FacetFixed,
+        source: Option<SourceRef>,
+    ) {
+        self.explicit_timezone = Some(ExplicitTimezoneFacet {
+            value,
+            fixed,
+            source,
+        });
     }
 
     /// Merge facets from a base type (for type derivation by restriction)
@@ -589,7 +810,8 @@ impl FacetSet {
             match &result.length {
                 Some(derived) => {
                     // Fixed length cannot be changed
-                    if base_length.fixed == FacetFixed::Fixed && derived.value != base_length.value {
+                    if base_length.fixed == FacetFixed::Fixed && derived.value != base_length.value
+                    {
                         return Err(FacetError::fixed_violation(
                             "length",
                             base_length.value.to_string(),
@@ -656,7 +878,11 @@ impl FacetSet {
         // === Patterns ===
         // Patterns are cumulative (ANDed) - add base patterns that aren't already present
         for base_pattern in &base.patterns {
-            if !result.patterns.iter().any(|p| p.value == base_pattern.value) {
+            if !result
+                .patterns
+                .iter()
+                .any(|p| p.value == base_pattern.value)
+            {
                 result.patterns.push(base_pattern.clone());
             }
         }
@@ -1287,7 +1513,9 @@ impl FacetSet {
                         message: "timezone is prohibited but present".to_string(),
                     });
                 }
-                ExplicitTimezone::Optional | ExplicitTimezone::Required | ExplicitTimezone::Prohibited => {
+                ExplicitTimezone::Optional
+                | ExplicitTimezone::Required
+                | ExplicitTimezone::Prohibited => {
                     // Valid
                 }
             }
@@ -1437,9 +1665,7 @@ fn count_total_digits(value: &rust_decimal::Decimal) -> u32 {
     // Get absolute value and remove trailing zeros
     let s = value.abs().normalize().to_string();
     // Count digits, excluding decimal point and leading zeros after decimal
-    s.chars()
-        .filter(|c| c.is_ascii_digit())
-        .count() as u32
+    s.chars().filter(|c| c.is_ascii_digit()).count() as u32
 }
 
 /// Count fraction digits in a decimal value
@@ -1456,7 +1682,11 @@ fn format_float_for_error(v: f32) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
-        if v.is_sign_positive() { "INF".to_string() } else { "-INF".to_string() }
+        if v.is_sign_positive() {
+            "INF".to_string()
+        } else {
+            "-INF".to_string()
+        }
     } else {
         v.to_string()
     }
@@ -1467,7 +1697,11 @@ fn format_double_for_error(v: f64) -> String {
     if v.is_nan() {
         "NaN".to_string()
     } else if v.is_infinite() {
-        if v.is_sign_positive() { "INF".to_string() } else { "-INF".to_string() }
+        if v.is_sign_positive() {
+            "INF".to_string()
+        } else {
+            "-INF".to_string()
+        }
     } else {
         v.to_string()
     }
@@ -1559,9 +1793,9 @@ pub fn facet_applicable_for_type(facet: FacetKind, type_code: XmlTypeCode) -> Fa
     match facet {
         // Length facets apply to string, binary, list, and URI types
         Length | MinLength | MaxLength => match type_code {
-            String | NormalizedString | Token | Language | NmToken | Name | NCName | Id
-            | IdRef | Entity | HexBinary | Base64Binary | AnyUri | QName | Notation
-            | NmTokens | IdRefs | Entities => Applicable,
+            String | NormalizedString | Token | Language | NmToken | Name | NCName | Id | IdRef
+            | Entity | HexBinary | Base64Binary | AnyUri | QName | Notation | NmTokens | IdRefs
+            | Entities => Applicable,
             _ => NotApplicable,
         },
 
@@ -1577,8 +1811,9 @@ pub fn facet_applicable_for_type(facet: FacetKind, type_code: XmlTypeCode) -> Fa
         // Whitespace is required for string, applicable to all string-derived types
         Whitespace => match type_code {
             String => Required,
-            NormalizedString | Token | Language | NmToken | Name | NCName | Id | IdRef
-            | Entity => Applicable,
+            NormalizedString | Token | Language | NmToken | Name | NCName | Id | IdRef | Entity => {
+                Applicable
+            }
             // All other atomic types can have whitespace
             _ if type_code.is_atomic() => Applicable,
             _ => NotApplicable,
@@ -1593,8 +1828,8 @@ pub fn facet_applicable_for_type(facet: FacetKind, type_code: XmlTypeCode) -> Fa
             // Float/Double
             Float | Double => Applicable,
             // Date/time types (all have total ordering)
-            Duration | DateTime | Time | Date | GYearMonth | GYear | GMonthDay | GDay
-            | GMonth | YearMonthDuration | DayTimeDuration | DateTimeStamp => Applicable,
+            Duration | DateTime | Time | Date | GYearMonth | GYear | GMonthDay | GDay | GMonth
+            | YearMonthDuration | DayTimeDuration | DateTimeStamp => Applicable,
             _ => NotApplicable,
         },
 
@@ -1673,8 +1908,12 @@ mod tests {
     #[test]
     fn test_facet_set_patterns() {
         let mut facets = FacetSet::new();
-        facets.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
-        facets.add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        facets
+            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
+        facets
+            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
 
         assert_eq!(facets.patterns.len(), 2);
     }
@@ -1696,7 +1935,8 @@ mod tests {
         let mut base = FacetSet::new();
         base.set_min_length(5, FacetFixed::Fixed, None);
         base.set_max_length(100, FacetFixed::Default, None);
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
 
         let mut derived = FacetSet::new();
         derived.set_max_length(50, FacetFixed::Default, None); // Override
@@ -1752,8 +1992,14 @@ mod tests {
         assert_eq!(facet_applicable_for_type(TotalDigits, Float), NotApplicable);
 
         // Date/time facets
-        assert_eq!(facet_applicable_for_type(ExplicitTimezone, DateTime), Applicable);
-        assert_eq!(facet_applicable_for_type(ExplicitTimezone, String), NotApplicable);
+        assert_eq!(
+            facet_applicable_for_type(ExplicitTimezone, DateTime),
+            Applicable
+        );
+        assert_eq!(
+            facet_applicable_for_type(ExplicitTimezone, String),
+            NotApplicable
+        );
     }
 
     // =========================================================================
@@ -1762,8 +2008,7 @@ mod tests {
 
     #[test]
     fn test_pattern_matching() {
-        let pattern =
-            PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern = PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("hello"));
         assert!(!pattern.matches("HELLO"));
         assert!(!pattern.matches("hello123"));
@@ -1772,8 +2017,7 @@ mod tests {
     #[test]
     fn test_pattern_xsd_anchoring() {
         // XSD patterns are implicitly anchored
-        let pattern =
-            PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern = PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("abc"));
         assert!(!pattern.matches("xabc"));
         assert!(!pattern.matches("abcx"));
@@ -1782,8 +2026,7 @@ mod tests {
     #[test]
     fn test_pattern_xsd_name_chars() {
         // Test \i (initial name char) and \c (name char)
-        let pattern =
-            PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern = PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1).unwrap();
         assert!(pattern.matches("foo"));
         assert!(pattern.matches("_bar"));
         assert!(pattern.matches("x123"));
@@ -1852,7 +2095,9 @@ mod tests {
     #[test]
     fn test_validate_string_pattern() {
         let mut facets = FacetSet::new();
-        facets.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        facets
+            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
 
         assert!(facets.validate_string("hello").is_ok());
         assert!(facets.validate_string("HELLO").is_err());
@@ -2042,10 +2287,13 @@ mod tests {
     #[test]
     fn test_merge_with_base_patterns_cumulative() {
         let mut base = FacetSet::new();
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
 
         let mut derived = FacetSet::new();
-        derived.add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        derived
+            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1)
+            .unwrap();
 
         let merged = derived.merge_with_base(&base).unwrap();
         assert_eq!(merged.patterns.len(), 2);
@@ -2170,7 +2418,10 @@ mod tests {
     #[test]
     fn test_facet_kind_from_name() {
         assert_eq!(FacetKind::from_name("length"), Some(FacetKind::Length));
-        assert_eq!(FacetKind::from_name("minLength"), Some(FacetKind::MinLength));
+        assert_eq!(
+            FacetKind::from_name("minLength"),
+            Some(FacetKind::MinLength)
+        );
         assert_eq!(FacetKind::from_name("pattern"), Some(FacetKind::Pattern));
         assert_eq!(FacetKind::from_name("unknown"), None);
     }

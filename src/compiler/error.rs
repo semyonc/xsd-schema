@@ -81,7 +81,10 @@ impl NfaCompileError {
     }
 
     /// Create an invalid all-group occurrence error
-    pub fn invalid_all_group_occurs(reason: impl Into<String>, location: Option<SourceRef>) -> Self {
+    pub fn invalid_all_group_occurs(
+        reason: impl Into<String>,
+        location: Option<SourceRef>,
+    ) -> Self {
         NfaCompileError::InvalidAllGroupOccurs {
             reason: reason.into(),
             location,

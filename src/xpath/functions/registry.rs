@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use once_cell::sync::Lazy;
 
-use super::signature::{FunctionSignature, FunctionArity, FN_NAMESPACE, FN_2010_NAMESPACE};
+use super::signature::{FunctionArity, FunctionSignature, FN_2010_NAMESPACE, FN_NAMESPACE};
 use super::FunctionId;
 use crate::types::sequence::SequenceType;
 
@@ -80,18 +80,26 @@ impl FunctionRegistry {
         // Register for each valid arity
         match sig.arity {
             FunctionArity::Exact(n) => {
-                let key = FunctionKey::new(sig.namespace.to_string(), sig.local_name.to_string(), n);
+                let key =
+                    FunctionKey::new(sig.namespace.to_string(), sig.local_name.to_string(), n);
                 self.lookup.insert(key, index);
             }
             FunctionArity::Range(min, max) => {
                 for arity in min..=max {
-                    let key = FunctionKey::new(sig.namespace.to_string(), sig.local_name.to_string(), arity);
+                    let key = FunctionKey::new(
+                        sig.namespace.to_string(),
+                        sig.local_name.to_string(),
+                        arity,
+                    );
                     self.lookup.insert(key, index);
                 }
             }
             FunctionArity::Variadic(_) => {
                 // For variadic, register in the variadic lookup
-                self.variadic_lookup.insert((sig.namespace.to_string(), sig.local_name.to_string()), index);
+                self.variadic_lookup.insert(
+                    (sig.namespace.to_string(), sig.local_name.to_string()),
+                    index,
+                );
             }
         }
 
@@ -101,7 +109,12 @@ impl FunctionRegistry {
     /// Look up a function by namespace, local name, and arity.
     ///
     /// Also handles the XPath 2010 namespace alias.
-    pub fn lookup(&self, namespace: &str, local_name: &str, arity: usize) -> Option<&FunctionEntry> {
+    pub fn lookup(
+        &self,
+        namespace: &str,
+        local_name: &str,
+        arity: usize,
+    ) -> Option<&FunctionEntry> {
         // Try exact lookup first
         let key = FunctionKey {
             namespace: namespace.to_string(),
@@ -244,11 +257,25 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DistinctValues,
-        FunctionSignature::range(FN_NAMESPACE, "distinct-values", 1, 2, vec![any_atomic_star(), string()], any_atomic_star()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "distinct-values",
+            1,
+            2,
+            vec![any_atomic_star(), string()],
+            any_atomic_star(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::IndexOf,
-        FunctionSignature::range(FN_NAMESPACE, "index-of", 2, 3, vec![any_atomic_star(), any_atomic(), string()], integer_star()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "index-of",
+            2,
+            3,
+            vec![any_atomic_star(), any_atomic(), string()],
+            integer_star(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Remove,
@@ -256,11 +283,23 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::InsertBefore,
-        FunctionSignature::new(FN_NAMESPACE, "insert-before", vec![any(), integer(), any()], any()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "insert-before",
+            vec![any(), integer(), any()],
+            any(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Subsequence,
-        FunctionSignature::range(FN_NAMESPACE, "subsequence", 2, 3, vec![any(), double(), double()], any()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "subsequence",
+            2,
+            3,
+            vec![any(), double(), double()],
+            any(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Unordered,
@@ -268,7 +307,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DeepEqual,
-        FunctionSignature::range(FN_NAMESPACE, "deep-equal", 2, 3, vec![any(), any(), string()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "deep-equal",
+            2,
+            3,
+            vec![any(), any(), string()],
+            boolean(),
+        ),
     ));
 
     // ========================================================================
@@ -276,19 +322,45 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::Sum,
-        FunctionSignature::range(FN_NAMESPACE, "sum", 1, 2, vec![any_atomic_star(), any_atomic_opt()], any_atomic()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "sum",
+            1,
+            2,
+            vec![any_atomic_star(), any_atomic_opt()],
+            any_atomic(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Avg,
-        FunctionSignature::new(FN_NAMESPACE, "avg", vec![any_atomic_star()], any_atomic_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "avg",
+            vec![any_atomic_star()],
+            any_atomic_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Min,
-        FunctionSignature::range(FN_NAMESPACE, "min", 1, 2, vec![any_atomic_star(), string()], any_atomic_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "min",
+            1,
+            2,
+            vec![any_atomic_star(), string()],
+            any_atomic_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Max,
-        FunctionSignature::range(FN_NAMESPACE, "max", 1, 2, vec![any_atomic_star(), string()], any_atomic_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "max",
+            1,
+            2,
+            vec![any_atomic_star(), string()],
+            any_atomic_opt(),
+        ),
     ));
 
     // ========================================================================
@@ -296,27 +368,66 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::Concat,
-        FunctionSignature::variadic(FN_NAMESPACE, "concat", 2, vec![any_atomic_opt(), any_atomic_opt()], string()),
+        FunctionSignature::variadic(
+            FN_NAMESPACE,
+            "concat",
+            2,
+            vec![any_atomic_opt(), any_atomic_opt()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::StringJoin,
-        FunctionSignature::new(FN_NAMESPACE, "string-join", vec![string_star(), string()], string()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "string-join",
+            vec![string_star(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Substring,
-        FunctionSignature::range(FN_NAMESPACE, "substring", 2, 3, vec![string_opt(), double(), double()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "substring",
+            2,
+            3,
+            vec![string_opt(), double(), double()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::StringLength,
-        FunctionSignature::range(FN_NAMESPACE, "string-length", 0, 1, vec![string_opt()], integer()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "string-length",
+            0,
+            1,
+            vec![string_opt()],
+            integer(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NormalizeSpace,
-        FunctionSignature::range(FN_NAMESPACE, "normalize-space", 0, 1, vec![string_opt()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "normalize-space",
+            0,
+            1,
+            vec![string_opt()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NormalizeUnicode,
-        FunctionSignature::range(FN_NAMESPACE, "normalize-unicode", 1, 2, vec![string_opt(), string()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "normalize-unicode",
+            1,
+            2,
+            vec![string_opt(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::UpperCase,
@@ -328,7 +439,12 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Translate,
-        FunctionSignature::new(FN_NAMESPACE, "translate", vec![string_opt(), string(), string()], string()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "translate",
+            vec![string_opt(), string(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::EncodeForUri,
@@ -340,43 +456,107 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::EscapeHtmlUri,
-        FunctionSignature::new(FN_NAMESPACE, "escape-html-uri", vec![string_opt()], string()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "escape-html-uri",
+            vec![string_opt()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Contains,
-        FunctionSignature::range(FN_NAMESPACE, "contains", 2, 3, vec![string_opt(), string_opt(), string()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "contains",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            boolean(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::StartsWith,
-        FunctionSignature::range(FN_NAMESPACE, "starts-with", 2, 3, vec![string_opt(), string_opt(), string()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "starts-with",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            boolean(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::EndsWith,
-        FunctionSignature::range(FN_NAMESPACE, "ends-with", 2, 3, vec![string_opt(), string_opt(), string()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "ends-with",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            boolean(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::SubstringBefore,
-        FunctionSignature::range(FN_NAMESPACE, "substring-before", 2, 3, vec![string_opt(), string_opt(), string()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "substring-before",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::SubstringAfter,
-        FunctionSignature::range(FN_NAMESPACE, "substring-after", 2, 3, vec![string_opt(), string_opt(), string()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "substring-after",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::StringToCodepoints,
-        FunctionSignature::new(FN_NAMESPACE, "string-to-codepoints", vec![string_opt()], integer_star()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "string-to-codepoints",
+            vec![string_opt()],
+            integer_star(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::CodepointsToString,
-        FunctionSignature::new(FN_NAMESPACE, "codepoints-to-string", vec![integer_star()], string()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "codepoints-to-string",
+            vec![integer_star()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Compare,
-        FunctionSignature::range(FN_NAMESPACE, "compare", 2, 3, vec![string_opt(), string_opt(), string()], integer_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "compare",
+            2,
+            3,
+            vec![string_opt(), string_opt(), string()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::CodepointEqual,
-        FunctionSignature::new(FN_NAMESPACE, "codepoint-equal", vec![string_opt(), string_opt()], SequenceType::optional(crate::types::sequence::ItemType::AtomicType(crate::types::XmlTypeCode::Boolean))),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "codepoint-equal",
+            vec![string_opt(), string_opt()],
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::Boolean,
+            )),
+        ),
     ));
 
     // ========================================================================
@@ -400,7 +580,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::RoundHalfToEven,
-        FunctionSignature::range(FN_NAMESPACE, "round-half-to-even", 1, 2, vec![numeric_opt(), integer()], numeric_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "round-half-to-even",
+            1,
+            2,
+            vec![numeric_opt(), integer()],
+            numeric_opt(),
+        ),
     ));
 
     // ========================================================================
@@ -416,7 +603,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NamespaceUri,
-        FunctionSignature::range(FN_NAMESPACE, "namespace-uri", 0, 1, vec![node_opt()], any_uri()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "namespace-uri",
+            0,
+            1,
+            vec![node_opt()],
+            any_uri(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NodeName,
@@ -424,19 +618,45 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Nilled,
-        FunctionSignature::new(FN_NAMESPACE, "nilled", vec![node_opt()], SequenceType::optional(crate::types::sequence::ItemType::AtomicType(crate::types::XmlTypeCode::Boolean))),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "nilled",
+            vec![node_opt()],
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::Boolean,
+            )),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::BaseUri,
-        FunctionSignature::range(FN_NAMESPACE, "base-uri", 0, 1, vec![node_opt()], any_uri_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "base-uri",
+            0,
+            1,
+            vec![node_opt()],
+            any_uri_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DocumentUri,
-        FunctionSignature::new(FN_NAMESPACE, "document-uri", vec![node_opt()], any_uri_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "document-uri",
+            vec![node_opt()],
+            any_uri_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Lang,
-        FunctionSignature::range(FN_NAMESPACE, "lang", 1, 2, vec![string_opt(), node()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "lang",
+            1,
+            2,
+            vec![string_opt(), node()],
+            boolean(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Root,
@@ -445,7 +665,10 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     registry.register(FunctionEntry::new(
         FunctionId::Id,
         FunctionSignature::range(
-            FN_NAMESPACE, "id", 1, 2,
+            FN_NAMESPACE,
+            "id",
+            1,
+            2,
             vec![string_star(), node()],
             SequenceType::star(crate::types::sequence::ItemType::AnyNode),
         ),
@@ -457,7 +680,10 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     registry.register(FunctionEntry::new(
         FunctionId::Collection,
         FunctionSignature::range(
-            FN_NAMESPACE, "collection", 0, 1,
+            FN_NAMESPACE,
+            "collection",
+            0,
+            1,
             vec![string_opt()],
             SequenceType::star(crate::types::sequence::ItemType::AnyNode),
         ),
@@ -468,7 +694,12 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::DateTime,
-        FunctionSignature::new(FN_NAMESPACE, "dateTime", vec![date_opt(), time_opt()], datetime_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "dateTime",
+            vec![date_opt(), time_opt()],
+            datetime_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::CurrentDateTime,
@@ -484,113 +715,250 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::ImplicitTimezone,
-        FunctionSignature::new(FN_NAMESPACE, "implicit-timezone", vec![], day_time_duration()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "implicit-timezone",
+            vec![],
+            day_time_duration(),
+        ),
     ));
 
     // Duration component extraction
     registry.register(FunctionEntry::new(
         FunctionId::YearsFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "years-from-duration", vec![duration_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "years-from-duration",
+            vec![duration_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MonthsFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "months-from-duration", vec![duration_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "months-from-duration",
+            vec![duration_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DaysFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "days-from-duration", vec![duration_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "days-from-duration",
+            vec![duration_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::HoursFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "hours-from-duration", vec![duration_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "hours-from-duration",
+            vec![duration_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MinutesFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "minutes-from-duration", vec![duration_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "minutes-from-duration",
+            vec![duration_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::SecondsFromDuration,
-        FunctionSignature::new(FN_NAMESPACE, "seconds-from-duration", vec![duration_opt()], SequenceType::optional(crate::types::sequence::ItemType::AtomicType(crate::types::XmlTypeCode::Decimal))),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "seconds-from-duration",
+            vec![duration_opt()],
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::Decimal,
+            )),
+        ),
     ));
 
     // DateTime component extraction
     registry.register(FunctionEntry::new(
         FunctionId::YearFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "year-from-dateTime", vec![datetime_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "year-from-dateTime",
+            vec![datetime_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MonthFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "month-from-dateTime", vec![datetime_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "month-from-dateTime",
+            vec![datetime_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DayFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "day-from-dateTime", vec![datetime_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "day-from-dateTime",
+            vec![datetime_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::HoursFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "hours-from-dateTime", vec![datetime_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "hours-from-dateTime",
+            vec![datetime_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MinutesFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "minutes-from-dateTime", vec![datetime_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "minutes-from-dateTime",
+            vec![datetime_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::SecondsFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "seconds-from-dateTime", vec![datetime_opt()], SequenceType::optional(crate::types::sequence::ItemType::AtomicType(crate::types::XmlTypeCode::Decimal))),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "seconds-from-dateTime",
+            vec![datetime_opt()],
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::Decimal,
+            )),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::TimezoneFromDateTime,
-        FunctionSignature::new(FN_NAMESPACE, "timezone-from-dateTime", vec![datetime_opt()], day_time_duration_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "timezone-from-dateTime",
+            vec![datetime_opt()],
+            day_time_duration_opt(),
+        ),
     ));
 
     // Date component extraction
     registry.register(FunctionEntry::new(
         FunctionId::YearFromDate,
-        FunctionSignature::new(FN_NAMESPACE, "year-from-date", vec![date_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "year-from-date",
+            vec![date_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MonthFromDate,
-        FunctionSignature::new(FN_NAMESPACE, "month-from-date", vec![date_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "month-from-date",
+            vec![date_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::DayFromDate,
-        FunctionSignature::new(FN_NAMESPACE, "day-from-date", vec![date_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "day-from-date",
+            vec![date_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::TimezoneFromDate,
-        FunctionSignature::new(FN_NAMESPACE, "timezone-from-date", vec![date_opt()], day_time_duration_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "timezone-from-date",
+            vec![date_opt()],
+            day_time_duration_opt(),
+        ),
     ));
 
     // Time component extraction
     registry.register(FunctionEntry::new(
         FunctionId::HoursFromTime,
-        FunctionSignature::new(FN_NAMESPACE, "hours-from-time", vec![time_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "hours-from-time",
+            vec![time_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::MinutesFromTime,
-        FunctionSignature::new(FN_NAMESPACE, "minutes-from-time", vec![time_opt()], integer_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "minutes-from-time",
+            vec![time_opt()],
+            integer_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::SecondsFromTime,
-        FunctionSignature::new(FN_NAMESPACE, "seconds-from-time", vec![time_opt()], SequenceType::optional(crate::types::sequence::ItemType::AtomicType(crate::types::XmlTypeCode::Decimal))),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "seconds-from-time",
+            vec![time_opt()],
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::Decimal,
+            )),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::TimezoneFromTime,
-        FunctionSignature::new(FN_NAMESPACE, "timezone-from-time", vec![time_opt()], day_time_duration_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "timezone-from-time",
+            vec![time_opt()],
+            day_time_duration_opt(),
+        ),
     ));
 
     // Timezone adjustment
     registry.register(FunctionEntry::new(
         FunctionId::AdjustDateTimeToTimezone,
-        FunctionSignature::range(FN_NAMESPACE, "adjust-dateTime-to-timezone", 1, 2, vec![datetime_opt(), day_time_duration_opt()], datetime_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "adjust-dateTime-to-timezone",
+            1,
+            2,
+            vec![datetime_opt(), day_time_duration_opt()],
+            datetime_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::AdjustDateToTimezone,
-        FunctionSignature::range(FN_NAMESPACE, "adjust-date-to-timezone", 1, 2, vec![date_opt(), day_time_duration_opt()], date_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "adjust-date-to-timezone",
+            1,
+            2,
+            vec![date_opt(), day_time_duration_opt()],
+            date_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::AdjustTimeToTimezone,
-        FunctionSignature::range(FN_NAMESPACE, "adjust-time-to-timezone", 1, 2, vec![time_opt(), day_time_duration_opt()], time_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "adjust-time-to-timezone",
+            1,
+            2,
+            vec![time_opt(), day_time_duration_opt()],
+            time_opt(),
+        ),
     ));
 
     // ========================================================================
@@ -598,7 +966,12 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::ResolveQName,
-        FunctionSignature::new(FN_NAMESPACE, "resolve-QName", vec![string_opt(), element()], qname_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "resolve-QName",
+            vec![string_opt(), element()],
+            qname_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::QName,
@@ -606,23 +979,48 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::PrefixFromQName,
-        FunctionSignature::new(FN_NAMESPACE, "prefix-from-QName", vec![qname_opt()], string_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "prefix-from-QName",
+            vec![qname_opt()],
+            string_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::LocalNameFromQName,
-        FunctionSignature::new(FN_NAMESPACE, "local-name-from-QName", vec![qname_opt()], string_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "local-name-from-QName",
+            vec![qname_opt()],
+            string_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NamespaceUriFromQName,
-        FunctionSignature::new(FN_NAMESPACE, "namespace-uri-from-QName", vec![qname_opt()], any_uri_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "namespace-uri-from-QName",
+            vec![qname_opt()],
+            any_uri_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::NamespaceUriForPrefix,
-        FunctionSignature::new(FN_NAMESPACE, "namespace-uri-for-prefix", vec![string_opt(), element()], any_uri_opt()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "namespace-uri-for-prefix",
+            vec![string_opt(), element()],
+            any_uri_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::InScopePrefixes,
-        FunctionSignature::new(FN_NAMESPACE, "in-scope-prefixes", vec![element()], string_star()),
+        FunctionSignature::new(
+            FN_NAMESPACE,
+            "in-scope-prefixes",
+            vec![element()],
+            string_star(),
+        ),
     ));
 
     // ========================================================================
@@ -630,7 +1028,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::ResolveUri,
-        FunctionSignature::range(FN_NAMESPACE, "resolve-uri", 1, 2, vec![string_opt(), string()], any_uri_opt()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "resolve-uri",
+            1,
+            2,
+            vec![string_opt(), string()],
+            any_uri_opt(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::StaticBaseUri,
@@ -642,15 +1047,36 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     // ========================================================================
     registry.register(FunctionEntry::new(
         FunctionId::Matches,
-        FunctionSignature::range(FN_NAMESPACE, "matches", 2, 3, vec![string_opt(), string(), string()], boolean()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "matches",
+            2,
+            3,
+            vec![string_opt(), string(), string()],
+            boolean(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Replace,
-        FunctionSignature::range(FN_NAMESPACE, "replace", 3, 4, vec![string_opt(), string(), string(), string()], string()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "replace",
+            3,
+            4,
+            vec![string_opt(), string(), string(), string()],
+            string(),
+        ),
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Tokenize,
-        FunctionSignature::range(FN_NAMESPACE, "tokenize", 2, 3, vec![string_opt(), string(), string()], string_star()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "tokenize",
+            2,
+            3,
+            vec![string_opt(), string(), string()],
+            string_star(),
+        ),
     ));
 
     // ========================================================================
@@ -678,7 +1104,14 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
     ));
     registry.register(FunctionEntry::new(
         FunctionId::Number,
-        FunctionSignature::range(FN_NAMESPACE, "number", 0, 1, vec![any_atomic_opt()], double()),
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "number",
+            0,
+            1,
+            vec![any_atomic_opt()],
+            double(),
+        ),
     ));
 }
 

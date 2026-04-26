@@ -2,11 +2,11 @@
 //!
 //! This module implements XSD simple type definitions: atomic, list, and union types.
 
+use super::facets::FacetSet;
+use super::{PrimitiveTypeCode, XmlTypeCode};
 use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::parser::location::SourceRef;
 use crate::schema::model::DerivationSet;
-use super::facets::FacetSet;
-use super::{XmlTypeCode, PrimitiveTypeCode};
 
 /// Simple type variety (atomic, list, or union)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,15 +737,30 @@ mod tests {
         assert_eq!(BuiltInType::AnyURI.local_name(), "anyURI");
         assert_eq!(BuiltInType::NMTOKEN.local_name(), "NMTOKEN");
         assert_eq!(BuiltInType::UntypedAtomic.local_name(), "untypedAtomic");
-        assert_eq!(BuiltInType::YearMonthDuration.local_name(), "yearMonthDuration");
+        assert_eq!(
+            BuiltInType::YearMonthDuration.local_name(),
+            "yearMonthDuration"
+        );
     }
 
     #[test]
     fn test_builtin_type_parsing() {
-        assert_eq!(BuiltInType::from_local_name("string"), Some(BuiltInType::String));
-        assert_eq!(BuiltInType::from_local_name("integer"), Some(BuiltInType::Integer));
-        assert_eq!(BuiltInType::from_local_name("untypedAtomic"), Some(BuiltInType::UntypedAtomic));
-        assert_eq!(BuiltInType::from_local_name("yearMonthDuration"), Some(BuiltInType::YearMonthDuration));
+        assert_eq!(
+            BuiltInType::from_local_name("string"),
+            Some(BuiltInType::String)
+        );
+        assert_eq!(
+            BuiltInType::from_local_name("integer"),
+            Some(BuiltInType::Integer)
+        );
+        assert_eq!(
+            BuiltInType::from_local_name("untypedAtomic"),
+            Some(BuiltInType::UntypedAtomic)
+        );
+        assert_eq!(
+            BuiltInType::from_local_name("yearMonthDuration"),
+            Some(BuiltInType::YearMonthDuration)
+        );
         assert_eq!(BuiltInType::from_local_name("nonExistent"), None);
         // anyType is not a simple type
         assert_eq!(BuiltInType::from_local_name("anyType"), None);
@@ -792,11 +807,26 @@ mod tests {
 
     #[test]
     fn test_builtin_primitive_type_code() {
-        assert_eq!(BuiltInType::String.primitive_type_code(), Some(PrimitiveTypeCode::String));
-        assert_eq!(BuiltInType::NCName.primitive_type_code(), Some(PrimitiveTypeCode::String));
-        assert_eq!(BuiltInType::Integer.primitive_type_code(), Some(PrimitiveTypeCode::Decimal));
-        assert_eq!(BuiltInType::Duration.primitive_type_code(), Some(PrimitiveTypeCode::Duration));
-        assert_eq!(BuiltInType::YearMonthDuration.primitive_type_code(), Some(PrimitiveTypeCode::Duration));
+        assert_eq!(
+            BuiltInType::String.primitive_type_code(),
+            Some(PrimitiveTypeCode::String)
+        );
+        assert_eq!(
+            BuiltInType::NCName.primitive_type_code(),
+            Some(PrimitiveTypeCode::String)
+        );
+        assert_eq!(
+            BuiltInType::Integer.primitive_type_code(),
+            Some(PrimitiveTypeCode::Decimal)
+        );
+        assert_eq!(
+            BuiltInType::Duration.primitive_type_code(),
+            Some(PrimitiveTypeCode::Duration)
+        );
+        assert_eq!(
+            BuiltInType::YearMonthDuration.primitive_type_code(),
+            Some(PrimitiveTypeCode::Duration)
+        );
         // Abstract types and list types have no primitive
         assert_eq!(BuiltInType::AnySimpleType.primitive_type_code(), None);
         assert_eq!(BuiltInType::NMTOKENS.primitive_type_code(), None);
@@ -806,18 +836,36 @@ mod tests {
     fn test_builtin_to_xml_type_code_conversion() {
         // Test From<BuiltInType> for XmlTypeCode
         assert_eq!(XmlTypeCode::from(BuiltInType::String), XmlTypeCode::String);
-        assert_eq!(XmlTypeCode::from(BuiltInType::NOTATION), XmlTypeCode::Notation);
+        assert_eq!(
+            XmlTypeCode::from(BuiltInType::NOTATION),
+            XmlTypeCode::Notation
+        );
         assert_eq!(XmlTypeCode::from(BuiltInType::AnyURI), XmlTypeCode::AnyUri);
-        assert_eq!(XmlTypeCode::from(BuiltInType::NMTOKEN), XmlTypeCode::NmToken);
+        assert_eq!(
+            XmlTypeCode::from(BuiltInType::NMTOKEN),
+            XmlTypeCode::NmToken
+        );
     }
 
     #[test]
     fn test_xml_type_code_to_builtin_conversion() {
         // Test TryFrom<XmlTypeCode> for BuiltInType
-        assert_eq!(BuiltInType::try_from(XmlTypeCode::String), Ok(BuiltInType::String));
-        assert_eq!(BuiltInType::try_from(XmlTypeCode::Notation), Ok(BuiltInType::NOTATION));
-        assert_eq!(BuiltInType::try_from(XmlTypeCode::AnyUri), Ok(BuiltInType::AnyURI));
-        assert_eq!(BuiltInType::try_from(XmlTypeCode::NmToken), Ok(BuiltInType::NMTOKEN));
+        assert_eq!(
+            BuiltInType::try_from(XmlTypeCode::String),
+            Ok(BuiltInType::String)
+        );
+        assert_eq!(
+            BuiltInType::try_from(XmlTypeCode::Notation),
+            Ok(BuiltInType::NOTATION)
+        );
+        assert_eq!(
+            BuiltInType::try_from(XmlTypeCode::AnyUri),
+            Ok(BuiltInType::AnyURI)
+        );
+        assert_eq!(
+            BuiltInType::try_from(XmlTypeCode::NmToken),
+            Ok(BuiltInType::NMTOKEN)
+        );
 
         // Node types and AnyType should fail
         assert!(BuiltInType::try_from(XmlTypeCode::None).is_err());
@@ -849,7 +897,10 @@ mod tests {
         );
 
         assert_eq!(st.variety, SimpleTypeVariety::Atomic);
-        assert_eq!(st.derivation_method, SimpleTypeDerivationMethod::Restriction);
+        assert_eq!(
+            st.derivation_method,
+            SimpleTypeDerivationMethod::Restriction
+        );
         assert!(st.is_global());
         assert!(st.is_atomic());
         assert!(st.is_restriction());
@@ -860,11 +911,7 @@ mod tests {
 
     #[test]
     fn test_simple_type_list() {
-        let st = SimpleTypeDef::new_list(
-            None,
-            None,
-            SimpleTypeRef::BuiltIn(BuiltInType::Integer),
-        );
+        let st = SimpleTypeDef::new_list(None, None, SimpleTypeRef::BuiltIn(BuiltInType::Integer));
 
         assert_eq!(st.variety, SimpleTypeVariety::List);
         assert_eq!(st.derivation_method, SimpleTypeDerivationMethod::List);
@@ -894,14 +941,13 @@ mod tests {
 
     #[test]
     fn test_simple_type_builtin_atomic() {
-        let st = SimpleTypeDef::new_builtin(
-            NameId(1),
-            Some(NameId(2)),
-            BuiltInType::String,
-        );
+        let st = SimpleTypeDef::new_builtin(NameId(1), Some(NameId(2)), BuiltInType::String);
 
         assert_eq!(st.variety, SimpleTypeVariety::Atomic);
-        assert_eq!(st.derivation_method, SimpleTypeDerivationMethod::Restriction);
+        assert_eq!(
+            st.derivation_method,
+            SimpleTypeDerivationMethod::Restriction
+        );
         assert!(st.is_atomic());
         assert_eq!(st.type_code, XmlTypeCode::String);
         assert_eq!(st.primitive_type, Some(PrimitiveTypeCode::String));
@@ -909,11 +955,7 @@ mod tests {
 
     #[test]
     fn test_simple_type_builtin_list() {
-        let st = SimpleTypeDef::new_builtin(
-            NameId(1),
-            Some(NameId(2)),
-            BuiltInType::NMTOKENS,
-        );
+        let st = SimpleTypeDef::new_builtin(NameId(1), Some(NameId(2)), BuiltInType::NMTOKENS);
 
         assert_eq!(st.variety, SimpleTypeVariety::List);
         assert_eq!(st.derivation_method, SimpleTypeDerivationMethod::List);
@@ -925,11 +967,7 @@ mod tests {
     #[test]
     fn test_simple_type_builtin_derived() {
         // Test a derived type like integer (derived from decimal)
-        let st = SimpleTypeDef::new_builtin(
-            NameId(1),
-            Some(NameId(2)),
-            BuiltInType::Integer,
-        );
+        let st = SimpleTypeDef::new_builtin(NameId(1), Some(NameId(2)), BuiltInType::Integer);
 
         assert_eq!(st.type_code, XmlTypeCode::Integer);
         assert_eq!(st.primitive_type, Some(PrimitiveTypeCode::Decimal));
@@ -937,7 +975,10 @@ mod tests {
 
     #[test]
     fn test_simple_type_derivation_method_default() {
-        assert_eq!(SimpleTypeDerivationMethod::default(), SimpleTypeDerivationMethod::Restriction);
+        assert_eq!(
+            SimpleTypeDerivationMethod::default(),
+            SimpleTypeDerivationMethod::Restriction
+        );
     }
 
     #[test]
@@ -968,11 +1009,7 @@ mod tests {
         assert!(!restriction.is_union());
         assert!(restriction.is_restriction());
 
-        let list = SimpleTypeDef::new_list(
-            None,
-            None,
-            SimpleTypeRef::BuiltIn(BuiltInType::String),
-        );
+        let list = SimpleTypeDef::new_list(None, None, SimpleTypeRef::BuiltIn(BuiltInType::String));
         assert!(!list.is_atomic());
         assert!(list.is_list());
         assert!(!list.is_union());
@@ -989,28 +1026,16 @@ mod tests {
 
     #[test]
     fn test_simple_type_get_type_code() {
-        let st = SimpleTypeDef::new_builtin(
-            NameId(1),
-            None,
-            BuiltInType::DateTime,
-        );
+        let st = SimpleTypeDef::new_builtin(NameId(1), None, BuiltInType::DateTime);
         assert_eq!(st.get_type_code(), XmlTypeCode::DateTime);
     }
 
     #[test]
     fn test_simple_type_get_primitive_type() {
-        let st = SimpleTypeDef::new_builtin(
-            NameId(1),
-            None,
-            BuiltInType::NCName,
-        );
+        let st = SimpleTypeDef::new_builtin(NameId(1), None, BuiltInType::NCName);
         assert_eq!(st.get_primitive_type(), Some(PrimitiveTypeCode::String));
 
-        let list_st = SimpleTypeDef::new_builtin(
-            NameId(2),
-            None,
-            BuiltInType::IDREFS,
-        );
+        let list_st = SimpleTypeDef::new_builtin(NameId(2), None, BuiltInType::IDREFS);
         assert_eq!(list_st.get_primitive_type(), None);
     }
 }

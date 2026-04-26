@@ -1,8 +1,8 @@
 use super::*;
 
 use crate::namespace::table::NameTable;
-use crate::types::XmlTypeCode;
 use crate::navigator::RoXmlNavigator;
+use crate::types::XmlTypeCode;
 use crate::xpath::context::XPathContext;
 
 // Helper to create ElementDeclData for tests
@@ -135,8 +135,8 @@ fn test_sequence_type_element_name() {
 
 #[test]
 fn test_sequence_type_document_with_element() {
-    let doc = roxmltree::Document::parse("<root xmlns=\"urn:test\"><child/></root>")
-        .expect("parse xml");
+    let doc =
+        roxmltree::Document::parse("<root xmlns=\"urn:test\"><child/></root>").expect("parse xml");
     let nav = RoXmlNavigator::new(&doc);
     let table = NameTable::new();
     let ns_id = table.add("urn:test");
@@ -767,8 +767,7 @@ fn test_kind_test_schema_element_prefixed_qname() {
     use crate::namespace::context::NamespaceContextSnapshot;
 
     // Test KindTest::SchemaElement with prefixed QName (exercises prefix resolution path)
-    let doc =
-        roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:test\"/>").expect("parse xml");
+    let doc = roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:test\"/>").expect("parse xml");
     let mut nav = RoXmlNavigator::new(&doc);
     nav.move_to_first_child();
 
@@ -793,8 +792,7 @@ fn test_kind_test_schema_element_prefixed_qname_wrong_ns() {
     use crate::namespace::context::NamespaceContextSnapshot;
 
     // Test that prefixed QName rejects elements in different namespace
-    let doc =
-        roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:other\"/>").expect("parse xml");
+    let doc = roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:other\"/>").expect("parse xml");
     let mut nav = RoXmlNavigator::new(&doc);
     nav.move_to_first_child();
 
@@ -816,8 +814,7 @@ fn test_kind_test_schema_element_prefixed_qname_wrong_ns() {
 #[test]
 fn test_kind_test_schema_element_unresolved_prefix() {
     // Test that unresolved prefix returns false (no panic)
-    let doc =
-        roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:test\"/>").expect("parse xml");
+    let doc = roxmltree::Document::parse("<ns:root xmlns:ns=\"urn:test\"/>").expect("parse xml");
     let mut nav = RoXmlNavigator::new(&doc);
     nav.move_to_first_child();
 

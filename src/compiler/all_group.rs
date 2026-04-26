@@ -19,7 +19,7 @@ use crate::ids::NameId;
 use crate::parser::frames::{ParticleResult, ParticleTerm};
 use crate::parser::location::SourceRef;
 use crate::schema::model::XsdVersion;
-use crate::types::complex::{NamespaceConstraint, ProcessContents, not_qnames_exclude};
+use crate::types::complex::{not_qnames_exclude, NamespaceConstraint, ProcessContents};
 
 use super::error::{NfaCompileError, NfaCompileResult};
 use super::nfa::NfaTerm;
@@ -100,7 +100,10 @@ impl AllGroupModel {
     }
 
     /// Create an all-group model with open content
-    pub fn with_open_content(particles: Vec<AllParticle>, open_content: OpenContentWildcard) -> Self {
+    pub fn with_open_content(
+        particles: Vec<AllParticle>,
+        open_content: OpenContentWildcard,
+    ) -> Self {
         Self {
             particles,
             open_content: Some(open_content),
@@ -131,7 +134,12 @@ impl AllGroupModel {
 
 impl AllParticle {
     /// Create a new all-particle
-    pub fn new(term: NfaTerm, min_occurs: u32, max_occurs: MaxOccurs, source: Option<SourceRef>) -> Self {
+    pub fn new(
+        term: NfaTerm,
+        min_occurs: u32,
+        max_occurs: MaxOccurs,
+        source: Option<SourceRef>,
+    ) -> Self {
         Self {
             term,
             min_occurs,
@@ -149,7 +157,6 @@ impl AllParticle {
     pub fn is_satisfied(&self, consumed: u32) -> bool {
         consumed >= self.min_occurs
     }
-
 }
 
 impl AllGroupState {
@@ -311,10 +318,7 @@ fn validate_all_group_xsd10(
             Some(1) => {} // OK
             Some(n) => {
                 return Err(NfaCompileError::InvalidAllGroupOccurs {
-                    reason: format!(
-                        "maxOccurs must be 1 in XSD 1.0 all-group, found {}",
-                        n
-                    ),
+                    reason: format!("maxOccurs must be 1 in XSD 1.0 all-group, found {}", n),
                     location: particle.source.clone().or(source.clone()),
                 });
             }
@@ -408,11 +412,14 @@ pub fn term_matches_with_substitution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler::build_substitution_group_map;
     use crate::ids::NameId;
     use crate::schema::model::{DerivationSet, SchemaSet};
-    use crate::compiler::build_substitution_group_map;
 
-    fn element_data(name: NameId, target_namespace: Option<NameId>) -> crate::arenas::ElementDeclData {
+    fn element_data(
+        name: NameId,
+        target_namespace: Option<NameId>,
+    ) -> crate::arenas::ElementDeclData {
         crate::arenas::ElementDeclData {
             name: Some(name),
             target_namespace,
@@ -603,7 +610,13 @@ mod tests {
         let target_ns = Some(NameId(100));
 
         assert_eq!(
-            term_matches(&term, NameId(1), Some(NameId(200)), target_ns, XsdVersion::V1_0),
+            term_matches(
+                &term,
+                NameId(1),
+                Some(NameId(200)),
+                target_ns,
+                XsdVersion::V1_0
+            ),
             TermMatchResult::Match
         );
         assert_eq!(
@@ -637,7 +650,14 @@ mod tests {
         let term = NfaTerm::element(head_name, None, Some(head_key));
 
         assert_eq!(
-            term_matches_with_substitution(&term, member_name, None, None, Some(&map), XsdVersion::V1_0),
+            term_matches_with_substitution(
+                &term,
+                member_name,
+                None,
+                None,
+                Some(&map),
+                XsdVersion::V1_0
+            ),
             TermMatchResult::Match
         );
     }
@@ -666,11 +686,25 @@ mod tests {
         let term = NfaTerm::element(head_name, None, Some(head_key));
 
         assert_eq!(
-            term_matches_with_substitution(&term, head_name, None, None, Some(&map), XsdVersion::V1_0),
+            term_matches_with_substitution(
+                &term,
+                head_name,
+                None,
+                None,
+                Some(&map),
+                XsdVersion::V1_0
+            ),
             TermMatchResult::NoMatch
         );
         assert_eq!(
-            term_matches_with_substitution(&term, member_name, None, None, Some(&map), XsdVersion::V1_0),
+            term_matches_with_substitution(
+                &term,
+                member_name,
+                None,
+                None,
+                Some(&map),
+                XsdVersion::V1_0
+            ),
             TermMatchResult::Match
         );
     }

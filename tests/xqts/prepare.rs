@@ -70,6 +70,9 @@ pub fn self_test() {
     assert_eq!(escaped_index_of("hello world", '{'), None);
 
     assert_eq!(prepare_query_text("(: comment :)\n{ 1 + 2 }"), "1 + 2");
-    assert_eq!(prepare_query_text("(: Kelvin sign :)(: test :)\n{ 42 }"), "42");
+    assert_eq!(
+        prepare_query_text("(: Kelvin sign :)(: test :)\n{ 42 }"),
+        "42"
+    );
     assert_eq!(prepare_query_text("(: comment :)\n1 + 2"), "1 + 2");
 }

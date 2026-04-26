@@ -183,7 +183,11 @@ mod tests {
         let mut indices = Vec::new();
         for _ in 0..10 {
             let sk = sm.insert(());
-            indices.push(table.register(binding_from_type(TypeKey::Simple(sk))).unwrap());
+            indices.push(
+                table
+                    .register(binding_from_type(TypeKey::Simple(sk)))
+                    .unwrap(),
+            );
         }
 
         let unique: std::collections::HashSet<_> = indices.iter().collect();
@@ -221,7 +225,10 @@ mod tests {
 
         let idx1 = table.register(b1).unwrap();
         let idx2 = table.register(b2).unwrap();
-        assert_ne!(idx1, idx2, "same type with different element_decl must get distinct indices");
+        assert_ne!(
+            idx1, idx2,
+            "same type with different element_decl must get distinct indices"
+        );
         assert_eq!(table.get(idx1), Some(&b1));
         assert_eq!(table.get(idx2), Some(&b2));
     }

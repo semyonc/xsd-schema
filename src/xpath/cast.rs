@@ -13,17 +13,16 @@
 use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
+use super::error::XPathError;
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::{well_known, NameTable};
 use crate::types::value::{
-    XmlAtomicValue, XmlValue, XmlValueKind,
-    DateTimeValue, DateValue, TimeValue,
-    GYearMonthValue, GYearValue, GMonthDayValue, GDayValue, GMonthValue,
-    DurationValue, YearMonthDurationValue, DayTimeDurationValue,
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GDayValue, GMonthDayValue,
+    GMonthValue, GYearMonthValue, GYearValue, TimeValue, XmlAtomicValue, XmlValue, XmlValueKind,
+    YearMonthDurationValue,
 };
 use crate::types::{XmlTypeCode, VALIDATOR_REGISTRY};
 use crate::xpath::ast::OccurrenceIndicator;
-use super::error::XPathError;
 
 /// Check if a cast from `source` to `target` is allowed by the XPath 2.0 casting table.
 ///
@@ -41,7 +40,8 @@ fn can_cast(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     }
 
     // untypedAtomic and string can cast to anything (except NOTATION, handled above)
-    if source == XmlTypeCode::UntypedAtomic || source == XmlTypeCode::String
+    if source == XmlTypeCode::UntypedAtomic
+        || source == XmlTypeCode::String
         || source.is_string_derived()
     {
         return true;
@@ -62,10 +62,7 @@ fn can_cast(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     let source_gmonthday = source == XmlTypeCode::GMonthDay;
     let source_gday = source == XmlTypeCode::GDay;
     let source_gmonth = source == XmlTypeCode::GMonth;
-    let source_binary = matches!(
-        source,
-        XmlTypeCode::Base64Binary | XmlTypeCode::HexBinary
-    );
+    let source_binary = matches!(source, XmlTypeCode::Base64Binary | XmlTypeCode::HexBinary);
     let source_anyuri = source == XmlTypeCode::AnyUri;
 
     let target_ua_or_string = target == XmlTypeCode::UntypedAtomic
@@ -159,10 +156,7 @@ fn can_cast(source: XmlTypeCode, target: XmlTypeCode) -> bool {
     // base64Binary / hexBinary → uA, string, base64Binary, hexBinary
     if source_binary {
         return target_ua_or_string
-            || matches!(
-                target,
-                XmlTypeCode::Base64Binary | XmlTypeCode::HexBinary
-            );
+            || matches!(target, XmlTypeCode::Base64Binary | XmlTypeCode::HexBinary);
     }
 
     // anyURI → uA, string, anyURI
@@ -317,11 +311,10 @@ fn cast_to_boolean(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
 fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathError> {
     let result = match &value.value {
         XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => *d,
-        XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => {
-            i.to_string()
-                .parse::<Decimal>()
-                .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?
-        }
+        XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => i
+            .to_string()
+            .parse::<Decimal>()
+            .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
                 return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
@@ -378,10 +371,9 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             let truncated = f.trunc() as f64;
             // Use string round-trip to handle values outside i64 range
             let s = format!("{:.0}", truncated);
-            s.parse::<BigInt>()
-                .map_err(|_| XPathError::FOCA0003 {
-                    message: format!("Value {} is too large for xs:integer", string_val),
-                })?
+            s.parse::<BigInt>().map_err(|_| XPathError::FOCA0003 {
+                message: format!("Value {} is too large for xs:integer", string_val),
+            })?
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
             if d.is_nan() || d.is_infinite() {
@@ -389,14 +381,11 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             }
             // Use string round-trip to handle values outside i64 range
             let s = format!("{:.0}", d.trunc());
-            s.parse::<BigInt>()
-                .map_err(|_| XPathError::FOCA0003 {
-                    message: format!("Value {} is too large for xs:integer", string_val),
-                })?
+            s.parse::<BigInt>().map_err(|_| XPathError::FOCA0003 {
+                message: format!("Value {} is too large for xs:integer", string_val),
+            })?
         }
-        XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
-            BigInt::from(if *b { 1 } else { 0 })
-        }
+        XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => BigInt::from(if *b { 1 } else { 0 }),
         _ => string_val
             .trim()
             .parse::<BigInt>()
@@ -870,31 +859,33 @@ fn cast_datetime_cross(
         // YearMonthDuration → DayTimeDuration: yields zero per XPath 2.0 F&O §17.1.5.
         // Cast goes through xs:duration as intermediate; yearMonthDuration has no day/time
         // components, so extracting the day-time part always produces PT0S.
-        (XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(_)), XmlTypeCode::DayTimeDuration) => {
-            Some(Ok(XmlValue::new(
-                XmlTypeCode::DayTimeDuration,
-                XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(DayTimeDurationValue {
-                    negative: false,
-                    days: 0,
-                    hours: 0,
-                    minutes: 0,
-                    seconds: Decimal::ZERO,
-                })),
-            )))
-        }
+        (
+            XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(_)),
+            XmlTypeCode::DayTimeDuration,
+        ) => Some(Ok(XmlValue::new(
+            XmlTypeCode::DayTimeDuration,
+            XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(DayTimeDurationValue {
+                negative: false,
+                days: 0,
+                hours: 0,
+                minutes: 0,
+                seconds: Decimal::ZERO,
+            })),
+        ))),
         // DayTimeDuration → YearMonthDuration: yields zero per XPath 2.0 F&O §17.1.5.
         // Cast goes through xs:duration as intermediate; dayTimeDuration has no year/month
         // components, so extracting the year-month part always produces P0M.
-        (XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(_)), XmlTypeCode::YearMonthDuration) => {
-            Some(Ok(XmlValue::new(
-                XmlTypeCode::YearMonthDuration,
-                XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(YearMonthDurationValue {
-                    negative: false,
-                    years: 0,
-                    months: 0,
-                })),
-            )))
-        }
+        (
+            XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(_)),
+            XmlTypeCode::YearMonthDuration,
+        ) => Some(Ok(XmlValue::new(
+            XmlTypeCode::YearMonthDuration,
+            XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(YearMonthDurationValue {
+                negative: false,
+                years: 0,
+                months: 0,
+            })),
+        ))),
         _ => None,
     }
 }
@@ -959,10 +950,9 @@ pub fn cast_to_integer_subtype(
     };
 
     // Check range
-    let val_i128: i128 = bigint
-        .to_string()
-        .parse()
-        .map_err(|_| XPathError::invalid_cast_value(bigint.to_string(), format!("{:?}", target_type)))?;
+    let val_i128: i128 = bigint.to_string().parse().map_err(|_| {
+        XPathError::invalid_cast_value(bigint.to_string(), format!("{:?}", target_type))
+    })?;
 
     if val_i128 < min || val_i128 > max {
         return Err(XPathError::invalid_cast_value(
@@ -1137,27 +1127,48 @@ mod tests {
         // Integer non-zero → true
         assert_eq!(
             cast_to(&XmlValue::integer(BigInt::from(10)), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(true));
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
         // Integer zero → false
         assert_eq!(
             cast_to(&XmlValue::integer(BigInt::from(0)), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(false));
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
         // Double NaN → false
         assert_eq!(
             cast_to(&XmlValue::double(f64::NAN), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(false));
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
         // Double -0 → false
         assert_eq!(
             cast_to(&XmlValue::double(-0.0), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(false));
+                .unwrap()
+                .as_boolean(),
+            Some(false)
+        );
         // Float non-zero → true
         assert_eq!(
             cast_to(&XmlValue::float(1.5), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(true));
+                .unwrap()
+                .as_boolean(),
+            Some(true)
+        );
         // Decimal → true
         assert_eq!(
-            cast_to(&XmlValue::decimal(Decimal::new(-11234, 4)), XmlTypeCode::Boolean)
-                .unwrap().as_boolean(), Some(true));
+            cast_to(
+                &XmlValue::decimal(Decimal::new(-11234, 4)),
+                XmlTypeCode::Boolean
+            )
+            .unwrap()
+            .as_boolean(),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1165,8 +1176,12 @@ mod tests {
         let dt = XmlValue::new(
             XmlTypeCode::DateTime,
             XmlValueKind::Atomic(XmlAtomicValue::DateTime(DateTimeValue {
-                year: 1999, month: 5, day: 31,
-                hour: 13, minute: 20, second: Decimal::ZERO,
+                year: 1999,
+                month: 5,
+                day: 31,
+                hour: 13,
+                minute: 20,
+                second: Decimal::ZERO,
                 timezone: Some(crate::types::value::TimezoneOffset(-300)),
             })),
         );
@@ -1180,8 +1195,12 @@ mod tests {
         let dt = XmlValue::new(
             XmlTypeCode::DateTime,
             XmlValueKind::Atomic(XmlAtomicValue::DateTime(DateTimeValue {
-                year: 1999, month: 5, day: 31,
-                hour: 13, minute: 20, second: Decimal::ZERO,
+                year: 1999,
+                month: 5,
+                day: 31,
+                hour: 13,
+                minute: 20,
+                second: Decimal::ZERO,
                 timezone: Some(crate::types::value::TimezoneOffset(-300)),
             })),
         );
@@ -1195,7 +1214,9 @@ mod tests {
         let d = XmlValue::new(
             XmlTypeCode::Date,
             XmlValueKind::Atomic(XmlAtomicValue::Date(DateValue {
-                year: 1999, month: 5, day: 31,
+                year: 1999,
+                month: 5,
+                day: 31,
                 timezone: Some(crate::types::value::TimezoneOffset::UTC),
             })),
         );
@@ -1209,8 +1230,12 @@ mod tests {
         let dt = XmlValue::new(
             XmlTypeCode::DateTime,
             XmlValueKind::Atomic(XmlAtomicValue::DateTime(DateTimeValue {
-                year: 1999, month: 5, day: 31,
-                hour: 13, minute: 20, second: Decimal::ZERO,
+                year: 1999,
+                month: 5,
+                day: 31,
+                hour: 13,
+                minute: 20,
+                second: Decimal::ZERO,
                 timezone: None,
             })),
         );
@@ -1235,8 +1260,13 @@ mod tests {
         let dur = XmlValue::new(
             XmlTypeCode::Duration,
             XmlValueKind::Atomic(XmlAtomicValue::Duration(DurationValue {
-                negative: false, years: 1, months: 2,
-                days: 3, hours: 10, minutes: 30, seconds: Decimal::new(23, 0),
+                negative: false,
+                years: 1,
+                months: 2,
+                days: 3,
+                hours: 10,
+                minutes: 30,
+                seconds: Decimal::new(23, 0),
             })),
         );
         let result = cast_to(&dur, XmlTypeCode::YearMonthDuration).unwrap();

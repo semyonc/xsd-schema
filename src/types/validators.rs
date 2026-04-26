@@ -16,16 +16,14 @@ use num_bigint::BigInt;
 use once_cell::sync::Lazy;
 use rust_decimal::Decimal;
 
-use crate::error::FacetError;
-use super::facets::{FacetSet, WhitespaceMode, normalize_whitespace};
+use super::facets::{normalize_whitespace, FacetSet, WhitespaceMode};
 use super::value::{
-    XmlValue, XmlValueKind, XmlAtomicValue,
-    DateTimeValue, DateValue, TimeValue, DurationValue,
-    GYearMonthValue, GYearValue, GMonthDayValue, GDayValue, GMonthValue,
-    YearMonthDurationValue, DayTimeDurationValue,
-    TimezoneOffset,
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GDayValue, GMonthDayValue,
+    GMonthValue, GYearMonthValue, GYearValue, TimeValue, TimezoneOffset, XmlAtomicValue, XmlValue,
+    XmlValueKind, YearMonthDurationValue,
 };
-use super::{XmlTypeCode, PrimitiveTypeCode};
+use super::{PrimitiveTypeCode, XmlTypeCode};
+use crate::error::FacetError;
 
 /// Error type for validation operations
 #[derive(Debug, Clone)]
@@ -53,7 +51,11 @@ pub enum ValidationError {
 impl std::fmt::Display for ValidationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::InvalidLexical { value, type_name, message } => {
+            Self::InvalidLexical {
+                value,
+                type_name,
+                message,
+            } => {
                 write!(f, "Invalid {} value '{}': {}", type_name, value, message)
             }
             Self::FacetViolation(e) => write!(f, "{}", e),
@@ -87,10 +89,12 @@ pub type ValidationResult<T> = Result<T, ValidationError>;
 /// compares in value space (not lexically) for these types.
 macro_rules! enum_matches_value_space {
     ($typed:expr, $parse_fn:expr, $eq_fn:expr) => {
-        |s: &str| $parse_fn(&normalize_whitespace(s, WhitespaceMode::Collapse))
-            .ok()
-            .map(|e| $eq_fn($typed, e))
-            .unwrap_or(false)
+        |s: &str| {
+            $parse_fn(&normalize_whitespace(s, WhitespaceMode::Collapse))
+                .ok()
+                .map(|e| $eq_fn($typed, e))
+                .unwrap_or(false)
+        }
     };
 }
 
@@ -264,24 +268,39 @@ pub static VALIDATOR_REGISTRY: Lazy<ValidatorRegistry> = Lazy::new(ValidatorRegi
 pub struct StringValidator;
 
 impl TypeValidator for StringValidator {
-    fn type_name(&self) -> &'static str { "string" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::String }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Preserve }
+    fn type_name(&self) -> &'static str {
+        "string"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::String
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Preserve
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         Ok(XmlValue::string(value))
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
-        let ws = facets.whitespace.as_ref().map(|w| w.value).unwrap_or(WhitespaceMode::Preserve);
+        let ws = facets
+            .whitespace
+            .as_ref()
+            .map(|w| w.value)
+            .unwrap_or(WhitespaceMode::Preserve);
         let normalized = normalize_whitespace(value, ws);
         facets.validate_string(&normalized)?;
         Ok(XmlValue::string(normalized))
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -289,10 +308,18 @@ impl TypeValidator for StringValidator {
 pub struct NormalizedStringValidator;
 
 impl TypeValidator for NormalizedStringValidator {
-    fn type_name(&self) -> &'static str { "normalizedString" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NormalizedString }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Replace }
+    fn type_name(&self) -> &'static str {
+        "normalizedString"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NormalizedString
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Replace
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Replace);
@@ -304,7 +331,11 @@ impl TypeValidator for NormalizedStringValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         // NormalizedString requires at least Replace mode
-        let base_ws = facets.whitespace.as_ref().map(|w| w.value).unwrap_or(WhitespaceMode::Replace);
+        let base_ws = facets
+            .whitespace
+            .as_ref()
+            .map(|w| w.value)
+            .unwrap_or(WhitespaceMode::Replace);
         let ws = if matches!(base_ws, WhitespaceMode::Collapse) {
             WhitespaceMode::Collapse
         } else {
@@ -319,7 +350,10 @@ impl TypeValidator for NormalizedStringValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -327,10 +361,18 @@ impl TypeValidator for NormalizedStringValidator {
 pub struct TokenValidator;
 
 impl TypeValidator for TokenValidator {
-    fn type_name(&self) -> &'static str { "token" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Token }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "token"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Token
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -350,7 +392,10 @@ impl TypeValidator for TokenValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -358,10 +403,18 @@ impl TypeValidator for TokenValidator {
 pub struct LanguageValidator;
 
 impl TypeValidator for LanguageValidator {
-    fn type_name(&self) -> &'static str { "language" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Language }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "language"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Language
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -386,7 +439,10 @@ impl TypeValidator for LanguageValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -394,10 +450,18 @@ impl TypeValidator for LanguageValidator {
 pub struct NmTokenValidator;
 
 impl TypeValidator for NmTokenValidator {
-    fn type_name(&self) -> &'static str { "NMTOKEN" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NmToken }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "NMTOKEN"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NmToken
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -421,7 +485,10 @@ impl TypeValidator for NmTokenValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -429,10 +496,18 @@ impl TypeValidator for NmTokenValidator {
 pub struct NameValidator;
 
 impl TypeValidator for NameValidator {
-    fn type_name(&self) -> &'static str { "Name" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Name }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "Name"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Name
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -456,7 +531,10 @@ impl TypeValidator for NameValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -464,10 +542,18 @@ impl TypeValidator for NameValidator {
 pub struct NCNameValidator;
 
 impl TypeValidator for NCNameValidator {
-    fn type_name(&self) -> &'static str { "NCName" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NCName }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "NCName"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NCName
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -491,7 +577,10 @@ impl TypeValidator for NCNameValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -499,10 +588,18 @@ impl TypeValidator for NCNameValidator {
 pub struct IdValidator;
 
 impl TypeValidator for IdValidator {
-    fn type_name(&self) -> &'static str { "ID" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Id }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "ID"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Id
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -526,7 +623,10 @@ impl TypeValidator for IdValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -534,10 +634,18 @@ impl TypeValidator for IdValidator {
 pub struct IdRefValidator;
 
 impl TypeValidator for IdRefValidator {
-    fn type_name(&self) -> &'static str { "IDREF" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::IdRef }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "IDREF"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::IdRef
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -561,7 +669,10 @@ impl TypeValidator for IdRefValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -569,10 +680,18 @@ impl TypeValidator for IdRefValidator {
 pub struct EntityValidator;
 
 impl TypeValidator for EntityValidator {
-    fn type_name(&self) -> &'static str { "ENTITY" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Entity }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "ENTITY"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Entity
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -596,7 +715,10 @@ impl TypeValidator for EntityValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration" | "whitespace"
+        )
     }
 }
 
@@ -608,10 +730,18 @@ impl TypeValidator for EntityValidator {
 pub struct BooleanValidator;
 
 impl TypeValidator for BooleanValidator {
-    fn type_name(&self) -> &'static str { "boolean" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Boolean }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Boolean }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "boolean"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Boolean
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Boolean
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -658,14 +788,23 @@ impl TypeValidator for BooleanValidator {
 pub struct DecimalValidator;
 
 impl TypeValidator for DecimalValidator {
-    fn type_name(&self) -> &'static str { "decimal" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Decimal }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "decimal"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Decimal
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<Decimal>()
+        normalized
+            .parse::<Decimal>()
             .map(XmlValue::decimal)
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
@@ -685,10 +824,16 @@ impl TypeValidator for DecimalValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -697,14 +842,23 @@ impl TypeValidator for DecimalValidator {
 pub struct IntegerValidator;
 
 impl TypeValidator for IntegerValidator {
-    fn type_name(&self) -> &'static str { "integer" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Integer }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "integer"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Integer
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<BigInt>()
+        normalized
+            .parse::<BigInt>()
             .map(XmlValue::integer)
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
@@ -724,10 +878,16 @@ impl TypeValidator for IntegerValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -736,10 +896,18 @@ impl TypeValidator for IntegerValidator {
 pub struct FloatValidator;
 
 impl TypeValidator for FloatValidator {
-    fn type_name(&self) -> &'static str { "float" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Float }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Float }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "float"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Float
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Float
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -767,9 +935,14 @@ impl TypeValidator for FloatValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -778,10 +951,18 @@ impl TypeValidator for FloatValidator {
 pub struct DoubleValidator;
 
 impl TypeValidator for DoubleValidator {
-    fn type_name(&self) -> &'static str { "double" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Double }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Double }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "double"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Double
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Double
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -809,9 +990,14 @@ impl TypeValidator for DoubleValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -822,7 +1008,9 @@ fn parse_float(s: &str) -> Result<f32, String> {
         "INF" => Ok(f32::INFINITY),
         "-INF" => Ok(f32::NEG_INFINITY),
         "NaN" => Ok(f32::NAN),
-        _ => s.parse().map_err(|e: std::num::ParseFloatError| e.to_string()),
+        _ => s
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| e.to_string()),
     }
 }
 
@@ -832,7 +1020,9 @@ fn parse_double(s: &str) -> Result<f64, String> {
         "INF" => Ok(f64::INFINITY),
         "-INF" => Ok(f64::NEG_INFINITY),
         "NaN" => Ok(f64::NAN),
-        _ => s.parse().map_err(|e: std::num::ParseFloatError| e.to_string()),
+        _ => s
+            .parse()
+            .map_err(|e: std::num::ParseFloatError| e.to_string()),
     }
 }
 
@@ -864,7 +1054,11 @@ fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
             + rust_decimal::Decimal::from(d.hours as i64) * rust_decimal::Decimal::from(3600)
             + rust_decimal::Decimal::from(d.minutes as i64) * rust_decimal::Decimal::from(60)
             + d.seconds;
-        if d.negative { -s } else { s }
+        if d.negative {
+            -s
+        } else {
+            s
+        }
     };
     day_secs(a) == day_secs(b)
 }
@@ -896,10 +1090,12 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
             if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater)
                 && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
             {
-                return Err(ValidationError::FacetViolation(FacetError::MinInclusiveViolation {
-                    value: value_str.to_string(),
-                    min: min.value.clone(),
-                }));
+                return Err(ValidationError::FacetViolation(
+                    FacetError::MinInclusiveViolation {
+                        value: value_str.to_string(),
+                        min: min.value.clone(),
+                    },
+                ));
             }
         }
     }
@@ -908,30 +1104,36 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
             if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less)
                 && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
             {
-                return Err(ValidationError::FacetViolation(FacetError::MaxInclusiveViolation {
-                    value: value_str.to_string(),
-                    max: max.value.clone(),
-                }));
+                return Err(ValidationError::FacetViolation(
+                    FacetError::MaxInclusiveViolation {
+                        value: value_str.to_string(),
+                        max: max.value.clone(),
+                    },
+                ));
             }
         }
     }
     if let Some(ref min) = facets.min_exclusive {
         if let Some(bound) = parse_fn(&min.value) {
             if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater) {
-                return Err(ValidationError::FacetViolation(FacetError::MinExclusiveViolation {
-                    value: value_str.to_string(),
-                    min: min.value.clone(),
-                }));
+                return Err(ValidationError::FacetViolation(
+                    FacetError::MinExclusiveViolation {
+                        value: value_str.to_string(),
+                        min: min.value.clone(),
+                    },
+                ));
             }
         }
     }
     if let Some(ref max) = facets.max_exclusive {
         if let Some(bound) = parse_fn(&max.value) {
             if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less) {
-                return Err(ValidationError::FacetViolation(FacetError::MaxExclusiveViolation {
-                    value: value_str.to_string(),
-                    max: max.value.clone(),
-                }));
+                return Err(ValidationError::FacetViolation(
+                    FacetError::MaxExclusiveViolation {
+                        value: value_str.to_string(),
+                        max: max.value.clone(),
+                    },
+                ));
             }
         }
     }
@@ -945,17 +1147,27 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
 pub struct DurationValidator;
 
 impl TypeValidator for DurationValidator {
-    fn type_name(&self) -> &'static str { "duration" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Duration }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Duration }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "duration"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Duration
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Duration
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_duration(&normalized).map(|d| XmlValue::new(
-            XmlTypeCode::Duration,
-            XmlValueKind::Atomic(XmlAtomicValue::Duration(d)),
-        ))
+        parse_duration(&normalized).map(|d| {
+            XmlValue::new(
+                XmlTypeCode::Duration,
+                XmlValueKind::Atomic(XmlAtomicValue::Duration(d)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -975,9 +1187,14 @@ impl TypeValidator for DurationValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -986,17 +1203,27 @@ impl TypeValidator for DurationValidator {
 pub struct DateTimeValidator;
 
 impl TypeValidator for DateTimeValidator {
-    fn type_name(&self) -> &'static str { "dateTime" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::DateTime }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::DateTime }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "dateTime"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::DateTime
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::DateTime
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_datetime(&normalized).map(|dt| XmlValue::new(
-            XmlTypeCode::DateTime,
-            XmlValueKind::Atomic(XmlAtomicValue::DateTime(dt)),
-        ))
+        parse_datetime(&normalized).map(|dt| {
+            XmlValue::new(
+                XmlTypeCode::DateTime,
+                XmlValueKind::Atomic(XmlAtomicValue::DateTime(dt)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1016,9 +1243,15 @@ impl TypeValidator for DateTimeValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1027,17 +1260,27 @@ impl TypeValidator for DateTimeValidator {
 pub struct DateValidator;
 
 impl TypeValidator for DateValidator {
-    fn type_name(&self) -> &'static str { "date" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Date }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Date }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "date"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Date
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Date
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_date(&normalized).map(|d| XmlValue::new(
-            XmlTypeCode::Date,
-            XmlValueKind::Atomic(XmlAtomicValue::Date(d)),
-        ))
+        parse_date(&normalized).map(|d| {
+            XmlValue::new(
+                XmlTypeCode::Date,
+                XmlValueKind::Atomic(XmlAtomicValue::Date(d)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1057,9 +1300,15 @@ impl TypeValidator for DateValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1068,17 +1317,27 @@ impl TypeValidator for DateValidator {
 pub struct TimeValidator;
 
 impl TypeValidator for TimeValidator {
-    fn type_name(&self) -> &'static str { "time" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Time }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Time }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "time"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Time
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Time
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_time(&normalized).map(|t| XmlValue::new(
-            XmlTypeCode::Time,
-            XmlValueKind::Atomic(XmlAtomicValue::Time(t)),
-        ))
+        parse_time(&normalized).map(|t| {
+            XmlValue::new(
+                XmlTypeCode::Time,
+                XmlValueKind::Atomic(XmlAtomicValue::Time(t)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1098,9 +1357,15 @@ impl TypeValidator for TimeValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1109,17 +1374,27 @@ impl TypeValidator for TimeValidator {
 pub struct GYearMonthValidator;
 
 impl TypeValidator for GYearMonthValidator {
-    fn type_name(&self) -> &'static str { "gYearMonth" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::GYearMonth }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::GYearMonth }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "gYearMonth"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::GYearMonth
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::GYearMonth
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_gyearmonth(&normalized).map(|v| XmlValue::new(
-            XmlTypeCode::GYearMonth,
-            XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(v)),
-        ))
+        parse_gyearmonth(&normalized).map(|v| {
+            XmlValue::new(
+                XmlTypeCode::GYearMonth,
+                XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(v)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1135,9 +1410,15 @@ impl TypeValidator for GYearMonthValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1146,17 +1427,27 @@ impl TypeValidator for GYearMonthValidator {
 pub struct GYearValidator;
 
 impl TypeValidator for GYearValidator {
-    fn type_name(&self) -> &'static str { "gYear" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::GYear }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::GYear }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "gYear"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::GYear
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::GYear
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_gyear(&normalized).map(|v| XmlValue::new(
-            XmlTypeCode::GYear,
-            XmlValueKind::Atomic(XmlAtomicValue::GYear(v)),
-        ))
+        parse_gyear(&normalized).map(|v| {
+            XmlValue::new(
+                XmlTypeCode::GYear,
+                XmlValueKind::Atomic(XmlAtomicValue::GYear(v)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1172,9 +1463,15 @@ impl TypeValidator for GYearValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1183,17 +1480,27 @@ impl TypeValidator for GYearValidator {
 pub struct GMonthDayValidator;
 
 impl TypeValidator for GMonthDayValidator {
-    fn type_name(&self) -> &'static str { "gMonthDay" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::GMonthDay }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::GMonthDay }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "gMonthDay"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::GMonthDay
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::GMonthDay
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_gmonthday(&normalized).map(|v| XmlValue::new(
-            XmlTypeCode::GMonthDay,
-            XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(v)),
-        ))
+        parse_gmonthday(&normalized).map(|v| {
+            XmlValue::new(
+                XmlTypeCode::GMonthDay,
+                XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(v)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1209,9 +1516,15 @@ impl TypeValidator for GMonthDayValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1220,17 +1533,27 @@ impl TypeValidator for GMonthDayValidator {
 pub struct GDayValidator;
 
 impl TypeValidator for GDayValidator {
-    fn type_name(&self) -> &'static str { "gDay" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::GDay }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::GDay }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "gDay"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::GDay
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::GDay
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_gday(&normalized).map(|v| XmlValue::new(
-            XmlTypeCode::GDay,
-            XmlValueKind::Atomic(XmlAtomicValue::GDay(v)),
-        ))
+        parse_gday(&normalized).map(|v| {
+            XmlValue::new(
+                XmlTypeCode::GDay,
+                XmlValueKind::Atomic(XmlAtomicValue::GDay(v)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1246,9 +1569,15 @@ impl TypeValidator for GDayValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1257,17 +1586,27 @@ impl TypeValidator for GDayValidator {
 pub struct GMonthValidator;
 
 impl TypeValidator for GMonthValidator {
-    fn type_name(&self) -> &'static str { "gMonth" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::GMonth }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::GMonth }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "gMonth"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::GMonth
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::GMonth
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_gmonth(&normalized).map(|v| XmlValue::new(
-            XmlTypeCode::GMonth,
-            XmlValueKind::Atomic(XmlAtomicValue::GMonth(v)),
-        ))
+        parse_gmonth(&normalized).map(|v| {
+            XmlValue::new(
+                XmlTypeCode::GMonth,
+                XmlValueKind::Atomic(XmlAtomicValue::GMonth(v)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -1283,9 +1622,15 @@ impl TypeValidator for GMonthValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }
@@ -1298,18 +1643,28 @@ impl TypeValidator for GMonthValidator {
 pub struct HexBinaryValidator;
 
 impl TypeValidator for HexBinaryValidator {
-    fn type_name(&self) -> &'static str { "hexBinary" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::HexBinary }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::HexBinary }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "hexBinary"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::HexBinary
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::HexBinary
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         hex::decode(&normalized)
-            .map(|bytes| XmlValue::new(
-                XmlTypeCode::HexBinary,
-                XmlValueKind::Atomic(XmlAtomicValue::HexBinary(bytes)),
-            ))
+            .map(|bytes| {
+                XmlValue::new(
+                    XmlTypeCode::HexBinary,
+                    XmlValueKind::Atomic(XmlAtomicValue::HexBinary(bytes)),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "hexBinary",
@@ -1328,7 +1683,10 @@ impl TypeValidator for HexBinaryValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -1336,20 +1694,30 @@ impl TypeValidator for HexBinaryValidator {
 pub struct Base64BinaryValidator;
 
 impl TypeValidator for Base64BinaryValidator {
-    fn type_name(&self) -> &'static str { "base64Binary" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Base64Binary }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Base64Binary }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "base64Binary"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Base64Binary
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Base64Binary
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         use base64::Engine;
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         base64::engine::general_purpose::STANDARD
             .decode(&normalized)
-            .map(|bytes| XmlValue::new(
-                XmlTypeCode::Base64Binary,
-                XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(bytes)),
-            ))
+            .map(|bytes| {
+                XmlValue::new(
+                    XmlTypeCode::Base64Binary,
+                    XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(bytes)),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "base64Binary",
@@ -1368,7 +1736,10 @@ impl TypeValidator for Base64BinaryValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -1380,10 +1751,18 @@ impl TypeValidator for Base64BinaryValidator {
 pub struct AnyUriValidator;
 
 impl TypeValidator for AnyUriValidator {
-    fn type_name(&self) -> &'static str { "anyURI" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::AnyUri }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::AnyUri }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "anyURI"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::AnyUri
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::AnyUri
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -1402,7 +1781,10 @@ impl TypeValidator for AnyUriValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -1410,7 +1792,9 @@ impl TypeValidator for AnyUriValidator {
 /// (`alpha *( alpha | digit | "+" | "-" | "." )`). Empty is invalid.
 pub fn is_valid_uri_scheme(s: &str) -> bool {
     let mut chars = s.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     if !first.is_ascii_alphabetic() {
         return false;
     }
@@ -1536,7 +1920,9 @@ fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
                 pos += 1;
             }
             if pos == frac_start {
-                return Err(bad("Fractional part must have at least one digit".to_string()));
+                return Err(bad(
+                    "Fractional part must have at least one digit".to_string()
+                ));
             }
         }
         let has_fraction = pos != int_end;
@@ -1593,11 +1979,17 @@ fn parse_duration(s: &str) -> ValidationResult<DurationValue> {
     }
 
     if !seen.iter().any(|&b| b) {
-        return Err(bad("Duration must contain at least one component".to_string()));
+        return Err(bad(
+            "Duration must contain at least one component".to_string()
+        ));
     }
-    let any_time = seen[Field::Hours as usize] || seen[Field::Minutes as usize] || seen[Field::Seconds as usize];
+    let any_time = seen[Field::Hours as usize]
+        || seen[Field::Minutes as usize]
+        || seen[Field::Seconds as usize];
     if in_time && !any_time {
-        return Err(bad("Time designator 'T' requires at least one time component".to_string()));
+        return Err(bad(
+            "Time designator 'T' requires at least one time component".to_string(),
+        ));
     }
 
     Ok(out)
@@ -1678,7 +2070,11 @@ fn days_in_month(year: i32, month: u8) -> u32 {
         4 | 6 | 9 | 11 => 30,
         2 => {
             let leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
-            if leap { 29 } else { 28 }
+            if leap {
+                29
+            } else {
+                28
+            }
         }
         _ => 0,
     }
@@ -1688,7 +2084,12 @@ fn days_in_month(year: i32, month: u8) -> u32 {
 fn parse_date(s: &str) -> ValidationResult<DateValue> {
     let (date_str, tz) = split_timezone(s);
     let (year, month, day) = parse_date_part(date_str, "date")?;
-    Ok(DateValue { year, month, day, timezone: tz })
+    Ok(DateValue {
+        year,
+        month,
+        day,
+        timezone: tz,
+    })
 }
 
 /// Parse XSD time
@@ -1707,7 +2108,12 @@ fn parse_time(s: &str) -> ValidationResult<TimeValue> {
         }
         hour = 0;
     }
-    Ok(TimeValue { hour, minute, second, timezone: tz })
+    Ok(TimeValue {
+        hour,
+        minute,
+        second,
+        timezone: tz,
+    })
 }
 
 /// Validate the lexical form of a yearFrag per XSD Part 2 §3.3.9:
@@ -1734,39 +2140,51 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
     let (year_str, year, month, day) = if s.starts_with('-') && parts.len() >= 4 {
         // Negative year
         let year_str = format!("-{}", parts[1]);
-        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid year".to_string(),
-        })?;
-        let month: u8 = parts[2].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid month".to_string(),
-        })?;
-        let day: u8 = parts[3].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid day".to_string(),
-        })?;
+        let year: i32 = year_str
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid year".to_string(),
+            })?;
+        let month: u8 = parts[2]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid month".to_string(),
+            })?;
+        let day: u8 = parts[3]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid day".to_string(),
+            })?;
         (year_str, year, month, day)
     } else if parts.len() == 3 {
         let year_str = parts[0].to_string();
-        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid year".to_string(),
-        })?;
-        let month: u8 = parts[1].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid month".to_string(),
-        })?;
-        let day: u8 = parts[2].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name,
-            message: "Invalid day".to_string(),
-        })?;
+        let year: i32 = year_str
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid year".to_string(),
+            })?;
+        let month: u8 = parts[1]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid month".to_string(),
+            })?;
+        let day: u8 = parts[2]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Invalid day".to_string(),
+            })?;
         (year_str, year, month, day)
     } else {
         return Err(ValidationError::InvalidLexical {
@@ -1780,7 +2198,8 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name,
-            message: "Invalid year: must be 4+ digits, no leading zeros except single '0YYY' form".to_string(),
+            message: "Invalid year: must be 4+ digits, no leading zeros except single '0YYY' form"
+                .to_string(),
         });
     }
 
@@ -1818,21 +2237,27 @@ fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8
         });
     }
 
-    let hour: u8 = parts[0].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name,
-        message: "Invalid hour".to_string(),
-    })?;
-    let minute: u8 = parts[1].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name,
-        message: "Invalid minute".to_string(),
-    })?;
-    let second: Decimal = parts[2].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name,
-        message: "Invalid second".to_string(),
-    })?;
+    let hour: u8 = parts[0]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Invalid hour".to_string(),
+        })?;
+    let minute: u8 = parts[1]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Invalid minute".to_string(),
+        })?;
+    let second: Decimal = parts[2]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Invalid second".to_string(),
+        })?;
 
     if hour > 24 || minute > 59 || second >= Decimal::from(60) {
         return Err(ValidationError::InvalidLexical {
@@ -1890,29 +2315,37 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
 
     let (year_str, year, month) = if date_str.starts_with('-') && parts.len() >= 3 {
         let year_str = format!("-{}", parts[1]);
-        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gYearMonth",
-            message: "Invalid year".to_string(),
-        })?;
-        let month: u8 = parts[2].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gYearMonth",
-            message: "Invalid month".to_string(),
-        })?;
+        let year: i32 = year_str
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "gYearMonth",
+                message: "Invalid year".to_string(),
+            })?;
+        let month: u8 = parts[2]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "gYearMonth",
+                message: "Invalid month".to_string(),
+            })?;
         (year_str, year, month)
     } else if parts.len() == 2 {
         let year_str = parts[0].to_string();
-        let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gYearMonth",
-            message: "Invalid year".to_string(),
-        })?;
-        let month: u8 = parts[1].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gYearMonth",
-            message: "Invalid month".to_string(),
-        })?;
+        let year: i32 = year_str
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "gYearMonth",
+                message: "Invalid year".to_string(),
+            })?;
+        let month: u8 = parts[1]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "gYearMonth",
+                message: "Invalid month".to_string(),
+            })?;
         (year_str, year, month)
     } else {
         return Err(ValidationError::InvalidLexical {
@@ -1938,17 +2371,23 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
         });
     }
 
-    Ok(GYearMonthValue { year, month, timezone: tz })
+    Ok(GYearMonthValue {
+        year,
+        month,
+        timezone: tz,
+    })
 }
 
 /// Parse gYear
 fn parse_gyear(s: &str) -> ValidationResult<GYearValue> {
     let (year_str, tz) = split_timezone(s);
-    let year: i32 = year_str.parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name: "gYear",
-        message: "Invalid year".to_string(),
-    })?;
+    let year: i32 = year_str
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gYear",
+            message: "Invalid year".to_string(),
+        })?;
     if !valid_year_lexical(year_str) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
@@ -1980,16 +2419,20 @@ fn parse_gmonthday(s: &str) -> ValidationResult<GMonthDayValue> {
         });
     }
 
-    let month: u8 = parts[0].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name: "gMonthDay",
-        message: "Invalid month".to_string(),
-    })?;
-    let day: u8 = parts[1].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name: "gMonthDay",
-        message: "Invalid day".to_string(),
-    })?;
+    let month: u8 = parts[0]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gMonthDay",
+            message: "Invalid month".to_string(),
+        })?;
+    let day: u8 = parts[1]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gMonthDay",
+            message: "Invalid day".to_string(),
+        })?;
 
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
@@ -1999,7 +2442,11 @@ fn parse_gmonthday(s: &str) -> ValidationResult<GMonthDayValue> {
         });
     }
 
-    Ok(GMonthDayValue { month, day, timezone: tz })
+    Ok(GMonthDayValue {
+        month,
+        day,
+        timezone: tz,
+    })
 }
 
 /// Parse gDay (---DD)
@@ -2013,11 +2460,13 @@ fn parse_gday(s: &str) -> ValidationResult<GDayValue> {
         });
     }
 
-    let day: u8 = day_str[3..].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name: "gDay",
-        message: "Invalid day".to_string(),
-    })?;
+    let day: u8 = day_str[3..]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gDay",
+            message: "Invalid day".to_string(),
+        })?;
 
     if !(1..=31).contains(&day) {
         return Err(ValidationError::InvalidLexical {
@@ -2041,11 +2490,13 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
         });
     }
 
-    let month: u8 = month_str[2..].parse().map_err(|_| ValidationError::InvalidLexical {
-        value: s.to_string(),
-        type_name: "gMonth",
-        message: "Invalid month".to_string(),
-    })?;
+    let month: u8 = month_str[2..]
+        .parse()
+        .map_err(|_| ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gMonth",
+            message: "Invalid month".to_string(),
+        })?;
 
     if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
@@ -2055,7 +2506,10 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
         });
     }
 
-    Ok(GMonthValue { month, timezone: tz })
+    Ok(GMonthValue {
+        month,
+        timezone: tz,
+    })
 }
 
 /// Parse xs:yearMonthDuration (XSD 1.1)
@@ -2099,21 +2553,25 @@ fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue
 
     // Parse years
     if let Some(y_pos) = current.find('Y') {
-        years = current[..y_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Invalid years value".to_string(),
-        })?;
+        years = current[..y_pos]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "yearMonthDuration",
+                message: "Invalid years value".to_string(),
+            })?;
         current = &current[y_pos + 1..];
     }
 
     // Parse months
     if let Some(m_pos) = current.find('M') {
-        months = current[..m_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "yearMonthDuration",
-            message: "Invalid months value".to_string(),
-        })?;
+        months = current[..m_pos]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "yearMonthDuration",
+                message: "Invalid months value".to_string(),
+            })?;
         current = &current[m_pos + 1..];
     }
 
@@ -2126,7 +2584,11 @@ fn parse_year_month_duration(s: &str) -> ValidationResult<YearMonthDurationValue
         });
     }
 
-    Ok(YearMonthDurationValue { negative, years, months })
+    Ok(YearMonthDurationValue {
+        negative,
+        years,
+        months,
+    })
 }
 
 /// Parse xs:dayTimeDuration (XSD 1.1)
@@ -2177,11 +2639,13 @@ fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
 
     // Parse days
     if let Some(d_pos) = current.find('D') {
-        days = current[..d_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "dayTimeDuration",
-            message: "Invalid days value".to_string(),
-        })?;
+        days = current[..d_pos]
+            .parse()
+            .map_err(|_| ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name: "dayTimeDuration",
+                message: "Invalid days value".to_string(),
+            })?;
         current = &current[d_pos + 1..];
     }
 
@@ -2191,31 +2655,37 @@ fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
 
         // Parse hours
         if let Some(h_pos) = current.find('H') {
-            hours = current[..h_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "dayTimeDuration",
-                message: "Invalid hours value".to_string(),
-            })?;
+            hours = current[..h_pos]
+                .parse()
+                .map_err(|_| ValidationError::InvalidLexical {
+                    value: s.to_string(),
+                    type_name: "dayTimeDuration",
+                    message: "Invalid hours value".to_string(),
+                })?;
             current = &current[h_pos + 1..];
         }
 
         // Parse minutes
         if let Some(m_pos) = current.find('M') {
-            minutes = current[..m_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "dayTimeDuration",
-                message: "Invalid minutes value".to_string(),
-            })?;
+            minutes = current[..m_pos]
+                .parse()
+                .map_err(|_| ValidationError::InvalidLexical {
+                    value: s.to_string(),
+                    type_name: "dayTimeDuration",
+                    message: "Invalid minutes value".to_string(),
+                })?;
             current = &current[m_pos + 1..];
         }
 
         // Parse seconds
         if let Some(s_pos) = current.find('S') {
-            seconds = current[..s_pos].parse().map_err(|_| ValidationError::InvalidLexical {
-                value: s.to_string(),
-                type_name: "dayTimeDuration",
-                message: "Invalid seconds value".to_string(),
-            })?;
+            seconds = current[..s_pos]
+                .parse()
+                .map_err(|_| ValidationError::InvalidLexical {
+                    value: s.to_string(),
+                    type_name: "dayTimeDuration",
+                    message: "Invalid seconds value".to_string(),
+                })?;
             current = &current[s_pos + 1..];
         }
     }
@@ -2229,7 +2699,13 @@ fn parse_day_time_duration(s: &str) -> ValidationResult<DayTimeDurationValue> {
         });
     }
 
-    Ok(DayTimeDurationValue { negative, days, hours, minutes, seconds })
+    Ok(DayTimeDurationValue {
+        negative,
+        days,
+        hours,
+        minutes,
+        seconds,
+    })
 }
 
 // ============================================================================
@@ -2249,10 +2725,11 @@ fn is_name_start_char(c: char) -> bool {
 
 /// Check if a character is a valid XML name character
 fn is_name_char(c: char) -> bool {
-    is_name_start_char(c) || matches!(c,
-        '-' | '.' | '0'..='9' | '\u{B7}' |
-        '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
-    )
+    is_name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9' | '\u{B7}' |
+            '\u{0300}'..='\u{036F}' | '\u{203F}'..='\u{2040}'
+        )
 }
 
 /// Check if a character is a valid NCName start character (no colon)
@@ -2314,18 +2791,29 @@ pub fn is_valid_language(s: &str) -> bool {
 pub struct LongValidator;
 
 impl TypeValidator for LongValidator {
-    fn type_name(&self) -> &'static str { "long" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Long }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "long"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Long
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<i64>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::Long,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<i64>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::Long,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "long",
@@ -2344,10 +2832,16 @@ impl TypeValidator for LongValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2356,18 +2850,29 @@ impl TypeValidator for LongValidator {
 pub struct IntValidator;
 
 impl TypeValidator for IntValidator {
-    fn type_name(&self) -> &'static str { "int" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Int }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "int"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Int
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<i32>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::Int,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<i32>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::Int,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "int",
@@ -2386,10 +2891,16 @@ impl TypeValidator for IntValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2398,18 +2909,29 @@ impl TypeValidator for IntValidator {
 pub struct ShortValidator;
 
 impl TypeValidator for ShortValidator {
-    fn type_name(&self) -> &'static str { "short" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Short }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "short"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Short
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<i16>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::Short,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<i16>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::Short,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "short",
@@ -2428,10 +2950,16 @@ impl TypeValidator for ShortValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2440,18 +2968,29 @@ impl TypeValidator for ShortValidator {
 pub struct ByteValidator;
 
 impl TypeValidator for ByteValidator {
-    fn type_name(&self) -> &'static str { "byte" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Byte }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "byte"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Byte
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<i8>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::Byte,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<i8>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::Byte,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "byte",
@@ -2470,10 +3009,16 @@ impl TypeValidator for ByteValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2482,14 +3027,23 @@ impl TypeValidator for ByteValidator {
 pub struct NonNegativeIntegerValidator;
 
 impl TypeValidator for NonNegativeIntegerValidator {
-    fn type_name(&self) -> &'static str { "nonNegativeInteger" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NonNegativeInteger }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "nonNegativeInteger"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NonNegativeInteger
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized.parse::<BigInt>()
+        let bigint = normalized
+            .parse::<BigInt>()
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "nonNegativeInteger",
@@ -2518,10 +3072,16 @@ impl TypeValidator for NonNegativeIntegerValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2530,14 +3090,23 @@ impl TypeValidator for NonNegativeIntegerValidator {
 pub struct PositiveIntegerValidator;
 
 impl TypeValidator for PositiveIntegerValidator {
-    fn type_name(&self) -> &'static str { "positiveInteger" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::PositiveInteger }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "positiveInteger"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::PositiveInteger
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized.parse::<BigInt>()
+        let bigint = normalized
+            .parse::<BigInt>()
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "positiveInteger",
@@ -2566,10 +3135,16 @@ impl TypeValidator for PositiveIntegerValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2578,14 +3153,23 @@ impl TypeValidator for PositiveIntegerValidator {
 pub struct NonPositiveIntegerValidator;
 
 impl TypeValidator for NonPositiveIntegerValidator {
-    fn type_name(&self) -> &'static str { "nonPositiveInteger" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NonPositiveInteger }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "nonPositiveInteger"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NonPositiveInteger
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized.parse::<BigInt>()
+        let bigint = normalized
+            .parse::<BigInt>()
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "nonPositiveInteger",
@@ -2614,10 +3198,16 @@ impl TypeValidator for NonPositiveIntegerValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2626,14 +3216,23 @@ impl TypeValidator for NonPositiveIntegerValidator {
 pub struct NegativeIntegerValidator;
 
 impl TypeValidator for NegativeIntegerValidator {
-    fn type_name(&self) -> &'static str { "negativeInteger" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NegativeInteger }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "negativeInteger"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NegativeInteger
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        let bigint = normalized.parse::<BigInt>()
+        let bigint = normalized
+            .parse::<BigInt>()
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "negativeInteger",
@@ -2662,10 +3261,16 @@ impl TypeValidator for NegativeIntegerValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2674,18 +3279,29 @@ impl TypeValidator for NegativeIntegerValidator {
 pub struct UnsignedLongValidator;
 
 impl TypeValidator for UnsignedLongValidator {
-    fn type_name(&self) -> &'static str { "unsignedLong" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::UnsignedLong }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "unsignedLong"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UnsignedLong
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<u64>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::UnsignedLong,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<u64>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::UnsignedLong,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "unsignedLong",
@@ -2704,10 +3320,16 @@ impl TypeValidator for UnsignedLongValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2716,18 +3338,29 @@ impl TypeValidator for UnsignedLongValidator {
 pub struct UnsignedIntValidator;
 
 impl TypeValidator for UnsignedIntValidator {
-    fn type_name(&self) -> &'static str { "unsignedInt" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::UnsignedInt }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "unsignedInt"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UnsignedInt
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<u32>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::UnsignedInt,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<u32>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::UnsignedInt,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "unsignedInt",
@@ -2746,10 +3379,16 @@ impl TypeValidator for UnsignedIntValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2758,18 +3397,29 @@ impl TypeValidator for UnsignedIntValidator {
 pub struct UnsignedShortValidator;
 
 impl TypeValidator for UnsignedShortValidator {
-    fn type_name(&self) -> &'static str { "unsignedShort" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::UnsignedShort }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "unsignedShort"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UnsignedShort
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<u16>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::UnsignedShort,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<u16>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::UnsignedShort,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "unsignedShort",
@@ -2788,10 +3438,16 @@ impl TypeValidator for UnsignedShortValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2800,18 +3456,29 @@ impl TypeValidator for UnsignedShortValidator {
 pub struct UnsignedByteValidator;
 
 impl TypeValidator for UnsignedByteValidator {
-    fn type_name(&self) -> &'static str { "unsignedByte" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::UnsignedByte }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Decimal }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "unsignedByte"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::UnsignedByte
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Decimal
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        normalized.parse::<u8>()
-            .map(|v| XmlValue::new(
-                XmlTypeCode::UnsignedByte,
-                XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
-            ))
+        normalized
+            .parse::<u8>()
+            .map(|v| {
+                XmlValue::new(
+                    XmlTypeCode::UnsignedByte,
+                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(v))),
+                )
+            })
             .map_err(|e| ValidationError::InvalidLexical {
                 value: value.to_string(),
                 type_name: "unsignedByte",
@@ -2830,10 +3497,16 @@ impl TypeValidator for UnsignedByteValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "totalDigits" | "fractionDigits" |
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "totalDigits"
+                | "fractionDigits"
+                | "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -2849,10 +3522,18 @@ impl TypeValidator for UnsignedByteValidator {
 pub struct QNameValidator;
 
 impl TypeValidator for QNameValidator {
-    fn type_name(&self) -> &'static str { "QName" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::QName }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::QName }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "QName"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::QName
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::QName
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -2904,7 +3585,10 @@ impl TypeValidator for QNameValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -2914,10 +3598,18 @@ impl TypeValidator for QNameValidator {
 pub struct NotationValidator;
 
 impl TypeValidator for NotationValidator {
-    fn type_name(&self) -> &'static str { "NOTATION" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Notation }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Notation }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "NOTATION"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Notation
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Notation
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -2965,7 +3657,10 @@ impl TypeValidator for NotationValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -2977,10 +3672,18 @@ impl TypeValidator for NotationValidator {
 pub struct NmTokensValidator;
 
 impl TypeValidator for NmTokensValidator {
-    fn type_name(&self) -> &'static str { "NMTOKENS" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::NmTokens }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "NMTOKENS"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::NmTokens
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -3022,7 +3725,10 @@ impl TypeValidator for NmTokensValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -3030,10 +3736,18 @@ impl TypeValidator for NmTokensValidator {
 pub struct IdRefsValidator;
 
 impl TypeValidator for IdRefsValidator {
-    fn type_name(&self) -> &'static str { "IDREFS" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::IdRefs }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "IDREFS"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::IdRefs
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -3075,7 +3789,10 @@ impl TypeValidator for IdRefsValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -3083,10 +3800,18 @@ impl TypeValidator for IdRefsValidator {
 pub struct EntitiesValidator;
 
 impl TypeValidator for EntitiesValidator {
-    fn type_name(&self) -> &'static str { "ENTITIES" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::Entities }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::String }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "ENTITIES"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::Entities
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::String
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -3128,7 +3853,10 @@ impl TypeValidator for EntitiesValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet, "length" | "minLength" | "maxLength" | "pattern" | "enumeration")
+        matches!(
+            facet,
+            "length" | "minLength" | "maxLength" | "pattern" | "enumeration"
+        )
     }
 }
 
@@ -3140,17 +3868,27 @@ impl TypeValidator for EntitiesValidator {
 pub struct YearMonthDurationValidator;
 
 impl TypeValidator for YearMonthDurationValidator {
-    fn type_name(&self) -> &'static str { "yearMonthDuration" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::YearMonthDuration }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Duration }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "yearMonthDuration"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::YearMonthDuration
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Duration
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_year_month_duration(&normalized).map(|d| XmlValue::new(
-            XmlTypeCode::YearMonthDuration,
-            XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(d)),
-        ))
+        parse_year_month_duration(&normalized).map(|d| {
+            XmlValue::new(
+                XmlTypeCode::YearMonthDuration,
+                XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(d)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -3160,7 +3898,9 @@ impl TypeValidator for YearMonthDurationValidator {
                 parse_year_month_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dur, parse_year_month_duration, |a, b| year_month_duration_value_eq(a, &b)),
+                enum_matches_value_space!(dur, parse_year_month_duration, |a, b| {
+                    year_month_duration_value_eq(a, &b)
+                }),
                 value,
             )?;
         }
@@ -3169,9 +3909,14 @@ impl TypeValidator for YearMonthDurationValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -3180,17 +3925,27 @@ impl TypeValidator for YearMonthDurationValidator {
 pub struct DayTimeDurationValidator;
 
 impl TypeValidator for DayTimeDurationValidator {
-    fn type_name(&self) -> &'static str { "dayTimeDuration" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::DayTimeDuration }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::Duration }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "dayTimeDuration"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::DayTimeDuration
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::Duration
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        parse_day_time_duration(&normalized).map(|d| XmlValue::new(
-            XmlTypeCode::DayTimeDuration,
-            XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(d)),
-        ))
+        parse_day_time_duration(&normalized).map(|d| {
+            XmlValue::new(
+                XmlTypeCode::DayTimeDuration,
+                XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(d)),
+            )
+        })
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
@@ -3200,7 +3955,9 @@ impl TypeValidator for DayTimeDurationValidator {
                 parse_day_time_duration(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
             facets.validate_enum_value_space(
-                enum_matches_value_space!(dur, parse_day_time_duration, |a, b| day_time_duration_value_eq(a, &b)),
+                enum_matches_value_space!(dur, parse_day_time_duration, |a, b| {
+                    day_time_duration_value_eq(a, &b)
+                }),
                 value,
             )?;
         }
@@ -3209,9 +3966,14 @@ impl TypeValidator for DayTimeDurationValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
         )
     }
 }
@@ -3221,10 +3983,18 @@ impl TypeValidator for DayTimeDurationValidator {
 pub struct DateTimeStampValidator;
 
 impl TypeValidator for DateTimeStampValidator {
-    fn type_name(&self) -> &'static str { "dateTimeStamp" }
-    fn type_code(&self) -> XmlTypeCode { XmlTypeCode::DateTimeStamp }
-    fn primitive_type(&self) -> PrimitiveTypeCode { PrimitiveTypeCode::DateTime }
-    fn whitespace(&self) -> WhitespaceMode { WhitespaceMode::Collapse }
+    fn type_name(&self) -> &'static str {
+        "dateTimeStamp"
+    }
+    fn type_code(&self) -> XmlTypeCode {
+        XmlTypeCode::DateTimeStamp
+    }
+    fn primitive_type(&self) -> PrimitiveTypeCode {
+        PrimitiveTypeCode::DateTime
+    }
+    fn whitespace(&self) -> WhitespaceMode {
+        WhitespaceMode::Collapse
+    }
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
@@ -3262,9 +4032,15 @@ impl TypeValidator for DateTimeStampValidator {
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
-        matches!(facet,
-            "minInclusive" | "maxInclusive" | "minExclusive" | "maxExclusive" |
-            "pattern" | "enumeration" | "explicitTimezone"
+        matches!(
+            facet,
+            "minInclusive"
+                | "maxInclusive"
+                | "minExclusive"
+                | "maxExclusive"
+                | "pattern"
+                | "enumeration"
+                | "explicitTimezone"
         )
     }
 }

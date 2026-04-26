@@ -2,11 +2,9 @@
 //!
 //! This module defines named model groups (xs:group) and attribute groups (xs:attributeGroup).
 
-use crate::ids::{NameId, ModelGroupKey, AttributeGroupKey};
+use crate::ids::{AttributeGroupKey, ModelGroupKey, NameId};
 use crate::parser::location::SourceRef;
-use crate::types::complex::{
-    ContentParticle, Compositor, AttributeUse, AttributeWildcard,
-};
+use crate::types::complex::{AttributeUse, AttributeWildcard, Compositor, ContentParticle};
 
 /// Named model group definition (xs:group)
 ///
@@ -185,10 +183,16 @@ pub struct Occurrence {
 
 impl Occurrence {
     /// Default occurrence (1..1)
-    pub const ONCE: Occurrence = Occurrence { min: 1, max: Some(1) };
+    pub const ONCE: Occurrence = Occurrence {
+        min: 1,
+        max: Some(1),
+    };
 
     /// Optional occurrence (0..1)
-    pub const OPTIONAL: Occurrence = Occurrence { min: 0, max: Some(1) };
+    pub const OPTIONAL: Occurrence = Occurrence {
+        min: 0,
+        max: Some(1),
+    };
 
     /// Unbounded occurrence (0..unbounded)
     pub const UNBOUNDED: Occurrence = Occurrence { min: 0, max: None };

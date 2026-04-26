@@ -1421,14 +1421,10 @@ pub(crate) const ZS_XSD10: Ranges = &[
 ];
 
 /// Unicode 3.0.0 Zl (1 ranges).
-pub(crate) const ZL_XSD10: Ranges = &[
-    (0x2028, 0x2028),
-];
+pub(crate) const ZL_XSD10: Ranges = &[(0x2028, 0x2028)];
 
 /// Unicode 3.0.0 Zp (1 ranges).
-pub(crate) const ZP_XSD10: Ranges = &[
-    (0x2029, 0x2029),
-];
+pub(crate) const ZP_XSD10: Ranges = &[(0x2029, 0x2029)];
 
 /// Unicode 3.0.0 Sm (35 ranges).
 pub(crate) const SM_XSD10: Ranges = &[
@@ -1612,10 +1608,7 @@ pub(crate) const SO_XSD10: Ranges = &[
 ];
 
 /// Unicode 3.0.0 Cc (2 ranges).
-pub(crate) const CC_XSD10: Ranges = &[
-    (0x0000, 0x001F),
-    (0x007F, 0x009F),
-];
+pub(crate) const CC_XSD10: Ranges = &[(0x0000, 0x001F), (0x007F, 0x009F)];
 
 /// Unicode 3.0.0 Cf (7 ranges).
 pub(crate) const CF_XSD10: Ranges = &[
@@ -1629,9 +1622,7 @@ pub(crate) const CF_XSD10: Ranges = &[
 ];
 
 /// Unicode 3.0.0 Co (1 ranges).
-pub(crate) const CO_XSD10: Ranges = &[
-    (0xE000, 0xF8FF),
-];
+pub(crate) const CO_XSD10: Ranges = &[(0xE000, 0xF8FF)];
 
 /// Unicode 3.0.0 L = Lu∪Ll∪Lt∪Lm∪Lo (255 ranges).
 pub(crate) const L_XSD10: Ranges = &[
@@ -2330,41 +2321,9 @@ pub(crate) fn expand_xsd_category_body(name: &str) -> Option<&'static str> {
 
 fn build_cache() -> HashMap<&'static str, String> {
     let names: &[&str] = &[
-        "Lu",
-        "Ll",
-        "Lt",
-        "Lm",
-        "Lo",
-        "Mn",
-        "Mc",
-        "Me",
-        "Nd",
-        "Nl",
-        "No",
-        "Pc",
-        "Pd",
-        "Ps",
-        "Pe",
-        "Pi",
-        "Pf",
-        "Po",
-        "Zs",
-        "Zl",
-        "Zp",
-        "Sm",
-        "Sc",
-        "Sk",
-        "So",
-        "Cc",
-        "Cf",
-        "Co",
-        "L",
-        "M",
-        "N",
-        "P",
-        "Z",
-        "S",
-        "C",
+        "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe",
+        "Pi", "Pf", "Po", "Zs", "Zl", "Zp", "Sm", "Sc", "Sk", "So", "Cc", "Cf", "Co", "L", "M",
+        "N", "P", "Z", "S", "C",
     ];
     let mut map = HashMap::with_capacity(names.len());
     for name in names {

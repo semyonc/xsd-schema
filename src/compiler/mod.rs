@@ -26,53 +26,41 @@
 //! assert_eq!(nfa.state_count(), 2); // term state + exit state
 //! ```
 
-mod nfa;
-mod fragment;
+mod all_group;
 mod compile;
 mod error;
-mod particle;
-mod all_group;
-mod upa;
-pub(crate) mod substitution;
+mod fragment;
+mod nfa;
 #[cfg(feature = "xsd11")]
 mod open_content;
+mod particle;
+pub(crate) mod substitution;
+mod upa;
 
-pub use nfa::{
-    advance_states,
-    advance_with_priority,
-    epsilon_closure,
-    term_matches as nfa_term_matches,
-    NfaTable,
-    NfaState,
-    NfaTerm,
-    NfaTransition,
-    TransitionKind,
-    StateId,
-    CounterId,
-    CounterDef,
-    ActiveConfig,
-    ActiveStates,
-    MatchInfo,
+pub use all_group::{
+    term_matches, term_matches_with_substitution, validate_all_group_constraints, AllGroupModel,
+    AllGroupState, AllParticle, OpenContentMode, OpenContentWildcard, TermMatchResult,
 };
-pub use fragment::{NfaFragment, FragmentBuilder, fragment_to_table};
 pub use compile::{
-    CompileContext, compile_content_model_matcher, compile_content_model_for_upa,
-    compile_model_group, compile_particle,
+    compile_content_model_for_upa, compile_content_model_matcher, compile_model_group,
+    compile_particle, CompileContext,
 };
 pub(crate) use compile::{
     is_top_level_all_group, resolve_top_level_all_group_ref, validate_outer_all_group_occurs,
 };
 pub use error::{NfaCompileError, NfaCompileResult};
-pub use particle::{MaxOccurs, apply_occurs};
-pub use all_group::{
-    AllGroupModel, AllParticle, AllGroupState, OpenContentWildcard, OpenContentMode,
-    validate_all_group_constraints, term_matches, term_matches_with_substitution, TermMatchResult,
+pub use fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
+pub use nfa::{
+    advance_states, advance_with_priority, epsilon_closure, term_matches as nfa_term_matches,
+    ActiveConfig, ActiveStates, CounterDef, CounterId, MatchInfo, NfaState, NfaTable, NfaTerm,
+    NfaTransition, StateId, TransitionKind,
 };
-pub use upa::{check_all_group_upa, check_upa};
+pub use particle::{apply_occurs, MaxOccurs};
 pub use substitution::{
     build_substitution_group_map, build_substitution_group_map_with_abstract,
     validate_all_substitution_groups, SubstitutionGroupMap,
 };
+pub use upa::{check_all_group_upa, check_upa};
 
 use crate::types::complex::{OpenContentMode as TypesOpenContentMode, WildcardRef};
 

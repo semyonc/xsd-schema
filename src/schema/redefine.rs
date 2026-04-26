@@ -20,7 +20,7 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::*;
 use crate::parser::frames::{ParticleResult, ParticleTerm};
 use crate::schema::composition::{
-    ComponentIdentity, ComponentKey, ComponentKind, record_provenance, redefined_action,
+    record_provenance, redefined_action, ComponentIdentity, ComponentKey, ComponentKind,
 };
 use crate::schema::model::RedefineDirective;
 use crate::schema::SchemaSet;
@@ -53,7 +53,12 @@ pub fn apply_redefine(
     }
 
     for attr_group_key in &redefine.attribute_groups {
-        apply_attribute_group_redefine(schema_set, *attr_group_key, target_doc_id, redefining_doc_id)?;
+        apply_attribute_group_redefine(
+            schema_set,
+            *attr_group_key,
+            target_doc_id,
+            redefining_doc_id,
+        )?;
     }
 
     Ok(())
@@ -123,7 +128,11 @@ fn apply_simple_type_redefine(
     if let Some(doc_id) = redefining_doc_id {
         if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
             doc.component_index.insert(
-                ComponentIdentity { kind: ComponentKind::SimpleType, name, namespace },
+                ComponentIdentity {
+                    kind: ComponentKind::SimpleType,
+                    name,
+                    namespace,
+                },
                 ComponentKey::Type(TypeKey::Simple(new_key)),
             );
         }
@@ -132,8 +141,17 @@ fn apply_simple_type_redefine(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Simple(new_key)),
-        ComponentKind::SimpleType, namespace, name, redefining_doc_id,
-        redefined_action(redefining_doc_id, ComponentKind::SimpleType, name, namespace, target_doc_id),
+        ComponentKind::SimpleType,
+        namespace,
+        name,
+        redefining_doc_id,
+        redefined_action(
+            redefining_doc_id,
+            ComponentKind::SimpleType,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -199,7 +217,11 @@ fn apply_complex_type_redefine(
     if let Some(doc_id) = redefining_doc_id {
         if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
             doc.component_index.insert(
-                ComponentIdentity { kind: ComponentKind::ComplexType, name, namespace },
+                ComponentIdentity {
+                    kind: ComponentKind::ComplexType,
+                    name,
+                    namespace,
+                },
                 ComponentKey::Type(TypeKey::Complex(new_key)),
             );
         }
@@ -208,8 +230,17 @@ fn apply_complex_type_redefine(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::Type(TypeKey::Complex(new_key)),
-        ComponentKind::ComplexType, namespace, name, redefining_doc_id,
-        redefined_action(redefining_doc_id, ComponentKind::ComplexType, name, namespace, target_doc_id),
+        ComponentKind::ComplexType,
+        namespace,
+        name,
+        redefining_doc_id,
+        redefined_action(
+            redefining_doc_id,
+            ComponentKind::ComplexType,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -275,7 +306,11 @@ fn apply_model_group_redefine(
     if let Some(doc_id) = redefining_doc_id {
         if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
             doc.component_index.insert(
-                ComponentIdentity { kind: ComponentKind::ModelGroup, name, namespace },
+                ComponentIdentity {
+                    kind: ComponentKind::ModelGroup,
+                    name,
+                    namespace,
+                },
                 ComponentKey::ModelGroup(new_key),
             );
         }
@@ -284,8 +319,17 @@ fn apply_model_group_redefine(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::ModelGroup(new_key),
-        ComponentKind::ModelGroup, namespace, name, redefining_doc_id,
-        redefined_action(redefining_doc_id, ComponentKind::ModelGroup, name, namespace, target_doc_id),
+        ComponentKind::ModelGroup,
+        namespace,
+        name,
+        redefining_doc_id,
+        redefined_action(
+            redefining_doc_id,
+            ComponentKind::ModelGroup,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -351,7 +395,11 @@ fn apply_attribute_group_redefine(
     if let Some(doc_id) = redefining_doc_id {
         if let Some(doc) = schema_set.documents.get_mut(doc_id as usize) {
             doc.component_index.insert(
-                ComponentIdentity { kind: ComponentKind::AttributeGroup, name, namespace },
+                ComponentIdentity {
+                    kind: ComponentKind::AttributeGroup,
+                    name,
+                    namespace,
+                },
                 ComponentKey::AttributeGroup(new_key),
             );
         }
@@ -360,8 +408,17 @@ fn apply_attribute_group_redefine(
     record_provenance(
         &mut schema_set.effective_components,
         ComponentKey::AttributeGroup(new_key),
-        ComponentKind::AttributeGroup, namespace, name, redefining_doc_id,
-        redefined_action(redefining_doc_id, ComponentKind::AttributeGroup, name, namespace, target_doc_id),
+        ComponentKind::AttributeGroup,
+        namespace,
+        name,
+        redefining_doc_id,
+        redefined_action(
+            redefining_doc_id,
+            ComponentKind::AttributeGroup,
+            name,
+            namespace,
+            target_doc_id,
+        ),
     );
 
     Ok(())
@@ -833,9 +890,12 @@ mod tests {
         let (mut schema_set, original_key, new_key) = setup_model_group_redefine();
 
         // Apply redefine (no target doc — fallback to global lookup)
-        let result =
-            apply_model_group_redefine(&mut schema_set, new_key, None, None);
-        assert!(result.is_ok(), "apply_model_group_redefine failed: {:?}", result.err());
+        let result = apply_model_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_ok(),
+            "apply_model_group_redefine failed: {:?}",
+            result.err()
+        );
 
         // Verify redefine_original is set
         let group = schema_set.arenas.model_groups.get(new_key).unwrap();
@@ -847,7 +907,11 @@ mod tests {
 
         // Now resolve references and verify self-ref redirects to original
         let result = crate::schema::resolver::resolve_all_references(&mut schema_set);
-        assert!(result.is_ok(), "resolve_all_references failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "resolve_all_references failed: {:?}",
+            result.err()
+        );
 
         let group = schema_set.arenas.model_groups.get(new_key).unwrap();
         // First particle is the group ref (self-reference → should resolve to original)
@@ -916,9 +980,12 @@ mod tests {
         let new_key = schema_set.arenas.alloc_attribute_group(new_data);
 
         // Apply redefine
-        let result =
-            apply_attribute_group_redefine(&mut schema_set, new_key, None, None);
-        assert!(result.is_ok(), "apply_attribute_group_redefine failed: {:?}", result.err());
+        let result = apply_attribute_group_redefine(&mut schema_set, new_key, None, None);
+        assert!(
+            result.is_ok(),
+            "apply_attribute_group_redefine failed: {:?}",
+            result.err()
+        );
 
         // Verify redefine_original
         let group = schema_set.arenas.attribute_groups.get(new_key).unwrap();
@@ -926,7 +993,11 @@ mod tests {
 
         // Resolve references
         let result = crate::schema::resolver::resolve_all_references(&mut schema_set);
-        assert!(result.is_ok(), "resolve_all_references failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "resolve_all_references failed: {:?}",
+            result.err()
+        );
 
         // Verify self-ref redirected to original
         let group = schema_set.arenas.attribute_groups.get(new_key).unwrap();
@@ -1515,7 +1586,10 @@ mod tests {
             max_occurs: None,
         };
         count_group_self_refs(&particles_with_ref, group_name, &mut scan);
-        assert_eq!(scan.count, 1, "sanity check: walker detects a top-level self-ref");
+        assert_eq!(
+            scan.count, 1,
+            "sanity check: walker detects a top-level self-ref"
+        );
     }
 
     #[test]

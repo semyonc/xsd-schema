@@ -120,5 +120,3 @@ impl QuantifiedNode {
         }
     }
 }
-
-

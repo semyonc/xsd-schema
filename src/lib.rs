@@ -88,9 +88,9 @@
 //! ```
 
 // Core type definitions
-pub mod ids;
-pub mod error;
 pub mod arenas;
+pub mod error;
+pub mod ids;
 
 // Parser infrastructure
 pub mod parser;
@@ -133,46 +133,44 @@ pub mod compiler;
 pub mod validation;
 
 // Re-export primary types
-pub use error::{SchemaError, SchemaResult, FacetError, FacetResult};
+pub use error::{FacetError, FacetResult, SchemaError, SchemaResult};
 pub use ids::*;
-pub use schema::{SchemaSet, SchemaDocument};
+pub use schema::{SchemaDocument, SchemaSet};
 
 // Re-export resolution and inline assembly
 pub use schema::{
-    assemble_inline_types, InlineAssemblyStats,
-    resolve_all_references, ResolutionStats,
+    assemble_inline_types, resolve_all_references, InlineAssemblyStats, ResolutionStats,
 };
 
 // Re-export XSD version
 pub use schema::model::XsdVersion;
 
 // Re-export type system enums
-pub use types::{XmlTypeCode, PrimitiveTypeCode, ValueKind, BuiltinTypes};
+pub use types::{BuiltinTypes, PrimitiveTypeCode, ValueKind, XmlTypeCode};
 
 // Re-export facet types
 pub use types::{
-    FacetSet, FacetFixed, WhitespaceMode, FacetApplicability, FacetKind,
-    facet_applicable, facet_applicable_for_type, normalize_whitespace,
+    facet_applicable, facet_applicable_for_type, normalize_whitespace, FacetApplicability,
+    FacetFixed, FacetKind, FacetSet, WhitespaceMode,
 };
 
 // Re-export navigator types (always available)
 pub use navigator::{
-    DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope,
-    RoXmlNavigator, NavigatorError,
+    DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, RoXmlNavigator, XmlNodeOrder,
 };
 
 // Re-export XPath types (only with xsd11 feature)
 #[cfg(feature = "xsd11")]
 pub use xpath::{
-    XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
-    EmptyIterator, BufferedNodeIterator, RangeIterator, TreeComparer, XPathContext,
-    XPathExpr, XPathEvaluator, ExternalVar, EvalValue, TypedEvaluator,
+    BufferedNodeIterator, EmptyIterator, EvalValue, ExternalVar, RangeIterator, TreeComparer,
+    TypedEvaluator, VecNodeIterator, XPathContext, XPathEvaluator, XPathExpr, XmlItem, XmlItemRef,
+    XmlNodeIterator,
 };
 
 // Re-export pipeline functions
 pub use pipeline::{
     load_and_process_schema, load_schema, parse_schema_only, process_loaded_schemas,
-    PipelineConfig, PipelineStats, DirectiveStats,
+    DirectiveStats, PipelineConfig, PipelineStats,
 };
 
 // Re-export async pipeline functions
@@ -180,13 +178,12 @@ pub use pipeline::{
 pub use pipeline::{load_and_process_schema_async, load_schema_async};
 
 // Re-export builder types
-pub use builder::{SchemaSetBuilder, CompiledSchemaSet, CompilationStats};
+pub use builder::{CompilationStats, CompiledSchemaSet, SchemaSetBuilder};
 
 // Re-export resolver types
 pub use parser::resolver::{
-    decode_xml_bytes, decode_xml_to_utf8_bytes,
-    SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
-    SchemaResolver, ResolverConfig, SchemaCatalog,
+    decode_xml_bytes, decode_xml_to_utf8_bytes, EmbeddedLoader, FileSystemLoader, LoaderChain,
+    ResolverConfig, SchemaCatalog, SchemaLoader, SchemaResolver,
 };
 
 // Re-export async loader trait
@@ -194,27 +191,25 @@ pub use parser::resolver::{
 pub use parser::resolver::AsyncSchemaLoader;
 
 // Re-export embedded assets
-pub use embedded::{XML_XSD, XLINK_XSD, XML_NAMESPACE, XLINK_NAMESPACE, get_embedded_schema, has_embedded_schema};
+pub use embedded::{
+    get_embedded_schema, has_embedded_schema, XLINK_NAMESPACE, XLINK_XSD, XML_NAMESPACE, XML_XSD,
+};
 
 // Re-export compiler types
 pub use compiler::{
-    NfaTable, NfaState, NfaTerm, NfaTransition, TransitionKind, StateId,
-    NfaFragment, FragmentBuilder, fragment_to_table,
-    CompileContext, compile_particle, compile_model_group,
-    NfaCompileError, NfaCompileResult,
+    compile_model_group, compile_particle, fragment_to_table, CompileContext, FragmentBuilder,
+    NfaCompileError, NfaCompileResult, NfaFragment, NfaState, NfaTable, NfaTerm, NfaTransition,
+    StateId, TransitionKind,
 };
 
 // Re-export instance validation types
 // Note: ValidationError here is distinct from types::validators::ValidationError
 pub use validation::{
-    ValidationError as InstanceValidationError,
-    ValidationResult as InstanceValidationResult,
-    error as validation_error,
-    error_with_path as validation_error_with_path,
-    from_value_error, from_facet_error,
-    facet_constraint_code, value_error_constraint_code,
+    error as validation_error, error_with_path as validation_error_with_path,
+    facet_constraint_code, from_facet_error, from_value_error, value_error_constraint_code,
+    ValidationError as InstanceValidationError, ValidationResult as InstanceValidationResult,
 };
 
 // Re-export hint-driven schema loading
 pub use validation::hint_loader::{enrich_schema_set, load_hints_into_builder, HintLoadResult};
-pub use validation::info::{SchemaLocationHint, NoNamespaceSchemaLocationHint};
+pub use validation::info::{NoNamespaceSchemaLocationHint, SchemaLocationHint};

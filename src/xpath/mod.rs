@@ -19,28 +19,28 @@
 // Parser modules
 pub mod arena;
 pub mod ast;
-pub mod error;
-pub mod lexer;
-pub mod parser;
-pub mod operators;
-pub mod iterator;
-pub mod tree_comparer;
-pub mod node_test;
-pub mod context;
-pub mod timsort;
-pub mod item_set;
 pub mod axis_iterators;
+pub mod context;
+pub mod error;
+pub mod item_set;
+pub mod iterator;
+pub mod lexer;
+pub mod node_test;
+pub mod operators;
+pub mod parser;
+pub mod timsort;
+pub mod tree_comparer;
 
 // Core function modules (ported from CoreFuncs.cs)
-pub mod boolean;
 pub mod atomize;
+pub mod boolean;
 pub mod cast;
-pub mod sequence_ops;
+pub mod iter_adapters;
 pub mod node_ops;
 pub mod quantified;
+pub mod sequence_ops;
 pub mod string_ops;
 pub mod type_info;
-pub mod iter_adapters;
 
 // XPath 2.0 function registry and dispatch
 pub mod functions;
@@ -54,43 +54,47 @@ pub mod api;
 
 // Re-export navigator types for backward compatibility
 pub use crate::navigator::{
-    DomNavigator, DomNodeType, XmlNodeOrder, NamespaceAxisScope,
-    RoXmlNavigator, NavigatorError, TypedValue,
+    DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, RoXmlNavigator, TypedValue,
+    XmlNodeOrder,
 };
 
 // High-level API re-exports
-pub use self::api::{XPathExpr, XPathEvaluator, ExternalVar, EvalValue, TypedEvaluator};
+pub use self::api::{EvalValue, ExternalVar, TypedEvaluator, XPathEvaluator, XPathExpr};
 
 // Re-export key parser types
 pub use self::arena::{AstArena, AstNodeId, SourceSpan};
 pub use self::ast::AstNode;
-pub use self::error::XPathError;
-pub use self::lexer::{Lexer, Token};
-pub use self::parser::{parse, parse_with_options, parse_xpath10, parse_xpath20, ParseError, ParsedXPath};
-pub use self::iterator::{
-    XmlItem, XmlItemRef, XmlNodeIterator, VecNodeIterator,
-    EmptyIterator, BufferedNodeIterator, RangeIterator,
-    DocumentOrderNodeIterator, PositionFilterNodeIterator, ItemIterator,
-};
 pub use self::axis_iterators::{
-    AxisTraversal, SequentialAxisNodeIterator,
-    SelfAxis, ParentAxis, AncestorAxis, ChildAxis, AttributeAxis,
-    NamespaceAxis, FollowingSiblingAxis, PrecedingSiblingAxis,
-    DescendantNodeIterator, FollowingNodeIterator, PrecedingNodeIterator,
-    SpecialChildNodeIterator, SpecialDescendantNodeIterator, ChildOverDescendantsNodeIterator,
+    AncestorAxis, AttributeAxis, AxisTraversal, ChildAxis, ChildOverDescendantsNodeIterator,
+    DescendantNodeIterator, FollowingNodeIterator, FollowingSiblingAxis, NamespaceAxis, ParentAxis,
+    PrecedingNodeIterator, PrecedingSiblingAxis, SelfAxis, SequentialAxisNodeIterator,
+    SpecialChildNodeIterator, SpecialDescendantNodeIterator,
+};
+pub use self::bind::bind_node;
+pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
+pub use self::error::XPathError;
+pub use self::eval::eval_node;
+pub use self::functions::{
+    FunctionArity, FunctionId, FunctionSignature, XPathValue, FUNCTION_REGISTRY,
+};
+pub use self::item_set::{
+    ItemSet, ItemSetIter, ItemSetIterMut, XPathComparer, XPathEqualityComparer,
+};
+pub use self::iterator::{
+    BufferedNodeIterator, DocumentOrderNodeIterator, EmptyIterator, ItemIterator,
+    PositionFilterNodeIterator, RangeIterator, VecNodeIterator, XmlItem, XmlItemRef,
+    XmlNodeIterator,
+};
+pub use self::lexer::{Lexer, Token};
+pub use self::node_test::{matches_name_test, matches_sequence_type, NodeTest};
+pub use self::parser::{
+    parse, parse_with_options, parse_xpath10, parse_xpath20, ParseError, ParsedXPath,
+};
+pub use self::timsort::{
+    timsort, timsort_by, timsort_slice, timsort_slice_by, timsort_slice_with_comparer,
+    timsort_with_comparer, FnComparer, IComparer, OrdComparer, ReverseComparer,
 };
 pub use self::tree_comparer::TreeComparer;
-pub use self::node_test::{NodeTest, matches_name_test, matches_sequence_type};
-pub use self::context::{XPathContext, DynamicContext, VarStore, VarSlotId, VarRef, NameBinder};
-pub use self::functions::{FunctionId, FunctionArity, FunctionSignature, XPathValue, FUNCTION_REGISTRY};
-pub use self::bind::bind_node;
-pub use self::eval::eval_node;
-pub use self::timsort::{
-    timsort, timsort_by, timsort_slice, timsort_slice_by,
-    timsort_with_comparer, timsort_slice_with_comparer,
-    IComparer, OrdComparer, ReverseComparer, FnComparer,
-};
-pub use self::item_set::{ItemSet, ItemSetIter, ItemSetIterMut, XPathComparer, XPathEqualityComparer};
 
 /// Selects XPath language version for parsing and evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

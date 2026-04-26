@@ -1,13 +1,21 @@
 use super::*;
 use crate::namespace::table::NameTable;
 use crate::xpath::arena::SourceSpan;
-use crate::xpath::ast::{BinaryOpNode, ExprNode, FunctionCallNode, IfNode, RangeNode, UnaryOpNode, UnaryOpKind, ValueNode};
+use crate::xpath::ast::{
+    BinaryOpNode, ExprNode, FunctionCallNode, IfNode, RangeNode, UnaryOpKind, UnaryOpNode,
+    ValueNode,
+};
 use crate::xpath::bind::bind_node;
 use crate::xpath::context::{NameBinder, XPathContext};
 use crate::xpath::RoXmlNavigator;
 
 /// Helper to create a test arena with a function call
-fn make_function_call(arena: &mut AstArena, prefix: &str, local_name: &str, args: Vec<AstNodeId>) -> AstNodeId {
+fn make_function_call(
+    arena: &mut AstArena,
+    prefix: &str,
+    local_name: &str,
+    args: Vec<AstNodeId>,
+) -> AstNodeId {
     let span = SourceSpan::new(0, 10);
     let func = FunctionCallNode::new(prefix.to_string(), local_name.to_string(), args, span);
     arena.add(AstNode::FunctionCall(func))
@@ -21,7 +29,10 @@ fn wrap_in_expr(arena: &mut AstArena, node_id: AstNodeId) -> AstNodeId {
 }
 
 /// Helper to bind and eval a manually constructed AST
-fn bind_and_eval(arena: &mut AstArena, root: AstNodeId) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+fn bind_and_eval(
+    arena: &mut AstArena,
+    root: AstNodeId,
+) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
     let names = NameTable::new();
     let ctx = XPathContext::new(&names);
     let mut binder = NameBinder::new();
@@ -110,7 +121,10 @@ fn test_eval_integer_literal() {
     let result = bind_and_eval(&mut arena, root).unwrap();
     match result {
         XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("42".to_string()));
+            assert_eq!(
+                v.as_integer().map(|i| i.to_string()),
+                Some("42".to_string())
+            );
         }
         _ => panic!("Expected integer"),
     }
@@ -247,8 +261,7 @@ fn test_eval_position_last() {
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
     let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
-        DynamicContext::new(&ctx, binder.len())
-            .with_position(3, 10);
+        DynamicContext::new(&ctx, binder.len()).with_position(3, 10);
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     match result {
@@ -268,7 +281,10 @@ fn test_eval_position_last() {
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     match result {
         XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("10".to_string()));
+            assert_eq!(
+                v.as_integer().map(|i| i.to_string()),
+                Some("10".to_string())
+            );
         }
         _ => panic!("Expected integer 10"),
     }
@@ -403,7 +419,10 @@ fn test_eval_arithmetic_mul() {
     let result = bind_and_eval(&mut arena, root).unwrap();
     match result {
         XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("15".to_string()));
+            assert_eq!(
+                v.as_integer().map(|i| i.to_string()),
+                Some("15".to_string())
+            );
         }
         _ => panic!("Expected integer 15"),
     }
@@ -460,7 +479,10 @@ fn test_unary_negate() {
     let result = bind_and_eval(&mut arena, root).unwrap();
     match result {
         XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("-5".to_string()));
+            assert_eq!(
+                v.as_integer().map(|i| i.to_string()),
+                Some("-5".to_string())
+            );
         }
         _ => panic!("Expected integer -5"),
     }
@@ -530,7 +552,10 @@ fn test_unary_identity() {
     let result = bind_and_eval(&mut arena, root).unwrap();
     match result {
         XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("-5".to_string()));
+            assert_eq!(
+                v.as_integer().map(|i| i.to_string()),
+                Some("-5".to_string())
+            );
         }
         _ => panic!("Expected integer -5"),
     }
@@ -823,16 +848,20 @@ fn test_node_is_same() {
     // Build AST for: . is .
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 6);
-    let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let left = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Is, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     match result {
@@ -860,15 +889,17 @@ fn test_node_is_empty() {
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 8);
     let left = arena.add(AstNode::Value(ValueNode::Empty));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Is, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     assert!(result.is_empty());
@@ -891,15 +922,17 @@ fn test_node_is_type_error() {
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 6);
     let left = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Is, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx);
     assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
@@ -928,8 +961,8 @@ fn test_node_before_after() {
 
         bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder)?;
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
     };
@@ -1055,16 +1088,20 @@ fn test_union_operator_with_nodes() {
     // Same node union should return just one node
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 6);
-    let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let left = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Union, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     // Union of same node with itself should give 1 node (deduplicated)
@@ -1089,16 +1126,20 @@ fn test_intersect_operator_with_nodes() {
     // Same node intersect should return that node
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 15);
-    let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let left = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Intersect, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     // Intersect of same node with itself should give 1 node
@@ -1123,16 +1164,20 @@ fn test_except_operator_with_nodes() {
     // Same node except should return empty (node minus itself = empty)
     let mut arena = AstArena::new();
     let span = SourceSpan::new(0, 12);
-    let left = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
-    let right = arena.add(AstNode::ContextItem(crate::xpath::ast::ContextItemNode::new(span)));
+    let left = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
+    let right = arena.add(AstNode::ContextItem(
+        crate::xpath::ast::ContextItemNode::new(span),
+    ));
     let bin_op = BinaryOpNode::new(BinaryOpKind::Except, left, right, span);
     let bin_id = arena.add(AstNode::BinaryOp(bin_op));
     let root = wrap_in_expr(&mut arena, bin_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-    let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-        .with_context_item(XmlItem::Node(nav.clone()));
+    let mut dyn_ctx =
+        DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
     let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
     // Except of same node with itself should give empty sequence
@@ -1451,7 +1496,14 @@ fn test_some_true() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, two, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![seq], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Some,
+        &["x"],
+        vec![seq],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1482,7 +1534,14 @@ fn test_some_false() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, five, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![seq], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Some,
+        &["x"],
+        vec![seq],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1513,7 +1572,14 @@ fn test_some_empty_sequence() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x"], vec![empty], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Some,
+        &["x"],
+        vec![empty],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1544,7 +1610,14 @@ fn test_every_true() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![seq], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Every,
+        &["x"],
+        vec![seq],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1575,7 +1648,14 @@ fn test_every_false() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, two, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![seq], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Every,
+        &["x"],
+        vec![seq],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1606,7 +1686,14 @@ fn test_every_empty_vacuous_truth() {
     let span = SourceSpan::new(0, 10);
     let gt = BinaryOpNode::new(BinaryOpKind::GeneralGt, var_x, zero, span);
     let gt_id = arena.add(AstNode::BinaryOp(gt));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Every, &["x"], vec![empty], gt_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Every,
+        &["x"],
+        vec![empty],
+        gt_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1641,7 +1728,14 @@ fn test_some_multiple_bindings() {
     let add_id = arena.add(AstNode::BinaryOp(add));
     let eq = BinaryOpNode::new(BinaryOpKind::GeneralEq, add_id, five, span);
     let eq_id = arena.add(AstNode::BinaryOp(eq));
-    let quant_id = make_quantified_expr(&mut arena, &names, QuantifierKind::Some, &["x", "y"], vec![seq1, seq2], eq_id);
+    let quant_id = make_quantified_expr(
+        &mut arena,
+        &names,
+        QuantifierKind::Some,
+        &["x", "y"],
+        vec![seq1, seq2],
+        eq_id,
+    );
     let root = wrap_in_expr(&mut arena, quant_id);
 
     bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
@@ -1830,7 +1924,8 @@ fn test_some_dependent_bindings() {
         ForBinding::new(String::new(), "x".to_string(), seq, span),
         ForBinding::new(String::new(), "y".to_string(), mul_id, span),
     ];
-    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Some, bindings, gt_id, span);
+    let quant_node =
+        crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Some, bindings, gt_id, span);
     let quant_id = arena.add(AstNode::Quantified(quant_node));
     let root = wrap_in_expr(&mut arena, quant_id);
 
@@ -1882,7 +1977,8 @@ fn test_every_dependent_bindings() {
         ForBinding::new(String::new(), "x".to_string(), seq, span),
         ForBinding::new(String::new(), "y".to_string(), range_id, span),
     ];
-    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, le_id, span);
+    let quant_node =
+        crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, le_id, span);
     let quant_id = arena.add(AstNode::Quantified(quant_node));
     let root = wrap_in_expr(&mut arena, quant_id);
 
@@ -1932,7 +2028,8 @@ fn test_every_dependent_bindings_fails() {
         ForBinding::new(String::new(), "x".to_string(), seq, span),
         ForBinding::new(String::new(), "y".to_string(), range_id, span),
     ];
-    let quant_node = crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, lt_id, span);
+    let quant_node =
+        crate::xpath::ast::QuantifiedNode::new(QuantifierKind::Every, bindings, lt_id, span);
     let quant_id = arena.add(AstNode::Quantified(quant_node));
     let root = wrap_in_expr(&mut arena, quant_id);
 
@@ -2052,15 +2149,24 @@ mod integration_tests {
     #[test]
     fn test_parse_bind_eval_arithmetic() {
         assert_eq!(
-            eval_xpath("1 + 2").unwrap().as_integer().map(|i| i.to_string()),
+            eval_xpath("1 + 2")
+                .unwrap()
+                .as_integer()
+                .map(|i| i.to_string()),
             Some("3".to_string())
         );
         assert_eq!(
-            eval_xpath("5 - 3").unwrap().as_integer().map(|i| i.to_string()),
+            eval_xpath("5 - 3")
+                .unwrap()
+                .as_integer()
+                .map(|i| i.to_string()),
             Some("2".to_string())
         );
         assert_eq!(
-            eval_xpath("2 * 3").unwrap().as_integer().map(|i| i.to_string()),
+            eval_xpath("2 * 3")
+                .unwrap()
+                .as_integer()
+                .map(|i| i.to_string()),
             Some("6".to_string())
         );
     }
@@ -2071,21 +2177,21 @@ mod integration_tests {
 // ========================================================================
 
 mod type_expr_tests {
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::namespace::table::well_known;
     use crate::namespace::table::NameTable;
     use crate::xpath::arena::{AstArena, AstNodeId, SourceSpan};
     use crate::xpath::ast::{
-        AstNode, ExprNode, ItemTypeNode as AstItemTypeNode, OccurrenceIndicator,
-        QName as AstQName, SequenceTypeNode, TypeExprKind, TypeExprNode, ValueNode,
+        AstNode, ExprNode, ItemTypeNode as AstItemTypeNode, OccurrenceIndicator, QName as AstQName,
+        SequenceTypeNode, TypeExprKind, TypeExprNode, ValueNode,
     };
     use crate::xpath::bind::bind_node;
     use crate::xpath::context::{DynamicContext, NameBinder, XPathContext};
     use crate::xpath::error::XPathError;
+    use crate::xpath::eval::eval_node;
     use crate::xpath::functions::XPathValue;
     use crate::xpath::iterator::XmlItem;
-    use crate::namespace::context::NamespaceContextSnapshot;
-    use crate::namespace::table::well_known;
     use crate::xpath::RoXmlNavigator;
-    use crate::xpath::eval::eval_node;
 
     /// Helper to wrap a node in an Expr
     fn wrap_in_expr(arena: &mut AstArena, node_id: AstNodeId) -> AstNodeId {
@@ -2095,7 +2201,10 @@ mod type_expr_tests {
     }
 
     /// Helper to bind and eval a manually constructed AST
-    fn bind_and_eval(arena: &mut AstArena, root: AstNodeId) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+    fn bind_and_eval(
+        arena: &mut AstArena,
+        root: AstNodeId,
+    ) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
         let names = NameTable::new();
         // Set up namespace context with "xs" prefix bound to XSD namespace
         let xs_prefix = names.add("xs");
@@ -2156,475 +2265,481 @@ mod type_expr_tests {
         arena.add(AstNode::TypeExpr(type_expr))
     }
 
-#[test]
-fn test_instance_of_atomic_matching() {
-    // 42 instance of xs:integer -> true
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_atomic_matching() {
+        // 42 instance of xs:integer -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected boolean true"),
-    }
-}
-
-#[test]
-fn test_instance_of_atomic_not_matching() {
-    // 42 instance of xs:string -> false
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        val,
-        "string",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
-        }
-        _ => panic!("Expected boolean false"),
-    }
-}
-
-#[test]
-fn test_instance_of_string() {
-    // "hello" instance of xs:string -> true
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        val,
-        "string",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
-        }
-        _ => panic!("Expected boolean true"),
-    }
-}
-
-#[test]
-fn test_instance_of_cardinality_too_many() {
-    // (1, 2) instance of xs:integer -> false (too many items)
-    let mut arena = AstArena::new();
-    let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
-    let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
-    let span = SourceSpan::new(0, 5);
-    let seq = ExprNode::sequence(vec![v1, v2], span);
-    let seq_id = arena.add(AstNode::Expr(seq));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        seq_id,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
-        }
-        _ => panic!("Expected boolean false"),
-    }
-}
-
-#[test]
-fn test_instance_of_cardinality_star() {
-    // (1, 2) instance of xs:integer* -> true
-    let mut arena = AstArena::new();
-    let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
-    let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
-    let span = SourceSpan::new(0, 5);
-    let seq = ExprNode::sequence(vec![v1, v2], span);
-    let seq_id = arena.add(AstNode::Expr(seq));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        seq_id,
-        "integer",
-        OccurrenceIndicator::ZeroOrMore,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
-        }
-        _ => panic!("Expected boolean true"),
-    }
-}
-
-#[test]
-fn test_instance_of_empty_sequence() {
-    // () instance of xs:integer? -> true
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        empty,
-        "integer",
-        OccurrenceIndicator::ZeroOrOne,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
-        }
-        _ => panic!("Expected boolean true"),
     }
 
-    // () instance of xs:integer -> false
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        empty,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_atomic_not_matching() {
+        // 42 instance of xs:string -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
         }
-        _ => panic!("Expected boolean false"),
-    }
-}
-
-#[test]
-fn test_instance_of_item() {
-    // 42 instance of item() -> true
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
-    let type_expr = make_type_expr_item(
-        &mut arena,
-        TypeExprKind::InstanceOf,
-        val,
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
-        }
-        _ => panic!("Expected boolean true"),
-    }
-}
-
-#[test]
-fn test_instance_of_empty_sequence_type() {
-    // () instance of empty-sequence() -> true
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, empty);
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
-        }
-        _ => panic!("Expected boolean true"),
     }
 
-    // 42 instance of empty-sequence() -> false
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
-    let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, val);
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_string() {
+        // "hello" instance of xs:string -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected boolean false"),
     }
-}
 
-#[test]
-fn test_treat_as_success() {
-    // "hello" treat as xs:string -> "hello"
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::TreatAs,
-        val,
-        "string",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_cardinality_too_many() {
+        // (1, 2) instance of xs:integer -> false (too many items)
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let seq = ExprNode::sequence(vec![v1, v2], span);
+        let seq_id = arena.add(AstNode::Expr(seq));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            seq_id,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_string(), Some("hello"));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
         }
-        _ => panic!("Expected string 'hello'"),
     }
-}
 
-#[test]
-fn test_treat_as_failure() {
-    // 42 treat as xs:string -> XPTY0004 error
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::TreatAs,
-        val,
-        "string",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_cardinality_star() {
+        // (1, 2) instance of xs:integer* -> true
+        let mut arena = AstArena::new();
+        let v1 = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
+        let v2 = arena.add(AstNode::Value(ValueNode::Integer("2".to_string())));
+        let span = SourceSpan::new(0, 5);
+        let seq = ExprNode::sequence(vec![v1, v2], span);
+        let seq_id = arena.add(AstNode::Expr(seq));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            seq_id,
+            "integer",
+            OccurrenceIndicator::ZeroOrMore,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root);
-    assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
-}
-
-#[test]
-fn test_treat_as_empty_optional() {
-    // () treat as xs:integer? -> ()
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::TreatAs,
-        empty,
-        "integer",
-        OccurrenceIndicator::ZeroOrOne,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_cast_as_string_to_integer() {
-    // "42" cast as xs:integer -> 42
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastAs,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("42".to_string()));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected integer 42"),
     }
-}
 
-#[test]
-fn test_cast_as_double_to_integer() {
-    // 42.7 cast as xs:integer -> 42 (truncated)
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::Double("42.7".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastAs,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_empty_sequence() {
+        // () instance of xs:integer? -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_integer().map(|i| i.to_string()), Some("42".to_string()));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected integer 42"),
-    }
-}
 
-#[test]
-fn test_cast_as_empty_optional() {
-    // () cast as xs:integer? -> ()
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastAs,
-        empty,
-        "integer",
-        OccurrenceIndicator::ZeroOrOne,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+        // () instance of xs:integer -> false
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    assert!(result.is_empty());
-}
-
-#[test]
-fn test_cast_as_empty_required() {
-    // () cast as xs:integer -> XPTY0004 error
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastAs,
-        empty,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root);
-    assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
-}
-
-#[test]
-fn test_cast_as_invalid() {
-    // "abc" cast as xs:integer -> FORG0001 error
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastAs,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root);
-    assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
-}
-
-#[test]
-fn test_castable_as_success() {
-    // "42" castable as xs:integer -> true
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastableAs,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
-
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
         }
-        _ => panic!("Expected boolean true"),
     }
-}
 
-#[test]
-fn test_castable_as_failure() {
-    // "abc" castable as xs:integer -> false
-    let mut arena = AstArena::new();
-    let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastableAs,
-        val,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_item() {
+        // 42 instance of item() -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr_item(
+            &mut arena,
+            TypeExprKind::InstanceOf,
+            val,
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected boolean false"),
     }
-}
 
-#[test]
-fn test_castable_as_empty_optional() {
-    // () castable as xs:integer? -> true
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastableAs,
-        empty,
-        "integer",
-        OccurrenceIndicator::ZeroOrOne,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+    #[test]
+    fn test_instance_of_empty_sequence_type() {
+        // () instance of empty-sequence() -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, empty);
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(true));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
         }
-        _ => panic!("Expected boolean true"),
-    }
-}
 
-#[test]
-fn test_castable_as_empty_required() {
-    // () castable as xs:integer -> false
-    let mut arena = AstArena::new();
-    let empty = arena.add(AstNode::Value(ValueNode::Empty));
-    let type_expr = make_type_expr(
-        &mut arena,
-        TypeExprKind::CastableAs,
-        empty,
-        "integer",
-        OccurrenceIndicator::One,
-    );
-    let root = wrap_in_expr(&mut arena, type_expr);
+        // 42 instance of empty-sequence() -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr_empty_seq(&mut arena, TypeExprKind::InstanceOf, val);
+        let root = wrap_in_expr(&mut arena, type_expr);
 
-    let result = bind_and_eval(&mut arena, root).unwrap();
-    match result {
-        XPathValue::Item(XmlItem::Atomic(v)) => {
-            assert_eq!(v.as_boolean(), Some(false));
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
         }
-        _ => panic!("Expected boolean false"),
     }
-}
+
+    #[test]
+    fn test_treat_as_success() {
+        // "hello" treat as xs:string -> "hello"
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("hello".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_string(), Some("hello"));
+            }
+            _ => panic!("Expected string 'hello'"),
+        }
+    }
+
+    #[test]
+    fn test_treat_as_failure() {
+        // 42 treat as xs:string -> XPTY0004 error
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            val,
+            "string",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
+    }
+
+    #[test]
+    fn test_treat_as_empty_optional() {
+        // () treat as xs:integer? -> ()
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::TreatAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cast_as_string_to_integer() {
+        // "42" cast as xs:integer -> 42
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(
+                    v.as_integer().map(|i| i.to_string()),
+                    Some("42".to_string())
+                );
+            }
+            _ => panic!("Expected integer 42"),
+        }
+    }
+
+    #[test]
+    fn test_cast_as_double_to_integer() {
+        // 42.7 cast as xs:integer -> 42 (truncated)
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::Double("42.7".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(
+                    v.as_integer().map(|i| i.to_string()),
+                    Some("42".to_string())
+                );
+            }
+            _ => panic!("Expected integer 42"),
+        }
+    }
+
+    #[test]
+    fn test_cast_as_empty_optional() {
+        // () cast as xs:integer? -> ()
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_cast_as_empty_required() {
+        // () cast as xs:integer -> XPTY0004 error
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
+    }
+
+    #[test]
+    fn test_cast_as_invalid() {
+        // "abc" cast as xs:integer -> FORG0001 error
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root);
+        assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
+    }
+
+    #[test]
+    fn test_castable_as_success() {
+        // "42" castable as xs:integer -> true
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("42".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_failure() {
+        // "abc" castable as xs:integer -> false
+        let mut arena = AstArena::new();
+        let val = arena.add(AstNode::Value(ValueNode::String("abc".to_string())));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            val,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_empty_optional() {
+        // () castable as xs:integer? -> true
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::ZeroOrOne,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(true));
+            }
+            _ => panic!("Expected boolean true"),
+        }
+    }
+
+    #[test]
+    fn test_castable_as_empty_required() {
+        // () castable as xs:integer -> false
+        let mut arena = AstArena::new();
+        let empty = arena.add(AstNode::Value(ValueNode::Empty));
+        let type_expr = make_type_expr(
+            &mut arena,
+            TypeExprKind::CastableAs,
+            empty,
+            "integer",
+            OccurrenceIndicator::One,
+        );
+        let root = wrap_in_expr(&mut arena, type_expr);
+
+        let result = bind_and_eval(&mut arena, root).unwrap();
+        match result {
+            XPathValue::Item(XmlItem::Atomic(v)) => {
+                assert_eq!(v.as_boolean(), Some(false));
+            }
+            _ => panic!("Expected boolean false"),
+        }
+    }
 } // end type_expr_tests
 
 // ============================================================================
@@ -2634,8 +2749,8 @@ fn test_castable_as_empty_required() {
 mod path_expr_tests {
     use super::*;
     use crate::xpath::ast::{
-        Axis, ExprNode, FilterExprNode, KindTest,
-        NameTest as AstNameTest, NodeTest as AstNodeTest, PathExprNode, PathStepNode,
+        Axis, ExprNode, FilterExprNode, KindTest, NameTest as AstNameTest, NodeTest as AstNodeTest,
+        PathExprNode, PathStepNode,
     };
     use crate::xpath::bind::bind_node;
     use crate::xpath::context::NameBinder;
@@ -2678,8 +2793,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         match result {
@@ -2718,8 +2833,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         match result {
@@ -2754,8 +2869,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         let items = result.into_vec();
@@ -2793,8 +2908,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         let items = result.into_vec();
@@ -2827,8 +2942,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         match result {
@@ -2857,12 +2972,8 @@ mod path_expr_tests {
         let pred = arena.add(AstNode::Value(ValueNode::Integer("1".to_string())));
 
         // Create step: child::* with predicate [1]
-        let step = PathStepNode::with_predicates(
-            Axis::Child,
-            wildcard_name_test(),
-            vec![pred],
-            span,
-        );
+        let step =
+            PathStepNode::with_predicates(Axis::Child, wildcard_name_test(), vec![pred], span);
         let step_id = arena.add(AstNode::PathStep(step));
 
         // Create relative path
@@ -2872,8 +2983,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         match result {
@@ -2902,12 +3013,8 @@ mod path_expr_tests {
         let pred = make_function_call(&mut arena, "", "true", vec![]);
 
         // Create step: child::* with predicate [true()]
-        let step = PathStepNode::with_predicates(
-            Axis::Child,
-            wildcard_name_test(),
-            vec![pred],
-            span,
-        );
+        let step =
+            PathStepNode::with_predicates(Axis::Child, wildcard_name_test(), vec![pred], span);
         let step_id = arena.add(AstNode::PathStep(step));
 
         // Create relative path
@@ -2917,8 +3024,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         let items = result.into_vec();
@@ -2951,8 +3058,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         let items = result.into_vec();
@@ -3032,8 +3139,8 @@ mod path_expr_tests {
 
         bind_node(&mut arena, root, &ctx, &mut binder).unwrap();
 
-        let mut dyn_ctx = DynamicContext::new(&ctx, binder.len())
-            .with_context_item(XmlItem::Node(nav.clone()));
+        let mut dyn_ctx =
+            DynamicContext::new(&ctx, binder.len()).with_context_item(XmlItem::Node(nav.clone()));
 
         let result = eval_node(&arena, root, &mut dyn_ctx).unwrap();
         match result {
@@ -3079,8 +3186,7 @@ mod xpath10_eval_tests {
 
         let evaluator = XPath10Evaluator;
         let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
-            DynamicContext::new(&ctx, binder.len())
-                .with_function_evaluator(&evaluator);
+            DynamicContext::new(&ctx, binder.len()).with_function_evaluator(&evaluator);
 
         eval_node(&parsed.arena, parsed.root, &mut dyn_ctx)
     }

@@ -199,10 +199,7 @@ fn parse_test_case(node: &roxmltree::Node, ns: &str) -> Option<XqtsTestCase> {
         }
         match child.tag_name().name() {
             "description" => {
-                description = child
-                    .text()
-                    .unwrap_or("")
-                    .to_string();
+                description = child.text().unwrap_or("").to_string();
             }
             "query" => {
                 query_name = child.attribute("name").unwrap_or("").to_string();
@@ -226,10 +223,7 @@ fn parse_test_case(node: &roxmltree::Node, ns: &str) -> Option<XqtsTestCase> {
             "output-file" => {
                 let compare = child.attribute("compare").unwrap_or("").to_string();
                 let file_name = child.text().unwrap_or("").trim().to_string();
-                output_files.push(OutputFile {
-                    compare,
-                    file_name,
-                });
+                output_files.push(OutputFile { compare, file_name });
             }
             "expected-error" => {
                 let code = child.text().unwrap_or("").trim().to_string();

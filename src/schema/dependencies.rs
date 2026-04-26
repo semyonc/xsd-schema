@@ -80,16 +80,10 @@ impl DependencyGraph {
         self.all_types.insert(base);
 
         // Add forward edge: derived -> base (derived depends on base)
-        self.dependencies
-            .entry(derived)
-            .or_default()
-            .push(base);
+        self.dependencies.entry(derived).or_default().push(base);
 
         // Add reverse edge: base -> derived (derived is a dependent of base)
-        self.dependents
-            .entry(base)
-            .or_default()
-            .push(derived);
+        self.dependents.entry(base).or_default().push(derived);
 
         self.is_sorted = false;
     }
@@ -136,7 +130,11 @@ impl DependencyGraph {
         // Calculate in-degrees (number of dependencies for each type)
         let mut in_degree: HashMap<TypeKey, usize> = HashMap::new();
         for type_key in &self.all_types {
-            let deps = self.dependencies.get(type_key).map(|v| v.len()).unwrap_or(0);
+            let deps = self
+                .dependencies
+                .get(type_key)
+                .map(|v| v.len())
+                .unwrap_or(0);
             in_degree.insert(*type_key, deps);
         }
 
@@ -198,7 +196,9 @@ impl DependencyGraph {
 
         for &start in &self.all_types {
             if !visited.contains(&start) {
-                if let Some(cycle) = self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path) {
+                if let Some(cycle) =
+                    self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path)
+                {
                     return Ok(cycle);
                 }
             }
@@ -251,9 +251,12 @@ impl DependencyGraph {
 
         for &start in &self.all_types {
             if !visited.contains(&start)
-                && self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path).is_some() {
-                    return true;
-                }
+                && self
+                    .dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path)
+                    .is_some()
+            {
+                return true;
+            }
         }
 
         false
@@ -287,7 +290,9 @@ pub struct DependencyStats {
 /// # Returns
 ///
 /// A tuple of (DependencyGraph, DependencyStats)
-pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(DependencyGraph, DependencyStats)> {
+pub fn build_dependency_graph(
+    schema_set: &SchemaSet,
+) -> SchemaResult<(DependencyGraph, DependencyStats)> {
     let mut graph = DependencyGraph::new();
     let mut stats = DependencyStats::default();
 
@@ -378,7 +383,10 @@ pub fn build_dependency_graph(schema_set: &SchemaSet) -> SchemaResult<(Dependenc
 }
 
 /// Check if a simple type key refers to a built-in type
-fn is_builtin_simple_type(key: SimpleTypeKey, builtin: &crate::types::builtin::BuiltinTypes) -> bool {
+fn is_builtin_simple_type(
+    key: SimpleTypeKey,
+    builtin: &crate::types::builtin::BuiltinTypes,
+) -> bool {
     // Check if this key matches any of the well-known built-in type keys
     // We only need to check a few common ones since built-in types are
     // created with specific keys during initialization
@@ -461,7 +469,11 @@ fn calculate_max_depth(graph: &DependencyGraph) -> usize {
         let depth = if deps.is_empty() {
             0
         } else {
-            1 + deps.iter().map(|&d| get_depth(d, graph, cache)).max().unwrap_or(0)
+            1 + deps
+                .iter()
+                .map(|&d| get_depth(d, graph, cache))
+                .max()
+                .unwrap_or(0)
         };
 
         cache.insert(key, depth);

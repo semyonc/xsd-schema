@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use catalog::{CatalogConfig, Scenario, XqtsTestCase};
 use xsd_schema::namespace::context::NamespaceContextSnapshot;
 use xsd_schema::namespace::table::NameTable;
-use xsd_schema::xpath::api::{XPathExpr, XPathEvaluator};
+use xsd_schema::xpath::api::{XPathEvaluator, XPathExpr};
 use xsd_schema::xpath::context::XPathContext;
 use xsd_schema::xpath::functions::XPathValue;
 use xsd_schema::RoXmlNavigator;
@@ -113,10 +113,7 @@ fn execute_test(
     let query_path = config.base_path.join(
         format!(
             "{}{}{}{}",
-            config.query_offset_path,
-            tc.file_path,
-            tc.query_name,
-            config.query_file_extension
+            config.query_offset_path, tc.file_path, tc.query_name, config.query_file_extension
         )
         .replace('\\', "/"),
     );
@@ -238,10 +235,7 @@ fn execute_test(
                     name: tc.name.clone(),
                     outcome: TestOutcome::Skip,
                     duration: start.elapsed(),
-                    message: Some(format!(
-                        "Cannot parse source {}: {}",
-                        doc_source_ids[i], e
-                    )),
+                    message: Some(format!("Cannot parse source {}: {}", doc_source_ids[i], e)),
                 };
             }
         }
@@ -274,10 +268,7 @@ fn execute_test(
                 let val = XPathValue::from_node(nav);
                 if let Err(e) = typed_eval.set_variable_by_name(&input.variable, val) {
                     if verbose {
-                        eprintln!(
-                            "  Warning: failed to bind var '{}': {}",
-                            input.variable, e
-                        );
+                        eprintln!("  Warning: failed to bind var '{}': {}", input.variable, e);
                     }
                 }
             }
@@ -339,13 +330,15 @@ fn execute_test(
             let mut any_passed = false;
             for output in &tc.output_files {
                 let result_path = config.base_path.join(
-                    format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
-                        .replace('\\', "/"),
+                    format!(
+                        "{}{}{}",
+                        config.result_offset_path, tc.file_path, output.file_name
+                    )
+                    .replace('\\', "/"),
                 );
 
                 let xml_compare = output.compare == "XML";
-                let text_or_fragment =
-                    output.compare == "Text" || output.compare == "Fragment";
+                let text_or_fragment = output.compare == "Text" || output.compare == "Fragment";
 
                 if output.compare == "Inspect" {
                     return TestResult {
@@ -415,8 +408,11 @@ fn execute_test(
                         continue;
                     }
                     let result_path = config.base_path.join(
-                        format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
-                            .replace('\\', "/"),
+                        format!(
+                            "{}{}{}",
+                            config.result_offset_path, tc.file_path, output.file_name
+                        )
+                        .replace('\\', "/"),
                     );
                     let xml_compare = output.compare == "XML";
                     let _ = compare::compare_result_debug(
@@ -446,8 +442,11 @@ fn execute_test(
             if !tc.output_files.is_empty() {
                 for output in &tc.output_files {
                     let result_path = config.base_path.join(
-                        format!("{}{}{}", config.result_offset_path, tc.file_path, output.file_name)
-                            .replace('\\', "/"),
+                        format!(
+                            "{}{}{}",
+                            config.result_offset_path, tc.file_path, output.file_name
+                        )
+                        .replace('\\', "/"),
                     );
                     let xml_compare = output.compare == "XML";
                     if output.compare == "Inspect" || output.compare == "Ignore" {
@@ -626,7 +625,12 @@ fn main() {
                 TestOutcome::Skip => "SKIP",
                 TestOutcome::Error => "ERR ",
             };
-            print!("[{}] {} ({:.1}ms)", status, tr.name, tr.duration.as_secs_f64() * 1000.0);
+            print!(
+                "[{}] {} ({:.1}ms)",
+                status,
+                tr.name,
+                tr.duration.as_secs_f64() * 1000.0
+            );
             if let Some(ref msg) = tr.message {
                 print!(" - {}", msg);
             }
@@ -638,17 +642,37 @@ fn main() {
     let total_duration = overall_start.elapsed();
 
     // Summary
-    let passed = results.iter().filter(|r| r.outcome == TestOutcome::Pass).count();
-    let failed = results.iter().filter(|r| r.outcome == TestOutcome::Fail).count();
-    let skipped = results.iter().filter(|r| r.outcome == TestOutcome::Skip).count();
-    let errors = results.iter().filter(|r| r.outcome == TestOutcome::Error).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.outcome == TestOutcome::Pass)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|r| r.outcome == TestOutcome::Fail)
+        .count();
+    let skipped = results
+        .iter()
+        .filter(|r| r.outcome == TestOutcome::Skip)
+        .count();
+    let errors = results
+        .iter()
+        .filter(|r| r.outcome == TestOutcome::Error)
+        .count();
     let total = results.len();
 
     println!("\n{}", "=".repeat(60));
     println!("XQTS XPath 2.0 Test Results");
     println!("{}", "=".repeat(60));
     println!("Total:   {}", total);
-    println!("Passed:  {} ({:.1}%)", passed, if total > 0 { passed as f64 / total as f64 * 100.0 } else { 0.0 });
+    println!(
+        "Passed:  {} ({:.1}%)",
+        passed,
+        if total > 0 {
+            passed as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
     println!("Failed:  {}", failed);
     println!("Skipped: {}", skipped);
     println!("Errors:  {}", errors);

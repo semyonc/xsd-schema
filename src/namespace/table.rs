@@ -382,8 +382,14 @@ mod tests {
         let table = NameTable::new();
         assert_eq!(table.resolve(well_known::XSI_TYPE), "type");
         assert_eq!(table.resolve(well_known::XSI_NIL), "nil");
-        assert_eq!(table.resolve(well_known::XSI_SCHEMA_LOCATION), "schemaLocation");
-        assert_eq!(table.resolve(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION), "noNamespaceSchemaLocation");
+        assert_eq!(
+            table.resolve(well_known::XSI_SCHEMA_LOCATION),
+            "schemaLocation"
+        );
+        assert_eq!(
+            table.resolve(well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION),
+            "noNamespaceSchemaLocation"
+        );
     }
 
     #[test]

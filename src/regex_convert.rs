@@ -39,17 +39,26 @@ impl Default for ConvertOptions {
 impl ConvertOptions {
     /// Create options for XSD 1.1 pattern facets (anchored, modern Unicode).
     pub fn xsd() -> Self {
-        Self { anchor: true, xsd_version: XsdVersion::V1_1 }
+        Self {
+            anchor: true,
+            xsd_version: XsdVersion::V1_1,
+        }
     }
 
     /// Create options for XSD 1.0 pattern facets (anchored, Unicode-3.0 pin).
     pub fn xsd_v1_0() -> Self {
-        Self { anchor: true, xsd_version: XsdVersion::V1_0 }
+        Self {
+            anchor: true,
+            xsd_version: XsdVersion::V1_0,
+        }
     }
 
     /// Create options for XPath regex functions (unanchored, modern Unicode).
     pub fn xpath() -> Self {
-        Self { anchor: false, xsd_version: XsdVersion::V1_1 }
+        Self {
+            anchor: false,
+            xsd_version: XsdVersion::V1_1,
+        }
     }
 }
 
@@ -106,8 +115,8 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
                     result.push_str(r"[^A-Za-z0-9._:\-]");
                 }
                 // Standard escapes - pass through
-                'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | '\\' | '|' | '.'
-                | '?' | '*' | '+' | '{' | '}' | '(' | ')' | '[' | ']' | '^' | '$' | '-' => {
+                'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | '\\' | '|' | '.' | '?'
+                | '*' | '+' | '{' | '}' | '(' | ')' | '[' | ']' | '^' | '$' | '-' => {
                     result.push('\\');
                     result.push(next);
                     chars.next();
@@ -231,7 +240,10 @@ fn validate_char_class(chars: &[char], mut index: usize) -> Result<usize, String
         match chars[index] {
             '\\' => {
                 let (is_single_char, next_index) = consume_class_escape(chars, index + 1);
-                prev_atom = Some(ClassAtom { available_for_range: is_single_char, unescaped_hyphen: false });
+                prev_atom = Some(ClassAtom {
+                    available_for_range: is_single_char,
+                    unescaped_hyphen: false,
+                });
                 at_group_start = false;
                 allow_nested_class = false;
                 index = next_index;
@@ -241,7 +253,10 @@ fn validate_char_class(chars: &[char], mut index: usize) -> Result<usize, String
                     return Err("unescaped '[' in character class".to_string());
                 }
                 index = validate_char_class(chars, index + 1)?;
-                prev_atom = Some(ClassAtom { available_for_range: false, unescaped_hyphen: false });
+                prev_atom = Some(ClassAtom {
+                    available_for_range: false,
+                    unescaped_hyphen: false,
+                });
                 at_group_start = false;
                 allow_nested_class = false;
             }
@@ -258,8 +273,14 @@ fn validate_char_class(chars: &[char], mut index: usize) -> Result<usize, String
                     continue;
                 }
 
-                if at_group_start || next == Some(']') || (next == Some('-') && next_after == Some('[')) {
-                    prev_atom = Some(ClassAtom { available_for_range: true, unescaped_hyphen: true });
+                if at_group_start
+                    || next == Some(']')
+                    || (next == Some('-') && next_after == Some('['))
+                {
+                    prev_atom = Some(ClassAtom {
+                        available_for_range: true,
+                        unescaped_hyphen: true,
+                    });
                     at_group_start = false;
                     allow_nested_class = false;
                     index += 1;
@@ -280,13 +301,19 @@ fn validate_char_class(chars: &[char], mut index: usize) -> Result<usize, String
                     return Err("unescaped hyphen cannot be a character range endpoint".to_string());
                 }
 
-                prev_atom = Some(ClassAtom { available_for_range: false, unescaped_hyphen: false });
+                prev_atom = Some(ClassAtom {
+                    available_for_range: false,
+                    unescaped_hyphen: false,
+                });
                 at_group_start = false;
                 allow_nested_class = false;
                 index = next_index;
             }
             _ => {
-                prev_atom = Some(ClassAtom { available_for_range: true, unescaped_hyphen: false });
+                prev_atom = Some(ClassAtom {
+                    available_for_range: true,
+                    unescaped_hyphen: false,
+                });
                 at_group_start = false;
                 allow_nested_class = false;
                 index += 1;
@@ -314,7 +341,24 @@ fn skip_escape(chars: &[char], index: usize) -> usize {
 fn consume_class_escape(chars: &[char], index: usize) -> (bool, usize) {
     let is_single_char = matches!(
         chars.get(index),
-        Some('n' | 'r' | 't' | '\\' | '|' | '.' | '?' | '*' | '+' | '(' | ')' | '{' | '}' | '-' | '[' | ']' | '^')
+        Some(
+            'n' | 'r'
+                | 't'
+                | '\\'
+                | '|'
+                | '.'
+                | '?'
+                | '*'
+                | '+'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '-'
+                | '['
+                | ']'
+                | '^'
+        )
     );
     (is_single_char, skip_escape(chars, index))
 }
@@ -323,11 +367,29 @@ fn peek_single_class_atom(chars: &[char], index: usize) -> Option<(ClassAtom, us
     match chars.get(index).copied()? {
         '\\' => {
             let (is_single_char, next_index) = consume_class_escape(chars, index + 1);
-            is_single_char.then_some((ClassAtom { available_for_range: false, unescaped_hyphen: false }, next_index))
+            is_single_char.then_some((
+                ClassAtom {
+                    available_for_range: false,
+                    unescaped_hyphen: false,
+                },
+                next_index,
+            ))
         }
         '[' | ']' => None,
-        '-' => Some((ClassAtom { available_for_range: false, unescaped_hyphen: true }, index + 1)),
-        _ => Some((ClassAtom { available_for_range: false, unescaped_hyphen: false }, index + 1)),
+        '-' => Some((
+            ClassAtom {
+                available_for_range: false,
+                unescaped_hyphen: true,
+            },
+            index + 1,
+        )),
+        _ => Some((
+            ClassAtom {
+                available_for_range: false,
+                unescaped_hyphen: false,
+            },
+            index + 1,
+        )),
     }
 }
 

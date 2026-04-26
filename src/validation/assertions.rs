@@ -11,8 +11,8 @@
 
 use crate::document::buffer::BufferDocument;
 use crate::document::navigator::BufferDocNavigator;
-use crate::navigator::{DomNavigator, TypedValue};
 use crate::ids::{ComplexTypeKey, NameId, TypeKey};
+use crate::navigator::{DomNavigator, TypedValue};
 use crate::parser::frames::{AssertResult, ComplexContentResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
@@ -52,10 +52,7 @@ pub(crate) struct AssertionBufferFrame {
 /// Returns `true` if the complex type (or any base in its derivation chain)
 /// has non-empty `assertions`. No allocation. Used in
 /// `validate_element_by_id` to decide whether to start assertion buffering.
-pub(crate) fn has_inherited_assertions(
-    ct_key: ComplexTypeKey,
-    arenas: &SchemaArenas,
-) -> bool {
+pub(crate) fn has_inherited_assertions(ct_key: ComplexTypeKey, arenas: &SchemaArenas) -> bool {
     let ct = &arenas.complex_types[ct_key];
     if !ct.assertions.is_empty() {
         return true;
@@ -190,10 +187,7 @@ fn compute_dollar_value<'doc>(
                     .iter()
                     .cloned()
                     .map(|atom| {
-                        XmlItem::Atomic(XmlValue::new(
-                            item_type_code,
-                            XmlValueKind::Atomic(atom),
-                        ))
+                        XmlItem::Atomic(XmlValue::new(item_type_code, XmlValueKind::Atomic(atom)))
                     })
                     .collect();
                 return XPathValue::from_sequence(xpath_items);
@@ -262,7 +256,7 @@ pub(crate) fn evaluate_complex_type_assertions(
             }
         };
 
-        let nav = BufferDocNavigator::new(doc, element_ref);
+        let nav = BufferDocNavigator::new_assertion(doc, element_ref);
         let value_for_eval = dollar_value.clone();
 
         let result = match expr
@@ -413,8 +407,14 @@ mod tests {
 
         // Base-first ordering: base assertion comes first
         assert_eq!(assertions.len(), 2);
-        assert_eq!(assertions[0].1, base_key, "first assertion should be from base");
-        assert_eq!(assertions[1].1, derived_key, "second assertion should be from derived");
+        assert_eq!(
+            assertions[0].1, base_key,
+            "first assertion should be from base"
+        );
+        assert_eq!(
+            assertions[1].1, derived_key,
+            "second assertion should be from derived"
+        );
         assert!(assertions[0].0.test.contains(">= 0"));
         assert!(assertions[1].0.test.contains("< 100"));
     }

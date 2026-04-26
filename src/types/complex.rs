@@ -4,15 +4,14 @@
 //! attributes, and derivation mechanisms.
 
 use crate::ids::{
-    NameId, ComplexTypeKey, SimpleTypeKey, TypeKey, ElementKey, AttributeKey,
-    AttributeGroupKey, ModelGroupKey,
+    AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, ModelGroupKey, NameId,
+    SimpleTypeKey, TypeKey,
 };
 use crate::parser::location::SourceRef;
 use crate::schema::model::{DerivationSet, XsdVersion};
 
 /// Complex type content kind
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ContentKind {
     /// Empty content (no child elements or text)
     #[default]
@@ -24,7 +23,6 @@ pub enum ContentKind {
     /// Mixed content (child elements with interleaved text)
     Mixed,
 }
-
 
 /// Derivation method for complex types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,8 +68,7 @@ pub enum ComplexTypeRef {
 }
 
 /// Content model for complex types
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum ComplexTypeContent {
     /// Empty content (no elements or text)
     #[default]
@@ -83,7 +80,6 @@ pub enum ComplexTypeContent {
     /// Complex content (elements with optional mixed text)
     Complex(Box<ComplexContentDef>),
 }
-
 
 /// Simple content definition (text value with attributes)
 #[derive(Debug, Clone)]
@@ -245,8 +241,7 @@ pub struct WildcardRef {
 }
 
 /// Namespace constraint for wildcards
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum NamespaceConstraint {
     /// Any namespace (##any)
     #[default]
@@ -306,7 +301,9 @@ pub fn not_qnames_exclude(
     namespace: Option<NameId>,
     name: NameId,
 ) -> bool {
-    not_qnames.iter().any(|&(ns, n)| ns == namespace && n == name)
+    not_qnames
+        .iter()
+        .any(|&(ns, n)| ns == namespace && n == name)
 }
 
 // Re-export ProcessContents from schema::wildcard to avoid duplication.

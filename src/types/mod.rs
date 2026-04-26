@@ -16,52 +16,46 @@
 //! - `PrimitiveTypeCode` - The 19 primitive XSD types for validator dispatch
 //! - `ValueKind` - Runtime value kind for type discrimination
 
-pub mod facets;
-pub mod simple;
-pub mod complex;
 pub mod builtin;
-pub mod value;
-#[cfg(feature = "xsd11")]
-pub mod sequence;
-pub mod validators;
+pub mod complex;
 pub mod convert;
 pub mod equality;
+pub mod facets;
+#[cfg(feature = "xsd11")]
+pub mod sequence;
+pub mod simple;
+pub mod validators;
+pub mod value;
 
 // Re-exports
-pub use facets::{
-    FacetSet, FacetFixed, WhitespaceMode, FacetApplicability, FacetKind,
-    facet_applicable, facet_applicable_for_type, normalize_whitespace,
-    PatternFacet, EnumerationFacet, ExplicitTimezone,
-    LengthFacet, MinLengthFacet, MaxLengthFacet,
-    MinInclusiveFacet, MaxInclusiveFacet, MinExclusiveFacet, MaxExclusiveFacet,
-    TotalDigitsFacet, FractionDigitsFacet, WhitespaceFacet,
-    ExplicitTimezoneFacet, AssertionFacet,
-};
-pub use simple::{SimpleTypeDef, SimpleTypeVariety, SimpleTypeRef, BuiltInType, SimpleTypeDerivationMethod};
 pub use builtin::BuiltinTypes;
 pub use complex::{
-    ComplexTypeDef, ComplexTypeContent, ContentKind, DerivationMethod,
-    ContentParticle, ContentTerm, Compositor, ModelGroupDef,
-    AttributeUse, AttributeUseKind, AttributeWildcard,
+    AttributeUse, AttributeUseKind, AttributeWildcard, ComplexTypeContent, ComplexTypeDef,
+    Compositor, ContentKind, ContentParticle, ContentTerm, DerivationMethod, ModelGroupDef,
     NamespaceConstraint, ProcessContents,
 };
-pub use value::{
-    XmlValue, XmlValueKind, XmlAtomicValue,
-    DateTimeValue, DateValue, TimeValue, DurationValue,
-    GYearMonthValue, GYearValue, GMonthDayValue, GDayValue, GMonthValue,
-    YearMonthDurationValue, DayTimeDurationValue, TimezoneOffset,
+pub use convert::{ConversionError, ConversionResult, IntoXmlValue, TypeConverter};
+pub use facets::{
+    facet_applicable, facet_applicable_for_type, normalize_whitespace, AssertionFacet,
+    EnumerationFacet, ExplicitTimezone, ExplicitTimezoneFacet, FacetApplicability, FacetFixed,
+    FacetKind, FacetSet, FractionDigitsFacet, LengthFacet, MaxExclusiveFacet, MaxInclusiveFacet,
+    MaxLengthFacet, MinExclusiveFacet, MinInclusiveFacet, MinLengthFacet, PatternFacet,
+    TotalDigitsFacet, WhitespaceFacet, WhitespaceMode,
 };
 #[cfg(feature = "xsd11")]
 pub use sequence::{
-    SequenceType, XmlTypeCardinality, ItemType, NameTest,
-    resolve_list_item_schema_type,
+    resolve_list_item_schema_type, ItemType, NameTest, SequenceType, XmlTypeCardinality,
+};
+pub use simple::{
+    BuiltInType, SimpleTypeDef, SimpleTypeDerivationMethod, SimpleTypeRef, SimpleTypeVariety,
 };
 pub use validators::{
-    TypeValidator, ValidatorRegistry, ValidationError, ValidationResult,
-    VALIDATOR_REGISTRY,
+    TypeValidator, ValidationError, ValidationResult, ValidatorRegistry, VALIDATOR_REGISTRY,
 };
-pub use convert::{
-    TypeConverter, ConversionError, ConversionResult, IntoXmlValue,
+pub use value::{
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, GDayValue, GMonthDayValue,
+    GMonthValue, GYearMonthValue, GYearValue, TimeValue, TimezoneOffset, XmlAtomicValue, XmlValue,
+    XmlValueKind, YearMonthDurationValue,
 };
 
 // ============================================================================
@@ -241,7 +235,10 @@ impl XmlTypeCode {
     #[inline]
     pub fn is_atomic(&self) -> bool {
         (*self as u8) >= Self::UntypedAtomic as u8
-            && !matches!(self, Self::NmTokens | Self::IdRefs | Self::Entities | Self::Error)
+            && !matches!(
+                self,
+                Self::NmTokens | Self::IdRefs | Self::Entities | Self::Error
+            )
     }
 
     /// Returns true if this is a list type (NMTOKENS, IDREFS, ENTITIES).
@@ -367,9 +364,16 @@ impl XmlTypeCode {
     /// Get the local name of this type code (XSD type name).
     pub fn local_name(&self) -> Option<&'static str> {
         match self {
-            Self::None | Self::Item | Self::Node | Self::Document | Self::Element
-            | Self::Attribute | Self::Namespace | Self::ProcessingInstruction
-            | Self::Comment | Self::Text => None,
+            Self::None
+            | Self::Item
+            | Self::Node
+            | Self::Document
+            | Self::Element
+            | Self::Attribute
+            | Self::Namespace
+            | Self::ProcessingInstruction
+            | Self::Comment
+            | Self::Text => None,
 
             Self::AnyType => Some("anyType"),
             Self::AnySimpleType => Some("anySimpleType"),
@@ -485,7 +489,6 @@ impl XmlTypeCode {
         }
     }
 }
-
 
 // ============================================================================
 // PrimitiveTypeCode - The 19 primitive XSD types
@@ -696,8 +699,7 @@ impl PrimitiveTypeCode {
 /// Used to identify the category of a value at runtime,
 /// enabling efficient dispatch in XPath2 operations.
 /// See XSD_TYPE_DESIGN.md §3.4 for specification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum ValueKind {
     /// Atomic value (single indivisible value)
     #[default]
@@ -707,7 +709,6 @@ pub enum ValueKind {
     /// Union value (one of multiple possible types)
     Union,
 }
-
 
 // ============================================================================
 // Tests
@@ -832,9 +833,18 @@ mod tests {
 
     #[test]
     fn test_xml_type_code_list_item_type() {
-        assert_eq!(XmlTypeCode::NmTokens.list_item_type(), Some(XmlTypeCode::NmToken));
-        assert_eq!(XmlTypeCode::IdRefs.list_item_type(), Some(XmlTypeCode::IdRef));
-        assert_eq!(XmlTypeCode::Entities.list_item_type(), Some(XmlTypeCode::Entity));
+        assert_eq!(
+            XmlTypeCode::NmTokens.list_item_type(),
+            Some(XmlTypeCode::NmToken)
+        );
+        assert_eq!(
+            XmlTypeCode::IdRefs.list_item_type(),
+            Some(XmlTypeCode::IdRef)
+        );
+        assert_eq!(
+            XmlTypeCode::Entities.list_item_type(),
+            Some(XmlTypeCode::Entity)
+        );
         assert_eq!(XmlTypeCode::String.list_item_type(), None);
     }
 
@@ -853,13 +863,34 @@ mod tests {
 
     #[test]
     fn test_xml_type_code_from_local_name() {
-        assert_eq!(XmlTypeCode::from_local_name("string"), Some(XmlTypeCode::String));
-        assert_eq!(XmlTypeCode::from_local_name("integer"), Some(XmlTypeCode::Integer));
-        assert_eq!(XmlTypeCode::from_local_name("dateTime"), Some(XmlTypeCode::DateTime));
-        assert_eq!(XmlTypeCode::from_local_name("anyURI"), Some(XmlTypeCode::AnyUri));
-        assert_eq!(XmlTypeCode::from_local_name("QName"), Some(XmlTypeCode::QName));
-        assert_eq!(XmlTypeCode::from_local_name("NMTOKEN"), Some(XmlTypeCode::NmToken));
-        assert_eq!(XmlTypeCode::from_local_name("NMTOKENS"), Some(XmlTypeCode::NmTokens));
+        assert_eq!(
+            XmlTypeCode::from_local_name("string"),
+            Some(XmlTypeCode::String)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("integer"),
+            Some(XmlTypeCode::Integer)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("dateTime"),
+            Some(XmlTypeCode::DateTime)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("anyURI"),
+            Some(XmlTypeCode::AnyUri)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("QName"),
+            Some(XmlTypeCode::QName)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("NMTOKEN"),
+            Some(XmlTypeCode::NmToken)
+        );
+        assert_eq!(
+            XmlTypeCode::from_local_name("NMTOKENS"),
+            Some(XmlTypeCode::NmTokens)
+        );
         assert_eq!(XmlTypeCode::from_local_name("unknown"), None);
     }
 
@@ -984,8 +1015,14 @@ mod tests {
         // Non-atomic types return None
         assert_eq!(PrimitiveTypeCode::from_type_code(XmlTypeCode::None), None);
         assert_eq!(PrimitiveTypeCode::from_type_code(XmlTypeCode::Node), None);
-        assert_eq!(PrimitiveTypeCode::from_type_code(XmlTypeCode::AnyType), None);
-        assert_eq!(PrimitiveTypeCode::from_type_code(XmlTypeCode::NmTokens), None);
+        assert_eq!(
+            PrimitiveTypeCode::from_type_code(XmlTypeCode::AnyType),
+            None
+        );
+        assert_eq!(
+            PrimitiveTypeCode::from_type_code(XmlTypeCode::NmTokens),
+            None
+        );
     }
 
     #[test]

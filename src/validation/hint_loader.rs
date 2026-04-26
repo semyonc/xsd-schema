@@ -30,9 +30,9 @@
 //! let compiled = builder.compile()?;
 //! ```
 
+use super::info::{NoNamespaceSchemaLocationHint, SchemaLocationHint};
 use crate::builder::SchemaSetBuilder;
 use crate::error::SchemaError;
-use super::info::{SchemaLocationHint, NoNamespaceSchemaLocationHint};
 
 /// Result of hint-driven schema loading.
 #[derive(Debug, Default)]
@@ -143,7 +143,7 @@ pub fn enrich_schema_set(
 mod tests {
     use super::*;
     use crate::builder::SchemaSetBuilder;
-    use crate::validation::info::{SchemaLocationHint, NoNamespaceSchemaLocationHint};
+    use crate::validation::info::{NoNamespaceSchemaLocationHint, SchemaLocationHint};
 
     #[test]
     fn test_load_hints_empty() {
@@ -188,7 +188,8 @@ mod tests {
             <xs:element name="root" type="xs:string"/>
         </xs:schema>"#;
         let mut builder = SchemaSetBuilder::new()
-            .add_source(xsd, "http://example.com/dedup.xsd").unwrap();
+            .add_source(xsd, "http://example.com/dedup.xsd")
+            .unwrap();
 
         // Hint pointing to the same location should be skipped, not loaded again.
         // try_add normalizes, and add_source records the exact base_uri —
@@ -215,7 +216,8 @@ mod tests {
         </xs:schema>"#;
         let cwd = std::env::current_dir().unwrap();
         let mut builder = SchemaSetBuilder::new()
-            .add_source(xsd, "schemas/test.xsd").unwrap();
+            .add_source(xsd, "schemas/test.xsd")
+            .unwrap();
 
         let instance_base = cwd
             .join("schemas")
@@ -228,8 +230,10 @@ mod tests {
             base_uri: instance_base,
         }];
         let result = load_hints_into_builder(&mut builder, &hints, &[]);
-        assert_eq!(result.loaded_count, 0,
-            "hint resolving to already-loaded URI should not reload");
+        assert_eq!(
+            result.loaded_count, 0,
+            "hint resolving to already-loaded URI should not reload"
+        );
         assert_eq!(result.skipped_count, 1);
     }
 
@@ -239,8 +243,10 @@ mod tests {
             <xs:element name="root" type="xs:string"/>
         </xs:schema>"#;
         let compiled = SchemaSetBuilder::new()
-            .add_source(xsd, "test.xsd").unwrap()
-            .compile().unwrap();
+            .add_source(xsd, "test.xsd")
+            .unwrap()
+            .compile()
+            .unwrap();
 
         let result = enrich_schema_set(compiled.schema_set(), &[], &[]);
         assert!(result.is_none(), "should return None when no hints");
@@ -252,13 +258,19 @@ mod tests {
         let dir = std::env::temp_dir().join("xsd_hint_test_enrich");
         let _ = std::fs::create_dir_all(&dir);
         let schema_path = dir.join("base.xsd");
-        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        std::fs::write(
+            &schema_path,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:element name="root" type="xs:string"/>
-        </xs:schema>"#).unwrap();
+        </xs:schema>"#,
+        )
+        .unwrap();
 
         let compiled = SchemaSetBuilder::new()
-            .add("", &schema_path.to_string_lossy()).unwrap()
-            .compile().unwrap();
+            .add("", &schema_path.to_string_lossy())
+            .unwrap()
+            .compile()
+            .unwrap();
         let original = compiled.schema_set();
 
         // Provide a hint that fails to load — enrichment should still
@@ -287,13 +299,19 @@ mod tests {
         let dir = std::env::temp_dir().join("xsd_hint_test_version");
         let _ = std::fs::create_dir_all(&dir);
         let schema_path = dir.join("test.xsd");
-        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        std::fs::write(
+            &schema_path,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:element name="root" type="xs:string"/>
-        </xs:schema>"#).unwrap();
+        </xs:schema>"#,
+        )
+        .unwrap();
 
         let compiled = SchemaSetBuilder::xsd11()
-            .add("", &schema_path.to_string_lossy()).unwrap()
-            .compile().unwrap();
+            .add("", &schema_path.to_string_lossy())
+            .unwrap()
+            .compile()
+            .unwrap();
         let original = compiled.schema_set();
         assert_eq!(original.xsd_version, crate::schema::model::XsdVersion::V1_1);
 
@@ -317,13 +335,19 @@ mod tests {
         let dir = std::env::temp_dir().join("xsd_hint_test_add_from");
         let _ = std::fs::create_dir_all(&dir);
         let schema_path = dir.join("original.xsd");
-        std::fs::write(&schema_path, r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        std::fs::write(
+            &schema_path,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:element name="root" type="xs:string"/>
-        </xs:schema>"#).unwrap();
+        </xs:schema>"#,
+        )
+        .unwrap();
 
         let compiled = SchemaSetBuilder::new()
-            .add("", &schema_path.to_string_lossy()).unwrap()
-            .compile().unwrap();
+            .add("", &schema_path.to_string_lossy())
+            .unwrap()
+            .compile()
+            .unwrap();
 
         let mut builder = SchemaSetBuilder::new();
         builder.add_from(compiled.schema_set());

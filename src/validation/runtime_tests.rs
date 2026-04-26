@@ -1,6 +1,6 @@
-use super::*;
 use super::super::info::{NoNamespaceSchemaLocationHint, SchemaLocationHint};
 use super::super::validator::SchemaValidator;
+use super::*;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::pipeline::load_and_process_schema;
 
@@ -176,7 +176,10 @@ fn test_sequence_wrong_order() {
 
     // Should have content model error
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.4"),
         "errors: {:?}",
         v.sink.errors
     );
@@ -210,7 +213,10 @@ fn test_required_attribute_missing() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.4"),
         "expected required attribute error, got: {:?}",
         v.sink.errors
     );
@@ -245,7 +251,10 @@ fn test_duplicate_attribute() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.3"),
         "expected duplicate attribute error, got: {:?}",
         v.sink.errors
     );
@@ -272,7 +281,10 @@ fn test_text_in_empty_content() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.1"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.1"),
         "expected empty content error, got: {:?}",
         v.sink.errors
     );
@@ -414,7 +426,10 @@ fn test_local_element_with_complex_type() {
 
     let info = v.validate_element("address", "", None, None, &ns);
     assert_eq!(info.validity, SchemaValidity::Valid);
-    assert!(info.schema_type.is_some(), "local element should have resolved type");
+    assert!(
+        info.schema_type.is_some(),
+        "local element should have resolved type"
+    );
     assert!(
         matches!(info.content_type, Some(ContentType::ElementOnly)),
         "addressType has element-only content, got {:?}",
@@ -464,7 +479,10 @@ fn test_local_element_with_simple_type_resolved() {
 
     let info = v.validate_element("count", "", None, None, &ns);
     assert_eq!(info.validity, SchemaValidity::Valid);
-    assert!(info.schema_type.is_some(), "local element should have resolved type for xs:integer");
+    assert!(
+        info.schema_type.is_some(),
+        "local element should have resolved type for xs:integer"
+    );
     assert_eq!(info.content_type, Some(ContentType::TextOnly));
 
     v.validate_end_of_attributes();
@@ -517,7 +535,10 @@ fn test_local_element_complex_type_rejects_wrong_children() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.4"),
         "expected content model error for wrong child, got: {:?}",
         v.sink.errors
     );
@@ -546,11 +567,15 @@ fn test_local_element_with_inline_type() {
     );
 
     // Verify schema internals: inline type is assembled and propagated
-    let root_name = schema_set.name_table.get("root")
+    let root_name = schema_set
+        .name_table
+        .get("root")
         .expect("name 'root' not interned");
-    let root_key = schema_set.lookup_element(None, root_name)
+    let root_key = schema_set
+        .lookup_element(None, root_name)
         .expect("root element not found");
-    let root_type = schema_set.arenas.elements[root_key].resolved_type
+    let root_type = schema_set.arenas.elements[root_key]
+        .resolved_type
         .expect("root element has no resolved_type");
     let ct_key = match root_type {
         crate::ids::TypeKey::Complex(k) => k,
@@ -650,7 +675,10 @@ fn test_xsi_type_on_local_element() {
 
     let info = v.validate_element("item", "", Some("derivedType"), None, &ns);
     assert_eq!(info.validity, SchemaValidity::Valid);
-    assert!(info.schema_type.is_some(), "schema_type should reflect overridden type");
+    assert!(
+        info.schema_type.is_some(),
+        "schema_type should reflect overridden type"
+    );
 
     v.validate_end_of_attributes();
 
@@ -710,7 +738,10 @@ fn test_group_ref_with_nillable_fixed_default() {
     v.validate_text("WRONG");
     let end_info = v.validate_end_element();
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.5.2.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-elt.5.2.2"),
         "expected cvc-elt.5.2.2 for fixed value mismatch, errors: {:?}",
         v.sink.errors
     );
@@ -836,7 +867,10 @@ fn test_attribute_group_required_missing() {
     assert!(v.end_validation().is_ok());
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.4"),
         "expected cvc-complex-type.4 for missing required attribute from group, errors: {:?}",
         v.sink.errors
     );
@@ -881,7 +915,10 @@ fn test_wildcard_namespace_other_rejects_same_ns() {
     let info = v.validate_attribute("local", "http://example.com/ns", "val");
     assert_eq!(info.validity, SchemaValidity::Invalid);
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.3.2.2"),
         "expected cvc-complex-type.3.2.2, errors: {:?}",
         v.sink.errors
     );
@@ -944,7 +981,10 @@ fn test_wildcard_process_contents_strict_unknown() {
     let info = v.validate_attribute("unknownAttr", "", "anything");
     assert_eq!(info.validity, SchemaValidity::Invalid);
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-assess-attr.1.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-assess-attr.1.2"),
         "expected cvc-assess-attr.1.2 for strict wildcard with unknown attr, errors: {:?}",
         v.sink.errors
     );
@@ -1051,7 +1091,10 @@ fn test_attribute_ref_basic() {
         "attribute ref should match by resolved name; errors: {:?}",
         v.sink.errors
     );
-    assert!(info.attribute_decl.is_some(), "should resolve attribute decl key");
+    assert!(
+        info.attribute_decl.is_some(),
+        "should resolve attribute decl key"
+    );
 
     v.validate_end_of_attributes();
     v.validate_text("hello");
@@ -1090,7 +1133,10 @@ fn test_attribute_ref_required_missing() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.4"),
         "expected cvc-complex-type.4 for missing required ref attribute, errors: {:?}",
         v.sink.errors
     );
@@ -1119,7 +1165,10 @@ fn test_prohibited_attribute_wildcard_rescue() {
     let _info = v.validate_attribute("blocked", "", "value");
     // skip wildcard → no error (validity is NotKnown, which is correct PSVI for skip)
     assert!(
-        !v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+        !v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.3.2.2"),
         "wildcard should rescue prohibited attribute; errors: {:?}",
         v.sink.errors
     );
@@ -1148,8 +1197,10 @@ fn test_prohibited_attribute_wildcard_rescue() {
         "prohibited without wildcard must be rejected"
     );
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"
-            && e.message.contains("prohibited")),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.3.2.2" && e.message.contains("prohibited")),
         "expected 'prohibited' error, errors: {:?}",
         v.sink.errors
     );
@@ -1368,7 +1419,10 @@ fn test_mixed_content_text_only_incomplete_model() {
 
     // Content model is incomplete because required child <a> was never provided
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.4"),
         "expected content model incomplete error, got: {:?}",
         v.sink.errors
     );
@@ -1451,7 +1505,10 @@ fn test_element_only_rejects_non_whitespace_text() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.3"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.3"),
         "expected element-only text error, got: {:?}",
         v.sink.errors
     );
@@ -1499,7 +1556,10 @@ fn test_mixed_content_wrong_child_order() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.2.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.2.4"),
         "expected content model error for wrong child order, got: {:?}",
         v.sink.errors
     );
@@ -1799,7 +1859,10 @@ fn test_ic_key_duplicate() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
         "Expected duplicate key error, got: {:?}",
         v.sink.errors
     );
@@ -1855,10 +1918,18 @@ fn test_ic_unique_incomplete_ok_duplicate_rejected() {
     v.validate_end_element(); // </root>
     v.end_validation().ok();
 
-    let dup_errors: Vec<_> = v.sink.errors.iter()
+    let dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-identity-constraint.4.2.2")
         .collect();
-    assert_eq!(dup_errors.len(), 1, "Expected exactly 1 duplicate error, got: {:?}", dup_errors);
+    assert_eq!(
+        dup_errors.len(),
+        1,
+        "Expected exactly 1 duplicate error, got: {:?}",
+        dup_errors
+    );
 }
 
 /// Test 3: Keyref cross-reference — matching + missing (cvc-identity-constraint.4.3)
@@ -1921,10 +1992,18 @@ fn test_ic_keyref_matching_and_missing() {
     v.validate_end_element(); // </root>
     v.end_validation().ok();
 
-    let keyref_errors: Vec<_> = v.sink.errors.iter()
+    let keyref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-identity-constraint.4.3")
         .collect();
-    assert_eq!(keyref_errors.len(), 1, "Expected 1 keyref error for missing 'B', got: {:?}", keyref_errors);
+    assert_eq!(
+        keyref_errors.len(),
+        1,
+        "Expected 1 keyref error for missing 'B', got: {:?}",
+        keyref_errors
+    );
 }
 
 /// Test 4: Element field value — field matches element text content
@@ -1981,7 +2060,10 @@ fn test_ic_element_field_value() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
         "Expected duplicate key error for element field, got: {:?}",
         v.sink.errors
     );
@@ -2138,10 +2220,18 @@ fn test_idref_valid_and_missing() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
-    assert_eq!(idref_errors.len(), 1, "Expected 1 IDREF error for 'missing', got: {:?}", idref_errors);
+    assert_eq!(
+        idref_errors.len(),
+        1,
+        "Expected 1 IDREF error for 'missing', got: {:?}",
+        idref_errors
+    );
 }
 
 /// Test 9: Nested selector matches (.//item with nested items)
@@ -2269,10 +2359,18 @@ fn test_ic_keyref_key_same_scope() {
     v.validate_end_element(); // </root>
     v.end_validation().ok();
 
-    let keyref_errors: Vec<_> = v.sink.errors.iter()
+    let keyref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-identity-constraint.4.3")
         .collect();
-    assert_eq!(keyref_errors.len(), 1, "Expected 1 keyref error for 'hr', got: {:?}", keyref_errors);
+    assert_eq!(
+        keyref_errors.len(),
+        1,
+        "Expected 1 keyref error for 'hr', got: {:?}",
+        keyref_errors
+    );
 }
 
 /// Test: Key constraint with no duplicates — valid document
@@ -2367,7 +2465,9 @@ mod assertion_runtime_tests {
         );
         let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
         let validator = SchemaValidator::new(&schema_set, flags);
-        assert!(!validator.flags.contains(ValidationFlags::PROCESS_ASSERTIONS));
+        assert!(!validator
+            .flags
+            .contains(ValidationFlags::PROCESS_ASSERTIONS));
         // Validation proceeds without panic
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
@@ -2413,10 +2513,8 @@ mod assertion_runtime_tests {
         text: Option<&str>,
     ) -> Vec<ValidationError> {
         let schema_set = load_schema_xsd11(xsd);
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
         v.validate_element(element, "", None, None, &ns);
@@ -2471,9 +2569,7 @@ mod assertion_runtime_tests {
             &[("val", "-5")],
             None,
         );
-        let has_assertion_error = errors
-            .iter()
-            .any(|e| e.constraint == "cvc-assertion");
+        let has_assertion_error = errors.iter().any(|e| e.constraint == "cvc-assertion");
         assert!(
             has_assertion_error,
             "Expected cvc-assertion error for negative @val, got: {:?}",
@@ -2568,10 +2664,8 @@ mod assertion_runtime_tests {
                 </xs:element>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2615,10 +2709,8 @@ mod assertion_runtime_tests {
                 </xs:element>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2669,10 +2761,8 @@ mod assertion_runtime_tests {
                 <xs:element name="item" type="derivedType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2715,10 +2805,8 @@ mod assertion_runtime_tests {
                 <xs:element name="item" type="derivedType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2760,10 +2848,8 @@ mod assertion_runtime_tests {
                 <xs:element name="item" type="derivedType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2808,10 +2894,8 @@ mod assertion_runtime_tests {
                 <xs:element name="item" type="derivedType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2859,10 +2943,8 @@ mod assertion_runtime_tests {
                 </xs:element>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2913,10 +2995,8 @@ mod assertion_runtime_tests {
                 </xs:element>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -2985,9 +3065,7 @@ mod assertion_runtime_tests {
             &[("val", "-1")],
             None,
         );
-        let has_assertion_error = errors
-            .iter()
-            .any(|e| e.constraint == "cvc-assertion");
+        let has_assertion_error = errors.iter().any(|e| e.constraint == "cvc-assertion");
         assert!(
             has_assertion_error,
             "Named type assertion should fail for val=-1, got: {:?}",
@@ -3012,10 +3090,8 @@ mod assertion_runtime_tests {
                 <xs:element name="order" type="orderType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -3060,10 +3136,8 @@ mod assertion_runtime_tests {
                 <xs:element name="order" type="orderType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -3118,10 +3192,8 @@ mod assertion_runtime_tests {
                 </xs:element>
             </xs:schema>"###,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
         let tns = "http://example.com/ns";
@@ -3173,10 +3245,8 @@ mod assertion_runtime_tests {
                 <xs:element name="item" type="extType"/>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new_fragment_buffer(
-            &schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
 
@@ -3281,14 +3351,22 @@ fn test_global_element_with_named_complex_type_ref() {
 
     // Child "name"
     let name_info = v.validate_element("name", "", None, None, &ns);
-    assert_eq!(name_info.validity, SchemaValidity::Valid, "name should be valid");
+    assert_eq!(
+        name_info.validity,
+        SchemaValidity::Valid,
+        "name should be valid"
+    );
     v.validate_end_of_attributes();
     v.validate_text("Widget");
     v.validate_end_element();
 
     // Child "value"
     let value_info = v.validate_element("value", "", None, None, &ns);
-    assert_eq!(value_info.validity, SchemaValidity::Valid, "value should be valid");
+    assert_eq!(
+        value_info.validity,
+        SchemaValidity::Valid,
+        "value should be valid"
+    );
     v.validate_end_of_attributes();
     v.validate_text("42");
     v.validate_end_element();
@@ -3304,7 +3382,10 @@ mod type_alternatives_tests {
     use super::*;
 
     /// Helper: run a full validation pass and return the collected errors.
-    fn validate_errors(schema_set: &SchemaSet, run: impl FnOnce(&mut ValidationRuntime<'_, TestSink>)) -> Vec<ValidationError> {
+    fn validate_errors(
+        schema_set: &SchemaSet,
+        run: impl FnOnce(&mut ValidationRuntime<'_, TestSink>),
+    ) -> Vec<ValidationError> {
         let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         run(&mut v);
@@ -3393,7 +3474,10 @@ mod type_alternatives_tests {
 
             v.validate_end_element();
         });
-        assert!(!errors.is_empty(), "Expected validation error for non-integer value");
+        assert!(
+            !errors.is_empty(),
+            "Expected validation error for non-integer value"
+        );
     }
 
     #[test]
@@ -3414,7 +3498,11 @@ mod type_alternatives_tests {
 
             v.validate_end_element();
         });
-        assert!(errors.is_empty(), "Expected no errors with declared type, got: {:?}", errors);
+        assert!(
+            errors.is_empty(),
+            "Expected no errors with declared type, got: {:?}",
+            errors
+        );
     }
 
     #[test]
@@ -3458,7 +3546,11 @@ mod type_alternatives_tests {
             v.validate_end_element();
             v.validate_end_element();
         });
-        assert!(errors_special.is_empty(), "Expected no errors for special mode, got: {:?}", errors_special);
+        assert!(
+            errors_special.is_empty(),
+            "Expected no errors for special mode, got: {:?}",
+            errors_special
+        );
 
         // mode='other' -> defaultType (expects string child "d")
         let errors_default = validate_errors(&schema_set, |v| {
@@ -3471,7 +3563,11 @@ mod type_alternatives_tests {
             v.validate_end_element();
             v.validate_end_element();
         });
-        assert!(errors_default.is_empty(), "Expected no errors for default mode, got: {:?}", errors_default);
+        assert!(
+            errors_default.is_empty(),
+            "Expected no errors for default mode, got: {:?}",
+            errors_default
+        );
     }
 
     #[test]
@@ -3508,7 +3604,10 @@ mod type_alternatives_tests {
             v.validate_end_element();
             v.validate_end_element();
         });
-        assert!(!errors.is_empty(), "Expected content model error for wrong child element");
+        assert!(
+            !errors.is_empty(),
+            "Expected content model error for wrong child element"
+        );
     }
 
     #[test]
@@ -3656,7 +3755,11 @@ mod type_alternatives_tests {
             v.validate_end_element();
             v.validate_end_element();
         });
-        assert!(errors_ok.is_empty(), "Expected no errors, got: {:?}", errors_ok);
+        assert!(
+            errors_ok.is_empty(),
+            "Expected no errors, got: {:?}",
+            errors_ok
+        );
     }
 
     #[test]
@@ -3714,7 +3817,11 @@ mod type_alternatives_tests {
             v.validate_end_element();
             v.validate_end_element();
         });
-        assert!(errors_ok.is_empty(), "Expected no errors, got: {:?}", errors_ok);
+        assert!(
+            errors_ok.is_empty(),
+            "Expected no errors, got: {:?}",
+            errors_ok
+        );
     }
 
     // Regression: when CTA evaluates but selects the same type (or no
@@ -3736,7 +3843,9 @@ mod type_alternatives_tests {
             v.validate_end_element();
         });
         assert!(
-            errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+            errors
+                .iter()
+                .any(|e| e.constraint == "cvc-complex-type.3.2.2"),
             "Undeclared attribute 'unknown' should be reported even when CTA \
              doesn't switch type, got: {:?}",
             errors
@@ -3770,10 +3879,8 @@ mod type_alternatives_tests {
         schema_set: &SchemaSet,
         run: impl FnOnce(&mut ValidationRuntime<'_, TestSink>),
     ) -> Vec<ValidationError> {
-        let validator = SchemaValidator::new_fragment_buffer(
-            schema_set,
-            ValidationFlags::default(),
-        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         run(&mut v);
         v.end_validation().ok();
@@ -4041,7 +4148,10 @@ fn test_default_attributes_opt_out() {
 
     // 'lang' should be rejected because the type opted out
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint.starts_with("cvc-complex-type.3")),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint.starts_with("cvc-complex-type.3")),
         "Attribute 'lang' should be rejected when defaultAttributesApply=false, got: {:?}",
         v.sink.errors
     );
@@ -4082,7 +4192,10 @@ fn test_default_attributes_contributes_defaults() {
             name == "lang" && d.value == "en"
         }),
         "Default attributes should include 'lang' with value 'en', got: {:?}",
-        defaults.iter().map(|d| (schema_set.name_table.resolve(d.local_name), &d.value)).collect::<Vec<_>>()
+        defaults
+            .iter()
+            .map(|d| (schema_set.name_table.resolve(d.local_name), &d.value))
+            .collect::<Vec<_>>()
     );
 
     v.validate_element("a", "", None, None, &ns);
@@ -4127,7 +4240,10 @@ fn test_default_attributes_required() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.4"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.4"),
         "Required attribute from default group should cause cvc-complex-type.4 error, got: {:?}",
         v.sink.errors
     );
@@ -4205,11 +4321,20 @@ fn assert_attribute_form(
     let mut v = validator.start_run(TestSink::new());
     v.validate_element("root", "http://example.com/ns", None, None, &ns);
     let info = v.validate_attribute("id", accept_ns, "val");
-    assert_ne!(info.validity, SchemaValidity::Invalid, "{accept_msg}, errors: {:?}", v.sink.errors);
+    assert_ne!(
+        info.validity,
+        SchemaValidity::Invalid,
+        "{accept_msg}, errors: {:?}",
+        v.sink.errors
+    );
     v.validate_end_of_attributes();
     v.validate_end_element();
     v.end_validation().ok();
-    assert!(v.sink.errors.is_empty(), "expected no errors, got: {:?}", v.sink.errors);
+    assert!(
+        v.sink.errors.is_empty(),
+        "expected no errors, got: {:?}",
+        v.sink.errors
+    );
 
     // --- Reject case
     let mut v2 = validator.start_run(TestSink::new());
@@ -4220,8 +4345,12 @@ fn assert_attribute_form(
     v2.validate_end_element();
     v2.end_validation().ok();
     assert!(
-        v2.sink.errors.iter().any(|e| e.constraint == "cvc-complex-type.3.2.2"),
-        "expected cvc-complex-type.3.2.2, got: {:?}", v2.sink.errors
+        v2.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-complex-type.3.2.2"),
+        "expected cvc-complex-type.3.2.2, got: {:?}",
+        v2.sink.errors
     );
 }
 
@@ -4242,7 +4371,9 @@ fn test_attribute_form_default_qualified() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, TNS, "",
+        &schema_set,
+        TNS,
+        "",
         "qualified attribute should be valid",
         "unqualified attribute should be rejected when attributeFormDefault=qualified",
     );
@@ -4262,7 +4393,9 @@ fn test_attribute_form_qualified_explicit() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, TNS, "",
+        &schema_set,
+        TNS,
+        "",
         "form=qualified attribute should be valid",
         "unqualified attribute should be rejected when form=qualified",
     );
@@ -4283,7 +4416,9 @@ fn test_attribute_form_unqualified_explicit() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, "", TNS,
+        &schema_set,
+        "",
+        TNS,
         "form=unqualified attribute should be valid",
         "qualified attribute should be rejected when form=unqualified",
     );
@@ -4303,7 +4438,9 @@ fn test_attribute_form_default_unqualified() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, "", TNS,
+        &schema_set,
+        "",
+        TNS,
         "default unqualified attribute should be valid",
         "qualified attribute should be rejected when default is unqualified",
     );
@@ -4327,7 +4464,9 @@ fn test_attribute_group_form_qualified() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, TNS, "",
+        &schema_set,
+        TNS,
+        "",
         "qualified attribute from group should be valid",
         "unqualified attribute should be rejected for qualified group attribute",
     );
@@ -4350,7 +4489,9 @@ fn test_attribute_explicit_target_namespace() {
         </xs:schema>"###,
     );
     assert_attribute_form(
-        &schema_set, "http://other.com/ns", TNS,
+        &schema_set,
+        "http://other.com/ns",
+        TNS,
         "explicit targetNamespace attribute should be valid",
         "attribute with wrong namespace should be rejected",
     );
@@ -4502,11 +4643,15 @@ fn test_idrefs_one_missing_one_valid() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
-        idref_errors.len(), 1,
+        idref_errors.len(),
+        1,
         "Expected 1 IDREF error for 'ghost', got: {:?}",
         idref_errors
     );
@@ -4536,11 +4681,15 @@ fn test_idrefs_multiple_missing() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
-        idref_errors.len(), 3,
+        idref_errors.len(),
+        3,
         "Expected 3 IDREF errors for nope1/nope2/nope3, got: {:?}",
         idref_errors
     );
@@ -4570,7 +4719,10 @@ fn test_idrefs_empty_after_collapse() {
         !v.sink.errors.is_empty(),
         "IDREFS with only whitespace should produce an error"
     );
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -4605,7 +4757,10 @@ fn test_id_invalid_ncname() {
         "Invalid NCName for ID should produce an error"
     );
     // Should NOT appear in ID table (no duplicate detection)
-    let id_dup_errors: Vec<_> = v.sink.errors.iter()
+    let id_dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.2")
         .collect();
     assert!(
@@ -4639,7 +4794,10 @@ fn test_idref_invalid_ncname() {
         "Invalid NCName for IDREF should produce an error"
     );
     // The invalid value should NOT end up in pending_idrefs
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -4674,7 +4832,10 @@ fn test_idrefs_one_invalid_ncname_token() {
         "IDREFS with one invalid token should produce an error"
     );
     // No tokens should be tracked (lexical validation rejects entire value)
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -4767,11 +4928,15 @@ fn test_element_text_idref_resolution() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
-        idref_errors.len(), 1,
+        idref_errors.len(),
+        1,
         "Expected 1 cvc-id.1 error for element-text IDREF 'missing', got: {:?}",
         idref_errors
     );
@@ -4882,11 +5047,15 @@ fn test_derived_idref_tracking() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
-        idref_errors.len(), 1,
+        idref_errors.len(),
+        1,
         "Derived xs:IDREF should track references, got: {:?}",
         idref_errors
     );
@@ -4941,11 +5110,15 @@ fn test_derived_idrefs_tracking() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
-        idref_errors.len(), 1,
+        idref_errors.len(),
+        1,
         "Derived xs:IDREFS should track each token, got: {:?}",
         idref_errors
     );
@@ -5033,7 +5206,10 @@ fn test_invalid_lexical_does_not_poison_tracking() {
 
     // Should have lexical errors for the invalid ID + IDREF,
     // but the valid ID/IDREF pair should work
-    let dup_errors: Vec<_> = v.sink.errors.iter()
+    let dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.2")
         .collect();
     assert!(
@@ -5042,7 +5218,10 @@ fn test_invalid_lexical_does_not_poison_tracking() {
         dup_errors
     );
     // "good" should resolve, "123bad" IDREF also fails lexically so no cvc-id.1 for it
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -5103,7 +5282,10 @@ fn test_custom_idref_list_tracking() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert_eq!(
@@ -5153,7 +5335,10 @@ fn test_whitespace_normalization_id_idref_match() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -5161,7 +5346,10 @@ fn test_whitespace_normalization_id_idref_match() {
         "Whitespace-padded ID/IDREF/IDREFS should all resolve after collapse, got: {:?}",
         idref_errors
     );
-    let dup_errors: Vec<_> = v.sink.errors.iter()
+    let dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.2")
         .collect();
     assert!(
@@ -5209,7 +5397,10 @@ fn test_whitespace_normalization_element_text() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -5253,7 +5444,10 @@ fn test_xsi_type_unresolved_on_global_element() {
     v.validate_text("hello");
     let end_info = v.validate_end_element();
     // End element should not produce additional type errors
-    let type_errors: Vec<_> = v.sink.errors.iter()
+    let type_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint != "cvc-elt.4.1")
         .collect();
     assert!(
@@ -5303,7 +5497,10 @@ fn test_xsi_type_invalid_derivation_on_global_element() {
     v.end_validation().ok();
 
     // No additional errors beyond cvc-elt.4.2
-    let other_errors: Vec<_> = v.sink.errors.iter()
+    let other_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint != "cvc-elt.4.2")
         .collect();
     assert!(
@@ -5397,7 +5594,10 @@ fn test_xsi_type_unresolved_lax_assessment() {
         "Expected cvc-elt.4.1 error, got: {:?}",
         v.sink.errors
     );
-    let content_errors: Vec<_> = v.sink.errors.iter()
+    let content_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-complex-type.2.4")
         .collect();
     assert!(
@@ -5551,7 +5751,10 @@ fn test_strict_undeclared_same_assessment_as_lax() {
     v.end_validation().ok();
 
     // No content model errors on the unknown element's children
-    let content_errors: Vec<_> = v.sink.errors.iter()
+    let content_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-complex-type.2.4")
         .collect();
     assert!(
@@ -5605,7 +5808,8 @@ fn test_cta_preserves_xsi_type_invalidity() {
 
     // CTA should switch to typeB, but validity should stay Invalid
     assert_eq!(
-        eoa_info.validity, SchemaValidity::Invalid,
+        eoa_info.validity,
+        SchemaValidity::Invalid,
         "CTA switch should preserve prior invalidity from bad xsi:type"
     );
 
@@ -5928,7 +6132,10 @@ fn test_cta_selected_same_type() {
     v.validate_attribute("kind", "", "same");
     let eoa_info = v.validate_end_of_attributes();
     // CTA selected same type → cta_selected true, type_source TypeAlternative
-    assert!(eoa_info.cta_selected, "cta_selected should be true even when type is unchanged");
+    assert!(
+        eoa_info.cta_selected,
+        "cta_selected should be true even when type is unchanged"
+    );
     assert_eq!(eoa_info.type_source, Some(TypeSource::TypeAlternative));
 
     v.validate_element("val", "", None, None, &ns);
@@ -5979,10 +6186,7 @@ fn test_assertion_outcome_passed() {
             </xs:element>
         </xs:schema>"#,
     );
-    let validator = SchemaValidator::new_fragment_buffer(
-        &schema_set,
-        ValidationFlags::default(),
-    );
+    let validator = SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
 
@@ -6012,10 +6216,7 @@ fn test_assertion_outcome_failed() {
             </xs:element>
         </xs:schema>"#,
     );
-    let validator = SchemaValidator::new_fragment_buffer(
-        &schema_set,
-        ValidationFlags::default(),
-    );
+    let validator = SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
 
@@ -6072,10 +6273,7 @@ fn test_no_assertions_outcome_none() {
             <xs:element name="root" type="xs:string"/>
         </xs:schema>"#,
     );
-    let validator = SchemaValidator::new_fragment_buffer(
-        &schema_set,
-        ValidationFlags::default(),
-    );
+    let validator = SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
 
@@ -6084,8 +6282,7 @@ fn test_no_assertions_outcome_none() {
     v.validate_text("hello");
     let end_info = v.validate_end_element();
     assert_eq!(
-        end_info.assertion_outcome,
-        None,
+        end_info.assertion_outcome, None,
         "No assertions on type → None"
     );
     v.end_validation().ok();
@@ -6127,10 +6324,7 @@ fn test_inheritable_basic() {
     let inherited = v.get_inherited_attributes();
     assert_eq!(inherited.len(), 1, "child should inherit 'lang'");
     let lang = &inherited[0];
-    assert_eq!(
-        v.schema_set.name_table.resolve(lang.local_name),
-        "lang"
-    );
+    assert_eq!(v.schema_set.name_table.resolve(lang.local_name), "lang");
     assert_eq!(lang.value, "en");
 
     v.validate_text("hello");
@@ -6187,15 +6381,20 @@ fn test_inheritable_override() {
 
     // After attributes, mid's PSVI [inherited attributes] is unchanged (incoming)
     let mid_inherited_after = v.get_inherited_attributes();
-    assert_eq!(mid_inherited_after[0].value, "en",
-        "PSVI [inherited attributes] is the incoming snapshot, not affected by own attrs");
+    assert_eq!(
+        mid_inherited_after[0].value, "en",
+        "PSVI [inherited attributes] is the incoming snapshot, not affected by own attrs"
+    );
 
     v.validate_element("leaf", "", None, None, &ns);
     v.validate_end_of_attributes();
 
     let inherited = v.get_inherited_attributes();
     assert_eq!(inherited.len(), 1);
-    assert_eq!(inherited[0].value, "fr", "grandchild should see overridden value");
+    assert_eq!(
+        inherited[0].value, "fr",
+        "grandchild should see overridden value"
+    );
 
     v.validate_text("text");
     v.validate_end_element();
@@ -6288,7 +6487,10 @@ fn test_inheritable_not_set() {
     v.validate_end_of_attributes();
 
     let inherited = v.get_inherited_attributes();
-    assert!(inherited.is_empty(), "non-inheritable attr should NOT be inherited");
+    assert!(
+        inherited.is_empty(),
+        "non-inheritable attr should NOT be inherited"
+    );
 
     v.validate_text("text");
     v.validate_end_element();
@@ -6759,7 +6961,10 @@ fn test_psvi_is_simple_complex_type() {
 
     // Simple type element
     let info = v.validate_element("simple", "", None, None, &ns);
-    assert!(info.is_simple_type(), "xs:string element should be simple type");
+    assert!(
+        info.is_simple_type(),
+        "xs:string element should be simple type"
+    );
     assert!(!info.is_complex_type());
     v.validate_end_of_attributes();
     v.validate_text("hi");
@@ -6767,7 +6972,10 @@ fn test_psvi_is_simple_complex_type() {
 
     // Complex type element
     let info = v.validate_element("complex", "", None, None, &ns);
-    assert!(info.is_complex_type(), "complexType element should be complex type");
+    assert!(
+        info.is_complex_type(),
+        "complexType element should be complex type"
+    );
     assert!(!info.is_simple_type());
     v.validate_end_of_attributes();
     v.validate_end_element();
@@ -6819,12 +7027,19 @@ fn test_psvi_identity_constraint_tables() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 
     let tables = v.identity_constraint_tables();
-    assert!(tables.is_some(), "IC tables should be available after validation");
+    assert!(
+        tables.is_some(),
+        "IC tables should be available after validation"
+    );
     let tables = tables.unwrap();
     assert!(!tables.is_empty(), "should have at least one IC table");
     // The unique constraint should have 2 sequences (one for each item)
     let table = tables.values().next().unwrap();
-    assert_eq!(table.sequences.len(), 2, "unique constraint should have 2 key sequences");
+    assert_eq!(
+        table.sequences.len(),
+        2,
+        "unique constraint should have 2 key sequences"
+    );
 }
 
 #[test]
@@ -6876,8 +7091,14 @@ fn test_psvi_schema_error_codes_wildcard_xsi_type() {
     let ns = NamespaceContextSnapshot {
         default_ns: None,
         bindings: vec![
-            (v.schema_set.name_table.add("xsi"), v.schema_set.name_table.add(xsi_ns)),
-            (v.schema_set.name_table.add("xs"), v.schema_set.name_table.add(xs_ns)),
+            (
+                v.schema_set.name_table.add("xsi"),
+                v.schema_set.name_table.add(xsi_ns),
+            ),
+            (
+                v.schema_set.name_table.add("xs"),
+                v.schema_set.name_table.add(xs_ns),
+            ),
         ],
     };
 
@@ -7246,16 +7467,28 @@ fn test_xsi_attribute_decl_returned_for_all_builtins() {
     v.validate_element("root", "", None, None, &ns);
 
     let info_type = v.validate_attribute("type", XSI_NS, "xs:string");
-    assert!(info_type.attribute_decl.is_some(), "xsi:type should have attribute_decl");
+    assert!(
+        info_type.attribute_decl.is_some(),
+        "xsi:type should have attribute_decl"
+    );
 
     let info_nil = v.validate_attribute("nil", XSI_NS, "false");
-    assert!(info_nil.attribute_decl.is_some(), "xsi:nil should have attribute_decl");
+    assert!(
+        info_nil.attribute_decl.is_some(),
+        "xsi:nil should have attribute_decl"
+    );
 
     let info_sl = v.validate_attribute("schemaLocation", XSI_NS, "http://ex.com a.xsd");
-    assert!(info_sl.attribute_decl.is_some(), "xsi:schemaLocation should have attribute_decl");
+    assert!(
+        info_sl.attribute_decl.is_some(),
+        "xsi:schemaLocation should have attribute_decl"
+    );
 
     let info_nnsl = v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "a.xsd");
-    assert!(info_nnsl.attribute_decl.is_some(), "xsi:noNamespaceSchemaLocation should have attribute_decl");
+    assert!(
+        info_nnsl.attribute_decl.is_some(),
+        "xsi:noNamespaceSchemaLocation should have attribute_decl"
+    );
 
     v.validate_end_of_attributes();
     v.validate_text("hello");
@@ -7274,17 +7507,30 @@ fn test_xsi_declarations_visible_through_namespace_lookup() {
     );
 
     // All four XSI attributes should be discoverable via lookup_attribute
-    let type_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_TYPE);
+    let type_key =
+        schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_TYPE);
     assert!(type_key.is_some(), "xsi:type should be in namespace table");
 
     let nil_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_NIL);
     assert!(nil_key.is_some(), "xsi:nil should be in namespace table");
 
-    let sl_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_SCHEMA_LOCATION);
-    assert!(sl_key.is_some(), "xsi:schemaLocation should be in namespace table");
+    let sl_key = schema_set.lookup_attribute(
+        Some(well_known::XSI_NAMESPACE),
+        well_known::XSI_SCHEMA_LOCATION,
+    );
+    assert!(
+        sl_key.is_some(),
+        "xsi:schemaLocation should be in namespace table"
+    );
 
-    let nnsl_key = schema_set.lookup_attribute(Some(well_known::XSI_NAMESPACE), well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION);
-    assert!(nnsl_key.is_some(), "xsi:noNamespaceSchemaLocation should be in namespace table");
+    let nnsl_key = schema_set.lookup_attribute(
+        Some(well_known::XSI_NAMESPACE),
+        well_known::XSI_NO_NAMESPACE_SCHEMA_LOCATION,
+    );
+    assert!(
+        nnsl_key.is_some(),
+        "xsi:noNamespaceSchemaLocation should be in namespace table"
+    );
 }
 
 #[test]
@@ -7315,7 +7561,11 @@ fn test_xsi_schema_location_inherits_per_element_base_uri() {
 
     // Child element with absolute xml:base override
     v.validate_element("child", "", None, None, &ns);
-    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://other.com/schemas/");
+    v.validate_attribute(
+        "base",
+        "http://www.w3.org/XML/1998/namespace",
+        "http://other.com/schemas/",
+    );
     v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "child.xsd");
     v.validate_end_of_attributes();
     v.validate_text("hello");
@@ -7413,9 +7663,17 @@ fn test_duplicate_xml_base_does_not_overwrite() {
 
     v.validate_element("root", "", None, None, &ns);
     // First xml:base — should be applied
-    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://first.com/");
+    v.validate_attribute(
+        "base",
+        "http://www.w3.org/XML/1998/namespace",
+        "http://first.com/",
+    );
     // Duplicate xml:base — should be rejected and NOT overwrite base_uri
-    v.validate_attribute("base", "http://www.w3.org/XML/1998/namespace", "http://second.com/");
+    v.validate_attribute(
+        "base",
+        "http://www.w3.org/XML/1998/namespace",
+        "http://second.com/",
+    );
     // Hint should use the first (valid) xml:base
     v.validate_attribute("noNamespaceSchemaLocation", XSI_NS, "schema.xsd");
     v.validate_end_of_attributes();
@@ -7425,8 +7683,10 @@ fn test_duplicate_xml_base_does_not_overwrite() {
 
     let hints = v.no_namespace_schema_location_hints();
     assert_eq!(hints.len(), 1);
-    assert_eq!(hints[0].base_uri, "http://first.com/",
-        "duplicate xml:base should not overwrite the first");
+    assert_eq!(
+        hints[0].base_uri, "http://first.com/",
+        "duplicate xml:base should not overwrite the first"
+    );
 }
 
 #[test]
@@ -7454,8 +7714,7 @@ fn test_xml_base_after_xsi_hint_rebases_current_element_hints() {
     let hints = v.no_namespace_schema_location_hints();
     assert_eq!(hints.len(), 1);
     assert_eq!(
-        hints[0].base_uri,
-        "http://example.com/docs/subdir/",
+        hints[0].base_uri, "http://example.com/docs/subdir/",
         "xml:base should rebase earlier hints on the same element"
     );
 }
@@ -7675,7 +7934,10 @@ fn test_prohibited_attribute_overrides_base() {
     v.validate_end_of_attributes();
     v.validate_end_element();
     let _ = v.end_validation();
-    assert!(v.sink.errors.is_empty(), "inherited 'allowed' should be accepted");
+    assert!(
+        v.sink.errors.is_empty(),
+        "inherited 'allowed' should be accepted"
+    );
 
     // "forbidden" should be rejected
     let mut v2 = validator.start_run(TestSink::new());
@@ -8155,7 +8417,10 @@ fn test_ic_singleton_list_equals_atomic() {
         )),
     };
 
-    assert_eq!(atomic, singleton_list, "atomic xs:Name must equal singleton list-of-xs:Name for IC");
+    assert_eq!(
+        atomic, singleton_list,
+        "atomic xs:Name must equal singleton list-of-xs:Name for IC"
+    );
     assert_eq!(singleton_list, atomic, "equality must be symmetric");
 }
 
@@ -8197,7 +8462,10 @@ fn test_xsd11_same_id_on_same_element() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let dup_errors: Vec<_> = v.sink.errors.iter()
+    let dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.2")
         .collect();
     assert!(
@@ -8310,7 +8578,10 @@ fn test_xsd11_child_element_id_binds_to_parent() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let dup_errors: Vec<_> = v.sink.errors.iter()
+    let dup_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.2")
         .collect();
     assert!(
@@ -8369,7 +8640,10 @@ fn test_xsd11_list_of_id_per_item_tracking() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let idref_errors: Vec<_> = v.sink.errors.iter()
+    let idref_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-id.1")
         .collect();
     assert!(
@@ -8437,7 +8711,10 @@ fn test_xsd11_ic_ref_resolves_global() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-identity-constraint.4.2.2"),
         "IC @ref must resolve and enforce the unique constraint, errors={:?}",
         v.sink.errors,
     );
@@ -8469,7 +8746,10 @@ fn test_entity_undeclared_reports_error() {
     v.end_validation().ok();
 
     assert!(
-        v.sink.errors.iter().any(|e| e.constraint == "cvc-datatype-valid.1.2.1"),
+        v.sink
+            .errors
+            .iter()
+            .any(|e| e.constraint == "cvc-datatype-valid.1.2.1"),
         "undeclared ENTITY must report error, errors={:?}",
         v.sink.errors,
     );
@@ -8501,7 +8781,10 @@ fn test_entity_declared_passes() {
     v.validate_end_element();
     v.end_validation().ok();
 
-    let entity_errors: Vec<_> = v.sink.errors.iter()
+    let entity_errors: Vec<_> = v
+        .sink
+        .errors
+        .iter()
         .filter(|e| e.constraint == "cvc-datatype-valid.1.2.1")
         .collect();
     assert!(

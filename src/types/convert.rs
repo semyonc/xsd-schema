@@ -16,20 +16,17 @@
 use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
-use super::value::{XmlValue, XmlValueKind, XmlAtomicValue};
 #[cfg(feature = "xsd11")]
-use super::sequence::{SequenceType, ItemType};
-use super::{XmlTypeCode, PrimitiveTypeCode};
-use super::validators::{ValidatorRegistry, ValidationError};
+use super::sequence::{ItemType, SequenceType};
+use super::validators::{ValidationError, ValidatorRegistry};
+use super::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use super::{PrimitiveTypeCode, XmlTypeCode};
 
 /// Error type for conversion operations
 #[derive(Debug, Clone)]
 pub enum ConversionError {
     /// Type conversion not allowed (XPTY0004)
-    TypeMismatch {
-        from: XmlTypeCode,
-        to: XmlTypeCode,
-    },
+    TypeMismatch { from: XmlTypeCode, to: XmlTypeCode },
     /// Invalid value for target type (FORG0001)
     InvalidValue {
         value: String,
@@ -53,11 +50,23 @@ impl std::fmt::Display for ConversionError {
             Self::TypeMismatch { from, to } => {
                 write!(f, "XPTY0004: Cannot convert {:?} to {:?}", from, to)
             }
-            Self::InvalidValue { value, target_type, message } => {
-                write!(f, "FORG0001: Invalid {} value '{}': {}", target_type, value, message)
+            Self::InvalidValue {
+                value,
+                target_type,
+                message,
+            } => {
+                write!(
+                    f,
+                    "FORG0001: Invalid {} value '{}': {}",
+                    target_type, value, message
+                )
             }
             Self::Overflow { value, target_type } => {
-                write!(f, "FOAR0002: Overflow converting '{}' to {}", value, target_type)
+                write!(
+                    f,
+                    "FOAR0002: Overflow converting '{}' to {}",
+                    value, target_type
+                )
             }
             Self::EmptySequence => {
                 write!(f, "XPTY0004: Empty sequence where value expected")
@@ -110,7 +119,9 @@ impl TypeConverter {
         // Handle untyped atomic - cast via string
         if value.is_untyped() {
             let str_val = value.to_string_value();
-            return self.validators.validate(target, &str_val)
+            return self
+                .validators
+                .validate(target, &str_val)
                 .map_err(ConversionError::from);
         }
 
@@ -154,20 +165,22 @@ impl TypeConverter {
             XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => Ok(*d),
             XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Ok(*f as f64),
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => {
-                d.to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: d.to_string(),
-                    target_type: "double",
-                })
+                d.to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: d.to_string(),
+                        target_type: "double",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => {
-                i.to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: i.to_string(),
-                    target_type: "double",
-                })
+                i.to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: i.to_string(),
+                        target_type: "double",
+                    })
             }
-            XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
-                Ok(if *b { 1.0 } else { 0.0 })
-            }
+            XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => Ok(if *b { 1.0 } else { 0.0 }),
             XmlValueKind::UntypedAtomic(s) => {
                 s.trim().parse().map_err(|_| ConversionError::InvalidValue {
                     value: s.clone(),
@@ -187,10 +200,12 @@ impl TypeConverter {
         match &value.value {
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => Ok(*d),
             XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => {
-                i.to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: i.to_string(),
-                    target_type: "decimal",
-                })
+                i.to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: i.to_string(),
+                        target_type: "decimal",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
                 if f.is_nan() || f.is_infinite() {
@@ -242,10 +257,13 @@ impl TypeConverter {
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => {
                 // Truncate to integer
                 let truncated = d.trunc();
-                truncated.to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: d.to_string(),
-                    target_type: "integer",
-                })
+                truncated
+                    .to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: d.to_string(),
+                        target_type: "integer",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
                 if f.is_nan() || f.is_infinite() {
@@ -256,10 +274,13 @@ impl TypeConverter {
                     });
                 }
                 let truncated = f.trunc();
-                (truncated as i64).to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: f.to_string(),
-                    target_type: "integer",
-                })
+                (truncated as i64)
+                    .to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: f.to_string(),
+                        target_type: "integer",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
                 if d.is_nan() || d.is_infinite() {
@@ -270,10 +291,13 @@ impl TypeConverter {
                     });
                 }
                 let truncated = d.trunc();
-                (truncated as i64).to_string().parse().map_err(|_| ConversionError::Overflow {
-                    value: d.to_string(),
-                    target_type: "integer",
-                })
+                (truncated as i64)
+                    .to_string()
+                    .parse()
+                    .map_err(|_| ConversionError::Overflow {
+                        value: d.to_string(),
+                        target_type: "integer",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
                 Ok(if *b { BigInt::from(1) } else { BigInt::from(0) })
@@ -390,17 +414,13 @@ impl TypeConverter {
                 let b = self.to_boolean(value)?;
                 Ok(XmlValue::boolean(b))
             }
-            XmlTypeCode::String => {
-                Ok(XmlValue::string(str_val))
-            }
-            XmlTypeCode::UntypedAtomic => {
-                Ok(XmlValue::untyped(str_val))
-            }
+            XmlTypeCode::String => Ok(XmlValue::string(str_val)),
+            XmlTypeCode::UntypedAtomic => Ok(XmlValue::untyped(str_val)),
             // For other types, use the validator
-            _ => {
-                self.validators.validate(target, &str_val)
-                    .map_err(ConversionError::from)
-            }
+            _ => self
+                .validators
+                .validate(target, &str_val)
+                .map_err(ConversionError::from),
         }
     }
 }
@@ -569,14 +589,20 @@ fn derives_from(derived: XmlTypeCode, base: XmlTypeCode) -> bool {
             XmlTypeCode::UnsignedInt | XmlTypeCode::UnsignedShort | XmlTypeCode::UnsignedByte
         ),
         XmlTypeCode::UnsignedInt => {
-            matches!(derived, XmlTypeCode::UnsignedShort | XmlTypeCode::UnsignedByte)
+            matches!(
+                derived,
+                XmlTypeCode::UnsignedShort | XmlTypeCode::UnsignedByte
+            )
         }
         XmlTypeCode::UnsignedShort => matches!(derived, XmlTypeCode::UnsignedByte),
         XmlTypeCode::NonPositiveInteger => matches!(derived, XmlTypeCode::NegativeInteger),
 
         // Duration hierarchy
         XmlTypeCode::Duration => {
-            matches!(derived, XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration)
+            matches!(
+                derived,
+                XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
+            )
         }
 
         // DateTime hierarchy
@@ -661,8 +687,12 @@ mod tests {
         assert!(!converter.to_boolean(&XmlValue::boolean(false)).unwrap());
         assert!(converter.to_boolean(&XmlValue::string("hello")).unwrap());
         assert!(!converter.to_boolean(&XmlValue::string("")).unwrap());
-        assert!(converter.to_boolean(&XmlValue::integer(BigInt::from(1))).unwrap());
-        assert!(!converter.to_boolean(&XmlValue::integer(BigInt::from(0))).unwrap());
+        assert!(converter
+            .to_boolean(&XmlValue::integer(BigInt::from(1)))
+            .unwrap());
+        assert!(!converter
+            .to_boolean(&XmlValue::integer(BigInt::from(0)))
+            .unwrap());
         assert!(converter.to_boolean(&XmlValue::double(1.5)).unwrap());
         assert!(!converter.to_boolean(&XmlValue::double(0.0)).unwrap());
         assert!(!converter.to_boolean(&XmlValue::double(f64::NAN)).unwrap());
@@ -674,8 +704,18 @@ mod tests {
 
         assert_eq!(converter.to_double(&XmlValue::double(2.5)).unwrap(), 2.5);
         assert_eq!(converter.to_double(&XmlValue::float(2.5)).unwrap(), 2.5);
-        assert_eq!(converter.to_double(&XmlValue::integer(BigInt::from(42))).unwrap(), 42.0);
-        assert_eq!(converter.to_double(&XmlValue::decimal(Decimal::new(123, 1))).unwrap(), 12.3);
+        assert_eq!(
+            converter
+                .to_double(&XmlValue::integer(BigInt::from(42)))
+                .unwrap(),
+            42.0
+        );
+        assert_eq!(
+            converter
+                .to_double(&XmlValue::decimal(Decimal::new(123, 1)))
+                .unwrap(),
+            12.3
+        );
         assert_eq!(converter.to_double(&XmlValue::boolean(true)).unwrap(), 1.0);
         assert_eq!(converter.to_double(&XmlValue::boolean(false)).unwrap(), 0.0);
     }
@@ -685,7 +725,9 @@ mod tests {
         let converter = TypeConverter::new();
 
         assert_eq!(
-            converter.to_integer(&XmlValue::integer(BigInt::from(42))).unwrap(),
+            converter
+                .to_integer(&XmlValue::integer(BigInt::from(42)))
+                .unwrap(),
             BigInt::from(42)
         );
         assert_eq!(
@@ -693,7 +735,9 @@ mod tests {
             BigInt::from(3) // Truncated
         );
         assert_eq!(
-            converter.to_integer(&XmlValue::decimal(Decimal::new(99, 1))).unwrap(),
+            converter
+                .to_integer(&XmlValue::decimal(Decimal::new(99, 1)))
+                .unwrap(),
             BigInt::from(9) // Truncated from 9.9
         );
     }
@@ -769,13 +813,25 @@ mod tests {
         assert!(derives_from(XmlTypeCode::Byte, XmlTypeCode::Short));
 
         // String hierarchy
-        assert!(derives_from(XmlTypeCode::NormalizedString, XmlTypeCode::String));
-        assert!(derives_from(XmlTypeCode::Token, XmlTypeCode::NormalizedString));
+        assert!(derives_from(
+            XmlTypeCode::NormalizedString,
+            XmlTypeCode::String
+        ));
+        assert!(derives_from(
+            XmlTypeCode::Token,
+            XmlTypeCode::NormalizedString
+        ));
         assert!(derives_from(XmlTypeCode::NCName, XmlTypeCode::Name));
 
         // Duration hierarchy
-        assert!(derives_from(XmlTypeCode::YearMonthDuration, XmlTypeCode::Duration));
-        assert!(derives_from(XmlTypeCode::DayTimeDuration, XmlTypeCode::Duration));
+        assert!(derives_from(
+            XmlTypeCode::YearMonthDuration,
+            XmlTypeCode::Duration
+        ));
+        assert!(derives_from(
+            XmlTypeCode::DayTimeDuration,
+            XmlTypeCode::Duration
+        ));
 
         // Negative cases
         assert!(!derives_from(XmlTypeCode::String, XmlTypeCode::Integer));

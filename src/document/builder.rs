@@ -4,8 +4,8 @@
 //! its low-level push API (`start_element`, `attribute`, `text`, …) or via
 //! the `build()` method which drives the push API from a quick-xml event stream.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::BufRead;
 
@@ -13,8 +13,8 @@ use bumpalo::Bump;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
-use crate::namespace::NameTable;
 use crate::namespace::table::XML_NAMESPACE;
+use crate::namespace::NameTable;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
 
@@ -22,7 +22,7 @@ use super::buffer::BufferDocument;
 use super::error::BufferDocumentError;
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
-    NamespacePageFactory, Node, NodePages, NodeSourceSpans, NodeSchemaBinding, NodeType, NsRef,
+    NamespacePageFactory, Node, NodePages, NodeSchemaBinding, NodeSourceSpans, NodeType, NsRef,
     QNameAtom, QNameTable, StringStore, NULL,
 };
 
@@ -425,11 +425,7 @@ impl<'a> BufferDocumentBuilder<'a> {
     ///
     /// Returns [`BufferDocumentError::DuplicateId`] if the id has already
     /// been registered.  This is a no-op in `Fragment` mode.
-    pub fn register_xml_id(
-        &mut self,
-        id: &str,
-        elem_ref: u32,
-    ) -> Result<(), BufferDocumentError> {
+    pub fn register_xml_id(&mut self, id: &str, elem_ref: u32) -> Result<(), BufferDocumentError> {
         if self.doc.kind != DocumentKind::Full {
             return Ok(());
         }
@@ -520,7 +516,10 @@ impl<'a> BufferDocumentBuilder<'a> {
     // ── quick-xml adapter ─────────────────────────────────────────────
 
     /// Builds the document from a quick-xml event stream.
-    pub fn build<R: BufRead>(mut self, reader: R) -> Result<BufferDocument<'a>, BufferDocumentError> {
+    pub fn build<R: BufRead>(
+        mut self,
+        reader: R,
+    ) -> Result<BufferDocument<'a>, BufferDocumentError> {
         let mut xml_reader = Reader::from_reader(reader);
         xml_reader.trim_text(false);
 
@@ -550,23 +549,15 @@ impl<'a> BufferDocumentBuilder<'a> {
 
             match xml_reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
-                    let elem_ref = self.handle_start_or_empty(
-                        e,
-                        false,
-                        &mut prefix_map,
-                        &mut scope_decls,
-                    )?;
+                    let elem_ref =
+                        self.handle_start_or_empty(e, false, &mut prefix_map, &mut scope_decls)?;
                     if track {
                         self.pending_spans.push((elem_ref, event_start));
                     }
                 }
                 Ok(Event::Empty(ref e)) => {
-                    let elem_ref = self.handle_start_or_empty(
-                        e,
-                        true,
-                        &mut prefix_map,
-                        &mut scope_decls,
-                    )?;
+                    let elem_ref =
+                        self.handle_start_or_empty(e, true, &mut prefix_map, &mut scope_decls)?;
                     if track {
                         self.doc.source_spans.set(
                             elem_ref,
@@ -678,8 +669,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         // Resolve element name
         let full_name = e.name();
         let full_name_bytes = full_name.as_ref();
-        let (elem_prefix_bytes, elem_local_bytes) =
-            split_prefix_local(full_name_bytes);
+        let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
 
         let elem_local =
             std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
@@ -721,9 +711,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 String::new()
             } else {
                 match prefix_map.get(attr_prefix_bytes) {
-                    Some(stack) if !stack.is_empty() => {
-                        stack.last().unwrap().as_str().to_string()
-                    }
+                    Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
                     _ => {
                         return Err(BufferDocumentError::UnboundPrefix(
                             attr_prefix_str.to_string(),
@@ -742,9 +730,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             {
                 let id_val: Box<str> = unescaped.as_ref().into();
                 if self.doc.id_elements.contains_key(&id_val) {
-                    return Err(BufferDocumentError::DuplicateId(
-                        id_val.into_string(),
-                    ));
+                    return Err(BufferDocumentError::DuplicateId(id_val.into_string()));
                 }
                 self.doc.id_elements.insert(id_val, elem_ref);
             }
@@ -803,17 +789,11 @@ mod tests {
     use crate::ids::TypeKey;
     use crate::navigator::DomNavigator;
 
-    fn make_builder<'a>(
-        arena: &'a Bump,
-        names: &'a NameTable,
-    ) -> BufferDocumentBuilder<'a> {
+    fn make_builder<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocumentBuilder<'a> {
         BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default()).unwrap()
     }
 
-    fn make_builder_full<'a>(
-        arena: &'a Bump,
-        names: &'a NameTable,
-    ) -> BufferDocumentBuilder<'a> {
+    fn make_builder_full<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocumentBuilder<'a> {
         BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::full()).unwrap()
     }
 
@@ -1026,7 +1006,12 @@ mod tests {
         let mut builder = make_builder(&arena, &names);
 
         builder
-            .start_element("root", "http://example.com", "ex", &[("ex", "http://example.com")])
+            .start_element(
+                "root",
+                "http://example.com",
+                "ex",
+                &[("ex", "http://example.com")],
+            )
             .unwrap();
         builder.end_of_attributes();
         builder.end_element().unwrap();
@@ -1046,13 +1031,23 @@ mod tests {
 
         // Outer element declares ns
         builder
-            .start_element("outer", "http://outer.com", "o", &[("o", "http://outer.com")])
+            .start_element(
+                "outer",
+                "http://outer.com",
+                "o",
+                &[("o", "http://outer.com")],
+            )
             .unwrap();
         builder.end_of_attributes();
 
         // Inner element declares different ns with same prefix
         builder
-            .start_element("inner", "http://inner.com", "o", &[("o", "http://inner.com")])
+            .start_element(
+                "inner",
+                "http://inner.com",
+                "o",
+                &[("o", "http://inner.com")],
+            )
             .unwrap();
         builder.end_of_attributes();
         builder.end_element().unwrap();
@@ -1195,10 +1190,7 @@ mod tests {
 
         let qname = doc.qname_table.get(elem.value);
         assert_eq!(doc.names.resolve(qname.local_name), "root");
-        assert_eq!(
-            doc.names.resolve(qname.namespace_uri),
-            "http://example.com"
-        );
+        assert_eq!(doc.names.resolve(qname.namespace_uri), "http://example.com");
         assert_eq!(doc.names.resolve(qname.prefix), "ns");
     }
 
@@ -1291,9 +1283,7 @@ mod tests {
 
     #[test]
     fn test_build_xml_id() {
-        let doc = build_from_str_full(
-            r#"<root xml:id="myid"/>"#,
-        );
+        let doc = build_from_str_full(r#"<root xml:id="myid"/>"#);
         assert_eq!(doc.get_element_by_id("myid"), Some(1));
     }
 
@@ -1303,9 +1293,7 @@ mod tests {
         let names = Box::leak(Box::new(NameTable::new()));
         let builder =
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::full()).unwrap();
-        let result = builder.build(
-            r#"<root><a xml:id="dup"/><b xml:id="dup"/></root>"#.as_bytes(),
-        );
+        let result = builder.build(r#"<root><a xml:id="dup"/><b xml:id="dup"/></root>"#.as_bytes());
         assert!(matches!(result, Err(BufferDocumentError::DuplicateId(_))));
     }
 
@@ -1317,10 +1305,7 @@ mod tests {
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
                 .unwrap();
         let result = builder.build(r#"<ns:root/>"#.as_bytes());
-        assert!(matches!(
-            result,
-            Err(BufferDocumentError::UnboundPrefix(_))
-        ));
+        assert!(matches!(result, Err(BufferDocumentError::UnboundPrefix(_))));
     }
 
     #[test]
@@ -1410,8 +1395,8 @@ mod tests {
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // element
-        assert!(nav.move_to_parent());      // back to Root
-        assert!(!nav.move_to_parent());     // boundary — Root has parent=NULL
+        assert!(nav.move_to_parent()); // back to Root
+        assert!(!nav.move_to_parent()); // boundary — Root has parent=NULL
     }
 
     #[test]
@@ -1460,7 +1445,12 @@ mod tests {
         let mut builder = make_builder_fragment(&arena, &names);
 
         builder
-            .start_element("outer", "http://example.com", "ex", &[("ex", "http://example.com")])
+            .start_element(
+                "outer",
+                "http://example.com",
+                "ex",
+                &[("ex", "http://example.com")],
+            )
             .unwrap();
         builder.end_of_attributes();
 

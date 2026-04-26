@@ -50,7 +50,8 @@ impl<N: DomNavigator> XmlItem<N> {
 
     /// Try to extract a string from an atomic item.
     pub fn as_str(&self) -> Option<String> {
-        self.as_atomic().and_then(|v| v.as_string().map(|s| s.to_string()))
+        self.as_atomic()
+            .and_then(|v| v.as_string().map(|s| s.to_string()))
     }
 
     /// Try to extract a boolean from an atomic item.
@@ -146,10 +147,7 @@ pub struct VecNodeIterator<N: DomNavigator> {
 
 impl<N: DomNavigator> VecNodeIterator<N> {
     pub fn new(items: Vec<XmlItem<N>>) -> Self {
-        Self {
-            items,
-            index: None,
-        }
+        Self { items, index: None }
     }
 }
 
@@ -629,10 +627,7 @@ mod tests {
 
     fn current_integer<N: DomNavigator>(iter: &impl XmlNodeIterator<Navigator = N>) -> BigInt {
         match iter.current() {
-            Some(XmlItemRef::Atomic(value)) => value
-                .as_integer()
-                .expect("integer value")
-                .clone(),
+            Some(XmlItemRef::Atomic(value)) => value.as_integer().expect("integer value").clone(),
             _ => panic!("expected integer value"),
         }
     }

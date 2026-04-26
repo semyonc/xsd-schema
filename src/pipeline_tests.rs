@@ -31,13 +31,19 @@ fn test_load_and_process_element_with_type() {
 
     let stats = result.unwrap();
     let resolution_stats = stats.resolution_stats.unwrap();
-    assert!(resolution_stats.types_resolved > 0, "Should resolve type reference");
+    assert!(
+        resolution_stats.types_resolved > 0,
+        "Should resolve type reference"
+    );
 
     // Verify element's type was resolved
     let root_name = schema_set.name_table.get("root").unwrap();
     let elem_key = schema_set.lookup_element(None, root_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Element type should be resolved");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Element type should be resolved"
+    );
 }
 
 #[test]
@@ -56,17 +62,27 @@ fn test_load_and_process_inline_complex_type() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should parse schema with inline type: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Should parse schema with inline type: {:?}",
+        result
+    );
 
     let stats = result.unwrap();
     let inline_stats = stats.inline_stats.unwrap();
-    assert!(inline_stats.element_inline_types > 0, "Should assemble inline complex type");
+    assert!(
+        inline_stats.element_inline_types > 0,
+        "Should assemble inline complex type"
+    );
 
     // Verify element's resolved_type is set
     let person_name = schema_set.name_table.get("person").unwrap();
     let elem_key = schema_set.lookup_element(None, person_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Inline type should be resolved");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Inline type should be resolved"
+    );
     assert!(matches!(elem.resolved_type, Some(TypeKey::Complex(_))));
 }
 
@@ -86,17 +102,27 @@ fn test_load_and_process_inline_simple_type() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should parse schema with inline simple type: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Should parse schema with inline simple type: {:?}",
+        result
+    );
 
     let stats = result.unwrap();
     let inline_stats = stats.inline_stats.unwrap();
-    assert!(inline_stats.element_inline_types > 0, "Should assemble inline simple type");
+    assert!(
+        inline_stats.element_inline_types > 0,
+        "Should assemble inline simple type"
+    );
 
     // Verify element's resolved_type is set
     let status_name = schema_set.name_table.get("status").unwrap();
     let elem_key = schema_set.lookup_element(None, status_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Inline type should be resolved");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Inline type should be resolved"
+    );
     assert!(matches!(elem.resolved_type, Some(TypeKey::Simple(_))));
 }
 
@@ -181,7 +207,11 @@ fn test_load_and_process_accepts_sequence_restriction_of_all_group() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "all-group restriction should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "all-group restriction should be valid: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -282,7 +312,10 @@ fn test_reject_repeated_sequence_occurs_mismatch() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "b{{3,3}} cannot restrict sequence{{1,2}}(b{{2,2}})");
+    assert!(
+        result.is_err(),
+        "b{{3,3}} cannot restrict sequence{{1,2}}(b{{2,2}})"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "derivation-ok-restriction");
@@ -324,7 +357,10 @@ fn test_reject_choice_branch_occurs_mismatch() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "c1{{3,3}} cannot restrict choice branch c1{{2,2}}");
+    assert!(
+        result.is_err(),
+        "c1{{3,3}} cannot restrict choice branch c1{{2,2}}"
+    );
 }
 
 /// Section 3.8 normalization: flatten nested same-compositor groups with
@@ -367,7 +403,11 @@ fn test_accept_group_ref_restriction_with_flatten() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "group ref restriction should be valid after flattening: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "group ref restriction should be valid after flattening: {:?}",
+        result
+    );
 }
 
 /// Pointless particles (maxOccurs=0) must be removed during normalization.
@@ -397,7 +437,11 @@ fn test_accept_restriction_with_zero_max_occurs_branch() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "restriction with maxOccurs=0 branch should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "restriction with maxOccurs=0 branch should be valid: {:?}",
+        result
+    );
 }
 
 /// Restriction where derived is entirely pointless (all maxOccurs=0) against
@@ -425,7 +469,11 @@ fn test_accept_all_zero_restriction_of_optional_wildcard() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "all-zero restriction of optional wildcard should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "all-zero restriction of optional wildcard should be valid: {:?}",
+        result
+    );
 }
 
 /// Empty extension inherits base content. Restricting such a type must see
@@ -457,7 +505,11 @@ fn test_accept_restriction_of_empty_extension() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "restriction of empty extension should see inherited content: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "restriction of empty extension should see inherited content: {:?}",
+        result
+    );
 }
 
 /// Cross-compositor restriction: sequence restricts repeated choice.
@@ -487,7 +539,11 @@ fn test_accept_sequence_restricting_repeated_choice() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "cross-compositor restriction should be provisionally accepted: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "cross-compositor restriction should be provisionally accepted: {:?}",
+        result
+    );
 }
 
 // ── Step 2 regression targets ───────────────────────────────────────────
@@ -528,7 +584,11 @@ fn test_accept_repeated_sequence_restriction_w011() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "sequence{{1,1}} validly restricts sequence{{1,9}}: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "sequence{{1,1}} validly restricts sequence{{1,9}}: {:?}",
+        result
+    );
 }
 
 /// Valid: repeated-sequence restriction with element type narrowing.
@@ -576,7 +636,11 @@ fn test_accept_repeated_sequence_restriction_type_narrowing_w016() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "type-narrowed sequence restriction should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "type-narrowed sequence restriction should be valid: {:?}",
+        result
+    );
 }
 
 /// Invalid: sequence-vs-choice where derived e3 minOccurs=2 is less than
@@ -608,7 +672,10 @@ fn test_reject_sequence_vs_choice_min_violation_v002() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "sequence-vs-choice: e3 min=2 violates base choice branch min=3");
+    assert!(
+        result.is_err(),
+        "sequence-vs-choice: e3 min=2 violates base choice branch min=3"
+    );
 }
 
 /// Invalid: sequence-vs-choice where derived sequence{0,2}(e1{0,2},e2{0,2})
@@ -640,7 +707,10 @@ fn test_reject_sequence_vs_choice_not_expressible_v005() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "sequence-vs-choice with both elements required per repetition is invalid");
+    assert!(
+        result.is_err(),
+        "sequence-vs-choice with both elements required per repetition is invalid"
+    );
 }
 
 /// Invalid: sequence-vs-choice where derived sequence introduces e4 which
@@ -673,7 +743,10 @@ fn test_reject_sequence_vs_choice_extra_element_v016() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "sequence-vs-choice: e4 has no base counterpart");
+    assert!(
+        result.is_err(),
+        "sequence-vs-choice: e4 has no base counterpart"
+    );
 }
 
 /// Invalid: sequence-vs-choice where derived element e1 has type ct2
@@ -715,7 +788,10 @@ fn test_reject_sequence_vs_choice_type_mismatch_v018() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "sequence-vs-choice: ct2 is not derived from ct1");
+    assert!(
+        result.is_err(),
+        "sequence-vs-choice: ct2 is not derived from ct1"
+    );
 }
 
 /// Invalid: all-from-choice — derived `all` restricts base `choice`.
@@ -793,7 +869,10 @@ fn test_reject_all_restricting_sequence_hb007() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "all-from-sequence restriction via group refs is forbidden");
+    assert!(
+        result.is_err(),
+        "all-from-sequence restriction via group refs is forbidden"
+    );
 }
 
 /// Invalid: choice-from-all — derived `choice` restricts base `all`.
@@ -858,7 +937,10 @@ fn test_reject_choice_branch_element_vs_sequence_m033() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "choice branch d2 cannot restrict base sequence(d1,d2)");
+    assert!(
+        result.is_err(),
+        "choice branch d2 cannot restrict base sequence(d1,d2)"
+    );
 }
 
 /// Invalid: choice restriction where derived branch d1 cannot match
@@ -893,7 +975,10 @@ fn test_reject_choice_branch_vs_multi_child_sequences_m034() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "choice branch d1 cannot restrict either base sequence branch");
+    assert!(
+        result.is_err(),
+        "choice branch d1 cannot restrict either base sequence branch"
+    );
 }
 
 /// Choice-vs-choice restriction where both are optional.  The derived
@@ -925,7 +1010,11 @@ fn test_accept_choice_restriction_all_branches_zero() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "choice restriction with all-zero branches should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "choice restriction with all-zero branches should be valid: {:?}",
+        result
+    );
 }
 
 /// recurseAsIfGroup: element restricts base group.  The implicit wrapper
@@ -953,7 +1042,10 @@ fn test_reject_element_restricting_group_with_required_repetition() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "derived sequence{{1,1}} cannot restrict base sequence{{2,2}}");
+    assert!(
+        result.is_err(),
+        "derived sequence{{1,1}} cannot restrict base sequence{{2,2}}"
+    );
 }
 
 /// Valid same-compositor restriction: sequence restricts sequence with
@@ -981,7 +1073,11 @@ fn test_accept_sequence_restriction_dropping_optional() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "dropping optional tail should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "dropping optional tail should be valid: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -1001,12 +1097,19 @@ fn test_load_and_process_attribute_with_inline_type() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should parse schema with attribute inline type: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Should parse schema with attribute inline type: {:?}",
+        result
+    );
 
     let stats = result.unwrap();
     let inline_stats = stats.inline_stats.unwrap();
     // The inline type is within a complex type's attribute, so it should be counted
-    assert!(inline_stats.total_inline_types > 0, "Should assemble attribute inline type");
+    assert!(
+        inline_stats.total_inline_types > 0,
+        "Should assemble attribute inline type"
+    );
 }
 
 #[test]
@@ -1034,7 +1137,10 @@ fn test_parse_only_mode() {
     let root_name = schema_set.name_table.get("root").unwrap();
     let elem_key = schema_set.lookup_element(None, root_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_none(), "Type should not be resolved in parse-only mode");
+    assert!(
+        elem.resolved_type.is_none(),
+        "Type should not be resolved in parse-only mode"
+    );
 }
 
 #[test]
@@ -1067,7 +1173,10 @@ fn test_process_loaded_schemas() {
 
     // Element type should now be resolved
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Type should be resolved after processing");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Type should be resolved after processing"
+    );
 
     // Resolution stats should show resolved references
     // Resolution stats should show we processed the schemas
@@ -1130,12 +1239,19 @@ fn test_nested_inline_types() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should handle nested inline types: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Should handle nested inline types: {:?}",
+        result
+    );
 
     let stats = result.unwrap();
     let inline_stats = stats.inline_stats.unwrap();
     // Should have multiple inline types: order's complexType, item's complexType, price's simpleType
-    assert!(inline_stats.total_inline_types >= 1, "Should assemble multiple inline types");
+    assert!(
+        inline_stats.total_inline_types >= 1,
+        "Should assemble multiple inline types"
+    );
 }
 
 // ========================================================================
@@ -1155,11 +1271,17 @@ fn test_reject_element_name_and_ref() {
     config.parser.error_recovery = false;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
-    assert!(result.is_err(), "Should reject element with both name and ref");
+    assert!(
+        result.is_err(),
+        "Should reject element with both name and ref"
+    );
 
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("name") || err.to_string().contains("ref"),
-        "Error should mention name/ref conflict: {}", err);
+    assert!(
+        err.to_string().contains("name") || err.to_string().contains("ref"),
+        "Error should mention name/ref conflict: {}",
+        err
+    );
 }
 
 #[test]
@@ -1181,7 +1303,10 @@ fn test_list_itemtype_xor_inline() {
     config.parser.error_recovery = false;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
-    assert!(result.is_err(), "Should reject list with both itemType and inline type");
+    assert!(
+        result.is_err(),
+        "Should reject list with both itemType and inline type"
+    );
 }
 
 #[test]
@@ -1202,8 +1327,10 @@ fn test_union_requires_membertypes_or_inline() {
     // Note: This validation might happen during assembly or resolution, not parsing
     // If the schema parses but fails during resolution, we still consider it a success
     // as long as the error is eventually caught
-    assert!(result.is_err() || !schema_set.arenas.simple_types.is_empty(),
-        "Should either reject empty union or parse it for later validation");
+    assert!(
+        result.is_err() || !schema_set.arenas.simple_types.is_empty(),
+        "Should either reject empty union or parse it for later validation"
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -1222,12 +1349,18 @@ fn test_xsd11_assert_rejected_in_10_mode() {
         </xs:schema>"#;
 
     let config = PipelineConfig {
-        parser: ParserConfig { error_recovery: false, ..Default::default() },
+        parser: ParserConfig {
+            error_recovery: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
-    assert!(result.is_err(), "xs:assert should be rejected in XSD 1.0 mode");
+    assert!(
+        result.is_err(),
+        "xs:assert should be rejected in XSD 1.0 mode"
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -1246,7 +1379,11 @@ fn test_xsd11_assert_allowed_in_11_mode() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "xs:assert should be allowed in XSD 1.1 mode: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "xs:assert should be allowed in XSD 1.1 mode: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -1262,12 +1399,18 @@ fn test_xsd11_alternative_rejected_in_10_mode() {
         </xs:schema>"#;
 
     let config = PipelineConfig {
-        parser: ParserConfig { error_recovery: false, ..Default::default() },
+        parser: ParserConfig {
+            error_recovery: false,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, Some(config));
-    assert!(result.is_err(), "xs:alternative should be rejected in XSD 1.0 mode");
+    assert!(
+        result.is_err(),
+        "xs:alternative should be rejected in XSD 1.0 mode"
+    );
 }
 
 #[test]
@@ -1322,16 +1465,26 @@ fn test_element_foreign_attribute_creates_implicit_annotation() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Should parse schema with foreign attribute: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Should parse schema with foreign attribute: {:?}",
+        result
+    );
 
     // Verify element has annotation with foreign attribute
     let test_name = schema_set.name_table.get("test").unwrap();
     let elem_key = schema_set.lookup_element(None, test_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
 
-    assert!(elem.annotation.is_some(), "Element with foreign attribute should have annotation");
+    assert!(
+        elem.annotation.is_some(),
+        "Element with foreign attribute should have annotation"
+    );
     let ann = elem.annotation.as_ref().unwrap();
-    assert!(!ann.attributes.is_empty(), "Annotation should have foreign attributes");
+    assert!(
+        !ann.attributes.is_empty(),
+        "Annotation should have foreign attributes"
+    );
     assert_eq!(ann.attributes[0].value, "value");
 }
 
@@ -1359,8 +1512,14 @@ fn test_foreign_attribute_merged_with_explicit_annotation() {
 
     assert!(elem.annotation.is_some(), "Element should have annotation");
     let ann = elem.annotation.as_ref().unwrap();
-    assert!(!ann.items.is_empty(), "Annotation should have documentation item");
-    assert!(!ann.attributes.is_empty(), "Annotation should have merged foreign attributes");
+    assert!(
+        !ann.items.is_empty(),
+        "Annotation should have documentation item"
+    );
+    assert!(
+        !ann.attributes.is_empty(),
+        "Annotation should have merged foreign attributes"
+    );
 }
 
 #[test]
@@ -1385,9 +1544,15 @@ fn test_complex_type_foreign_attribute() {
     let type_key = schema_set.lookup_type(None, type_name).unwrap();
     if let TypeKey::Complex(ct_key) = type_key {
         let ct = schema_set.arenas.complex_types.get(ct_key).unwrap();
-        assert!(ct.annotation.is_some(), "ComplexType with foreign attribute should have annotation");
+        assert!(
+            ct.annotation.is_some(),
+            "ComplexType with foreign attribute should have annotation"
+        );
         let ann = ct.annotation.as_ref().unwrap();
-        assert!(!ann.attributes.is_empty(), "Annotation should have foreign attributes");
+        assert!(
+            !ann.attributes.is_empty(),
+            "Annotation should have foreign attributes"
+        );
     } else {
         panic!("Expected complex type");
     }
@@ -1435,7 +1600,11 @@ fn test_redefine_via_pipeline() {
         &mut schema_set,
         None,
     );
-    assert!(result.is_ok(), "Redefine via pipeline should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Redefine via pipeline should succeed: {:?}",
+        result
+    );
 
     // Verify the redefined type is in the namespace table
     let name = schema_set.name_table.get("MyString").unwrap();
@@ -1447,7 +1616,10 @@ fn test_redefine_via_pipeline() {
     let root_name = schema_set.name_table.get("root").unwrap();
     let elem_key = schema_set.lookup_element(None, root_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Element type should resolve to redefined type");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Element type should resolve to redefined type"
+    );
 
     // Clean up
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1495,7 +1667,11 @@ fn test_override_via_pipeline() {
         &mut schema_set,
         None,
     );
-    assert!(result.is_ok(), "Override via pipeline should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Override via pipeline should succeed: {:?}",
+        result
+    );
 
     // Verify the overriding type replaced the original
     let name = schema_set.name_table.get("CodeType").unwrap();
@@ -1506,7 +1682,10 @@ fn test_override_via_pipeline() {
     let code_name = schema_set.name_table.get("code").unwrap();
     let elem_key = schema_set.lookup_element(None, code_name).unwrap();
     let elem = schema_set.arenas.elements.get(elem_key).unwrap();
-    assert!(elem.resolved_type.is_some(), "Element type should resolve to overridden type");
+    assert!(
+        elem.resolved_type.is_some(),
+        "Element type should resolve to overridden type"
+    );
 
     // Clean up
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1545,11 +1724,16 @@ fn test_process_loaded_schemas_with_redefine() {
 
     // Parse both schemas manually (simulating pre-loading)
     let _base_id = parse_schema_only(base_xsd.as_bytes(), "base.xsd", &mut schema_set).unwrap();
-    let _redefine_id = parse_schema_only(redefine_xsd.as_bytes(), "redefine.xsd", &mut schema_set).unwrap();
+    let _redefine_id =
+        parse_schema_only(redefine_xsd.as_bytes(), "redefine.xsd", &mut schema_set).unwrap();
 
     // process_loaded_schemas applies redefine before assembly
     let result = process_loaded_schemas(&mut schema_set);
-    assert!(result.is_ok(), "process_loaded_schemas with redefine should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "process_loaded_schemas with redefine should succeed: {:?}",
+        result
+    );
 
     // Verify the redefined type is in the namespace table
     let name = schema_set.name_table.get("BaseType").unwrap();
@@ -1608,8 +1792,14 @@ fn test_redefine_simple_type_base_resolves_to_original() {
     };
 
     let type_def = schema_set.arenas.simple_types.get(simple_key).unwrap();
-    assert!(type_def.redefine_original.is_some(), "redefine_original should be set");
-    assert!(type_def.resolved_base_type.is_some(), "resolved_base_type should be set");
+    assert!(
+        type_def.redefine_original.is_some(),
+        "redefine_original should be set"
+    );
+    assert!(
+        type_def.resolved_base_type.is_some(),
+        "resolved_base_type should be set"
+    );
 
     // The resolved base type must NOT be the visible type itself
     assert_ne!(
@@ -1681,8 +1871,14 @@ fn test_redefine_complex_type_base_resolves_to_original() {
     };
 
     let type_def = schema_set.arenas.complex_types.get(complex_key).unwrap();
-    assert!(type_def.redefine_original.is_some(), "redefine_original should be set");
-    assert!(type_def.resolved_base_type.is_some(), "resolved_base_type should be set");
+    assert!(
+        type_def.redefine_original.is_some(),
+        "redefine_original should be set"
+    );
+    assert!(
+        type_def.resolved_base_type.is_some(),
+        "resolved_base_type should be set"
+    );
 
     // The resolved base type must NOT be the visible type itself
     assert_ne!(
@@ -1732,10 +1928,15 @@ fn test_redefine_complex_type_extension_via_batch_path() {
 
     let mut schema_set = SchemaSet::new();
     let _base_id = parse_schema_only(base_xsd.as_bytes(), "base.xsd", &mut schema_set).unwrap();
-    let _redefine_id = parse_schema_only(redefine_xsd.as_bytes(), "redefine.xsd", &mut schema_set).unwrap();
+    let _redefine_id =
+        parse_schema_only(redefine_xsd.as_bytes(), "redefine.xsd", &mut schema_set).unwrap();
 
     let result = process_loaded_schemas(&mut schema_set);
-    assert!(result.is_ok(), "process_loaded_schemas should succeed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "process_loaded_schemas should succeed: {:?}",
+        result
+    );
 
     let name = schema_set.name_table.get("BaseType").unwrap();
     let type_key = schema_set.lookup_type(None, name).unwrap();
@@ -1744,7 +1945,10 @@ fn test_redefine_complex_type_extension_via_batch_path() {
     };
 
     let type_def = schema_set.arenas.complex_types.get(complex_key).unwrap();
-    assert!(type_def.resolved_base_type.is_some(), "resolved_base_type should be set");
+    assert!(
+        type_def.resolved_base_type.is_some(),
+        "resolved_base_type should be set"
+    );
     assert_ne!(
         type_def.resolved_base_type.unwrap(),
         type_key,
@@ -1773,7 +1977,10 @@ fn test_process_loaded_schemas_propagates_dependency_error() {
     let _doc_id = parse_schema_only(schema_xsd.as_bytes(), "selfref.xsd", &mut schema_set).unwrap();
 
     let result = process_loaded_schemas(&mut schema_set);
-    assert!(result.is_err(), "Self-referencing type dependency should be detected as error");
+    assert!(
+        result.is_err(),
+        "Self-referencing type dependency should be detected as error"
+    );
 }
 
 #[test]
@@ -1804,7 +2011,8 @@ fn test_cross_reference_cycle_with_namespace_prefix() {
 </xs:schema>"#;
 
     let mut schema_set = SchemaSet::new();
-    let _doc_id = parse_schema_only(schema_xsd.as_bytes(), "circular.xsd", &mut schema_set).unwrap();
+    let _doc_id =
+        parse_schema_only(schema_xsd.as_bytes(), "circular.xsd", &mut schema_set).unwrap();
 
     // Inspect what the parser stored for each type's base_type
     let urn_test = schema_set.name_table.get("urn:test");
@@ -1823,23 +2031,42 @@ fn test_cross_reference_cycle_with_namespace_prefix() {
     // Both types should be registered in the namespace table
     let a_key = schema_set.lookup_type(Some(urn_test), type_a_name);
     let b_key = schema_set.lookup_type(Some(urn_test), type_b_name);
-    assert!(a_key.is_some(), "TypeA should be registered in urn:test namespace");
-    assert!(b_key.is_some(), "TypeB should be registered in urn:test namespace");
+    assert!(
+        a_key.is_some(),
+        "TypeA should be registered in urn:test namespace"
+    );
+    assert!(
+        b_key.is_some(),
+        "TypeB should be registered in urn:test namespace"
+    );
 
-    let TypeKey::Complex(ak) = a_key.unwrap() else { panic!("TypeA not complex") };
-    let TypeKey::Complex(bk) = b_key.unwrap() else { panic!("TypeB not complex") };
+    let TypeKey::Complex(ak) = a_key.unwrap() else {
+        panic!("TypeA not complex")
+    };
+    let TypeKey::Complex(bk) = b_key.unwrap() else {
+        panic!("TypeB not complex")
+    };
 
     // Verify both types have their base_type QName set from parsing
     let a_def = schema_set.arenas.complex_types.get(ak).unwrap();
     let b_def = schema_set.arenas.complex_types.get(bk).unwrap();
-    assert!(a_def.base_type.is_some(), "TypeA base_type QName should be set after parsing");
-    assert!(b_def.base_type.is_some(), "TypeB base_type QName should be set after parsing");
+    assert!(
+        a_def.base_type.is_some(),
+        "TypeA base_type QName should be set after parsing"
+    );
+    assert!(
+        b_def.base_type.is_some(),
+        "TypeB base_type QName should be set after parsing"
+    );
 
     // process_loaded_schemas resolves references then builds the dependency graph.
     // The resolution succeeds (both base types resolve), but the dependency graph
     // detects the cycle and returns an error.
     let result = process_loaded_schemas(&mut schema_set);
-    assert!(result.is_err(), "Circular dependency (TypeA ↔ TypeB) should be detected as error");
+    assert!(
+        result.is_err(),
+        "Circular dependency (TypeA ↔ TypeB) should be detected as error"
+    );
 
     // Even though process_loaded_schemas returned Err, resolution already happened.
     // Verify that both base types were resolved (creating the cycle).
@@ -1935,7 +2162,8 @@ fn test_malformed_qname_rejected() {
             let td = schema_set.arenas.simple_types.get(sk).unwrap();
             // base_type should be None — the malformed QName was rejected
             assert!(
-                td.base_type.is_none() || matches!(&td.base_type, Some(crate::parser::frames::TypeRefResult::QName(q)) if schema_set.name_table.resolve(q.local_name).is_empty()),
+                td.base_type.is_none()
+                    || matches!(&td.base_type, Some(crate::parser::frames::TypeRefResult::QName(q)) if schema_set.name_table.resolve(q.local_name).is_empty()),
                 "Malformed QName 'xs:' should not produce a valid base_type"
             );
         }
@@ -1960,7 +2188,11 @@ fn test_default_open_content_interleave_valid() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Valid defaultOpenContent (interleave) should pass: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Valid defaultOpenContent (interleave) should pass: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -1976,7 +2208,11 @@ fn test_default_open_content_suffix_valid() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Valid defaultOpenContent (suffix) should pass: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Valid defaultOpenContent (suffix) should pass: {:?}",
+        result
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -1992,12 +2228,18 @@ fn test_default_open_content_missing_wildcard() {
         </xs:schema>"#;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "defaultOpenContent without wildcard should fail");
+    assert!(
+        result.is_err(),
+        "defaultOpenContent without wildcard should fail"
+    );
 
     if let Err(SchemaError::StructuralError { constraint, .. }) = result {
         assert_eq!(constraint, "cos-valid-default-oc");
     } else {
-        panic!("Expected structural error with cos-valid-default-oc constraint, got: {:?}", result);
+        panic!(
+            "Expected structural error with cos-valid-default-oc constraint, got: {:?}",
+            result
+        );
     }
 }
 
@@ -2014,7 +2256,11 @@ fn test_default_open_content_applies_to_empty_valid() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Valid defaultOpenContent with appliesToEmpty should pass: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Valid defaultOpenContent with appliesToEmpty should pass: {:?}",
+        result
+    );
 }
 
 // ======================================================================
@@ -2049,7 +2295,10 @@ fn test_substitution_group_final_restriction_blocks_member() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "Schema should be invalid: final='restriction' blocks member");
+    assert!(
+        result.is_err(),
+        "Schema should be invalid: final='restriction' blocks member"
+    );
     match result.unwrap_err() {
         SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "e-props-correct.4");
@@ -2086,7 +2335,11 @@ fn test_substitution_group_final_extension_allows_restriction_member() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "final='extension' should not block restriction-derived member: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "final='extension' should not block restriction-derived member: {:?}",
+        result
+    );
 }
 
 // ======================================================================
@@ -2164,7 +2417,10 @@ fn test_all_all_reorder_invalid_xsd10() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "All:All reordering should be invalid in XSD 1.0");
+    assert!(
+        result.is_err(),
+        "All:All reordering should be invalid in XSD 1.0"
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -2195,7 +2451,11 @@ fn test_all_all_reorder_valid_xsd11() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "All:All reordering should be valid in XSD 1.1: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "All:All reordering should be valid in XSD 1.1: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -2223,7 +2483,11 @@ fn test_all_all_same_order_valid_xsd10() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "All:All same order should be valid in XSD 1.0: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "All:All same order should be valid in XSD 1.0: {:?}",
+        result
+    );
 }
 
 // ======================================================================
@@ -2256,7 +2520,11 @@ fn test_accept_sequence_restricts_all_reordered_u003() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Sequence:All reordering should be valid (RecurseUnordered): {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sequence:All reordering should be valid (RecurseUnordered): {:?}",
+        result
+    );
 }
 
 /// Valid: derived sequence omits optional element from base all group.
@@ -2286,7 +2554,11 @@ fn test_accept_sequence_restricts_all_omit_optional_u004() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Sequence:All reorder + omit optional should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sequence:All reorder + omit optional should be valid: {:?}",
+        result
+    );
 }
 
 /// Valid: derived sequence fully reorders 4-element base all group,
@@ -2319,7 +2591,11 @@ fn test_accept_sequence_restricts_all_full_reorder_u007() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Sequence:All full reorder with promoted optional should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Sequence:All full reorder with promoted optional should be valid: {:?}",
+        result
+    );
 }
 
 // ======================================================================
@@ -2354,7 +2630,11 @@ fn test_accept_repeated_sequence_restricts_choice_v001() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Repeated sequence should validly restrict repeated choice (MapAndSum): {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Repeated sequence should validly restrict repeated choice (MapAndSum): {:?}",
+        result
+    );
 }
 
 /// Valid: repeated sequence{2,4} restricts choice{3,9} — iteration budget
@@ -2383,7 +2663,11 @@ fn test_accept_repeated_sequence_restricts_choice_v003() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Repeated sequence{{2,4}} should validly restrict choice{{3,9}}: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Repeated sequence{{2,4}} should validly restrict choice{{3,9}}: {:?}",
+        result
+    );
 }
 
 // ======================================================================
@@ -2421,7 +2705,10 @@ fn test_choice_choice_reorder_invalid_xsd10() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "Choice:Choice reordering should be invalid in XSD 1.0");
+    assert!(
+        result.is_err(),
+        "Choice:Choice reordering should be invalid in XSD 1.0"
+    );
 }
 
 #[cfg(feature = "xsd11")]
@@ -2456,7 +2743,11 @@ fn test_choice_choice_reorder_valid_xsd11() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Choice:Choice reordering should be valid in XSD 1.1: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Choice:Choice reordering should be valid in XSD 1.1: {:?}",
+        result
+    );
 }
 
 #[test]
@@ -2490,7 +2781,11 @@ fn test_choice_choice_same_order_valid_xsd10() {
     </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "Choice:Choice same order should be valid in XSD 1.0: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Choice:Choice same order should be valid in XSD 1.0: {:?}",
+        result
+    );
 }
 
 // ── Step 11 regression targets ─────────────────────────────────────────
@@ -2523,7 +2818,11 @@ fn test_accept_dead_wildcard_restriction_jd005() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "dead wildcard restriction (Jd005 shape) should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "dead wildcard restriction (Jd005 shape) should be valid: {:?}",
+        result
+    );
 }
 
 /// particlesJf005: same shape but with imported element ref in the dead slot.
@@ -2552,7 +2851,11 @@ fn test_accept_dead_imported_element_restriction_jf005() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "dead imported-element restriction (Jf005 shape) should be valid: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "dead imported-element restriction (Jf005 shape) should be valid: {:?}",
+        result
+    );
 }
 
 // ── Step 13 canary tests ──────────────────────────────────────────────
@@ -2573,7 +2876,10 @@ fn test_reject_all_group_with_wildcard_xsd10() {
         </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "xs:any in xs:all must be rejected in XSD 1.0");
+    assert!(
+        result.is_err(),
+        "xs:any in xs:all must be rejected in XSD 1.0"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "src-model-group");
@@ -2599,7 +2905,11 @@ fn test_accept_all_group_with_wildcard_xsd11() {
         </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_ok(), "xs:any in xs:all should be accepted in XSD 1.1: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "xs:any in xs:all should be accepted in XSD 1.1: {:?}",
+        result
+    );
 }
 
 /// particlesFb002: extending choice content with all compositor is invalid
@@ -2631,7 +2941,10 @@ fn test_reject_extension_with_all_over_choice() {
         </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "extending choice with all must be rejected");
+    assert!(
+        result.is_err(),
+        "extending choice with all must be rejected"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "cos-ct-extends");
@@ -2746,7 +3059,10 @@ fn test_reject_attribute_type_not_derived_in_restriction() {
         </xsd:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "attribute type not derived from base must be rejected");
+    assert!(
+        result.is_err(),
+        "attribute type not derived from base must be rejected"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "derivation-ok-restriction");
@@ -2784,7 +3100,10 @@ fn test_reject_required_attribute_becomes_optional() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "required->optional attribute must be rejected");
+    assert!(
+        result.is_err(),
+        "required->optional attribute must be rejected"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "derivation-ok-restriction");
@@ -2859,7 +3178,10 @@ fn test_reject_simple_content_restriction_with_list_over_atomic() {
         </xs:schema>"###;
 
     let result = load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None);
-    assert!(result.is_err(), "list type restricting atomic simple content must be rejected");
+    assert!(
+        result.is_err(),
+        "list type restricting atomic simple content must be rejected"
+    );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
             assert_eq!(constraint, "derivation-ok-restriction");
@@ -3279,4 +3601,3 @@ fn test_accept_xsd11_intensional_restriction_z028() {
         result
     );
 }
-

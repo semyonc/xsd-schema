@@ -3,8 +3,8 @@
 //! Port of `xpath2/XPath20Api/XPath20Api/TreeComparer.cs`.
 //! Aligns with `DOM_NAVIGATOR_DESIGN.md` and `XML_NODE_ITERATOR_DESIGN.md`.
 
-use crate::types::{normalize_whitespace, WhitespaceMode, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use crate::types::{normalize_whitespace, WhitespaceMode, XmlAtomicValue, XmlValue, XmlValueKind};
 
 use super::ast::BinaryOpKind;
 use super::error::XPathError;
@@ -14,12 +14,10 @@ use super::string_ops::is_xml_whitespace;
 use super::{DomNavigator, DomNodeType};
 
 /// Compares XPath nodes and sequences for deep equality.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct TreeComparer {
     pub ignore_whitespace: bool,
 }
-
 
 impl TreeComparer {
     pub fn new() -> Self {
@@ -103,15 +101,15 @@ impl TreeComparer {
     }
 
     fn element_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri() {
+        if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri()
+        {
             return false;
         }
 
         let mut left_nav = left.clone();
         let mut right_nav = right.clone();
 
-        self.element_attributes_equal(&mut left_nav, &mut right_nav)
-            && self.deep_equal(left, right)
+        self.element_attributes_equal(&mut left_nav, &mut right_nav) && self.deep_equal(left, right)
     }
 
     fn element_attributes_equal<N: DomNavigator>(&self, left: &mut N, right: &mut N) -> bool {
@@ -165,7 +163,8 @@ impl TreeComparer {
     }
 
     fn attribute_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri() {
+        if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri()
+        {
             return false;
         }
 
@@ -311,16 +310,15 @@ mod tests {
     use num_bigint::BigInt;
     use rust_decimal::Decimal;
 
-    use crate::xpath::iterator::{VecNodeIterator, XmlItem};
     use crate::navigator::RoXmlNavigator;
+    use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 
     #[test]
     fn test_deep_equal_ignores_whitespace_nodes() {
         let comparer = TreeComparer::with_ignore_whitespace(true);
         let doc1 = roxmltree::Document::parse("<root>\n  <a>1</a>\n  <b>2</b>\n</root>")
             .expect("parse xml");
-        let doc2 = roxmltree::Document::parse("<root><a>1</a><b>2</b></root>")
-            .expect("parse xml");
+        let doc2 = roxmltree::Document::parse("<root><a>1</a><b>2</b></root>").expect("parse xml");
         let nav1 = RoXmlNavigator::new(&doc1);
         let nav2 = RoXmlNavigator::new(&doc2);
 
@@ -330,10 +328,8 @@ mod tests {
     #[test]
     fn test_deep_equal_detects_whitespace_when_enabled() {
         let comparer = TreeComparer::new();
-        let doc1 = roxmltree::Document::parse("<root>\n  <a>1</a>\n</root>")
-            .expect("parse xml");
-        let doc2 = roxmltree::Document::parse("<root><a>1</a></root>")
-            .expect("parse xml");
+        let doc1 = roxmltree::Document::parse("<root>\n  <a>1</a>\n</root>").expect("parse xml");
+        let doc2 = roxmltree::Document::parse("<root><a>1</a></root>").expect("parse xml");
         let nav1 = RoXmlNavigator::new(&doc1);
         let nav2 = RoXmlNavigator::new(&doc2);
 
@@ -343,10 +339,8 @@ mod tests {
     #[test]
     fn test_deep_equal_attributes_order_insensitive() {
         let comparer = TreeComparer::new();
-        let doc1 = roxmltree::Document::parse("<root b=\"2\" a=\"1\"/>")
-            .expect("parse xml");
-        let doc2 = roxmltree::Document::parse("<root a=\"1\" b=\"2\"/>")
-            .expect("parse xml");
+        let doc1 = roxmltree::Document::parse("<root b=\"2\" a=\"1\"/>").expect("parse xml");
+        let doc2 = roxmltree::Document::parse("<root a=\"1\" b=\"2\"/>").expect("parse xml");
         let nav1 = RoXmlNavigator::new(&doc1);
         let nav2 = RoXmlNavigator::new(&doc2);
 

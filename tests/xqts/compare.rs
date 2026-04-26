@@ -1,8 +1,8 @@
-use xsd_schema::RoXmlNavigator;
-use xsd_schema::xpath::tree_comparer::TreeComparer;
 use xsd_schema::xpath::functions::XPathValue;
 use xsd_schema::xpath::iterator::XmlItem;
+use xsd_schema::xpath::tree_comparer::TreeComparer;
 use xsd_schema::xpath::{DomNavigator, DomNodeType};
+use xsd_schema::RoXmlNavigator;
 
 /// Special test names that force XML comparison.
 const FORCE_XML_COMPARE: &[&str] = &["ReturnExpr010"];
@@ -55,9 +55,9 @@ fn serialize_node_to_xml<N: DomNavigator>(nav: &N, out: &mut String) {
                             escape_xml_attr(&ns_uri)
                         ));
                     }
-                    if !ns_nav.move_to_next_namespace(
-                        xsd_schema::xpath::NamespaceAxisScope::ExcludeXml,
-                    ) {
+                    if !ns_nav
+                        .move_to_next_namespace(xsd_schema::xpath::NamespaceAxisScope::ExcludeXml)
+                    {
                         break;
                     }
                 }
@@ -107,7 +107,7 @@ fn serialize_node_to_xml<N: DomNavigator>(nav: &N, out: &mut String) {
                     out.push_str(&format!("</{}:{}>", prefix, local));
                 }
             } else {
-                    out.push_str("/>");
+                out.push_str("/>");
             }
         }
         DomNodeType::Text | DomNodeType::Whitespace | DomNodeType::SignificantWhitespace => {
@@ -315,20 +315,25 @@ fn compare_result_inner<'a>(
     let expected_xml = if xml_compare {
         expected_content
     } else {
-        format!(
-            "<?xml version='1.0'?><root>{}</root>",
-            expected_content
-        )
+        format!("<?xml version='1.0'?><root>{}</root>", expected_content)
     };
 
     // Parse expected XML to get root element name (per C# CompareResult: doc1.DocumentElement.Name)
-    let doc1 = roxmltree::Document::parse(&expected_xml)
-        .map_err(|e| format!("Failed to parse expected XML: {} (content: {})", e, truncate(&expected_xml, 200)))?;
+    let doc1 = roxmltree::Document::parse(&expected_xml).map_err(|e| {
+        format!(
+            "Failed to parse expected XML: {} (content: {})",
+            e,
+            truncate(&expected_xml, 200)
+        )
+    })?;
 
     let root_elem = doc1.root().children().find(|n| n.is_element());
     let wrap_element = root_elem
         .map(|e| {
-            let prefix = e.tag_name().namespace().and_then(|uri| e.lookup_prefix(uri));
+            let prefix = e
+                .tag_name()
+                .namespace()
+                .and_then(|uri| e.lookup_prefix(uri));
             if let Some(pfx) = prefix {
                 format!("{}:{}", pfx, e.tag_name().name())
             } else {
@@ -348,7 +353,14 @@ fn compare_result_inner<'a>(
 
     // Serialize result to XML using the expected document's root element name
     let items = result.into_vec();
-    let result_xml = serialize_xpath_result(&items, xml_compare, is_single, is_excpt, &wrap_element, &wrap_namespaces);
+    let result_xml = serialize_xpath_result(
+        &items,
+        xml_compare,
+        is_single,
+        is_excpt,
+        &wrap_element,
+        &wrap_namespaces,
+    );
 
     // Compare with TreeComparer.
     // When xml_compare is true and the result is a bare atomic value (not valid XML),
@@ -376,9 +388,11 @@ fn compare_result_inner<'a>(
             }
             Ok(eq)
         }
-        Err(e) => {
-            Err(format!("Failed to parse result XML: {} (content: {})", e, truncate(&result_xml, 200)))
-        }
+        Err(e) => Err(format!(
+            "Failed to parse result XML: {} (content: {})",
+            e,
+            truncate(&result_xml, 200)
+        )),
     }
 }
 

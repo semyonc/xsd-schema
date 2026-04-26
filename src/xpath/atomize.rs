@@ -12,13 +12,13 @@
 //! - For empty sequences, returns None
 //! - For sequences with more than one item, raises XPDY0050
 
-use crate::navigator::TypedValue;
-use crate::types::value::{XmlValue, XmlValueKind, XmlAtomicValue};
-use crate::types::XmlTypeCode;
 use super::error::XPathError;
-use super::{DomNavigator, DomNodeType};
 use super::functions::XPathValue;
 use super::iterator::XmlItem;
+use super::{DomNavigator, DomNodeType};
+use crate::navigator::TypedValue;
+use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::XmlTypeCode;
 
 /// Atomize a navigator node to its XDM atomic value.
 ///
@@ -72,12 +72,10 @@ pub fn atomize(value: &XmlValue) -> Result<XmlValue, XPathError> {
         }
 
         // Single-item list: return the item
-        XmlValueKind::List { items, item_type } if items.len() == 1 => {
-            Ok(XmlValue::new(
-                *item_type,
-                XmlValueKind::Atomic(items[0].clone()),
-            ))
-        }
+        XmlValueKind::List { items, item_type } if items.len() == 1 => Ok(XmlValue::new(
+            *item_type,
+            XmlValueKind::Atomic(items[0].clone()),
+        )),
 
         // Empty list: conceptually empty sequence
         XmlValueKind::List { .. } => Err(XPathError::type_mismatch("item()", "empty-sequence()")),
@@ -188,7 +186,13 @@ fn atomic_to_number(atom: &XmlAtomicValue) -> f64 {
         XmlAtomicValue::Float(f) => *f as f64,
         XmlAtomicValue::Decimal(d) => d.to_string().parse().unwrap_or(f64::NAN),
         XmlAtomicValue::Integer(i) => i.to_string().parse().unwrap_or(f64::NAN),
-        XmlAtomicValue::Boolean(b) => if *b { 1.0 } else { 0.0 },
+        XmlAtomicValue::Boolean(b) => {
+            if *b {
+                1.0
+            } else {
+                0.0
+            }
+        }
         XmlAtomicValue::String(s) => s.trim().parse().unwrap_or(f64::NAN),
         _ => f64::NAN,
     }
@@ -455,10 +459,7 @@ mod tests {
         nav_a.move_to_first_child(); // <a>
         let mut nav_b = nav_a.clone();
         nav_b.move_to_next_sibling(); // <b>
-        let value = XPathValue::from_sequence(vec![
-            XmlItem::Node(nav_a),
-            XmlItem::Node(nav_b),
-        ]);
+        let value = XPathValue::from_sequence(vec![XmlItem::Node(nav_a), XmlItem::Node(nav_b)]);
         // XPath 1.0: first node's string value
         assert_eq!(first_node_string_value(&value), "first");
     }

@@ -61,11 +61,19 @@ fn resolve_derivation_default(
     })
 }
 
-fn resolve_block(block: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
+fn resolve_block(
+    block: Option<DerivationSet>,
+    source: Option<&SourceRef>,
+    schema_set: &SchemaSet,
+) -> DerivationSet {
     resolve_derivation_default(block, source, schema_set, |d| d.block_default)
 }
 
-fn resolve_final(final_derivation: Option<DerivationSet>, source: Option<&SourceRef>, schema_set: &SchemaSet) -> DerivationSet {
+fn resolve_final(
+    final_derivation: Option<DerivationSet>,
+    source: Option<&SourceRef>,
+    schema_set: &SchemaSet,
+) -> DerivationSet {
     resolve_derivation_default(final_derivation, source, schema_set, |d| d.final_default)
 }
 
@@ -621,7 +629,9 @@ pub(crate) fn resolve_ic_ref(
             }
             found.ok_or_else(|| {
                 let ref_display = crate::schema::resolver::format_resolved_qname(
-                    &schema_set.name_table, ref_ns, ref_local,
+                    &schema_set.name_table,
+                    ref_ns,
+                    ref_local,
                 );
                 let location = source.and_then(|s| schema_set.source_maps.locate(s));
                 crate::error::SchemaError::structural(
@@ -637,7 +647,9 @@ pub(crate) fn resolve_ic_ref(
     let target = &schema_set.arenas.identity_constraints[target_key];
     if target.kind != kind {
         let ref_display = crate::schema::resolver::format_resolved_qname(
-            &schema_set.name_table, ref_ns, ref_local,
+            &schema_set.name_table,
+            ref_ns,
+            ref_local,
         );
         let location = source.and_then(|s| schema_set.source_maps.locate(s));
         return Err(crate::error::SchemaError::structural(
@@ -670,8 +682,7 @@ pub(crate) fn validate_keyref_refers(
             let refer_ns = refer.namespace;
             // Find the referenced constraint on the same element
             let target = identity_constraints.iter().find(|other| {
-                other.name == refer_name
-                    && (refer_ns.is_none() || refer_ns == target_namespace)
+                other.name == refer_name && (refer_ns.is_none() || refer_ns == target_namespace)
             });
             match target {
                 None => {
@@ -705,15 +716,18 @@ pub(crate) fn validate_keyref_refers(
                     match global_target {
                         Some(target_data) => {
                             check_keyref_target(
-                                ic, target_data.kind, target_data.fields.len(),
-                                refer_name, name_table, source_maps,
+                                ic,
+                                target_data.kind,
+                                target_data.fields.len(),
+                                refer_name,
+                                name_table,
+                                source_maps,
                             )?;
                         }
                         None => {
                             let ic_name = name_table.resolve_ref(ic.name);
                             let refer_name_str = name_table.resolve_ref(refer_name);
-                            let location =
-                                ic.source.as_ref().and_then(|s| source_maps.locate(s));
+                            let location = ic.source.as_ref().and_then(|s| source_maps.locate(s));
                             return Err(SchemaError::structural(
                                 "src-identity-constraint",
                                 format!(
@@ -727,8 +741,12 @@ pub(crate) fn validate_keyref_refers(
                 }
                 Some(target_ic) => {
                     check_keyref_target(
-                        ic, target_ic.kind, target_ic.fields.len(),
-                        refer_name, name_table, source_maps,
+                        ic,
+                        target_ic.kind,
+                        target_ic.fields.len(),
+                        refer_name,
+                        name_table,
+                        source_maps,
                     )?;
                 }
             }
@@ -788,7 +806,10 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
     let mut ic_names_by_doc: HashMap<DocumentId, HashSet<NameId>> = HashMap::new();
     for ic in schema_set.arenas.identity_constraints.values() {
         if let Some(source) = &ic.source {
-            ic_names_by_doc.entry(source.doc_id).or_default().insert(ic.name);
+            ic_names_by_doc
+                .entry(source.doc_id)
+                .or_default()
+                .insert(ic.name);
         }
     }
 
@@ -810,8 +831,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
                     Some(TypeRefResult::QName(qname)) => schema_set
                         .lookup_type(qname.namespace, qname.local_name)
                         .or_else(|| {
-                            schema_set
-                                .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                            schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name)
                         }),
                     _ => None,
                 }
@@ -859,23 +879,28 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
                     let name_str = schema_set.name_table.resolve(ic.name);
                     return Err(SchemaError::structural(
                         "ic-unique",
-                        format!("Duplicate identity constraint name '{}' in schema document", name_str),
+                        format!(
+                            "Duplicate identity constraint name '{}' in schema document",
+                            name_str
+                        ),
                         location,
                     ));
                 }
             }
             let ic_name = ic.name;
-            let ic_key = schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
-                kind: ic.kind,
-                name: ic.name,
-                ref_name: ic.ref_name,
-                refer: ic.refer,
-                selector: ic.selector,
-                fields: ic.fields,
-                id: ic.id,
-                annotation: ic.annotation,
-                source: ic.source,
-            });
+            let ic_key = schema_set
+                .arenas
+                .alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                });
             // Register in namespace table for @ref resolution
             let ns_table = schema_set.get_or_create_namespace(job.target_namespace);
             ns_table.identity_constraints.insert(ic_name, ic_key);
@@ -884,14 +909,21 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
         // Resolve XSD 1.1 @ref identity constraint references
         for ic_ref in &job.elem.identity_constraint_refs {
             let target_key = resolve_ic_ref(
-                ic_ref.kind, &ic_ref.ref_name, ic_ref.source.as_ref(),
-                job.target_namespace, schema_set,
+                ic_ref.kind,
+                &ic_ref.ref_name,
+                ic_ref.source.as_ref(),
+                job.target_namespace,
+                schema_set,
             )?;
             identity_constraint_keys.push(target_key);
         }
 
         let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
-        let final_derivation = resolve_final(job.elem.final_derivation, job.elem.source.as_ref(), schema_set);
+        let final_derivation = resolve_final(
+            job.elem.final_derivation,
+            job.elem.source.as_ref(),
+            schema_set,
+        );
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -921,7 +953,11 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
 
-        if let Some(ct) = schema_set.arenas.complex_types.get_mut(job.complex_type_key) {
+        if let Some(ct) = schema_set
+            .arenas
+            .complex_types
+            .get_mut(job.complex_type_key)
+        {
             while ct.resolved_content_particle_elements.len() <= job.flat_idx {
                 ct.resolved_content_particle_elements.push(None);
             }
@@ -1001,12 +1037,7 @@ pub fn resolve_local_element_alternatives(
             let Some(inline_type) = &alt.inline_type else {
                 continue;
             };
-            pending.push((
-                key,
-                idx,
-                (**inline_type).clone(),
-                elem.target_namespace,
-            ));
+            pending.push((key, idx, (**inline_type).clone(), elem.target_namespace));
         }
     }
 
@@ -1060,7 +1091,10 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
     let mut ic_names_by_doc: HashMap<DocumentId, HashSet<NameId>> = HashMap::new();
     for ic in schema_set.arenas.identity_constraints.values() {
         if let Some(source) = &ic.source {
-            ic_names_by_doc.entry(source.doc_id).or_default().insert(ic.name);
+            ic_names_by_doc
+                .entry(source.doc_id)
+                .or_default()
+                .insert(ic.name);
         }
     }
 
@@ -1082,8 +1116,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
                     Some(TypeRefResult::QName(qname)) => schema_set
                         .lookup_type(qname.namespace, qname.local_name)
                         .or_else(|| {
-                            schema_set
-                                .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                            schema_set.get_built_in_type_by_qname(qname.namespace, qname.local_name)
                         }),
                     _ => None,
                 }
@@ -1113,23 +1146,28 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
                     let name_str = schema_set.name_table.resolve(ic.name);
                     return Err(SchemaError::structural(
                         "ic-unique",
-                        format!("Duplicate identity constraint name '{}' in schema document", name_str),
+                        format!(
+                            "Duplicate identity constraint name '{}' in schema document",
+                            name_str
+                        ),
                         location,
                     ));
                 }
             }
             let ic_name = ic.name;
-            let ic_key = schema_set.arenas.alloc_identity_constraint(IdentityConstraintData {
-                kind: ic.kind,
-                name: ic.name,
-                ref_name: ic.ref_name,
-                refer: ic.refer,
-                selector: ic.selector,
-                fields: ic.fields,
-                id: ic.id,
-                annotation: ic.annotation,
-                source: ic.source,
-            });
+            let ic_key = schema_set
+                .arenas
+                .alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                });
             // Register in namespace table for @ref resolution
             let ns_table = schema_set.get_or_create_namespace(job.target_namespace);
             ns_table.identity_constraints.insert(ic_name, ic_key);
@@ -1138,14 +1176,21 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
         // Resolve XSD 1.1 @ref identity constraint references
         for ic_ref in &job.elem.identity_constraint_refs {
             let target_key = resolve_ic_ref(
-                ic_ref.kind, &ic_ref.ref_name, ic_ref.source.as_ref(),
-                job.target_namespace, schema_set,
+                ic_ref.kind,
+                &ic_ref.ref_name,
+                ic_ref.source.as_ref(),
+                job.target_namespace,
+                schema_set,
             )?;
             identity_constraint_keys.push(target_key);
         }
 
         let block = resolve_block(job.elem.block, job.elem.source.as_ref(), schema_set);
-        let final_derivation = resolve_final(job.elem.final_derivation, job.elem.source.as_ref(), schema_set);
+        let final_derivation = resolve_final(
+            job.elem.final_derivation,
+            job.elem.source.as_ref(),
+            schema_set,
+        );
         let elem_data = ElementDeclData {
             name: job.elem.name,
             target_namespace: effective_ns,
@@ -1234,7 +1279,8 @@ fn assemble_inline_type(
 ) -> SchemaResult<TypeKey> {
     match type_frame {
         TypeFrameResult::Simple(simple) => {
-            let final_derivation = resolve_final(simple.final_derivation, simple.source.as_ref(), schema_set);
+            let final_derivation =
+                resolve_final(simple.final_derivation, simple.source.as_ref(), schema_set);
             let data = SimpleTypeDefData {
                 name: simple.name, // May be None for anonymous types
                 target_namespace,
@@ -1269,7 +1315,11 @@ fn assemble_inline_type(
                 ComplexContentResult::Empty => Vec::new(),
             };
             let block = resolve_block(complex.block, complex.source.as_ref(), schema_set);
-            let final_derivation = resolve_final(complex.final_derivation, complex.source.as_ref(), schema_set);
+            let final_derivation = resolve_final(
+                complex.final_derivation,
+                complex.source.as_ref(),
+                schema_set,
+            );
             let data = ComplexTypeDefData {
                 name: complex.name, // May be None for anonymous types
                 target_namespace,
@@ -1785,7 +1835,7 @@ mod tests {
     #[test]
     fn test_inline_type_in_content_particle_resolved() {
         use crate::parser::frames::{
-            Compositor, ComplexContentDefResult, ElementFrameResult, ModelGroupDefResult,
+            ComplexContentDefResult, Compositor, ElementFrameResult, ModelGroupDefResult,
         };
 
         let mut schema_set = SchemaSet::new();

@@ -110,9 +110,7 @@ impl ActiveAxis {
                     awaiting_attribute: false,
                     try_from_start: false,
                 });
-            } else if matches!(path.steps[first_real], AstStep::Attribute(_))
-                && !path.descendant
-            {
+            } else if matches!(path.steps[first_real], AstStep::Attribute(_)) && !path.descendant {
                 // `./@attr` — SelfNode followed by an attribute step (non-descendant).
                 // The attribute belongs to the scope element, so mark it
                 // awaiting immediately (no `move_to_start_element` needed).
@@ -372,8 +370,7 @@ mod tests {
 
     fn compile_sel(xpath: &str, table: &NameTable) -> Asttree {
         let snap = NamespaceContextSnapshot::default();
-        Asttree::compile_selector(xpath, &snap, table, None, None, None, XsdVersion::V1_0)
-            .unwrap()
+        Asttree::compile_selector(xpath, &snap, table, None, None, None, XsdVersion::V1_0).unwrap()
     }
 
     fn compile_fld(xpath: &str, table: &NameTable) -> Asttree {
@@ -761,7 +758,7 @@ mod tests {
         // <a> at depth 2 (nested under first <a>)
         assert!(axis.move_to_start_element(a, well_known::EMPTY));
         axis.end_element(); // </a> inner
-        // <x> at depth 2 — no match
+                            // <x> at depth 2 — no match
         assert!(!axis.move_to_start_element(x, well_known::EMPTY));
         axis.end_element(); // </x>
         axis.end_element(); // </a> outer

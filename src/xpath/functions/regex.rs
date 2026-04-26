@@ -14,8 +14,8 @@ use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
 
 use super::{atomize_to_string, atomize_to_string_opt, atomize_to_string_required, XPathValue};
-use crate::xpath::iterator::XmlItem;
 use crate::types::value::XmlValue;
+use crate::xpath::iterator::XmlItem;
 
 /// fn:matches($input as xs:string?, $pattern as xs:string, $flags as xs:string?) as xs:boolean
 ///
@@ -29,7 +29,11 @@ pub fn matches<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("matches", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "matches",
+            2,
+            args.len(),
+        ));
     }
 
     // Get flags (optional third argument)
@@ -69,7 +73,11 @@ pub fn replace<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 3 || args.len() > 4 {
-        return Err(XPathError::wrong_number_of_arguments("replace", 3, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "replace",
+            3,
+            args.len(),
+        ));
     }
 
     // Get flags (optional fourth argument)
@@ -92,13 +100,15 @@ pub fn replace<N: DomNavigator>(
     let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
 
     // regexml handles FORX0003 (zero-length match) and FORX0004 (invalid replacement) internally
-    let result = regex.replace_all(&input, &replacement).map_err(|e| match e {
-        regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
-        regexml::Error::InvalidReplacementString(_) => {
-            XPathError::invalid_replacement_string(&replacement)
-        }
-        _ => XPathError::invalid_regex_pattern(&pattern),
-    })?;
+    let result = regex
+        .replace_all(&input, &replacement)
+        .map_err(|e| match e {
+            regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
+            regexml::Error::InvalidReplacementString(_) => {
+                XPathError::invalid_replacement_string(&replacement)
+            }
+            _ => XPathError::invalid_regex_pattern(&pattern),
+        })?;
 
     Ok(XPathValue::string(result))
 }
@@ -115,7 +125,11 @@ pub fn tokenize<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
-        return Err(XPathError::wrong_number_of_arguments("tokenize", 2, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "tokenize",
+            2,
+            args.len(),
+        ));
     }
 
     // Get flags (optional third argument)
@@ -193,13 +207,13 @@ mod tests {
 
         let result = matches(
             &mut ctx,
-            vec![
-                XPathValue::string("abracadabra"),
-                XPathValue::string("bra"),
-            ],
-        ).unwrap();
+            vec![XPathValue::string("abracadabra"), XPathValue::string("bra")],
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -209,13 +223,13 @@ mod tests {
 
         let result = matches(
             &mut ctx,
-            vec![
-                XPathValue::string("abracadabra"),
-                XPathValue::string("xyz"),
-            ],
-        ).unwrap();
+            vec![XPathValue::string("abracadabra"), XPathValue::string("xyz")],
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
     }
 
     #[test]
@@ -230,9 +244,12 @@ mod tests {
                 XPathValue::string("hello"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -247,9 +264,12 @@ mod tests {
                 XPathValue::string("^line2"),
                 XPathValue::string("m"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -264,9 +284,12 @@ mod tests {
                 XPathValue::string("^$"),
                 XPathValue::string("m"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
     }
 
     #[test]
@@ -281,9 +304,12 @@ mod tests {
                 XPathValue::string("^$"),
                 XPathValue::string("m"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -298,8 +324,11 @@ mod tests {
                 XPathValue::string("[A-Z-[OI]]"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
-        assert!(matches!(match_x, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        )
+        .unwrap();
+        assert!(
+            matches!(match_x, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
 
         let match_o = matches(
             &mut ctx,
@@ -308,8 +337,11 @@ mod tests {
                 XPathValue::string("[A-Z-[OI]]"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
-        assert!(matches!(match_o, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        )
+        .unwrap();
+        assert!(
+            matches!(match_o, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
 
         let match_i = matches(
             &mut ctx,
@@ -318,8 +350,11 @@ mod tests {
                 XPathValue::string("[A-Z-[OI]]"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
-        assert!(matches!(match_i, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        )
+        .unwrap();
+        assert!(
+            matches!(match_i, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
     }
 
     #[test]
@@ -334,8 +369,11 @@ mod tests {
                 XPathValue::string(r"\p{Lu}"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
-        assert!(matches!(upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        )
+        .unwrap();
+        assert!(
+            matches!(upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
 
         let not_upper = matches(
             &mut ctx,
@@ -344,8 +382,11 @@ mod tests {
                 XPathValue::string(r"\P{Lu}"),
                 XPathValue::string("i"),
             ],
-        ).unwrap();
-        assert!(matches!(not_upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        )
+        .unwrap();
+        assert!(
+            matches!(not_upper, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -372,10 +413,7 @@ mod tests {
 
         let result = matches(
             &mut ctx,
-            vec![
-                XPathValue::string("test"),
-                XPathValue::string("[invalid"),
-            ],
+            vec![XPathValue::string("test"), XPathValue::string("[invalid")],
         );
 
         assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
@@ -393,7 +431,8 @@ mod tests {
                 XPathValue::string("a"),
                 XPathValue::string("X"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         if let XPathValue::Item(XmlItem::Atomic(v)) = result {
             assert_eq!(v.as_string(), Some("XbrXcXdXbrX"));
@@ -414,7 +453,8 @@ mod tests {
                 XPathValue::string("([a-z]+) ([a-z]+)"),
                 XPathValue::string("$2 $1"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         if let XPathValue::Item(XmlItem::Atomic(v)) = result {
             assert_eq!(v.as_string(), Some("world hello"));
@@ -465,22 +505,23 @@ mod tests {
 
         let result = tokenize(
             &mut ctx,
-            vec![
-                XPathValue::string("a,b,c"),
-                XPathValue::string(","),
-            ],
-        ).unwrap();
+            vec![XPathValue::string("a,b,c"), XPathValue::string(",")],
+        )
+        .unwrap();
 
         match result {
             XPathValue::Sequence(items) => {
                 assert_eq!(items.len(), 3);
-                let strs: Vec<String> = items.iter().map(|item| {
-                    if let XmlItem::Atomic(v) = item {
-                        v.to_string_value()
-                    } else {
-                        panic!("Expected atomic")
-                    }
-                }).collect();
+                let strs: Vec<String> = items
+                    .iter()
+                    .map(|item| {
+                        if let XmlItem::Atomic(v) = item {
+                            v.to_string_value()
+                        } else {
+                            panic!("Expected atomic")
+                        }
+                    })
+                    .collect();
                 assert_eq!(strs, vec!["a", "b", "c"]);
             }
             _ => panic!("Expected sequence"),
@@ -498,7 +539,8 @@ mod tests {
                 XPathValue::string("red   green   blue"),
                 XPathValue::string("\\s+"),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         match result {
             XPathValue::Sequence(items) => {
@@ -515,11 +557,9 @@ mod tests {
 
         let result = tokenize(
             &mut ctx,
-            vec![
-                XPathValue::string(""),
-                XPathValue::string(","),
-            ],
-        ).unwrap();
+            vec![XPathValue::string(""), XPathValue::string(",")],
+        )
+        .unwrap();
 
         assert!(matches!(result, XPathValue::Empty));
     }
@@ -533,22 +573,23 @@ mod tests {
         // Leading delimiter - should not produce empty token at start
         let result = tokenize(
             &mut ctx,
-            vec![
-                XPathValue::string(",a,b"),
-                XPathValue::string(","),
-            ],
-        ).unwrap();
+            vec![XPathValue::string(",a,b"), XPathValue::string(",")],
+        )
+        .unwrap();
 
         match result {
             XPathValue::Sequence(items) => {
                 assert_eq!(items.len(), 2); // "a" and "b" only, no leading empty
-                let strs: Vec<String> = items.iter().map(|item| {
-                    if let XmlItem::Atomic(v) = item {
-                        v.to_string_value()
-                    } else {
-                        panic!("Expected atomic")
-                    }
-                }).collect();
+                let strs: Vec<String> = items
+                    .iter()
+                    .map(|item| {
+                        if let XmlItem::Atomic(v) = item {
+                            v.to_string_value()
+                        } else {
+                            panic!("Expected atomic")
+                        }
+                    })
+                    .collect();
                 assert_eq!(strs, vec!["a", "b"]);
             }
             _ => panic!("Expected sequence"),
@@ -563,11 +604,9 @@ mod tests {
 
         let result = tokenize(
             &mut ctx,
-            vec![
-                XPathValue::string("a,b,"),
-                XPathValue::string(","),
-            ],
-        ).unwrap();
+            vec![XPathValue::string("a,b,"), XPathValue::string(",")],
+        )
+        .unwrap();
 
         match result {
             XPathValue::Sequence(items) => {
@@ -586,11 +625,14 @@ mod tests {
         // Test \i matches initial XML name characters
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = matches(&mut ctx, vec![
-            XPathValue::string("_foo"),
-            XPathValue::string(r"\i"),
-        ]).unwrap();
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        let result = matches(
+            &mut ctx,
+            vec![XPathValue::string("_foo"), XPathValue::string(r"\i")],
+        )
+        .unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -598,11 +640,14 @@ mod tests {
         // Test \i\c* matches XML names
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = matches(&mut ctx, vec![
-            XPathValue::string("foo:bar"),
-            XPathValue::string(r"\i\c*"),
-        ]).unwrap();
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        let result = matches(
+            &mut ctx,
+            vec![XPathValue::string("foo:bar"), XPathValue::string(r"\i\c*")],
+        )
+        .unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -610,11 +655,14 @@ mod tests {
         // Test \i does NOT match digits
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = matches(&mut ctx, vec![
-            XPathValue::string("123"),
-            XPathValue::string(r"^\i"),
-        ]).unwrap();
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false)));
+        let result = matches(
+            &mut ctx,
+            vec![XPathValue::string("123"), XPathValue::string(r"^\i")],
+        )
+        .unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
     }
 
     #[test]
@@ -622,11 +670,14 @@ mod tests {
         // Test \c matches digits and other name characters
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = matches(&mut ctx, vec![
-            XPathValue::string("abc123"),
-            XPathValue::string(r"\c+"),
-        ]).unwrap();
-        assert!(matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true)));
+        let result = matches(
+            &mut ctx,
+            vec![XPathValue::string("abc123"), XPathValue::string(r"\c+")],
+        )
+        .unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
     }
 
     #[test]
@@ -634,11 +685,15 @@ mod tests {
         // Test replace with \c pattern
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = replace(&mut ctx, vec![
-            XPathValue::string("hello world"),
-            XPathValue::string(r"\c+"),
-            XPathValue::string("X"),
-        ]).unwrap();
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("hello world"),
+                XPathValue::string(r"\c+"),
+                XPathValue::string("X"),
+            ],
+        )
+        .unwrap();
 
         if let XPathValue::Item(XmlItem::Atomic(v)) = result {
             assert_eq!(v.as_string(), Some("X X"));
@@ -652,21 +707,28 @@ mod tests {
         // Test tokenize using \C (non-name character) as delimiter
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-        let result = tokenize(&mut ctx, vec![
-            XPathValue::string("foo bar baz"),
-            XPathValue::string(r"\C+"),
-        ]).unwrap();
+        let result = tokenize(
+            &mut ctx,
+            vec![
+                XPathValue::string("foo bar baz"),
+                XPathValue::string(r"\C+"),
+            ],
+        )
+        .unwrap();
 
         match result {
             XPathValue::Sequence(items) => {
                 assert_eq!(items.len(), 3);
-                let strs: Vec<String> = items.iter().map(|item| {
-                    if let XmlItem::Atomic(v) = item {
-                        v.to_string_value()
-                    } else {
-                        panic!("Expected atomic")
-                    }
-                }).collect();
+                let strs: Vec<String> = items
+                    .iter()
+                    .map(|item| {
+                        if let XmlItem::Atomic(v) = item {
+                            v.to_string_value()
+                        } else {
+                            panic!("Expected atomic")
+                        }
+                    })
+                    .collect();
                 assert_eq!(strs, vec!["foo", "bar", "baz"]);
             }
             _ => panic!("Expected sequence"),

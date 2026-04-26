@@ -3,8 +3,8 @@
 //! Provides hierarchical namespace management for XML parsing.
 //! Each element can push a new scope, and scopes are popped when elements close.
 
+use super::table::{well_known, NameTable};
 use crate::ids::NameId;
-use super::table::{NameTable, well_known};
 use std::collections::HashMap;
 
 /// Scoped prefix-to-namespace mapping
@@ -335,7 +335,10 @@ mod tests {
 
         let ns = ctx.lookup_namespace("xml");
         assert!(ns.is_some());
-        assert_eq!(ctx.name_table().resolve(ns.unwrap()), super::super::table::XML_NAMESPACE);
+        assert_eq!(
+            ctx.name_table().resolve(ns.unwrap()),
+            super::super::table::XML_NAMESPACE
+        );
     }
 
     #[test]

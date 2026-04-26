@@ -196,11 +196,14 @@ pub fn parse_expr_with_mode(
 /// let result = parse_with_options("/a/b", &opts).unwrap();
 /// println!("Parsed {} nodes", result.node_count());
 /// ```
-pub fn parse_with_options(input: &str, opts: &XPathParseOptions) -> Result<ParsedXPath, XPathError> {
+pub fn parse_with_options(
+    input: &str,
+    opts: &XPathParseOptions,
+) -> Result<ParsedXPath, XPathError> {
     let parsed = parse_with_mode(input, opts.mode)?; // ParseError → XPathError via From
-    // XPath 1.0 validation: the lexer blocks all major 2.0-only constructs by suppressing
-    // their tokens. The 3 remaining edge cases (comma sequences, empty parens, double literals)
-    // are caught at eval time in eval_node(). No separate AST validator is needed.
+                                                     // XPath 1.0 validation: the lexer blocks all major 2.0-only constructs by suppressing
+                                                     // their tokens. The 3 remaining edge cases (comma sequences, empty parens, double literals)
+                                                     // are caught at eval time in eval_node(). No separate AST validator is needed.
     Ok(parsed)
 }
 
@@ -554,15 +557,11 @@ mod tests {
                 assert_eq!(binop.kind, BinaryOpKind::Union);
                 // Walk left until we find a UnaryOp(Negate) somewhere
                 // The structure could be ((- a) | b) | c or (- a) | (b | c)
-                fn has_unary_negate(
-                    parsed: &ParsedXPath,
-                    node_id: AstNodeId,
-                ) -> bool {
+                fn has_unary_negate(parsed: &ParsedXPath, node_id: AstNodeId) -> bool {
                     match parsed.get_node(node_id) {
                         AstNode::UnaryOp(u) => u.kind == UnaryOpKind::Negate,
                         AstNode::BinaryOp(b) => {
-                            has_unary_negate(parsed, b.left)
-                                || has_unary_negate(parsed, b.right)
+                            has_unary_negate(parsed, b.left) || has_unary_negate(parsed, b.right)
                         }
                         _ => false,
                     }
@@ -594,7 +593,11 @@ mod tests {
             mode: XPathMode::XPath10,
         };
         let result = parse_with_options("//union", &opts);
-        assert!(result.is_ok(), "parse_with_options failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "parse_with_options failed: {:?}",
+            result.err()
+        );
     }
 
     #[test]

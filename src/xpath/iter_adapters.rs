@@ -25,9 +25,9 @@ impl Iterator for CodepointIterator {
     type Item = XmlValue;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.chars.next().map(|c| {
-            XmlValue::integer(num_bigint::BigInt::from(c as u32))
-        })
+        self.chars
+            .next()
+            .map(|c| XmlValue::integer(num_bigint::BigInt::from(c as u32)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -157,9 +157,7 @@ pub struct ReverseIterator<I: DoubleEndedIterator> {
 impl<I: DoubleEndedIterator> ReverseIterator<I> {
     /// Create a new reverse iterator.
     pub fn new(inner: I) -> Self {
-        Self {
-            inner: inner.rev(),
-        }
+        Self { inner: inner.rev() }
     }
 }
 
@@ -205,7 +203,10 @@ impl<I: Iterator> Iterator for TakeIterator<I> {
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         let (lower, upper) = self.inner.size_hint();
-        (lower.min(self.remaining), upper.map(|u| u.min(self.remaining)))
+        (
+            lower.min(self.remaining),
+            upper.map(|u| u.min(self.remaining)),
+        )
     }
 }
 

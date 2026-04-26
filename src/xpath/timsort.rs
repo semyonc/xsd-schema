@@ -343,7 +343,14 @@ where
 
         // Find where the last element of run1 goes in run2. Subsequent elements
         // in run2 can be ignored (because they're already in place).
-        len2 = gallop_left(&self.a[base1 + len1 - 1], &self.a, base2, len2, len2 - 1, &mut self.c);
+        len2 = gallop_left(
+            &self.a[base1 + len1 - 1],
+            &self.a,
+            base2,
+            len2,
+            len2 - 1,
+            &mut self.c,
+        );
         if len2 == 0 {
             return;
         }
@@ -609,7 +616,14 @@ where
             loop {
                 debug_assert!(len1 > 0 && len2 > 1);
                 count1 = len1
-                    - gallop_right(&self.tmp[cursor2], &self.a, base1, len1, len1 - 1, &mut self.c);
+                    - gallop_right(
+                        &self.tmp[cursor2],
+                        &self.a,
+                        base1,
+                        len1,
+                        len1 - 1,
+                        &mut self.c,
+                    );
                 if count1 != 0 {
                     dest -= count1;
                     cursor1 -= count1;
@@ -629,8 +643,8 @@ where
                     break 'outer;
                 }
 
-                count2 = len2
-                    - gallop_left(&self.a[cursor1], &self.tmp, 0, len2, len2 - 1, &mut self.c);
+                count2 =
+                    len2 - gallop_left(&self.a[cursor1], &self.tmp, 0, len2, len2 - 1, &mut self.c);
                 if count2 != 0 {
                     dest -= count2;
                     cursor2 = cursor2.wrapping_sub(count2);

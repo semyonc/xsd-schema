@@ -16,9 +16,9 @@ use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
+use super::{PrimitiveTypeCode, XmlTypeCode};
 use crate::ids::SimpleTypeKey;
 use crate::namespace::qname::QualifiedName;
-use super::{XmlTypeCode, PrimitiveTypeCode};
 
 /// A typed XSD value with type information.
 ///
@@ -45,7 +45,11 @@ impl XmlValue {
     }
 
     /// Create a new XmlValue with schema type reference
-    pub fn with_schema_type(type_code: XmlTypeCode, schema_type: SimpleTypeKey, value: XmlValueKind) -> Self {
+    pub fn with_schema_type(
+        type_code: XmlTypeCode,
+        schema_type: SimpleTypeKey,
+        value: XmlValueKind,
+    ) -> Self {
         Self {
             type_code,
             schema_type: Some(schema_type),
@@ -118,7 +122,10 @@ impl XmlValue {
 
     /// Check if this is an atomic value
     pub fn is_atomic(&self) -> bool {
-        matches!(self.value, XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_))
+        matches!(
+            self.value,
+            XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_)
+        )
     }
 
     /// Check if this is a list value
@@ -145,12 +152,11 @@ impl XmlValue {
     pub fn to_string_value(&self) -> String {
         match &self.value {
             XmlValueKind::Atomic(atom) => atom.to_string(),
-            XmlValueKind::List { items, .. } => {
-                items.iter()
-                    .map(|v| v.to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            }
+            XmlValueKind::List { items, .. } => items
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(" "),
             XmlValueKind::Union(inner) => inner.to_string_value(),
             XmlValueKind::UntypedAtomic(s) => s.clone(),
         }
@@ -376,7 +382,9 @@ impl XmlAtomicValue {
             Self::DateTime(_) => PrimitiveTypeCode::DateTime,
             Self::Date(_) => PrimitiveTypeCode::Date,
             Self::Time(_) => PrimitiveTypeCode::Time,
-            Self::Duration(_) | Self::YearMonthDuration(_) | Self::DayTimeDuration(_) => PrimitiveTypeCode::Duration,
+            Self::Duration(_) | Self::YearMonthDuration(_) | Self::DayTimeDuration(_) => {
+                PrimitiveTypeCode::Duration
+            }
             Self::GYearMonth(_) => PrimitiveTypeCode::GYearMonth,
             Self::GYear(_) => PrimitiveTypeCode::GYear,
             Self::GMonthDay(_) => PrimitiveTypeCode::GMonthDay,
@@ -423,7 +431,11 @@ impl fmt::Display for XmlAtomicValue {
             }
             Self::Base64Binary(bytes) => {
                 use base64::Engine;
-                write!(f, "{}", base64::engine::general_purpose::STANDARD.encode(bytes))
+                write!(
+                    f,
+                    "{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
             }
             Self::AnyUri(uri) => write!(f, "{}", uri),
             Self::QName(qn) => {
@@ -553,16 +565,19 @@ impl DateTimeValue {
 
 impl PartialOrd for DateTimeValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_instant().partial_cmp(&other.to_comparable_instant())
+        self.to_comparable_instant()
+            .partial_cmp(&other.to_comparable_instant())
     }
 }
 
 impl fmt::Display for DateTimeValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         format_year(self.year, f)?;
-        write!(f, "-{:02}-{:02}T{:02}:{:02}:",
-            self.month, self.day,
-            self.hour, self.minute)?;
+        write!(
+            f,
+            "-{:02}-{:02}T{:02}:{:02}:",
+            self.month, self.day, self.hour, self.minute
+        )?;
         format_seconds(self.second, f)?;
         if let Some(tz) = &self.timezone {
             write!(f, "{}", tz)?;
@@ -584,14 +599,14 @@ impl DateValue {
     fn to_comparable_instant(&self) -> Decimal {
         let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let days = date_to_days(self.year, self.month as i32, self.day as i32);
-        Decimal::from(days) * Decimal::from(86400)
-            - Decimal::from(tz_minutes) * Decimal::from(60)
+        Decimal::from(days) * Decimal::from(86400) - Decimal::from(tz_minutes) * Decimal::from(60)
     }
 }
 
 impl PartialOrd for DateValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_instant().partial_cmp(&other.to_comparable_instant())
+        self.to_comparable_instant()
+            .partial_cmp(&other.to_comparable_instant())
     }
 }
 
@@ -627,7 +642,8 @@ impl TimeValue {
 
 impl PartialOrd for TimeValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_comparable_seconds().partial_cmp(&other.to_comparable_seconds())
+        self.to_comparable_seconds()
+            .partial_cmp(&other.to_comparable_seconds())
     }
 }
 
@@ -663,19 +679,25 @@ impl DurationValue {
     fn to_approx_total_seconds(&self) -> Decimal {
         // Average month in seconds: 30.436875 * 86400 = 2629746
         let month_secs = Decimal::from(2629746i64);
-        let total_months = Decimal::from(self.years as i64) * Decimal::from(12) + Decimal::from(self.months as i64);
+        let total_months = Decimal::from(self.years as i64) * Decimal::from(12)
+            + Decimal::from(self.months as i64);
         let day_time_secs = Decimal::from(self.days as i64) * Decimal::from(86400)
             + Decimal::from(self.hours as i64) * Decimal::from(3600)
             + Decimal::from(self.minutes as i64) * Decimal::from(60)
             + self.seconds;
         let total = total_months * month_secs + day_time_secs;
-        if self.negative { -total } else { total }
+        if self.negative {
+            -total
+        } else {
+            total
+        }
     }
 }
 
 impl PartialOrd for DurationValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.to_approx_total_seconds().partial_cmp(&other.to_approx_total_seconds())
+        self.to_approx_total_seconds()
+            .partial_cmp(&other.to_approx_total_seconds())
     }
 }
 
@@ -717,8 +739,8 @@ impl fmt::Display for DurationValue {
             }
         }
         // Handle zero duration
-        if years == 0 && months == 0 && days == 0
-            && hours == 0 && minutes == 0 && seconds.is_zero() {
+        if years == 0 && months == 0 && days == 0 && hours == 0 && minutes == 0 && seconds.is_zero()
+        {
             write!(f, "T0S")?;
         }
         Ok(())
@@ -825,14 +847,22 @@ impl PartialOrd for DayTimeDurationValue {
                 + Decimal::from(self.hours as i64) * Decimal::from(3600i64)
                 + Decimal::from(self.minutes as i64) * Decimal::from(60i64)
                 + self.seconds;
-            if self.negative { -s } else { s }
+            if self.negative {
+                -s
+            } else {
+                s
+            }
         };
         let other_secs = {
             let s = Decimal::from(other.days as i64) * Decimal::from(86400i64)
                 + Decimal::from(other.hours as i64) * Decimal::from(3600i64)
                 + Decimal::from(other.minutes as i64) * Decimal::from(60i64)
                 + other.seconds;
-            if other.negative { -s } else { s }
+            if other.negative {
+                -s
+            } else {
+                s
+            }
         };
         self_secs.partial_cmp(&other_secs)
     }
@@ -1031,7 +1061,12 @@ fn date_to_days(year: i32, month: i32, day: i32) -> i64 {
 ///
 /// Carries over whole seconds into minutes, minutes into hours, hours into days.
 /// Only the integer part of seconds is carried; the fractional part stays in seconds.
-fn normalize_day_time(days: u32, hours: u32, minutes: u32, seconds: Decimal) -> (u32, u32, u32, Decimal) {
+fn normalize_day_time(
+    days: u32,
+    hours: u32,
+    minutes: u32,
+    seconds: Decimal,
+) -> (u32, u32, u32, Decimal) {
     let whole_secs = seconds.trunc();
     let frac_secs = seconds - whole_secs;
 
@@ -1144,9 +1179,18 @@ mod tests {
 
     #[test]
     fn test_xml_atomic_value_type_code() {
-        assert_eq!(XmlAtomicValue::String("test".into()).type_code(), XmlTypeCode::String);
-        assert_eq!(XmlAtomicValue::Boolean(true).type_code(), XmlTypeCode::Boolean);
-        assert_eq!(XmlAtomicValue::Integer(BigInt::from(1)).type_code(), XmlTypeCode::Integer);
+        assert_eq!(
+            XmlAtomicValue::String("test".into()).type_code(),
+            XmlTypeCode::String
+        );
+        assert_eq!(
+            XmlAtomicValue::Boolean(true).type_code(),
+            XmlTypeCode::Boolean
+        );
+        assert_eq!(
+            XmlAtomicValue::Integer(BigInt::from(1)).type_code(),
+            XmlTypeCode::Integer
+        );
     }
 
     #[test]
@@ -1185,18 +1229,12 @@ mod tests {
 
     #[test]
     fn test_float_special_values() {
-        assert_eq!(
-            format!("{}", XmlAtomicValue::Float(f32::INFINITY)),
-            "INF"
-        );
+        assert_eq!(format!("{}", XmlAtomicValue::Float(f32::INFINITY)), "INF");
         assert_eq!(
             format!("{}", XmlAtomicValue::Float(f32::NEG_INFINITY)),
             "-INF"
         );
-        assert_eq!(
-            format!("{}", XmlAtomicValue::Float(f32::NAN)),
-            "NaN"
-        );
+        assert_eq!(format!("{}", XmlAtomicValue::Float(f32::NAN)), "NaN");
     }
 
     #[test]

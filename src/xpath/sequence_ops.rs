@@ -51,7 +51,9 @@ pub fn union_nodes<N: DomNavigator + Clone>(
             ));
         }
         // Check for duplicates using node identity
-        let is_duplicate = result.iter().any(|existing| eq_comparer.equals(existing, &item));
+        let is_duplicate = result
+            .iter()
+            .any(|existing| eq_comparer.equals(existing, &item));
         if !is_duplicate {
             result.add(item);
         }
@@ -65,7 +67,9 @@ pub fn union_nodes<N: DomNavigator + Clone>(
                 "atomic value".to_string(),
             ));
         }
-        let is_duplicate = result.iter().any(|existing| eq_comparer.equals(existing, &item));
+        let is_duplicate = result
+            .iter()
+            .any(|existing| eq_comparer.equals(existing, &item));
         if !is_duplicate {
             result.add(item);
         }
@@ -120,7 +124,9 @@ pub fn intersect_nodes<N: DomNavigator + Clone>(
         let in_right = right.iter().any(|r| eq_comparer.equals(&left_item, r));
         if in_right {
             // Check we haven't already added this node
-            let already_added = result.iter().any(|existing| eq_comparer.equals(existing, &left_item));
+            let already_added = result
+                .iter()
+                .any(|existing| eq_comparer.equals(existing, &left_item));
             if !already_added {
                 result.add(left_item);
             }
@@ -176,7 +182,9 @@ pub fn except_nodes<N: DomNavigator + Clone>(
         let in_right = right.iter().any(|r| eq_comparer.equals(&left_item, r));
         if !in_right {
             // Check we haven't already added this node
-            let already_added = result.iter().any(|existing| eq_comparer.equals(existing, &left_item));
+            let already_added = result
+                .iter()
+                .any(|existing| eq_comparer.equals(existing, &left_item));
             if !already_added {
                 result.add(left_item);
             }
@@ -390,7 +398,9 @@ pub fn union_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<XmlValue> 
 }
 
 /// Deprecated: Use `intersect_atomic_values` for atomic sequences or `intersect_nodes` for nodes.
-#[deprecated(note = "Use intersect_atomic_values for atomic sequences or intersect_nodes for nodes")]
+#[deprecated(
+    note = "Use intersect_atomic_values for atomic sequences or intersect_nodes for nodes"
+)]
 pub fn intersect_values(left: Vec<XmlValue>, right: Vec<XmlValue>) -> Vec<XmlValue> {
     intersect_atomic_values(left, right)
 }

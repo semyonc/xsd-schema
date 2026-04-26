@@ -55,7 +55,9 @@ pub enum FacetError {
     TotalDigitsViolation { actual: u32, max: u32 },
 
     /// Value violates fractionDigits constraint
-    #[error("fractionDigits constraint violation: value has {actual} fraction digits, maximum is {max}")]
+    #[error(
+        "fractionDigits constraint violation: value has {actual} fraction digits, maximum is {max}"
+    )]
     FractionDigitsViolation { actual: u32, max: u32 },
 
     /// Value violates explicitTimezone constraint
@@ -236,18 +238,36 @@ impl SchemaError {
     /// Add source location to error if it doesn't already have one
     pub fn with_location(self, location: SourceLocation) -> Self {
         match self {
-            SchemaError::XmlError { message, location: None } => {
-                SchemaError::XmlError { message, location: Some(location) }
-            }
-            SchemaError::StructuralError { constraint, message, location: None } => {
-                SchemaError::StructuralError { constraint, message, location: Some(location) }
-            }
-            SchemaError::NamespaceError { message, location: None } => {
-                SchemaError::NamespaceError { message, location: Some(location) }
-            }
-            SchemaError::FeatureError { message, location: None } => {
-                SchemaError::FeatureError { message, location: Some(location) }
-            }
+            SchemaError::XmlError {
+                message,
+                location: None,
+            } => SchemaError::XmlError {
+                message,
+                location: Some(location),
+            },
+            SchemaError::StructuralError {
+                constraint,
+                message,
+                location: None,
+            } => SchemaError::StructuralError {
+                constraint,
+                message,
+                location: Some(location),
+            },
+            SchemaError::NamespaceError {
+                message,
+                location: None,
+            } => SchemaError::NamespaceError {
+                message,
+                location: Some(location),
+            },
+            SchemaError::FeatureError {
+                message,
+                location: None,
+            } => SchemaError::FeatureError {
+                message,
+                location: Some(location),
+            },
             // Already has location or doesn't support location - return unchanged
             other => other,
         }

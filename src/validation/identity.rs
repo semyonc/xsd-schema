@@ -321,11 +321,7 @@ pub struct KeyTable {
 
 impl KeyTable {
     /// Create a new empty key table.
-    pub fn new(
-        ic_key: IdentityConstraintKey,
-        constraint_name: NameId,
-        kind: IdentityKind,
-    ) -> Self {
+    pub fn new(ic_key: IdentityConstraintKey, constraint_name: NameId, kind: IdentityKind) -> Self {
         KeyTable {
             ic_key,
             constraint_name,
@@ -356,10 +352,7 @@ impl KeyTable {
                 if !seq.is_complete() {
                     errors.push(error_with_path(
                         "cvc-identity-constraint.4.2.1",
-                        format!(
-                            "Key constraint '{}': not all fields have values",
-                            name
-                        ),
+                        format!("Key constraint '{}': not all fields have values", name),
                         location.clone(),
                         element_path,
                     ));
@@ -369,10 +362,7 @@ impl KeyTable {
                 if self.find_duplicate(&seq).is_some() {
                     errors.push(error_with_path(
                         "cvc-identity-constraint.4.2.2",
-                        format!(
-                            "Key constraint '{}': duplicate key value detected",
-                            name
-                        ),
+                        format!("Key constraint '{}': duplicate key value detected", name),
                         location,
                         element_path,
                     ));
@@ -383,10 +373,7 @@ impl KeyTable {
                 if seq.is_complete() && self.find_duplicate(&seq).is_some() {
                     errors.push(error_with_path(
                         "cvc-identity-constraint.4.2.2",
-                        format!(
-                            "Unique constraint '{}': duplicate key value detected",
-                            name
-                        ),
+                        format!("Unique constraint '{}': duplicate key value detected", name),
                         location,
                         element_path,
                     ));
@@ -729,12 +716,10 @@ impl ConstraintStruct {
                 let seq = KeySequence {
                     fields: frame.current_key_sequence,
                 };
-                errors.extend(self.key_table.add_sequence(
-                    seq,
-                    name_table,
-                    element_path,
-                    location,
-                ));
+                errors.extend(
+                    self.key_table
+                        .add_sequence(seq, name_table, element_path, location),
+                );
             }
         }
 
@@ -890,10 +875,7 @@ mod tests {
     #[test]
     fn key_sequence_is_complete_all_present() {
         let seq = KeySequence {
-            fields: vec![
-                Some(make_string_field("a")),
-                Some(make_string_field("b")),
-            ],
+            fields: vec![Some(make_string_field("a")), Some(make_string_field("b"))],
         };
         assert!(seq.is_complete());
     }
@@ -909,16 +891,10 @@ mod tests {
     #[test]
     fn key_sequence_equal() {
         let a = KeySequence {
-            fields: vec![
-                Some(make_string_field("x")),
-                Some(make_string_field("y")),
-            ],
+            fields: vec![Some(make_string_field("x")), Some(make_string_field("y"))],
         };
         let b = KeySequence {
-            fields: vec![
-                Some(make_string_field("x")),
-                Some(make_string_field("y")),
-            ],
+            fields: vec![Some(make_string_field("x")), Some(make_string_field("y"))],
         };
         assert_eq!(a, b);
     }
@@ -926,16 +902,10 @@ mod tests {
     #[test]
     fn key_sequence_not_equal() {
         let a = KeySequence {
-            fields: vec![
-                Some(make_string_field("x")),
-                Some(make_string_field("y")),
-            ],
+            fields: vec![Some(make_string_field("x")), Some(make_string_field("y"))],
         };
         let b = KeySequence {
-            fields: vec![
-                Some(make_string_field("x")),
-                Some(make_string_field("z")),
-            ],
+            fields: vec![Some(make_string_field("x")), Some(make_string_field("z"))],
         };
         assert_ne!(a, b);
     }
@@ -985,7 +955,9 @@ mod tests {
             fields: vec![Some(make_string_field("a")), None],
         };
         let errs = table.add_sequence(seq, &nt, "/root/item[1]", None);
-        assert!(errs.iter().any(|e| e.constraint == "cvc-identity-constraint.4.2.1"));
+        assert!(errs
+            .iter()
+            .any(|e| e.constraint == "cvc-identity-constraint.4.2.1"));
     }
 
     #[test]
@@ -1014,9 +986,7 @@ mod tests {
         let name = nt.add("uq");
         let mut table = KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Unique);
 
-        let seq = KeySequence {
-            fields: vec![None],
-        };
+        let seq = KeySequence { fields: vec![None] };
         let errs = table.add_sequence(seq, &nt, "/root/item[1]", None);
         assert!(errs.is_empty());
     }
@@ -1040,12 +1010,17 @@ mod tests {
         let pk_name = nt.add("pk");
         let fk_name = nt.add("fk");
 
-        let mut key_table = KeyTable::new(IdentityConstraintKey::default(), pk_name, IdentityKind::Key);
+        let mut key_table =
+            KeyTable::new(IdentityConstraintKey::default(), pk_name, IdentityKind::Key);
         key_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("1"))],
         });
 
-        let mut keyref_table = KeyTable::new(IdentityConstraintKey::default(), fk_name, IdentityKind::Keyref);
+        let mut keyref_table = KeyTable::new(
+            IdentityConstraintKey::default(),
+            fk_name,
+            IdentityKind::Keyref,
+        );
         keyref_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("1"))],
         });
@@ -1062,7 +1037,11 @@ mod tests {
 
         let key_table = KeyTable::new(IdentityConstraintKey::default(), pk_name, IdentityKind::Key);
 
-        let mut keyref_table = KeyTable::new(IdentityConstraintKey::default(), fk_name, IdentityKind::Keyref);
+        let mut keyref_table = KeyTable::new(
+            IdentityConstraintKey::default(),
+            fk_name,
+            IdentityKind::Keyref,
+        );
         keyref_table.sequences.push(KeySequence {
             fields: vec![Some(make_string_field("missing"))],
         });
@@ -1110,10 +1089,7 @@ mod tests {
             ref_name: None,
             refer: None,
             selector: make_selector_result(selector_xpath),
-            fields: field_xpaths
-                .iter()
-                .map(|x| make_field_result(x))
-                .collect(),
+            fields: field_xpaths.iter().map(|x| make_field_result(x)).collect(),
             id: None,
             annotation: None,
             source: None,
@@ -1128,14 +1104,8 @@ mod tests {
 
         let data = make_identity_data(IdentityKind::Key, name, "./item", &["@id"]);
 
-        let compiled = CompiledIdentityConstraint::compile(
-            &data,
-            key,
-            &nt,
-            None,
-            None,
-            XsdVersion::V1_0,
-        );
+        let compiled =
+            CompiledIdentityConstraint::compile(&data, key, &nt, None, None, XsdVersion::V1_0);
         assert!(compiled.is_ok());
         let compiled = compiled.unwrap();
         assert_eq!(compiled.field_count, 1);
@@ -1151,14 +1121,8 @@ mod tests {
 
         let data = make_identity_data(IdentityKind::Key, name, "///invalid", &["@id"]);
 
-        let result = CompiledIdentityConstraint::compile(
-            &data,
-            key,
-            &nt,
-            None,
-            None,
-            XsdVersion::V1_0,
-        );
+        let result =
+            CompiledIdentityConstraint::compile(&data, key, &nt, None, None, XsdVersion::V1_0);
         assert!(result.is_err());
     }
 
@@ -1173,15 +1137,9 @@ mod tests {
         let key = IdentityConstraintKey::default();
 
         let data = make_identity_data(IdentityKind::Key, name, "./item", &["@id"]);
-        let compiled = CompiledIdentityConstraint::compile(
-            &data,
-            key,
-            &nt,
-            None,
-            None,
-            XsdVersion::V1_0,
-        )
-        .unwrap();
+        let compiled =
+            CompiledIdentityConstraint::compile(&data, key, &nt, None, None, XsdVersion::V1_0)
+                .unwrap();
 
         let mut cs = ConstraintStruct::new(&compiled);
 
@@ -1231,15 +1189,9 @@ mod tests {
         let key = IdentityConstraintKey::default();
 
         let data = make_identity_data(IdentityKind::Unique, name, ".//item", &["@id"]);
-        let compiled = CompiledIdentityConstraint::compile(
-            &data,
-            key,
-            &nt,
-            None,
-            None,
-            XsdVersion::V1_0,
-        )
-        .unwrap();
+        let compiled =
+            CompiledIdentityConstraint::compile(&data, key, &nt, None, None, XsdVersion::V1_0)
+                .unwrap();
 
         let mut cs = ConstraintStruct::new(&compiled);
         cs.activate();
@@ -1302,15 +1254,9 @@ mod tests {
 
         // Two fields both matching @id
         let data = make_identity_data(IdentityKind::Unique, name, "./item", &["@id", "@id"]);
-        let compiled = CompiledIdentityConstraint::compile(
-            &data,
-            key,
-            &nt,
-            None,
-            None,
-            XsdVersion::V1_0,
-        )
-        .unwrap();
+        let compiled =
+            CompiledIdentityConstraint::compile(&data, key, &nt, None, None, XsdVersion::V1_0)
+                .unwrap();
 
         let mut cs = ConstraintStruct::new(&compiled);
         cs.activate();

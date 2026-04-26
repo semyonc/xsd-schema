@@ -1,10 +1,10 @@
 use super::*;
-use crate::compiler::{FragmentBuilder, NfaTerm, fragment_to_table};
 use crate::compiler::compile::cap_for_upa;
-use crate::parser::location::{SourceRef, SourceSpan};
-use crate::types::complex::ProcessContents;
+use crate::compiler::{fragment_to_table, FragmentBuilder, NfaTerm};
 use crate::error::SchemaError;
+use crate::parser::location::{SourceRef, SourceSpan};
 use crate::schema::model::DerivationSet;
+use crate::types::complex::ProcessContents;
 
 fn assert_cos_nonambig(error: SchemaError) {
     match error {
@@ -355,7 +355,12 @@ fn test_elements_overlap_different_name() {
 #[test]
 fn test_elements_overlap_different_ns() {
     let name = NameId(1);
-    assert!(!elements_overlap(name, Some(NameId(2)), name, Some(NameId(3))));
+    assert!(!elements_overlap(
+        name,
+        Some(NameId(2)),
+        name,
+        Some(NameId(3))
+    ));
 }
 
 #[test]
@@ -471,12 +476,7 @@ fn test_substitution_group_blocked_no_conflict() {
         .unwrap()
         .resolved_substitution_groups
         .push(head_key);
-    schema_set
-        .arenas
-        .elements
-        .get_mut(head_key)
-        .unwrap()
-        .block = DerivationSet::SUBSTITUTION;
+    schema_set.arenas.elements.get_mut(head_key).unwrap().block = DerivationSet::SUBSTITUTION;
 
     let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
@@ -816,7 +816,10 @@ fn test_element_wildcard_subst_member_namespace_conflict() {
     // BUT member is in other_ns (DOES overlap with ##other).
     // UPA should detect conflict.
     let result = check_upa(&nfa, &schema_set, Some(target_ns));
-    assert!(result.is_err(), "should detect conflict via substitution member in other namespace");
+    assert!(
+        result.is_err(),
+        "should detect conflict via substitution member in other namespace"
+    );
     assert_cos_nonambig(result.unwrap_err());
 }
 
@@ -858,7 +861,10 @@ fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
     // XSD 1.0: head is excluded by notQName, but member is not.
     // The wildcard can still match "member", so UPA conflict exists.
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_err(), "should detect conflict: member not excluded by notQName");
+    assert!(
+        result.is_err(),
+        "should detect conflict: member not excluded by notQName"
+    );
     assert_cos_nonambig(result.unwrap_err());
 }
 
@@ -893,7 +899,10 @@ fn test_dead_wildcard_no_upa_conflict() {
     let nfa = fragment_to_table(sequence);
 
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_ok(), "dead wildcard (maxOccurs=0) should not cause UPA conflict");
+    assert!(
+        result.is_ok(),
+        "dead wildcard (maxOccurs=0) should not cause UPA conflict"
+    );
 }
 
 #[test]
@@ -939,7 +948,10 @@ fn test_counted_element_trailing_sibling_conflict() {
     let nfa = fragment_to_table(sequence);
 
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_err(), "should detect UPA violation for a{{1,2}} followed by a");
+    assert!(
+        result.is_err(),
+        "should detect UPA violation for a{{1,2}} followed by a"
+    );
     assert_cos_nonambig(result.unwrap_err());
 }
 
@@ -959,7 +971,10 @@ fn test_nullable_counted_trailing_sibling_conflict() {
     let nfa = fragment_to_table(sequence);
 
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_err(), "should detect UPA violation for a{{0,2}} followed by a");
+    assert!(
+        result.is_err(),
+        "should detect UPA violation for a{{0,2}} followed by a"
+    );
     assert_cos_nonambig(result.unwrap_err());
 }
 
@@ -981,7 +996,10 @@ fn test_counted_different_elements_no_conflict() {
     let nfa = fragment_to_table(sequence);
 
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_ok(), "sequence(a{{1,2}}, b{{1,2}}) should not violate UPA");
+    assert!(
+        result.is_ok(),
+        "sequence(a{{1,2}}, b{{1,2}}) should not violate UPA"
+    );
 }
 
 #[test]
@@ -1000,5 +1018,8 @@ fn test_single_repeated_element_no_conflict() {
     let nfa = fragment_to_table(repeated);
 
     let result = check_upa(&nfa, &schema_set, None);
-    assert!(result.is_ok(), "single repeated element should not violate UPA");
+    assert!(
+        result.is_ok(),
+        "single repeated element should not violate UPA"
+    );
 }

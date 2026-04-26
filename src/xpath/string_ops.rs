@@ -387,7 +387,10 @@ pub fn normalize_unicode(value: &str, form: Option<UnicodeNormalizationForm>) ->
 ///
 /// Without the unicode-normalization feature, this only handles the no-op case.
 #[cfg(not(feature = "unicode-normalization"))]
-pub fn normalize_unicode(value: &str, form: Option<UnicodeNormalizationForm>) -> Result<String, super::error::XPathError> {
+pub fn normalize_unicode(
+    value: &str,
+    form: Option<UnicodeNormalizationForm>,
+) -> Result<String, super::error::XPathError> {
     match form {
         None => Ok(value.to_string()),
         Some(f) => Err(super::error::XPathError::not_implemented(format!(
@@ -404,7 +407,12 @@ pub fn normalize_unicode(value: &str, form: Option<UnicodeNormalizationForm>) ->
 pub fn encode_for_uri(value: &str) -> String {
     let mut result = String::with_capacity(value.len() * 3);
     for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.' || byte == b'~' {
+        if byte.is_ascii_alphanumeric()
+            || byte == b'-'
+            || byte == b'_'
+            || byte == b'.'
+            || byte == b'~'
+        {
             result.push(byte as char);
         } else {
             result.push('%');
@@ -426,9 +434,15 @@ pub fn iri_to_uri(value: &str) -> String {
         if byte == b' ' {
             result.push_str("%20");
         } else if (0x20..0x7F).contains(&byte)
-            && byte != b'<' && byte != b'>'
-            && byte != b'"' && byte != b'{' && byte != b'}'
-            && byte != b'|' && byte != b'\\' && byte != b'^' && byte != b'`'
+            && byte != b'<'
+            && byte != b'>'
+            && byte != b'"'
+            && byte != b'{'
+            && byte != b'}'
+            && byte != b'|'
+            && byte != b'\\'
+            && byte != b'^'
+            && byte != b'`'
         {
             result.push(byte as char);
         } else {

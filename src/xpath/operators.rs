@@ -16,8 +16,8 @@ use crate::namespace::qname::QualifiedName;
 use crate::schema::model::SchemaSet;
 use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{
-    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue,
-    TimezoneOffset, YearMonthDurationValue, XmlAtomicValue, XmlValue, XmlValueKind,
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue, TimezoneOffset,
+    XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
@@ -124,9 +124,8 @@ pub fn eval_range(start: &XmlValue, end: &XmlValue) -> Result<Vec<XmlValue>, XPa
     let start_class = numeric_class(start.type_code).ok_or_else(|| {
         XPathError::type_mismatch("xs:integer", type_code_to_name(start.type_code))
     })?;
-    let end_class = numeric_class(end.type_code).ok_or_else(|| {
-        XPathError::type_mismatch("xs:integer", type_code_to_name(end.type_code))
-    })?;
+    let end_class = numeric_class(end.type_code)
+        .ok_or_else(|| XPathError::type_mismatch("xs:integer", type_code_to_name(end.type_code)))?;
 
     if !is_integer_class(start_class) {
         return Err(XPathError::type_mismatch(
@@ -173,12 +172,12 @@ fn eval_boolean_logic(
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<XmlValue, XPathError> {
-    let left_bool = left.as_boolean().ok_or_else(|| {
-        XPathError::internal("Boolean operator requires boolean operands")
-    })?;
-    let right_bool = right.as_boolean().ok_or_else(|| {
-        XPathError::internal("Boolean operator requires boolean operands")
-    })?;
+    let left_bool = left
+        .as_boolean()
+        .ok_or_else(|| XPathError::internal("Boolean operator requires boolean operands"))?;
+    let right_bool = right
+        .as_boolean()
+        .ok_or_else(|| XPathError::internal("Boolean operator requires boolean operands"))?;
 
     let result = match op {
         BinaryOpKind::And => left_bool && right_bool,
@@ -298,10 +297,7 @@ fn eval_temporal_binary(
     Ok(Some(result))
 }
 
-fn compare_temporal_eq(
-    left: &XmlValue,
-    right: &XmlValue,
-) -> Result<Option<bool>, XPathError> {
+fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>, XPathError> {
     if !is_temporal_type(left.type_code) && !is_temporal_type(right.type_code) {
         return Ok(None);
     }
@@ -310,10 +306,10 @@ fn compare_temporal_eq(
         if !(is_date_time_code(left.type_code) && is_date_time_code(right.type_code)) {
             return Err(operator_not_defined("op:eq", left, right));
         }
-        let left_dt = as_datetime(left)
-            .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
-        let right_dt = as_datetime(right)
-            .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
+        let left_dt =
+            as_datetime(left).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
+        let right_dt =
+            as_datetime(right).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         return Ok(Some(compare_datetime_eq(left_dt, right_dt)?));
     }
 
@@ -321,10 +317,9 @@ fn compare_temporal_eq(
         if left.type_code != XmlTypeCode::Date || right.type_code != XmlTypeCode::Date {
             return Err(operator_not_defined("op:eq", left, right));
         }
-        let left_date = as_date(left)
-            .ok_or_else(|| XPathError::internal("Expected date value"))?;
-        let right_date = as_date(right)
-            .ok_or_else(|| XPathError::internal("Expected date value"))?;
+        let left_date = as_date(left).ok_or_else(|| XPathError::internal("Expected date value"))?;
+        let right_date =
+            as_date(right).ok_or_else(|| XPathError::internal("Expected date value"))?;
         return Ok(Some(compare_date_eq(left_date, right_date)?));
     }
 
@@ -332,10 +327,9 @@ fn compare_temporal_eq(
         if left.type_code != XmlTypeCode::Time || right.type_code != XmlTypeCode::Time {
             return Err(operator_not_defined("op:eq", left, right));
         }
-        let left_time = as_time(left)
-            .ok_or_else(|| XPathError::internal("Expected time value"))?;
-        let right_time = as_time(right)
-            .ok_or_else(|| XPathError::internal("Expected time value"))?;
+        let left_time = as_time(left).ok_or_else(|| XPathError::internal("Expected time value"))?;
+        let right_time =
+            as_time(right).ok_or_else(|| XPathError::internal("Expected time value"))?;
         return Ok(Some(compare_time_eq(left_time, right_time)?));
     }
 
@@ -343,8 +337,8 @@ fn compare_temporal_eq(
         if !(is_duration_code(left.type_code) && is_duration_code(right.type_code)) {
             return Err(operator_not_defined("op:eq", left, right));
         }
-        let left_parts = duration_parts(left)?
-            .ok_or_else(|| XPathError::internal("Expected duration value"))?;
+        let left_parts =
+            duration_parts(left)?.ok_or_else(|| XPathError::internal("Expected duration value"))?;
         let right_parts = duration_parts(right)?
             .ok_or_else(|| XPathError::internal("Expected duration value"))?;
         return Ok(Some(left_parts == right_parts));
@@ -353,10 +347,7 @@ fn compare_temporal_eq(
     Err(operator_not_defined("op:eq", left, right))
 }
 
-fn compare_temporal_gt(
-    left: &XmlValue,
-    right: &XmlValue,
-) -> Result<Option<bool>, XPathError> {
+fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>, XPathError> {
     if !is_temporal_type(left.type_code) && !is_temporal_type(right.type_code) {
         return Ok(None);
     }
@@ -365,10 +356,10 @@ fn compare_temporal_gt(
         if !(is_date_time_code(left.type_code) && is_date_time_code(right.type_code)) {
             return Err(operator_not_defined("op:gt", left, right));
         }
-        let left_dt = as_datetime(left)
-            .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
-        let right_dt = as_datetime(right)
-            .ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
+        let left_dt =
+            as_datetime(left).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
+        let right_dt =
+            as_datetime(right).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         return Ok(Some(compare_datetime_gt(left_dt, right_dt)?));
     }
 
@@ -376,10 +367,9 @@ fn compare_temporal_gt(
         if left.type_code != XmlTypeCode::Date || right.type_code != XmlTypeCode::Date {
             return Err(operator_not_defined("op:gt", left, right));
         }
-        let left_date = as_date(left)
-            .ok_or_else(|| XPathError::internal("Expected date value"))?;
-        let right_date = as_date(right)
-            .ok_or_else(|| XPathError::internal("Expected date value"))?;
+        let left_date = as_date(left).ok_or_else(|| XPathError::internal("Expected date value"))?;
+        let right_date =
+            as_date(right).ok_or_else(|| XPathError::internal("Expected date value"))?;
         return Ok(Some(compare_date_gt(left_date, right_date)?));
     }
 
@@ -387,10 +377,9 @@ fn compare_temporal_gt(
         if left.type_code != XmlTypeCode::Time || right.type_code != XmlTypeCode::Time {
             return Err(operator_not_defined("op:gt", left, right));
         }
-        let left_time = as_time(left)
-            .ok_or_else(|| XPathError::internal("Expected time value"))?;
-        let right_time = as_time(right)
-            .ok_or_else(|| XPathError::internal("Expected time value"))?;
+        let left_time = as_time(left).ok_or_else(|| XPathError::internal("Expected time value"))?;
+        let right_time =
+            as_time(right).ok_or_else(|| XPathError::internal("Expected time value"))?;
         return Ok(Some(compare_time_gt(left_time, right_time)?));
     }
 
@@ -424,8 +413,7 @@ fn compare_temporal_gt(
         let right_duration = as_day_time_duration(right)
             .ok_or_else(|| XPathError::internal("Expected dayTimeDuration value"))?;
         return Ok(Some(
-            day_time_total_seconds(left_duration)?
-                > day_time_total_seconds(right_duration)?,
+            day_time_total_seconds(left_duration)? > day_time_total_seconds(right_duration)?,
         ));
     }
 
@@ -509,11 +497,11 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_duration) = as_year_month_duration(left) {
         if let Some(right_duration) = as_year_month_duration(right) {
-            let total = year_month_total_months(left_duration)
-                + year_month_total_months(right_duration);
-            return Ok(xml_year_month_duration_value(
-                year_month_from_months(total)?,
-            ));
+            let total =
+                year_month_total_months(left_duration) + year_month_total_months(right_duration);
+            return Ok(xml_year_month_duration_value(year_month_from_months(
+                total,
+            )?));
         }
         if let Some(right_dt) = as_datetime(right) {
             let result = add_datetime_year_month(right_dt, left_duration)?;
@@ -530,9 +518,7 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
         if let Some(right_duration) = as_day_time_duration(right) {
             let total =
                 day_time_total_seconds(left_duration)? + day_time_total_seconds(right_duration)?;
-            return Ok(xml_day_time_duration_value(
-                day_time_from_seconds(total)?,
-            ));
+            return Ok(xml_day_time_duration_value(day_time_from_seconds(total)?));
         }
         if let Some(right_dt) = as_datetime(right) {
             let result = add_datetime_day_time(right_dt, left_duration)?;
@@ -599,11 +585,11 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_duration) = as_year_month_duration(left) {
         if let Some(right_duration) = as_year_month_duration(right) {
-            let total = year_month_total_months(left_duration)
-                - year_month_total_months(right_duration);
-            return Ok(xml_year_month_duration_value(
-                year_month_from_months(total)?,
-            ));
+            let total =
+                year_month_total_months(left_duration) - year_month_total_months(right_duration);
+            return Ok(xml_year_month_duration_value(year_month_from_months(
+                total,
+            )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
     }
@@ -612,9 +598,7 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
         if let Some(right_duration) = as_day_time_duration(right) {
             let total =
                 day_time_total_seconds(left_duration)? - day_time_total_seconds(right_duration)?;
-            return Ok(xml_day_time_duration_value(
-                day_time_from_seconds(total)?,
-            ));
+            return Ok(xml_day_time_duration_value(day_time_from_seconds(total)?));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
     }
@@ -626,18 +610,18 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     if let Some(duration) = as_year_month_duration(left) {
         if right.type_code.is_numeric() {
             let factor = numeric_to_f64(right)?;
-            return Ok(xml_year_month_duration_value(
-                year_month_mul_numeric(duration, factor)?,
-            ));
+            return Ok(xml_year_month_duration_value(year_month_mul_numeric(
+                duration, factor,
+            )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Mul, left, right));
     }
 
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
-            return Ok(xml_day_time_duration_value(
-                day_time_mul_numeric_value(duration, right)?,
-            ));
+            return Ok(xml_day_time_duration_value(day_time_mul_numeric_value(
+                duration, right,
+            )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Mul, left, right));
     }
@@ -645,14 +629,14 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     if left.type_code.is_numeric() {
         if let Some(duration) = as_year_month_duration(right) {
             let factor = numeric_to_f64(left)?;
-            return Ok(xml_year_month_duration_value(
-                year_month_mul_numeric(duration, factor)?,
-            ));
+            return Ok(xml_year_month_duration_value(year_month_mul_numeric(
+                duration, factor,
+            )?));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            return Ok(xml_day_time_duration_value(
-                day_time_mul_numeric_value(duration, left)?,
-            ));
+            return Ok(xml_day_time_duration_value(day_time_mul_numeric_value(
+                duration, left,
+            )?));
         }
     }
 
@@ -663,9 +647,9 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     if let Some(duration) = as_year_month_duration(left) {
         if right.type_code.is_numeric() {
             let divisor = numeric_to_f64(right)?;
-            return Ok(xml_year_month_duration_value(
-                year_month_div_numeric(duration, divisor)?,
-            ));
+            return Ok(xml_year_month_duration_value(year_month_div_numeric(
+                duration, divisor,
+            )?));
         }
         if let Some(right_duration) = as_year_month_duration(right) {
             let ratio = year_month_div_duration(duration, right_duration)?;
@@ -676,9 +660,9 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
-            return Ok(xml_day_time_duration_value(
-                day_time_div_numeric_value(duration, right)?,
-            ));
+            return Ok(xml_day_time_duration_value(day_time_div_numeric_value(
+                duration, right,
+            )?));
         }
         if let Some(right_duration) = as_day_time_duration(right) {
             let ratio = day_time_div_duration(duration, right_duration)?;
@@ -784,9 +768,7 @@ fn numeric_add(
     result_type: XmlTypeCode,
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
-        (NumericValue::Integer(l), NumericValue::Integer(r)) => {
-            NumericValue::Integer(l + r)
-        }
+        (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l + r),
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l + r),
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l + r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l + r),
@@ -801,9 +783,7 @@ fn numeric_sub(
     result_type: XmlTypeCode,
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
-        (NumericValue::Integer(l), NumericValue::Integer(r)) => {
-            NumericValue::Integer(l - r)
-        }
+        (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l - r),
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l - r),
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l - r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l - r),
@@ -818,9 +798,7 @@ fn numeric_mul(
     result_type: XmlTypeCode,
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
-        (NumericValue::Integer(l), NumericValue::Integer(r)) => {
-            NumericValue::Integer(l * r)
-        }
+        (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l * r),
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l * r),
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l * r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l * r),
@@ -929,9 +907,10 @@ fn numeric_mod(
 /// expressions are cast to `xs:double`.
 fn cast_untyped_to_double(value: &XmlValue) -> Result<XmlValue, XPathError> {
     let s = value.to_string_value();
-    let d: f64 = s.trim().parse().map_err(|_| {
-        XPathError::invalid_cast_value(&s, "xs:double")
-    })?;
+    let d: f64 = s
+        .trim()
+        .parse()
+        .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
     Ok(XmlValue::double(d))
 }
 
@@ -1153,40 +1132,28 @@ fn numeric_to_xml_value(value: NumericValue, type_code: XmlTypeCode) -> XmlValue
     }
 }
 
-fn integer_pair(
-    left: NumericValue,
-    right: NumericValue,
-) -> Result<(BigInt, BigInt), XPathError> {
+fn integer_pair(left: NumericValue, right: NumericValue) -> Result<(BigInt, BigInt), XPathError> {
     match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => Ok((l, r)),
         _ => Err(XPathError::internal("Expected integer values")),
     }
 }
 
-fn decimal_pair(
-    left: NumericValue,
-    right: NumericValue,
-) -> Result<(Decimal, Decimal), XPathError> {
+fn decimal_pair(left: NumericValue, right: NumericValue) -> Result<(Decimal, Decimal), XPathError> {
     match (left, right) {
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => Ok((l, r)),
         _ => Err(XPathError::internal("Expected decimal values")),
     }
 }
 
-fn float_pair(
-    left: NumericValue,
-    right: NumericValue,
-) -> Result<(f32, f32), XPathError> {
+fn float_pair(left: NumericValue, right: NumericValue) -> Result<(f32, f32), XPathError> {
     match (left, right) {
         (NumericValue::Float(l), NumericValue::Float(r)) => Ok((l, r)),
         _ => Err(XPathError::internal("Expected float values")),
     }
 }
 
-fn double_pair(
-    left: NumericValue,
-    right: NumericValue,
-) -> Result<(f64, f64), XPathError> {
+fn double_pair(left: NumericValue, right: NumericValue) -> Result<(f64, f64), XPathError> {
     match (left, right) {
         (NumericValue::Double(l), NumericValue::Double(r)) => Ok((l, r)),
         _ => Err(XPathError::internal("Expected double values")),
@@ -1543,15 +1510,12 @@ fn negate_year_month_duration(value: &YearMonthDurationValue) -> YearMonthDurati
 }
 
 fn negate_day_time_duration(value: &DayTimeDurationValue) -> DayTimeDurationValue {
-    let negative = if value.days == 0
-        && value.hours == 0
-        && value.minutes == 0
-        && value.seconds.is_zero()
-    {
-        false
-    } else {
-        !value.negative
-    };
+    let negative =
+        if value.days == 0 && value.hours == 0 && value.minutes == 0 && value.seconds.is_zero() {
+            false
+        } else {
+            !value.negative
+        };
     DayTimeDurationValue {
         negative,
         days: value.days,
@@ -1672,8 +1636,7 @@ fn day_time_mul_numeric_value(
             let total = day_time_total_seconds(value)?
                 .to_f64()
                 .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
-            let result =
-                Decimal::from_f64(total * f).ok_or(XPathError::FODT0002)?;
+            let result = Decimal::from_f64(total * f).ok_or(XPathError::FODT0002)?;
             day_time_from_seconds(result)
         }
     }
@@ -1695,8 +1658,7 @@ fn day_time_div_numeric_value(
             let total = day_time_total_seconds(value)?
                 .to_f64()
                 .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
-            let result =
-                Decimal::from_f64(total / f).ok_or(XPathError::FODT0002)?;
+            let result = Decimal::from_f64(total / f).ok_or(XPathError::FODT0002)?;
             day_time_from_seconds(result)
         }
     }
@@ -1722,7 +1684,11 @@ fn add_months_to_date(
 ) -> Result<(i32, u8, u8), XPathError> {
     // Convert XSD year (no year 0) to astronomical year (continuous, with year 0)
     // XSD year > 0 → astro = year; XSD year < 0 → astro = year + 1
-    let astro_year = if year <= 0 { year as i64 + 1 } else { year as i64 };
+    let astro_year = if year <= 0 {
+        year as i64 + 1
+    } else {
+        year as i64
+    };
     let month_index = month as i64 - 1;
     let total = astro_year * 12 + month_index + delta_months;
     let new_astro_year = total.div_euclid(12);
@@ -1733,10 +1699,8 @@ fn add_months_to_date(
     } else {
         new_astro_year
     };
-    let year = i32::try_from(new_year)
-        .map_err(|_| XPathError::internal("Year out of range"))?;
-    let month = u8::try_from(new_month)
-        .map_err(|_| XPathError::internal("Month out of range"))?;
+    let year = i32::try_from(new_year).map_err(|_| XPathError::internal("Year out of range"))?;
+    let month = u8::try_from(new_month).map_err(|_| XPathError::internal("Month out of range"))?;
     let max_day = days_in_month(year, month)?;
     let day = day.min(max_day);
     Ok((year, month, day))
@@ -1867,9 +1831,7 @@ fn normalize_seconds_in_day(seconds: Decimal) -> Result<Decimal, XPathError> {
     Ok(remainder)
 }
 
-fn time_components_from_seconds(
-    seconds: Decimal,
-) -> Result<(u8, u8, Decimal), XPathError> {
+fn time_components_from_seconds(seconds: Decimal) -> Result<(u8, u8, Decimal), XPathError> {
     let hours = (seconds / Decimal::from(3_600)).floor();
     let mut remainder = seconds - hours * Decimal::from(3_600);
     let minutes = (remainder / Decimal::from(60)).floor();
@@ -1918,14 +1880,12 @@ fn decimal_to_i64(value: Decimal, label: &str) -> Result<i64, XPathError> {
 
 fn decimal_to_u32(value: Decimal, label: &str) -> Result<u32, XPathError> {
     let val = decimal_to_i64(value, label)?;
-    u32::try_from(val)
-        .map_err(|_| XPathError::internal(format!("{} out of range", label)))
+    u32::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
 }
 
 fn decimal_to_u8(value: Decimal, label: &str) -> Result<u8, XPathError> {
     let val = decimal_to_i64(value, label)?;
-    u8::try_from(val)
-        .map_err(|_| XPathError::internal(format!("{} out of range", label)))
+    u8::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
 }
 
 fn is_string_like(code: XmlTypeCode) -> bool {
@@ -1965,9 +1925,10 @@ pub fn magnitude_relationship(
         if right.type_code.is_numeric() {
             // Promote to double
             let s = left.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| {
-                XPathError::invalid_cast_value(&s, "xs:double")
-            })?;
+            let d: f64 = s
+                .trim()
+                .parse()
+                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // Keep as string
@@ -1981,9 +1942,10 @@ pub fn magnitude_relationship(
         if left_result.type_code.is_numeric() {
             // Promote to double
             let s = right.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| {
-                XPathError::invalid_cast_value(&s, "xs:double")
-            })?;
+            let d: f64 = s
+                .trim()
+                .parse()
+                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // Keep as string
@@ -2116,10 +2078,7 @@ fn get_xsd_primitive_type(code: XmlTypeCode) -> XmlTypeCode {
 ///
 /// Uses `cast_to` for types it supports, falls back to `VALIDATOR_REGISTRY`
 /// for other types (date/time/duration/etc). Does NOT apply facets.
-fn cast_to_primitive(
-    value: &XmlValue,
-    target_type: XmlTypeCode,
-) -> Result<XmlValue, XPathError> {
+fn cast_to_primitive(value: &XmlValue, target_type: XmlTypeCode) -> Result<XmlValue, XPathError> {
     // First try cast_to which handles common types
     match cast_to(value, target_type) {
         Ok(result) => Ok(result),
@@ -2221,20 +2180,18 @@ pub fn magnitude_relationship_ctx(
         if right.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = left_result.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| {
-                XPathError::invalid_cast_value(&s, "xs:double")
-            })?;
+            let d: f64 = s
+                .trim()
+                .parse()
+                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
             left_result = XmlValue::double(d);
         } else if is_string_like(right.type_code) {
             // String-like → cast to xs:string
             left_result = XmlValue::string(left_result.to_string_value());
         } else if right.type_code != XmlTypeCode::UntypedAtomic {
             // Other typed value → cast to primitive base type
-            let primitive_type = get_primitive_base_type(
-                context.schema_set,
-                right.schema_type,
-                right.type_code,
-            );
+            let primitive_type =
+                get_primitive_base_type(context.schema_set, right.schema_type, right.type_code);
             left_result = cast_to_primitive_ctx(context, &left_result, primitive_type)?;
         }
     }
@@ -2243,9 +2200,10 @@ pub fn magnitude_relationship_ctx(
         if left_result.type_code.is_numeric() {
             // Numeric → cast to xs:double
             let s = right_result.to_string_value();
-            let d: f64 = s.trim().parse().map_err(|_| {
-                XPathError::invalid_cast_value(&s, "xs:double")
-            })?;
+            let d: f64 = s
+                .trim()
+                .parse()
+                .map_err(|_| XPathError::invalid_cast_value(&s, "xs:double"))?;
             right_result = XmlValue::double(d);
         } else if is_string_like(left_result.type_code) {
             // String-like → cast to xs:string
@@ -2992,11 +2950,11 @@ fn unsupported_operator(op: BinaryOpKind, left: &XmlValue, right: &XmlValue) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::namespace::NameTable;
     use crate::namespace::qname::QualifiedName;
+    use crate::namespace::NameTable;
+    use crate::navigator::RoXmlNavigator;
     use crate::xpath::context::XPathContext;
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-    use crate::navigator::RoXmlNavigator;
 
     fn int_value(type_code: XmlTypeCode, value: i64) -> XmlValue {
         XmlValue {
@@ -3010,9 +2968,7 @@ mod tests {
         XmlValue {
             type_code: XmlTypeCode::Decimal,
             schema_type: None,
-            value: XmlValueKind::Atomic(XmlAtomicValue::Decimal(
-                value.parse::<Decimal>().unwrap(),
-            )),
+            value: XmlValueKind::Atomic(XmlAtomicValue::Decimal(value.parse::<Decimal>().unwrap())),
         }
     }
 
@@ -3102,15 +3058,13 @@ mod tests {
         XmlValue {
             type_code: XmlTypeCode::DayTimeDuration,
             schema_type: None,
-            value: XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(
-                DayTimeDurationValue {
-                    negative: false,
-                    days,
-                    hours,
-                    minutes,
-                    seconds,
-                },
-            )),
+            value: XmlValueKind::Atomic(XmlAtomicValue::DayTimeDuration(DayTimeDurationValue {
+                negative: false,
+                days,
+                hours,
+                minutes,
+                seconds,
+            })),
         }
     }
 
@@ -3219,7 +3173,10 @@ mod tests {
             .iter()
             .map(|v| v.as_integer().unwrap().clone())
             .collect();
-        assert_eq!(values, vec![BigInt::from(1), BigInt::from(2), BigInt::from(3)]);
+        assert_eq!(
+            values,
+            vec![BigInt::from(1), BigInt::from(2), BigInt::from(3)]
+        );
     }
 
     #[test]
@@ -3232,15 +3189,7 @@ mod tests {
 
     #[test]
     fn test_datetime_add_year_month_clamps_day() {
-        let left = datetime_value(
-            XmlTypeCode::DateTime,
-            2023,
-            1,
-            31,
-            10,
-            0,
-            Decimal::ZERO,
-        );
+        let left = datetime_value(XmlTypeCode::DateTime, 2023, 1, 31, 10, 0, Decimal::ZERO);
         let right = year_month_duration_value(0, 1);
         let result = eval_binary(BinaryOpKind::Add, &left, &right).unwrap();
         assert_eq!(result.type_code, XmlTypeCode::DateTime);
@@ -3327,24 +3276,8 @@ mod tests {
 
     #[test]
     fn test_datetime_sub_datetime_returns_day_time_duration() {
-        let left = datetime_value(
-            XmlTypeCode::DateTime,
-            2024,
-            3,
-            15,
-            12,
-            0,
-            Decimal::ZERO,
-        );
-        let right = datetime_value(
-            XmlTypeCode::DateTime,
-            2024,
-            3,
-            15,
-            11,
-            0,
-            Decimal::ZERO,
-        );
+        let left = datetime_value(XmlTypeCode::DateTime, 2024, 3, 15, 12, 0, Decimal::ZERO);
+        let right = datetime_value(XmlTypeCode::DateTime, 2024, 3, 15, 11, 0, Decimal::ZERO);
         let result = eval_binary(BinaryOpKind::Sub, &left, &right).unwrap();
         assert_eq!(result.type_code, XmlTypeCode::DayTimeDuration);
         match result.value {
@@ -3661,9 +3594,8 @@ mod tests {
             XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
             XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
         ]);
-        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::integer(BigInt::from(2))),
-        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(2)))]);
 
         assert!(general_eq_iter(&context, &left, &right).unwrap());
     }
@@ -3672,12 +3604,10 @@ mod tests {
     fn test_general_eq_iter_invalid_cast_errors() {
         let names = NameTable::new();
         let context = XPathContext::new(&names);
-        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::untyped("not-a-number")),
-        ]);
-        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
-        ]);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::untyped("not-a-number"))]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(1)))]);
 
         let result = general_eq_iter(&context, &left, &right);
         assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
@@ -3687,12 +3617,10 @@ mod tests {
     fn test_general_eq_iter_type_mismatch_is_false() {
         let names = NameTable::new();
         let context = XPathContext::new(&names);
-        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::boolean(true)),
-        ]);
-        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(date_value(2024, 1, 1)),
-        ]);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::boolean(true))]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(date_value(2024, 1, 1))]);
 
         assert!(!general_eq_iter(&context, &left, &right).unwrap());
     }
@@ -3701,15 +3629,16 @@ mod tests {
     fn test_general_gt_iter_type_mismatch_errors() {
         let names = NameTable::new();
         let context = XPathContext::new(&names);
-        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::boolean(true)),
-        ]);
-        let right: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
-            XmlItem::Atomic(XmlValue::string("false")),
-        ]);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::boolean(true))]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::string("false"))]);
 
         let result = general_gt_iter(&context, &left, &right);
-        assert!(matches!(result, Err(XPathError::BinaryOperatorNotDefined { .. })));
+        assert!(matches!(
+            result,
+            Err(XPathError::BinaryOperatorNotDefined { .. })
+        ));
     }
 
     // =========================================================================
@@ -3766,38 +3695,74 @@ mod tests {
     #[test]
     fn test_get_xsd_primitive_type_string_derived() {
         // String-derived types should map to xs:string
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::NormalizedString), XmlTypeCode::String);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Token), XmlTypeCode::String);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::NCName), XmlTypeCode::String);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::NormalizedString),
+            XmlTypeCode::String
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::Token),
+            XmlTypeCode::String
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::NCName),
+            XmlTypeCode::String
+        );
         assert_eq!(get_xsd_primitive_type(XmlTypeCode::Id), XmlTypeCode::String);
     }
 
     #[test]
     fn test_get_xsd_primitive_type_integer_derived() {
         // Integer-derived types should map to xs:decimal
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Integer), XmlTypeCode::Decimal);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Long), XmlTypeCode::Decimal);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Int), XmlTypeCode::Decimal);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::UnsignedInt), XmlTypeCode::Decimal);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::Integer),
+            XmlTypeCode::Decimal
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::Long),
+            XmlTypeCode::Decimal
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::Int),
+            XmlTypeCode::Decimal
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::UnsignedInt),
+            XmlTypeCode::Decimal
+        );
     }
 
     #[test]
     fn test_get_xsd_primitive_type_duration_special_cases() {
         // dayTimeDuration and yearMonthDuration are their own primitives for XPath
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DayTimeDuration), XmlTypeCode::DayTimeDuration);
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::YearMonthDuration), XmlTypeCode::YearMonthDuration);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::DayTimeDuration),
+            XmlTypeCode::DayTimeDuration
+        );
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::YearMonthDuration),
+            XmlTypeCode::YearMonthDuration
+        );
         // But xs:duration is already primitive
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::Duration), XmlTypeCode::Duration);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::Duration),
+            XmlTypeCode::Duration
+        );
     }
 
     #[test]
     fn test_get_xsd_primitive_type_date_time() {
         // Date/time types are already primitive
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DateTime), XmlTypeCode::DateTime);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::DateTime),
+            XmlTypeCode::DateTime
+        );
         assert_eq!(get_xsd_primitive_type(XmlTypeCode::Date), XmlTypeCode::Date);
         assert_eq!(get_xsd_primitive_type(XmlTypeCode::Time), XmlTypeCode::Time);
         // dateTimeStamp derives from dateTime
-        assert_eq!(get_xsd_primitive_type(XmlTypeCode::DateTimeStamp), XmlTypeCode::DateTime);
+        assert_eq!(
+            get_xsd_primitive_type(XmlTypeCode::DateTimeStamp),
+            XmlTypeCode::DateTime
+        );
     }
 
     #[test]

@@ -184,7 +184,8 @@ impl<'a> BufferDocument<'a> {
         options: BufferDocumentOptions,
         schema_set: Option<&'a SchemaSet>,
     ) -> Result<Self, super::BufferDocumentError> {
-        let builder = super::builder::BufferDocumentBuilder::new(arena, names, schema_set, options)?;
+        let builder =
+            super::builder::BufferDocumentBuilder::new(arena, names, schema_set, options)?;
         builder.build(reader)
     }
 
@@ -196,7 +197,6 @@ impl<'a> BufferDocument<'a> {
     ) -> Result<Self, super::BufferDocumentError> {
         Self::from_reader(reader, arena, names, BufferDocumentOptions::default(), None)
     }
-
 }
 
 #[cfg(test)]

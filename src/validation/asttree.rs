@@ -21,20 +21,11 @@ pub enum IdentityXPathError {
     /// Lexer error (invalid character, unsupported syntax).
     Lex(IdXPathLexError),
     /// Parser error (unexpected token, malformed expression).
-    Parse {
-        message: String,
-        position: usize,
-    },
+    Parse { message: String, position: usize },
     /// Unbound namespace prefix.
-    UnboundPrefix {
-        prefix: String,
-        position: usize,
-    },
+    UnboundPrefix { prefix: String, position: usize },
     /// Restriction violation (e.g. attribute step in selector, attribute not last).
-    Restriction {
-        message: String,
-        position: usize,
-    },
+    Restriction { message: String, position: usize },
 }
 
 impl fmt::Display for IdentityXPathError {
@@ -42,7 +33,10 @@ impl fmt::Display for IdentityXPathError {
         match self {
             IdentityXPathError::Lex(e) => write!(f, "{e}"),
             IdentityXPathError::Parse { message, position } => {
-                write!(f, "identity XPath parse error at position {position}: {message}")
+                write!(
+                    f,
+                    "identity XPath parse error at position {position}: {message}"
+                )
             }
             IdentityXPathError::UnboundPrefix { prefix, position } => {
                 write!(
@@ -97,7 +91,10 @@ impl NameTest {
         match self {
             NameTest::Wildcard => true,
             NameTest::NamespaceWildcard(ns) => namespace_uri == *ns,
-            NameTest::QName { namespace, local_name: ln } => {
+            NameTest::QName {
+                namespace,
+                local_name: ln,
+            } => {
                 *ln == local_name
                     && match namespace {
                         NamespaceMatch::NoNamespace => {
@@ -266,13 +263,8 @@ mod tests {
             default_ns: Some(uri_id),
             bindings: vec![],
         };
-        let result = resolve_effective_default_ns(
-            Some("##defaultNamespace"),
-            None,
-            &snapshot,
-            None,
-            &table,
-        );
+        let result =
+            resolve_effective_default_ns(Some("##defaultNamespace"), None, &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::Exact(uri_id));
     }
 
@@ -295,8 +287,7 @@ mod tests {
     fn own_local() {
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
-        let result =
-            resolve_effective_default_ns(Some("##local"), None, &snapshot, None, &table);
+        let result = resolve_effective_default_ns(Some("##local"), None, &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::NoNamespace);
     }
 
@@ -304,13 +295,8 @@ mod tests {
     fn own_literal_uri() {
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
-        let result = resolve_effective_default_ns(
-            Some("http://example.com"),
-            None,
-            &snapshot,
-            None,
-            &table,
-        );
+        let result =
+            resolve_effective_default_ns(Some("http://example.com"), None, &snapshot, None, &table);
         let expected_id = table.add("http://example.com");
         assert_eq!(result, NamespaceMatch::Exact(expected_id));
     }
@@ -321,13 +307,8 @@ mod tests {
         let schema_ns = table.add("http://example.com");
         let snapshot = NamespaceContextSnapshot::default();
         // own = ##local wins over schema-level URI
-        let result = resolve_effective_default_ns(
-            Some("##local"),
-            Some(schema_ns),
-            &snapshot,
-            None,
-            &table,
-        );
+        let result =
+            resolve_effective_default_ns(Some("##local"), Some(schema_ns), &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::NoNamespace);
     }
 
@@ -337,8 +318,7 @@ mod tests {
         let schema_ns = table.add("http://example.com");
         let snapshot = NamespaceContextSnapshot::default();
         // own = None, falls through to schema-level
-        let result =
-            resolve_effective_default_ns(None, Some(schema_ns), &snapshot, None, &table);
+        let result = resolve_effective_default_ns(None, Some(schema_ns), &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::Exact(schema_ns));
     }
 
@@ -349,13 +329,8 @@ mod tests {
             default_ns: None,
             bindings: vec![],
         };
-        let result = resolve_effective_default_ns(
-            Some("##defaultNamespace"),
-            None,
-            &snapshot,
-            None,
-            &table,
-        );
+        let result =
+            resolve_effective_default_ns(Some("##defaultNamespace"), None, &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::NoNamespace);
     }
 
@@ -363,13 +338,8 @@ mod tests {
     fn target_ns_absent() {
         let table = NameTable::new();
         let snapshot = NamespaceContextSnapshot::default();
-        let result = resolve_effective_default_ns(
-            Some("##targetNamespace"),
-            None,
-            &snapshot,
-            None,
-            &table,
-        );
+        let result =
+            resolve_effective_default_ns(Some("##targetNamespace"), None, &snapshot, None, &table);
         assert_eq!(result, NamespaceMatch::NoNamespace);
     }
 

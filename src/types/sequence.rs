@@ -7,6 +7,7 @@
 
 use std::fmt;
 
+use super::XmlTypeCode;
 use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::namespace::qname::QualifiedName;
 use crate::schema::model::DerivationSet;
@@ -15,7 +16,6 @@ use crate::xpath::cast::type_matches;
 use crate::xpath::context::XPathContext;
 use crate::xpath::iterator::XmlItem;
 use crate::xpath::{DomNavigator, DomNodeType};
-use super::XmlTypeCode;
 
 /// XPath2 sequence type cardinality
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -148,11 +148,7 @@ impl ItemType {
     ///
     /// This is the runtime type matching method for function signatures
     /// and general type checking.
-    pub fn matches_item<N: DomNavigator>(
-        &self,
-        item: &XmlItem<N>,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
+    pub fn matches_item<N: DomNavigator>(&self, item: &XmlItem<N>, ctx: &XPathContext<'_>) -> bool {
         match item {
             XmlItem::Node(nav) => self.matches_node(nav, ctx),
             XmlItem::Atomic(value) => self.matches_atomic(value, ctx),
@@ -966,8 +962,7 @@ mod tests {
             XmlItem::Atomic(XmlValue::string("hello"));
         let int_value: XmlItem<RoXmlNavigator<'static>> =
             XmlItem::Atomic(XmlValue::integer(BigInt::from(42)));
-        let bool_value: XmlItem<RoXmlNavigator<'static>> =
-            XmlItem::Atomic(XmlValue::boolean(true));
+        let bool_value: XmlItem<RoXmlNavigator<'static>> = XmlItem::Atomic(XmlValue::boolean(true));
 
         assert!(item_type.matches_item(&str_value, &ctx));
         assert!(item_type.matches_item(&int_value, &ctx));
@@ -986,8 +981,7 @@ mod tests {
         nav.move_to_first_child();
 
         let node_item = XmlItem::Node(nav);
-        let atomic_item: XmlItem<RoXmlNavigator<'_>> =
-            XmlItem::Atomic(XmlValue::string("hello"));
+        let atomic_item: XmlItem<RoXmlNavigator<'_>> = XmlItem::Atomic(XmlValue::string("hello"));
 
         assert!(item_type.matches_item(&node_item, &ctx));
         assert!(item_type.matches_item(&atomic_item, &ctx));
@@ -1198,7 +1192,8 @@ mod tests {
         let root_id = table.add("root");
         let qname = QualifiedName::local(root_id);
         let name_test = NameTest::QName(qname);
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let item_type =
+            ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
         let ctx = XPathContext::new(&table);
 
         let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
@@ -1214,7 +1209,8 @@ mod tests {
         let root_id = table.add("root");
         let qname = QualifiedName::local(root_id);
         let name_test = NameTest::QName(qname);
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let item_type =
+            ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
         let ctx = XPathContext::new(&table);
 
         let doc = roxmltree::Document::parse("<other/>").expect("parse xml");

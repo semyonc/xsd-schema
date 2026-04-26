@@ -14,13 +14,22 @@ pub struct OpFlags {
 
 impl OpFlags {
     pub fn atomized() -> Self {
-        Self { atomize: true, ..Default::default() }
+        Self {
+            atomize: true,
+            ..Default::default()
+        }
     }
     pub fn singleton() -> Self {
-        Self { singleton: true, ..Default::default() }
+        Self {
+            singleton: true,
+            ..Default::default()
+        }
     }
     pub fn ordered() -> Self {
-        Self { ordered: true, ..Default::default() }
+        Self {
+            ordered: true,
+            ..Default::default()
+        }
     }
 }
 
@@ -165,5 +174,3 @@ impl BinaryOpNode {
         }
     }
 }
-
-

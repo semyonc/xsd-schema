@@ -86,7 +86,11 @@ impl SequenceTypeNode {
     }
 
     /// Single item type with optional occurrence.
-    pub fn single(item_type: ItemTypeNode, occurrence: OccurrenceIndicator, span: SourceSpan) -> Self {
+    pub fn single(
+        item_type: ItemTypeNode,
+        occurrence: OccurrenceIndicator,
+        span: SourceSpan,
+    ) -> Self {
         Self {
             item_type: Some(item_type),
             occurrence,
@@ -105,5 +109,3 @@ pub enum ItemTypeNode {
     /// Kind test (`node()`, `element()`, etc.).
     Kind(KindTest),
 }
-
-

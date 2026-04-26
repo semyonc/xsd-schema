@@ -8,14 +8,13 @@
 use slotmap::SlotMap;
 
 use crate::ids::*;
-use crate::parser::frames::{
-    AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor,
-    DerivationMethod, FieldResult, IdentityKind, OpenContentResult, ParticleResult, QNameRef,
-    SelectorResult, SimpleTypeResult, SimpleTypeVariety, TypeFrameResult, TypeRefResult,
-    WildcardResult,
-};
 #[cfg(feature = "xsd11")]
 use crate::parser::frames::AssertResult;
+use crate::parser::frames::{
+    AlternativeResult, AttributeUseResult, ComplexContentResult, Compositor, DerivationMethod,
+    FieldResult, IdentityKind, OpenContentResult, ParticleResult, QNameRef, SelectorResult,
+    SimpleTypeResult, SimpleTypeVariety, TypeFrameResult, TypeRefResult, WildcardResult,
+};
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::Annotation;
 use crate::schema::model::DerivationSet;
@@ -204,9 +203,7 @@ pub enum ResolvedParticleTerm {
         resolved_ref: Option<ElementKey>,
     },
     /// Group with resolved ref
-    Group {
-        resolved_ref: Option<ModelGroupKey>,
-    },
+    Group { resolved_ref: Option<ModelGroupKey> },
     /// Wildcard (no resolution needed)
     Any,
 }
@@ -361,7 +358,10 @@ impl SchemaArenas {
         self.attribute_groups.get(key)
     }
 
-    pub fn get_attribute_group_mut(&mut self, key: AttributeGroupKey) -> Option<&mut AttributeGroupData> {
+    pub fn get_attribute_group_mut(
+        &mut self,
+        key: AttributeGroupKey,
+    ) -> Option<&mut AttributeGroupData> {
         self.attribute_groups.get_mut(key)
     }
 
@@ -392,15 +392,24 @@ impl SchemaArenas {
     }
 
     // Identity constraints
-    pub fn alloc_identity_constraint(&mut self, data: IdentityConstraintData) -> IdentityConstraintKey {
+    pub fn alloc_identity_constraint(
+        &mut self,
+        data: IdentityConstraintData,
+    ) -> IdentityConstraintKey {
         self.identity_constraints.insert(data)
     }
 
-    pub fn get_identity_constraint(&self, key: IdentityConstraintKey) -> Option<&IdentityConstraintData> {
+    pub fn get_identity_constraint(
+        &self,
+        key: IdentityConstraintKey,
+    ) -> Option<&IdentityConstraintData> {
         self.identity_constraints.get(key)
     }
 
-    pub fn get_identity_constraint_mut(&mut self, key: IdentityConstraintKey) -> Option<&mut IdentityConstraintData> {
+    pub fn get_identity_constraint_mut(
+        &mut self,
+        key: IdentityConstraintKey,
+    ) -> Option<&mut IdentityConstraintData> {
         self.identity_constraints.get_mut(key)
     }
 }
@@ -512,7 +521,9 @@ mod tests {
         arenas.alloc_simple_type(simple_type_data(NameId(20)));
         arenas.alloc_simple_type(simple_type_data(NameId(30)));
 
-        let names: Vec<_> = arenas.simple_types.values()
+        let names: Vec<_> = arenas
+            .simple_types
+            .values()
             .filter_map(|d| d.name)
             .map(|n| n.0)
             .collect();
@@ -529,7 +540,9 @@ mod tests {
         let key2 = arenas.alloc_element(element_data(NameId(2), None));
 
         // Iterate with keys
-        let pairs: Vec<_> = arenas.elements.iter()
+        let pairs: Vec<_> = arenas
+            .elements
+            .iter()
             .map(|(k, v)| (k, v.name.unwrap().0))
             .collect();
 

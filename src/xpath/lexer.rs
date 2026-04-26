@@ -39,7 +39,10 @@ pub enum Token {
     /// QName followed by "?" in kind test context, meaning nillable type.
     /// Used to resolve shift/reduce conflict in element(name, type?).
     QNameNillable(String),
-    VarName { prefix: String, local: String },
+    VarName {
+        prefix: String,
+        local: String,
+    },
 
     // Keywords
     For,
@@ -265,7 +268,11 @@ pub struct LexerError {
 
 impl fmt::Display for LexerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Lexer error at position {}: {}", self.position, self.message)
+        write!(
+            f,
+            "Lexer error at position {}: {}",
+            self.position, self.message
+        )
     }
 }
 
@@ -381,7 +388,11 @@ impl<'input> Lexer<'input> {
 
     /// Check if a character is an XML NCName character.
     fn is_ncname_char(c: char) -> bool {
-        c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '\u{B7}'
+        c.is_alphanumeric()
+            || c == '_'
+            || c == '-'
+            || c == '.'
+            || c == '\u{B7}'
             || ('\u{0300}'..='\u{036F}').contains(&c)
             || ('\u{203F}'..='\u{2040}').contains(&c)
     }
@@ -455,7 +466,8 @@ impl<'input> Lexer<'input> {
         matches!(c,
             'a'..='z' | 'A'..='Z' | '_' |  // NCName start
             '@' | '*' | '.' | '$' | '(' | '"' | '\''
-        ) || c.is_ascii_digit() || c.is_alphabetic()
+        ) || c.is_ascii_digit()
+            || c.is_alphabetic()
     }
 
     /// Skip whitespace and comments.
@@ -770,10 +782,12 @@ impl<'input> Lexer<'input> {
 
         // Decode entity/character references (e.g., &amp; &#xHHHH;) in string literals,
         // matching the C# Tokenizer's ConsumeLiteral() behavior.
-        let value = crate::xpath::string_ops::normalize_string_value(&value, false, true)
-            .map_err(|e| LexerError {
-                message: format!("{}", e),
-                position: start,
+        let value =
+            crate::xpath::string_ops::normalize_string_value(&value, false, true).map_err(|e| {
+                LexerError {
+                    message: format!("{}", e),
+                    position: start,
+                }
             })?;
 
         Ok((Token::StringLiteral(value), start, self.pos))
@@ -844,10 +858,28 @@ impl<'input> Lexer<'input> {
                     ';' => Token::Comma, // Semicolon treated as comma? Actually not standard
                     ',' => Token::Comma,
                     '(' => Token::LParen,
-                    '-' => if self.is_xpath10() { Token::Minus10 } else { Token::Minus20 },
-                    '+' => if self.is_xpath10() { Token::Plus10 } else { Token::Plus20 },
+                    '-' => {
+                        if self.is_xpath10() {
+                            Token::Minus10
+                        } else {
+                            Token::Minus20
+                        }
+                    }
+                    '+' => {
+                        if self.is_xpath10() {
+                            Token::Plus10
+                        } else {
+                            Token::Plus20
+                        }
+                    }
                     '@' => Token::At,
-                    '~' => if self.is_xpath10() { Token::Minus10 } else { Token::Minus20 },
+                    '~' => {
+                        if self.is_xpath10() {
+                            Token::Minus10
+                        } else {
+                            Token::Minus20
+                        }
+                    }
                     _ => unreachable!(),
                 };
                 self.enqueue(token, start, self.pos);
@@ -1745,9 +1777,18 @@ mod tests {
 
     #[test]
     fn test_simple_number() {
-        assert_eq!(tokenize("42"), vec![Token::IntegerLiteral("42".to_string())]);
-        assert_eq!(tokenize("2.5"), vec![Token::DecimalLiteral("2.5".to_string())]);
-        assert_eq!(tokenize("1e10"), vec![Token::DoubleLiteral("1e10".to_string())]);
+        assert_eq!(
+            tokenize("42"),
+            vec![Token::IntegerLiteral("42".to_string())]
+        );
+        assert_eq!(
+            tokenize("2.5"),
+            vec![Token::DecimalLiteral("2.5".to_string())]
+        );
+        assert_eq!(
+            tokenize("1e10"),
+            vec![Token::DoubleLiteral("1e10".to_string())]
+        );
     }
 
     #[test]
@@ -1793,8 +1834,14 @@ mod tests {
     #[test]
     fn test_axis_specifiers() {
         assert_eq!(tokenize("child::"), vec![Token::AxisChild]);
-        assert_eq!(tokenize("ancestor-or-self::"), vec![Token::AxisAncestorOrSelf]);
-        assert_eq!(tokenize("descendant-or-self::"), vec![Token::AxisDescendantOrSelf]);
+        assert_eq!(
+            tokenize("ancestor-or-self::"),
+            vec![Token::AxisAncestorOrSelf]
+        );
+        assert_eq!(
+            tokenize("descendant-or-self::"),
+            vec![Token::AxisDescendantOrSelf]
+        );
     }
 
     #[test]
@@ -2052,30 +2099,21 @@ mod tests {
     fn test_slash_with_path() {
         // "/" followed by a name should emit Slash (not SlashOnly)
         let tokens = tokenize("/a");
-        assert_eq!(
-            tokens,
-            vec![Token::Slash, Token::QName("a".to_string())]
-        );
+        assert_eq!(tokens, vec![Token::Slash, Token::QName("a".to_string())]);
     }
 
     #[test]
     fn test_slash_with_whitespace_then_path() {
         // "/" followed by whitespace then a name should emit Slash
         let tokens = tokenize("/ a");
-        assert_eq!(
-            tokens,
-            vec![Token::Slash, Token::QName("a".to_string())]
-        );
+        assert_eq!(tokens, vec![Token::Slash, Token::QName("a".to_string())]);
     }
 
     #[test]
     fn test_slash_with_comment_then_path() {
         // "/" followed by comment then a name should emit Slash
         let tokens = tokenize("/ (: comment :) a");
-        assert_eq!(
-            tokens,
-            vec![Token::Slash, Token::QName("a".to_string())]
-        );
+        assert_eq!(tokens, vec![Token::Slash, Token::QName("a".to_string())]);
     }
 
     #[test]
@@ -2134,21 +2172,42 @@ mod tests {
     #[test]
     fn test_xpath10_every_as_element_name() {
         let tokens = tokenize_10("//every");
-        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("every".into())]);
+        assert_eq!(
+            tokens,
+            vec![Token::DoubleSlash, Token::QName("every".into())]
+        );
     }
 
     #[test]
     fn test_xpath10_some_as_element_name() {
         let tokens = tokenize_10("//some");
-        assert_eq!(tokens, vec![Token::DoubleSlash, Token::QName("some".into())]);
+        assert_eq!(
+            tokens,
+            vec![Token::DoubleSlash, Token::QName("some".into())]
+        );
     }
 
     #[test]
     fn test_xpath10_xpath20_keywords_as_qnames() {
         // Various XPath 2.0-only keywords used as element names in 1.0 mode
         for name in &[
-            "then", "else", "return", "to", "union", "except", "intersect",
-            "eq", "ne", "lt", "le", "gt", "ge", "is", "idiv", "satisfies", "in",
+            "then",
+            "else",
+            "return",
+            "to",
+            "union",
+            "except",
+            "intersect",
+            "eq",
+            "ne",
+            "lt",
+            "le",
+            "gt",
+            "ge",
+            "is",
+            "idiv",
+            "satisfies",
+            "in",
         ] {
             let input = format!("a/{}", name);
             let tokens = tokenize_10(&input);
@@ -2188,7 +2247,11 @@ mod tests {
         let tokens = tokenize_10("a - b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::Minus, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::Minus,
+                Token::QName("b".into())
+            ]
         );
     }
 
@@ -2197,7 +2260,11 @@ mod tests {
         let tokens = tokenize_10("a + b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::Plus, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::Plus,
+                Token::QName("b".into())
+            ]
         );
     }
 
@@ -2206,22 +2273,38 @@ mod tests {
         let tokens = tokenize_10("a and b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::And, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::And,
+                Token::QName("b".into())
+            ]
         );
         let tokens = tokenize_10("a or b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::Or, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::Or,
+                Token::QName("b".into())
+            ]
         );
         let tokens = tokenize_10("a div b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::Div, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::Div,
+                Token::QName("b".into())
+            ]
         );
         let tokens = tokenize_10("a mod b");
         assert_eq!(
             tokens,
-            vec![Token::QName("a".into()), Token::Mod, Token::QName("b".into())]
+            vec![
+                Token::QName("a".into()),
+                Token::Mod,
+                Token::QName("b".into())
+            ]
         );
     }
 
@@ -2278,7 +2361,12 @@ mod tests {
         let tokens = tokenize_10("ancestor-or-self::node()");
         assert_eq!(
             tokens,
-            vec![Token::AxisAncestorOrSelf, Token::Node, Token::LParen, Token::RParen]
+            vec![
+                Token::AxisAncestorOrSelf,
+                Token::Node,
+                Token::LParen,
+                Token::RParen
+            ]
         );
     }
 

@@ -19,9 +19,7 @@ pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroup
 /// substitution group for schema-time UPA / cos-element-consistent (EDC)
 /// constraints, even though they cannot appear in instances. This variant is
 /// used by UPA/EDC schema-time validation under XSD 1.1.
-pub fn build_substitution_group_map_with_abstract(
-    schema_set: &SchemaSet,
-) -> SubstitutionGroupMap {
+pub fn build_substitution_group_map_with_abstract(schema_set: &SchemaSet) -> SubstitutionGroupMap {
     build_substitution_group_map_inner(schema_set, true)
 }
 
@@ -55,7 +53,8 @@ fn build_substitution_group_map_inner(
             }
         }
 
-        let (effective_block, effective_final) = effective_element_constraints(schema_set, head_elem);
+        let (effective_block, effective_final) =
+            effective_element_constraints(schema_set, head_elem);
         if !effective_block.contains_substitution() {
             let head_type = head_elem.resolved_type;
             let exclude = derivation_exclusions(effective_block, effective_final);
@@ -69,7 +68,12 @@ fn build_substitution_group_map_inner(
                 if let Some(member) = resolved_element(schema_set, member_key) {
                     if let Some(name) = member.name {
                         if (!member.is_abstract || include_abstract)
-                            && is_substitutable(schema_set, head_type, exclude, member.resolved_type)
+                            && is_substitutable(
+                                schema_set,
+                                head_type,
+                                exclude,
+                                member.resolved_type,
+                            )
                         {
                             names.insert((name, member.target_namespace));
                         }
@@ -122,7 +126,10 @@ pub(crate) fn derivation_exclusions(
 }
 
 fn derivation_mask() -> DerivationSet {
-    DerivationSet::EXTENSION | DerivationSet::RESTRICTION | DerivationSet::LIST | DerivationSet::UNION
+    DerivationSet::EXTENSION
+        | DerivationSet::RESTRICTION
+        | DerivationSet::LIST
+        | DerivationSet::UNION
 }
 
 pub(crate) fn is_substitutable(
@@ -215,7 +222,12 @@ fn check_substitution_group_affiliation(
     };
     let (_, effective_final) = effective_element_constraints(schema_set, head_elem);
     let exclude = derivation_exclusions(DerivationSet::empty(), effective_final);
-    is_substitutable(schema_set, head_elem.resolved_type, exclude, member_elem.resolved_type)
+    is_substitutable(
+        schema_set,
+        head_elem.resolved_type,
+        exclude,
+        member_elem.resolved_type,
+    )
 }
 
 /// Validate all declared substitution group memberships.
@@ -226,9 +238,7 @@ fn check_substitution_group_affiliation(
 /// Note: This uses only the head's `{substitution group exclusions}` (= `final`),
 /// NOT the head's `block` attribute. The `block` attribute controls instance-time
 /// substitution, not schema-level affiliation legality.
-pub fn validate_all_substitution_groups(
-    schema_set: &SchemaSet,
-) -> crate::SchemaResult<()> {
+pub fn validate_all_substitution_groups(schema_set: &SchemaSet) -> crate::SchemaResult<()> {
     for (member_key, elem) in schema_set.arenas.elements.iter() {
         for &head_key in &elem.resolved_substitution_groups {
             if !check_substitution_group_affiliation(schema_set, head_key, member_key) {
@@ -349,9 +359,10 @@ mod tests {
         let head_key = schema_set
             .arenas
             .alloc_element(element_data(head_name, head_type, None));
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements
@@ -376,9 +387,10 @@ mod tests {
         let mut head = element_data(head_name, head_type, None);
         head.final_derivation = DerivationSet::RESTRICTION;
         let head_key = schema_set.arenas.alloc_element(head);
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements
@@ -409,12 +421,15 @@ mod tests {
             type_def.final_derivation = DerivationSet::RESTRICTION;
         }
 
-        let head_key = schema_set
-            .arenas
-            .alloc_element(element_data(head_name, TypeKey::Simple(head_type), None));
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let head_key = schema_set.arenas.alloc_element(element_data(
+            head_name,
+            TypeKey::Simple(head_type),
+            None,
+        ));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements
@@ -440,9 +455,10 @@ mod tests {
         let mut head = element_data(head_name, head_type, None);
         head.block = DerivationSet::SUBSTITUTION;
         let head_key = schema_set.arenas.alloc_element(head);
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements
@@ -470,9 +486,10 @@ mod tests {
         let mut head = element_data(head_name, head_type, None);
         head.block = DerivationSet::SUBSTITUTION;
         let head_key = schema_set.arenas.alloc_element(head);
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements
@@ -500,9 +517,10 @@ mod tests {
         let mut head = element_data(head_name, head_type, None);
         head.final_derivation = DerivationSet::RESTRICTION;
         let head_key = schema_set.arenas.alloc_element(head);
-        let member_key = schema_set
-            .arenas
-            .alloc_element(element_data(member_name, member_type, None));
+        let member_key =
+            schema_set
+                .arenas
+                .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
             .elements

@@ -82,7 +82,9 @@ pub enum XPathError {
     // XQuery Type Errors (XQTY)
     // ========================================================================
     /// XQTY0030: Validate expression argument must be single document or element.
-    #[error("[XQTY0030] Validate expression argument must be exactly one document or element node")]
+    #[error(
+        "[XQTY0030] Validate expression argument must be exactly one document or element node"
+    )]
     XQTY0030,
 
     // ========================================================================
@@ -108,7 +110,9 @@ pub enum XPathError {
     FORG0004,
 
     /// FORG0005: fn:exactly-one called with wrong cardinality.
-    #[error("[FORG0005] fn:exactly-one called with sequence containing zero or more than one item")]
+    #[error(
+        "[FORG0005] fn:exactly-one called with sequence containing zero or more than one item"
+    )]
     FORG0005,
 
     /// FORG0006: Invalid argument type for function.
@@ -365,7 +369,11 @@ impl XPathError {
         XPathError::XPST0017 {
             name: function.to_string(),
             arity: actual,
-            namespace: format!("(expected {} argument{})", expected, if expected == 1 { "" } else { "s" }),
+            namespace: format!(
+                "(expected {} argument{})",
+                expected,
+                if expected == 1 { "" } else { "s" }
+            ),
         }
     }
 
@@ -505,8 +513,14 @@ mod tests {
 
     #[test]
     fn test_error_codes() {
-        assert_eq!(XPathError::context_undefined().error_code(), Some("XPDY0002"));
-        assert_eq!(XPathError::more_than_one_item().error_code(), Some("XPDY0050"));
+        assert_eq!(
+            XPathError::context_undefined().error_code(),
+            Some("XPDY0002")
+        );
+        assert_eq!(
+            XPathError::more_than_one_item().error_code(),
+            Some("XPDY0050")
+        );
         assert_eq!(
             XPathError::type_mismatch("xs:integer", "xs:string").error_code(),
             Some("XPTY0004")

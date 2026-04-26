@@ -5,9 +5,9 @@
 //! - Foreign attributes (non-XSD attributes on schema elements)
 //! - XML fragment preservation for extensibility
 
-use crate::ids::{NameId, DocumentId};
-use crate::parser::location::{SourceRef, SourceSpan};
+use crate::ids::{DocumentId, NameId};
 use crate::namespace::context::NamespaceContextSnapshot;
+use crate::parser::location::{SourceRef, SourceSpan};
 
 /// XML fragment - raw XML content preserved from source
 ///
@@ -54,11 +54,7 @@ pub struct ForeignAttribute {
 
 impl ForeignAttribute {
     /// Create a new foreign attribute
-    pub fn new(
-        namespace: Option<NameId>,
-        local_name: NameId,
-        value: String,
-    ) -> Self {
+    pub fn new(namespace: Option<NameId>, local_name: NameId, value: String) -> Self {
         Self {
             namespace,
             local_name,
@@ -219,9 +215,8 @@ impl Annotation {
 
     /// Get documentation in a specific language
     pub fn documentation_for_lang(&self, lang: &str) -> Option<&DocumentationElement> {
-        self.documentations().find(|d| {
-            d.lang.as_ref().is_some_and(|l| l == lang)
-        })
+        self.documentations()
+            .find(|d| d.lang.as_ref().is_some_and(|l| l == lang))
     }
 
     /// Add a foreign attribute
@@ -240,7 +235,10 @@ impl Default for Annotation {
 ///
 /// When a schema element has foreign attributes but no explicit xs:annotation,
 /// an implicit annotation is created to hold them.
-pub fn create_implicit_annotation(attrs: Vec<ForeignAttribute>, source: Option<SourceRef>) -> Annotation {
+pub fn create_implicit_annotation(
+    attrs: Vec<ForeignAttribute>,
+    source: Option<SourceRef>,
+) -> Annotation {
     Annotation {
         id: None,
         attributes: attrs,
@@ -267,7 +265,7 @@ pub fn merge_foreign_attributes(
             ann.attributes.extend(foreign_attrs);
             Some(ann)
         }
-        None => Some(create_implicit_annotation(foreign_attrs, source))
+        None => Some(create_implicit_annotation(foreign_attrs, source)),
     }
 }
 
@@ -296,11 +294,7 @@ mod tests {
 
     #[test]
     fn test_foreign_attribute() {
-        let attr = ForeignAttribute::new(
-            Some(NameId(1)),
-            NameId(2),
-            "value".to_string(),
-        );
+        let attr = ForeignAttribute::new(Some(NameId(1)), NameId(2), "value".to_string());
         assert!(attr.is_in_namespace(Some(NameId(1))));
         assert!(!attr.is_in_namespace(None));
     }
@@ -355,9 +349,11 @@ mod tests {
 
     #[test]
     fn test_implicit_annotation() {
-        let attrs = vec![
-            ForeignAttribute::new(Some(NameId(1)), NameId(2), "value".to_string()),
-        ];
+        let attrs = vec![ForeignAttribute::new(
+            Some(NameId(1)),
+            NameId(2),
+            "value".to_string(),
+        )];
 
         let ann = create_implicit_annotation(attrs, None);
         assert!(!ann.is_empty());

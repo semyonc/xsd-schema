@@ -89,9 +89,7 @@ pub fn get_root<N: DomNavigator>(node: &N) -> N {
 /// * `Ok(N)` - The context node
 /// * `Err(XPathError)` - XPDY0002 if context is undefined
 pub fn context_node<N: DomNavigator>(context: Option<&N>) -> Result<N, XPathError> {
-    context
-        .cloned()
-        .ok_or_else(XPathError::context_undefined)
+    context.cloned().ok_or_else(XPathError::context_undefined)
 }
 
 /// Compare two nodes by document order.

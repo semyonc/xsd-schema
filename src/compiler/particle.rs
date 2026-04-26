@@ -93,18 +93,20 @@ pub fn apply_occurs(frag: NfaFragment, min: u32, max: MaxOccurs) -> NfaFragment 
 
     match effective_max {
         // Unbounded with large min → counted exact prefix + star tail
-        None if min > COUNTED_THRESHOLD => {
-            frag.clone().repeat_counted(min, min).concat(frag.repeat_star())
-        }
+        None if min > COUNTED_THRESHOLD => frag
+            .clone()
+            .repeat_counted(min, min)
+            .concat(frag.repeat_star()),
         // Unbounded with small min → existing unroll via repeat_range (star/plus)
         None => frag.repeat_range(min, None),
         // Small bounded → existing unroll via repeat_range
         Some(m) if m <= COUNTED_THRESHOLD => frag.repeat_range(min, Some(m)),
         // Large bounded → counted construction
         Some(m) if min == 0 => frag.repeat_counted(0, m),
-        Some(m) if min <= COUNTED_THRESHOLD => {
-            frag.clone().repeat_exact(min).concat(frag.repeat_counted(0, m - min))
-        }
+        Some(m) if min <= COUNTED_THRESHOLD => frag
+            .clone()
+            .repeat_exact(min)
+            .concat(frag.repeat_counted(0, m - min)),
         Some(m) => frag.repeat_counted(min, m),
     }
 }

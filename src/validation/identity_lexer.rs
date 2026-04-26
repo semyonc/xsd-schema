@@ -44,7 +44,11 @@ pub struct IdXPathLexError {
 
 impl fmt::Display for IdXPathLexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "identity XPath lex error at position {}: {}", self.position, self.message)
+        write!(
+            f,
+            "identity XPath lex error at position {}: {}",
+            self.position, self.message
+        )
     }
 }
 
@@ -361,14 +365,22 @@ mod tests {
     #[test]
     fn error_parent_axis() {
         let err = lex_err("..");
-        assert!(err.message.contains("parent axis"), "message: {}", err.message);
+        assert!(
+            err.message.contains("parent axis"),
+            "message: {}",
+            err.message
+        );
         assert_eq!(err.position, 0);
     }
 
     #[test]
     fn error_predicate() {
         let err = lex_err("foo[1]");
-        assert!(err.message.contains("predicates"), "message: {}", err.message);
+        assert!(
+            err.message.contains("predicates"),
+            "message: {}",
+            err.message
+        );
         assert_eq!(err.position, 3);
     }
 

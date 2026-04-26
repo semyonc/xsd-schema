@@ -151,7 +151,8 @@ impl<'a> RoXmlNavigator<'a> {
                     let is_local = if parent_prefixes.contains(&prefix) {
                         // Check if this is a redeclaration with different URI
                         if let Some(parent) = node.parent() {
-                            parent.namespaces()
+                            parent
+                                .namespaces()
                                 .find(|p_ns| p_ns.name() == prefix)
                                 .map(|p_ns| p_ns.uri() != ns.uri())
                                 .unwrap_or(true)
@@ -182,9 +183,8 @@ impl<'a> RoXmlNavigator<'a> {
 
                 // Filter out xml namespace if ExcludeXml
                 if scope == NamespaceAxisScope::ExcludeXml {
-                    result.retain(|(prefix, _)| {
-                        prefix.as_ref().map(|p| p != "xml").unwrap_or(true)
-                    });
+                    result
+                        .retain(|(prefix, _)| prefix.as_ref().map(|p| p != "xml").unwrap_or(true));
                 }
             }
         }
@@ -251,14 +251,8 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         match (&self.cursor, &other.cursor) {
             (RoCursor::Node(a), RoCursor::Node(b)) => a.id() == b.id(),
             (
-                RoCursor::Attribute {
-                    owner: a,
-                    index: i,
-                },
-                RoCursor::Attribute {
-                    owner: b,
-                    index: j,
-                },
+                RoCursor::Attribute { owner: a, index: i },
+                RoCursor::Attribute { owner: b, index: j },
             ) => a.id() == b.id() && i == j,
             (
                 RoCursor::Namespace {
@@ -975,7 +969,9 @@ mod tests {
 
     #[test]
     fn test_inherited_namespaces() {
-        let doc = parse(r#"<root xmlns:ns="http://example.com"><child xmlns:local="http://local.com"/></root>"#);
+        let doc = parse(
+            r#"<root xmlns:ns="http://example.com"><child xmlns:local="http://local.com"/></root>"#,
+        );
         let mut nav = RoXmlNavigator::new(&doc);
 
         nav.move_to_first_child(); // root
@@ -993,8 +989,14 @@ mod tests {
         }
 
         // Should have both inherited (ns) and local (local) namespaces
-        assert!(all_uris.contains("http://example.com"), "Should see inherited namespace");
-        assert!(all_uris.contains("http://local.com"), "Should see local namespace");
+        assert!(
+            all_uris.contains("http://example.com"),
+            "Should see inherited namespace"
+        );
+        assert!(
+            all_uris.contains("http://local.com"),
+            "Should see local namespace"
+        );
 
         // Now test Local scope - should only have local namespace
         let mut nav2 = RoXmlNavigator::new(&doc);
@@ -1011,8 +1013,14 @@ mod tests {
         }
 
         // Should only have the local namespace, not inherited
-        assert!(local_uris.contains("http://local.com"), "Should see local namespace");
+        assert!(
+            local_uris.contains("http://local.com"),
+            "Should see local namespace"
+        );
         // The inherited namespace from root should NOT be visible in Local scope
-        assert!(!local_uris.contains("http://example.com"), "Should NOT see inherited namespace in Local scope");
+        assert!(
+            !local_uris.contains("http://example.com"),
+            "Should NOT see inherited namespace in Local scope"
+        );
     }
 }

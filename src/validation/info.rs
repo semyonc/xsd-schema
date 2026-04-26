@@ -222,7 +222,11 @@ impl SchemaInfo {
     }
 
     /// Create a SchemaInfo indicating a valid element
-    pub fn valid_element(element_decl: ElementKey, schema_type: TypeKey, content_type: ContentType) -> Self {
+    pub fn valid_element(
+        element_decl: ElementKey,
+        schema_type: TypeKey,
+        content_type: ContentType,
+    ) -> Self {
         SchemaInfo {
             element_decl: Some(element_decl),
             attribute_decl: None,

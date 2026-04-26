@@ -96,4 +96,3 @@ impl From<ComplexTypeKey> for TypeKey {
         TypeKey::Complex(key)
     }
 }
-

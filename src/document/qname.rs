@@ -283,7 +283,10 @@ mod tests {
         };
         let idx1 = table.atomize(q1);
         let idx2 = table.atomize(q2);
-        assert_eq!(idx1, idx2, "Same identity fields must dedup despite different qualified_name_idx");
+        assert_eq!(
+            idx1, idx2,
+            "Same identity fields must dedup despite different qualified_name_idx"
+        );
         // The stored atom keeps the first occurrence's qualified_name_idx
         assert_eq!(table.get(idx1).qualified_name_idx, 10);
     }

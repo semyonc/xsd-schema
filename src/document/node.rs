@@ -35,10 +35,7 @@ pub fn slot_of(node_ref: u32) -> u32 {
 /// Panics if `slot >= PAGE_SIZE`, which would alias bits into the page portion.
 #[inline]
 pub fn node_ref_from(page: u32, slot: u32) -> u32 {
-    debug_assert!(
-        slot < PAGE_SIZE,
-        "slot {slot} >= PAGE_SIZE ({PAGE_SIZE})"
-    );
+    debug_assert!(slot < PAGE_SIZE, "slot {slot} >= PAGE_SIZE ({PAGE_SIZE})");
     (page << PAGE_SHIFT) | slot
 }
 
@@ -202,12 +199,8 @@ impl Node {
     /// Panics if `idx` exceeds 20 bits (>= 0x10_0000).
     #[inline]
     pub fn set_binding_index(&mut self, idx: u32) {
-        debug_assert!(
-            idx < (1 << 20),
-            "binding_index {idx} exceeds 20-bit range"
-        );
-        self.props_type =
-            (self.props_type & 0xFFF) | (idx << Self::BINDING_INDEX_SHIFT);
+        debug_assert!(idx < (1 << 20), "binding_index {idx} exceeds 20-bit range");
+        self.props_type = (self.props_type & 0xFFF) | (idx << Self::BINDING_INDEX_SHIFT);
     }
 }
 
@@ -400,9 +393,15 @@ mod tests {
     fn dom_node_type_conversion() {
         assert_eq!(DomNodeType::from(NodeType::Root), DomNodeType::Root);
         assert_eq!(DomNodeType::from(NodeType::Element), DomNodeType::Element);
-        assert_eq!(DomNodeType::from(NodeType::Attribute), DomNodeType::Attribute);
+        assert_eq!(
+            DomNodeType::from(NodeType::Attribute),
+            DomNodeType::Attribute
+        );
         assert_eq!(DomNodeType::from(NodeType::Text), DomNodeType::Text);
-        assert_eq!(DomNodeType::from(NodeType::Whitespace), DomNodeType::Whitespace);
+        assert_eq!(
+            DomNodeType::from(NodeType::Whitespace),
+            DomNodeType::Whitespace
+        );
         assert_eq!(
             DomNodeType::from(NodeType::SignificantWhitespace),
             DomNodeType::SignificantWhitespace

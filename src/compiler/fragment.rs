@@ -34,7 +34,13 @@ impl NfaFragment {
     pub fn new(states: Vec<NfaState>, start: usize, end: usize) -> Self {
         debug_assert!(start < states.len(), "start index out of bounds");
         debug_assert!(end < states.len(), "end index out of bounds");
-        Self { states, start, end, counter_defs: Vec::new(), nullable: false }
+        Self {
+            states,
+            start,
+            end,
+            counter_defs: Vec::new(),
+            nullable: false,
+        }
     }
 
     /// Create a new fragment with counter definitions
@@ -47,7 +53,13 @@ impl NfaFragment {
     ) -> Self {
         debug_assert!(start < states.len(), "start index out of bounds");
         debug_assert!(end < states.len(), "end index out of bounds");
-        Self { states, start, end, counter_defs, nullable }
+        Self {
+            states,
+            start,
+            end,
+            counter_defs,
+            nullable,
+        }
     }
 
     /// Verifies the position-based ID invariant: `state.id == index` for all states.
@@ -59,11 +71,9 @@ impl NfaFragment {
     fn assert_ids_normalized(&self) {
         for (pos, state) in self.states.iter().enumerate() {
             debug_assert_eq!(
-                state.id,
-                pos as StateId,
+                state.id, pos as StateId,
                 "Fragment ID invariant violated: state at position {} has id {}",
-                pos,
-                state.id
+                pos, state.id
             );
         }
     }
@@ -114,7 +124,13 @@ impl NfaFragment {
         self.states.extend(other.states);
         self.counter_defs.extend(other.counter_defs);
 
-        NfaFragment::with_counters(self.states, self.start, new_end, self.counter_defs, nullable)
+        NfaFragment::with_counters(
+            self.states,
+            self.start,
+            new_end,
+            self.counter_defs,
+            nullable,
+        )
     }
 
     /// Alternate two fragments: self | other
@@ -162,7 +178,13 @@ impl NfaFragment {
         let mut counter_defs = self.counter_defs;
         counter_defs.extend(other.counter_defs);
 
-        NfaFragment::with_counters(states, new_start_id as usize, new_end_id as usize, counter_defs, nullable)
+        NfaFragment::with_counters(
+            states,
+            new_start_id as usize,
+            new_end_id as usize,
+            counter_defs,
+            nullable,
+        )
     }
 
     /// Make fragment optional: self?
@@ -250,7 +272,11 @@ impl NfaFragment {
 
         // Allocate counter
         let counter_id = self.counter_defs.len() as CounterId;
-        self.counter_defs.push(CounterDef { min, max, body_nullable });
+        self.counter_defs.push(CounterDef {
+            min,
+            max,
+            body_nullable,
+        });
 
         // Allocate new states: entry, guard, exit
         let entry_idx = self.states.len();
@@ -272,7 +298,8 @@ impl NfaFragment {
         }
 
         // body_end → CounterIncrement → guard
-        self.states[self.end].add_transition(guard_id, TransitionKind::CounterIncrement(counter_id));
+        self.states[self.end]
+            .add_transition(guard_id, TransitionKind::CounterIncrement(counter_id));
 
         // guard → CounterMaxGuard → body_start (loop back)
         // guard → CounterMinGuard → exit (exit loop)
@@ -385,7 +412,12 @@ pub fn fragment_to_table(fragment: NfaFragment) -> NfaTable {
     let start_state = fragment.start as StateId;
     let accept_state = fragment.end as StateId;
 
-    NfaTable::with_counters(fragment.states, start_state, accept_state, fragment.counter_defs)
+    NfaTable::with_counters(
+        fragment.states,
+        start_state,
+        accept_state,
+        fragment.counter_defs,
+    )
 }
 
 #[cfg(test)]
@@ -476,11 +508,15 @@ mod tests {
 
         // Check epsilon loop from end to start
         let end = &star.states[star.end];
-        assert!(end.epsilon_transitions().any(|t| t == star.start as StateId));
+        assert!(end
+            .epsilon_transitions()
+            .any(|t| t == star.start as StateId));
 
         // Check optional bypass
         let start = &star.states[star.start];
-        assert!(start.epsilon_transitions().any(|t| t == star.end as StateId));
+        assert!(start
+            .epsilon_transitions()
+            .any(|t| t == star.end as StateId));
     }
 
     #[test]
@@ -491,11 +527,15 @@ mod tests {
 
         // Check epsilon loop from end to start
         let end = &plus.states[plus.end];
-        assert!(end.epsilon_transitions().any(|t| t == plus.start as StateId));
+        assert!(end
+            .epsilon_transitions()
+            .any(|t| t == plus.start as StateId));
 
         // Should NOT have optional bypass
         let start = &plus.states[plus.start];
-        assert!(!start.epsilon_transitions().any(|t| t == plus.end as StateId));
+        assert!(!start
+            .epsilon_transitions()
+            .any(|t| t == plus.end as StateId));
     }
 
     #[test]

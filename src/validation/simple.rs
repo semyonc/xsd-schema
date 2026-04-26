@@ -5,7 +5,7 @@
 //! facet constraint checking.
 
 use crate::ids::{SimpleTypeKey, TypeKey};
-use crate::parser::frames::SimpleTypeVariety;
+use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
 use crate::schema::SchemaSet;
 use crate::types::facets::{normalize_whitespace, FacetSet, WhitespaceMode};
 use crate::types::validators::VALIDATOR_REGISTRY;
@@ -124,18 +124,34 @@ fn validate_simple_type_inner(
                     ));
                 }
             };
-            if let Some(inline_st) = ct_data.resolved_simple_content_type {
-                validate_simple_type_inner(value, inline_st, schema_set)
+            let result = if let Some(inline_st) = ct_data.resolved_simple_content_type {
+                validate_simple_type_inner(value, inline_st, schema_set)?
             } else if let Some(base_key) = ct_data.resolved_base_type {
-                validate_simple_type_inner(value, base_key, schema_set)
+                validate_simple_type_inner(value, base_key, schema_set)?
             } else {
                 // No base type — treat as anySimpleType (accept any value)
-                Ok(SimpleTypeResult {
+                SimpleTypeResult {
                     typed_value: XmlValue::untyped(value),
                     member_type: None,
                     normalized_value: None,
-                })
+                }
+            };
+            // §3.4.2.2 clause 1.2: a simpleContent restriction may declare
+            // local string-applicable facets (length / pattern / enumeration)
+            // that further constrain the recursively validated value. The
+            // base/inline call already applied the base type's facets; here we
+            // apply only the restriction's local set. Extension cannot add
+            // facets, so it is excluded.
+            if let ComplexContentResult::Simple(sc) = &ct_data.content {
+                if sc.derivation == DerivationMethod::Restriction && !sc.facets.is_empty() {
+                    let lex = result.normalized_value.as_deref().unwrap_or(value);
+                    sc.facets.validate_string(lex).map_err(|e| {
+                        let code = errors::facet_constraint_code(&e);
+                        errors::from_facet_error(code, e, None)
+                    })?;
+                }
             }
+            Ok(result)
         }
     }
 }
@@ -370,10 +386,12 @@ fn validate_list_type(
             })?;
 
         // Pattern/enumeration on the normalized string representation
-        facets.validate_string_patterns_enums(&normalized).map_err(|e| {
-            let code = errors::facet_constraint_code(&e);
-            errors::from_facet_error(code, e, None)
-        })?;
+        facets
+            .validate_string_patterns_enums(&normalized)
+            .map_err(|e| {
+                let code = errors::facet_constraint_code(&e);
+                errors::from_facet_error(code, e, None)
+            })?;
     }
 
     // Use the list type's own code (e.g. IdRefs, NmTokens, Entities) when it
@@ -444,16 +462,20 @@ fn validate_union_type(
                 // matched primitive type and compare canonical forms (handles float/
                 // double rounding and duration leading-zero differences)
                 let type_code = result.typed_value.type_code;
-                facets.validate_enum_value_space(
-                    |s| VALIDATOR_REGISTRY
-                        .validate(type_code, s)
-                        .map(|v| v.to_string_value() == check_value)
-                        .unwrap_or(false),
-                    &check_value,
-                ).map_err(|e| {
-                    let code = errors::facet_constraint_code(&e);
-                    errors::from_facet_error(code, e, None)
-                })?;
+                facets
+                    .validate_enum_value_space(
+                        |s| {
+                            VALIDATOR_REGISTRY
+                                .validate(type_code, s)
+                                .map(|v| v.to_string_value() == check_value)
+                                .unwrap_or(false)
+                        },
+                        &check_value,
+                    )
+                    .map_err(|e| {
+                        let code = errors::facet_constraint_code(&e);
+                        errors::from_facet_error(code, e, None)
+                    })?;
             }
 
             // Propagate schema type on inner value from the matched member type
@@ -465,11 +487,9 @@ fn validate_union_type(
             // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
             #[cfg(feature = "xsd11")]
             {
-                let item_sk = member_key
-                    .as_simple()
-                    .and_then(|sk| {
-                        crate::types::sequence::resolve_list_item_schema_type(sk, schema_set)
-                    });
+                let item_sk = member_key.as_simple().and_then(|sk| {
+                    crate::types::sequence::resolve_list_item_schema_type(sk, schema_set)
+                });
                 evaluate_assertion_facets(&inner, &facets, schema_set, item_sk)?;
             }
 
@@ -575,8 +595,8 @@ fn evaluate_assertion_facets(
         };
 
         // Compile the XPath expression with $value declared
-        let expr = XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]).map_err(
-            |e| {
+        let expr =
+            XPathExpr::compile_with_vars(&assertion.test, &ctx, &["value"]).map_err(|e| {
                 errors::error(
                     "cvc-assertion",
                     format!(
@@ -585,8 +605,7 @@ fn evaluate_assertion_facets(
                     ),
                     location.clone(),
                 )
-            },
-        )?;
+            })?;
 
         // Convert typed value to XPathValue
         let xpath_value = typed_value.to_xpath_value::<RoXmlNavigator<'static>>(item_schema_type);
@@ -709,7 +728,11 @@ mod tests {
         );
         let tk = element_type(&schema, "e");
         for v in &["true", "false", "1", "0"] {
-            assert!(validate_simple_type(v, tk, &schema).is_ok(), "failed for '{}'", v);
+            assert!(
+                validate_simple_type(v, tk, &schema).is_ok(),
+                "failed for '{}'",
+                v
+            );
         }
     }
 

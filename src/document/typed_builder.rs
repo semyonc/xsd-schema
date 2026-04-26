@@ -15,11 +15,11 @@ use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::table::{XML_NAMESPACE, XSI_NAMESPACE};
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
-use crate::xpath::string_ops::is_xml_whitespace_str;
 use crate::validation::errors::ValidationError;
 use crate::validation::info::ValidationFlags;
 use crate::validation::validator::{ValidationSink, ValidationWarning};
 use crate::validation::{SchemaValidator, ValidationRuntime};
+use crate::xpath::string_ops::is_xml_whitespace_str;
 
 use super::buffer::BufferDocument;
 use super::builder::{parse_pi_content, split_prefix_local, BufferDocumentBuilder};
@@ -57,12 +57,8 @@ pub fn build_typed_document<'a, R: BufRead>(
     schema_set: &'a SchemaSet,
     options: BufferDocumentOptions,
 ) -> Result<BufferDocument<'a>, BufferDocumentError> {
-    let mut builder = BufferDocumentBuilder::new(
-        arena,
-        &schema_set.name_table,
-        Some(schema_set),
-        options,
-    )?;
+    let mut builder =
+        BufferDocumentBuilder::new(arena, &schema_set.name_table, Some(schema_set), options)?;
 
     let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
     let mut runtime = validator.start_run(SilentValidationSink);
@@ -258,8 +254,7 @@ fn handle_start_or_empty<S: ValidationSink>(
     let full_name_bytes = full_name.as_ref();
     let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
 
-    let elem_local =
-        std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
+    let elem_local = std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
     let elem_prefix_str =
         std::str::from_utf8(elem_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
 
@@ -292,8 +287,8 @@ fn handle_start_or_empty<S: ValidationSink>(
         if let Some(stack) = prefix_map.get(attr_prefix_bytes) {
             if let Some(ns_uri) = stack.last() {
                 if ns_uri == XSI_NAMESPACE {
-                    let local = std::str::from_utf8(attr_local_bytes)
-                        .map_err(BufferDocumentError::Utf8)?;
+                    let local =
+                        std::str::from_utf8(attr_local_bytes).map_err(BufferDocumentError::Utf8)?;
                     let value = attr.unescape_value()?;
                     match local {
                         "type" => xsi_type = Some(value.to_string()),
@@ -309,7 +304,8 @@ fn handle_start_or_empty<S: ValidationSink>(
     let ns_ctx = build_ns_context(prefix_map, schema_set);
 
     // ── Push element to builder ───────────────────────────────────────
-    let elem_ref = builder.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
+    let elem_ref =
+        builder.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
 
     // ── Validate element ──────────────────────────────────────────────
     let info = runtime.validate_element(
@@ -359,9 +355,7 @@ fn handle_start_or_empty<S: ValidationSink>(
             String::new()
         } else {
             match prefix_map.get(attr_prefix_bytes) {
-                Some(stack) if !stack.is_empty() => {
-                    stack.last().unwrap().as_str().to_string()
-                }
+                Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
                 _ => {
                     return Err(BufferDocumentError::UnboundPrefix(
                         attr_prefix_str.to_string(),
@@ -498,11 +492,7 @@ mod tests {
         schema_set
     }
 
-    fn build_doc<'a>(
-        xml: &str,
-        arena: &'a Bump,
-        schema_set: &'a SchemaSet,
-    ) -> BufferDocument<'a> {
+    fn build_doc<'a>(xml: &str, arena: &'a Bump, schema_set: &'a SchemaSet) -> BufferDocument<'a> {
         build_typed_document(
             xml.as_bytes(),
             arena,
@@ -551,7 +541,10 @@ mod tests {
         assert!(nav.move_to_first_attribute());
         assert!(nav.element_type_key().is_some());
         let tv = nav.typed_value();
-        assert!(matches!(tv, TypedValue::Value(_)), "attribute should have typed value");
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "attribute should have typed value"
+        );
     }
 
     // ── Test 3: typed_value() for TextOnly element ────────────────────
@@ -569,7 +562,10 @@ mod tests {
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
         let tv = nav.typed_value();
-        assert!(matches!(tv, TypedValue::Value(_)), "simple-typed element should have typed value");
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "simple-typed element should have typed value"
+        );
     }
 
     // ── Test 4: typed_value() returns Absent for ElementOnly/Mixed ────
@@ -588,11 +584,7 @@ mod tests {
             </xs:schema>"#,
         );
         let arena = Bump::new();
-        let doc = build_doc(
-            "<root><child>hello</child></root>",
-            &arena,
-            &schema_set,
-        );
+        let doc = build_doc("<root><child>hello</child></root>", &arena, &schema_set);
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
@@ -626,10 +618,7 @@ mod tests {
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
-        assert!(matches!(
-            nav.element_type_key(),
-            Some(TypeKey::Complex(_))
-        ));
+        assert!(matches!(nav.element_type_key(), Some(TypeKey::Complex(_))));
         let binding = nav.schema_binding().unwrap();
         assert_eq!(
             binding.content_type,
@@ -637,7 +626,10 @@ mod tests {
             "simpleContent should have TextOnly content type"
         );
         let tv = nav.typed_value();
-        assert!(matches!(tv, TypedValue::Value(_)), "simpleContent element should have typed_value");
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "simpleContent element should have typed_value"
+        );
     }
 
     // ── Test 6: untyped document → binding_index=0, typed_value=Untyped
@@ -655,7 +647,7 @@ mod tests {
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
-        // Unknown element should still build, just no type binding
+                                            // Unknown element should still build, just no type binding
         assert_eq!(nav.typed_value(), TypedValue::Untyped);
     }
 
@@ -682,7 +674,10 @@ mod tests {
         assert!(nav.element_type_key().is_some());
         // The type should be resolved (either xs:integer or the declared type)
         let tv = nav.typed_value();
-        assert!(matches!(tv, TypedValue::Value(_)), "xsi:type override should produce typed value");
+        assert!(
+            matches!(tv, TypedValue::Value(_)),
+            "xsi:type override should produce typed value"
+        );
     }
 
     // ── Test 8: xsi:nil → IS_NIL, typed_value() returns Nilled ───────
@@ -743,11 +738,7 @@ mod tests {
             </xs:schema>"#,
         );
         let arena = Bump::new();
-        let doc = build_doc(
-            "<root><val>10</val></root>",
-            &arena,
-            &schema_set,
-        );
+        let doc = build_doc("<root><val>10</val></root>", &arena, &schema_set);
 
         let mut nav = doc.create_navigator();
         assert!(nav.move_to_first_child()); // root element
@@ -917,15 +908,11 @@ mod tests {
         fn cta_selected_type_binds_attribute() {
             let schema_set = load_schema(CTA_ATTR_SCHEMA);
             let arena = Bump::new();
-            let doc = build_doc(
-                r#"<data kind="int" val="42"/>"#,
-                &arena,
-                &schema_set,
-            );
+            let doc = build_doc(r#"<data kind="int" val="42"/>"#, &arena, &schema_set);
 
             let mut nav = doc.create_navigator();
             assert!(nav.move_to_first_child()); // <data>
-            // Element should have intType binding
+                                                // Element should have intType binding
             assert!(nav.element_type_key().is_some());
 
             // Navigate to 'val' attribute — should have xs:integer type from intType
@@ -947,11 +934,7 @@ mod tests {
             let schema_set = load_schema(CTA_ATTR_SCHEMA);
             let arena = Bump::new();
             // kind='str' selects strType — val should be xs:string
-            let doc = build_doc(
-                r#"<data kind="str" val="hello"/>"#,
-                &arena,
-                &schema_set,
-            );
+            let doc = build_doc(r#"<data kind="str" val="hello"/>"#, &arena, &schema_set);
 
             let mut nav = doc.create_navigator();
             assert!(nav.move_to_first_child()); // <data>
@@ -990,11 +973,7 @@ mod tests {
 
             let schema_set = load_schema(schema);
             let arena = Bump::new();
-            let doc = build_doc(
-                r#"<point kind="full" x="10" y="20"/>"#,
-                &arena,
-                &schema_set,
-            );
+            let doc = build_doc(r#"<point kind="full" x="10" y="20"/>"#, &arena, &schema_set);
 
             let mut nav = doc.create_navigator();
             assert!(nav.move_to_first_child()); // <point>
@@ -1062,7 +1041,10 @@ mod tests {
 
             let mut nav = doc.create_navigator();
             assert!(nav.move_to_first_child()); // <outer>
-            assert!(nav.element_type_key().is_some(), "outer should have type binding");
+            assert!(
+                nav.element_type_key().is_some(),
+                "outer should have type binding"
+            );
 
             // Check outerAttr has binding
             assert!(nav.move_to_first_attribute());
@@ -1084,7 +1066,10 @@ mod tests {
             // Navigate to <inner>
             nav.move_to_parent();
             assert!(nav.move_to_first_child()); // <inner>
-            assert!(nav.element_type_key().is_some(), "inner should have type binding");
+            assert!(
+                nav.element_type_key().is_some(),
+                "inner should have type binding"
+            );
 
             // Check innerAttr has binding
             assert!(nav.move_to_first_attribute());

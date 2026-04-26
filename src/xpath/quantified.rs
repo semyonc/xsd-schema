@@ -4,9 +4,9 @@
 //! - `some $x in ... satisfies ...`
 //! - `every $x in ... satisfies ...`
 
-use crate::types::value::XmlValue;
 use super::boolean::effective_boolean_value;
 use super::error::XPathError;
+use crate::types::value::XmlValue;
 
 /// Check if some item in the sequence satisfies the condition.
 ///
@@ -118,10 +118,7 @@ mod tests {
 
     #[test]
     fn test_some_with_all_false() {
-        let values = vec![
-            XmlValue::boolean(false),
-            XmlValue::boolean(false),
-        ];
+        let values = vec![XmlValue::boolean(false), XmlValue::boolean(false)];
         assert!(!some(&values).unwrap());
     }
 
@@ -133,10 +130,7 @@ mod tests {
 
     #[test]
     fn test_every_with_all_true() {
-        let values = vec![
-            XmlValue::boolean(true),
-            XmlValue::boolean(true),
-        ];
+        let values = vec![XmlValue::boolean(true), XmlValue::boolean(true)];
         assert!(every(&values).unwrap());
     }
 
@@ -160,27 +154,18 @@ mod tests {
     #[test]
     fn test_some_with_strings() {
         // Non-empty strings are true
-        let values = vec![
-            XmlValue::string(""),
-            XmlValue::string("hello"),
-        ];
+        let values = vec![XmlValue::string(""), XmlValue::string("hello")];
         assert!(some(&values).unwrap());
     }
 
     #[test]
     fn test_every_with_strings() {
         // All non-empty strings
-        let values = vec![
-            XmlValue::string("a"),
-            XmlValue::string("b"),
-        ];
+        let values = vec![XmlValue::string("a"), XmlValue::string("b")];
         assert!(every(&values).unwrap());
 
         // One empty string
-        let values = vec![
-            XmlValue::string("a"),
-            XmlValue::string(""),
-        ];
+        let values = vec![XmlValue::string("a"), XmlValue::string("")];
         assert!(!every(&values).unwrap());
     }
 
@@ -192,7 +177,9 @@ mod tests {
             XmlValue::string("cherry"),
         ];
         assert!(some_with(&values, |v| v.to_string_value().starts_with('b')));
-        assert!(!some_with(&values, |v| v.to_string_value().starts_with('z')));
+        assert!(!some_with(&values, |v| v
+            .to_string_value()
+            .starts_with('z')));
     }
 
     #[test]
@@ -202,7 +189,9 @@ mod tests {
             XmlValue::string("avocado"),
             XmlValue::string("apricot"),
         ];
-        assert!(every_with(&values, |v| v.to_string_value().starts_with('a')));
+        assert!(every_with(&values, |v| v
+            .to_string_value()
+            .starts_with('a')));
         assert!(!every_with(&values, |v| v.to_string_value().len() == 5));
     }
 

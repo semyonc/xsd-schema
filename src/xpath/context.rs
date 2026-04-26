@@ -7,16 +7,16 @@
 //! - `NameBinder` - Compile-time variable slot allocation
 
 use crate::ids::NameId;
-use crate::namespace::table::NameTable;
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::QualifiedName;
+use crate::namespace::table::NameTable;
 use crate::schema::SchemaSet;
-use crate::types::value::{TimezoneOffset, DateTimeValue};
+use crate::types::value::{DateTimeValue, TimezoneOffset};
 
-use super::DomNavigator;
-use super::XPathMode;
 use super::functions::{BuiltinCatalog, BuiltinEvaluator, FunctionCatalog, FunctionEvaluator};
 use super::iterator::XmlItem;
+use super::DomNavigator;
+use super::XPathMode;
 
 // ============================================================================
 // XPathContext (static context for bind-time and eval-time)
@@ -144,9 +144,11 @@ impl<'a> XPathContext<'a> {
     pub fn resolve_prefix(&self, prefix: &str) -> Option<String> {
         if prefix.is_empty() {
             // Empty prefix: use default element namespace
-            self.default_element_ns.and_then(|id| self.names.try_resolve(id))
+            self.default_element_ns
+                .and_then(|id| self.names.try_resolve(id))
         } else if let Some(prefix_id) = self.names.get(prefix) {
-            self.namespaces.resolve_prefix(prefix_id)
+            self.namespaces
+                .resolve_prefix(prefix_id)
                 .and_then(|ns_id| self.names.try_resolve(ns_id))
         } else {
             None
@@ -165,7 +167,9 @@ impl<'a> XPathContext<'a> {
     pub fn default_function_namespace(&self) -> &str {
         match self.mode {
             XPathMode::XPath10 => "",
-            XPathMode::XPath20 => self.default_function_ns.unwrap_or(super::functions::FN_NAMESPACE),
+            XPathMode::XPath20 => self
+                .default_function_ns
+                .unwrap_or(super::functions::FN_NAMESPACE),
         }
     }
 
@@ -306,9 +310,13 @@ impl NameBinder {
             }
         }
         // Format QName for error using NameTable
-        let local = names.try_resolve(name.local_name).unwrap_or_else(|| "<unknown>".to_string());
+        let local = names
+            .try_resolve(name.local_name)
+            .unwrap_or_else(|| "<unknown>".to_string());
         let qname_str = if let Some(prefix_id) = name.prefix {
-            let prefix = names.try_resolve(prefix_id).unwrap_or_else(|| "<unknown>".to_string());
+            let prefix = names
+                .try_resolve(prefix_id)
+                .unwrap_or_else(|| "<unknown>".to_string());
             format!("{}:{}", prefix, local)
         } else {
             local.to_string()
@@ -469,9 +477,11 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
 
     /// Get the context item, returning an error if undefined.
     pub fn require_context_item(&self) -> Result<&XmlItem<N>, super::error::XPathError> {
-        self.context_item.as_ref().ok_or_else(|| super::error::XPathError::XPDY0002 {
-            message: "Context item is undefined".to_string(),
-        })
+        self.context_item
+            .as_ref()
+            .ok_or_else(|| super::error::XPathError::XPDY0002 {
+                message: "Context item is undefined".to_string(),
+            })
     }
 
     /// Get the context node, returning an error if undefined or not a node.
@@ -579,7 +589,10 @@ mod tests {
     fn test_xpath_context_default_function_ns() {
         let names = NameTable::new();
         let ctx = XPathContext::new(&names);
-        assert_eq!(ctx.default_function_namespace(), super::super::functions::FN_NAMESPACE);
+        assert_eq!(
+            ctx.default_function_namespace(),
+            super::super::functions::FN_NAMESPACE
+        );
     }
 
     #[test]
@@ -652,6 +665,9 @@ mod tests {
         let undefined_id = names.add("undefined");
         let name = QualifiedName::local(undefined_id);
         let result = binder.resolve(&name);
-        assert!(matches!(result, Err(super::super::error::XPathError::XPST0008 { .. })));
+        assert!(matches!(
+            result,
+            Err(super::super::error::XPathError::XPST0008 { .. })
+        ));
     }
 }

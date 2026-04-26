@@ -145,7 +145,9 @@ fn check_no_user_defined_types(
     schema_set: &SchemaSet,
 ) -> SchemaResult<()> {
     let arena = expr.arena();
-    let xs_ns = schema_set.name_table.add("http://www.w3.org/2001/XMLSchema");
+    let xs_ns = schema_set
+        .name_table
+        .add("http://www.w3.org/2001/XMLSchema");
 
     for (_id, node) in arena.iter() {
         let AstNode::TypeExpr(type_expr) = node else {
@@ -163,13 +165,17 @@ fn check_no_user_defined_types(
         // CTA only allows xs:* type names. Anything else is a
         // user-defined type, which §3.12.4 forbids.
         if qn.namespace_uri != Some(xs_ns) {
-            return Err(report_user_defined_type(alt, elem, type_expr, test, schema_set));
+            return Err(report_user_defined_type(
+                alt, elem, type_expr, test, schema_set,
+            ));
         }
         // Even within xs:, only built-in atomic types are allowed;
         // a name not recognised as a built-in counts as user-defined.
         if let Some(local) = schema_set.name_table.try_resolve_ref(qn.local_name) {
             if crate::types::XmlTypeCode::from_local_name(local).is_none() {
-                return Err(report_user_defined_type(alt, elem, type_expr, test, schema_set));
+                return Err(report_user_defined_type(
+                    alt, elem, type_expr, test, schema_set,
+                ));
             }
         }
     }

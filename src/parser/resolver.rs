@@ -65,7 +65,6 @@ pub enum LoadOutcome {
     Cycle(String),
 }
 
-
 // ============================================================================
 // Encoding-Aware Decoding
 // ============================================================================
@@ -424,16 +423,10 @@ impl SchemaCatalog {
     /// by the [`EmbeddedLoader`].
     pub fn add_xml_catalog(&mut self) {
         // XML namespace (xml:lang, xml:space, xml:base) - uses embedded schema
-        self.add(
-            "http://www.w3.org/XML/1998/namespace",
-            "embedded://xml.xsd",
-        );
+        self.add("http://www.w3.org/XML/1998/namespace", "embedded://xml.xsd");
 
         // XLink namespace (xlink:type, xlink:href, etc.) - uses embedded schema
-        self.add(
-            "http://www.w3.org/1999/xlink",
-            "embedded://xlink.xsd",
-        );
+        self.add("http://www.w3.org/1999/xlink", "embedded://xlink.xsd");
 
         // XML Schema instance namespace (xsi:type, xsi:nil, etc.)
         // Note: This could be embedded in the future
@@ -543,11 +536,7 @@ impl SchemaResolver {
     }
 
     /// Resolve a schema location to an absolute path or URL
-    pub fn resolve_location(
-        &self,
-        schema_location: &str,
-        base_uri: &str,
-    ) -> SchemaResult<String> {
+    pub fn resolve_location(&self, schema_location: &str, base_uri: &str) -> SchemaResult<String> {
         // Check if it's already absolute
         if is_absolute_uri(schema_location) {
             return Ok(schema_location.to_string());
@@ -973,12 +962,15 @@ pub async fn resolve_all_directives_async(
 
     // Process includes (pass chameleon namespace)
     for (i, include) in includes.iter().enumerate() {
-        match resolver.load_schema_async(
-            &include.schema_location,
-            &base_uri,
-            schema_set,
-            target_namespace,
-        ).await {
+        match resolver
+            .load_schema_async(
+                &include.schema_location,
+                &base_uri,
+                schema_set,
+                target_namespace,
+            )
+            .await
+        {
             Ok(ref outcome) => {
                 if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
                     result.loaded.push(*id);
@@ -987,8 +979,12 @@ pub async fn resolve_all_directives_async(
                     result.skipped.push(include.schema_location.clone());
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Include,
-                    include.source.as_ref(), &include.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Include,
+                    include.source.as_ref(),
+                    &include.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -998,7 +994,9 @@ pub async fn resolve_all_directives_async(
     // Process imports — catalog takes priority over schemaLocation
     for (i, import) in imports.iter().enumerate() {
         // Check catalog first (namespace mapping overrides location hints)
-        let catalog_location = import.namespace.as_deref()
+        let catalog_location = import
+            .namespace
+            .as_deref()
             .and_then(|ns| resolver.catalog.lookup(ns).map(|l| l.to_string()));
 
         if let Some(location) = catalog_location {
@@ -1009,33 +1007,49 @@ pub async fn resolve_all_directives_async(
             if catalog_already_loaded {
                 continue;
             }
-            match resolver.load_schema_async(&location, &base_uri, schema_set, None).await {
+            match resolver
+                .load_schema_async(&location, &base_uri, schema_set, None)
+                .await
+            {
                 Ok(ref outcome) => {
                     if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
                         result.loaded.push(*id);
-                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id =
+                            Some(*id);
                     } else {
                         result.skipped.push(location.clone());
                     }
                     record_edge(
-                        schema_set, doc_id, outcome, CompositionEdgeKind::Import,
-                        import.source.as_ref(), &location,
+                        schema_set,
+                        doc_id,
+                        outcome,
+                        CompositionEdgeKind::Import,
+                        import.source.as_ref(),
+                        &location,
                     );
                 }
                 Err(e) => result.import_errors.push(e),
             }
         } else if let Some(location) = import.schema_location.as_deref() {
-            match resolver.load_schema_async(location, &base_uri, schema_set, None).await {
+            match resolver
+                .load_schema_async(location, &base_uri, schema_set, None)
+                .await
+            {
                 Ok(ref outcome) => {
                     if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
                         result.loaded.push(*id);
-                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id =
+                            Some(*id);
                     } else {
                         result.skipped.push(location.to_string());
                     }
                     record_edge(
-                        schema_set, doc_id, outcome, CompositionEdgeKind::Import,
-                        import.source.as_ref(), location,
+                        schema_set,
+                        doc_id,
+                        outcome,
+                        CompositionEdgeKind::Import,
+                        import.source.as_ref(),
+                        location,
                     );
                 }
                 Err(e) => result.import_errors.push(e),
@@ -1045,12 +1059,15 @@ pub async fn resolve_all_directives_async(
 
     // Process redefines (pass chameleon namespace)
     for (i, redefine) in redefines.iter().enumerate() {
-        match resolver.load_schema_async(
-            &redefine.schema_location,
-            &base_uri,
-            schema_set,
-            target_namespace,
-        ).await {
+        match resolver
+            .load_schema_async(
+                &redefine.schema_location,
+                &base_uri,
+                schema_set,
+                target_namespace,
+            )
+            .await
+        {
             Ok(ref outcome) => {
                 if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
                     result.loaded.push(*id);
@@ -1059,8 +1076,12 @@ pub async fn resolve_all_directives_async(
                     result.skipped.push(redefine.schema_location.clone());
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Redefine,
-                    redefine.source.as_ref(), &redefine.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Redefine,
+                    redefine.source.as_ref(),
+                    &redefine.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -1070,12 +1091,15 @@ pub async fn resolve_all_directives_async(
     // Process overrides (XSD 1.1, pass chameleon namespace)
     #[cfg(feature = "xsd11")]
     for (i, override_dir) in overrides.iter().enumerate() {
-        match resolver.load_schema_async(
-            &override_dir.schema_location,
-            &base_uri,
-            schema_set,
-            target_namespace,
-        ).await {
+        match resolver
+            .load_schema_async(
+                &override_dir.schema_location,
+                &base_uri,
+                schema_set,
+                target_namespace,
+            )
+            .await
+        {
             Ok(ref outcome) => {
                 if let LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) = outcome {
                     result.loaded.push(*id);
@@ -1084,8 +1108,12 @@ pub async fn resolve_all_directives_async(
                     result.skipped.push(override_dir.schema_location.clone());
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Override,
-                    override_dir.source.as_ref(), &override_dir.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Override,
+                    override_dir.source.as_ref(),
+                    &override_dir.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -1341,7 +1369,8 @@ pub fn resolve_all_directives(
             Ok(ref outcome) => {
                 match outcome {
                     LoadOutcome::Loaded(id) | LoadOutcome::AlreadyLoaded(id) => {
-                        schema_set.documents[doc_id as usize].includes[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].includes[i].resolved_doc_id =
+                            Some(*id);
                         if matches!(outcome, LoadOutcome::Loaded(_)) {
                             result.loaded.push(*id);
                         }
@@ -1358,7 +1387,8 @@ pub fn resolve_all_directives(
                                     .source
                                     .as_ref()
                                     .and_then(|s| schema_set.source_maps.locate(s));
-                                let declared_str = schema_set.name_table.resolve(declared).to_string();
+                                let declared_str =
+                                    schema_set.name_table.resolve(declared).to_string();
                                 result.errors.push(SchemaError::structural(
                                     "src-include",
                                     format!(
@@ -1377,8 +1407,12 @@ pub fn resolve_all_directives(
                     }
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Include,
-                    include.source.as_ref(), &include.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Include,
+                    include.source.as_ref(),
+                    &include.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -1402,7 +1436,10 @@ pub fn resolve_all_directives(
                              schema's targetNamespace in XSD 1.0",
                             import_ns_str
                         ),
-                        import.source.as_ref().and_then(|s| schema_set.source_maps.locate(s)),
+                        import
+                            .source
+                            .as_ref()
+                            .and_then(|s| schema_set.source_maps.locate(s)),
                     ));
                     continue;
                 }
@@ -1418,11 +1455,13 @@ pub fn resolve_all_directives(
                 match outcome {
                     LoadOutcome::Loaded(id) => {
                         result.loaded.push(*id);
-                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id =
+                            Some(*id);
                     }
                     LoadOutcome::AlreadyLoaded(id) => {
                         // Already processed — record doc_id but don't add to loaded.
-                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].imports[i].resolved_doc_id =
+                            Some(*id);
                     }
                     _ => {
                         if let Some(loc) = &import.schema_location {
@@ -1431,7 +1470,10 @@ pub fn resolve_all_directives(
                     }
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Import,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Import,
                     import.source.as_ref(),
                     import.schema_location.as_deref().unwrap_or_default(),
                 );
@@ -1445,23 +1487,34 @@ pub fn resolve_all_directives(
 
     // Process redefines
     for (i, redefine) in redefines.iter().enumerate() {
-        match resolver.process_redefine(&redefine.schema_location, &base_uri, target_namespace, schema_set) {
+        match resolver.process_redefine(
+            &redefine.schema_location,
+            &base_uri,
+            target_namespace,
+            schema_set,
+        ) {
             Ok(ref outcome) => {
                 match outcome {
                     LoadOutcome::Loaded(id) => {
                         result.loaded.push(*id);
-                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id =
+                            Some(*id);
                     }
                     LoadOutcome::AlreadyLoaded(id) => {
-                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].redefines[i].resolved_doc_id =
+                            Some(*id);
                     }
                     _ => {
                         result.skipped.push(redefine.schema_location.clone());
                     }
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Redefine,
-                    redefine.source.as_ref(), &redefine.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Redefine,
+                    redefine.source.as_ref(),
+                    &redefine.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -1481,18 +1534,24 @@ pub fn resolve_all_directives(
                 match outcome {
                     LoadOutcome::Loaded(id) => {
                         result.loaded.push(*id);
-                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id =
+                            Some(*id);
                     }
                     LoadOutcome::AlreadyLoaded(id) => {
-                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id = Some(*id);
+                        schema_set.documents[doc_id as usize].overrides[i].resolved_doc_id =
+                            Some(*id);
                     }
                     _ => {
                         result.skipped.push(override_dir.schema_location.clone());
                     }
                 }
                 record_edge(
-                    schema_set, doc_id, outcome, CompositionEdgeKind::Override,
-                    override_dir.source.as_ref(), &override_dir.schema_location,
+                    schema_set,
+                    doc_id,
+                    outcome,
+                    CompositionEdgeKind::Override,
+                    override_dir.source.as_ref(),
+                    &override_dir.schema_location,
                 );
             }
             Err(e) => result.errors.push(e),
@@ -1523,8 +1582,8 @@ mod tests {
 
     #[test]
     fn test_resolve_relative_path_parent() {
-        let resolved = resolve_relative_path("../common/types.xsd", "/home/user/schemas/main.xsd")
-            .unwrap();
+        let resolved =
+            resolve_relative_path("../common/types.xsd", "/home/user/schemas/main.xsd").unwrap();
         // Should resolve to something like /home/user/common/types.xsd
         assert!(resolved.contains("common"));
         assert!(resolved.contains("types.xsd"));
@@ -1658,8 +1717,8 @@ mod tests {
     #[test]
     fn test_composition_edges_recorded() {
         use crate::parser::parse::parse_schema;
-        use crate::schema::SchemaSet;
         use crate::schema::composition::CompositionEdgeKind;
+        use crate::schema::SchemaSet;
 
         let tmp = std::env::temp_dir().join("xsd_test_composition_edges");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1730,8 +1789,8 @@ mod tests {
     #[test]
     fn test_composition_edges_cycle() {
         use crate::parser::parse::parse_schema;
-        use crate::schema::SchemaSet;
         use crate::schema::composition::CompositionEdgeKind;
+        use crate::schema::SchemaSet;
 
         let tmp = std::env::temp_dir().join("xsd_test_composition_cycle");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -1888,19 +1947,25 @@ mod tests {
 
         // Should find the simple type
         assert!(
-            doc.component_index.lookup_type(None, schema_set.name_table.get("MyString").unwrap()).is_some(),
+            doc.component_index
+                .lookup_type(None, schema_set.name_table.get("MyString").unwrap())
+                .is_some(),
             "Should find MyString type in document component index"
         );
 
         // Should find the element
         assert!(
-            doc.component_index.lookup_element(None, schema_set.name_table.get("root").unwrap()).is_some(),
+            doc.component_index
+                .lookup_element(None, schema_set.name_table.get("root").unwrap())
+                .is_some(),
             "Should find root element in document component index"
         );
 
         // Should NOT find a non-existent component
         assert!(
-            doc.component_index.lookup_type(None, schema_set.name_table.get("root").unwrap()).is_none(),
+            doc.component_index
+                .lookup_type(None, schema_set.name_table.get("root").unwrap())
+                .is_none(),
             "Should not find 'root' as a type"
         );
     }
@@ -1949,13 +2014,19 @@ mod tests {
 
         let main_doc = &schema_set.documents[doc_id as usize];
         let target_doc_id = main_doc.redefines[0].resolved_doc_id;
-        assert!(target_doc_id.is_some(), "Redefine should have resolved_doc_id");
+        assert!(
+            target_doc_id.is_some(),
+            "Redefine should have resolved_doc_id"
+        );
 
         // Verify the target document's component index has MyString
         let target_doc = &schema_set.documents[target_doc_id.unwrap() as usize];
         let my_string_name = schema_set.name_table.get("MyString").unwrap();
         assert!(
-            target_doc.component_index.lookup_type(None, my_string_name).is_some(),
+            target_doc
+                .component_index
+                .lookup_type(None, my_string_name)
+                .is_some(),
             "Target document should have MyString in component index"
         );
 
@@ -1964,7 +2035,10 @@ mod tests {
 
         // Verify the namespace table now has the redefined type
         let type_key = schema_set.lookup_type(None, my_string_name);
-        assert!(type_key.is_some(), "MyString should still be in namespace table after redefine");
+        assert!(
+            type_key.is_some(),
+            "MyString should still be in namespace table after redefine"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -1972,8 +2046,8 @@ mod tests {
     #[test]
     fn test_effective_components_provenance_populated() {
         use crate::parser::parse::parse_schema;
-        use crate::schema::SchemaSet;
         use crate::schema::composition::CompositionAction;
+        use crate::schema::SchemaSet;
 
         let tmp = std::env::temp_dir().join("xsd_test_provenance");
         std::fs::create_dir_all(&tmp).unwrap();
@@ -2027,7 +2101,10 @@ mod tests {
             namespace: None,
         };
         let my_str_eff = schema_set.effective_components.get(&my_str_identity);
-        assert!(my_str_eff.is_some(), "MyStr should be in effective components");
+        assert!(
+            my_str_eff.is_some(),
+            "MyStr should be in effective components"
+        );
         let my_str_eff = my_str_eff.unwrap();
         assert!(
             matches!(my_str_eff.action, CompositionAction::Redefined { .. }),
@@ -2035,7 +2112,8 @@ mod tests {
         );
         // origin should point at the redefining document (main), not the target
         assert_eq!(
-            my_str_eff.origin.owner_doc, Some(doc_id),
+            my_str_eff.origin.owner_doc,
+            Some(doc_id),
             "Redefined component origin should be the redefining document"
         );
 
@@ -2045,12 +2123,13 @@ mod tests {
             .values()
             .filter(|c| matches!(c.action, CompositionAction::Declared))
             .count();
-        assert!(declared_count > 0, "Should have declared components for non-redefined items");
+        assert!(
+            declared_count > 0,
+            "Should have declared components for non-redefined items"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
-
-
 
     /// When resolved_doc_id is Some but the target document does NOT declare
     /// the component, redefine must fail — it must not fall back to a
@@ -2110,8 +2189,9 @@ mod tests {
         // Create a fake redefine that points resolved_doc_id at doc_b
         // (which does NOT declare MyType). The redefine's replacement type
         // needs to exist in the arena with the right name.
-        let redef_key = schema_set.arenas.alloc_simple_type(
-            crate::arenas::SimpleTypeDefData {
+        let redef_key = schema_set
+            .arenas
+            .alloc_simple_type(crate::arenas::SimpleTypeDefData {
                 name: Some(my_type_name),
                 target_namespace: None,
                 variety: crate::parser::frames::SimpleTypeVariety::Atomic,
@@ -2134,8 +2214,7 @@ mod tests {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
-            },
-        );
+            });
 
         let redefine = RedefineDirective {
             source: None,
@@ -2196,17 +2275,24 @@ mod tests {
         // Verify target doc has Foo as complex type, NOT simple type
         let target_doc = &schema_set.documents[target_id as usize];
         assert!(
-            target_doc.component_index.lookup_complex_type(None, foo_name).is_some(),
+            target_doc
+                .component_index
+                .lookup_complex_type(None, foo_name)
+                .is_some(),
             "Target should have Foo as complex type"
         );
         assert!(
-            target_doc.component_index.lookup_simple_type(None, foo_name).is_none(),
+            target_doc
+                .component_index
+                .lookup_simple_type(None, foo_name)
+                .is_none(),
             "Target should NOT have Foo as simple type"
         );
 
         // Create a simple type redefine for "Foo" pointing at target doc
-        let redef_key = schema_set.arenas.alloc_simple_type(
-            crate::arenas::SimpleTypeDefData {
+        let redef_key = schema_set
+            .arenas
+            .alloc_simple_type(crate::arenas::SimpleTypeDefData {
                 name: Some(foo_name),
                 target_namespace: None,
                 variety: crate::parser::frames::SimpleTypeVariety::Atomic,
@@ -2229,8 +2315,7 @@ mod tests {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
-            },
-        );
+            });
 
         let redefine = RedefineDirective {
             source: None,
@@ -2291,21 +2376,30 @@ mod tests {
         let mut resolver = SchemaResolver::new();
         let result = resolve_all_directives(doc_id, &mut resolver, &mut schema_set);
         assert!(result.is_ok(), "Resolution should succeed");
-        assert!(!result.loaded.is_empty(), "Should have loaded chameleon.xsd");
+        assert!(
+            !result.loaded.is_empty(),
+            "Should have loaded chameleon.xsd"
+        );
 
         // The chameleon document should have adopted the includer's namespace
         let chameleon_doc_id = result.loaded[0];
         let chameleon_doc = &schema_set.documents[chameleon_doc_id as usize];
-        let main_ns = schema_set.name_table.get("http://example.com/main").unwrap();
+        let main_ns = schema_set
+            .name_table
+            .get("http://example.com/main")
+            .unwrap();
         assert_eq!(
-            chameleon_doc.target_namespace, Some(main_ns),
+            chameleon_doc.target_namespace,
+            Some(main_ns),
             "Chameleon document should adopt includer's targetNamespace"
         );
 
         // MyType should be registered in the main namespace, not no-namespace
         let my_type_name = schema_set.name_table.get("MyType").unwrap();
         assert!(
-            schema_set.lookup_type(Some(main_ns), my_type_name).is_some(),
+            schema_set
+                .lookup_type(Some(main_ns), my_type_name)
+                .is_some(),
             "MyType should be in the includer's namespace after chameleon adoption"
         );
         assert!(
@@ -2365,7 +2459,8 @@ mod tests {
         let chameleon_doc = &schema_set.documents[chameleon_doc_id as usize];
         let ns = schema_set.name_table.get("http://example.com/ns").unwrap();
         assert_eq!(
-            chameleon_doc.target_namespace, Some(ns),
+            chameleon_doc.target_namespace,
+            Some(ns),
             "Chameleon redefine target should adopt redefiner's namespace"
         );
 
@@ -2532,7 +2627,9 @@ mod tests {
 
         // The raw load should NOT be chameleon
         assert!(!schema_set.documents[raw_id as usize].is_chameleon());
-        assert!(schema_set.documents[raw_id as usize].target_namespace.is_none());
+        assert!(schema_set.documents[raw_id as usize]
+            .target_namespace
+            .is_none());
 
         // Second: load from namespace-bearing context (chameleon adoption)
         let with_ns_uri = with_ns_path.to_string_lossy().to_string();

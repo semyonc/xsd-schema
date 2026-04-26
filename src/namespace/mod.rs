@@ -8,11 +8,13 @@
 //! All strings in the schema model pass through `NameTable` for deduplication
 //! and fast equality checks via `NameId`.
 
-pub mod table;
-pub mod qname;
 pub mod context;
+pub mod qname;
+pub mod table;
 
 // Re-exports
-pub use table::{NameTable, well_known, XS_NAMESPACE, XSI_NAMESPACE, XML_NAMESPACE, XMLNS_NAMESPACE};
-pub use qname::{QualifiedName, QNameError, parse_qname, parse_qname_with_snapshot, is_ncname};
-pub use context::{NamespaceContext, NamespaceScope, NamespaceContextSnapshot};
+pub use context::{NamespaceContext, NamespaceContextSnapshot, NamespaceScope};
+pub use qname::{is_ncname, parse_qname, parse_qname_with_snapshot, QNameError, QualifiedName};
+pub use table::{
+    well_known, NameTable, XMLNS_NAMESPACE, XML_NAMESPACE, XSI_NAMESPACE, XS_NAMESPACE,
+};

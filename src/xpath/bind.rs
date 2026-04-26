@@ -220,8 +220,10 @@ pub fn bind_node(
             // resolved into the default namespace and miss the actual
             // unprefixed attribute on the instance.
             let axis = path_step.axis;
-            let is_attribute_axis =
-                matches!(axis, super::ast::Axis::Attribute | super::ast::Axis::Namespace);
+            let is_attribute_axis = matches!(
+                axis,
+                super::ast::Axis::Attribute | super::ast::Axis::Namespace
+            );
             let resolved = resolve_node_test_with_axis(&path_step.test, ctx, is_attribute_axis)?;
             if let AstNode::PathStep(ref mut node) = arena.get_mut(id) {
                 node.resolved_test = resolved;
@@ -264,9 +266,9 @@ fn resolve_var_qname(
         let prefix_id = ctx.names.add(prefix);
 
         // Resolve prefix to namespace - THIS can still fail legitimately
-        let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
-            XPathError::undefined_prefix(prefix)
-        })?;
+        let ns_id = ctx
+            .resolve_prefix_id(prefix_id)
+            .ok_or_else(|| XPathError::undefined_prefix(prefix))?;
 
         Ok(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id)))
     }
@@ -333,9 +335,9 @@ fn resolve_name_test_with_axis(
                 Ok(ResolvedNameTest::LocalWildcard(empty_ns))
             } else {
                 let prefix_id = ctx.names.add(prefix);
-                let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
-                    XPathError::undefined_prefix(prefix)
-                })?;
+                let ns_id = ctx
+                    .resolve_prefix_id(prefix_id)
+                    .ok_or_else(|| XPathError::undefined_prefix(prefix))?;
                 Ok(ResolvedNameTest::LocalWildcard(ns_id))
             }
         }
@@ -353,13 +355,19 @@ fn resolve_name_test_with_axis(
                 } else {
                     ctx.default_element_ns
                 };
-                Ok(ResolvedNameTest::QName(QualifiedName::new(ns_id, local_id, None)))
+                Ok(ResolvedNameTest::QName(QualifiedName::new(
+                    ns_id, local_id, None,
+                )))
             } else {
                 let prefix_id = ctx.names.add(prefix);
-                let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
-                    XPathError::undefined_prefix(prefix)
-                })?;
-                Ok(ResolvedNameTest::QName(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id))))
+                let ns_id = ctx
+                    .resolve_prefix_id(prefix_id)
+                    .ok_or_else(|| XPathError::undefined_prefix(prefix))?;
+                Ok(ResolvedNameTest::QName(QualifiedName::new(
+                    Some(ns_id),
+                    local_id,
+                    Some(prefix_id),
+                )))
             }
         }
     }
@@ -383,9 +391,9 @@ fn resolve_atomic_type_qname(
         Ok(QualifiedName::new(ns_id, local_id, None))
     } else {
         let prefix_id = ctx.names.add(&qname.prefix);
-        let ns_id = ctx.resolve_prefix_id(prefix_id).ok_or_else(|| {
-            XPathError::undefined_prefix(&qname.prefix)
-        })?;
+        let ns_id = ctx
+            .resolve_prefix_id(prefix_id)
+            .ok_or_else(|| XPathError::undefined_prefix(&qname.prefix))?;
         Ok(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id)))
     }
 }
@@ -427,11 +435,7 @@ fn try_bind_constructor_function(
 
     // List types and abstract types are not constructor functions —
     // fall through to normal function lookup (which will produce XPST0017)
-    if type_code.is_list()
-        || matches!(
-            type_code,
-            XmlTypeCode::AnyType | XmlTypeCode::AnySimpleType
-        )
+    if type_code.is_list() || matches!(type_code, XmlTypeCode::AnyType | XmlTypeCode::AnySimpleType)
     {
         return Ok(None);
     }
@@ -448,8 +452,12 @@ fn try_bind_constructor_function(
         OccurrenceIndicator::ZeroOrOne,
         func_call.span,
     );
-    let mut type_expr =
-        TypeExprNode::new(TypeExprKind::CastAs, func_call.args[0], target_type, func_call.span);
+    let mut type_expr = TypeExprNode::new(
+        TypeExprKind::CastAs,
+        func_call.args[0],
+        target_type,
+        func_call.span,
+    );
 
     // Eagerly resolve the atomic type QName
     let resolved = resolve_atomic_type_qname(&qname, ctx)?;

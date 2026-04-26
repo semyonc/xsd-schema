@@ -6,8 +6,8 @@
 //! - fn:min
 //! - fn:max
 
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
@@ -237,12 +237,9 @@ fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
             let i = value.as_integer().ok_or_else(|| XPathError::FORG0006 {
                 message: "Expected integer value".to_string(),
             })?;
-            let d: Decimal = i
-                .to_string()
-                .parse()
-                .map_err(|_| XPathError::FORG0006 {
-                    message: "Failed to convert integer to decimal".to_string(),
-                })?;
+            let d: Decimal = i.to_string().parse().map_err(|_| XPathError::FORG0006 {
+                message: "Failed to convert integer to decimal".to_string(),
+            })?;
             Ok(XmlValue::decimal(d))
         }
         XmlTypeCode::UntypedAtomic => {
@@ -266,13 +263,8 @@ fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
 /// Promote all numeric values to the common numeric type.
 /// Per F&O §15.4.3/4: if any value is double, all become double; if any is float, all become float.
 fn promote_to_common_numeric_type(values: &mut [XmlValue]) {
-    let has_double = values
-        .iter()
-        .any(|v| v.type_code == XmlTypeCode::Double);
-    let has_float = !has_double
-        && values
-            .iter()
-            .any(|v| v.type_code == XmlTypeCode::Float);
+    let has_double = values.iter().any(|v| v.type_code == XmlTypeCode::Double);
+    let has_float = !has_double && values.iter().any(|v| v.type_code == XmlTypeCode::Float);
 
     if has_double {
         for v in values.iter_mut() {

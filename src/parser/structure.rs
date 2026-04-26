@@ -28,11 +28,11 @@
 //! | union | Must have `memberTypes` XOR inline simpleTypes |
 
 use crate::error::{SchemaError, SchemaResult};
-use crate::namespace::{NameTable, is_ncname};
+use crate::namespace::{is_ncname, NameTable};
 use crate::parser::attrs::AttributeMap;
 use crate::parser::location::SourceRef;
 use crate::schema::XsdVersion;
-use crate::types::facets::{WhitespaceMode, normalize_whitespace};
+use crate::types::facets::{normalize_whitespace, WhitespaceMode};
 
 /// Apply XSD whitespace=collapse to an attribute value before NCName/QName validation.
 /// XSD attribute types like xs:NCName have whiteSpace=collapse semantics — leading,
@@ -174,17 +174,20 @@ pub fn validate_element_structure(
         // referenced declaration already determines the namespace.
         if has_ref {
             let ref_prohibited = [
-                "type", "default", "fixed", "nillable", "block", "final", "form",
+                "type",
+                "default",
+                "fixed",
+                "nillable",
+                "block",
+                "final",
+                "form",
                 "targetNamespace",
             ];
             for prohibited in &ref_prohibited {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
                         "src-element",
-                        format!(
-                            "Element reference cannot have '{}' attribute",
-                            prohibited
-                        ),
+                        format!("Element reference cannot have '{}' attribute", prohibited),
                         None,
                     ));
                 }
@@ -209,7 +212,9 @@ pub fn validate_element_structure(
         // src-element §3.3.3 clauses 3.2.2 / 4: `targetNamespace` may only
         // appear on a local element when (a) `form` is absent and (b) there
         // is a `<complexType>` lexical ancestor.
-        let has_target_ns = attrs.get_value_by_name(name_table, "targetNamespace").is_some();
+        let has_target_ns = attrs
+            .get_value_by_name(name_table, "targetNamespace")
+            .is_some();
         if has_target_ns {
             let has_form = attrs.get_value_by_name(name_table, "form").is_some();
             if has_form {
@@ -245,7 +250,12 @@ pub fn validate_element_structure(
     // §3.3.2 element XML representation: `final` allows only `extension|restriction|#all`.
     // (Substitution is permitted in `block`, but NOT `final`.)
     if let Some(final_val) = attrs.get_value_by_name(name_table, "final") {
-        validate_derivation_set_tokens(final_val, &["extension", "restriction"], "final", "element")?;
+        validate_derivation_set_tokens(
+            final_val,
+            &["extension", "restriction"],
+            "final",
+            "element",
+        )?;
     }
     // §3.3.2 element/@block allows `extension|restriction|substitution|#all`.
     if let Some(block_val) = attrs.get_value_by_name(name_table, "block") {
@@ -315,7 +325,10 @@ pub fn validate_attribute_structure(
         if !is_ncname(&collapsed_name) {
             return Err(SchemaError::structural(
                 "src-attribute",
-                format!("Attribute 'name' value '{}' is not a valid NCName", name_val),
+                format!(
+                    "Attribute 'name' value '{}' is not a valid NCName",
+                    name_val
+                ),
                 None,
             ));
         }
@@ -391,10 +404,7 @@ pub fn validate_attribute_structure(
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
                         "src-attribute",
-                        format!(
-                            "Attribute reference cannot have '{}' attribute",
-                            prohibited
-                        ),
+                        format!("Attribute reference cannot have '{}' attribute", prohibited),
                         None,
                     ));
                 }
@@ -404,7 +414,9 @@ pub fn validate_attribute_structure(
         // src-attribute §3.2.3 clauses 6.2 / 6: `targetNamespace` may only
         // appear on a local attribute when (a) `form` is absent and (b)
         // there is a `<complexType>` lexical ancestor.
-        let has_target_ns = attrs.get_value_by_name(name_table, "targetNamespace").is_some();
+        let has_target_ns = attrs
+            .get_value_by_name(name_table, "targetNamespace")
+            .is_some();
         if has_target_ns {
             let has_form = attrs.get_value_by_name(name_table, "form").is_some();
             if has_form {
@@ -507,7 +519,10 @@ pub fn validate_simple_type_structure(
         if !is_ncname(&collapsed(name_val)) {
             return Err(SchemaError::structural(
                 "src-simple-type",
-                format!("simpleType 'name' value '{}' is not a valid NCName", name_val),
+                format!(
+                    "simpleType 'name' value '{}' is not a valid NCName",
+                    name_val
+                ),
                 None,
             ));
         }
@@ -557,7 +572,10 @@ pub fn validate_complex_type_structure(
         if !is_ncname(&collapsed(name_val)) {
             return Err(SchemaError::structural(
                 "src-ct",
-                format!("complexType 'name' value '{}' is not a valid NCName", name_val),
+                format!(
+                    "complexType 'name' value '{}' is not a valid NCName",
+                    name_val
+                ),
                 None,
             ));
         }
@@ -714,7 +732,10 @@ pub fn validate_key_unique_structure(
         if !is_ncname(&collapsed(name_val)) {
             return Err(SchemaError::structural(
                 "src-identity-constraint",
-                format!("identity constraint 'name' value '{}' is not a valid NCName", name_val),
+                format!(
+                    "identity constraint 'name' value '{}' is not a valid NCName",
+                    name_val
+                ),
                 None,
             ));
         }
@@ -728,10 +749,7 @@ pub fn validate_key_unique_structure(
 /// - Must have `name` or `ref` attribute
 /// - `refer` is required when `name` is present
 /// - Child requirements (selector/field) are validated when the frame finishes
-pub fn validate_keyref_structure(
-    attrs: &AttributeMap,
-    name_table: &NameTable,
-) -> SchemaResult<()> {
+pub fn validate_keyref_structure(attrs: &AttributeMap, name_table: &NameTable) -> SchemaResult<()> {
     let has_name = attrs.get_value_by_name(name_table, "name").is_some();
     let has_refer = attrs.get_value_by_name(name_table, "refer").is_some();
     let has_ref = attrs.get_value_by_name(name_table, "ref").is_some();
@@ -890,7 +908,10 @@ pub fn validate_attribute_group_structure(
         if !is_ncname(&collapsed(name_val)) {
             return Err(SchemaError::structural(
                 "src-attribute_group",
-                format!("attributeGroup 'name' value '{}' is not a valid NCName", name_val),
+                format!(
+                    "attributeGroup 'name' value '{}' is not a valid NCName",
+                    name_val
+                ),
                 None,
             ));
         }
@@ -916,13 +937,13 @@ pub const XSD_1_1_ELEMENTS: &[&str] = &[
 
 /// XSD 1.1 attribute names that are not allowed in XSD 1.0 mode
 pub const XSD_1_1_ATTRIBUTES: &[&str] = &[
-    "targetNamespace",      // on element/attribute (local)
-    "notNamespace",         // on any/anyAttribute
-    "notQName",             // on any/anyAttribute
-    "inheritable",          // on attribute
-    "defaultAttributes",    // on schema
+    "targetNamespace",        // on element/attribute (local)
+    "notNamespace",           // on any/anyAttribute
+    "notQName",               // on any/anyAttribute
+    "inheritable",            // on attribute
+    "defaultAttributes",      // on schema
     "defaultAttributesApply", // on complexType
-    "xpathDefaultNamespace", // on schema/type definitions
+    "xpathDefaultNamespace",  // on schema/type definitions
 ];
 
 /// Validate that an element is allowed in the current XSD version
@@ -930,16 +951,15 @@ pub fn validate_xsd_version_element(
     element_name: &str,
     ctx: &ValidationContext,
 ) -> SchemaResult<()> {
-    if ctx.xsd_version == XsdVersion::V1_0
-        && XSD_1_1_ELEMENTS.contains(&element_name) {
-            return Err(SchemaError::feature(
-                format!(
-                    "Element '{}' requires XSD 1.1 but schema is in XSD 1.0 mode",
-                    element_name
-                ),
-                None,
-            ));
-        }
+    if ctx.xsd_version == XsdVersion::V1_0 && XSD_1_1_ELEMENTS.contains(&element_name) {
+        return Err(SchemaError::feature(
+            format!(
+                "Element '{}' requires XSD 1.1 but schema is in XSD 1.0 mode",
+                element_name
+            ),
+            None,
+        ));
+    }
     Ok(())
 }
 
@@ -1052,7 +1072,9 @@ pub fn validate_include_structure(
     attrs: &AttributeMap,
     name_table: &NameTable,
 ) -> SchemaResult<()> {
-    let has_location = attrs.get_value_by_name(name_table, "schemaLocation").is_some();
+    let has_location = attrs
+        .get_value_by_name(name_table, "schemaLocation")
+        .is_some();
 
     if !has_location {
         return Err(SchemaError::structural(
@@ -1071,10 +1093,7 @@ pub fn validate_include_structure(
 /// - `namespace`, when present, must not be the empty string (§4.2.6.2 / §4.2.3
 ///   src-import constraint 1.2 in XSD 1.1; §4.2.3 in XSD 1.0). Empty namespace is
 ///   forbidden because absent and "" denote different things in XSD.
-pub fn validate_import_structure(
-    attrs: &AttributeMap,
-    name_table: &NameTable,
-) -> SchemaResult<()> {
+pub fn validate_import_structure(attrs: &AttributeMap, name_table: &NameTable) -> SchemaResult<()> {
     if let Some(ns) = attrs.get_value_by_name(name_table, "namespace") {
         if ns.is_empty() {
             return Err(SchemaError::structural(
@@ -1099,10 +1118,7 @@ pub fn validate_import_structure(
 /// rejecting individual attribute declarations in the XSI namespace — is
 /// implemented in `validate_no_xsi_attribute_declarations` and that aligns
 /// with both interpretations.
-pub fn validate_schema_structure(
-    attrs: &AttributeMap,
-    name_table: &NameTable,
-) -> SchemaResult<()> {
+pub fn validate_schema_structure(attrs: &AttributeMap, name_table: &NameTable) -> SchemaResult<()> {
     if let Some(tns) = attrs.get_value_by_name(name_table, "targetNamespace") {
         if tns.is_empty() {
             return Err(SchemaError::structural(
@@ -1122,7 +1138,9 @@ pub fn validate_redefine_structure(
     attrs: &AttributeMap,
     name_table: &NameTable,
 ) -> SchemaResult<()> {
-    let has_location = attrs.get_value_by_name(name_table, "schemaLocation").is_some();
+    let has_location = attrs
+        .get_value_by_name(name_table, "schemaLocation")
+        .is_some();
 
     if !has_location {
         return Err(SchemaError::structural(
@@ -1283,7 +1301,10 @@ mod tests {
     #[test]
     fn test_notation_requires_public_in_1_0() {
         let mut name_table = NameTable::new();
-        let attrs = make_attr_map(&mut name_table, &[("name", "myNotation"), ("system", "foo")]);
+        let attrs = make_attr_map(
+            &mut name_table,
+            &[("name", "myNotation"), ("system", "foo")],
+        );
         let ctx = ValidationContext::new(XsdVersion::V1_0, true);
 
         let result = validate_notation_structure(&attrs, &name_table, &ctx);
@@ -1293,7 +1314,10 @@ mod tests {
     #[test]
     fn test_notation_system_ok_in_1_1() {
         let mut name_table = NameTable::new();
-        let attrs = make_attr_map(&mut name_table, &[("name", "myNotation"), ("system", "foo")]);
+        let attrs = make_attr_map(
+            &mut name_table,
+            &[("name", "myNotation"), ("system", "foo")],
+        );
         let ctx = ValidationContext::new(XsdVersion::V1_1, true);
 
         let result = validate_notation_structure(&attrs, &name_table, &ctx);

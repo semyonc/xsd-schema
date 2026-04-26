@@ -16,11 +16,12 @@
 //!
 //! Other node types return `not_implemented` errors for now.
 
+use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType, XmlTypeCode};
 use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{
-    AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode,
-    KindTest, NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode,
-    QuantifiedNode, QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+    AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode, KindTest,
+    NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode, QuantifiedNode,
+    QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
 };
 use crate::xpath::axis_iterators::{
     AncestorAxis, AttributeAxis, ChildAxis, DescendantNodeIterator, FollowingNodeIterator,
@@ -28,15 +29,17 @@ use crate::xpath::axis_iterators::{
     SelfAxis, SequentialAxisNodeIterator,
 };
 use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
-use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{
     atomize_to_single_opt, effective_boolean_value, effective_boolean_value_10, XPathValue,
 };
-use crate::xpath::iterator::{DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator};
+use crate::xpath::iterator::{
+    DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator,
+};
 use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node};
 use crate::xpath::node_test::{matches_item_type_node, NodeTest};
+use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::operators::{
     eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter,
     general_eq_iter_10, general_ge_iter, general_ge_iter_10, general_gt_iter, general_gt_iter_10,
@@ -45,7 +48,6 @@ use crate::xpath::operators::{
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::{DomNavigator, XPathMode};
-use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType, XmlTypeCode};
 
 /// Evaluate an AST node and return the result.
 ///
@@ -89,7 +91,8 @@ pub fn eval_node<N: DomNavigator>(
             // (the comma operator only appears in function args, which use a separate grammar production)
             if ctx.static_context.mode() == XPathMode::XPath10 {
                 return Err(XPathError::XPST0003 {
-                    message: "Sequence expressions (comma operator) are not available in XPath 1.0".to_string(),
+                    message: "Sequence expressions (comma operator) are not available in XPath 1.0"
+                        .to_string(),
                 });
             }
 
@@ -112,7 +115,8 @@ pub fn eval_node<N: DomNavigator>(
                 }
                 if matches!(value_node, ValueNode::Double(_)) {
                     return Err(XPathError::XPST0003 {
-                        message: "Double literals (e.g. 1e10) are not available in XPath 1.0".to_string(),
+                        message: "Double literals (e.g. 1e10) are not available in XPath 1.0"
+                            .to_string(),
                     });
                 }
             }
@@ -132,9 +136,9 @@ pub fn eval_node<N: DomNavigator>(
 
         AstNode::VarRef(var_ref) => {
             // Get the variable value from the context
-            let slot = var_ref.slot.ok_or_else(|| XPathError::Internal(
-                "Variable reference not bound".to_string(),
-            ))?;
+            let slot = var_ref
+                .slot
+                .ok_or_else(|| XPathError::Internal("Variable reference not bound".to_string()))?;
 
             ctx.get_variable(slot)
                 .cloned()
@@ -157,9 +161,9 @@ pub fn eval_node<N: DomNavigator>(
 
         AstNode::FunctionCall(func_call) => {
             // Get the resolved function handle
-            let handle = func_call.function_handle.ok_or_else(|| {
-                XPathError::Internal("Function call not bound".to_string())
-            })?;
+            let handle = func_call
+                .function_handle
+                .ok_or_else(|| XPathError::Internal("Function call not bound".to_string()))?;
 
             // Evaluate all arguments
             let mut args: Vec<XPathValue<N>> = Vec::with_capacity(func_call.args.len());
@@ -171,13 +175,9 @@ pub fn eval_node<N: DomNavigator>(
             ctx.eval_function(handle, args)
         }
 
-        AstNode::For(for_node) => {
-            eval_for_expression(arena, for_node, ctx)
-        }
+        AstNode::For(for_node) => eval_for_expression(arena, for_node, ctx),
 
-        AstNode::Quantified(quant_node) => {
-            eval_quantified_expression(arena, quant_node, ctx)
-        }
+        AstNode::Quantified(quant_node) => eval_quantified_expression(arena, quant_node, ctx),
 
         AstNode::PathExpr(path_expr) => eval_path_expr(arena, path_expr, ctx),
 
@@ -254,11 +254,18 @@ pub fn eval_node<N: DomNavigator>(
                 }
 
                 // Arithmetic and value comparison operators - atomize to single values
-                BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul |
-                BinaryOpKind::Div | BinaryOpKind::IDiv | BinaryOpKind::Mod |
-                BinaryOpKind::ValueEq | BinaryOpKind::ValueNe |
-                BinaryOpKind::ValueLt | BinaryOpKind::ValueLe |
-                BinaryOpKind::ValueGt | BinaryOpKind::ValueGe => {
+                BinaryOpKind::Add
+                | BinaryOpKind::Sub
+                | BinaryOpKind::Mul
+                | BinaryOpKind::Div
+                | BinaryOpKind::IDiv
+                | BinaryOpKind::Mod
+                | BinaryOpKind::ValueEq
+                | BinaryOpKind::ValueNe
+                | BinaryOpKind::ValueLt
+                | BinaryOpKind::ValueLe
+                | BinaryOpKind::ValueGt
+                | BinaryOpKind::ValueGe => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
@@ -270,10 +277,15 @@ pub fn eval_node<N: DomNavigator>(
                         (Some(left), Some(right)) => {
                             let is_arithmetic = matches!(
                                 bin_op.kind,
-                                BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul |
-                                BinaryOpKind::Div | BinaryOpKind::Mod
+                                BinaryOpKind::Add
+                                    | BinaryOpKind::Sub
+                                    | BinaryOpKind::Mul
+                                    | BinaryOpKind::Div
+                                    | BinaryOpKind::Mod
                             );
-                            let result = if is_arithmetic && ctx.static_context.mode() == XPathMode::XPath10 {
+                            let result = if is_arithmetic
+                                && ctx.static_context.mode() == XPathMode::XPath10
+                            {
                                 eval_numeric_binary_10(bin_op.kind, &left, &right)?
                             } else {
                                 eval_binary(bin_op.kind, &left, &right)?
@@ -284,9 +296,12 @@ pub fn eval_node<N: DomNavigator>(
                 }
 
                 // General comparisons - use Cartesian product semantics
-                BinaryOpKind::GeneralEq | BinaryOpKind::GeneralNe |
-                BinaryOpKind::GeneralLt | BinaryOpKind::GeneralLe |
-                BinaryOpKind::GeneralGt | BinaryOpKind::GeneralGe => {
+                BinaryOpKind::GeneralEq
+                | BinaryOpKind::GeneralNe
+                | BinaryOpKind::GeneralLt
+                | BinaryOpKind::GeneralLe
+                | BinaryOpKind::GeneralGt
+                | BinaryOpKind::GeneralGe => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
@@ -303,8 +318,10 @@ pub fn eval_node<N: DomNavigator>(
                             let result = match bin_op.kind {
                                 BinaryOpKind::GeneralEq => l == r,
                                 BinaryOpKind::GeneralNe => l != r,
-                                BinaryOpKind::GeneralLt | BinaryOpKind::GeneralLe |
-                                BinaryOpKind::GeneralGt | BinaryOpKind::GeneralGe => {
+                                BinaryOpKind::GeneralLt
+                                | BinaryOpKind::GeneralLe
+                                | BinaryOpKind::GeneralGt
+                                | BinaryOpKind::GeneralGe => {
                                     let ln = if l { 1.0_f64 } else { 0.0 };
                                     let rn = if r { 1.0_f64 } else { 0.0 };
                                     match bin_op.kind {
@@ -336,12 +353,24 @@ pub fn eval_node<N: DomNavigator>(
                         }
                     } else {
                         match bin_op.kind {
-                            BinaryOpKind::GeneralEq => general_eq_iter(ctx.static_context, &left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralNe => general_ne_iter(ctx.static_context, &left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralLt => general_lt_iter(ctx.static_context, &left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralLe => general_le_iter(ctx.static_context, &left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralGt => general_gt_iter(ctx.static_context, &left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralGe => general_ge_iter(ctx.static_context, &left_iter, &right_iter)?,
+                            BinaryOpKind::GeneralEq => {
+                                general_eq_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
+                            BinaryOpKind::GeneralNe => {
+                                general_ne_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
+                            BinaryOpKind::GeneralLt => {
+                                general_lt_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
+                            BinaryOpKind::GeneralLe => {
+                                general_le_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
+                            BinaryOpKind::GeneralGt => {
+                                general_gt_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
+                            BinaryOpKind::GeneralGe => {
+                                general_ge_iter(ctx.static_context, &left_iter, &right_iter)?
+                            }
                             _ => unreachable!(),
                         }
                     };
@@ -397,9 +426,7 @@ pub fn eval_node<N: DomNavigator>(
             ))
         }
 
-        AstNode::TypeExpr(type_expr) => {
-            eval_type_expr(arena, type_expr, ctx)
-        }
+        AstNode::TypeExpr(type_expr) => eval_type_expr(arena, type_expr, ctx),
     }
 }
 
@@ -526,12 +553,15 @@ fn eval_cast_as<N: DomNavigator>(
     ctx: &DynamicContext<'_, N>,
 ) -> Result<XPathValue<N>, XPathError> {
     // Cast only works with atomic types
-    let item_type = type_expr.target_type.item_type.as_ref().ok_or_else(|| {
-        XPathError::XPTY0004 {
-            expected: "atomic type".to_string(),
-            found: "empty-sequence()".to_string(),
-        }
-    })?;
+    let item_type =
+        type_expr
+            .target_type
+            .item_type
+            .as_ref()
+            .ok_or_else(|| XPathError::XPTY0004 {
+                expected: "atomic type".to_string(),
+                found: "empty-sequence()".to_string(),
+            })?;
 
     // The item type must be Atomic for cast
     if !matches!(item_type, ItemTypeNode::Atomic(_)) {
@@ -563,9 +593,10 @@ fn eval_cast_as<N: DomNavigator>(
         }
         Some(value) => {
             // Get target type code from resolved QName
-            let qname = type_expr.resolved_atomic_type.as_ref().ok_or_else(|| {
-                XPathError::Internal("Cast target type not resolved".to_string())
-            })?;
+            let qname = type_expr
+                .resolved_atomic_type
+                .as_ref()
+                .ok_or_else(|| XPathError::Internal("Cast target type not resolved".to_string()))?;
             let target_type = resolved_type_to_type_code(qname, ctx.static_context.names)?;
 
             // QName/NOTATION require namespace resolution from static context
@@ -992,8 +1023,7 @@ fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<Node
                     } else {
                         ctx.resolve_prefix(prefix).map(|s| ctx.names.add(&s))
                     };
-                    let qname =
-                        crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None);
+                    let qname = crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None);
                     Some(NodeTest::Name(RuntimeNameTest::QName(qname)))
                 }
             }
@@ -1041,9 +1071,7 @@ fn kind_test_to_item_type(kind: &KindTest) -> ItemType {
         KindTest::AnyKind => ItemType::AnyNode,
         KindTest::Text => ItemType::Text,
         KindTest::Comment => ItemType::Comment,
-        KindTest::ProcessingInstruction(target) => {
-            ItemType::ProcessingInstruction(target.clone())
-        }
+        KindTest::ProcessingInstruction(target) => ItemType::ProcessingInstruction(target.clone()),
         KindTest::Document(inner) => {
             let inner_type = inner.as_ref().map(|k| Box::new(kind_test_to_item_type(k)));
             ItemType::Document(inner_type)
@@ -1143,7 +1171,9 @@ fn apply_axis_iterator<N: DomNavigator>(
 }
 
 /// Collect iterator results into a Vec.
-fn collect_iterator<I: XmlNodeIterator>(iter: &mut I) -> Result<Vec<XmlItem<I::Navigator>>, XPathError> {
+fn collect_iterator<I: XmlNodeIterator>(
+    iter: &mut I,
+) -> Result<Vec<XmlItem<I::Navigator>>, XPathError> {
     let mut results = Vec::new();
     while iter.move_next()? {
         if let Some(item_ref) = iter.current() {
@@ -1354,14 +1384,9 @@ fn eval_for_bindings<N: DomNavigator, B>(
         ctx.set_variable(slot, XPathValue::from_item(item));
 
         // Recursively process remaining bindings
-        if let cf @ ControlFlow::Break(_) = eval_for_bindings(
-            arena,
-            bindings,
-            binding_index + 1,
-            body_id,
-            ctx,
-            collector,
-        ) {
+        if let cf @ ControlFlow::Break(_) =
+            eval_for_bindings(arena, bindings, binding_index + 1, body_id, ctx, collector)
+        {
             return cf;
         }
     }
@@ -1459,7 +1484,10 @@ fn eval_quantified_expression<N: DomNavigator>(
 }
 
 /// Evaluate a ValueNode to an XPathValue.
-fn eval_value<N: DomNavigator>(value: &ValueNode, mode: XPathMode) -> Result<XPathValue<N>, XPathError> {
+fn eval_value<N: DomNavigator>(
+    value: &ValueNode,
+    mode: XPathMode,
+) -> Result<XPathValue<N>, XPathError> {
     match value {
         ValueNode::Empty => Ok(XPathValue::empty()),
 
@@ -1469,11 +1497,9 @@ fn eval_value<N: DomNavigator>(value: &ValueNode, mode: XPathMode) -> Result<XPa
 
         ValueNode::Integer(s) => {
             // Parse integer string to BigInt
-            let i: num_bigint::BigInt = s.parse().map_err(|_| {
-                XPathError::FORG0001 {
-                    value: s.clone(),
-                    target_type: "xs:integer".to_string(),
-                }
+            let i: num_bigint::BigInt = s.parse().map_err(|_| XPathError::FORG0001 {
+                value: s.clone(),
+                target_type: "xs:integer".to_string(),
             })?;
             Ok(XPathValue::integer(i))
         }
@@ -1484,11 +1510,9 @@ fn eval_value<N: DomNavigator>(value: &ValueNode, mode: XPathMode) -> Result<XPa
                 let d: f64 = s.parse().unwrap_or(f64::NAN);
                 Ok(XPathValue::double(d))
             } else {
-                let d: rust_decimal::Decimal = s.parse().map_err(|_| {
-                    XPathError::FORG0001 {
-                        value: s.clone(),
-                        target_type: "xs:decimal".to_string(),
-                    }
+                let d: rust_decimal::Decimal = s.parse().map_err(|_| XPathError::FORG0001 {
+                    value: s.clone(),
+                    target_type: "xs:decimal".to_string(),
                 })?;
                 Ok(XPathValue::decimal(d))
             }
@@ -1499,9 +1523,7 @@ fn eval_value<N: DomNavigator>(value: &ValueNode, mode: XPathMode) -> Result<XPa
             Ok(XPathValue::double(d))
         }
 
-        ValueNode::Typed(xml_value) => {
-            Ok(XPathValue::from_atomic(xml_value.clone()))
-        }
+        ValueNode::Typed(xml_value) => Ok(XPathValue::from_atomic(xml_value.clone())),
     }
 }
 

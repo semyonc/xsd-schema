@@ -547,7 +547,8 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for DescendantNodeIterator<'a, I> {
     }
 
     fn sequential_position(&self) -> Option<usize> {
-        self.current_position().map(|_| self.base.sequential_position)
+        self.current_position()
+            .map(|_| self.base.sequential_position)
     }
 
     fn reset_sequential_position(&mut self) {
@@ -666,7 +667,8 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for SpecialDescendantNodeIterator<'
     }
 
     fn sequential_position(&self) -> Option<usize> {
-        self.current_position().map(|_| self.base.sequential_position)
+        self.current_position()
+            .map(|_| self.base.sequential_position)
     }
 
     fn reset_sequential_position(&mut self) {
@@ -776,10 +778,7 @@ impl<'a, I: XmlNodeIterator> ChildOverDescendantsNodeIterator<'a, I> {
 
             let mut nav = curr.clone();
             let mut matched = true;
-            for test in self.node_tests[..self.node_tests.len() - 1]
-                .iter()
-                .rev()
-            {
+            for test in self.node_tests[..self.node_tests.len() - 1].iter().rev() {
                 if !(nav.move_to_parent() && self.test_item(&nav, test)) {
                     matched = false;
                     break;
@@ -848,10 +847,9 @@ impl<'a, I: XmlNodeIterator> FollowingNodeIterator<'a, I> {
 
     fn next_item(&mut self) -> Result<bool, XPathError> {
         loop {
-            if !self.base.accept
-                && !self.base.move_next_iter()? {
-                    return Ok(false);
-                }
+            if !self.base.accept && !self.base.move_next_iter()? {
+                return Ok(false);
+            }
 
             let moved = match self.base.curr.as_mut() {
                 Some(nav) => nav.move_to_following(self.kind, None),
@@ -897,7 +895,8 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for FollowingNodeIterator<'a, I> {
     }
 
     fn sequential_position(&self) -> Option<usize> {
-        self.current_position().map(|_| self.base.sequential_position)
+        self.current_position()
+            .map(|_| self.base.sequential_position)
     }
 
     fn reset_sequential_position(&mut self) {
@@ -961,7 +960,13 @@ impl<'a, I: XmlNodeIterator> PrecedingNodeIterator<'a, I> {
                 self.anchor = Some(anchor.clone());
                 self.collect_ancestors(&anchor);
                 if let Some(curr) = self.base.curr.as_mut() {
-                    curr.move_to_root();
+                    // `move_to_visible_root` lands on the document root in
+                    // ordinary scope, and on the asserter element when the
+                    // navigator is in XSD 1.1 assertion scope. Using it here
+                    // keeps the forward walk inside the visible subtree
+                    // instead of being blocked by the synthetic-root child
+                    // gate that makes `//x` return empty under assertions.
+                    curr.move_to_visible_root();
                 }
                 self.started = false;
             }
@@ -1035,7 +1040,8 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for PrecedingNodeIterator<'a, I> {
     }
 
     fn sequential_position(&self) -> Option<usize> {
-        self.current_position().map(|_| self.base.sequential_position)
+        self.current_position()
+            .map(|_| self.base.sequential_position)
     }
 
     fn reset_sequential_position(&mut self) {
@@ -1048,9 +1054,9 @@ mod tests {
     use super::*;
 
     use crate::namespace::table::NameTable;
+    use crate::navigator::RoXmlNavigator;
     use crate::types::{ItemType, NameTest, SequenceType};
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-    use crate::navigator::RoXmlNavigator;
 
     fn collect_local_names<N: DomNavigator>(
         iter: &mut impl XmlNodeIterator<Navigator = N>,
@@ -1257,20 +1263,16 @@ mod tests {
 
     #[test]
     fn test_descendant_axis() {
-        let doc = roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>")
-            .expect("parse xml");
+        let doc =
+            roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child(); // root
 
         let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
-        let mut iter = DescendantNodeIterator::new(
-            ctx,
-            Some(NodeTest::Name(NameTest::Wildcard)),
-            false,
-            base,
-        );
+        let mut iter =
+            DescendantNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), false, base);
 
         let names = collect_local_names(&mut iter);
         assert_eq!(
@@ -1293,12 +1295,8 @@ mod tests {
         let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
-        let mut iter = DescendantNodeIterator::new(
-            ctx,
-            Some(NodeTest::Name(NameTest::Wildcard)),
-            true,
-            base,
-        );
+        let mut iter =
+            DescendantNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), true, base);
 
         let names = collect_local_names(&mut iter);
         assert_eq!(names, vec!["root".to_string(), "a".to_string()]);
@@ -1306,8 +1304,8 @@ mod tests {
 
     #[test]
     fn test_following_axis() {
-        let doc = roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>")
-            .expect("parse xml");
+        let doc =
+            roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1325,8 +1323,8 @@ mod tests {
 
     #[test]
     fn test_preceding_axis() {
-        let doc = roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>")
-            .expect("parse xml");
+        let doc =
+            roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child(); // root
         nav.move_to_first_child(); // a
@@ -1366,8 +1364,7 @@ mod tests {
 
     #[test]
     fn test_special_descendant_axis() {
-        let doc = roxmltree::Document::parse("<root>text<a><b/></a></root>")
-            .expect("parse xml");
+        let doc = roxmltree::Document::parse("<root>text<a><b/></a></root>").expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child(); // root
 
@@ -1387,10 +1384,8 @@ mod tests {
 
     #[test]
     fn test_child_over_descendants() {
-        let doc = roxmltree::Document::parse(
-            "<root><a><b><c/></b></a><x><b><c/></b></x></root>",
-        )
-        .expect("parse xml");
+        let doc = roxmltree::Document::parse("<root><a><b><c/></b></a><x><b><c/></b></x></root>")
+            .expect("parse xml");
         let mut nav = RoXmlNavigator::new(&doc);
         nav.move_to_first_child(); // root
 

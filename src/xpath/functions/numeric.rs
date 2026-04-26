@@ -75,38 +75,30 @@ pub fn abs<N: DomNavigator>(
 fn numeric_abs(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double => {
-            let d = value.as_double().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_double().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:double".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::double(d.abs()))
         }
         XmlTypeCode::Float => {
-            let f = get_float(value).ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:float".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:float".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::float(f.abs()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:decimal".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:decimal".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::decimal(d.abs()))
         }
         _ if is_integer_type(value.type_code) => {
-            let i = value.as_integer().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:integer".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let i = value.as_integer().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:integer".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             // For BigInt, we need to handle negative numbers
             let abs_val = if *i < BigInt::from(0) {
@@ -135,7 +127,11 @@ pub fn ceiling<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("ceiling", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "ceiling",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -151,29 +147,23 @@ pub fn ceiling<N: DomNavigator>(
 fn numeric_ceiling(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double => {
-            let d = value.as_double().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_double().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:double".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::double(d.ceil()))
         }
         XmlTypeCode::Float => {
-            let f = get_float(value).ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:float".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:float".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::float(f.ceil()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:decimal".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:decimal".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             // Decimal doesn't have ceil(), use manual calculation
             let truncated = d.trunc();
@@ -207,7 +197,11 @@ pub fn floor<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("floor", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "floor",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -223,29 +217,23 @@ pub fn floor<N: DomNavigator>(
 fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double => {
-            let d = value.as_double().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_double().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:double".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::double(d.floor()))
         }
         XmlTypeCode::Float => {
-            let f = get_float(value).ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:float".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:float".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::float(f.floor()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:decimal".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:decimal".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             // Decimal doesn't have floor(), use manual calculation
             let truncated = d.trunc();
@@ -280,7 +268,11 @@ pub fn round<N: DomNavigator>(
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() != 1 {
-        return Err(XPathError::wrong_number_of_arguments("round", 1, args.len()));
+        return Err(XPathError::wrong_number_of_arguments(
+            "round",
+            1,
+            args.len(),
+        ));
     }
 
     let arg = args.remove(0);
@@ -296,30 +288,24 @@ pub fn round<N: DomNavigator>(
 fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double => {
-            let d = value.as_double().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_double().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:double".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             // XPath round() rounds half away from zero
             Ok(XmlValue::double(round_half_away_from_zero_f64(d)))
         }
         XmlTypeCode::Float => {
-            let f = get_float(value).ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:float".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:float".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::float(round_half_away_from_zero_f32(f)))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:decimal".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:decimal".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::decimal(round_half_away_from_zero_decimal(d)))
         }
@@ -430,29 +416,23 @@ pub fn round_half_to_even<N: DomNavigator>(
 fn numeric_round_half_to_even(value: &XmlValue, precision: i32) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double => {
-            let d = value.as_double().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:double".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_double().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:double".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::double(round_half_to_even_f64(d, precision)))
         }
         XmlTypeCode::Float => {
-            let f = get_float(value).ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:float".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:float".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::float(round_half_to_even_f32(f, precision)))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:decimal".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:decimal".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
             Ok(XmlValue::decimal(round_half_to_even_decimal(d, precision)?))
         }
@@ -463,11 +443,9 @@ fn numeric_round_half_to_even(value: &XmlValue, precision: i32) -> Result<XmlVal
             }
 
             // For negative precision, round to powers of 10
-            let i = value.as_integer().ok_or_else(|| {
-                XPathError::XPTY0004 {
-                    expected: "xs:integer".to_string(),
-                    found: format!("{:?}", value.type_code),
-                }
+            let i = value.as_integer().ok_or_else(|| XPathError::XPTY0004 {
+                expected: "xs:integer".to_string(),
+                found: format!("{:?}", value.type_code),
             })?;
 
             let result = round_half_to_even_integer(i, precision);
@@ -561,10 +539,14 @@ fn round_half_to_even_decimal(d: Decimal, precision: i32) -> Result<Decimal, XPa
 
         // Divide, round, multiply
         let scaled = d / scale;
-        let rounded = scaled.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven);
+        let rounded =
+            scaled.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven);
         Ok(rounded * scale)
     } else {
-        Ok(d.round_dp_with_strategy(precision as u32, rust_decimal::RoundingStrategy::MidpointNearestEven))
+        Ok(d.round_dp_with_strategy(
+            precision as u32,
+            rust_decimal::RoundingStrategy::MidpointNearestEven,
+        ))
     }
 }
 
@@ -613,8 +595,8 @@ fn round_half_to_even_integer(i: &BigInt, precision: i32) -> BigInt {
 mod tests {
     use super::*;
     use crate::namespace::table::NameTable;
-    use crate::xpath::RoXmlNavigator;
     use crate::xpath::context::XPathContext;
+    use crate::xpath::RoXmlNavigator;
 
     fn make_context<'a>() -> DynamicContext<'a, RoXmlNavigator<'a>> {
         let table = Box::leak(Box::new(NameTable::new()));

@@ -240,10 +240,7 @@ mod tests {
             "cvc-minLength-valid"
         );
         assert_eq!(
-            facet_constraint_code(&FacetError::MaxLengthViolation {
-                actual: 10,
-                max: 5
-            }),
+            facet_constraint_code(&FacetError::MaxLengthViolation { actual: 10, max: 5 }),
             "cvc-maxLength-valid"
         );
         assert_eq!(
@@ -386,7 +383,11 @@ mod tests {
 
     #[test]
     fn test_with_location() {
-        let loc = SourceLocation { base_uri: "test.xsd".to_string(), line: 10, column: 5 };
+        let loc = SourceLocation {
+            base_uri: "test.xsd".to_string(),
+            line: 10,
+            column: 5,
+        };
         let err = error("cvc-elt", "test", None).with_location(loc.clone());
         assert_eq!(err.location, Some(loc));
     }
@@ -399,7 +400,11 @@ mod tests {
 
     #[test]
     fn test_builder_chaining() {
-        let loc = SourceLocation { base_uri: "test.xsd".to_string(), line: 3, column: 1 };
+        let loc = SourceLocation {
+            base_uri: "test.xsd".to_string(),
+            line: 3,
+            column: 1,
+        };
         let err = error("cvc-type", "Type mismatch", None)
             .with_location(loc)
             .with_path("/root/elem[2]");

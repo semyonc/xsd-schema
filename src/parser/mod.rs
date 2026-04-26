@@ -13,26 +13,25 @@
 //! - `structure` - Structural validation rules
 //! - `resolver` - Schema resolution (include/import/redefine)
 
-pub mod location;
-pub mod reader;
+pub mod assemble;
 pub mod attrs;
 pub mod frames;
+pub mod location;
 pub mod parse;
-pub mod structure;
+pub mod reader;
 pub mod resolver;
-pub mod assemble;
+pub mod structure;
 
 // Re-exports from location
-pub use location::{SourceLocation, SourceMap, SourceRef, SourceSpan, SourceRetention};
+pub use location::{SourceLocation, SourceMap, SourceRef, SourceRetention, SourceSpan};
 
 // Re-exports from reader
-pub use reader::{TrackedReader, TrackedEvent, ReaderConfig, split_qname};
+pub use reader::{split_qname, ReaderConfig, TrackedEvent, TrackedReader};
 
 // Re-exports from attrs
 pub use attrs::{
-    ParsedAttribute, AttributeMap,
-    parse_attributes, categorize_attributes,
-    parse_boolean, parse_occurs, parse_use, parse_process_contents, parse_form,
+    categorize_attributes, parse_attributes, parse_boolean, parse_form, parse_occurs,
+    parse_process_contents, parse_use, AttributeMap, ParsedAttribute,
 };
 
 // Re-exports from parse
@@ -48,22 +47,27 @@ pub use assemble::{assemble_schema, parse_form_choice};
 
 // Re-exports from structure
 pub use structure::{
-    ValidationContext,
-    validate_element_structure, validate_attribute_structure,
-    validate_simple_type_structure, validate_complex_type_structure,
-    validate_restriction_structure, validate_extension_structure,
-    validate_list_structure, validate_union_structure,
-    validate_key_unique_structure, validate_keyref_structure,
-    validate_group_structure, validate_attribute_group_structure,
-    validate_xsd_version_element, validate_xsd_version_attribute,
-    validate_notation_structure,
-    validate_include_structure, validate_import_structure, validate_redefine_structure,
+    validate_attribute_group_structure, validate_attribute_structure,
+    validate_complex_type_structure, validate_element_structure, validate_extension_structure,
+    validate_group_structure, validate_import_structure, validate_include_structure,
+    validate_key_unique_structure, validate_keyref_structure, validate_list_structure,
+    validate_notation_structure, validate_redefine_structure, validate_restriction_structure,
+    validate_simple_type_structure, validate_union_structure, validate_xsd_version_attribute,
+    validate_xsd_version_element, ValidationContext,
 };
 
 // Re-exports from resolver
 pub use resolver::{
-    SchemaResolver, ResolverConfig, SchemaCatalog, CatalogEntry,
-    ResolutionResult, resolve_all_directives, fixup_composition_edges,
+    fixup_composition_edges,
+    resolve_all_directives,
+    CatalogEntry,
+    EmbeddedLoader,
+    FileSystemLoader,
+    LoaderChain,
+    ResolutionResult,
+    ResolverConfig,
+    SchemaCatalog,
     // Loader trait and implementations
-    SchemaLoader, FileSystemLoader, EmbeddedLoader, LoaderChain,
+    SchemaLoader,
+    SchemaResolver,
 };

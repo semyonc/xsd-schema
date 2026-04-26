@@ -63,15 +63,16 @@ fn test_book_price_filter() {
 #[test]
 fn test_flwor_item_concat() {
     let xml_path = get_examples_dir().join("purchaseOrder.xml");
-    let xml_content =
-        fs::read_to_string(&xml_path).expect("Failed to read purchaseOrder.xml");
+    let xml_content = fs::read_to_string(&xml_path).expect("Failed to read purchaseOrder.xml");
 
     let names = NameTable::new();
     let ctx = XPathContext::new(&names);
 
-    let expr =
-        XPathExpr::compile("for $x in //item return concat($x/@partNum, '-', $x/productName)", &ctx)
-            .expect("Failed to compile XPath expression");
+    let expr = XPathExpr::compile(
+        "for $x in //item return concat($x/@partNum, '-', $x/productName)",
+        &ctx,
+    )
+    .expect("Failed to compile XPath expression");
 
     let doc = roxmltree::Document::parse(&xml_content).expect("Failed to parse XML");
     let nav = RoXmlNavigator::new(&doc);
@@ -109,8 +110,7 @@ fn test_positional_predicate() {
     let names = NameTable::new();
     let ctx = XPathContext::new(&names);
 
-    let expr =
-        XPathExpr::compile("//title[1]", &ctx).expect("Failed to compile XPath expression");
+    let expr = XPathExpr::compile("//title[1]", &ctx).expect("Failed to compile XPath expression");
 
     let doc = roxmltree::Document::parse(&xml_content).expect("Failed to parse XML");
     let nav = RoXmlNavigator::new(&doc);

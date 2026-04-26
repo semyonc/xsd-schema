@@ -2,7 +2,7 @@
 //!
 //! This module defines XSD element and attribute declarations.
 
-use crate::ids::{NameId, ElementKey, TypeKey, SimpleTypeKey, IdentityConstraintKey};
+use crate::ids::{ElementKey, IdentityConstraintKey, NameId, SimpleTypeKey, TypeKey};
 use crate::parser::location::SourceRef;
 use crate::schema::model::DerivationSet;
 
