@@ -288,7 +288,7 @@ impl BuiltinTypes {
                 base_type: None,
                 item_type: None,
                 member_types: Vec::new(),
-                facets: crate::types::facets::FacetSet::new(),
+                facets: crate::types::simple::effective_arena_facets_for_builtin(builtin),
                 final_derivation: crate::schema::model::DerivationSet::empty(),
                 id: None,
                 derivation_id: None,

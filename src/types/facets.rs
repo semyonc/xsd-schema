@@ -565,6 +565,22 @@ impl FacetSet {
     /// Returns a new FacetSet combining base and derived facets, or an error
     /// if the derivation rules are violated.
     pub fn merge_with_base(&self, base: &FacetSet) -> FacetResult<FacetSet> {
+        // XSD Datatypes Part 2 §4.3.1.4 / §4.3.2.4 / §4.3.3.4 same-step rule:
+        // It is an error for both `length` and `minLength` (or `length` and
+        // `maxLength`) to be members of {facets} in the same derivation step.
+        // `self` represents this step's locally declared facets before the
+        // base merge, so this is the correct moment to detect the conflict.
+        if self.length.is_some() && self.min_length.is_some() {
+            return Err(FacetError::conflicting(
+                "length and minLength cannot both appear in the same restriction step",
+            ));
+        }
+        if self.length.is_some() && self.max_length.is_some() {
+            return Err(FacetError::conflicting(
+                "length and maxLength cannot both appear in the same restriction step",
+            ));
+        }
+
         let mut result = self.clone();
 
         // === Length facets ===

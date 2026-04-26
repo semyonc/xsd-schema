@@ -137,13 +137,46 @@ fn validate_simple_type(
         SimpleTypeVariety::List => {
             stats.list_types_validated += 1;
             validate_simple_list(schema_set, type_def)?;
+            validate_facets_against_resolved_base(schema_set, type_def)?;
         }
         SimpleTypeVariety::Union => {
             stats.union_types_validated += 1;
             validate_simple_union(schema_set, type_def)?;
+            validate_facets_against_resolved_base(schema_set, type_def)?;
         }
     }
 
+    Ok(())
+}
+
+/// Run `FacetSet::merge_with_base` against the resolved base of a list or
+/// union simple type, then validate that local facet values fall in the
+/// base type's value space. Atomic types perform both checks inline in
+/// `validate_simple_restriction`; list (length/minLength/maxLength/whiteSpace)
+/// and union (pattern/enumeration/assertions) varieties share the same
+/// {facets} derivation semantics for the facets they are allowed to carry,
+/// so the merge must run for them too.
+fn validate_facets_against_resolved_base(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::SimpleTypeDefData,
+) -> SchemaResult<()> {
+    let Some(base_key) = type_def.resolved_base_type else {
+        return Ok(());
+    };
+    if let Some(base_facets) = get_type_facets(schema_set, base_key)? {
+        type_def
+            .facets
+            .merge_with_base(&base_facets)
+            .map_err(|e| {
+                let (location, type_name) = type_error_context(schema_set, type_def);
+                SchemaError::structural(
+                    "cos-st-restricts",
+                    format!("Simple type '{}' has invalid restriction: {}", type_name, e),
+                    location,
+                )
+            })?;
+    }
+    validate_facet_values_against_base_type(schema_set, type_def, base_key)?;
     Ok(())
 }
 
@@ -4105,14 +4138,30 @@ fn validate_facet_values_against_base_type(
     type_def: &crate::arenas::SimpleTypeDefData,
     base_key: TypeKey,
 ) -> SchemaResult<()> {
-    // Skip NOTATION/QName base types: validate_simple_type blocks bare xs:NOTATION
-    // at instance-validation time ("cannot be used directly"), and both types need
-    // namespace-declaration context unavailable during schema compilation.
+    let (location, type_name) = type_error_context(schema_set, type_def);
+
+    // QName/NOTATION need a runtime namespace context for full value-space
+    // validation, so most lexical checks are deferred. We *can* still reject
+    // the always-invalid empty literal in enumeration / bound facets — an
+    // empty string is not a valid QName or NOTATION lexically (xsd:QName ≡
+    // Prefix? ':'? LocalPart, where LocalPart is an NCName, never empty).
     if is_notation_or_qname_base(schema_set, base_key) {
+        if let Some(ref enum_facet) = type_def.facets.enumeration {
+            for value in &enum_facet.values {
+                if value.trim().is_empty() {
+                    return Err(SchemaError::structural(
+                        "enumeration-valid-restriction",
+                        format!(
+                            "Enumeration value '' in type '{}' is not in the value space of the base type",
+                            type_name
+                        ),
+                        location.clone(),
+                    ));
+                }
+            }
+        }
         return Ok(());
     }
-
-    let (location, type_name) = type_error_context(schema_set, type_def);
 
     // Validate enumeration values.
     // Walk past any base with its own enumeration to avoid string-equality comparison

@@ -648,21 +648,81 @@ impl SimpleTypeDef {
     }
 }
 
-/// Default facets for built-in types
+/// Default facets for built-in types — delegates to
+/// [`effective_arena_facets_for_builtin`] to keep the parser-frame
+/// `SimpleTypeDef` and the arena `SimpleTypeDefData` paths in sync.
 pub fn default_facets_for_builtin(builtin: BuiltInType) -> FacetSet {
+    effective_arena_facets_for_builtin(builtin)
+}
+
+/// Effective {facets} for a built-in type after walking the entire derivation
+/// chain, per XSD Datatypes Part 2. Bakes whiteSpace, integer-hierarchy
+/// fractionDigits=0, bounded-integer min/maxInclusive, and list minLength=1
+/// into the arena's `SimpleTypeDefData.facets` so user-derived types see
+/// the proper inherited facets through `merge_with_base`. The runtime
+/// equivalent for user-derived types is `validation::simple::collect_facets`.
+pub fn effective_arena_facets_for_builtin(builtin: BuiltInType) -> FacetSet {
     use super::facets::{FacetFixed, WhitespaceMode};
 
     let mut facets = FacetSet::new();
 
-    // All built-in types have whitespace handling
-    let ws_mode = match builtin {
-        BuiltInType::String => WhitespaceMode::Preserve,
-        BuiltInType::NormalizedString => WhitespaceMode::Replace,
-        _ => WhitespaceMode::Collapse,
-    };
-    facets.set_whitespace(ws_mode, FacetFixed::Fixed, None);
+    // String/NormalizedString leave whiteSpace unfixed so descendants can
+    // tighten preserve→replace→collapse; AnySimpleType/AnyAtomicType/XsError
+    // omit it entirely (cos-applicable-facets rejects whiteSpace on unions).
+    match builtin {
+        BuiltInType::String => {
+            facets.set_whitespace(WhitespaceMode::Preserve, FacetFixed::Default, None);
+        }
+        BuiltInType::NormalizedString => {
+            facets.set_whitespace(WhitespaceMode::Replace, FacetFixed::Default, None);
+        }
+        BuiltInType::AnySimpleType | BuiltInType::AnyAtomicType | BuiltInType::XsError => {}
+        _ => {
+            facets.set_whitespace(WhitespaceMode::Collapse, FacetFixed::Fixed, None);
+        }
+    }
+
+    if let Some((lo, hi)) = integer_hierarchy_bounds(builtin) {
+        facets.set_fraction_digits(0, FacetFixed::Fixed, None);
+        if let Some(v) = lo {
+            facets.set_min_inclusive(v, FacetFixed::Default, None);
+        }
+        if let Some(v) = hi {
+            facets.set_max_inclusive(v, FacetFixed::Default, None);
+        }
+    }
+
+    if matches!(
+        builtin,
+        BuiltInType::IDREFS | BuiltInType::NMTOKENS | BuiltInType::ENTITIES
+    ) {
+        facets.set_min_length(1, FacetFixed::Default, None);
+    }
 
     facets
+}
+
+/// Returns `Some((minInclusive?, maxInclusive?))` if `builtin` is in the
+/// xs:integer derivation chain, `None` otherwise. Bounds derive from the
+/// std numeric constants so they cannot drift from the underlying type.
+fn integer_hierarchy_bounds(builtin: BuiltInType) -> Option<(Option<String>, Option<String>)> {
+    let bounds = match builtin {
+        BuiltInType::Integer => (None, None),
+        BuiltInType::NonPositiveInteger => (None, Some("0".to_string())),
+        BuiltInType::NegativeInteger => (None, Some("-1".to_string())),
+        BuiltInType::NonNegativeInteger => (Some("0".to_string()), None),
+        BuiltInType::PositiveInteger => (Some("1".to_string()), None),
+        BuiltInType::Long => (Some(i64::MIN.to_string()), Some(i64::MAX.to_string())),
+        BuiltInType::Int => (Some(i32::MIN.to_string()), Some(i32::MAX.to_string())),
+        BuiltInType::Short => (Some(i16::MIN.to_string()), Some(i16::MAX.to_string())),
+        BuiltInType::Byte => (Some(i8::MIN.to_string()), Some(i8::MAX.to_string())),
+        BuiltInType::UnsignedLong => (Some("0".to_string()), Some(u64::MAX.to_string())),
+        BuiltInType::UnsignedInt => (Some("0".to_string()), Some(u32::MAX.to_string())),
+        BuiltInType::UnsignedShort => (Some("0".to_string()), Some(u16::MAX.to_string())),
+        BuiltInType::UnsignedByte => (Some("0".to_string()), Some(u8::MAX.to_string())),
+        _ => return None,
+    };
+    Some(bounds)
 }
 
 #[cfg(test)]
