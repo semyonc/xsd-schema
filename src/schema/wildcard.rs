@@ -266,10 +266,11 @@ mod tests {
 
         assert!(!constraint.allows(target, target, XsdVersion::V1_0)); // Same as target - not allowed
         assert!(constraint.allows(Some(NameId(2)), target, XsdVersion::V1_0)); // Different - allowed
-        // XSD 1.0: absent namespace is NOT allowed by ##other
+        // XSD 1.0 and 1.1: absent namespace is NOT allowed by ##other
+        // (§3.10.4: when the schema has a target namespace, ##other excludes
+        // both the target ns and the absent ns).
         assert!(!constraint.allows(None, target, XsdVersion::V1_0));
-        // XSD 1.1: absent namespace IS allowed by ##other
-        assert!(constraint.allows(None, target, XsdVersion::V1_1));
+        assert!(!constraint.allows(None, target, XsdVersion::V1_1));
     }
 
     #[test]

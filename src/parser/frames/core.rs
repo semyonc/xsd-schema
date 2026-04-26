@@ -772,6 +772,15 @@ pub trait Frame {
         false
     }
 
+    /// Returns true if children of this frame are inside a `<complexType>` ancestor
+    /// for purposes of src-element §3.3.3 / src-attribute §3.2.3 — i.e. the local
+    /// declaration's `targetNamespace` may diverge from the schema's only when there
+    /// is a complexType ancestor (and inside it, a restriction of a non-anyType base).
+    /// True for the complexType frame and the descendants that propagate the flag.
+    fn children_inside_complex_type(&self) -> bool {
+        false
+    }
+
     /// Returns true if this frame already has an annotation child.
     /// Used to reject duplicate annotations per XSD content model.
     fn has_annotation(&self) -> bool {

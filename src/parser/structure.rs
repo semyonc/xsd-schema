@@ -49,6 +49,10 @@ pub struct ValidationContext {
     pub xsd_version: XsdVersion,
     /// Whether this is a top-level (global) declaration
     pub is_top_level: bool,
+    /// Whether this declaration has a `<complexType>` lexical ancestor.
+    /// Per src-element §3.3.3 / src-attribute §3.2.3, a local declaration
+    /// may carry `targetNamespace` only when it has a complexType ancestor.
+    pub inside_complex_type: bool,
     /// Source reference for error reporting
     pub source: Option<SourceRef>,
 }
@@ -58,6 +62,7 @@ impl Default for ValidationContext {
         Self {
             xsd_version: XsdVersion::V1_0,
             is_top_level: false,
+            inside_complex_type: false,
             source: None,
         }
     }
@@ -69,6 +74,7 @@ impl ValidationContext {
         Self {
             xsd_version,
             is_top_level,
+            inside_complex_type: false,
             source: None,
         }
     }
@@ -130,8 +136,10 @@ pub fn validate_element_structure(
             ));
         }
 
-        // Prohibited attributes for top-level
-        for prohibited in &["minOccurs", "maxOccurs", "form"] {
+        // Prohibited attributes for top-level. `targetNamespace` is only
+        // allowed on local declarations inside a `<complexType>` ancestor
+        // (src-element §3.3.3 clause 4).
+        for prohibited in &["minOccurs", "maxOccurs", "form", "targetNamespace"] {
             if attrs.get_value_by_name(name_table, prohibited).is_some() {
                 return Err(SchemaError::structural(
                     "src-element",
@@ -161,10 +169,13 @@ pub fn validate_element_structure(
             ));
         }
 
-        // If ref is present, certain attributes are prohibited
+        // If ref is present, certain attributes are prohibited.
+        // `targetNamespace` is forbidden on element refs because the
+        // referenced declaration already determines the namespace.
         if has_ref {
             let ref_prohibited = [
                 "type", "default", "fixed", "nillable", "block", "final", "form",
+                "targetNamespace",
             ];
             for prohibited in &ref_prohibited {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
@@ -190,6 +201,30 @@ pub fn validate_element_structure(
                         "Local element declaration cannot have '{}' attribute",
                         prohibited
                     ),
+                    None,
+                ));
+            }
+        }
+
+        // src-element §3.3.3 clauses 3.2.2 / 4: `targetNamespace` may only
+        // appear on a local element when (a) `form` is absent and (b) there
+        // is a `<complexType>` lexical ancestor.
+        let has_target_ns = attrs.get_value_by_name(name_table, "targetNamespace").is_some();
+        if has_target_ns {
+            let has_form = attrs.get_value_by_name(name_table, "form").is_some();
+            if has_form {
+                return Err(SchemaError::structural(
+                    "src-element",
+                    "Local element with 'targetNamespace' cannot also have 'form' \
+                     (src-element §3.3.3 clause 3.2.2)",
+                    None,
+                ));
+            }
+            if !ctx.inside_complex_type {
+                return Err(SchemaError::structural(
+                    "src-element",
+                    "Local element with 'targetNamespace' must have a <complexType> \
+                     lexical ancestor (src-element §3.3.3 clause 4)",
                     None,
                 ));
             }
@@ -313,8 +348,10 @@ pub fn validate_attribute_structure(
             ));
         }
 
-        // Prohibited attributes for top-level
-        for prohibited in &["use", "form"] {
+        // Prohibited attributes for top-level. `targetNamespace` is only
+        // allowed on local declarations inside a `<complexType>` ancestor
+        // (src-attribute §3.2.3 clause 6).
+        for prohibited in &["use", "form", "targetNamespace"] {
             if attrs.get_value_by_name(name_table, prohibited).is_some() {
                 return Err(SchemaError::structural(
                     "src-attribute",
@@ -347,8 +384,10 @@ pub fn validate_attribute_structure(
         // src-attribute.3.2: If ref is present, <simpleType>, form and type must be absent.
         // Note: default and fixed ARE allowed on attribute references — they set the
         // attribute use's value constraint, overriding the referenced declaration's.
+        // `targetNamespace` is also forbidden on attribute refs because the referenced
+        // declaration determines the namespace.
         if has_ref {
-            for prohibited in &["type", "form"] {
+            for prohibited in &["type", "form", "targetNamespace"] {
                 if attrs.get_value_by_name(name_table, prohibited).is_some() {
                     return Err(SchemaError::structural(
                         "src-attribute",
@@ -359,6 +398,30 @@ pub fn validate_attribute_structure(
                         None,
                     ));
                 }
+            }
+        }
+
+        // src-attribute §3.2.3 clauses 6.2 / 6: `targetNamespace` may only
+        // appear on a local attribute when (a) `form` is absent and (b)
+        // there is a `<complexType>` lexical ancestor.
+        let has_target_ns = attrs.get_value_by_name(name_table, "targetNamespace").is_some();
+        if has_target_ns {
+            let has_form = attrs.get_value_by_name(name_table, "form").is_some();
+            if has_form {
+                return Err(SchemaError::structural(
+                    "src-attribute",
+                    "Local attribute with 'targetNamespace' cannot also have 'form' \
+                     (src-attribute §3.2.3 clause 6.2)",
+                    None,
+                ));
+            }
+            if !ctx.inside_complex_type {
+                return Err(SchemaError::structural(
+                    "src-attribute",
+                    "Local attribute with 'targetNamespace' must have a <complexType> \
+                     lexical ancestor (src-attribute §3.2.3 clause 6)",
+                    None,
+                ));
             }
         }
     }

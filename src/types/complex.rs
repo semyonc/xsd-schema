@@ -284,22 +284,20 @@ impl NamespaceConstraint {
     }
 }
 
-/// XSD-version-aware `##other` namespace predicate.
+/// `##other` namespace predicate (§3.10.4, XSD 1.0 and 1.1 alike).
 ///
-/// In XSD 1.0, `##other` excludes both the target namespace AND absent namespace.
-/// In XSD 1.1, `##other` excludes only the target namespace.
+/// `##other` excludes the target namespace and the absent namespace. When the
+/// schema has no target namespace, it still excludes absent — only non-absent
+/// namespaces match.
+///
+/// `_xsd_version` is retained in the signature for API stability; the rule is
+/// version-independent after the XSD 1.1 §3.10.4 alignment.
 pub fn other_matches_namespace(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
+    _xsd_version: XsdVersion,
 ) -> bool {
-    if element_namespace == target_namespace {
-        return false;
-    }
-    if element_namespace.is_none() && xsd_version == XsdVersion::V1_0 {
-        return false;
-    }
-    true
+    element_namespace.is_some() && element_namespace != target_namespace
 }
 
 /// Check whether a (namespace, name) pair is excluded by a notQName list.

@@ -204,9 +204,16 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             .last()
             .map(|f| f.children_are_top_level())
             .unwrap_or(false);
+        // Walk the frame stack to detect a `<complexType>` lexical ancestor.
+        // Stop walking when we hit a frame whose children are top-level
+        // (schema/redefine/override) — there's nothing more to look at.
+        let inside_complex_type = self.frame_stack.iter().rev().any(|f| {
+            f.children_inside_complex_type()
+        });
         ValidationContext {
             xsd_version: self.config.xsd_version,
             is_top_level,
+            inside_complex_type,
             source,
         }
     }

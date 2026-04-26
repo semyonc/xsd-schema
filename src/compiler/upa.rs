@@ -23,7 +23,10 @@ use crate::types::complex::{NamespaceConstraint, not_qnames_exclude, other_match
 
 use super::all_group::AllGroupModel;
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
-use super::substitution::{build_substitution_group_map, SubstitutionGroupMap};
+use super::substitution::{
+    build_substitution_group_map, build_substitution_group_map_with_abstract,
+    SubstitutionGroupMap,
+};
 
 /// Result type for internal UPA checking operations
 type UpaResult<T> = Result<T, Box<UpaError>>;
@@ -545,7 +548,14 @@ pub fn check_upa(
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
     let xsd_version = schema_set.xsd_version;
-    let substitution_sets = build_substitution_group_map(schema_set);
+    // Per XSD 1.1 (W3C Bugzilla 4337), abstract elements participate in the
+    // substitution group for cos-nonambig (UPA) purposes even though they
+    // can't appear in instances.
+    let substitution_sets = if schema_set.is_xsd11() {
+        build_substitution_group_map_with_abstract(schema_set)
+    } else {
+        build_substitution_group_map(schema_set)
+    };
 
     // Check from each state in the NFA
     for state in &nfa.states {
@@ -614,7 +624,11 @@ pub fn check_all_group_upa(
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
     let xsd_version = schema_set.xsd_version;
-    let substitution_sets = build_substitution_group_map(schema_set);
+    let substitution_sets = if schema_set.is_xsd11() {
+        build_substitution_group_map_with_abstract(schema_set)
+    } else {
+        build_substitution_group_map(schema_set)
+    };
 
     let mut elements: Vec<ReachableTerm> = Vec::new();
     let mut wildcards: Vec<ReachableTerm> = Vec::new();

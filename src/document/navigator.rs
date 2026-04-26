@@ -328,6 +328,102 @@ impl<'a> BufferDocNavigator<'a> {
         let idx = self.node().binding_index();
         self.doc.binding_remap.get(idx)
     }
+
+    /// Post-process a typed value for QName/Notation: resolve the lexical
+    /// form against the navigator's in-scope namespaces if the inner atomic
+    /// is still stored as a `String` (the simple-type validator has no
+    /// namespace context, so QName/Notation values come back lexically).
+    ///
+    /// Returns the value unchanged for any other type or shape.
+    fn resolve_qname_typed_value(
+        &self,
+        value: crate::types::value::XmlValue,
+    ) -> crate::types::value::XmlValue {
+        use crate::namespace::qname::QualifiedName;
+        use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+        use crate::types::XmlTypeCode;
+        use crate::xpath::functions::qname::parse_lexical_qname;
+
+        if !matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation) {
+            return value;
+        }
+        let lexical: &str = match &value.value {
+            XmlValueKind::Atomic(XmlAtomicValue::String(s)) => s.as_str(),
+            _ => return value,
+        };
+        let (prefix, local_name) = match parse_lexical_qname(lexical) {
+            Ok(parts) => parts,
+            Err(_) => return value,
+        };
+
+        let ns_id = match prefix.as_deref() {
+            Some(p) => match self.resolve_prefix_in_scope(Some(p)) {
+                Some(uri_id) => Some(uri_id),
+                None => return value,
+            },
+            None => self.resolve_prefix_in_scope(None),
+        };
+
+        let names = self.doc.names;
+        let local_id = names.add(&local_name);
+        let prefix_id = prefix.as_deref().map(|p| names.add(p));
+        let qn = QualifiedName::new(ns_id, local_id, prefix_id);
+
+        let mut new_value = XmlValue::new(
+            value.type_code,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)),
+        );
+        new_value.schema_type = value.schema_type;
+        new_value
+    }
+
+    /// Resolve a prefix to its in-scope namespace URI's `NameId`.
+    ///
+    /// Walks from the owning element (or current element if not on a virtual
+    /// node) up the ancestor chain. Returns `None` if the prefix is
+    /// undeclared or bound to an empty URI (XML 1.1 namespace undeclaration).
+    /// `prefix.is_none()` requests the default namespace; `Some("")` is
+    /// equivalent. The implicit `xml` prefix always resolves.
+    fn resolve_prefix_in_scope(&self, prefix: Option<&str>) -> Option<NameId> {
+        let target_prefix = prefix.unwrap_or("");
+        let names = self.doc.names;
+
+        if target_prefix == "xml" {
+            return Some(names.add("http://www.w3.org/XML/1998/namespace"));
+        }
+
+        let start = if self.virtual_parent != NULL {
+            self.virtual_parent
+        } else {
+            self.current
+        };
+
+        let mut cursor = start;
+        loop {
+            let node = self.doc.nodes.get(cursor);
+            if node.node_type() == NodeType::Element && node.has_flag(Node::HAS_NMSP_DECLS) {
+                if let Some(&head) = self.doc.element_namespaces.get(&cursor) {
+                    let mut ns_ref = head;
+                    while !ns_ref.is_null() {
+                        let ns_node = self.doc.namespace_pages.get(ns_ref);
+                        if names.resolve_ref(ns_node.prefix) == target_prefix {
+                            if names.resolve_ref(ns_node.namespace_uri).is_empty() {
+                                return None;
+                            }
+                            return Some(ns_node.namespace_uri);
+                        }
+                        ns_ref = ns_node.next;
+                    }
+                }
+            }
+            if node.parent == NULL {
+                break;
+            }
+            cursor = node.parent;
+        }
+
+        None
+    }
 }
 
 // ── DomNavigator impl ─────────────────────────────────────────────────
@@ -723,7 +819,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         };
 
         match validate_simple_type(&effective_value, binding.type_key, schema_set) {
-            Ok(r) => TypedValue::Value(r.typed_value),
+            Ok(r) => TypedValue::Value(self.resolve_qname_typed_value(r.typed_value)),
             Err(_) => TypedValue::Untyped,
         }
     }

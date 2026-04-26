@@ -303,25 +303,7 @@ pub fn load_and_process_schema(
     if config.assemble_inline_types && config.resolve_references {
         allocate_content_particle_elements(schema_set)?;
         allocate_model_group_particle_elements(schema_set)?;
-        // XSD 1.1: assemble inline alternative types attached to local
-        // elements (which only acquired their ElementKey in the pass
-        // above), then re-run reference resolution and content-particle
-        // allocation so the new types get their base/particle resolved.
-        #[cfg(feature = "xsd11")]
-        {
-            let new_alt_types =
-                crate::schema::inline::resolve_local_element_alternatives(schema_set)?;
-            if !new_alt_types.is_empty() {
-                resolve_all_references(schema_set)?;
-                allocate_content_particle_elements(schema_set)?;
-            }
-        }
-        #[cfg(feature = "xsd11")]
-        xsd11_element_consistency_checks(schema_set)?;
-        validate_all_group_outer_occurs(schema_set)?;
-        validate_all_group_content(schema_set)?;
-        validate_all_particle_occurs(schema_set)?;
-        validate_all_upa_constraints(schema_set)?;
+        finalize_local_element_pass(schema_set)?;
     }
 
     Ok(stats)
@@ -426,8 +408,18 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
     // on `{type definition}`. Runs after particle-element allocation so
     // local elements are tracked through their ElementKey.
     crate::schema::validate_substitution_group_element_consistency(schema_set)?;
-    // XSD 1.1: assemble inline alternative types attached to local
-    // elements (which only acquired their ElementKey above).
+    finalize_local_element_pass(schema_set)?;
+    Ok((inline_stats, resolution_stats))
+}
+
+/// Validation passes that depend on local element declarations having been
+/// allocated by `allocate_content_particle_elements`. Both pipeline entry
+/// points run these in identical order to finalize IC `@ref` resolution,
+/// re-validate default/fixed values, and (under xsd11) re-run CTA analysis
+/// against newly-visible local-element alternatives.
+fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    // XSD 1.1: assemble inline alternative types attached to local elements
+    // (which only acquired their ElementKey in the allocation pass).
     #[cfg(feature = "xsd11")]
     {
         let new_alt_types =
@@ -437,13 +429,25 @@ pub fn process_loaded_schemas(schema_set: &mut SchemaSet) -> SchemaResult<(Inlin
             allocate_content_particle_elements(schema_set)?;
         }
     }
+    // IC `@ref`s on top-level elements whose target IC lives on a local
+    // element couldn't resolve until now (the local IC was registered by the
+    // allocation pass).
+    crate::schema::finalize_pending_ic_refs(schema_set)?;
+    // e-props-correct.2 / .4 against local element default/fixed values
+    // (saxon `s3_3_4si07/08`).
+    validate_element_value_constraints(schema_set)?;
+    #[cfg(feature = "xsd11")]
+    {
+        crate::schema::validate_cta_xpath(schema_set)?;
+        crate::schema::validate_cta_substitutability(schema_set)?;
+    }
     #[cfg(feature = "xsd11")]
     xsd11_element_consistency_checks(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
     validate_all_group_content(schema_set)?;
     validate_all_particle_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
-    Ok((inline_stats, resolution_stats))
+    Ok(())
 }
 
 /// XSD 1.1 schema-validity checks that run after type derivation but before

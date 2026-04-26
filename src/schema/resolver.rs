@@ -259,6 +259,65 @@ pub struct ResolutionStats {
     pub errors: usize,
 }
 
+/// Drain `pending_ic_refs` for one element and try to resolve each entry.
+///
+/// On success the target is appended to the element's `identity_constraints`.
+/// On failure: if `defer_failures` is true, the entry is kept on the element
+/// for a later retry pass; otherwise the error is appended to `errors`.
+fn drain_pending_ic_refs_for(
+    schema_set: &mut SchemaSet,
+    key: ElementKey,
+    defer_failures: bool,
+    errors: &mut Vec<SchemaError>,
+) {
+    let pending = std::mem::take(&mut schema_set.arenas.elements[key].pending_ic_refs);
+    if pending.is_empty() {
+        return;
+    }
+    let target_ns = schema_set.arenas.elements[key].target_namespace;
+    let mut still_pending = Vec::new();
+    for (kind, ref_name, source) in pending {
+        match crate::schema::inline::resolve_ic_ref(
+            kind, &ref_name, source.as_ref(), target_ns, schema_set,
+        ) {
+            Ok(target_key) => {
+                schema_set.arenas.elements[key]
+                    .identity_constraints
+                    .push(target_key);
+            }
+            Err(e) => {
+                if defer_failures {
+                    still_pending.push((kind, ref_name, source));
+                } else {
+                    errors.push(e);
+                }
+            }
+        }
+    }
+    if !still_pending.is_empty() {
+        schema_set.arenas.elements[key].pending_ic_refs = still_pending;
+    }
+}
+
+/// Finalize any remaining pending IC `@ref` references on elements.
+///
+/// `resolve_all_references` keeps unresolved IC refs in `pending_ic_refs`
+/// because the target IC may live on a *local* element, which isn't
+/// allocated until `allocate_content_particle_elements`. After that pass
+/// runs, we call this function to resolve and clear the remaining refs,
+/// reporting an error for any still-unresolved ones.
+pub fn finalize_pending_ic_refs(schema_set: &mut SchemaSet) -> SchemaResult<()> {
+    let element_keys: Vec<ElementKey> = schema_set.arenas.elements.keys().collect();
+    let mut errors: Vec<SchemaError> = Vec::new();
+    for key in element_keys {
+        drain_pending_ic_refs_for(schema_set, key, false, &mut errors);
+    }
+    if let Some(first) = errors.into_iter().next() {
+        return Err(first);
+    }
+    Ok(())
+}
+
 /// Resolve all references in a schema set
 ///
 /// This function walks all components and resolves QName references
@@ -344,24 +403,11 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
 
     // Resolve XSD 1.1 identity constraint @ref references on top-level elements.
     // This runs after element resolution so ICs from all elements are registered.
+    // Failures are KEPT in `pending_ic_refs` so a later pass (after local
+    // elements are allocated) can resolve refs that point to ICs declared on
+    // a local element — otherwise the local IC isn't registered yet here.
     for &key in &element_keys {
-        let pending = std::mem::take(&mut schema_set.arenas.elements[key].pending_ic_refs);
-        if !pending.is_empty() {
-            let target_ns = schema_set.arenas.elements[key].target_namespace;
-            for (kind, ref_name, source) in pending {
-                match crate::schema::inline::resolve_ic_ref(
-                    kind, &ref_name, source.as_ref(), target_ns, schema_set,
-                ) {
-                    Ok(target_key) => {
-                        schema_set.arenas.elements[key].identity_constraints.push(target_key);
-                    }
-                    Err(e) => {
-                        errors.push(e);
-                        stats.errors += 1;
-                    }
-                }
-            }
-        }
+        drain_pending_ic_refs_for(schema_set, key, true, &mut errors);
     }
 
     // Resolve attribute references
@@ -372,7 +418,18 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         }
     }
 
-    // Resolve simple type references
+    // Resolve simple type references. Run twice so that a restriction-of-X
+    // type whose base X resolves later in the arena order can still inherit
+    // X's variety / resolved_member_types / resolved_item_type.  Without
+    // the second pass, dt = restriction(inline-union) ends up with
+    // variety=Union and an empty resolved_member_types vector when dt is
+    // visited before the inline union (saxon simple016).
+    for key in simple_type_keys.clone() {
+        if let Err(e) = resolve_simple_type_references(schema_set, key, &mut stats) {
+            errors.push(e);
+            stats.errors += 1;
+        }
+    }
     for key in simple_type_keys {
         if let Err(e) = resolve_simple_type_references(schema_set, key, &mut stats) {
             errors.push(e);

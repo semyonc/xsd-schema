@@ -817,6 +817,24 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
                 }
             });
 
+        // src-resolve §3.3.6: a local element's QName-typed type-ref must
+        // resolve. Falling back silently masks bad schemas (s3_12si02).
+        if resolved_type.is_none() {
+            if let Some(TypeRefResult::QName(qname)) = &job.elem.type_ref {
+                let display = crate::schema::resolver::format_resolved_qname(
+                    &schema_set.name_table,
+                    qname.namespace,
+                    qname.local_name,
+                );
+                let location = schema_set.locate(job.elem.source.as_ref());
+                return Err(SchemaError::structural(
+                    "src-resolve",
+                    format!("Type reference '{}' on local element not found", display),
+                    location,
+                ));
+            }
+        }
+
         let effective_ns = schema_set.effective_local_element_namespace(
             job.elem.target_namespace,
             job.elem.form.as_deref(),
@@ -945,8 +963,35 @@ pub fn resolve_local_element_alternatives(
 ) -> SchemaResult<Vec<ComplexTypeKey>> {
     use crate::ids::ComplexTypeKey;
 
-    // Collect (element_key, alt_idx, type_frame) triples first to avoid
-    // mutating arenas while iterating them.
+    // Pass 1: Collect QName type_refs that need resolution (no inline type).
+    // These are alternatives like `<xs:alternative test=… type="Quadrilateral"/>`
+    // attached to local element declarations. The first
+    // `resolve_all_references` pass walked global elements only; local
+    // element alternatives copied during `allocate_content_particle_elements`
+    // still carry an unresolved QName here.
+    let mut qname_pending: Vec<(ElementKey, usize, QNameRef, Option<SourceRef>)> = Vec::new();
+    for (key, elem) in schema_set.arenas.elements.iter() {
+        for (idx, alt) in elem.alternatives.iter().enumerate() {
+            if alt.resolved_type.is_some() {
+                continue;
+            }
+            if let Some(TypeRefResult::QName(qname)) = &alt.type_ref {
+                qname_pending.push((key, idx, qname.clone(), alt.source.clone()));
+            }
+        }
+    }
+    for (elem_key, alt_idx, qname, src) in qname_pending {
+        let resolver = crate::schema::resolver::ReferenceResolver::new(schema_set);
+        let type_key = resolver.resolve_type_ref(&qname, src.as_ref())?;
+        if let Some(elem) = schema_set.arenas.elements.get_mut(elem_key) {
+            if let Some(alt) = elem.alternatives.get_mut(alt_idx) {
+                alt.resolved_type = Some(type_key);
+            }
+        }
+    }
+
+    // Pass 2: Collect (element_key, alt_idx, type_frame) triples first to
+    // avoid mutating arenas while iterating them. Handles inline types.
     let mut pending: Vec<(ElementKey, usize, TypeFrameResult, Option<NameId>)> = Vec::new();
     for (key, elem) in schema_set.arenas.elements.iter() {
         for (idx, alt) in elem.alternatives.iter().enumerate() {

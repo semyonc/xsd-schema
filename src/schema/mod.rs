@@ -76,7 +76,7 @@ pub use annotation::{
 
 // Re-exports from resolver
 pub use resolver::{
-    ReferenceResolver, resolve_all_references,
+    ReferenceResolver, finalize_pending_ic_refs, resolve_all_references,
     ResolvedReferences, ResolutionStats,
 };
 

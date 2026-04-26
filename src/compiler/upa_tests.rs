@@ -528,7 +528,10 @@ fn test_element_wildcard_other_absent_namespace_xsd10() {
 fn test_element_wildcard_other_absent_namespace_xsd11() {
     let target_ns = Some(NameId(1));
 
-    assert!(element_wildcard_overlap(
+    // §3.10.4: when the schema has a target namespace, ##other excludes
+    // BOTH the target namespace AND the absent namespace, in both XSD 1.0
+    // and 1.1.
+    assert!(!element_wildcard_overlap(
         None,
         &NamespaceConstraint::Other,
         target_ns,
@@ -619,7 +622,10 @@ fn test_wildcards_overlap_other_local_xsd10() {
 #[test]
 fn test_wildcards_overlap_other_local_xsd11() {
     let target = Some(NameId(1));
-    assert!(wildcards_overlap(
+    // ##other never matches absent namespace when the schema has a target
+    // namespace (§3.10.4), so it cannot overlap with ##local. Same for
+    // both XSD 1.0 and 1.1.
+    assert!(!wildcards_overlap(
         &NamespaceConstraint::Other,
         &NamespaceConstraint::Local,
         target,

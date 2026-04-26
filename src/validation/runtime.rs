@@ -425,13 +425,37 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             return; // builder creation failed — error already reported
         }
 
-        // Forward start_element to builder (all children in scope)
+        // Forward start_element to builder (all children in scope).
+        // Materialize ns_declarations from the live in-scope bindings so the
+        // fragment element exposes the same namespace nodes, enabling
+        // `fn:in-scope-prefixes()` and prefixed-QName assertions to see
+        // every prefix declared by the element or its ancestors.
         let local = self.schema_set.name_table.resolve(local_name);
         let ns = namespace
             .map(|id| self.schema_set.name_table.resolve(id).to_string())
             .unwrap_or_default();
+        let mut ns_strings: Vec<(String, String)> = Vec::new();
+        if let Some(snapshot) = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref())
+        {
+            for &(prefix_id, uri_id) in &snapshot.bindings {
+                let prefix = self.schema_set.name_table.resolve(prefix_id).to_string();
+                let uri = self.schema_set.name_table.resolve(uri_id).to_string();
+                ns_strings.push((prefix, uri));
+            }
+            if let Some(default_ns) = snapshot.default_ns {
+                let uri = self.schema_set.name_table.resolve(default_ns).to_string();
+                ns_strings.push((String::new(), uri));
+            }
+        }
+        let ns_decls: Vec<(&str, &str)> = ns_strings
+            .iter()
+            .map(|(p, u)| (p.as_str(), u.as_str()))
+            .collect();
         let element_ref = match self.fragment_builder.as_mut() {
-            Some(builder) => match builder.start_element(&local, &ns, "", &[]) {
+            Some(builder) => match builder.start_element(&local, &ns, "", &ns_decls) {
                 Ok(r) => r,
                 Err(e) => {
                     self.report_error(
@@ -1348,6 +1372,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .unwrap_or(0);
             let mut result = self.validate_xsi_attribute(local_name, value);
             if let Some(ev) = self.validation_stack.last_mut() {
+                // Record xsi:* attributes in seen_attributes so user-declared
+                // attribute uses targeting xsi:type / xsi:nil / xsi:schemaLocation /
+                // xsi:noNamespaceSchemaLocation (use="required") are satisfied
+                // by the matching instance attribute. Without this insert,
+                // `check_required_attributes` would always report a missing
+                // required xsi:* attribute (saxon complex009/complex010).
+                ev.seen_attributes.insert((namespace, local_name));
                 // Extract attribute-specific error codes (mirrors normal attribute path)
                 if ev.error_codes.len() > ec_snapshot {
                     result.schema_error_codes = ev.error_codes[ec_snapshot..].to_vec();
@@ -4066,6 +4097,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         use crate::parser::frames::DerivationMethod;
         match &ct_data.content {
             ComplexContentResult::Empty => {
+                // §3.4.2.3 step 5.2: a `<defaultOpenContent>` with
+                // `appliesToEmpty="true"` widens an otherwise-empty
+                // content type to element-only/mixed (XSD 1.1).
+                #[cfg(feature = "xsd11")]
+                if self.schema_set.is_xsd11()
+                    && self.empty_ct_has_applicable_default_open_content(ct_data)
+                {
+                    return if ct_data.mixed {
+                        ContentType::Mixed
+                    } else {
+                        ContentType::ElementOnly
+                    };
+                }
                 if ct_data.mixed {
                     ContentType::Mixed
                 } else {
@@ -4112,6 +4156,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// distinguish a truly empty content type from one whose explicit content
     /// type variety = empty but is widened to element-only by an open content
     /// wildcard (own `<openContent>` or applicable `<defaultOpenContent>`).
+    /// Whether an otherwise-empty (`ComplexContentResult::Empty`) complex
+    /// type effectively gains a wildcard via the schema document's
+    /// `<defaultOpenContent>` with `appliesToEmpty="true"`. Mirrors the
+    /// `appliesToEmpty` half of `type_has_effective_open_content` for the
+    /// shorter syntax CTs that don't carry a `ComplexContentDefResult`.
+    #[cfg(feature = "xsd11")]
+    fn empty_ct_has_applicable_default_open_content(
+        &self,
+        ct_data: &ComplexTypeDefData,
+    ) -> bool {
+        let doc = ct_data
+            .source
+            .as_ref()
+            .and_then(|s| self.schema_set.documents.get(s.defaults_doc() as usize));
+        if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
+            if default.mode == crate::schema::model::OpenContentMode::None {
+                return false;
+            }
+            return default.applies_to_empty;
+        }
+        false
+    }
+
     #[allow(unused_variables)]
     fn type_has_effective_open_content(
         &self,

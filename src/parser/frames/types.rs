@@ -1261,6 +1261,10 @@ pub struct ComplexTypeFrame {
     base_type: Option<TypeRefResult>,
     derivation_method: Option<DerivationMethod>,
     mixed: bool,
+    /// `true` when the `<xs:complexType mixed="…">` attribute was explicitly
+    /// present. Used by §3.4.2.3 step 1 to require that an explicit
+    /// `<complexContent mixed="…">` agree with this value.
+    mixed_explicit: bool,
     is_abstract: bool,
     final_derivation: Option<DerivationSet>,
     block: Option<DerivationSet>,
@@ -1289,7 +1293,9 @@ impl ComplexTypeFrame {
             .get_value_by_name(name_table, "name")
             .and_then(|s| name_table.get(s));
 
-        let mixed = parse_bool_attr_default(attrs, name_table, "mixed", false)?;
+        let mixed_opt = parse_optional_bool_attr(attrs, name_table, "mixed")?;
+        let mixed_explicit = mixed_opt.is_some();
+        let mixed = mixed_opt.unwrap_or(false);
 
         let is_abstract = parse_bool_attr_default(attrs, name_table, "abstract", false)?;
 
@@ -1319,6 +1325,7 @@ impl ComplexTypeFrame {
             base_type: None,
             derivation_method: None,
             mixed,
+            mixed_explicit,
             is_abstract,
             final_derivation,
             block,
@@ -1461,9 +1468,18 @@ impl Frame for ComplexTypeFrame {
                 self.attributes = std::mem::take(&mut cc.attributes);
                 self.attribute_groups = std::mem::take(&mut cc.attribute_groups);
                 self.attribute_wildcard = cc.attribute_wildcard.take();
-                // §3.4.2.3 clause 1.1: the `mixed` attribute on <complexContent>
-                // takes precedence when explicitly present; otherwise retain the
-                // outer <complexType mixed="…"> value already on `self.mixed`.
+                // §3.4.2.3 step 1: `<complexContent mixed=…>` (clause 1.1) and
+                // `<complexType mixed=…>` (clause 1.2) must agree when both are
+                // explicit. The note at the end of step 1 says these "will never
+                // contradict each other in a conforming schema document".
+                if cc.mixed_explicit && self.mixed_explicit && cc.mixed != self.mixed {
+                    return Err(SchemaError::structural(
+                        "src-ct",
+                        "<complexType mixed=…> and <complexContent mixed=…> are both \
+                         present but disagree (§3.4.2.3 step 1)",
+                        None,
+                    ));
+                }
                 if cc.mixed_explicit {
                     self.mixed = cc.mixed;
                 } else {
@@ -1610,6 +1626,10 @@ impl Frame for ComplexTypeFrame {
 
     fn set_foreign_attributes(&mut self, attrs: Vec<ForeignAttribute>) {
         self.foreign_attributes = attrs;
+    }
+
+    fn children_inside_complex_type(&self) -> bool {
+        true
     }
 }
 

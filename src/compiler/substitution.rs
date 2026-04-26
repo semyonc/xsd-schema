@@ -10,6 +10,25 @@ pub type SubstitutionGroupMap = HashMap<ElementKey, HashSet<(NameId, Option<Name
 
 /// Build a substitution group membership map for the schema set.
 pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroupMap {
+    build_substitution_group_map_inner(schema_set, false)
+}
+
+/// Build a substitution group membership map that includes abstract members.
+///
+/// Per XSD 1.1 (W3C Bugzilla 4337), abstract elements participate in the
+/// substitution group for schema-time UPA / cos-element-consistent (EDC)
+/// constraints, even though they cannot appear in instances. This variant is
+/// used by UPA/EDC schema-time validation under XSD 1.1.
+pub fn build_substitution_group_map_with_abstract(
+    schema_set: &SchemaSet,
+) -> SubstitutionGroupMap {
+    build_substitution_group_map_inner(schema_set, true)
+}
+
+fn build_substitution_group_map_inner(
+    schema_set: &SchemaSet,
+    include_abstract: bool,
+) -> SubstitutionGroupMap {
     let mut member_map: HashMap<ElementKey, Vec<ElementKey>> = HashMap::new();
     for (member_key, elem) in schema_set.arenas.elements.iter() {
         for head_key in &elem.resolved_substitution_groups {
@@ -31,7 +50,7 @@ pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroup
         };
         let mut names = HashSet::new();
         if let Some(name) = head_elem.name {
-            if !head_elem.is_abstract {
+            if !head_elem.is_abstract || include_abstract {
                 names.insert((name, head_elem.target_namespace));
             }
         }
@@ -49,7 +68,7 @@ pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroup
                 }
                 if let Some(member) = resolved_element(schema_set, member_key) {
                     if let Some(name) = member.name {
-                        if !member.is_abstract
+                        if (!member.is_abstract || include_abstract)
                             && is_substitutable(schema_set, head_type, exclude, member.resolved_type)
                         {
                             names.insert((name, member.target_namespace));
@@ -237,6 +256,44 @@ pub fn validate_all_substitution_groups(
                     ),
                     location,
                 ));
+            }
+        }
+    }
+
+    // §3.3.6.1.5: substitution group affiliation must be acyclic. Walk each
+    // element's resolved substitution-group chain and reject any back-edge.
+    for (start_key, _) in schema_set.arenas.elements.iter() {
+        let mut visited = HashSet::new();
+        let mut stack = vec![start_key];
+        while let Some(current) = stack.pop() {
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(decl) = schema_set.arenas.elements.get(current) else {
+                continue;
+            };
+            for &head in &decl.resolved_substitution_groups {
+                if head == start_key {
+                    let elem = &schema_set.arenas.elements[start_key];
+                    let elem_name = elem
+                        .name
+                        .map(|n| schema_set.name_table.resolve(n).to_string())
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    let location = elem
+                        .source
+                        .as_ref()
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    return Err(crate::error::SchemaError::structural(
+                        "e-props-correct",
+                        format!(
+                            "Substitution group cycle detected involving element '{}' \
+                             (§3.3.6.1.5)",
+                            elem_name
+                        ),
+                        location,
+                    ));
+                }
+                stack.push(head);
             }
         }
     }

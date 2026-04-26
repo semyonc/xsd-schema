@@ -7470,7 +7470,10 @@ pub fn validate_substitution_group_element_consistency(
                         let Some(decl) = schema_set.arenas.elements.get(current) else {
                             continue;
                         };
-                        if !decl.is_abstract {
+                        // Per XSD 1.1 (W3C Bugzilla 4337), abstract members participate
+                        // in the substitution group for cos-element-consistent purposes;
+                        // XSD 1.0 excludes them.
+                        if !decl.is_abstract || schema_set.is_xsd11() {
                             if let (Some(name), Some(t)) = (decl.name, decl.resolved_type) {
                                 out.entry((decl.target_namespace, name))
                                     .or_default()

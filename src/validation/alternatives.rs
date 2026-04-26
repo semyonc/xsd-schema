@@ -358,6 +358,58 @@ mod tests {
         let type_a = find_type_key(&schema_set, "typeA");
         assert_eq!(result_a, Some(type_a));
 
+        // Same scenario but with a non-empty instance_ns snapshot — this is
+        // what `validation/runtime.rs::validate_end_of_attributes` passes,
+        // and is suspected of breaking attribute-value comparison in CTA.
+        let mut snapshot = NamespaceContextSnapshot::default();
+        let xml_prefix = schema_set.name_table.add("xml");
+        let xml_uri = schema_set.name_table.add("http://www.w3.org/XML/1998/namespace");
+        snapshot.bindings.push((xml_prefix, xml_uri));
+        let result_a_with_ns = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_a,
+            Some(&snapshot),
+            Some("file:///some/instance.xml"),
+            &schema_set,
+        );
+        assert_eq!(
+            result_a_with_ns,
+            Some(type_a),
+            "regression: CTA must select typeA even when an instance_ns snapshot is provided"
+        );
+
+        // Multiple sequential evaluations from the same name_table — does the
+        // second one see the first one's attribute value?
+        let attrs_b = vec![(None, kind_name, "B".to_string())];
+        let result_b_after_a = evaluate_type_alternatives(
+            elem_key,
+            local_name,
+            None,
+            &attrs_b,
+            Some(&snapshot),
+            Some("file:///some/instance.xml"),
+            &schema_set,
+        );
+        let type_b = find_type_key(&schema_set, "typeB");
+        assert_eq!(
+            result_b_after_a,
+            Some(type_b),
+            "regression: CTA must select typeB when called after a typeA evaluation"
+        );
+
+        // Three sequential calls (mirroring three polygons in typeAlternatives_001_2)
+        let attrs_a2 = vec![(None, kind_name, "A".to_string())];
+        let r1 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_a2, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        let attrs_b2 = vec![(None, kind_name, "B".to_string())];
+        let r2 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_b2, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        let attrs_x = vec![(None, kind_name, "X".to_string())];
+        let r3 = evaluate_type_alternatives(elem_key, local_name, None, &attrs_x, Some(&snapshot), Some("file:///x.xml"), &schema_set);
+        assert_eq!(r1, Some(type_a), "first sequential CTA: expected typeA");
+        assert_eq!(r2, Some(type_b), "second sequential CTA: expected typeB");
+        assert_eq!(r3, None, "third sequential CTA: expected no match");
+
         // kind='B' -> typeB
         let attrs_b = vec![(None, kind_name, "B".to_string())];
         let result_b = evaluate_type_alternatives(elem_key, local_name, None, &attrs_b, None, None, &schema_set);

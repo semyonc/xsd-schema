@@ -164,6 +164,9 @@ fn compute_dollar_value<'doc>(
     governing_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
 ) -> XPathValue<BufferDocNavigator<'doc>> {
+    use crate::types::value::{XmlValue, XmlValueKind};
+    use crate::xpath::iterator::XmlItem;
+
     let ct = &schema_set.arenas.complex_types[governing_ct_key];
     if !matches!(ct.content, ComplexContentResult::Simple(_)) {
         return XPathValue::empty();
@@ -175,7 +178,28 @@ fn compute_dollar_value<'doc>(
     }
 
     match validate_simple_type(&nav.value(), TypeKey::Complex(governing_ct_key), schema_set) {
-        Ok(result) => XPathValue::from_atomic(result.typed_value),
+        Ok(result) => {
+            // §3.13.4.1 clause 2.3.1.4: when the governing simple-content type's
+            // {variety} = list, `$value` is a sequence of atomic values, one per
+            // list item. The simple-type validator stores list items in
+            // `XmlValueKind::List`; unwrap to a sequence so XPath sees a
+            // multi-item input.
+            if let XmlValueKind::List { item_type, items } = &result.typed_value.value {
+                let item_type_code = *item_type;
+                let xpath_items: Vec<XmlItem<BufferDocNavigator<'doc>>> = items
+                    .iter()
+                    .cloned()
+                    .map(|atom| {
+                        XmlItem::Atomic(XmlValue::new(
+                            item_type_code,
+                            XmlValueKind::Atomic(atom),
+                        ))
+                    })
+                    .collect();
+                return XPathValue::from_sequence(xpath_items);
+            }
+            XPathValue::from_atomic(result.typed_value)
+        }
         Err(_) => XPathValue::empty(),
     }
 }
