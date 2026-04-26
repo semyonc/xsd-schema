@@ -99,6 +99,18 @@ impl Frame for OpenContentFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // §3.4.2 / W3C Bugzilla 7069: when xs:openContent declares mode="none"
+        // the wildcard child is meaningless and the schema for schemas
+        // disallows it. Report the schema as structurally invalid.
+        if self.mode == OpenContentMode::None && self.wildcard.is_some() {
+            return Err(SchemaError::structural(
+                "src-openContent",
+                "xs:openContent with mode='none' must not contain an xs:any \
+                 child wildcard (W3C Bugzilla 7069)"
+                    .to_string(),
+                None,
+            ));
+        }
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,

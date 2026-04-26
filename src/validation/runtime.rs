@@ -1439,11 +1439,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.schema_set.any_type_key()
             }
             _ => {
-                // Simple type: no attributes expected (except xsi:*)
-                // Still run post-processing so IC attribute fields and
-                // ID/IDREF collection are not skipped.
+                // Simple-typed element: only xsi:* and (when permitted)
+                // xml:* attributes are allowed. Any other attribute is a
+                // cvc-complex-type.3.2.1 violation (no matching {attribute
+                // use} on a simple type). xsi:* is already handled above;
+                // xml:* under ALLOW_XML_ATTRIBUTES is also handled above.
+                // Anything reaching here is an undeclared attribute on a
+                // simple-typed element.
                 self.current_state = ValidatorState::Attribute;
-                let result = SchemaInfo::empty();
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-complex-type.3.2.1",
+                    format!(
+                        "Attribute '{}' is not allowed on a simple-typed element",
+                        attr_name
+                    ),
+                );
+                let mut result = SchemaInfo::invalid();
+                result.schema_error_codes = vec!["cvc-complex-type.3.2.1"];
                 self.post_process_attribute(local_name, namespace, value, &result);
                 return result;
             }
@@ -1872,7 +1885,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         let mut nil_violation: Option<String> = None;
+        let mut empty_violation: Option<String> = None;
         if let Some(ev_state) = self.validation_stack.last_mut() {
+            // cvc-complex-type.2.1: when {content type} is empty the element
+            // information item must have *no* character information items,
+            // including whitespace. Element-only content still treats
+            // whitespace as insignificant.
+            if !text.is_empty()
+                && matches!(ev_state.content_type, Some(ContentType::Empty))
+            {
+                let elem_name = self
+                    .schema_set
+                    .name_table
+                    .resolve(ev_state.local_name)
+                    .to_string();
+                empty_violation = Some(format!(
+                    "Element '{}' has empty content type but text was found",
+                    elem_name,
+                ));
+            }
+
             // cvc-elt.3.2.1: a nilled element must have empty content. For
             // mixed and text-only content whitespace is significant, so any
             // text (including whitespace) is invalid. Element-only and empty
@@ -1905,6 +1937,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        if let Some(msg) = empty_violation {
+            self.report_error("cvc-complex-type.2.1", msg);
+        }
         if let Some(msg) = nil_violation {
             self.report_error("cvc-elt.3.2.1", msg);
         }
@@ -2470,7 +2505,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     })
                     .collect()
             }
-            ContentValidatorState::AllGroup { model, state } => {
+            ContentValidatorState::AllGroup { model, state, .. } => {
                 let mut result = Vec::new();
                 for (i, particle) in model.particles.iter().enumerate() {
                     if state.can_accept(model, i) {
@@ -4039,7 +4074,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             ComplexContentResult::Simple(_) => ContentType::TextOnly,
             ComplexContentResult::Complex(def) => {
-                if def.particle.is_none() && !ct_data.mixed {
+                // §3.4.2.3 step 4.1.1 / 4.2.1: explicit content type variety
+                // = empty when the effective content is empty (the explicit
+                // content is empty *and* effective mixed is false). Step 6
+                // then promotes variety to element-only/mixed if a wildcard
+                // element (open content) is present — without one, the final
+                // {content type} stays empty (no character or element items
+                // are allowed). Only apply the relaxed §3.4.2.3 step 2.1.x
+                // particle-shape recognition under XSD 1.1; XSD 1.0 tests
+                // historically rely on `def.particle.is_none()` strictness.
+                let particle_empty = match &def.particle {
+                    None => true,
+                    Some(p) => self.schema_set.is_xsd11()
+                        && crate::parser::frames::particle_is_explicit_empty(p),
+                };
+                let has_open_content = self.type_has_effective_open_content(ct_data, def);
+                if particle_empty && !ct_data.mixed && !def.mixed && !has_open_content {
                     // For extensions with no own particle, inherit base type's content type
                     if matches!(ct_data.derivation_method, Some(DerivationMethod::Extension)) {
                         if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
@@ -4055,6 +4105,45 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
         }
+    }
+
+    /// Whether a complex type effectively has open content per §3.4.2.3
+    /// step 5 (the "wildcard element"). Used by `determine_content_type` to
+    /// distinguish a truly empty content type from one whose explicit content
+    /// type variety = empty but is widened to element-only by an open content
+    /// wildcard (own `<openContent>` or applicable `<defaultOpenContent>`).
+    #[allow(unused_variables)]
+    fn type_has_effective_open_content(
+        &self,
+        ct_data: &ComplexTypeDefData,
+        def: &crate::parser::frames::ComplexContentDefResult,
+    ) -> bool {
+        #[cfg(feature = "xsd11")]
+        {
+            use crate::parser::frames::OpenContentMode;
+            // Step 5.1: own <openContent> child with mode != none.
+            if let Some(oc) = def.open_content.as_ref() {
+                return oc.mode != OpenContentMode::None;
+            }
+            // Step 5.2: schema's <defaultOpenContent>. Applies when
+            // appliesToEmpty=true OR explicit content type variety ≠ empty.
+            // Use the same gate as compile.rs `resolve_open_content`.
+            let doc = ct_data
+                .source
+                .as_ref()
+                .and_then(|s| self.schema_set.documents.get(s.defaults_doc() as usize));
+            if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
+                if default.mode == crate::schema::model::OpenContentMode::None {
+                    return false;
+                }
+                if default.applies_to_empty {
+                    return true;
+                }
+                return !ct_data.content.explicit_content_type_is_empty();
+            }
+        }
+        let _ = (ct_data, def);
+        false
     }
 
     /// Resolve an xsi:type QName string to an [`XsiTypeOutcome`].

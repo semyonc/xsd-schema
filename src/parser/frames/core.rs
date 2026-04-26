@@ -146,15 +146,69 @@ pub enum ComplexContentResult {
 }
 
 impl ComplexContentResult {
-    /// Returns `true` if this content is "empty" per §3.4.6.3 / §3.4.2.3:
-    /// explicit `Empty`, or a complex content with no particle.
-    /// SimpleContent is never empty.
+    /// Returns `true` if this content has *empty explicit content* per
+    /// §3.4.2.3 step 2 (used by §3.4.6.3 effective content and the
+    /// `<defaultOpenContent appliesToEmpty="false">` gate).
+    ///
+    /// Empty cases:
+    /// - 2.1.1: no `<group>/<all>/<choice>/<sequence>` child (no particle)
+    /// - 2.1.2: an `<all>` or `<sequence>` child with empty particles
+    /// - 2.1.3: a `<choice>` child with `minOccurs=0` and empty particles
+    /// - 2.1.4: the child has `maxOccurs=0`
+    ///
+    /// `SimpleContent` is never empty.
     pub fn is_empty(&self) -> bool {
         match self {
             ComplexContentResult::Empty => true,
-            ComplexContentResult::Complex(def) => def.particle.is_none(),
+            ComplexContentResult::Complex(def) => match &def.particle {
+                None => true,
+                Some(p) => particle_is_explicit_empty(p),
+            },
             ComplexContentResult::Simple(_) => false,
         }
+    }
+
+    /// True when this complex content collapses to *explicit content type
+    /// variety = empty* per §3.4.2.3 step 4.1.1 (restriction) — used by the
+    /// `<defaultOpenContent appliesToEmpty="false">` gate (§3.4.2.3 step
+    /// 5.2.2). Equivalent to "explicit content empty AND effective mixed
+    /// false": when mixed is true, step 3.1.1 promotes the empty explicit
+    /// content to a non-empty effective content (an empty sequence
+    /// particle), which means the explicit content type variety is `mixed`,
+    /// not `empty`.
+    pub fn explicit_content_type_is_empty(&self) -> bool {
+        match self {
+            ComplexContentResult::Empty => true,
+            ComplexContentResult::Complex(def) => {
+                let particle_empty = match &def.particle {
+                    None => true,
+                    Some(p) => particle_is_explicit_empty(p),
+                };
+                particle_empty && !def.mixed
+            }
+            ComplexContentResult::Simple(_) => false,
+        }
+    }
+}
+
+/// True when a particle counts as "empty explicit content" per §3.4.2.3
+/// clauses 2.1.2 / 2.1.3 / 2.1.4.
+///
+/// `compositor: None` means the particle is a `<xs:group ref="…">` whose
+/// referenced model group has not been resolved yet — its emptiness can
+/// only be decided after group resolution, so we conservatively treat it
+/// as non-empty (the safe default for runtime content-type computation).
+pub fn particle_is_explicit_empty(p: &ParticleResult) -> bool {
+    if p.max_occurs == Some(0) {
+        return true; // 2.1.4
+    }
+    match &p.term {
+        ParticleTerm::Group(group) => match group.compositor {
+            Some(Compositor::All) | Some(Compositor::Sequence) => group.particles.is_empty(),
+            Some(Compositor::Choice) => group.particles.is_empty() && group.min_occurs == 0,
+            None => false,
+        },
+        _ => false,
     }
 }
 

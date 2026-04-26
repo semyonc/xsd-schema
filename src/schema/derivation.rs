@@ -3500,7 +3500,9 @@ fn explicit_content_is_empty(
     if depth > 100 {
         return true;
     }
-    if !type_data.content.is_empty() {
+    // Use the §3.4.2.3 5.2.2 gate (explicit content type variety = empty),
+    // which incorporates the effective-mixed promotion of step 3.1.1.
+    if !type_data.content.explicit_content_type_is_empty() {
         return false;
     }
     if matches!(type_data.derivation_method, Some(DerivationMethod::Extension)) {

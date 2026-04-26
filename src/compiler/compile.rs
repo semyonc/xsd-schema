@@ -1671,7 +1671,13 @@ fn resolve_open_content(
     let doc = source.and_then(|s| schema_set.documents.get(s.defaults_doc() as usize));
     let default = doc.and_then(|d| d.default_open_content.as_ref())?;
 
-    if !default.applies_to_empty && content.is_empty() {
+    // §3.4.2.3 step 5.2.2: defaultOpenContent only applies to a type whose
+    // explicit content type variety = empty when appliesToEmpty=true.
+    // "Variety = empty" requires *both* an empty explicit content (step 2)
+    // AND effective mixed = false (step 3.1.2). When mixed=true, an empty
+    // explicit content promotes to a non-empty mixed content type, so
+    // appliesToEmpty=false should still attach the OC.
+    if !default.applies_to_empty && content.explicit_content_type_is_empty() {
         return None;
     }
 

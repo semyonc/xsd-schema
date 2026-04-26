@@ -69,6 +69,10 @@ pub enum ContentValidatorState {
     AllGroup {
         model: AllGroupModel,
         state: AllGroupState,
+        /// `true` once a suffix open-content element has been matched —
+        /// further declared all-group particles are no longer accepted
+        /// (§3.10.4 suffix semantics: declared content first, then wildcard).
+        suffix_locked: bool,
     },
     /// All-group base + NFA extension (XSD 1.1 complex type extension).
     #[cfg(feature = "xsd11")]
@@ -128,7 +132,7 @@ impl ContentValidatorState {
     /// Create a content validator state from an all-group model
     pub fn from_all_group(model: AllGroupModel) -> Self {
         let state = model.create_state();
-        ContentValidatorState::AllGroup { model, state }
+        ContentValidatorState::AllGroup { model, state, suffix_locked: false }
     }
 
     /// Advance the content model with a child element
@@ -193,59 +197,63 @@ impl ContentValidatorState {
                 *active_states = next;
                 Some(match_info)
             }
-            ContentValidatorState::AllGroup { model, state } => {
-                // Try to match against each particle in the all-group
-                for (i, particle) in model.particles.iter().enumerate() {
-                    if !state.can_accept(model, i) {
-                        continue;
-                    }
-                    let result = term_matches_with_substitution(
-                        &particle.term,
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
-                        xsd_version,
-                    );
-                    if result == TermMatchResult::Match {
-                        if state.accept(model, i) {
-                            let info = match &particle.term {
-                                NfaTerm::Element {
-                                    name: term_name,
-                                    namespace: term_ns,
-                                    element_key,
-                                    resolved_type,
-                                } => {
-                                    if *term_name == name && *term_ns == namespace {
-                                        // Direct match
-                                        ElementMatchInfo {
-                                            element_key: *element_key,
-                                            resolved_type: *resolved_type,
-                                            process_contents: None,
+            ContentValidatorState::AllGroup { model, state, suffix_locked } => {
+                // Once the suffix open-content section has begun, declared
+                // all-group particles are no longer eligible to match.
+                if !*suffix_locked {
+                    for (i, particle) in model.particles.iter().enumerate() {
+                        if !state.can_accept(model, i) {
+                            continue;
+                        }
+                        let result = term_matches_with_substitution(
+                            &particle.term,
+                            name,
+                            namespace,
+                            target_ns,
+                            subst_groups,
+                            xsd_version,
+                        );
+                        if result == TermMatchResult::Match {
+                            if state.accept(model, i) {
+                                let info = match &particle.term {
+                                    NfaTerm::Element {
+                                        name: term_name,
+                                        namespace: term_ns,
+                                        element_key,
+                                        resolved_type,
+                                    } => {
+                                        if *term_name == name && *term_ns == namespace {
+                                            // Direct match
+                                            ElementMatchInfo {
+                                                element_key: *element_key,
+                                                resolved_type: *resolved_type,
+                                                process_contents: None,
+                                            }
+                                        } else {
+                                            // Substitution match — let runtime resolve
+                                            ElementMatchInfo {
+                                                element_key: None,
+                                                resolved_type: None,
+                                                process_contents: None,
+                                            }
                                         }
-                                    } else {
-                                        // Substitution match — let runtime resolve
+                                    }
+                                    NfaTerm::Wildcard { process_contents, .. } => {
                                         ElementMatchInfo {
                                             element_key: None,
                                             resolved_type: None,
-                                            process_contents: None,
+                                            process_contents: Some(*process_contents),
                                         }
                                     }
-                                }
-                                NfaTerm::Wildcard { process_contents, .. } => {
-                                    ElementMatchInfo {
-                                        element_key: None,
-                                        resolved_type: None,
-                                        process_contents: Some(*process_contents),
-                                    }
-                                }
-                            };
-                            return Some(info);
+                                };
+                                return Some(info);
+                            }
+                            return None;
                         }
-                        return None;
                     }
                 }
-                // No declared particle matched — try open content wildcard
+                // No declared particle matched (or suffix lock engaged) —
+                // try open content wildcard.
                 if let Some(oc) = &model.open_content {
                     let allow = match oc.mode {
                         AllGroupOpenContentMode::Interleave => true,
@@ -255,6 +263,12 @@ impl ContentValidatorState {
                     if allow
                         && open_content_allows(&oc.namespace_constraint, &oc.not_qnames, name, namespace, target_ns)
                     {
+                        // §3.10.4 suffix semantics: once a suffix wildcard
+                        // element matches, no declared all-group particle may
+                        // match again.
+                        if matches!(oc.mode, AllGroupOpenContentMode::Suffix) {
+                            *suffix_locked = true;
+                        }
                         return Some(ElementMatchInfo {
                             element_key: None,
                             resolved_type: None,
@@ -427,7 +441,7 @@ impl ContentValidatorState {
             ContentValidatorState::Nfa { nfa, active_states, .. } => {
                 active_states.contains_accept(nfa)
             }
-            ContentValidatorState::AllGroup { model, state } => {
+            ContentValidatorState::AllGroup { model, state, .. } => {
                 // If the outer particle is optional (minOccurs=0) and no children
                 // have been consumed, the entire group was skipped — trivially satisfied.
                 if model.outer_optional && !state.has_any_consumed() {
@@ -500,21 +514,23 @@ impl ContentValidatorState {
                 }
                 false
             }
-            ContentValidatorState::AllGroup { model, state } => {
-                for (i, particle) in model.particles.iter().enumerate() {
-                    if !state.can_accept(model, i) {
-                        continue;
-                    }
-                    let result = term_matches_with_substitution(
-                        &particle.term,
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
-                        xsd_version,
-                    );
-                    if result == TermMatchResult::Match {
-                        return true;
+            ContentValidatorState::AllGroup { model, state, suffix_locked } => {
+                if !*suffix_locked {
+                    for (i, particle) in model.particles.iter().enumerate() {
+                        if !state.can_accept(model, i) {
+                            continue;
+                        }
+                        let result = term_matches_with_substitution(
+                            &particle.term,
+                            name,
+                            namespace,
+                            target_ns,
+                            subst_groups,
+                            xsd_version,
+                        );
+                        if result == TermMatchResult::Match {
+                            return true;
+                        }
                     }
                 }
                 // Try open content wildcard fallback
