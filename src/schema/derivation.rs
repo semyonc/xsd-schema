@@ -1180,11 +1180,39 @@ fn validate_complex_restriction(
                     ));
                 }
 
-                // (§3.4.6.4 clause 5.4.1 mixed-parity check intentionally
-                // omitted: the W3C suite marks several valid-schema tests
-                // that restrict mixed to element-only — e.g. particlesL012,
-                // mgA015, idK012 — relying on the spec's "pointless mixed
-                // restriction" tolerance applied by Saxon and Xerces.)
+                // §3.4.6.4 clause 5.4.1 mixed-parity (one direction only):
+                // restricting an element-only base to a `mixed="true"` derived
+                // type would add character data, which is incompatible with
+                // restriction. The reverse (mixed → element-only) is the
+                // "pointless mixed restriction" tolerated by Saxon/Xerces and
+                // exercised by valid-schema tests particlesL012 / mgA015 /
+                // idK012, so only the asymmetric error is enforced here.
+                // ctF006 (element-only choice + mixed restriction).
+                if let (
+                    ComplexContentResult::Complex(base_complex),
+                    ComplexContentResult::Complex(derived_complex),
+                ) = (&base_type.content, &type_def.content)
+                {
+                    let base_mixed = effective_mixed_of(base_type, base_complex);
+                    let derived_mixed = effective_mixed_of(type_def, derived_complex);
+                    if derived_mixed && !base_mixed {
+                        let (location, type_name) = type_error_context(schema_set, type_def);
+                        let base_name = format_type_name(
+                            schema_set,
+                            base_type.name,
+                            base_type.target_namespace,
+                        );
+                        return Err(SchemaError::structural(
+                            "derivation-ok-restriction",
+                            format!(
+                                "Complex type '{}' cannot restrict element-only base '{}' \
+                                 to mixed content (§3.4.6.4 clause 5.4.1)",
+                                type_name, base_name,
+                            ),
+                            location,
+                        ));
+                    }
+                }
 
                 // src-ct.2 (§3.4.6.2): when the derived type uses <xs:simpleContent>
                 // and the <xs:restriction> alternative, the base must be either a
@@ -1260,10 +1288,14 @@ fn effective_mixed_of(
 
 /// cos-ct-extends clause 1.4.3.2.2.4.1 (§3.4.6.2): when the derived type
 /// supplies its own particle, the effective mixed of the derived {content
-/// type} must match the base's — both element-only, or both mixed. Skipped
-/// when either side lacks a particle, because §3.4.2.3 clause 4.1 then
-/// copies the base's {content type} verbatim into the derived, trivially
-/// satisfying parity regardless of the outer `mixed="true"` attribute.
+/// type} must match the base's — both element-only, or both mixed. Also
+/// fires when the derived has no own particle but explicitly declares a
+/// `mixed=` value that disagrees with the base (ctF008): per §3.4.2.3
+/// clause 4.1 the {content type} inherits from the base, but Saxon/Xerces
+/// (and the W3C suite) treat the contradictory `mixed="true"` declaration
+/// as a structural error. The "no-particle and no explicit mixed flag"
+/// case is the only scenario that must be skipped, because there is then
+/// no inconsistency.
 fn validate_extension_mixed_parity(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
@@ -1275,12 +1307,14 @@ fn validate_extension_mixed_parity(
     let ComplexContentResult::Complex(ref derived_complex) = type_def.content else {
         return Ok(());
     };
-    if base_complex.particle.is_none() || derived_complex.particle.is_none() {
-        return Ok(());
-    }
     let base_mixed = effective_mixed_of(base_type, base_complex);
     let derived_mixed = effective_mixed_of(type_def, derived_complex);
     if derived_mixed == base_mixed {
+        return Ok(());
+    }
+    // No own particle and no explicit mixed declaration → parity is
+    // trivially inherited from the base; nothing to check.
+    if derived_complex.particle.is_none() && !derived_complex.mixed && !type_def.mixed {
         return Ok(());
     }
     let (location, type_name) = type_error_context(schema_set, type_def);
@@ -6232,6 +6266,24 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
             // Built-in xsi:* attributes have `source: None`; skip them.
             continue;
         }
+        // a-props-correct.1 / src-attribute: the {type definition} of every
+        // attribute must be a simple type definition. attD002 (`type="ct"`
+        // where `ct` is a complex type with simpleContent).
+        if matches!(attr.resolved_type, Some(TypeKey::Complex(_))) {
+            let attr_name = attr
+                .name
+                .map(|n| schema_set.name_table.resolve(n).to_string())
+                .unwrap_or_else(|| "(anonymous)".to_string());
+            return Err(SchemaError::structural(
+                "a-props-correct",
+                format!(
+                    "Attribute '{}' references a complex type; the type definition of an \
+                     attribute must be a simple type",
+                    attr_name,
+                ),
+                schema_set.locate(attr.source.as_ref()),
+            ));
+        }
         let (value, is_fixed) = match (&attr.default_value, &attr.fixed_value) {
             (Some(v), _) => (v.as_str(), false),
             (_, Some(v)) => (v.as_str(), true),
@@ -6292,6 +6344,70 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                             .or_else(|| d.default_value.as_deref().map(|v| (v, false)))
                     })
                 });
+
+            // au-props-correct.2 (§3.5.6): if the referenced attribute
+            // declaration has `fixed`, then a `fixed` on the attribute use
+            // must denote the same value (the use's `default` is forbidden
+            // when the declaration is fixed). Literal comparison after
+            // whitespace collapse — sufficient for the `xs:string`-flavoured
+            // fixed-value cases the test suite exercises (addB108, attO025).
+            if let (Some(use_fixed), Some(decl_fixed)) = (
+                attr_use.attribute.fixed_value.as_deref(),
+                ref_decl.and_then(|d| d.fixed_value.as_deref()),
+            ) {
+                use crate::types::WhitespaceMode;
+                let normalize = |s: &str| -> String {
+                    crate::types::facets::normalize_whitespace(s, WhitespaceMode::Collapse)
+                };
+                if normalize(use_fixed) != normalize(decl_fixed) {
+                    let attr_name = ref_decl
+                        .and_then(|d| d.name)
+                        .map(|n| schema_set.name_table.resolve(n).to_string())
+                        .unwrap_or_else(|| "(anonymous)".to_string());
+                    let location = attr_use
+                        .attribute
+                        .source
+                        .as_ref()
+                        .or(ct.source.as_ref())
+                        .and_then(|s| schema_set.source_maps.locate(s));
+                    return Err(SchemaError::structural(
+                        "au-props-correct",
+                        format!(
+                            "Attribute use 'fixed' value '{}' on '{}' does not match the \
+                             referenced attribute declaration's 'fixed' value '{}'",
+                            use_fixed, attr_name, decl_fixed,
+                        ),
+                        location,
+                    ));
+                }
+            }
+
+            // au-props-correct.2 also forbids a `default` on the use when
+            // the declaration has `fixed`.
+            if attr_use.attribute.default_value.is_some()
+                && ref_decl.and_then(|d| d.fixed_value.as_deref()).is_some()
+            {
+                let attr_name = ref_decl
+                    .and_then(|d| d.name)
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_else(|| "(anonymous)".to_string());
+                let location = attr_use
+                    .attribute
+                    .source
+                    .as_ref()
+                    .or(ct.source.as_ref())
+                    .and_then(|s| schema_set.source_maps.locate(s));
+                return Err(SchemaError::structural(
+                    "au-props-correct",
+                    format!(
+                        "Attribute use cannot specify 'default' for '{}' because the \
+                         referenced attribute declaration has 'fixed'",
+                        attr_name,
+                    ),
+                    location,
+                ));
+            }
+
             let Some((value, is_fixed)) = value_constraint else {
                 continue;
             };
@@ -7498,6 +7614,92 @@ pub fn validate_no_xsi_attribute_declarations(schema_set: &SchemaSet) -> SchemaR
             .map(|n| schema_set.name_table.resolve_ref(n).to_string())
             .unwrap_or_else(|| "(anonymous)".to_string());
         let location = schema_set.locate(attr.source.as_ref());
+        return Err(SchemaError::structural(
+            "no-xsi",
+            format!(
+                "Attribute declaration '{}' has target namespace \
+                 'http://www.w3.org/2001/XMLSchema-instance', which is \
+                 reserved (no-xsi, §3.2.6.4)",
+                attr_name
+            ),
+            location,
+        ));
+    }
+
+    // The same constraint must also apply to inline attribute declarations
+    // inside attribute groups and complex types — `<attribute>` children
+    // without a `ref=` declare a fresh attribute whose effective namespace
+    // is determined by `form` / `attributeFormDefault`. With
+    // `attributeFormDefault="qualified"` and `targetNamespace=XSI`
+    // (attKb018a), each unqualified attribute in an attribute group is
+    // promoted to the XSI namespace and must be rejected.
+    //
+    // Inline `target_namespace=XSI` on an `<attribute>` child reaches the
+    // arena unchanged. The form/default-driven path only routes to XSI
+    // when the owner's `target_namespace` is the XSI namespace, which is
+    // exceedingly rare; skip the per-use scan when no document declares
+    // XSI as its target.
+    let any_xsi_owner = schema_set
+        .documents
+        .iter()
+        .any(|d| d.target_namespace == Some(well_known::XSI_NAMESPACE));
+    let owners_to_scan = any_xsi_owner;
+    for (_key, group) in schema_set.arenas.attribute_groups.iter() {
+        check_no_xsi_in_attribute_uses(
+            schema_set,
+            &group.attributes,
+            group.target_namespace,
+            owners_to_scan,
+        )?;
+    }
+    for (_key, ct) in schema_set.arenas.complex_types.iter() {
+        check_no_xsi_in_attribute_uses(
+            schema_set,
+            &ct.attributes,
+            ct.target_namespace,
+            owners_to_scan,
+        )?;
+    }
+    Ok(())
+}
+
+/// Apply `no-xsi` (§3.2.6.4) to a slice of attribute uses owned by an
+/// attribute group or complex type. Skips `ref=` uses (they delegate to
+/// the global declaration, which is already covered by the global pass).
+fn check_no_xsi_in_attribute_uses(
+    schema_set: &SchemaSet,
+    attrs: &[crate::parser::frames::AttributeUseResult],
+    owner_target_namespace: Option<NameId>,
+    owner_could_be_xsi: bool,
+) -> SchemaResult<()> {
+    use crate::namespace::table::well_known;
+
+    for attr_use in attrs {
+        if attr_use.attribute.ref_name.is_some() {
+            continue;
+        }
+        // Fast-path: when the attribute carries no explicit XSI target and
+        // no owner document declares XSI as its target, the
+        // form/default-driven effective namespace can never be XSI.
+        let explicit_xsi = attr_use.attribute.target_namespace == Some(well_known::XSI_NAMESPACE);
+        if !explicit_xsi && !owner_could_be_xsi {
+            continue;
+        }
+        let effective_ns = schema_set.effective_local_attribute_namespace(
+            attr_use.attribute.target_namespace,
+            attr_use.attribute.form.as_deref(),
+            attr_use.attribute.source.as_ref(),
+            owner_target_namespace,
+        );
+        if effective_ns != Some(well_known::XSI_NAMESPACE) {
+            continue;
+        }
+        let attr_name = attr_use
+            .attribute
+            .name
+            .map(|n| schema_set.name_table.resolve_ref(n).to_string())
+            .unwrap_or_else(|| "(anonymous)".to_string());
+        let location = schema_set.locate(attr_use.attribute.source.as_ref());
         return Err(SchemaError::structural(
             "no-xsi",
             format!(

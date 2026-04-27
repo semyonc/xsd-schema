@@ -480,14 +480,22 @@ impl SchemaSet {
             return true;
         }
 
-        // Everything derives from anyType. For Complex→Complex with non-empty
-        // exclusions we must walk the chain to verify no step uses a blocked
-        // method (§3.4.6.5). Other combinations (Simple→Complex, etc.) never
-        // use extension in their chain to anyType, so the fast path is safe.
-        if self.is_any_type(base)
-            && (exclude_methods.is_empty() || !matches!(derived, TypeKey::Complex(_)))
-        {
-            return true;
+        // Everything derives from anyType. With no method exclusions we can
+        // short-circuit, but with a non-empty exclusion mask we must walk the
+        // chain to verify no step uses a blocked method (§3.4.6.5 / §3.16.6).
+        // For Simple→AnyType the chain *always* terminates with the
+        // anySimpleType→anyType restriction step, so an exclusion containing
+        // RESTRICTION (or matching the simple's variety method) blocks it
+        // (cvc-elt.4.3 with `block="restriction"` / `block="#all"` and
+        // declared anyType: elemT026/27/28/29, elemT054/55/56/57).
+        if self.is_any_type(base) {
+            if exclude_methods.is_empty() {
+                return true;
+            }
+            if let TypeKey::Simple(d) = derived {
+                return self.is_simple_chain_to_any_type_ok(d, exclude_methods);
+            }
+            // Complex→AnyType falls through to is_complex_type_derived_from below.
         }
 
         match (derived, base) {
@@ -511,6 +519,43 @@ impl SchemaSet {
                 self.is_complex_derived_from_simple(d, b, exclude_methods)
             }
         }
+    }
+
+    /// Whether the simple→anyType derivation chain rooted at `derived` avoids
+    /// every method in `exclude_methods`. Used by `is_type_derived_from` when
+    /// `base = anyType` and `exclude_methods` is non-empty (§3.16.6 + the
+    /// implicit anySimpleType→anyType restriction step).
+    fn is_simple_chain_to_any_type_ok(
+        &self,
+        derived: SimpleTypeKey,
+        exclude_methods: DerivationSet,
+    ) -> bool {
+        use crate::parser::frames::SimpleTypeVariety;
+
+        let mut current = derived;
+        let mut visited = std::collections::HashSet::new();
+
+        while visited.insert(current) {
+            if let Some(type_def) = self.arenas.simple_types.get(current) {
+                let method_flag = match type_def.variety {
+                    SimpleTypeVariety::Atomic => DerivationSet::RESTRICTION,
+                    SimpleTypeVariety::List => DerivationSet::LIST,
+                    SimpleTypeVariety::Union => DerivationSet::UNION,
+                };
+                if exclude_methods.contains(method_flag) {
+                    return false;
+                }
+                if let Some(TypeKey::Simple(simple_base)) = type_def.resolved_base_type {
+                    current = simple_base;
+                    continue;
+                }
+            }
+            // Fell off the user-defined simple chain — the next step is the
+            // anySimpleType→anyType restriction in the built-in hierarchy.
+            return !exclude_methods.contains(DerivationSet::RESTRICTION);
+        }
+        // Cycle detected (shouldn't happen for resolved schemas).
+        false
     }
 
     /// Check if simple type `derived` is derived from simple type `base` with method filtering.

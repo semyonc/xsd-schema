@@ -837,6 +837,20 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
                 }
             });
 
+        // §3.3.2 / §3.3.1: when a local element has neither `type=` nor
+        // an inline `<simpleType>` / `<complexType>` (and resolved_type is
+        // therefore not yet set), the {type definition} property defaults to
+        // xs:anyType. Otherwise content-model initialization in
+        // `init_content_model` falls back to (Simple, TextOnly), causing
+        // valid mixed/lax-wildcard children to be rejected (xsd002.v01).
+        let resolved_type = resolved_type.or_else(|| match &job.elem.type_ref {
+            // Only fall back when no type was specified at all. If a QName
+            // type-ref was given but didn't resolve, src-resolve below
+            // surfaces the error.
+            None => Some(TypeKey::Complex(schema_set.any_type_key())),
+            _ => None,
+        });
+
         // src-resolve §3.3.6: a local element's QName-typed type-ref must
         // resolve. Falling back silently masks bad schemas (s3_12si02).
         if resolved_type.is_none() {

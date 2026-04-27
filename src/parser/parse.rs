@@ -529,6 +529,33 @@ fn handle_start_element(
         &mut state.ns_context,
         source_ref.clone(),
     )?;
+    // sch-props-correct: attributes on XSD-namespace elements must be
+    // unqualified — an explicit `xsd:`/`xs:` prefix on an XSD attribute
+    // (e.g. `xsd:targetNamespace`) is not the same lexical attribute as the
+    // unqualified one, and the schema-for-schemas content model only
+    // declares the unqualified attribute. addB070a (test64756.xsd):
+    // `<xsd:schema ... xsd:targetNamespace="http://foobar">` must be rejected.
+    if state.is_in_xsd_namespace(element_ns) {
+        let xsd_ns = state.get_xsd_ns_id();
+        for attr in &parsed_attrs {
+            if attr.prefix.is_some() && attr.namespace == xsd_ns {
+                let attr_name = state.ns_context.name_table().resolve(attr.local_name);
+                let location = attr
+                    .source
+                    .as_ref()
+                    .map(|s| s.to_location(state.source_map));
+                state.recover_or_fail(SchemaError::structural(
+                    "sch-props-correct",
+                    format!(
+                        "XSD attribute '{}' on element '{}' must be unqualified, not in \
+                         the XSD namespace",
+                        attr_name, local_name,
+                    ),
+                    location,
+                ))?;
+            }
+        }
+    }
     let (xsd_attrs, foreign_attrs) =
         categorize_attributes(parsed_attrs, state.ns_context.name_table());
     let attr_map = AttributeMap::new(xsd_attrs);
@@ -612,25 +639,32 @@ fn handle_start_element(
             return Ok(());
         }
 
+        // `xs:appinfo` / `xs:documentation` (and any frame opting into
+        // `accepts_foreign_children`) treats its content as opaque XML —
+        // including child elements that happen to be in the XSD namespace.
+        // Without this gate a `<xs:complexType>` literal embedded in
+        // documentation prose (addB194) would be parsed as a real
+        // schema-level complexType and fail src-ct's "inline complexType
+        // cannot have name" check.
+        if accepts_foreign {
+            push_skip_frame(state, source_ref, foreign_attrs)?;
+            return Ok(());
+        }
+
         if !is_in_xsd_ns {
-            // Non-XSD child element. Frames like `xs:appinfo`/`xs:documentation`
-            // explicitly accept arbitrary foreign content; everywhere else the
-            // schema-for-schemas content model forbids foreign elements
-            // (sch-props-correct). Surface a structural error and (in error
-            // recovery mode) skip the subtree so subsequent valid content can
-            // still be parsed.
-            if !accepts_foreign {
-                let location = source_ref.as_ref().map(|s| s.to_location(state.source_map));
-                state.recover_or_fail(SchemaError::structural(
-                    "sch-props-correct",
-                    format!(
-                        "Foreign-namespace element '{}' is not allowed here",
-                        local_name
-                    ),
-                    location,
-                ))?;
-            }
-            // For appinfo/documentation (or under recovery), skip it.
+            // Non-XSD child element. The schema-for-schemas content model
+            // forbids foreign elements (sch-props-correct). Surface a
+            // structural error and (in error recovery mode) skip the
+            // subtree so subsequent valid content can still be parsed.
+            let location = source_ref.as_ref().map(|s| s.to_location(state.source_map));
+            state.recover_or_fail(SchemaError::structural(
+                "sch-props-correct",
+                format!(
+                    "Foreign-namespace element '{}' is not allowed here",
+                    local_name
+                ),
+                location,
+            ))?;
             push_skip_frame(state, source_ref, foreign_attrs)?;
             return Ok(());
         }

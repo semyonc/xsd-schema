@@ -138,6 +138,17 @@ impl Frame for SimpleTypeFrame {
     }
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
+        // src-simple-type: a simpleType definition must have exactly one of
+        // <restriction>, <list>, or <union> as a derivation child. A bare
+        // <simpleType> with no derivation (e.g. only an <annotation>) is
+        // structurally invalid (stB001).
+        if self.variety.is_none() {
+            return Err(SchemaError::structural(
+                "src-simple-type",
+                "simpleType must contain one of <restriction>, <list>, or <union>",
+                None,
+            ));
+        }
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,
@@ -663,6 +674,13 @@ pub struct ListFrame {
     inline_type: Option<SimpleTypeResult>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
+    /// Set on `<simpleType>` start (before the inline frame is pushed and
+    /// before `attach` populates `inline_type`). Used by `allows()` to
+    /// reject `<annotation>` siblings that follow a `<simpleType>`, since
+    /// `inline_type.is_some()` is also the natural "saw it" signal once
+    /// `attach` has run. The flag captures the earlier moment so that any
+    /// hypothetical pre-attach query also rejects (stD017).
+    saw_inline_type: bool,
 }
 
 impl ListFrame {
@@ -689,20 +707,29 @@ impl ListFrame {
             inline_type: None,
             source,
             foreign_attributes: Vec::new(),
+            saw_inline_type: false,
         })
     }
 }
 
 impl Frame for ListFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        matches!(local_name, xsd_names::ANNOTATION | xsd_names::SIMPLE_TYPE)
+        match local_name {
+            xsd_names::ANNOTATION => !self.saw_inline_type,
+            xsd_names::SIMPLE_TYPE => true,
+            _ => false,
+        }
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
         matches!(local_name, "itemType" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name == xsd_names::SIMPLE_TYPE {
+            self.saw_inline_type = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {
@@ -710,6 +737,13 @@ impl Frame for ListFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Type(TypeFrameResult::Simple(st)) => {
+                if self.inline_type.is_some() {
+                    return Err(SchemaError::structural(
+                        "src-list-itemType-or-simpleType",
+                        "xs:list may contain at most one inline <simpleType>",
+                        None,
+                    ));
+                }
                 self.inline_type = Some(*st);
             }
             FrameResult::Skip => {}
@@ -789,6 +823,10 @@ pub struct UnionFrame {
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
+    /// Whether a `<simpleType>` member has been seen — once true, no more
+    /// `<annotation>` siblings are allowed (annotation must come first per
+    /// the xs:union content model). stE016.
+    saw_inline_type: bool,
 }
 
 impl UnionFrame {
@@ -817,20 +855,29 @@ impl UnionFrame {
             annotation: None,
             source,
             foreign_attributes: Vec::new(),
+            saw_inline_type: false,
         })
     }
 }
 
 impl Frame for UnionFrame {
     fn allows(&self, local_name: &str, _name_table: &NameTable) -> bool {
-        matches!(local_name, xsd_names::ANNOTATION | xsd_names::SIMPLE_TYPE)
+        match local_name {
+            xsd_names::ANNOTATION => !self.saw_inline_type,
+            xsd_names::SIMPLE_TYPE => true,
+            _ => false,
+        }
     }
 
     fn allows_attribute(&self, local_name: &str, _name_table: &NameTable) -> bool {
         matches!(local_name, "memberTypes" | "id")
     }
 
-    fn on_child_start(&mut self, _local_name: &str, _name_table: &NameTable) {}
+    fn on_child_start(&mut self, local_name: &str, _name_table: &NameTable) {
+        if local_name == xsd_names::SIMPLE_TYPE {
+            self.saw_inline_type = true;
+        }
+    }
 
     fn attach(&mut self, child: FrameResult) -> SchemaResult<()> {
         match child {

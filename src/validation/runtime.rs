@@ -11,7 +11,7 @@ use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
 use crate::ids::{
     AttributeGroupKey, AttributeKey, ComplexTypeKey, ElementKey, IdentityConstraintKey, NameId,
-    NotationKey, TypeKey,
+    NotationKey, SimpleTypeKey, TypeKey,
 };
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
@@ -172,6 +172,11 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     no_namespace_schema_location_hints: Vec<NoNamespaceSchemaLocationHint>,
     /// Base URI of the instance document (set by caller for relative URI resolution).
     instance_base_uri: String,
+    /// Cached `xs:ID` simple-type key for XSD 1.0's ct-props-correct.5
+    /// "at most one ID-type attribute per element" runtime check. `None`
+    /// under XSD 1.1 (the rule was removed) so the per-attribute hot path
+    /// short-circuits without any built-in hash lookup or chain walk.
+    cached_xsd10_id_key: Option<SimpleTypeKey>,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -185,6 +190,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         sink: S,
         #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
     ) -> Self {
+        let cached_xsd10_id_key = if schema_set.is_xsd10() {
+            schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id)
+        } else {
+            None
+        };
         ValidationRuntime {
             schema_set,
             subst_groups,
@@ -218,6 +228,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             pending_assertion_frames: Vec::new(),
             #[cfg(feature = "xsd11")]
             deferred_attribute_results: Vec::new(),
+            cached_xsd10_id_key,
             _not_thread_safe: PhantomData,
         }
     }
@@ -1155,7 +1166,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             false
         };
-        let nillable_violation = is_nil && !elem_data.nillable;
+        // cvc-elt.3.1 (XSD 1.0 §3.3.4): the mere *presence* of xsi:nil on a
+        // non-nillable element is invalid, regardless of value. xsi:nil="false"
+        // on a non-nillable element still violates the rule because the element
+        // declaration's {nillable} property must be true wherever xsi:nil
+        // appears.
+        let nillable_violation = xsi_nil.is_some() && !elem_data.nillable;
 
         // 8. Initialize content model and determine ContentType
         let (content_state, content_type) = self.init_content_model(type_key);
@@ -1182,7 +1198,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.content_state = content_state;
         ev_state.content_type = Some(content_type);
         ev_state.is_nil = is_nil;
-        ev_state.validity = if xsi_type_invalid || abstract_type_invalid {
+        ev_state.validity = if xsi_type_invalid || abstract_type_invalid || nillable_violation {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid
@@ -1247,7 +1263,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.report_error(
                 "cvc-elt.3.1",
                 format!(
-                    "Element '{}' is not nillable but xsi:nil='true' was specified",
+                    "Element '{}' is not nillable but xsi:nil was specified",
                     elem_name,
                 ),
             );
@@ -1536,6 +1552,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .last()
             .map_or(0, |ev| ev.error_codes.len());
         let mut result = self.validate_attribute_against_type(ct_key, local_name, namespace, value);
+        // ct-props-correct.5 (XSD 1.0 only) / cvc-complex-type per-element
+        // ID attribute counting: an element instance may carry at most one
+        // attribute whose effective type is xs:ID (or derived). XSD 1.1
+        // explicitly relaxed this rule (the constraint was removed in the
+        // 1.1 errata pass), so the check is gated on `cached_xsd10_id_key`
+        // — populated only under XSD 1.0 (None otherwise), avoiding both
+        // the per-attribute version check and the per-attribute built-in
+        // hash lookup. (attZ014a/b)
+        let attr_is_id = self.cached_xsd10_id_key.is_some_and(|id_key| {
+            matches!(result.schema_type, Some(TypeKey::Simple(sk))
+                if self.schema_set.derives_from(sk, id_key))
+        });
         // Slice attribute-specific error codes and remove from parent
         if let Some(ev) = self.validation_stack.last_mut() {
             if ev.error_codes.len() > ec_snapshot {
@@ -1554,6 +1582,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ev.any_attr_not_full = true;
                     ev.any_attr_not_none = true;
                 }
+            }
+        }
+        if attr_is_id {
+            let already_seen = self
+                .validation_stack
+                .last()
+                .is_some_and(|ev| ev.seen_id_attr);
+            if already_seen {
+                let attr_name = self.schema_set.name_table.resolve(local_name).to_string();
+                self.report_error(
+                    "cvc-complex-type",
+                    format!(
+                        "Element has more than one attribute of type xs:ID (or a type \
+                         derived from xs:ID); '{}' is the second such attribute",
+                        attr_name,
+                    ),
+                );
+                result.validity = SchemaValidity::Invalid;
+            } else if let Some(ev) = self.validation_stack.last_mut() {
+                ev.seen_id_attr = true;
             }
         }
         #[cfg(feature = "xsd11")]

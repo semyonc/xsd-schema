@@ -95,6 +95,11 @@ pub struct ElementValidationState {
     pub no_namespace_schema_location_hint_start: usize,
     /// Set of (namespace, local_name) pairs for attributes already seen
     pub seen_attributes: HashSet<(Option<NameId>, NameId)>,
+    /// Whether an ID-typed attribute has already been seen on this element.
+    /// Used to enforce the "at most one ID-type attribute per element" rule
+    /// (XSD 1.0 §3.4.4 / §3.5.6 ct-props-correct.5) at runtime, after
+    /// wildcard-matched globals contribute.
+    pub seen_id_attr: bool,
     /// Accumulated text content for the element
     pub text_content: String,
     /// Whether any text nodes have been seen
@@ -171,6 +176,7 @@ impl ElementValidationState {
             schema_location_hint_start: 0,
             no_namespace_schema_location_hint_start: 0,
             seen_attributes: HashSet::new(),
+            seen_id_attr: false,
             text_content: String::new(),
             has_text: false,
             has_element_children: false,

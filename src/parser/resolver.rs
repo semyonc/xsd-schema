@@ -1445,6 +1445,21 @@ pub fn resolve_all_directives(
                 }
             }
         }
+        // src-import §4.2.3 clause 1.2 (XSD 1.0) / §4.2.6.1 clause 1.2 (XSD
+        // 1.1): if the `namespace` attribute is absent, the enclosing
+        // <schema> must have a targetNamespace attribute. addB008 / addB035.
+        if import.namespace.is_none() && target_namespace.is_none() {
+            result.errors.push(SchemaError::structural(
+                "src-import",
+                "xs:import without 'namespace' requires the enclosing schema to have \
+                 a 'targetNamespace' attribute",
+                import
+                    .source
+                    .as_ref()
+                    .and_then(|s| schema_set.source_maps.locate(s)),
+            ));
+            continue;
+        }
         match resolver.process_import(
             import.namespace.as_deref(),
             import.schema_location.as_deref(),
