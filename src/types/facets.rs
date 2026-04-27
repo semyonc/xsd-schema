@@ -1732,12 +1732,25 @@ pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> String {
     }
 }
 
-/// Count total significant digits in a decimal value
+/// Count total significant digits in a decimal value.
+///
+/// Per Datatypes Part 2 §4.3.11.4 the `totalDigits` constraint counts the
+/// digits of the unscaled integer mantissa `j` in the canonical
+/// representation `i = j × 10^-k` (with leading zeros excluded). For
+/// example `0.12345 = 12345 × 10^-5` has totalDigits = 5 — the leading `0`
+/// before the decimal point in the lexical form must not be counted.
 fn count_total_digits(value: &rust_decimal::Decimal) -> u32 {
-    // Get absolute value and remove trailing zeros
-    let s = value.abs().normalize().to_string();
-    // Count digits, excluding decimal point and leading zeros after decimal
-    s.chars().filter(|c| c.is_ascii_digit()).count() as u32
+    let normalized = value.abs().normalize();
+    let mut m = normalized.mantissa().unsigned_abs();
+    if m == 0 {
+        return 1;
+    }
+    let mut count = 0u32;
+    while m > 0 {
+        count += 1;
+        m /= 10;
+    }
+    count
 }
 
 /// Count fraction digits in a decimal value

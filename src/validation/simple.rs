@@ -299,6 +299,15 @@ fn validate_atomic_type(
             if val.schema_type.is_none() {
                 val.schema_type = Some(sk);
             }
+            // XSD 1.0 §3.2.7.2: year zero ("0000") is not allowed in dateTime,
+            // date, gYear, or gYearMonth lexical forms. XSD 1.1 explicitly
+            // permits 0000 as the representation of 1 BCE.
+            // XSD 1.0 §3.2.4 / §3.2.5 also omit `+INF` from the special
+            // float / double lexicals enumerated by XSD 1.1 §3.3.16/17.
+            if schema_set.is_xsd10() {
+                check_xsd10_year_zero(&val, value)?;
+                check_xsd10_plus_inf(&val, value)?;
+            }
             // XSD 1.1: evaluate assertion facets
             #[cfg(feature = "xsd11")]
             evaluate_assertion_facets(&val, &facets, schema_set, Some(sk))?;
@@ -312,6 +321,56 @@ fn validate_atomic_type(
             let code = errors::value_error_constraint_code(&type_err);
             Err(errors::from_value_error(code, type_err, None))
         }
+    }
+}
+
+/// XSD 1.0 §3.2.4 / §3.2.5: `+INF` is not in the lexical space (added in
+/// Datatypes 1.1). The collapsed value is checked against the original
+/// lexical form (after whitespace collapse, since `xs:float` / `xs:double`
+/// declare `whiteSpace = collapse`).
+fn check_xsd10_plus_inf(val: &XmlValue, raw: &str) -> Result<(), ValidationError> {
+    use crate::types::value::XmlAtomicValue;
+    let is_float_or_double = matches!(
+        val.value,
+        XmlValueKind::Atomic(XmlAtomicValue::Float(_)) | XmlValueKind::Atomic(XmlAtomicValue::Double(_))
+    );
+    if !is_float_or_double {
+        return Ok(());
+    }
+    let collapsed =
+        crate::types::facets::normalize_whitespace(raw, crate::types::facets::WhitespaceMode::Collapse);
+    if collapsed == "+INF" {
+        Err(errors::error(
+            "cvc-datatype-valid",
+            format!("'+INF' is not a valid XSD 1.0 float/double lexical form (value '{}')", raw),
+            None,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// XSD 1.0 §3.2.7.2: reject year 0000 in dateTime / date / gYear / gYearMonth.
+fn check_xsd10_year_zero(val: &XmlValue, raw: &str) -> Result<(), ValidationError> {
+    use crate::types::value::XmlAtomicValue;
+    let year_zero = match &val.value {
+        XmlValueKind::Atomic(XmlAtomicValue::DateTime(v)) => v.year == 0,
+        XmlValueKind::Atomic(XmlAtomicValue::Date(v)) => v.year == 0,
+        XmlValueKind::Atomic(XmlAtomicValue::GYear(v)) => v.year == 0,
+        XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(v)) => v.year == 0,
+        _ => false,
+    };
+    if year_zero {
+        Err(errors::error(
+            "cvc-datatype-valid",
+            format!(
+                "Year 0000 is not a valid XSD 1.0 lexical form (value '{}'); use '-0001' for 1 BCE",
+                raw
+            ),
+            None,
+        ))
+    } else {
+        Ok(())
     }
 }
 

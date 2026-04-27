@@ -1002,10 +1002,68 @@ impl TypeValidator for DoubleValidator {
     }
 }
 
+/// Validate strict XSD lexical form for `xs:float` / `xs:double`.
+///
+/// Datatypes 1.1 §3.3.16 / §3.3.17 enumerate the legal special values as
+/// `INF`, `+INF`, `-INF`, and `NaN` (case-sensitive). XSD 1.0 omits the
+/// `+INF` form (Datatypes 1.0 §3.2.4 / §3.2.5); the version-specific
+/// rejection of `+INF` is handled post-validation in `validate_atomic_type`.
+/// Anything else must match the numeric production
+/// `('+'|'-')? (digits ('.' digits?)? | '.' digits) ([eE] ('+'|'-')? digits)?`.
+/// Rust's `f32::from_str` / `f64::from_str` accept additional forms
+/// (`inf`, `nan`, `infinity`, `+NaN`, etc.) — we pre-validate to reject them.
+pub fn is_valid_xsd_float_lexical(s: &str) -> bool {
+    if s == "INF" || s == "-INF" || s == "+INF" || s == "NaN" {
+        return true;
+    }
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let mut has_int_digits = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        has_int_digits = true;
+        i += 1;
+    }
+    let mut has_frac_digits = false;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            has_frac_digits = true;
+            i += 1;
+        }
+    }
+    if !has_int_digits && !has_frac_digits {
+        return false;
+    }
+    if i < bytes.len() && (bytes[i] == b'e' || bytes[i] == b'E') {
+        i += 1;
+        if i < bytes.len() && (bytes[i] == b'+' || bytes[i] == b'-') {
+            i += 1;
+        }
+        let mut has_exp_digits = false;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            has_exp_digits = true;
+            i += 1;
+        }
+        if !has_exp_digits {
+            return false;
+        }
+    }
+    i == bytes.len()
+}
+
 /// Parse XSD float with special value handling
 fn parse_float(s: &str) -> Result<f32, String> {
+    if !is_valid_xsd_float_lexical(s) {
+        return Err(format!("Invalid xs:float lexical form: '{}'", s));
+    }
     match s {
-        "INF" => Ok(f32::INFINITY),
+        "INF" | "+INF" => Ok(f32::INFINITY),
         "-INF" => Ok(f32::NEG_INFINITY),
         "NaN" => Ok(f32::NAN),
         _ => s
@@ -1016,8 +1074,11 @@ fn parse_float(s: &str) -> Result<f32, String> {
 
 /// Parse XSD double with special value handling
 fn parse_double(s: &str) -> Result<f64, String> {
+    if !is_valid_xsd_float_lexical(s) {
+        return Err(format!("Invalid xs:double lexical form: '{}'", s));
+    }
     match s {
-        "INF" => Ok(f64::INFINITY),
+        "INF" | "+INF" => Ok(f64::INFINITY),
         "-INF" => Ok(f64::NEG_INFINITY),
         "NaN" => Ok(f64::NAN),
         _ => s
@@ -2227,6 +2288,11 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
 }
 
 /// Parse time part (HH:MM:SS(.sss)?)
+///
+/// Per Datatypes Part 2 §3.3.8 / §3.3.9 the hour, minute, and integer-second
+/// fields must each be exactly two ASCII digits. No leading sign or other
+/// non-digit characters are permitted (Rust's `from_str_radix` accepts a
+/// leading `+` even for unsigned types — we reject it explicitly here).
 fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8, Decimal)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 3 {
@@ -2235,6 +2301,43 @@ fn parse_time_part(s: &str, type_name: &'static str) -> ValidationResult<(u8, u8
             type_name,
             message: "Invalid time format".to_string(),
         });
+    }
+
+    let is_two_ascii_digits = |t: &str| t.len() == 2 && t.bytes().all(|b| b.is_ascii_digit());
+    if !is_two_ascii_digits(parts[0]) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Hour must be exactly two ASCII digits".to_string(),
+        });
+    }
+    if !is_two_ascii_digits(parts[1]) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Minute must be exactly two ASCII digits".to_string(),
+        });
+    }
+    let sec_str = parts[2];
+    let (sec_int, sec_frac) = match sec_str.find('.') {
+        Some(p) => (&sec_str[..p], Some(&sec_str[p + 1..])),
+        None => (sec_str, None),
+    };
+    if !is_two_ascii_digits(sec_int) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name,
+            message: "Seconds integer part must be exactly two ASCII digits".to_string(),
+        });
+    }
+    if let Some(frac) = sec_frac {
+        if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ValidationError::InvalidLexical {
+                value: s.to_string(),
+                type_name,
+                message: "Seconds fractional part must be one or more ASCII digits".to_string(),
+            });
+        }
     }
 
     let hour: u8 = parts[0]
@@ -2434,11 +2537,26 @@ fn parse_gmonthday(s: &str) -> ValidationResult<GMonthDayValue> {
             message: "Invalid day".to_string(),
         })?;
 
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gMonthDay",
-            message: "Value out of range".to_string(),
+            message: "Month out of range".to_string(),
+        });
+    }
+    // Day must exist in the given month. Year is unspecified, so allow
+    // Feb 29 (a leap year is possible) but still reject Feb 30/31, Apr 31, etc.
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => 29,
+        _ => unreachable!(),
+    };
+    if !(1..=max_day).contains(&day) {
+        return Err(ValidationError::InvalidLexical {
+            value: s.to_string(),
+            type_name: "gMonthDay",
+            message: "Day does not exist in the given month".to_string(),
         });
     }
 

@@ -2117,6 +2117,53 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         ev_state.member_type = result.member_type;
                         ev_state.typed_value = Some(result.typed_value);
                         ev_state.normalized_value = result.normalized_value;
+
+                        // QName/NOTATION prefix-binding check (Datatypes
+                        // §3.3.18 / §3.3.19): the simple-type validator
+                        // doesn't see namespaces, so an undeclared prefix
+                        // (e.g. `xmlns:xsi` per W3C bug 4053) must be
+                        // flagged here against the element's snapshot.
+                        // Apply only to single (atomic) QName/NOTATION
+                        // values — list-of-QName tokens are handled
+                        // elsewhere and may legitimately use any prefix
+                        // syntax in the joined text.
+                        let needs_qname_check =
+                            ev_state.typed_value.as_ref().is_some_and(|v| {
+                                matches!(
+                                    v.value,
+                                    crate::types::value::XmlValueKind::Atomic(_)
+                                ) && (v.type_code == XmlTypeCode::QName
+                                    || v.type_code == XmlTypeCode::Notation)
+                            });
+                        if needs_qname_check && ev_state.validity == SchemaValidity::Valid {
+                            if let Some(ctx) = ev_state.ns_context.as_ref() {
+                                let raw = ev_state.text_content.trim();
+                                if let Some(colon_pos) = raw.find(':') {
+                                    let prefix = &raw[..colon_pos];
+                                    let prefix_id = self.schema_set.name_table.add(prefix);
+                                    if ctx.resolve_prefix(prefix_id).is_none() {
+                                        let elem_name = self
+                                            .schema_set
+                                            .name_table
+                                            .resolve(ev_state.local_name)
+                                            .to_string();
+                                        let err = errors::error(
+                                            "cvc-datatype-valid.1.2.1",
+                                            format!(
+                                                "Element '{}' has QName value '{}' with undeclared prefix '{}'",
+                                                elem_name, raw, prefix
+                                            ),
+                                            self.current_location.clone(),
+                                        );
+                                        self.report_validation_error_to(
+                                            err,
+                                            &mut ev_state.error_codes,
+                                        );
+                                        ev_state.validity = SchemaValidity::Invalid;
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(err) => {
                         self.report_validation_error_to(err, &mut ev_state.error_codes);
