@@ -973,6 +973,14 @@ impl TestRunner {
         // Build and compile schema(s) using SchemaSetBuilder (public API).
         // This automatically resolves xs:import / xs:include directives.
         // Uses DtdEntityExpandingLoader to handle schemas with DTD entity declarations.
+        //
+        // The conformance harness always uses `RegexCompat::Strict`. The
+        // `LenientMs` mode is a downstream feature for callers loading
+        // .NET-authored schemas; the W3C suite has no `expected=Valid`
+        // pattern tests that exercise the unlocked constructs (backrefs,
+        // non-capturing groups, reluctant quantifiers), so wiring it here
+        // would be dead code. See `doc/INTRODUCTION.md` for details and
+        // `lib.rs` re-export `RegexCompat` for the public API.
         let mut builder = make_schema_builder(&test.version);
         let mut parse_error: Option<String> = None;
 

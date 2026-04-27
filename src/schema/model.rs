@@ -29,6 +29,26 @@ pub enum XsdVersion {
     V1_1,
 }
 
+/// Regex compatibility mode.
+///
+/// Controls how strictly the pattern facet grammar is enforced. The default
+/// `Strict` rejects any construct outside XSD Part 2 §F (1.0) / §G (1.1)
+/// regex grammar. `LenientMs` enables a closed list of safely-stripable MS
+/// dialect leniencies for schemas authored against .NET's regex engine —
+/// see `doc/INTRODUCTION.md` for the exact construct list.
+///
+/// This is an enum (not a bool) so future modes can be added without
+/// breaking the API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RegexCompat {
+    /// Strict XSD Part 2 regex grammar. Default.
+    #[default]
+    Strict,
+    /// Tolerate a closed list of MS dialect leniencies (anchors at
+    /// pattern start/end, `(?#...)` comments). See `doc/INTRODUCTION.md`.
+    LenientMs,
+}
+
 bitflags! {
     /// Derivation control flags (for final, block attributes)
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -122,6 +142,9 @@ pub struct SchemaSet {
     /// XSD version mode (1.0 or 1.1)
     pub xsd_version: XsdVersion,
 
+    /// Regex compatibility mode for pattern facets. Default `Strict`.
+    pub regex_compatibility: RegexCompat,
+
     /// Arena storage for all components
     pub arenas: SchemaArenas,
 
@@ -175,6 +198,7 @@ impl SchemaSet {
             documents: Vec::new(),
             namespaces: HashMap::new(),
             xsd_version: version,
+            regex_compatibility: RegexCompat::Strict,
             arenas: SchemaArenas::new(),
             loaded_locations: HashMap::new(),
             chameleon_cache: HashMap::new(),
@@ -199,6 +223,20 @@ impl SchemaSet {
     /// Returns `true` if this schema set is configured for XSD 1.1.
     pub fn is_xsd11(&self) -> bool {
         self.xsd_version == XsdVersion::V1_1
+    }
+
+    /// Set the regex compatibility mode for this schema set.
+    ///
+    /// Affects how pattern facets in subsequently compiled schemas are
+    /// validated. Has no effect on already-compiled patterns. Default is
+    /// `RegexCompat::Strict`.
+    pub fn set_regex_compatibility(&mut self, compat: RegexCompat) {
+        self.regex_compatibility = compat;
+    }
+
+    /// Get the regex compatibility mode for this schema set.
+    pub fn regex_compatibility(&self) -> RegexCompat {
+        self.regex_compatibility
     }
 
     /// Resolve an optional `SourceRef` to its line/column location.

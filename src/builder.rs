@@ -31,7 +31,7 @@ use crate::parser::resolver::{
 #[cfg(feature = "async")]
 use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
 use crate::pipeline::process_loaded_schemas;
-use crate::schema::model::XsdVersion;
+use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
 use std::path::{Path, PathBuf};
 
@@ -128,6 +128,17 @@ impl SchemaSetBuilder {
     /// Create a builder configured for XSD 1.1.
     pub fn xsd11() -> Self {
         Self::with_version(XsdVersion::V1_1)
+    }
+
+    /// Set the regex compatibility mode on the underlying schema set.
+    ///
+    /// Affects how pattern facets in subsequently added/compiled schemas
+    /// are validated. See [`RegexCompat`] and `doc/INTRODUCTION.md` for
+    /// the closed list of leniencies enabled by `LenientMs`. Default is
+    /// `RegexCompat::Strict`.
+    pub fn set_regex_compatibility(&mut self, compat: RegexCompat) -> &mut Self {
+        self.schema_set.set_regex_compatibility(compat);
+        self
     }
 
     /// Create a builder configured for XSD 1.1 with a custom schema loader.

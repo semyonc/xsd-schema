@@ -145,6 +145,9 @@ pub use schema::{
 // Re-export XSD version
 pub use schema::model::XsdVersion;
 
+// Re-export regex compatibility mode
+pub use schema::model::RegexCompat;
+
 // Re-export type system enums
 pub use types::{BuiltinTypes, PrimitiveTypeCode, ValueKind, XmlTypeCode};
 

@@ -120,10 +120,11 @@ use crate::error::{SchemaError, SchemaResult};
 /// Must be called after reference resolution so that all types are fully assembled.
 pub fn compile_all_patterns(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     let xsd_version = schema_set.xsd_version;
+    let regex_compat = schema_set.regex_compatibility;
     let keys: Vec<_> = schema_set.arenas.simple_types.keys().collect();
     for key in keys {
         let type_def = &mut schema_set.arenas.simple_types[key];
-        if let Err(facet_err) = type_def.facets.compile_patterns(xsd_version) {
+        if let Err(facet_err) = type_def.facets.compile_patterns(xsd_version, regex_compat) {
             let source = type_def.source.clone();
             let location = source
                 .as_ref()

@@ -65,6 +65,105 @@ impl ConvertOptions {
     }
 }
 
+/// Apply MS dialect leniencies to a pattern when the schema set is
+/// configured with [`RegexCompat::LenientMs`].
+///
+/// The textual preprocess is intentionally narrow. It only rewrites
+/// constructs that *no* runtime backend accepts natively, so they would
+/// otherwise fail at compile time even with the strict §F/§G grammar
+/// gate skipped:
+///
+/// - `(?#…)` inline comments. Stripped (including the closing `)`).
+///   Both Rust `regex` and regexml reject `(?#` as an unrecognized
+///   group prefix. .NET treats it as a comment per its native syntax.
+///
+/// Other MS dialect constructs (`^`/`$` anchors outside char class,
+/// non-capturing `(?:…)`, backreferences `\1`, reluctant quantifiers
+/// `*?`/`+?`) are left alone — the runtime backend handles them
+/// natively once the strict grammar gate is bypassed:
+///
+/// - Rust `regex` (default features) natively accepts `^`/`$` as
+///   anchors, `(?:…)`, named groups, reluctant quantifiers; it does
+///   *not* support backreferences or lookaround.
+/// - regexml `xpath()` (xsd11 feature) natively accepts `^`/`$`,
+///   backreferences (`op_back_reference.rs`), `(?:…)`, reluctant
+///   quantifiers; it does not implement lookaround at all.
+///
+/// Constructs neither backend supports (lookahead `(?=…)`, lookbehind
+/// `(?<=…)`) still fail at compile time even under `LenientMs` — that
+/// is an engine limit, not a grammar choice.
+///
+/// Returns the (possibly rewritten) pattern. When [`RegexCompat::Strict`]
+/// is in effect, callers should not invoke this.
+pub fn lenient_ms_preprocess(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains("(?#") {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    std::borrow::Cow::Owned(strip_inline_comments(pattern))
+}
+
+/// Strip `(?#…)` comments. Skips comment-like sequences inside character
+/// classes (where `(` has no special meaning). A `\` escapes the following
+/// character so `\(?#x)` is preserved.
+fn strip_inline_comments(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len());
+    let mut in_class = false;
+    let mut chars = pattern.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\\' {
+            out.push(ch);
+            if let Some((_, next)) = chars.next() {
+                out.push(next);
+            }
+            continue;
+        }
+        if ch == '[' {
+            in_class = true;
+            out.push(ch);
+            continue;
+        }
+        if ch == ']' {
+            in_class = false;
+            out.push(ch);
+            continue;
+        }
+        if !in_class && ch == '(' && pattern[idx..].starts_with("(?#") {
+            // Skip past matching `)`. Comments cannot be nested per
+            // .NET / PCRE conventions, but we still respect `\)`.
+            let after = idx + "(?#".len();
+            let remainder = &pattern[after..];
+            let mut close = None;
+            let mut j = 0;
+            let rb = remainder.as_bytes();
+            while j < rb.len() {
+                if rb[j] == b'\\' && j + 1 < rb.len() {
+                    j += 2;
+                    continue;
+                }
+                if rb[j] == b')' {
+                    close = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            if let Some(c) = close {
+                let consume_to = after + c + 1;
+                while let Some(&(next_idx, _)) = chars.peek() {
+                    if next_idx < consume_to {
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                continue;
+            }
+            // Unterminated `(?#` — fall through and emit literally.
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Convert XSD/XPath regex pattern to Rust regex syntax.
 ///
 /// Handles XSD-specific character class escapes:
@@ -762,5 +861,28 @@ mod tests {
                 "expected invalid XSD 1.0 regex: {invalid}",
             );
         }
+    }
+
+    #[test]
+    fn lenient_ms_strips_inline_comments() {
+        assert_eq!(lenient_ms_preprocess("a(?#note)b"), "ab");
+        assert_eq!(lenient_ms_preprocess("(?#start)abc(?#end)"), "abc");
+    }
+
+    #[test]
+    fn lenient_ms_passthrough_when_clean() {
+        // No `(?#` — should return Borrowed without copying.
+        let p = "^abc[0-9]+$";
+        let result = lenient_ms_preprocess(p);
+        assert!(matches!(result, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(result, p);
+    }
+
+    #[test]
+    fn lenient_ms_keeps_anchors_for_engine() {
+        // Anchors are handled natively by both backends after the
+        // `^(?:...)$` wrapping; preprocess no longer strips them.
+        assert_eq!(lenient_ms_preprocess("^abc$"), "^abc$");
+        assert_eq!(lenient_ms_preprocess("[^abc]"), "[^abc]");
     }
 }

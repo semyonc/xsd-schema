@@ -651,6 +651,71 @@ Useful patterns for applications:
   `is_chameleon()` returns `true` when `declared` is `None` but `effective`
   is `Some`.
 
+## 6. Regex Compatibility Mode
+
+By default, pattern facets are validated against the strict XSD Part 2
+regex grammar (§F for XSD 1.0, §G for XSD 1.1). Schemas authored against
+.NET's `XmlValidatingReader` often contain constructs that are valid in
+.NET's regex engine but outside XSD's grammar. The `RegexCompat` enum on
+`SchemaSet` lets a caller opt into a permissive mode that mirrors what
+.NET actually does: skip the strict grammar validation and let the
+runtime regex engine decide what is well-formed.
+
+```rust
+use xsd_schema::{RegexCompat, SchemaSetBuilder};
+
+let mut builder = SchemaSetBuilder::new();
+builder.set_regex_compatibility(RegexCompat::LenientMs);
+let compiled = builder.add("urn:ms-schema", "ms-authored.xsd")?.compile()?;
+```
+
+### What `LenientMs` does
+
+`LenientMs` matches .NET's behaviour: no XSD
+grammar enforcement; the pattern is handed to the regex engine after
+the standard `\d`/`\D`/`\w`/`\W`/`\i`/`\I`/`\c`/`\C` substitutions.
+
+Concretely, `LenientMs` does three things:
+
+1. **Skips** `validate_xml_pattern_syntax` — the XSD 1.0 §F hyphen rule
+   gate (rejects forms like `[a-c-1]`).
+2. **Skips** `regexml::Regex::xsd(...)` — the strict §F/§G grammar gate
+   (rejects XPath-only constructs).
+3. **Strips** `(?#...)` comments textually before compilation, because
+   neither Rust `regex` nor regexml's `xpath()` recognise that .NET
+   syntax. Comments inside character classes are left alone.
+
+After those three changes, the pattern is compiled with the same
+runtime engine used in `Strict` mode (Rust `regex` for default features,
+regexml `xpath()` for `xsd11`). The Unicode-3.0 `\p{X}` pinning for
+XSD 1.0 schemas applies in both modes — that is a versioning rule, not
+a grammar choice.
+
+### Constructs unlocked under `LenientMs`
+
+| Construct | Default features (Rust `regex`) | `xsd11` feature (regexml `xpath()`) |
+| --- | --- | --- |
+| `^`/`$` anchors outside char class | works | works |
+| `(?:non-capturing)` groups | works | works |
+| Reluctant quantifiers `*?`, `+?`, `??`, `{n,m}?` | works | works |
+| Backreferences `\1`, `\2`… | engine gap — still rejects | **works** |
+| Named groups `(?<name>…)` | works | works |
+| `(?#…)` inline comments | stripped before compilation | stripped before compilation |
+
+### When to use it
+
+Use `LenientMs` when you have a .NET-source schema you cannot edit and
+that uses constructs which are valid in .NET but outside XSD's grammar.
+A "passing" schema under `LenientMs` is *not* guaranteed to be portable
+to a strictly-conformant XSD validator — that is the trade-off.
+
+The W3C XSD Test Suite is run exclusively in `Strict` mode. The
+`msData/regex` group includes tests like `RegexTest_119`, `_929`,
+`_930`, `_1413`, `_1414` that verify a strict validator rejects
+`(?#...)` comments, and the `expected=Valid` tests in that group do
+not exercise the constructs unlocked by `LenientMs` — so wiring the
+flag into the harness would be dead code.
+
 ## Recommended Reading Order
 
 If you are new to the crate, this sequence usually works well:

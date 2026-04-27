@@ -22,12 +22,13 @@
 use crate::error::{FacetError, FacetResult};
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::parser::location::SourceRef;
+use crate::regex_convert::lenient_ms_preprocess;
 #[cfg(feature = "xsd11")]
 use crate::regex_convert::rewrite_xsd10_category_escapes;
 use crate::regex_convert::validate_xml_pattern_syntax;
 #[cfg(not(feature = "xsd11"))]
 use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
-use crate::schema::model::XsdVersion;
+use crate::schema::model::{RegexCompat, XsdVersion};
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
 use std::collections::HashSet;
@@ -107,13 +108,19 @@ impl PatternFacet {
     /// `xsd_version` controls the `\p{X}` category escape semantics: under
     /// `V1_0` recognized general-category names are expanded to Unicode 3.0
     /// ranges; `V1_1` passes them through to the backend unchanged.
+    ///
+    /// `regex_compat` controls grammar leniency: `Strict` enforces XSD
+    /// Part 2 §F/§G; `LenientMs` first applies [`lenient_ms_preprocess`]
+    /// to drop start/end anchors and `(?#…)` comments common in
+    /// .NET-authored schemas.
     pub fn new(
         value: String,
         source: Option<SourceRef>,
         xsd_version: XsdVersion,
+        regex_compat: RegexCompat,
     ) -> FacetResult<Self> {
         let mut facet = Self::new_unchecked(value, source);
-        facet.compile(xsd_version)?;
+        facet.compile(xsd_version, regex_compat)?;
         Ok(facet)
     }
 
@@ -128,10 +135,20 @@ impl PatternFacet {
 
     /// Compile the pattern if not already compiled
     #[cfg(not(feature = "xsd11"))]
-    pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
+    pub fn compile(
+        &mut self,
+        xsd_version: XsdVersion,
+        regex_compat: RegexCompat,
+    ) -> FacetResult<()> {
         if self.compiled.is_none() {
-            if xsd_version == XsdVersion::V1_0 {
-                validate_xml_pattern_syntax(&self.value).map_err(|message| {
+            let effective: std::borrow::Cow<'_, str> = match regex_compat {
+                RegexCompat::Strict => std::borrow::Cow::Borrowed(self.value.as_str()),
+                RegexCompat::LenientMs => lenient_ms_preprocess(&self.value),
+            };
+            // The XSD 1.0 hyphen-rule check is part of the strict §F grammar
+            // gate; skip it under LenientMs so the engine alone decides.
+            if xsd_version == XsdVersion::V1_0 && regex_compat == RegexCompat::Strict {
+                validate_xml_pattern_syntax(&effective).map_err(|message| {
                     FacetError::InvalidPattern {
                         pattern: self.value.clone(),
                         message,
@@ -142,7 +159,7 @@ impl PatternFacet {
                 XsdVersion::V1_0 => ConvertOptions::xsd_v1_0(),
                 XsdVersion::V1_1 => ConvertOptions::xsd(),
             };
-            let rust_pattern = convert_xml_pattern(&self.value, opts);
+            let rust_pattern = convert_xml_pattern(&effective, opts);
             let compiled = Regex::new(&rust_pattern).map_err(|e| FacetError::InvalidPattern {
                 pattern: self.value.clone(),
                 message: e.to_string(),
@@ -154,39 +171,61 @@ impl PatternFacet {
 
     /// Compile the pattern if not already compiled
     #[cfg(feature = "xsd11")]
-    pub fn compile(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
+    pub fn compile(
+        &mut self,
+        xsd_version: XsdVersion,
+        regex_compat: RegexCompat,
+    ) -> FacetResult<()> {
         if self.compiled.is_none() {
-            if xsd_version == XsdVersion::V1_0 {
-                validate_xml_pattern_syntax(&self.value).map_err(|message| {
+            let strict = regex_compat == RegexCompat::Strict;
+            // Apply MS dialect preprocess (closed list) before grammar
+            // validation when LenientMs is on. Owned to keep one stable
+            // backing string across the two-step validate+rewrite below.
+            let effective: String = if strict {
+                self.value.clone()
+            } else {
+                lenient_ms_preprocess(&self.value).into_owned()
+            };
+            // Strict XSD 1.0 hyphen-rule grammar gate. Skipped under
+            // LenientMs so the engine alone decides what is well-formed.
+            if xsd_version == XsdVersion::V1_0 && strict {
+                validate_xml_pattern_syntax(&effective).map_err(|message| {
                     FacetError::InvalidPattern {
                         pattern: self.value.clone(),
                         message,
                     }
                 })?;
             }
-            // Validate against XSD regex rules first. Intentional two-pass:
-            // xsd() rejects XPath-only constructs (e.g. `^$`, backrefs, `(?:...)`)
-            // that xpath() would otherwise accept. For XSD 1.1, an unrecognized
-            // `\p{IsX}` block name is treated as matching every character (W3C
-            // bug 13670 / XSD 1.1 Datatypes §G.4.2.3); the rewrite happens here
-            // because regexml 0.2 does not yet honour `allow_unknown_block_names`.
+            // Strict XSD §F/§G grammar gate via regexml `xsd()`. Skipped
+            // under LenientMs — the runtime matcher uses regexml `xpath()`
+            // (next step), which natively accepts XPath-only constructs
+            // like `^`/`$` outside char class, backrefs `\1`, non-capturing
+            // `(?:...)`, and reluctant quantifiers `*?` that are valid
+            // .NET regex idioms. For XSD 1.1, an unrecognized `\p{IsX}`
+            // block name is treated as matching every character (W3C bug
+            // 13670 / XSD 1.1 Datatypes §G.4.2.3); the rewrite remains in
+            // place under both modes because it is a spec rule, not a
+            // grammar choice (regexml 0.2 does not yet honour
+            // `allow_unknown_block_names`).
             let xsd_validated: std::borrow::Cow<'_, str> = match xsd_version {
                 XsdVersion::V1_0 => {
-                    regexml::Regex::xsd(&self.value, "").map_err(|e| {
-                        FacetError::InvalidPattern {
-                            pattern: self.value.clone(),
-                            message: format!("{:?}", e),
-                        }
-                    })?;
-                    std::borrow::Cow::Borrowed(&self.value)
+                    if strict {
+                        regexml::Regex::xsd(&effective, "").map_err(|e| {
+                            FacetError::InvalidPattern {
+                                pattern: self.value.clone(),
+                                message: format!("{:?}", e),
+                            }
+                        })?;
+                    }
+                    std::borrow::Cow::Borrowed(effective.as_str())
                 }
-                XsdVersion::V1_1 => validate_xsd11_pattern_with_block_fallback(&self.value)?,
+                XsdVersion::V1_1 => validate_xsd11_pattern_with_block_fallback(&effective)?,
             };
             // Under XSD 1.0 the \p{X} rewrite produces a new String; under 1.1
             // we use the (possibly block-rewritten) validated value.
             let pinned: std::borrow::Cow<'_, str> = match xsd_version {
                 XsdVersion::V1_0 => {
-                    std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&self.value))
+                    std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&effective))
                 }
                 XsdVersion::V1_1 => xsd_validated,
             };
@@ -567,8 +606,9 @@ impl FacetSet {
         value: String,
         source: Option<SourceRef>,
         xsd_version: XsdVersion,
+        regex_compat: RegexCompat,
     ) -> FacetResult<()> {
-        let pattern = PatternFacet::new(value, source, xsd_version)?;
+        let pattern = PatternFacet::new(value, source, xsd_version, regex_compat)?;
         self.push_pattern_to_current_step(pattern);
         Ok(())
     }
@@ -591,10 +631,15 @@ impl FacetSet {
     ///
     /// `xsd_version` selects the Unicode-category semantics for `\p{X}`: V1_0
     /// pins to Unicode 3.0; V1_1 passes through to the backend.
-    pub fn compile_patterns(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
+    /// `regex_compat` controls grammar leniency (see [`PatternFacet::compile`]).
+    pub fn compile_patterns(
+        &mut self,
+        xsd_version: XsdVersion,
+        regex_compat: RegexCompat,
+    ) -> FacetResult<()> {
         for step in &mut self.patterns {
             for pattern in step {
-                pattern.compile(xsd_version)?;
+                pattern.compile(xsd_version, regex_compat)?;
             }
         }
         Ok(())
@@ -1936,10 +1981,10 @@ mod tests {
     fn test_facet_set_patterns() {
         let mut facets = FacetSet::new();
         facets
-            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
         facets
-            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1)
+            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
 
         // Two adds within one FacetSet share the same derivation step (OR'd).
@@ -1964,7 +2009,7 @@ mod tests {
         let mut base = FacetSet::new();
         base.set_min_length(5, FacetFixed::Fixed, None);
         base.set_max_length(100, FacetFixed::Default, None);
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
 
         let mut derived = FacetSet::new();
@@ -2038,7 +2083,9 @@ mod tests {
 
     #[test]
     fn test_pattern_matching() {
-        let pattern = PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern =
+            PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+                .unwrap();
         assert!(pattern.matches("hello"));
         assert!(!pattern.matches("HELLO"));
         assert!(!pattern.matches("hello123"));
@@ -2047,7 +2094,9 @@ mod tests {
     #[test]
     fn test_pattern_xsd_anchoring() {
         // XSD patterns are implicitly anchored
-        let pattern = PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern =
+            PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+                .unwrap();
         assert!(pattern.matches("abc"));
         assert!(!pattern.matches("xabc"));
         assert!(!pattern.matches("abcx"));
@@ -2056,7 +2105,9 @@ mod tests {
     #[test]
     fn test_pattern_xsd_name_chars() {
         // Test \i (initial name char) and \c (name char)
-        let pattern = PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1).unwrap();
+        let pattern =
+            PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+                .unwrap();
         assert!(pattern.matches("foo"));
         assert!(pattern.matches("_bar"));
         assert!(pattern.matches("x123"));
@@ -2065,7 +2116,8 @@ mod tests {
 
     #[test]
     fn test_invalid_pattern() {
-        let result = PatternFacet::new("[invalid".to_string(), None, XsdVersion::V1_1);
+        let result =
+            PatternFacet::new("[invalid".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict);
         assert!(result.is_err());
     }
 
@@ -2126,7 +2178,7 @@ mod tests {
     fn test_validate_string_pattern() {
         let mut facets = FacetSet::new();
         facets
-            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
 
         assert!(facets.validate_string("hello").is_ok());
@@ -2317,12 +2369,12 @@ mod tests {
     #[test]
     fn test_merge_with_base_patterns_cumulative() {
         let mut base = FacetSet::new();
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1)
+        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
 
         let mut derived = FacetSet::new();
         derived
-            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1)
+            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
             .unwrap();
 
         let merged = derived.merge_with_base(&base).unwrap();
