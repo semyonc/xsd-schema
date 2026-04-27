@@ -14,7 +14,10 @@
 //! the MS `msData/regex/reJ*` conformance tests were authored against. See
 //! `regex_xsd_unicode` for the motivation.
 
-use crate::regex_xsd_unicode::expand_xsd_category_body;
+use crate::regex_xsd_unicode::{
+    expand_xsd_category_body, xsd10_non_digit_neg_body, xsd10_non_word_char_body,
+    xsd10_private_use_block_body, xsd10_word_char_body,
+};
 use crate::schema::model::XsdVersion;
 
 /// Options for pattern conversion.
@@ -82,7 +85,14 @@ impl ConvertOptions {
 /// A regex pattern string compatible with both the `regex` crate and `regexml`.
 pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
     let extra_capacity = if options.anchor { 4 } else { 0 };
-    let mut result = String::with_capacity(pattern.len() + extra_capacity);
+    // Under V1_0, `\d` / `\D` / `\w` / `\W` and `\p{X}` expand to multi-KB
+    // explicit ranges; over-allocate to avoid repeated reallocations
+    // (mirrors `rewrite_xsd10_category_escapes` at line 184).
+    let initial_capacity = match options.xsd_version {
+        XsdVersion::V1_0 => pattern.len() * 4 + extra_capacity,
+        XsdVersion::V1_1 => pattern.len() + extra_capacity,
+    };
+    let mut result = String::with_capacity(initial_capacity);
 
     if options.anchor {
         result.push('^');
@@ -113,6 +123,19 @@ pub fn convert_xml_pattern(pattern: &str, options: ConvertOptions) -> String {
                 'C' => {
                     chars.next();
                     result.push_str(r"[^A-Za-z0-9._:\-]");
+                }
+                // XSD 1.0 multi-character class escapes \d, \D, \w, \W —
+                // expand to explicit Unicode-3.0 ranges so the regex engine
+                // (which uses modern Unicode for \d / \w / \D / \W) cannot
+                // disagree with the MS reS/reT/reU test expectations. Inside
+                // a character class only the positive forms expand inline;
+                // the negated forms fall through to the engine's native
+                // escape (set complementation isn't expressible inline).
+                'd' | 'D' | 'w' | 'W'
+                    if options.xsd_version == XsdVersion::V1_0
+                        && expand_xsd10_class_escape(&mut result, next, in_class) =>
+                {
+                    chars.next();
                 }
                 // Standard escapes - pass through
                 'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'n' | 'r' | 't' | '\\' | '|' | '.' | '?'
@@ -183,6 +206,12 @@ pub fn rewrite_xsd10_category_escapes(pattern: &str) -> String {
             result.push('\\');
             continue;
         };
+        if matches!(next, 'd' | 'D' | 'w' | 'W')
+            && expand_xsd10_class_escape(&mut result, next, in_class)
+        {
+            chars.next();
+            continue;
+        }
         if next != 'p' && next != 'P' {
             result.push('\\');
             result.push(next);
@@ -194,6 +223,50 @@ pub fn rewrite_xsd10_category_escapes(pattern: &str) -> String {
         handle_category_escape(&mut result, &mut chars, negated, in_class, true);
     }
     result
+}
+
+/// Expand the XSD 1.0 multi-character class escapes `\d`, `\D`, `\w`, `\W`
+/// to explicit Unicode-3.0 ranges. Returns `true` if the expansion was
+/// emitted; `false` means the caller should fall back to passing the escape
+/// through verbatim.
+///
+/// All four expansions are BMP-bounded, matching MS test expectations
+/// authored against pre-Unicode-3.1 / UTF-16-unit semantics:
+///   - `\d` → `[<Nd>]` (positive, BMP)
+///   - `\D` → `[^<Nd>U+10000-U+10FFFD]` (negation excludes supplementary plane)
+///   - `\w` → `[<L+M+N+S>]` (positive, BMP — excludes Cn / supplementary)
+///   - `\W` → `[<P+Z+C>]` (positive, BMP — excludes supplementary)
+///
+/// Inside a character class only `\d` and `\w` expand inline (their bodies
+/// merge cleanly into the surrounding class); `\D` / `\W` would need set
+/// complementation, so they are passed through to the engine in that
+/// position.
+fn expand_xsd10_class_escape(out: &mut String, escape: char, in_class: bool) -> bool {
+    let (body, negated): (&str, bool) = match escape {
+        'd' => (expand_xsd_category_body("Nd").unwrap_or(""), false),
+        'D' => (xsd10_non_digit_neg_body(), true),
+        'w' => (xsd10_word_char_body(), false),
+        'W' => (xsd10_non_word_char_body(), false),
+        _ => return false,
+    };
+    if body.is_empty() {
+        return false;
+    }
+    if in_class {
+        if negated {
+            return false;
+        }
+        out.push_str(body);
+        return true;
+    }
+    if negated {
+        out.push_str("[^");
+    } else {
+        out.push('[');
+    }
+    out.push_str(body);
+    out.push(']');
+    true
 }
 
 /// Validate XSD 1.0 regex character-class hyphen rules — stricter than the backend
@@ -393,6 +466,23 @@ fn peek_single_class_atom(chars: &[char], index: usize) -> Option<(ClassAtom, us
     }
 }
 
+/// Look up the XSD 1.0 / Unicode 3.0 char-class body for `\p{name}`,
+/// covering both general-category codes and block names. Returns `None`
+/// for names handled by the engine natively (other `IsX` blocks, unknown
+/// names, Cn/Cs).
+///
+/// `IsPrivateUse` is overridden here because regexml's block lookup
+/// follows the DIS XSD 1.1 backwards-compatibility table and unions the
+/// BMP PUA with the supplementary PUAs (Plane 15 / 16). Those areas did
+/// not exist in Unicode 3.0 and the W3C MS reL/reM/reN tests require them
+/// to be excluded under XSD 1.0.
+fn xsd10_category_or_block_body(name: &str) -> Option<&'static str> {
+    if name == "IsPrivateUse" {
+        return Some(xsd10_private_use_block_body());
+    }
+    expand_xsd_category_body(name)
+}
+
 /// Shared lowering for `\p{X}` / `\P{X}` under XSD 1.0 Unicode-3.0 pinning.
 ///
 /// Returns `true` if `name` is a recognized general-category code and the
@@ -407,7 +497,7 @@ fn peek_single_class_atom(chars: &[char], index: usize) -> Option<(ClassAtom, us
 /// - Positive `\p{X}` outside: wraps the body with `[...]`.
 /// - Negated `\P{X}` outside: wraps with `[^...]`.
 fn try_expand_category(out: &mut String, name: &str, negated: bool, in_class: bool) -> bool {
-    let Some(body) = expand_xsd_category_body(name) else {
+    let Some(body) = xsd10_category_or_block_body(name) else {
         return false;
     };
     if in_class {

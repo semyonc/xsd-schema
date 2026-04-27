@@ -473,8 +473,15 @@ pub struct FacetSet {
     pub min_length: Option<MinLengthFacet>,
     pub max_length: Option<MaxLengthFacet>,
 
-    // Pattern facets (multiple patterns are ANDed)
-    pub patterns: Vec<PatternFacet>,
+    // Pattern facets grouped by derivation step.
+    //
+    // Per XSD Datatypes Part 2 §4.3.4 (and the equivalent §A.2 prose),
+    // multiple `<xs:pattern>` facets in a single restriction step combine
+    // as alternation (logical OR), while patterns inherited from earlier
+    // derivation steps further restrict the value (logical AND).
+    //
+    // Outer Vec = AND across derivation steps; inner Vec = OR within a step.
+    pub patterns: Vec<Vec<PatternFacet>>,
 
     // Enumeration (allowed values). The `Option` is only the presence flag;
     // multi-valued semantics live inside `EnumerationFacet::values` (HashSet),
@@ -511,7 +518,7 @@ impl FacetSet {
         self.length.is_none()
             && self.min_length.is_none()
             && self.max_length.is_none()
-            && self.patterns.is_empty()
+            && self.patterns.iter().all(|step| step.is_empty())
             && self.enumeration.is_none()
             && self.whitespace.is_none()
             && self.min_inclusive.is_none()
@@ -551,7 +558,10 @@ impl FacetSet {
         });
     }
 
-    /// Add a pattern facet (compiles the pattern)
+    /// Add a pattern facet (compiles the pattern) at the current
+    /// derivation step. Multiple consecutive `add_pattern` calls on the
+    /// same FacetSet are treated as alternatives (OR'd) within a single
+    /// step; a new step is opened by `inherit_from` / `merge_with_base`.
     pub fn add_pattern(
         &mut self,
         value: String,
@@ -559,14 +569,22 @@ impl FacetSet {
         xsd_version: XsdVersion,
     ) -> FacetResult<()> {
         let pattern = PatternFacet::new(value, source, xsd_version)?;
-        self.patterns.push(pattern);
+        self.push_pattern_to_current_step(pattern);
         Ok(())
     }
 
-    /// Add a pattern facet without compiling (for deferred validation)
+    /// Add a pattern facet without compiling (for deferred validation),
+    /// at the current derivation step. See `add_pattern` for the OR/AND
+    /// semantics across multiple calls.
     pub fn add_pattern_unchecked(&mut self, value: String, source: Option<SourceRef>) {
-        self.patterns
-            .push(PatternFacet::new_unchecked(value, source));
+        self.push_pattern_to_current_step(PatternFacet::new_unchecked(value, source));
+    }
+
+    fn push_pattern_to_current_step(&mut self, pattern: PatternFacet) {
+        if self.patterns.is_empty() {
+            self.patterns.push(Vec::new());
+        }
+        self.patterns.last_mut().unwrap().push(pattern);
     }
 
     /// Compile all uncompiled patterns. Returns the first error encountered.
@@ -574,8 +592,26 @@ impl FacetSet {
     /// `xsd_version` selects the Unicode-category semantics for `\p{X}`: V1_0
     /// pins to Unicode 3.0; V1_1 passes through to the backend.
     pub fn compile_patterns(&mut self, xsd_version: XsdVersion) -> FacetResult<()> {
-        for pattern in &mut self.patterns {
-            pattern.compile(xsd_version)?;
+        for step in &mut self.patterns {
+            for pattern in step {
+                pattern.compile(xsd_version)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the per-step XSD pattern check on `value`: every step must have
+    /// at least one alternative that matches (within-step OR, across-step
+    /// AND). Returns the first failing step's first pattern as error
+    /// context.
+    fn check_patterns(&self, value: &str) -> FacetResult<()> {
+        for step in &self.patterns {
+            if step.is_empty() {
+                continue;
+            }
+            if !step.iter().any(|p| p.matches(value)) {
+                return Err(FacetError::pattern(value, &step[0].value));
+            }
         }
         Ok(())
     }
@@ -731,10 +767,15 @@ impl FacetSet {
             self.max_length = base.max_length.clone();
         }
 
-        // Patterns are cumulative (ANDed together)
-        for pattern in &base.patterns {
-            if !self.patterns.iter().any(|p| p.value == pattern.value) {
-                self.patterns.push(pattern.clone());
+        // Each base derivation step is appended as a new outer step on
+        // self, preserving the within-step OR / across-step AND structure.
+        // (Step-level dedup vs. derived's local step would require value-set
+        // equivalence checks; skip it — repeated identical patterns are
+        // idempotent under either OR or AND, and recompilation cost is
+        // bounded by `compile_patterns` running per FacetSet at most once.)
+        for base_step in &base.patterns {
+            if !base_step.is_empty() {
+                self.patterns.push(base_step.clone());
             }
         }
 
@@ -876,14 +917,12 @@ impl FacetSet {
         }
 
         // === Patterns ===
-        // Patterns are cumulative (ANDed) - add base patterns that aren't already present
-        for base_pattern in &base.patterns {
-            if !result
-                .patterns
-                .iter()
-                .any(|p| p.value == base_pattern.value)
-            {
-                result.patterns.push(base_pattern.clone());
+        // Each base derivation step is appended as a new outer step on
+        // result. Within-step OR / across-step AND semantics survive the
+        // merge per XSD Datatypes §4.3.4.
+        for base_step in &base.patterns {
+            if !base_step.is_empty() {
+                result.patterns.push(base_step.clone());
             }
         }
 
@@ -1242,12 +1281,9 @@ impl FacetSet {
             }
         }
 
-        // Check all patterns (all must match)
-        for pattern in &self.patterns {
-            if !pattern.matches(check_value) {
-                return Err(FacetError::pattern(check_value, &pattern.value));
-            }
-        }
+        // Check all pattern steps (each step's alternatives are OR'd; all
+        // steps must match).
+        self.check_patterns(check_value)?;
 
         // Check enumeration
         if let Some(ref enumeration) = self.enumeration {
@@ -1268,11 +1304,7 @@ impl FacetSet {
         };
         let check_value = &normalized;
 
-        for pattern in &self.patterns {
-            if !pattern.matches(check_value) {
-                return Err(FacetError::pattern(check_value, &pattern.value));
-            }
-        }
+        self.check_patterns(check_value)?;
 
         if let Some(ref enumeration) = self.enumeration {
             if !enumeration.values.contains(check_value) {
@@ -1290,12 +1322,7 @@ impl FacetSet {
             Some(ws) => normalize_whitespace(value, ws.value),
             None => value.to_string(),
         };
-        for pattern in &self.patterns {
-            if !pattern.matches(&normalized) {
-                return Err(FacetError::pattern(&normalized, &pattern.value));
-            }
-        }
-        Ok(())
+        self.check_patterns(&normalized)
     }
 
     /// Validate enumeration in value space using a caller-supplied match predicate.
@@ -1915,7 +1942,9 @@ mod tests {
             .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1)
             .unwrap();
 
-        assert_eq!(facets.patterns.len(), 2);
+        // Two adds within one FacetSet share the same derivation step (OR'd).
+        assert_eq!(facets.patterns.len(), 1);
+        assert_eq!(facets.patterns[0].len(), 2);
     }
 
     #[test]
@@ -1947,8 +1976,9 @@ mod tests {
         assert_eq!(derived.min_length.as_ref().unwrap().value, 5);
         // maxLength not inherited (was overridden)
         assert_eq!(derived.max_length.as_ref().unwrap().value, 50);
-        // Pattern inherited
+        // Base step inherited as a separate step entry.
         assert_eq!(derived.patterns.len(), 1);
+        assert_eq!(derived.patterns[0].len(), 1);
     }
 
     // =========================================================================
@@ -2296,6 +2326,8 @@ mod tests {
             .unwrap();
 
         let merged = derived.merge_with_base(&base).unwrap();
+        // Derived step (one OR'd pattern) AND base step (one OR'd pattern)
+        // = two separate AND'd steps.
         assert_eq!(merged.patterns.len(), 2);
     }
 

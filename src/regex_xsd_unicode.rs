@@ -2319,6 +2319,73 @@ pub(crate) fn expand_xsd_category_body(name: &str) -> Option<&'static str> {
     cache.get(name).map(String::as_str)
 }
 
+/// Body for the XSD 1.0 `\w` escape under Unicode-3.0 pinning: the union
+/// of the L, M, N, S category-group ranges (BMP-only). Per XSD 1.0 §F.1.2
+/// `\w ::= [#x0-#x10FFFF]-[\p{P}\p{Z}\p{C}]`; pinning to Unicode 3.0 means
+/// supplementary-plane and BMP-Cn codepoints are excluded as well — they
+/// are unassigned under 3.0, so they fall outside L/M/N/S. The MS reU*
+/// tests rely on this exclusion. Using the positive L+M+N+S form (instead
+/// of `[^<P><Z><C>]`) keeps the class BMP-only without enumerating ranges.
+pub(crate) fn xsd10_word_char_body() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut s = String::with_capacity(16 * 1024);
+        for cat in &["L", "M", "N", "S"] {
+            if let Some(b) = expand_xsd_category_body(cat) {
+                s.push_str(b);
+            }
+        }
+        s
+    })
+}
+
+/// Body for the XSD 1.0 `\W` escape under Unicode-3.0 pinning: the union
+/// of the P, Z, C category-group ranges (BMP-only). Excludes supplementary
+/// codepoints and BMP-Cn (both absent from our 3.0 P/Z/C tables) so that
+/// MS reV*.i tests — which assert that supplementary codepoints match
+/// neither `\w` nor `\W` under pre-3.1 / UTF-16-unit semantics — pass.
+pub(crate) fn xsd10_non_word_char_body() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut s = String::with_capacity(4 * 1024);
+        for cat in &["P", "Z", "C"] {
+            if let Some(b) = expand_xsd_category_body(cat) {
+                s.push_str(b);
+            }
+        }
+        s
+    })
+}
+
+/// Body for the XSD 1.0 `\D` escape under Unicode-3.0 pinning: the Nd
+/// ranges followed by the supplementary plane range (U+10000..U+10FFFD).
+/// Used INSIDE a negated class — `[^<this>]` matches "BMP char not in Nd",
+/// which simultaneously satisfies the MS reT.v tests (BMP-Cn like U+0BE6
+/// must match `\D`) and reT.i tests (supplementary digits like U+1D7CE
+/// must NOT match `\D`, because they are 2 surrogate units under the
+/// UTF-16-unit semantics the tests were authored against).
+pub(crate) fn xsd10_non_digit_neg_body() -> &'static str {
+    static CACHE: OnceLock<String> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut s = String::new();
+        if let Some(b) = expand_xsd_category_body("Nd") {
+            s.push_str(b);
+        }
+        s.push_str("\u{10000}-\u{10FFFD}");
+        s
+    })
+}
+
+/// Body for the XSD 1.0 `\p{IsPrivateUse}` block under Unicode-3.0 pinning:
+/// the BMP Private Use Area only (U+E000–U+F8FF). Modern regex engines
+/// (including regexml) include the Plane 15 / Plane 16 supplementary PUAs
+/// for backward-compatibility with the DIS XSD 1.1 block names, but those
+/// blocks did not exist in Unicode 3.0 and the W3C MS reL/reM/reN tests
+/// require them to be excluded under XSD 1.0.
+pub(crate) fn xsd10_private_use_block_body() -> &'static str {
+    "\u{E000}-\u{F8FF}"
+}
+
 fn build_cache() -> HashMap<&'static str, String> {
     let names: &[&str] = &[
         "Lu", "Ll", "Lt", "Lm", "Lo", "Mn", "Mc", "Me", "Nd", "Nl", "No", "Pc", "Pd", "Ps", "Pe",
