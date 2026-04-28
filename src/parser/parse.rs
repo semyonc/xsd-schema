@@ -1021,10 +1021,12 @@ fn should_skip_for_vc(
                 }
             }
             "typeAvailable" | "typeUnavailable" | "facetAvailable" | "facetUnavailable" => {
-                // In XSD 1.0, these vc: attributes are silently ignored.
-                if xsd_version != XsdVersion::V1_1 {
-                    continue;
-                }
+                // The W3C XMLSchema-versioning spec says vc: attributes "SHOULD
+                // be honored" when recognized. Saxon honors them under both
+                // XSD 1.0 and 1.1, and the suite tests (e.g. vc014 under
+                // version="1.0 1.1") expect xs:error / XSD-1.1-only types to
+                // be considered "unavailable" under XSD 1.0. Evaluate in both
+                // modes so VC-driven branches are filtered correctly.
                 let is_available_attr = matches!(local, "typeAvailable" | "facetAvailable");
                 let is_type_check = matches!(local, "typeAvailable" | "typeUnavailable");
                 let mut available_count = 0usize;
