@@ -410,19 +410,31 @@ use xsd_schema::enrich_schema_set;
 let sl = runtime.schema_location_hints().to_vec();
 let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
 
-// Build enriched schema set (returns None if no hints or compile fails)
-if let Some(enriched) = enrich_schema_set(&schema_set, &sl, &nnsl) {
+// Build the enriched schema set. The returned EnrichmentOutcome carries
+// the compiled set (when recompile succeeded), per-hint load failures,
+// and the recompile error (if any) so each failure mode is observable.
+let outcome = enrich_schema_set(&schema_set, &sl, &nnsl);
+if let Some(enriched) = outcome.schema_set.as_ref() {
     // Second pass: re-validate with enriched schema set
-    let validator2 = SchemaValidator::new(&enriched, flags);
+    let validator2 = SchemaValidator::new(enriched, flags);
     let mut runtime2 = validator2.start_run(sink2);
     // ... drive the same XML events again ...
+} else if let Some(err) = outcome.compile_error.as_ref() {
+    eprintln!("hint enrichment failed at recompile: {err}");
+} else if !outcome.hint_errors.is_empty() {
+    // Hints were given but every one failed to load. The original
+    // SchemaSet is still valid for use without enrichment.
+    for e in &outcome.hint_errors {
+        eprintln!("hint load failure: {e}");
+    }
 }
 ```
 
 `enrich_schema_set` internally uses `SchemaSetBuilder::add_from()` to
 re-load all schemas from the original set's recorded locations, then
 adds the hinted schemas and compiles. You do not need to track the
-original schema file paths yourself.
+original schema file paths yourself. Use `outcome.is_no_op()` to
+distinguish "no hints to apply" from "tried but failed".
 
 For more control, use the builder directly:
 
@@ -436,8 +448,10 @@ let compiled = builder.compile()?;
 // Re-validate with compiled.schema_set()
 ```
 
-Load failures are non-fatal — the caller can inspect `HintLoadResult::errors`
-for diagnostics. No schemas are loaded during an active validation run; the
+Per-hint load failures are non-fatal — the caller can inspect
+`HintLoadResult::errors` (from `load_hints_into_builder`) or
+`EnrichmentOutcome::hint_errors` (from `enrich_schema_set`) for
+diagnostics. No schemas are loaded during an active validation run; the
 runtime borrows `&SchemaSet` immutably.
 
 **Base URI note:** Use an absolute (canonicalized) path for

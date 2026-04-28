@@ -1045,6 +1045,102 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 };
             }
 
+            // Root xsi:type promotion: at the document root with no governing
+            // element declaration, an `xsi:type` attribute may itself supply
+            // the governing type. XSD 1.0 §5.2 / 1.1 §5.2.2 — the element is
+            // laxly assessed against the xsi:type-supplied type. This mirrors
+            // PATH B2/B3 above (which handles the wildcard-child case) and
+            // must run *before* the unconditional cvc-elt.1 fall-through.
+            if self.validation_stack.is_empty() {
+                if let Some(xsi_type_str) = xsi_type {
+                    let mut deferred = Vec::new();
+                    match self.resolve_xsi_type(
+                        xsi_type_str,
+                        None,
+                        DerivationSet::empty(),
+                        ns_context,
+                        &mut deferred,
+                    ) {
+                        XsiTypeOutcome::Applied(type_key) => {
+                            let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
+                            let mut ev_state =
+                                ElementValidationState::new(local_name, namespace);
+                            ev_state.ns_context = Some(ns_context.clone());
+                            let (content_state, content_type) =
+                                self.init_content_model(Some(type_key));
+                            ev_state.schema_type = Some(type_key);
+                            ev_state.type_source = Some(TypeSource::XsiType);
+                            ev_state.content_state = content_state;
+                            ev_state.content_type = Some(content_type);
+                            ev_state.is_nil = is_nil;
+                            ev_state.validity = SchemaValidity::Valid;
+                            ev_state.process_contents = ContentProcessing::Strict;
+                            ev_state.strictly_assessed = true;
+                            self.push_element(ev_state);
+                            self.advance_constraints_start_element(
+                                local_name, namespace, None,
+                            );
+                            #[cfg(feature = "xsd11")]
+                            self.detect_assertions_on_element(
+                                Some(type_key),
+                                local_name,
+                                namespace,
+                            );
+                            return SchemaInfo {
+                                element_decl: None,
+                                attribute_decl: None,
+                                schema_type: Some(type_key),
+                                member_type: None,
+                                validity: SchemaValidity::Valid,
+                                validation_attempted: ValidationAttempted::None,
+                                is_default: false,
+                                is_nil,
+                                content_type: Some(content_type),
+                                typed_value: None,
+                                normalized_value: None,
+                                schema_error_codes: Vec::new(),
+                                notation: None,
+                                deferred_by_cta: false,
+                                type_source: Some(TypeSource::XsiType),
+                                #[cfg(feature = "xsd11")]
+                                cta_selected: false,
+                                #[cfg(feature = "xsd11")]
+                                assertion_outcome: None,
+                            };
+                        }
+                        XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
+                            // xsi:type failed to resolve at the root — fall
+                            // through to the Strict arm below for cvc-elt.1.
+                            // Emit the deferred xsi:type diagnostic in
+                            // addition, after push so attribution lands on
+                            // the child.
+                            let mut ev_state =
+                                ElementValidationState::new(local_name, namespace);
+                            ev_state.ns_context = Some(ns_context.clone());
+                            ev_state.validity = SchemaValidity::Invalid;
+                            let (content_state, content_type) =
+                                self.lax_assessment_content_model();
+                            ev_state.content_state = content_state;
+                            ev_state.content_type = Some(content_type);
+                            self.push_element(ev_state);
+                            let elem_name =
+                                self.schema_set.name_table.resolve(local_name).to_string();
+                            self.report_error(
+                                "cvc-elt.1",
+                                format!("Element '{}' is not declared", elem_name),
+                            );
+                            self.emit_deferred_xsi_type_errors(deferred);
+                            self.advance_constraints_start_element(
+                                local_name, namespace, None,
+                            );
+                            #[cfg(feature = "xsd11")]
+                            self.detect_assertions_on_element(None, local_name, namespace);
+                            return SchemaInfo::invalid();
+                        }
+                    }
+                }
+            }
+
             match process_contents {
                 ContentProcessing::Skip => {
                     // Skip validation entirely

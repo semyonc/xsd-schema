@@ -1024,7 +1024,23 @@ impl TestRunner {
                 expected_skip_reason(expected).map(str::to_string),
             ),
             (ExpectedOutcome::Valid, None) => (TestOutcome::Pass, None),
-            (ExpectedOutcome::Valid, Some(e)) => (TestOutcome::Fail, Some(e.clone())),
+            (ExpectedOutcome::Valid, Some(e)) => {
+                // Auto-skip mistagged XSD-1.1-only schemas tested in 1.0 mode.
+                // Mirrors the same skip on instance tests at line 1063.
+                if test.version == "1.0"
+                    && e.contains("requires XSD 1.1 but schema is in XSD 1.0")
+                {
+                    (
+                        TestOutcome::Skip,
+                        Some(
+                            "Skipped: schema uses XSD 1.1 features unavailable in 1.0 mode"
+                                .to_string(),
+                        ),
+                    )
+                } else {
+                    (TestOutcome::Fail, Some(e.clone()))
+                }
+            }
             (ExpectedOutcome::Invalid, None) => (
                 TestOutcome::Fail,
                 Some("Schema was valid but expected invalid".to_string()),
@@ -1208,12 +1224,12 @@ enum InstanceActualOutcome {
 ///
 /// Returns the root validity classification plus collected validation messages.
 /// Returns `Err` on I/O or XML parse errors.
-/// Validate an instance document against a compiled schema set.
 ///
 /// If the first validation pass collects `xsi:schemaLocation` or
-/// `xsi:noNamespaceSchemaLocation` hints, the driver uses the library's
-/// [`enrich_schema_set`] API to build an enriched schema set and
-/// re-validates (two-pass approach).
+/// `xsi:noNamespaceSchemaLocation` hints, the driver calls
+/// [`xsd_schema::enrich_schema_set`] to build an enriched schema set and
+/// re-validates (two-pass approach). Pass-2 errors replace pass-1 errors
+/// — pass-1 diagnostics are diagnostic-only when enrichment runs.
 fn validate_instance(
     schema_set: &xsd_schema::SchemaSet,
     instance_path: &Path,
@@ -1230,12 +1246,11 @@ fn validate_instance(
     let (actual_outcome, error_msgs, sl_hints, nnsl_hints) =
         validate_instance_pass(schema_set, &canonical_path, &content)?;
 
-    // Two-pass: if hints were collected, use the library's enrich_schema_set()
-    // to build an enriched schema set and re-validate.
-    if let Some(enriched) = xsd_schema::enrich_schema_set(schema_set, &sl_hints, &nnsl_hints) {
-        let (actual_outcome2, error_msgs2, _, _) =
+    let outcome = xsd_schema::enrich_schema_set(schema_set, &sl_hints, &nnsl_hints);
+    if let Some(enriched) = outcome.schema_set {
+        let (outcome2, errors2, _, _) =
             validate_instance_pass(&enriched, &canonical_path, &content)?;
-        return Ok((actual_outcome2, error_msgs2));
+        return Ok((outcome2, errors2));
     }
 
     Ok((actual_outcome, error_msgs))

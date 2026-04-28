@@ -40,7 +40,9 @@ pub use context::{ElementValidationState, ValidatorState};
 
 pub use simple::{validate_simple_type, SimpleTypeResult};
 
-pub use hint_loader::{enrich_schema_set, load_hints_into_builder, HintLoadResult};
+pub use hint_loader::{
+    enrich_schema_set, load_hints_into_builder, EnrichmentOutcome, HintLoadResult,
+};
 pub use identity::{KeyFieldValue, KeySequence, KeyTable};
 pub use runtime::ValidationRuntime;
 pub use validator::{

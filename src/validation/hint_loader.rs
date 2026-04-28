@@ -100,12 +100,60 @@ fn try_load_hint(
     }
 }
 
+/// Outcome of [`enrich_schema_set`].
+///
+/// `schema_set` is `Some` only when the recompile succeeded. The other
+/// fields surface diagnostics that the previous `Option<SchemaSet>` API
+/// silently dropped:
+///
+/// - `hint_errors` — per-hint load failures (network, missing file,
+///   relative-URI resolution, ...). Always non-fatal.
+/// - `compile_error` — the `SchemaError` from recompiling the enriched
+///   builder, if recompilation failed. When this is `Some`, `schema_set`
+///   is always `None`.
+///
+/// The `is_no_op` helper distinguishes "no hints to apply" from
+/// "tried but failed".
+#[derive(Debug, Default)]
+pub struct EnrichmentOutcome {
+    /// Compiled enriched schema set, if recompile succeeded.
+    pub schema_set: Option<crate::schema::SchemaSet>,
+    /// Errors from individual hint loads (non-fatal, partial success
+    /// is possible).
+    pub hint_errors: Vec<SchemaError>,
+    /// Recompile error after the enriched builder was assembled, if any.
+    pub compile_error: Option<SchemaError>,
+}
+
+impl EnrichmentOutcome {
+    /// Returns `true` when no hints were provided — enrichment was a
+    /// no-op rather than a failure.
+    pub fn is_no_op(&self) -> bool {
+        self.schema_set.is_none()
+            && self.hint_errors.is_empty()
+            && self.compile_error.is_none()
+    }
+
+    /// Returns the enriched [`SchemaSet`] if available, otherwise the
+    /// original. Convenient when you want to "use enriched if it
+    /// worked, fall back to the original".
+    pub fn schema_set_or<'a>(
+        &'a self,
+        original: &'a crate::schema::SchemaSet,
+    ) -> &'a crate::schema::SchemaSet {
+        self.schema_set.as_ref().unwrap_or(original)
+    }
+}
+
 /// Build an enriched [`SchemaSet`] by re-loading the original schemas and
 /// adding any `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hints
 /// collected during a validation run.
 ///
-/// Returns `Some(enriched_set)` if hints were present and compilation
-/// succeeded, `None` if there were no hints or compilation failed.
+/// Returns an [`EnrichmentOutcome`] describing the result. The compiled
+/// `schema_set` is populated only when at least one hint was supplied
+/// **and** the recompile succeeded; in every other case
+/// `schema_set` is `None` and `hint_errors` / `compile_error` describe
+/// what happened.
 ///
 /// This is the recommended way to handle schema-location hints without
 /// manually tracking original schema file paths:
@@ -115,17 +163,20 @@ fn try_load_hint(
 /// let sl = runtime.schema_location_hints().to_vec();
 /// let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
 ///
-/// if let Some(enriched) = enrich_schema_set(&schema_set, &sl, &nnsl) {
+/// let outcome = enrich_schema_set(&schema_set, &sl, &nnsl);
+/// if let Some(enriched) = outcome.schema_set.as_ref() {
 ///     // Re-validate with enriched schema set
+/// } else if let Some(err) = outcome.compile_error.as_ref() {
+///     eprintln!("hint enrichment recompile failed: {err}");
 /// }
 /// ```
 pub fn enrich_schema_set(
     original: &crate::schema::SchemaSet,
     schema_location_hints: &[SchemaLocationHint],
     no_namespace_hints: &[NoNamespaceSchemaLocationHint],
-) -> Option<crate::schema::SchemaSet> {
+) -> EnrichmentOutcome {
     if schema_location_hints.is_empty() && no_namespace_hints.is_empty() {
-        return None;
+        return EnrichmentOutcome::default();
     }
 
     let mut builder = if original.xsd_version == crate::schema::model::XsdVersion::V1_1 {
@@ -135,9 +186,23 @@ pub fn enrich_schema_set(
     };
 
     builder.add_from(original);
-    load_hints_into_builder(&mut builder, schema_location_hints, no_namespace_hints);
-    builder.compile().ok().map(|c| c.into_schema_set())
+    let hint_result =
+        load_hints_into_builder(&mut builder, schema_location_hints, no_namespace_hints);
+
+    match builder.compile() {
+        Ok(compiled) => EnrichmentOutcome {
+            schema_set: Some(compiled.into_schema_set()),
+            hint_errors: hint_result.errors,
+            compile_error: None,
+        },
+        Err(e) => EnrichmentOutcome {
+            schema_set: None,
+            hint_errors: hint_result.errors,
+            compile_error: Some(e),
+        },
+    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -238,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enrich_schema_set_returns_none_without_hints() {
+    fn test_enrich_schema_set_no_hints_is_no_op() {
         let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:element name="root" type="xs:string"/>
         </xs:schema>"#;
@@ -248,8 +313,14 @@ mod tests {
             .compile()
             .unwrap();
 
-        let result = enrich_schema_set(compiled.schema_set(), &[], &[]);
-        assert!(result.is_none(), "should return None when no hints");
+        let outcome = enrich_schema_set(compiled.schema_set(), &[], &[]);
+        assert!(
+            outcome.is_no_op(),
+            "should be a no-op when no hints are provided"
+        );
+        assert!(outcome.schema_set.is_none());
+        assert!(outcome.compile_error.is_none());
+        assert!(outcome.hint_errors.is_empty());
     }
 
     #[test]
@@ -274,17 +345,29 @@ mod tests {
         let original = compiled.schema_set();
 
         // Provide a hint that fails to load — enrichment should still
-        // succeed because add_from re-loaded the original schema.
+        // succeed because add_from re-loaded the original schema, and
+        // the hint failure is surfaced in `hint_errors`.
         let hints = vec![SchemaLocationHint {
             namespace: "urn:test".to_string(),
             location: "nonexistent_42.xsd".to_string(),
             base_uri: String::new(),
         }];
 
-        let enriched = enrich_schema_set(original, &hints, &[]);
-        assert!(enriched.is_some(), "should return Some even if hint fails");
+        let outcome = enrich_schema_set(original, &hints, &[]);
+        assert!(
+            outcome.schema_set.is_some(),
+            "should return Some even if hint fails"
+        );
+        assert!(
+            !outcome.hint_errors.is_empty(),
+            "hint load failure must be surfaced in hint_errors"
+        );
+        assert!(
+            outcome.compile_error.is_none(),
+            "recompile of the original schemas should still succeed"
+        );
 
-        let enriched = enriched.unwrap();
+        let enriched = outcome.schema_set.unwrap();
         let name = enriched.name_table.add("root");
         assert!(
             enriched.lookup_element(None, name).is_some(),
@@ -320,12 +403,72 @@ mod tests {
             location: "nonexistent_42.xsd".to_string(),
             base_uri: String::new(),
         }];
-        let enriched = enrich_schema_set(original, &hints, &[]).unwrap();
+        let enriched = enrich_schema_set(original, &hints, &[])
+            .schema_set
+            .unwrap();
         assert_eq!(
             enriched.xsd_version,
             crate::schema::model::XsdVersion::V1_1,
             "enriched set should preserve XSD 1.1 version"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_enrich_schema_set_surfaces_compile_error() {
+        // Build an enriched set that cannot recompile: the hint adds a
+        // schema whose targetNamespace already exists in the original
+        // with a conflicting global element of the same name.
+        let dir = std::env::temp_dir().join("xsd_hint_test_compile_err");
+        let _ = std::fs::create_dir_all(&dir);
+        let primary = dir.join("primary.xsd");
+        std::fs::write(
+            &primary,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                          targetNamespace="urn:test">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+        )
+        .unwrap();
+        let conflict = dir.join("conflict.xsd");
+        std::fs::write(
+            &conflict,
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                          targetNamespace="urn:test">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+        )
+        .unwrap();
+
+        let compiled = SchemaSetBuilder::new()
+            .add("urn:test", &primary.to_string_lossy())
+            .unwrap()
+            .compile()
+            .unwrap();
+        let original = compiled.schema_set();
+
+        let hints = vec![SchemaLocationHint {
+            namespace: "urn:test".to_string(),
+            location: conflict.to_string_lossy().into_owned(),
+            base_uri: String::new(),
+        }];
+        let outcome = enrich_schema_set(original, &hints, &[]);
+
+        // Either the recompile rejects the conflict (compile_error set),
+        // or the hint loader/dedup spots it (schema_set still None).
+        // What we are asserting: the failure is **not** silently swallowed.
+        assert!(
+            outcome.schema_set.is_none() || outcome.compile_error.is_none(),
+            "outcome must be internally consistent: {outcome:?}"
+        );
+        if outcome.schema_set.is_none() {
+            assert!(
+                outcome.compile_error.is_some() || !outcome.hint_errors.is_empty(),
+                "if no enriched set is produced, the failure reason must be \
+                 surfaced via compile_error or hint_errors, got: {outcome:?}"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -8793,3 +8793,180 @@ fn test_entity_declared_passes() {
         entity_errors,
     );
 }
+
+// ── Root xsi:type promotion (XSD §5.2.2) ──────────────────────────────────
+//
+// When the document root has no governing element declaration but the
+// instance carries an `xsi:type` attribute, the validator must lax-assess
+// against the supplied type rather than rejecting with cvc-elt.1.
+// Closes the Sun "two-schema instance" sub-cluster — sunData/{C,S}Type/...
+
+#[test]
+fn test_root_xsi_type_simple_type_governs_undeclared_root() {
+    // Schema declares only a simpleType; the instance root element is not
+    // declared but xsi:type points at the simpleType. Mirrors
+    // sunData/SType/ST_name/ST_name00401m.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                     targetNamespace="urn:t" xmlns="urn:t">
+            <xs:simpleType name="Test">
+                <xs:restriction base="xs:string">
+                    <xs:pattern value="1|2|3"/>
+                </xs:restriction>
+            </xs:simpleType>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let tns_prefix = schema_set.name_table.add("t");
+    let tns_uri = schema_set.name_table.add("urn:t");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_uri),
+        bindings: vec![(tns_prefix, tns_uri)],
+    };
+
+    let info = v.validate_element("test", "urn:t", Some("t:Test"), None, &ns);
+    assert!(
+        info.schema_type.is_some(),
+        "xsi:type should supply governing type at root with no element decl"
+    );
+    assert_eq!(info.type_source, Some(TypeSource::XsiType));
+
+    v.validate_end_of_attributes();
+    v.validate_text("2");
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let elt1: Vec<_> = v
+        .sink
+        .errors
+        .iter()
+        .filter(|e| e.constraint == "cvc-elt.1")
+        .collect();
+    assert!(
+        elt1.is_empty(),
+        "no cvc-elt.1 expected when root xsi:type resolves, got: {:?}",
+        elt1
+    );
+    assert!(
+        v.sink.errors.is_empty(),
+        "instance value '2' matches pattern '1|2|3' — expected zero errors, got: {:?}",
+        v.sink.errors
+    );
+}
+
+#[test]
+fn test_root_xsi_type_complex_type_governs_undeclared_root() {
+    // Schema declares only a complexType; the instance uses xsi:type to
+    // pick it for the otherwise-undeclared root. Mirrors
+    // sunData/CType/targetNS/targetNS00101m.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                     targetNamespace="urn:t" xmlns="urn:t">
+            <xs:complexType name="Test">
+                <xs:sequence>
+                    <xs:element name="abc" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let tns_prefix = schema_set.name_table.add("t");
+    let tns_uri = schema_set.name_table.add("urn:t");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_uri),
+        bindings: vec![(tns_prefix, tns_uri)],
+    };
+
+    let info = v.validate_element("test", "urn:t", Some("t:Test"), None, &ns);
+    assert!(
+        info.schema_type.is_some(),
+        "xsi:type should supply governing complex type at root"
+    );
+    assert_eq!(info.type_source, Some(TypeSource::XsiType));
+
+    v.validate_end_of_attributes();
+    // The complex type's content model expects an unqualified <abc>:
+    // the local element is declared with elementFormDefault=unqualified
+    // (the default) and no targetNamespace, so its namespace is empty.
+    v.validate_element("abc", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello");
+    v.validate_end_element();
+    let end_info = v.validate_end_element();
+    assert_eq!(
+        end_info.validity,
+        SchemaValidity::Valid,
+        "errors: {:?}",
+        v.sink.errors
+    );
+    v.end_validation().ok();
+
+    let elt1: Vec<_> = v
+        .sink
+        .errors
+        .iter()
+        .filter(|e| e.constraint == "cvc-elt.1")
+        .collect();
+    assert!(
+        elt1.is_empty(),
+        "no cvc-elt.1 expected when root xsi:type resolves, got: {:?}",
+        elt1
+    );
+    assert!(
+        v.sink.errors.is_empty(),
+        "no errors expected, got: {:?}",
+        v.sink.errors
+    );
+}
+
+#[test]
+fn test_root_xsi_type_unresolved_emits_cvc_elt_1() {
+    // xsi:type names a type that is not declared anywhere — the root
+    // remains undeclared and cvc-elt.1 must fire (alongside the
+    // xsi:type-specific cvc-elt.4.1 diagnostic).
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                     targetNamespace="urn:t" xmlns="urn:t">
+            <xs:simpleType name="Real">
+                <xs:restriction base="xs:string"/>
+            </xs:simpleType>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let tns_prefix = schema_set.name_table.add("t");
+    let tns_uri = schema_set.name_table.add("urn:t");
+    let ns = NamespaceContextSnapshot {
+        default_ns: Some(tns_uri),
+        bindings: vec![(tns_prefix, tns_uri)],
+    };
+
+    let info = v.validate_element("test", "urn:t", Some("t:Imaginary"), None, &ns);
+    assert_eq!(info.validity, SchemaValidity::Invalid);
+    assert!(
+        info.schema_type.is_none(),
+        "unresolved xsi:type must not supply a governing type"
+    );
+
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    let codes: std::collections::HashSet<&str> =
+        v.sink.errors.iter().map(|e| e.constraint).collect();
+    assert!(
+        codes.contains("cvc-elt.1"),
+        "expected cvc-elt.1 when root xsi:type fails to resolve, got: {:?}",
+        codes
+    );
+    assert!(
+        codes.contains("cvc-elt.4.1"),
+        "expected cvc-elt.4.1 (xsi:type unresolved) alongside cvc-elt.1, got: {:?}",
+        codes
+    );
+}
