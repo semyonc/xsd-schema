@@ -170,6 +170,14 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     schema_location_hints: Vec<SchemaLocationHint>,
     /// Accumulated `xsi:noNamespaceSchemaLocation` hints with base URI context.
     no_namespace_schema_location_hints: Vec<NoNamespaceSchemaLocationHint>,
+    /// First-introducer serial per namespace seen during validation.
+    /// Key: `Option<NameId>` (element namespace; `None` = absent namespace).
+    /// Value: `element_serial` of the first element using that namespace.
+    /// Used to enforce XSD 1.0 §4.3.2 Rule 4 ("late-arriving components"):
+    /// an `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hint that
+    /// announces a namespace whose first element appeared earlier than the
+    /// current element is rejected (XSD 1.0 only — XSD 1.1 §G.1.15 relaxes).
+    first_namespace_use: HashMap<Option<NameId>, u64>,
     /// Base URI of the instance document (set by caller for relative URI resolution).
     instance_base_uri: String,
     /// Cached `xs:ID` simple-type key for XSD 1.0's ct-props-correct.5
@@ -215,6 +223,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             final_ic_tables: None,
             schema_location_hints: Vec::new(),
             no_namespace_schema_location_hints: Vec::new(),
+            first_namespace_use: HashMap::new(),
             instance_base_uri: String::new(),
             #[cfg(feature = "xsd11")]
             assertion_source,
@@ -3037,6 +3046,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.element_serial = self.next_element_serial;
         self.next_element_serial += 1;
 
+        // Record the first element using this namespace (XSD 1.0 §4.3.2 Rule 4
+        // "late-arriving components"). Gated to XSD 1.0; XSD 1.1 §G.1.15
+        // relaxes the rule entirely, so the map stays empty there.
+        if self.schema_set.is_xsd10() {
+            self.first_namespace_use
+                .entry(ev_state.namespace)
+                .or_insert(ev_state.element_serial);
+        }
+
         let local_name = self.schema_set.name_table.resolve(ev_state.local_name);
         if !self.element_path.is_empty() || self.validation_stack.is_empty() {
             self.element_path.push('/');
@@ -3303,12 +3321,55 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         // Accumulate namespace/location pairs (even from invalid attributes —
-        // the complete pairs are still valid hints)
+        // the complete pairs are still valid hints).
+        //
+        // XSD 1.0 §4.3.2 Rule 4 ("late-arriving components") is enforced
+        // here: a pair that announces a *new* schema document for a
+        // namespace whose first item already appeared earlier in the
+        // instance document is rejected. Re-announcing the same schema
+        // document (same location) for an already-seen namespace is
+        // allowed — no new components are introduced. XSD 1.1 §G.1.15
+        // relaxes the rule entirely (gated by `is_xsd10()`).
         let base_uri = self.current_element_base_uri();
+        let xsd10 = self.schema_set.is_xsd10();
+        let current_serial = self.validation_stack.last().map(|ev| ev.element_serial);
         for pair in tokens.chunks_exact(2) {
+            let ns_str = pair[0];
+            let loc_str = pair[1];
+
+            if xsd10 {
+                if let Some(serial) = current_serial {
+                    let ns_id: Option<NameId> = if ns_str.is_empty() {
+                        None
+                    } else {
+                        Some(self.schema_set.name_table.add(ns_str))
+                    };
+                    if let Some(&first_serial) = self.first_namespace_use.get(&ns_id) {
+                        if first_serial != serial
+                            && !self
+                                .schema_location_hints
+                                .iter()
+                                .any(|h| h.namespace == ns_str && h.location == loc_str)
+                        {
+                            self.report_error(
+                                "sch-late-component",
+                                format!(
+                                    "xsi:schemaLocation announces a new schema document \
+                                     '{loc_str}' for namespace '{ns_str}', but an item \
+                                     from that namespace has already been encountered \
+                                     earlier in the instance document (XSD 1.0 §4.3.2 \
+                                     Rule 4 'late-arriving components')"
+                                ),
+                            );
+                            validity = SchemaValidity::Invalid;
+                        }
+                    }
+                }
+            }
+
             self.schema_location_hints.push(SchemaLocationHint {
-                namespace: pair[0].to_string(),
-                location: pair[1].to_string(),
+                namespace: ns_str.to_string(),
+                location: loc_str.to_string(),
                 base_uri: base_uri.clone(),
             });
         }
@@ -3345,10 +3406,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let builtin = self.schema_set.builtin_types();
         let any_uri_key = TypeKey::Simple(builtin.any_uri);
         let attr_key = builtin.xsi_no_namespace_schema_location_attr;
-        let result = self.validate_xsi_simple_value(value, any_uri_key, attr_key);
+        let mut result = self.validate_xsi_simple_value(value, any_uri_key, attr_key);
 
         let trimmed = value.trim();
         if !trimmed.is_empty() {
+            // XSD 1.0 §4.3.2 Rule 4 (late-arriving components): only fire the
+            // rule when the announced location is *new* — re-announcing the
+            // same noNamespace schema document already seen on an earlier
+            // element does not introduce new components and is allowed.
+            // Gated to XSD 1.0; XSD 1.1 §G.1.15 relaxes the rule.
+            if self.schema_set.is_xsd10() {
+                let current_serial = self.validation_stack.last().map(|ev| ev.element_serial);
+                if let Some(serial) = current_serial {
+                    if let Some(&first_serial) = self.first_namespace_use.get(&None) {
+                        if first_serial != serial
+                            && !self
+                                .no_namespace_schema_location_hints
+                                .iter()
+                                .any(|h| h.location == trimmed)
+                        {
+                            self.report_error(
+                                "sch-late-component",
+                                format!(
+                                    "xsi:noNamespaceSchemaLocation announces a new schema \
+                                     document '{trimmed}' for the absent namespace, but \
+                                     an item from the absent namespace has already been \
+                                     encountered earlier in the instance document (XSD 1.0 \
+                                     §4.3.2 Rule 4 'late-arriving components')"
+                                ),
+                            );
+                            result.validity = SchemaValidity::Invalid;
+                        }
+                    }
+                }
+            }
+
             self.no_namespace_schema_location_hints
                 .push(NoNamespaceSchemaLocationHint {
                     location: trimmed.to_string(),
