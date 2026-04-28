@@ -18,9 +18,19 @@
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,312 | 7 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 -- -s /Users/semyonc/Projects/XmlPad-Windows/XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
 
+
 # AI Disclosure
 
 This project was generated with AI as an experiment.
 The generated code and content were reviewed and refined by the author.
 Use of this repository is governed by its license, including any production use.
 This notice is provided for transparency.
+
+# Source Provenance
+
+No third-party source repositories were used as rewrite sources for this codebase, with the sole exception of the author's own prior work:
+
+- [semyonc/xpath2](https://github.com/semyonc/xpath2) — C# XPath 2.0 implementation
+- WmHelp XmlPad — earlier Delphi tool by the same author together with Edward Aponasko and Alex Pospelov
+
+A small number of Microsoft .NET API shapes are mirrored where they map naturally onto the data model, but no Microsoft source code was ported or rewritten. 

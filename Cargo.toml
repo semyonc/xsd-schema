@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 authors = ["XmlPad Project"]
 description = "XSD 1.0 schema parser and validator"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 # XML parsing
