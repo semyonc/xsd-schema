@@ -704,7 +704,12 @@ impl SchemaResolver {
     }
 
     /// Load a catalog-resolved import target, validating namespace match.
-    /// Returns `Ok(None)` when the catalog entry is already loaded.
+    /// Returns `Ok(None)` when the catalog entry is already loaded, or when
+    /// the requested namespace is already covered by a previously loaded
+    /// schema document — embedded catalog schemas (xml.xsd, xlink.xsd) are
+    /// only injected when nothing else has supplied that namespace, so a
+    /// user-provided overlay (msData/additional `test264908_*` chain;
+    /// saxon `over030`) does not collide with the embedded copy.
     fn try_catalog_load(
         &mut self,
         catalog_location: &str,
@@ -717,6 +722,9 @@ impl SchemaResolver {
             .ok()
             .is_some_and(|r| schema_set.loaded_locations.contains_key(&r));
         if already_loaded {
+            return Ok(None);
+        }
+        if namespace_already_covered(schema_set, namespace) {
             return Ok(None);
         }
         let outcome = self.load_schema(catalog_location, base_uri, schema_set, None)?;
@@ -771,6 +779,23 @@ impl Default for SchemaResolver {
 /// Re-checks both freshly `Loaded` and `AlreadyLoaded` outcomes so a stale
 /// duplicate import that disagrees with a previously-loaded document fails
 /// the same way as the first import would.
+/// Whether any already-loaded schema document declares (or chameleon-adopts)
+/// the given namespace URI. Used to suppress a redundant catalog fallback
+/// that would otherwise inject the embedded copy of `xml.xsd` / `xlink.xsd`
+/// on top of a user-supplied schema for the same namespace (msData
+/// `test264908_*` chain; saxon `over030`).
+fn namespace_already_covered(schema_set: &SchemaSet, namespace: Option<&str>) -> bool {
+    let Some(ns_str) = namespace else {
+        return false;
+    };
+    let Some(ns_id) = schema_set.name_table.get(ns_str) else {
+        return false;
+    };
+    schema_set.documents.iter().any(|d| {
+        d.declared_target_namespace == Some(ns_id) || d.target_namespace == Some(ns_id)
+    })
+}
+
 fn validate_import_target_namespace(
     schema_set: &SchemaSet,
     outcome: &LoadOutcome,
