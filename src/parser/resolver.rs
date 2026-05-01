@@ -2254,6 +2254,7 @@ mod tests {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
+                deferred_item_type_error: None,
             });
 
         let redefine = RedefineDirective {
@@ -2355,6 +2356,7 @@ mod tests {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
+                deferred_item_type_error: None,
             });
 
         let redefine = RedefineDirective {

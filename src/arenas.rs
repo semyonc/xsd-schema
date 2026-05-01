@@ -23,6 +23,17 @@ use crate::types::facets::FacetSet;
 // Forward declarations for types that will be defined later
 // These are placeholders until we define the actual types
 
+/// `src-resolve` reference miss deferred from schema compilation to
+/// instance validation. The schema compiles; the error fires only if the
+/// declaration carrying this payload is selected for validating an
+/// instance. Used in XSD 1.0 for explicit element `type` and
+/// `xs:list itemType` references whose target component does not exist.
+#[derive(Debug, Clone)]
+pub struct DeferredSrcResolve {
+    pub message: String,
+    pub source: Option<SourceRef>,
+}
+
 /// Placeholder for SimpleTypeDef (defined in types/simple.rs)
 #[derive(Debug)]
 pub struct SimpleTypeDefData {
@@ -49,6 +60,10 @@ pub struct SimpleTypeDefData {
 
     /// Original simple type key before redefine (for base-type resolution)
     pub redefine_original: Option<SimpleTypeKey>,
+
+    /// Deferred `src-resolve` error for an `xs:list itemType` whose target
+    /// is missing. Reported when this list type is used for validation.
+    pub deferred_item_type_error: Option<DeferredSrcResolve>,
 }
 
 /// Resolved attribute use - stores resolved keys for attribute use references
@@ -138,6 +153,11 @@ pub struct ElementDeclData {
     pub resolved_ref: Option<ElementKey>,
     /// Resolved substitution group head elements
     pub resolved_substitution_groups: Vec<ElementKey>,
+
+    /// Deferred `src-resolve` error for an explicit `type` attribute whose
+    /// target is missing. Reported when this element declaration is
+    /// selected for validation, before any `xs:anyType` fallback.
+    pub deferred_type_error: Option<DeferredSrcResolve>,
 }
 
 /// Placeholder for AttributeDecl (defined in schema/decl.rs)
@@ -437,6 +457,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         }
     }
 
@@ -467,6 +488,7 @@ mod tests {
             resolved_type: None,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         }
     }
 

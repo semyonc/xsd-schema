@@ -164,6 +164,7 @@ impl<'a> SchemaAssembler<'a> {
                     resolved_item_type: None,
                     resolved_member_types: Vec::new(),
                     redefine_original: None,
+                    deferred_item_type_error: None,
                 };
                 let key = self.schema_set.arenas.alloc_simple_type(data);
                 let type_key = TypeKey::Simple(key);
@@ -435,6 +436,7 @@ impl<'a> SchemaAssembler<'a> {
             resolved_type: None,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
         let key = self.schema_set.arenas.alloc_element(data);
         if register {

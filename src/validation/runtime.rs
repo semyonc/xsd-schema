@@ -1210,6 +1210,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Check abstract (deferred until after push)
         let is_abstract = elem_data.is_abstract;
 
+        // §src-resolve: when an explicit `type` attribute could not be
+        // resolved at compile time, the XSD 1.0 lazy path leaves a
+        // `deferred_type_error` on the declaration. Surface it on first
+        // selection rather than silently falling back to `xs:anyType`.
+        let has_deferred_type_error = elem_data.deferred_type_error.is_some();
+
         // 5. Resolve type from element declaration
         let mut type_key = elem_data.resolved_type;
 
@@ -1303,7 +1309,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.content_state = content_state;
         ev_state.content_type = Some(content_type);
         ev_state.is_nil = is_nil;
-        ev_state.validity = if xsi_type_invalid || abstract_type_invalid || nillable_violation {
+        ev_state.validity = if xsi_type_invalid
+            || abstract_type_invalid
+            || nillable_violation
+            || has_deferred_type_error
+        {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid
@@ -1373,6 +1383,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ),
             );
         }
+        if has_deferred_type_error {
+            let msg = self.schema_set.arenas.elements[elem_key]
+                .deferred_type_error
+                .as_ref()
+                .map(|d| d.message.as_str())
+                .unwrap_or("");
+            self.report_error("src-resolve", msg.to_string());
+        }
 
         self.advance_constraints_start_element(local_name, namespace, Some(elem_key));
 
@@ -1382,7 +1400,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 10. Return SchemaInfo
         #[allow(unused_mut)]
-        let mut validity = if xsi_type_invalid || abstract_type_invalid {
+        let mut validity = if xsi_type_invalid
+            || abstract_type_invalid
+            || has_deferred_type_error
+        {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid

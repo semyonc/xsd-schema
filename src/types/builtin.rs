@@ -299,6 +299,7 @@ impl BuiltinTypes {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
+                deferred_item_type_error: None,
             };
 
             schema_set.arenas.alloc_simple_type(data)
@@ -397,6 +398,7 @@ impl BuiltinTypes {
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
+                deferred_item_type_error: None,
             };
             schema_set.arenas.alloc_simple_type(data)
         };
@@ -956,6 +958,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         });
         assert!(!builtin.is_builtin(custom_type));
     }

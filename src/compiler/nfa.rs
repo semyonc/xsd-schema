@@ -1778,6 +1778,7 @@ mod tests {
             resolved_type: None,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         }
     }
 

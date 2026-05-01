@@ -49,6 +49,7 @@ fn element_data(name: NameId, target_namespace: Option<NameId>) -> crate::arenas
         resolved_type: None,
         resolved_ref: None,
         resolved_substitution_groups: Vec::new(),
+        deferred_type_error: None,
     }
 }
 

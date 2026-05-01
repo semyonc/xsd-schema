@@ -782,6 +782,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
 
         let _user_type_key = schema_set.arenas.alloc_simple_type(simple_data);
@@ -829,6 +830,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
         let type1_key = schema_set.arenas.alloc_simple_type(type1_data);
 
@@ -850,6 +852,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
         let type2_key = schema_set.arenas.alloc_simple_type(type2_data);
 

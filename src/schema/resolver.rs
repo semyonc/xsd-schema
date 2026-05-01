@@ -118,29 +118,43 @@ impl<'a> ReferenceResolver<'a> {
 
         // 3. Not found - error with provenance note
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
-        let name_str = self.format_qname(qname);
-        // Try both simple and complex type provenance
-        let note = {
-            let simple_note = self.schema_set.format_provenance_note(
-                ComponentKind::SimpleType,
-                qname.namespace,
-                qname.local_name,
-            );
-            if simple_note.is_empty() {
-                self.schema_set.format_provenance_note(
-                    ComponentKind::ComplexType,
-                    qname.namespace,
-                    qname.local_name,
-                )
-            } else {
-                simple_note
-            }
-        };
         Err(SchemaError::structural(
             "src-resolve",
-            format!("Type '{}' not found{}", name_str, note),
+            format_type_not_found_message(self.schema_set, qname, "Type"),
             location,
         ))
+    }
+
+    /// Lookup-only variant of [`resolve_type_ref`]: returns `Ok(None)` when
+    /// the QName resolves to no component, while still propagating
+    /// namespace-visibility errors as `Err`. Used by callers that want to
+    /// defer a missing-component miss instead of failing compilation.
+    pub fn try_resolve_type_ref(
+        &self,
+        qname: &QNameRef,
+        source: Option<&SourceRef>,
+    ) -> SchemaResult<Option<TypeKey>> {
+        if let Some(type_key) = self
+            .schema_set
+            .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+        {
+            return Ok(Some(type_key));
+        }
+        check_namespace_visible(self.schema_set, qname, source, "Type")?;
+        Ok(self.schema_set.lookup_type(qname.namespace, qname.local_name))
+    }
+
+    /// Lookup-only variant of [`resolve_element_ref`]: returns `Ok(None)` for
+    /// the "not found" case, while still propagating visibility errors.
+    pub fn try_resolve_element_ref(
+        &self,
+        qname: &QNameRef,
+        source: Option<&SourceRef>,
+    ) -> SchemaResult<Option<ElementKey>> {
+        check_namespace_visible(self.schema_set, qname, source, "Element")?;
+        Ok(self
+            .schema_set
+            .lookup_element(qname.namespace, qname.local_name))
     }
 
     /// Resolve a TypeRefResult to a TypeKey
@@ -452,6 +466,7 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                     (
                         elem.resolved_type.is_none()
                             && elem.resolved_ref.is_none()
+                            && elem.deferred_type_error.is_none()
                             && !elem.resolved_substitution_groups.is_empty(),
                         elem.resolved_substitution_groups.clone(),
                     )
@@ -476,12 +491,53 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                 break;
             }
         }
+        // Secondary post-pass: when no head has a resolved type but at least
+        // one carries a deferred src-resolve error on its own `type` attribute,
+        // propagate that deferred error down to the member. Without this, the
+        // late `xs:anyType` fallback below would silently substitute anyType
+        // and runtime validation against the member would never fire the
+        // deferred error.
+        for &key in &element_keys {
+            let needs_deferred = {
+                let elem = schema_set.arenas.elements.get(key).unwrap();
+                elem.resolved_type.is_none()
+                    && elem.resolved_ref.is_none()
+                    && elem.deferred_type_error.is_none()
+                    && !elem.resolved_substitution_groups.is_empty()
+            };
+            if !needs_deferred {
+                continue;
+            }
+            let inherited = {
+                let elem = schema_set.arenas.elements.get(key).unwrap();
+                elem.resolved_substitution_groups
+                    .iter()
+                    .find_map(|&head_key| {
+                        schema_set
+                            .arenas
+                            .elements
+                            .get(head_key)
+                            .and_then(|h| h.deferred_type_error.clone())
+                    })
+            };
+            if let Some(deferred) = inherited {
+                if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+                    elem.deferred_type_error = Some(deferred);
+                }
+            }
+        }
         // Final anyType fallback for elements that still have no type (e.g., circular
         // substitution group chains or heads that themselves have no type).
+        // Skip elements that carry a deferred src-resolve error on their explicit
+        // `type` attribute — runtime must report the deferred error rather than
+        // silently substituting `xs:anyType`.
         let any_type = TypeKey::Complex(schema_set.any_type_key());
         for &key in &element_keys {
             if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
-                if elem.resolved_type.is_none() && elem.resolved_ref.is_none() {
+                if elem.resolved_type.is_none()
+                    && elem.resolved_ref.is_none()
+                    && elem.deferred_type_error.is_none()
+                {
                     assign_element_type(elem, any_type);
                 }
             }
@@ -751,21 +807,53 @@ fn resolve_element_references(
     // Create resolver
     let resolver = ReferenceResolver::new(schema_set);
 
-    // Resolve type reference (if not already resolved from inline type)
+    // XSD 1.0 permits an unresolved `type` reference on an unused element
+    // declaration; XSD 1.1 treats the same miss as a fatal compile error.
+    let lazy_src_resolve = schema_set.is_xsd10();
+
+    // Resolve type reference (if not already resolved from inline type).
+    // Under XSD 1.0, a missing target is deferred via `deferred_type_error`
+    // and the schema still compiles. Visibility violations remain fatal.
+    let mut deferred_type_error: Option<crate::arenas::DeferredSrcResolve> = None;
     let mut resolved_type = if already_resolved_type.is_some() {
         // Type was already resolved during assembly (inline type)
         already_resolved_type
     } else if let Some(ref qname) = type_qname {
-        let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
-        stats.types_resolved += 1;
-        Some(type_key)
+        if lazy_src_resolve {
+            match resolver.try_resolve_type_ref(qname, source.as_ref())? {
+                Some(type_key) => {
+                    stats.types_resolved += 1;
+                    Some(type_key)
+                }
+                None => {
+                    deferred_type_error = Some(build_deferred_type_resolve(
+                        schema_set,
+                        qname,
+                        source.as_ref(),
+                        "Type",
+                    ));
+                    None
+                }
+            }
+        } else {
+            let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
+            stats.types_resolved += 1;
+            Some(type_key)
+        }
     } else {
         None
     };
-    // Only fall back to anyType when there is no substitution group.
-    // Elements with a substitutionGroup but no explicit type inherit the
-    // head's type in the post-pass inside resolve_all_references (§3.3.2.1 rule 3).
-    if resolved_type.is_none() && ref_name.is_none() && substitution_groups.is_empty() {
+    // Only fall back to anyType when there is no substitution group AND no
+    // deferred type error. An explicit but unresolved `type` attribute must
+    // not be silently rewritten as `xs:anyType`; runtime checks the deferred
+    // error instead. Elements with a substitutionGroup but no explicit type
+    // inherit the head's type in the post-pass inside `resolve_all_references`
+    // (§3.3.2.1 rule 3).
+    if resolved_type.is_none()
+        && deferred_type_error.is_none()
+        && ref_name.is_none()
+        && substitution_groups.is_empty()
+    {
         resolved_type = Some(TypeKey::Complex(schema_set.any_type_key()));
     }
 
@@ -778,12 +866,27 @@ fn resolve_element_references(
         None
     };
 
-    // Resolve substitution groups
+    // Resolve substitution groups. Under XSD 1.0, an unresolved head is
+    // dropped silently — direct validation of the affiliating element is
+    // still permitted, so the missing affiliation must not poison the rest
+    // of the declaration. Under XSD 1.1, a missing head is fatal.
     let mut resolved_subst_groups = Vec::with_capacity(substitution_groups.len());
     for qname in &substitution_groups {
-        let elem_key = resolver.resolve_element_ref(qname, source.as_ref())?;
-        stats.elements_resolved += 1;
-        resolved_subst_groups.push(elem_key);
+        if lazy_src_resolve {
+            match resolver.try_resolve_element_ref(qname, source.as_ref())? {
+                Some(elem_key) => {
+                    stats.elements_resolved += 1;
+                    resolved_subst_groups.push(elem_key);
+                }
+                None => {
+                    // Drop unresolved head; do not poison the affiliating element.
+                }
+            }
+        } else {
+            let elem_key = resolver.resolve_element_ref(qname, source.as_ref())?;
+            stats.elements_resolved += 1;
+            resolved_subst_groups.push(elem_key);
+        }
     }
 
     // Resolve alternative type references (XSD 1.1)
@@ -817,6 +920,7 @@ fn resolve_element_references(
         elem.resolved_type = resolved_type;
         elem.resolved_ref = resolved_ref;
         elem.resolved_substitution_groups = resolved_subst_groups;
+        elem.deferred_type_error = deferred_type_error;
 
         #[cfg(feature = "xsd11")]
         for (i, alt_type) in resolved_alt_types.into_iter().enumerate() {
@@ -827,6 +931,46 @@ fn resolve_element_references(
     }
 
     Ok(())
+}
+
+/// Format a "type not found" `src-resolve` message with provenance, trying
+/// the `SimpleType` arena first and falling back to `ComplexType`. `label`
+/// is the human-facing kind ("Type", "List item type") prepended to the
+/// QName.
+fn format_type_not_found_message(
+    schema_set: &SchemaSet,
+    qname: &QNameRef,
+    label: &str,
+) -> String {
+    let name_str = format_resolved_qname(&schema_set.name_table, qname.namespace, qname.local_name);
+    let simple_note = schema_set.format_provenance_note(
+        ComponentKind::SimpleType,
+        qname.namespace,
+        qname.local_name,
+    );
+    let note = if simple_note.is_empty() {
+        schema_set.format_provenance_note(
+            ComponentKind::ComplexType,
+            qname.namespace,
+            qname.local_name,
+        )
+    } else {
+        simple_note
+    };
+    format!("{} '{}' not found{}", label, name_str, note)
+}
+
+/// Build a deferred `src-resolve` error payload for a missing type reference.
+fn build_deferred_type_resolve(
+    schema_set: &SchemaSet,
+    qname: &QNameRef,
+    source: Option<&SourceRef>,
+    label: &str,
+) -> crate::arenas::DeferredSrcResolve {
+    crate::arenas::DeferredSrcResolve {
+        message: format_type_not_found_message(schema_set, qname, label),
+        source: source.cloned(),
+    }
 }
 
 /// Resolve references in an attribute declaration
@@ -972,13 +1116,37 @@ fn resolve_simple_type_references(
         None
     };
 
-    // Resolve item type reference (for list) - if not already resolved
+    // Resolve item type reference (for list) - if not already resolved.
+    // Under XSD 1.0, a missing target is deferred via
+    // `deferred_item_type_error` and the simple type still compiles. Under
+    // XSD 1.1, the miss is fatal. Visibility violations and missing
+    // `base` / union `memberTypes` references are always fatal.
+    let lazy_src_resolve = schema_set.is_xsd10();
+    let mut deferred_item_error: Option<crate::arenas::DeferredSrcResolve> = None;
     let resolved_item = if already_resolved_item.is_some() {
         already_resolved_item
     } else if let Some(ref qname) = item_qname {
-        let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
-        stats.types_resolved += 1;
-        Some(type_key)
+        if lazy_src_resolve {
+            match resolver.try_resolve_type_ref(qname, source.as_ref())? {
+                Some(type_key) => {
+                    stats.types_resolved += 1;
+                    Some(type_key)
+                }
+                None => {
+                    deferred_item_error = Some(build_deferred_type_resolve(
+                        schema_set,
+                        qname,
+                        source.as_ref(),
+                        "List item type",
+                    ));
+                    None
+                }
+            }
+        } else {
+            let type_key = resolver.resolve_type_ref(qname, source.as_ref())?;
+            stats.types_resolved += 1;
+            Some(type_key)
+        }
     } else {
         None
     };
@@ -1019,21 +1187,23 @@ fn resolve_simple_type_references(
         type_def.resolved_base_type = resolved_base;
         type_def.resolved_item_type = resolved_item;
         type_def.resolved_member_types = resolved_members;
+        type_def.deferred_item_type_error = deferred_item_error;
     }
 
     // Inherit variety and structural properties from base type for restriction-derived types.
     // Parser sets variety=Atomic for all restrictions, but restrictions of union/list types
     // must inherit the base type's variety and member types / item type.
     if let Some(TypeKey::Simple(base_sk)) = resolved_base {
-        let (base_variety, base_members, base_item) = {
+        let (base_variety, base_members, base_item, base_deferred_item) = {
             if let Some(base_def) = schema_set.arenas.simple_types.get(base_sk) {
                 (
                     base_def.variety,
                     base_def.resolved_member_types.clone(),
                     base_def.resolved_item_type,
+                    base_def.deferred_item_type_error.clone(),
                 )
             } else {
-                (SimpleTypeVariety::Atomic, Vec::new(), None)
+                (SimpleTypeVariety::Atomic, Vec::new(), None, None)
             }
         };
         if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
@@ -1048,6 +1218,12 @@ fn resolve_simple_type_references(
             }
             if base_variety == SimpleTypeVariety::List && type_def.resolved_item_type.is_none() {
                 type_def.resolved_item_type = base_item;
+                // Propagate the base's deferred itemType miss so a derived
+                // list type doesn't silently fall through to "untyped" at
+                // validation time when the base's itemType was lazy-resolved.
+                if type_def.deferred_item_type_error.is_none() {
+                    type_def.deferred_item_type_error = base_deferred_item;
+                }
             }
         }
     }
@@ -1718,6 +1894,7 @@ mod tests {
             resolved_type: None,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
@@ -1822,6 +1999,7 @@ mod tests {
             resolved_type: Some(TypeKey::Simple(string_key)),
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);

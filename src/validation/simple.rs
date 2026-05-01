@@ -397,6 +397,13 @@ fn validate_list_type(
     let item_type_key = match st_data.resolved_item_type {
         Some(tk) => tk,
         None => {
+            if let Some(deferred) = &st_data.deferred_item_type_error {
+                return Err(errors::error(
+                    "src-resolve",
+                    deferred.message.clone(),
+                    None,
+                ));
+            }
             // No item type resolved — cannot validate list items, accept as untyped
             return Ok(SimpleTypeResult {
                 typed_value: XmlValue::untyped(value),

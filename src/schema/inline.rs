@@ -986,6 +986,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
             resolved_type,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
@@ -1263,6 +1264,7 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
             resolved_type,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
@@ -1346,6 +1348,7 @@ fn assemble_inline_type(
                 resolved_item_type: None,
                 resolved_member_types: Vec::new(),
                 redefine_original: None,
+                deferred_item_type_error: None,
             };
             let key = schema_set.arenas.alloc_simple_type(data);
             Ok(TypeKey::Simple(key))
@@ -1663,6 +1666,7 @@ mod tests {
             resolved_type: None,
             resolved_ref: None,
             resolved_substitution_groups: Vec::new(),
+            deferred_type_error: None,
         };
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
@@ -1707,6 +1711,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
@@ -1749,6 +1754,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
@@ -1790,6 +1796,7 @@ mod tests {
             resolved_item_type: None,
             resolved_member_types: Vec::new(),
             redefine_original: None,
+            deferred_item_type_error: None,
         };
 
         let type_key = schema_set.arenas.alloc_simple_type(type_data);
