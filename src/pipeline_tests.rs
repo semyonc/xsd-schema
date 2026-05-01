@@ -2882,9 +2882,9 @@ fn test_reject_all_group_with_wildcard_xsd10() {
     );
     match result.unwrap_err() {
         crate::error::SchemaError::StructuralError { constraint, .. } => {
-            assert_eq!(constraint, "src-model-group");
+            assert_eq!(constraint, "cos-all-limited");
         }
-        other => panic!("Expected src-model-group, got {:?}", other),
+        other => panic!("Expected cos-all-limited, got {:?}", other),
     }
 }
 

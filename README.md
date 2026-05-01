@@ -14,7 +14,7 @@
 
 | Suite | Command | Total | Passed | Failed | Skipped | Errors | Pass rate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,414 | 55 | 34 | 7 | 99.9% |
+| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,419 | 51 | 34 | 6 | 99.9% |
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,313 | 6 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 -- -s /Users/semyonc/Projects/XmlPad-Windows/XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
 

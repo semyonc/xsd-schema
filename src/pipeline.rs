@@ -453,6 +453,7 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     xsd11_element_consistency_checks(schema_set)?;
     validate_all_group_outer_occurs(schema_set)?;
     validate_all_group_content(schema_set)?;
+    validate_all_group_placement(schema_set)?;
     validate_all_particle_occurs(schema_set)?;
     validate_all_upa_constraints(schema_set)?;
     Ok(())
@@ -537,9 +538,13 @@ fn validate_all_group_outer_occurs(schema_set: &SchemaSet) -> SchemaResult<()> {
 
 /// Validate all-group content constraints.
 ///
-/// XSD 1.0: all groups may only contain element declarations (the schema-for-schemas
-/// `allModel` group is `(annotation?, element*)`). Wildcards (`xs:any`) are forbidden.
-/// XSD 1.1 relaxes this to allow `xs:any` and group references in all groups.
+/// XSD 1.0 §3.8 cos-all-limited: every particle inside an `xs:all` must be
+/// an element declaration whose `minOccurs` is 0 or 1 and whose `maxOccurs`
+/// is 1 — wildcards (`xs:any`) and nested groups are forbidden, and a member
+/// element with `maxOccurs > 1` is illegal even when its sibling has the
+/// default `maxOccurs="1"`. XSD 1.1 relaxes these constraints (any
+/// `maxOccurs`, wildcards, group refs are allowed subject to cos-all-limited
+/// 1.3 / rule 2 enforced at compile time).
 fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
     use crate::parser::frames::{ComplexContentResult, Compositor};
 
@@ -550,7 +555,7 @@ fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
     // Check named model groups
     for (_, mg) in schema_set.arenas.model_groups.iter() {
         if mg.compositor == Some(Compositor::All) {
-            check_all_group_no_wildcards(&mg.particles, schema_set)?;
+            check_all_group_xsd10_constraints(&mg.particles, schema_set)?;
         }
     }
 
@@ -558,7 +563,7 @@ fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
         if let ComplexContentResult::Complex(content) = &type_def.content {
             if let Some(particle) = content.particle.as_ref() {
-                check_particle_all_group_wildcards(particle, schema_set)?;
+                check_particle_all_group_constraints(particle, schema_set)?;
             }
         }
     }
@@ -566,26 +571,77 @@ fn validate_all_group_content(schema_set: &SchemaSet) -> SchemaResult<()> {
     Ok(())
 }
 
-fn check_all_group_no_wildcards(
+fn check_all_group_xsd10_constraints(
     particles: &[crate::parser::frames::ParticleResult],
     schema_set: &SchemaSet,
 ) -> SchemaResult<()> {
     use crate::parser::frames::ParticleTerm;
 
     for particle in particles {
-        if let ParticleTerm::Any(wc) = &particle.term {
-            let location = schema_set.locate(wc.source.as_ref());
+        let particle_loc = schema_set.locate(particle.source.as_ref());
+        match &particle.term {
+            ParticleTerm::Any(wc) => {
+                let location = schema_set
+                    .locate(wc.source.as_ref())
+                    .or_else(|| particle_loc.clone());
+                return Err(crate::error::SchemaError::structural(
+                    "cos-all-limited",
+                    "In XSD 1.0, xs:any (wildcard) is not allowed inside an xs:all group"
+                        .to_string(),
+                    location,
+                ));
+            }
+            ParticleTerm::Group(mg) => {
+                let location = schema_set
+                    .locate(mg.source.as_ref())
+                    .or_else(|| particle_loc.clone());
+                return Err(crate::error::SchemaError::structural(
+                    "cos-all-limited",
+                    "In XSD 1.0, a nested model group is not allowed inside an xs:all group"
+                        .to_string(),
+                    location,
+                ));
+            }
+            ParticleTerm::Element(_) => {}
+        }
+
+        if particle.min_occurs > 1 {
             return Err(crate::error::SchemaError::structural(
-                "src-model-group",
-                "In XSD 1.0, xs:any (wildcard) is not allowed inside an xs:all group".to_string(),
-                location,
+                "cos-all-limited",
+                format!(
+                    "In XSD 1.0, an xs:all member's minOccurs must be 0 or 1, found {}",
+                    particle.min_occurs
+                ),
+                particle_loc,
             ));
+        }
+
+        match particle.max_occurs {
+            Some(0) | Some(1) => {}
+            Some(n) => {
+                return Err(crate::error::SchemaError::structural(
+                    "cos-all-limited",
+                    format!(
+                        "In XSD 1.0, an xs:all member's maxOccurs must be 0 or 1, found {}",
+                        n
+                    ),
+                    particle_loc,
+                ));
+            }
+            None => {
+                return Err(crate::error::SchemaError::structural(
+                    "cos-all-limited",
+                    "In XSD 1.0, an xs:all member's maxOccurs must be 0 or 1 (unbounded not allowed)"
+                        .to_string(),
+                    particle_loc,
+                ));
+            }
         }
     }
     Ok(())
 }
 
-fn check_particle_all_group_wildcards(
+fn check_particle_all_group_constraints(
     particle: &crate::parser::frames::ParticleResult,
     schema_set: &SchemaSet,
 ) -> SchemaResult<()> {
@@ -593,11 +649,108 @@ fn check_particle_all_group_wildcards(
 
     if let ParticleTerm::Group(mg) = &particle.term {
         if mg.compositor == Some(Compositor::All) {
-            check_all_group_no_wildcards(&mg.particles, schema_set)?;
+            check_all_group_xsd10_constraints(&mg.particles, schema_set)?;
         }
         // Recurse into child particles regardless of compositor
         for child in &mg.particles {
-            check_particle_all_group_wildcards(child, schema_set)?;
+            check_particle_all_group_constraints(child, schema_set)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate XSD 1.0 cos-all-limited.1.2 placement: an `xs:all` model group
+/// (whether inline or reached through a named-group reference) may only
+/// appear as the top-level particle of a complex type's content. It must
+/// not appear nested inside `xs:sequence` / `xs:choice`, nor reached via a
+/// chain of group references that pass through a non-all compositor.
+fn validate_all_group_placement(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::compiler::{is_top_level_all_group, resolve_top_level_all_group_ref};
+    use crate::parser::frames::ComplexContentResult;
+
+    if !schema_set.is_xsd10() {
+        return Ok(());
+    }
+
+    for (_, type_def) in schema_set.arenas.complex_types.iter() {
+        let ComplexContentResult::Complex(content) = &type_def.content else {
+            continue;
+        };
+        let Some(particle) = content.particle.as_ref() else {
+            continue;
+        };
+
+        // Per-particle constraints on a top-level all-group are enforced
+        // by validate_all_group_content; only deeper placements need the
+        // recursion guard below.
+        if is_top_level_all_group(particle).is_some()
+            || resolve_top_level_all_group_ref(particle, schema_set).is_some()
+        {
+            continue;
+        }
+
+        let mut visited = std::collections::HashSet::new();
+        check_no_nested_all_group(particle, schema_set, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn check_no_nested_all_group(
+    particle: &crate::parser::frames::ParticleResult,
+    schema_set: &SchemaSet,
+    visited: &mut std::collections::HashSet<crate::ids::ModelGroupKey>,
+) -> SchemaResult<()> {
+    use crate::parser::frames::{Compositor, ParticleTerm, ParticleResult, ModelGroupDefResult};
+
+    fn placement_location(
+        particle: &ParticleResult,
+        group: &ModelGroupDefResult,
+        schema_set: &SchemaSet,
+    ) -> Option<crate::parser::location::SourceLocation> {
+        schema_set
+            .locate(particle.source.as_ref())
+            .or_else(|| schema_set.locate(group.source.as_ref()))
+    }
+
+    let ParticleTerm::Group(group) = &particle.term else {
+        return Ok(());
+    };
+
+    if group.compositor == Some(Compositor::All) && group.ref_name.is_none() {
+        return Err(crate::error::SchemaError::structural(
+            "cos-all-limited",
+            "In XSD 1.0, an xs:all model group may only appear as the top-level \
+             particle of a complex type definition"
+                .to_string(),
+            placement_location(particle, group, schema_set),
+        ));
+    }
+
+    if let Some(ref_name) = group.ref_name.as_ref() {
+        if let Some(group_key) =
+            schema_set.lookup_model_group(ref_name.namespace, ref_name.local_name)
+        {
+            if let Some(group_data) = schema_set.arenas.get_model_group(group_key) {
+                if group_data.compositor == Some(Compositor::All) {
+                    return Err(crate::error::SchemaError::structural(
+                        "cos-all-limited",
+                        "In XSD 1.0, a reference to a named xs:all group may only \
+                         appear as the top-level particle of a complex type definition"
+                            .to_string(),
+                        placement_location(particle, group, schema_set),
+                    ));
+                }
+                if visited.insert(group_key) {
+                    for child in &group_data.particles {
+                        check_no_nested_all_group(child, schema_set, visited)?;
+                    }
+                    visited.remove(&group_key);
+                }
+            }
+        }
+    } else {
+        for child in &group.particles {
+            check_no_nested_all_group(child, schema_set, visited)?;
         }
     }
     Ok(())

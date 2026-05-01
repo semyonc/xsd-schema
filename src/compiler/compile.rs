@@ -1108,6 +1108,39 @@ fn compile_base_all_group(
     }
 }
 
+/// Recognize the XSD 1.0 empty-base xs:all + group-ref-to-all extension
+/// shape (mgO007, mgZ003) and produce its AllGroup matcher. Returns `None`
+/// when the shape doesn't apply, leaving the caller to fall through.
+#[cfg(feature = "xsd11")]
+fn try_xsd10_empty_base_all_extension(
+    ctx: &mut CompileContext<'_>,
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    is_extension: bool,
+) -> NfaCompileResult<Option<ContentModelMatcher>> {
+    if !is_extension || !schema_set.is_xsd10() {
+        return Ok(None);
+    }
+    let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? else {
+        return Ok(None);
+    };
+    if !base_all_model.particles.is_empty() {
+        return Ok(None);
+    }
+    let ComplexContentResult::Complex(def) = &type_def.content else {
+        return Ok(None);
+    };
+    let Some(particle) = def.particle.as_ref() else {
+        return Ok(None);
+    };
+    let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) else {
+        return Ok(None);
+    };
+    Ok(Some(compile_top_level_all_group_ref_matcher(
+        ctx, schema_set, type_def, particle, group_data,
+    )?))
+}
+
 /// Convert an `AllGroupModel` into an NFA table for concatenation with
 /// extension content. Each particle becomes a choice alternative wrapped
 /// in repeat(0, max_occurs).
@@ -1135,6 +1168,41 @@ fn all_group_to_nfa(model: &AllGroupModel) -> NfaTable {
     choice = choice.repeat_range(0, Some(n));
 
     fragment_to_table(choice)
+}
+
+/// Build the content-model matcher for a complex type whose top-level
+/// particle resolves (via `resolve_top_level_all_group_ref`) to a named
+/// `xs:all` group. Validates outer occurrence constraints, sets up the
+/// redefine redirect when applicable, compiles the all-group's particles,
+/// and attaches open content.
+fn compile_top_level_all_group_ref_matcher(
+    ctx: &mut CompileContext<'_>,
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    particle: &ParticleResult,
+    group_data: &ModelGroupData,
+) -> NfaCompileResult<ContentModelMatcher> {
+    validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
+    ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
+    ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
+    ctx.content_flat_idx = Some(0);
+    // Self-references inside the all-group resolve to the original group,
+    // not back to the redefining group.
+    if let (Some(original_key), Some(name)) = (group_data.redefine_original, group_data.name) {
+        ctx.redefine_redirect = Some((name, group_data.target_namespace, original_key));
+    }
+    let mut model = ctx.compile_all_group_model(&group_data.particles, group_data.source.as_ref())?;
+    if particle.min_occurs == 0 {
+        model.outer_optional = true;
+    }
+    let base_matcher = ContentModelMatcher::AllGroup(model);
+    let open_content = resolve_open_content(
+        schema_set,
+        &type_def.content,
+        type_def.open_content.as_ref(),
+        type_def.source.as_ref(),
+    );
+    Ok(attach_open_content(schema_set, base_matcher, open_content))
 }
 
 /// Compile a complex type's content model into a matcher, applying open content defaults.
@@ -1201,45 +1269,30 @@ fn compile_content_model_matcher_impl(
 
                 // Named group ref resolving to all-group
                 if let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) {
-                    validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
-                    ctx.resolved_particle_types = group_data.resolved_particle_types.clone();
-                    ctx.resolved_particle_elements = group_data.resolved_particle_elements.clone();
-                    ctx.content_flat_idx = Some(0);
-                    // Set up redefine redirect so self-references inside the
-                    // all-group resolve to the original group, not back to
-                    // the redefining group.
-                    if let (Some(original_key), Some(name)) =
-                        (group_data.redefine_original, group_data.name)
-                    {
-                        ctx.redefine_redirect =
-                            Some((name, group_data.target_namespace, original_key));
-                    }
-                    let mut model = ctx.compile_all_group_model(
-                        &group_data.particles,
-                        group_data.source.as_ref(),
-                    )?;
-                    if particle.min_occurs == 0 {
-                        model.outer_optional = true;
-                    }
-                    let base_matcher = ContentModelMatcher::AllGroup(model);
-
-                    let open_content = resolve_open_content(
-                        schema_set,
-                        &type_def.content,
-                        type_def.open_content.as_ref(),
-                        type_def.source.as_ref(),
+                    return compile_top_level_all_group_ref_matcher(
+                        &mut ctx, schema_set, type_def, particle, group_data,
                     );
-
-                    return Ok(attach_open_content(schema_set, base_matcher, open_content));
                 }
             }
         }
     }
 
+    // XSD 1.0: empty-base xs:all extended via a top-level group reference to
+    // an xs:all. Without this branch the xsd11-feature path below would
+    // reject the schema even when the SchemaSet runs in XSD 1.0 mode
+    // (mgO007, mgZ003). Per §3.4.2.2 / §3.8 cos-all-limited, the empty base
+    // contributes nothing so the result is the extension's own all-group.
+    #[cfg(feature = "xsd11")]
+    if let Some(matcher) =
+        try_xsd10_empty_base_all_extension(&mut ctx, schema_set, type_def, is_extension)?
+    {
+        return Ok(matcher);
+    }
+
     // XSD 1.1: Extension from an all-group base type — produce AllGroup or
     // AllGroupExtension instead of the lossy NFA conversion.
     #[cfg(feature = "xsd11")]
-    if is_extension {
+    if is_extension && schema_set.is_xsd11() {
         if let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? {
             let open_content = resolve_open_content(
                 schema_set,

@@ -586,17 +586,11 @@ fn test_extension_from_all_group_base_with_own_particles() {
     ext_type.resolved_base_type = Some(TypeKey::Complex(base_key));
 
     let result = compile_content_model_matcher(&schema_set, &ext_type);
-    // XSD 1.0: AllGroup converted to NFA, concat with own → Nfa
-    // XSD 1.1: extending an xs:all base with a non-all particle violates
-    // cos-all-limited.1.2 (an xs:all may only appear at the top of a content
-    // model). The compiler rejects with InvalidAllGroupContent.
-    #[cfg(not(feature = "xsd11"))]
+    // XSD 1.0 SchemaSet falls through to the legacy NFA path regardless of
+    // cargo feature: the base AllGroup is converted to NFA and concatenated
+    // with the extension's own sequence. XSD 1.1 rejection of this shape is
+    // covered by `test_extension_all_group_base_with_sequence`.
     assert!(matches!(result.unwrap(), ContentModelMatcher::Nfa(_)));
-    #[cfg(feature = "xsd11")]
-    assert!(matches!(
-        result,
-        Err(crate::compiler::NfaCompileError::InvalidAllGroupContent { .. })
-    ));
 }
 
 #[test]
@@ -646,7 +640,7 @@ fn test_attach_open_content_all_group() {
 fn test_extension_merged_all_groups() {
     use crate::parser::frames::ComplexContentDefResult;
 
-    let mut schema_set = SchemaSet::new();
+    let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
 
     // Base type: all(A, B)
     let base_all = make_all_particle(vec![
@@ -710,7 +704,7 @@ fn test_extension_merged_all_groups() {
 fn test_extension_all_group_base_with_sequence() {
     use crate::parser::frames::ComplexContentDefResult;
 
-    let mut schema_set = SchemaSet::new();
+    let mut schema_set = SchemaSet::with_version(XsdVersion::V1_1);
 
     // Base type: all(A, B)
     let base_all = make_all_particle(vec![
