@@ -27,6 +27,53 @@ use crate::parser::location::SourceRef;
 use crate::schema::composition::ComponentKind;
 use crate::schema::SchemaSet;
 
+/// Enforce XSD §3.17.6.2 `src-resolve` clause 4 (per-document QName visibility)
+/// for a (namespace, local) pair attributed to a lexical document via `source`.
+///
+/// Returns `Ok(())` when no source is attached (synthesized arena entries are
+/// not subject to src-resolve) or when the namespace is reachable from the
+/// lexical document. Otherwise returns a `src-resolve` error.
+pub(crate) fn check_namespace_visible_ns(
+    schema_set: &SchemaSet,
+    namespace: Option<NameId>,
+    local_name: NameId,
+    source: Option<&SourceRef>,
+    kind_label: &str,
+) -> SchemaResult<()> {
+    let Some(source) = source else { return Ok(()) };
+    let Some(doc) = schema_set.documents.get(source.doc_id as usize) else {
+        return Ok(());
+    };
+    if doc.can_see_namespace(namespace, &schema_set.name_table) {
+        return Ok(());
+    }
+    let location = schema_set.source_maps.locate(source);
+    let qname_str = format_resolved_qname(&schema_set.name_table, namespace, local_name);
+    let ns_label = match namespace {
+        Some(ns) => format!("'{}'", schema_set.name_table.resolve_ref(ns)),
+        None => "the absent namespace".to_string(),
+    };
+    Err(SchemaError::structural(
+        "src-resolve",
+        format!(
+            "{} reference '{}' to namespace {} is not <xs:import>-ed by schema document '{}'",
+            kind_label, qname_str, ns_label, doc.base_uri,
+        ),
+        location,
+    ))
+}
+
+/// Convenience wrapper around [`check_namespace_visible_ns`] for callers that
+/// already hold a `QNameRef`.
+pub(crate) fn check_namespace_visible(
+    schema_set: &SchemaSet,
+    qname: &QNameRef,
+    source: Option<&SourceRef>,
+    kind_label: &str,
+) -> SchemaResult<()> {
+    check_namespace_visible_ns(schema_set, qname.namespace, qname.local_name, source, kind_label)
+}
+
 /// Reference resolver for QName → component ID resolution
 ///
 /// This struct holds a reference to the schema set and provides
@@ -60,6 +107,9 @@ impl<'a> ReferenceResolver<'a> {
         {
             return Ok(type_key);
         }
+
+        // §3.17.6.2 clause 4 — per-document QName visibility gate.
+        check_namespace_visible(self.schema_set, qname, source, "Type")?;
 
         // 2. Look up in namespace table
         if let Some(type_key) = self.schema_set.lookup_type(namespace, qname.local_name) {
@@ -127,6 +177,8 @@ impl<'a> ReferenceResolver<'a> {
         component_kind: ComponentKind,
         lookup: impl FnOnce(&SchemaSet, Option<NameId>, NameId) -> Option<K>,
     ) -> SchemaResult<K> {
+        // §3.17.6.2 clause 4 — per-document QName visibility gate.
+        check_namespace_visible(self.schema_set, qname, source, kind_label)?;
         if let Some(key) = lookup(self.schema_set, qname.namespace, qname.local_name) {
             return Ok(key);
         }
@@ -516,6 +568,18 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         Vec::with_capacity(schema_set.documents.len());
     for doc in &schema_set.documents {
         if let Some(ref qname) = doc.default_attributes {
+            if let Err(e) = check_namespace_visible_ns(
+                schema_set,
+                qname.namespace_uri,
+                qname.local_name,
+                doc.source.as_ref(),
+                "Attribute group",
+            ) {
+                errors.push(e);
+                stats.errors += 1;
+                doc_default_attr_groups.push(None);
+                continue;
+            }
             if let Some(key) =
                 schema_set.lookup_attribute_group(qname.namespace_uri, qname.local_name)
             {
@@ -568,12 +632,78 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         }
     }
 
+    // §3.17.6.2 clause 4 — per-document QName visibility on complex-type
+    // content particles and model-group particles. References inside
+    // particles are NOT looked up by `resolve_all_references` for top-level
+    // complex types (they're looked up lazily at NFA compile time), so we
+    // must validate visibility here.
+    if let Err(e) = validate_particle_qname_visibility(schema_set) {
+        errors.push(e);
+        stats.errors += 1;
+    }
+
     // If there were errors, return the first one
     if let Some(first_error) = errors.into_iter().next() {
         return Err(first_error);
     }
 
     Ok(stats)
+}
+
+/// Walk complex-type content particles, enforcing §3.17.6.2 clause 4 on every
+/// QName reference therein.
+///
+/// Complex-type content particle refs (element/type/group) are looked up
+/// lazily during NFA compilation, bypassing `ReferenceResolver`'s gate; this
+/// pass plugs that gap. Top-level model groups are not re-walked — their
+/// particles already pass through `resolve_model_group_references`.
+fn validate_particle_qname_visibility(schema_set: &SchemaSet) -> SchemaResult<()> {
+    use crate::parser::frames::{ParticleResult, ParticleTerm};
+
+    fn visit(
+        schema_set: &SchemaSet,
+        particles: &[ParticleResult],
+        depth: usize,
+    ) -> SchemaResult<()> {
+        if depth > 64 {
+            return Ok(());
+        }
+        for particle in particles {
+            match &particle.term {
+                ParticleTerm::Element(elem) => {
+                    let src = elem.source.as_ref().or(particle.source.as_ref());
+                    if let Some(ref_qn) = &elem.ref_name {
+                        check_namespace_visible(schema_set, ref_qn, src, "Element")?;
+                    }
+                    if let Some(TypeRefResult::QName(qname)) = &elem.type_ref {
+                        check_namespace_visible(schema_set, qname, src, "Type")?;
+                    }
+                }
+                ParticleTerm::Group(group_def) => {
+                    if let Some(ref_qn) = &group_def.ref_name {
+                        check_namespace_visible(
+                            schema_set,
+                            ref_qn,
+                            particle.source.as_ref(),
+                            "Group",
+                        )?;
+                    }
+                    visit(schema_set, &group_def.particles, depth + 1)?;
+                }
+                ParticleTerm::Any(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    for (_, ct) in schema_set.arenas.complex_types.iter() {
+        if let crate::parser::frames::ComplexContentResult::Complex(content) = &ct.content {
+            if let Some(particle) = &content.particle {
+                visit(schema_set, std::slice::from_ref(particle), 0)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Set an element's resolved type and propagate to XSD 1.1 type alternatives

@@ -601,6 +601,17 @@ pub(crate) fn resolve_ic_ref(
     let ref_ns = ref_name.namespace.or(target_namespace);
     let ref_local = ref_name.local_name;
 
+    // §3.17.6.2 clause 4 — per-document QName visibility gate.
+    // Feed the *resolved* `ref_ns` (after target-namespace fallback) so an
+    // unprefixed IC ref doesn't accidentally bypass the gate as "absent".
+    crate::schema::resolver::check_namespace_visible_ns(
+        schema_set,
+        ref_ns,
+        ref_local,
+        source,
+        "Identity constraint",
+    )?;
+
     // Look up in namespace tables
     let target_key = schema_set
         .namespaces
@@ -815,6 +826,18 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
 
     // Allocation pass: create element declarations and store keys
     for job in jobs {
+        // §3.17.6.2 clause 4 — per-document QName visibility gate.
+        // This fast path bypasses `resolve_type_ref` so it must gate the QName
+        // itself; otherwise un-imported local-element type refs slip through.
+        if let Some(TypeRefResult::QName(qname)) = &job.elem.type_ref {
+            crate::schema::resolver::check_namespace_visible(
+                schema_set,
+                qname,
+                job.elem.source.as_ref(),
+                "Type",
+            )?;
+        }
+
         let resolved_type = schema_set
             .arenas
             .complex_types
@@ -1114,6 +1137,16 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
 
     // Allocation pass: create element declarations and store keys
     for job in jobs {
+        // §3.17.6.2 clause 4 — per-document QName visibility gate.
+        if let Some(TypeRefResult::QName(qname)) = &job.elem.type_ref {
+            crate::schema::resolver::check_namespace_visible(
+                schema_set,
+                qname,
+                job.elem.source.as_ref(),
+                "Type",
+            )?;
+        }
+
         let resolved_type = schema_set
             .arenas
             .model_groups

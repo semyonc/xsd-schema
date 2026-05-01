@@ -941,6 +941,46 @@ impl SchemaDocument {
         self.declared_target_namespace.is_none() && self.target_namespace.is_some()
     }
 
+    /// Per-document QName visibility per XSD §3.17.6.2 `src-resolve` clause 4.
+    ///
+    /// Returns `true` when a QName whose resolved namespace is `qname_ns`
+    /// may be referenced from this schema document. Resolution is strictly
+    /// per-document and lexical: imports are not transitive.
+    ///
+    /// Reads `declared_target_namespace` for clause 4.1.1 / 4.2.1 so chameleon
+    /// includes (no declared `targetNamespace`) take 4.1.1 for absent-NS QNames
+    /// instead of failing 4.2.1 against the includer's NS. For chameleon docs
+    /// whose QNames were rewritten by §4.2.3 adoption to the includer's NS,
+    /// also accept the post-adoption `target_namespace`.
+    pub fn can_see_namespace(&self, qname_ns: Option<NameId>, name_table: &NameTable) -> bool {
+        if qname_ns.is_none() {
+            // 4.1
+            return self.declared_target_namespace.is_none()
+                || self.imports.iter().any(|i| i.namespace.is_none());
+        }
+        // 4.2.1 (incl. chameleon-adopted target namespace)
+        if qname_ns == self.declared_target_namespace
+            || (self.is_chameleon() && qname_ns == self.target_namespace)
+        {
+            return true;
+        }
+        // 4.2.3 / 4.2.4
+        if qname_ns == Some(well_known::XS_NAMESPACE) || qname_ns == Some(well_known::XSI_NAMESPACE)
+        {
+            return true;
+        }
+        // 4.2.2. `import.namespace` is `Option<String>` (not pre-interned), but every
+        // *used* namespace is interned at parse time, so `get` (read-only) suffices —
+        // a string never interned cannot match the already-interned `qname_ns`.
+        self.imports.iter().any(|i| {
+            i.namespace
+                .as_deref()
+                .and_then(|s| name_table.get(s))
+                .map(|id| Some(id) == qname_ns)
+                .unwrap_or(false)
+        })
+    }
+
     /// Create a new schema document
     pub fn new(id: DocumentId, base_uri: String) -> Self {
         Self {
