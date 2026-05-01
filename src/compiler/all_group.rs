@@ -237,7 +237,9 @@ impl AllGroupState {
 /// XSD 1.0 has strict constraints on what can appear in an all-group:
 /// - Only element particles (no wildcards, no group references)
 /// - minOccurs must be 0 or 1
-/// - maxOccurs must be exactly 1
+/// - maxOccurs must be 0 or 1 (`maxOccurs="0"` is the standard idiom for
+///   forbidding an element via restriction; see W3C XSD 1.0 §3.8.6
+///   cos-all-limited and the conformance test mgA015)
 ///
 /// XSD 1.1 relaxes these constraints to allow wildcards and arbitrary
 /// occurrence values. Group references are allowed but must satisfy
@@ -313,12 +315,12 @@ fn validate_all_group_xsd10(
             });
         }
 
-        // XSD 1.0: maxOccurs must be exactly 1
+        // XSD 1.0: maxOccurs must be 0 or 1
         match particle.max_occurs {
-            Some(1) => {} // OK
+            Some(0) | Some(1) => {} // OK
             Some(n) => {
                 return Err(NfaCompileError::InvalidAllGroupOccurs {
-                    reason: format!("maxOccurs must be 1 in XSD 1.0 all-group, found {}", n),
+                    reason: format!("maxOccurs must be 0 or 1 in XSD 1.0 all-group, found {}", n),
                     location: particle.source.clone().or(source.clone()),
                 });
             }
