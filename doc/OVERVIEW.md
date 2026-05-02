@@ -100,6 +100,10 @@ src/compiler/
 push-event instance validation
 src/validation/validator.rs
 src/validation/runtime.rs
+        ^
+        |
+quick-xml streaming driver
+src/validation/quick_xml_driver.rs
 ```
 
 ### Phase Ownership
@@ -194,6 +198,7 @@ Important runtime modules:
 | --- | --- |
 | `src/validation/validator.rs` | Public push-event API and validator configuration. |
 | `src/validation/runtime.rs` | Main per-run validation engine. |
+| `src/validation/quick_xml_driver.rs` | Reusable mid-layer between `quick-xml` and the runtime push API. |
 | `src/validation/content.rs` | Content-model state transitions. |
 | `src/validation/simple.rs` | Simple type, list/union, atomic value, and facet validation. |
 | `src/validation/identity.rs` | Streaming `key`, `unique`, and `keyref` evaluation. |
@@ -206,6 +211,60 @@ Important runtime modules:
 parsed unconditionally but enforced only when `PROCESS_IDENTITY_CONSTRAINTS` is
 set. XSD 1.1 assertions require an assertion-capable validator constructor such
 as `SchemaValidator::new_fragment_buffer`.
+
+### Streaming Driver — The Mid-Layer Between `quick-xml` And The Runtime
+
+The push-event API on `ValidationRuntime` (`validate_element`,
+`validate_attribute`, `validate_end_of_attributes`, `validate_text`,
+`validate_whitespace`, `validate_end_element`, `end_validation`) is
+deliberately XML-source-agnostic. Driving it from a real `quick-xml`
+stream needs non-trivial plumbing: maintaining the xmlns prefix scope,
+resolving element/attribute namespaces, scanning for `xsi:type` and
+`xsi:nil`, building a `NamespaceContextSnapshot`, separating whitespace
+from character text, and tracking depth for stream-end consistency.
+
+`src/validation/quick_xml_driver.rs` is the shared mid-layer that owns
+that plumbing once. It sits between `quick-xml` and the push API:
+
+```text
+quick_xml::Reader  -->  quick_xml_driver  -->  ValidationRuntime push API
+                          (xmlns scope,         (validate_element, etc.)
+                           xsi scan,
+                           ns context,
+                           depth tracking)
+```
+
+Two layers are exposed:
+
+- **Layer 1 (turn-key):** `drive_quick_xml` / `drive_quick_xml_in`.
+  Streams a reader into the runtime, then calls
+  `runtime.end_validation()`. Diagnostics arrive through the runtime's
+  `ValidationSink`. Comments, processing instructions, and DTD events
+  are dropped. Use this when all you want is validation diagnostics.
+- **Layer 2 (handler-driven):** `drive_quick_xml_with` /
+  `drive_quick_xml_with_in` plus a caller-supplied
+  `ValidationEventHandler`. Every method on the trait has a no-op default,
+  so a handler that only cares about (say) end-of-element fires exactly
+  that one method. Comments, PIs, and optional source-span offsets flow
+  through dedicated hooks. Layer 2 does **not** call `end_validation`;
+  the caller does so after collecting any post-stream runtime state
+  (e.g. `schema_location_hints`, `no_namespace_schema_location_hints`).
+
+In-tree consumers:
+
+- `tests/conformance/driver.rs::validate_instance_pass` — layer 2 with a
+  small handler that only records root validity. Hint collection and
+  `end_validation` ordering stay in the caller.
+- `src/document/typed_builder.rs::build_typed_document` — layer 2 with a
+  handler that drives a `BufferDocumentBuilder`, preserving comments,
+  PIs, source spans, and CTA-deferred attribute bindings.
+- `doc/INTRODUCTION.md` — layer 1 example for the public-facing common
+  case.
+
+External integrators that need to mirror events into a custom DOM,
+track spans, or otherwise interleave bookkeeping with validation should
+implement `ValidationEventHandler` rather than open-coding the
+`quick-xml` → push API translation.
 
 ### XSD 1.1 Assertion Buffering
 

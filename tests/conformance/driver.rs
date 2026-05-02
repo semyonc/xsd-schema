@@ -1211,8 +1211,6 @@ impl TestRunner {
 // Instance document validation
 // ---------------------------------------------------------------------------
 
-const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InstanceActualOutcome {
     Valid,
@@ -1308,7 +1306,10 @@ fn validate_instance_pass(
     instance_path: &Path,
     content: &[u8],
 ) -> ValidationPassResult {
-    use xsd_schema::validation::SchemaValidity;
+    use xsd_schema::validation::{
+        drive_quick_xml_with, DriveWithError, EndElementInfo, SchemaValidity,
+        ValidationEventHandler,
+    };
 
     // Conformance runs identity-constraint processing on top of the
     // strict-conformance default flags. `ALLOW_XML_ATTRIBUTES` is deliberately
@@ -1350,9 +1351,6 @@ fn validate_instance_pass(
     //   which correctly rejects any ENTITY values).
     {
         let xml_str = std::str::from_utf8(content).unwrap_or("");
-        // Detect external-only DTD: <!DOCTYPE ... SYSTEM/PUBLIC ...> without
-        // an internal subset (no "["). We can only scan inline entity decls,
-        // so skip entity validation when all entities may be in an external file.
         let has_external_only_dtd = if let Some(dt_start) = xml_str.find("<!DOCTYPE") {
             let dt_rest = &xml_str[dt_start..];
             let dt_end = dt_rest.find('>').unwrap_or(dt_rest.len());
@@ -1367,103 +1365,33 @@ fn validate_instance_pass(
         }
     }
 
-    let mut reader = Reader::from_reader(content);
-    reader.trim_text(false);
-    let mut buf = Vec::new();
-
-    // Namespace prefix tracking (stack-based for proper scoping)
-    let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
-    // Per-element scope: prefixes declared on the current element
-    let mut scope_stack: Vec<Vec<Vec<u8>>> = Vec::new();
-
-    // Seed the implicit "xml" namespace binding (always in scope per XML Namespaces §3)
-    prefix_map.insert(
-        b"xml".to_vec(),
-        vec!["http://www.w3.org/XML/1998/namespace".to_string()],
-    );
-
-    // Track element depth so we only send content events inside elements.
-    // Whitespace/text outside the root element (e.g. between <?xml?> and
-    // root, or after the root closes) is not significant for validation.
-    let mut depth: usize = 0;
-    let mut root_validity: Option<SchemaValidity> = None;
-
-    loop {
-        match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                depth += 1;
-                let (xsi_type, xsi_nil, ns_ctx) =
-                    process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
-                let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
-
-                runtime.validate_element(
-                    &elem_local,
-                    &elem_ns,
-                    xsi_type.as_deref(),
-                    xsi_nil.as_deref(),
-                    &ns_ctx,
-                );
-
-                // Validate all attributes (including xsi:*)
-                validate_attributes(e, &prefix_map, &mut runtime)?;
-
-                runtime.validate_end_of_attributes();
-            }
-            Ok(Event::Empty(ref e)) => {
-                depth += 1;
-                let (xsi_type, xsi_nil, ns_ctx) =
-                    process_element_start(e, &mut prefix_map, &mut scope_stack, schema_set)?;
-                let (elem_local, elem_ns) = resolve_element_name(e, &prefix_map)?;
-
-                runtime.validate_element(
-                    &elem_local,
-                    &elem_ns,
-                    xsi_type.as_deref(),
-                    xsi_nil.as_deref(),
-                    &ns_ctx,
-                );
-
-                validate_attributes(e, &prefix_map, &mut runtime)?;
-
-                runtime.validate_end_of_attributes();
-                let end_info = runtime.validate_end_element();
-                if depth == 1 {
-                    root_validity = Some(end_info.validity);
-                }
-                depth -= 1;
-
-                // Pop namespace scope
-                pop_ns_scope(&mut prefix_map, &mut scope_stack);
-            }
-            Ok(Event::End(_)) => {
-                let end_info = runtime.validate_end_element();
-                if depth == 1 {
-                    root_validity = Some(end_info.validity);
-                }
-                depth -= 1;
-                pop_ns_scope(&mut prefix_map, &mut scope_stack);
-            }
-            Ok(Event::Text(ref e)) if depth > 0 => {
-                let text = e
-                    .unescape()
-                    .map_err(|err| format!("Text unescape error: {}", err))?;
-                if text.chars().all(|c| c.is_whitespace()) {
-                    runtime.validate_whitespace(&text);
-                } else {
-                    runtime.validate_text(&text);
-                }
-            }
-            Ok(Event::CData(ref e)) if depth > 0 => {
-                let text = std::str::from_utf8(e.as_ref())
-                    .map_err(|err| format!("CData UTF-8 error: {}", err))?;
-                runtime.validate_text(text);
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {} // PI, Comment, Decl — skip
-            Err(e) => return Err(format!("XML parse error: {}", e)),
-        }
-        buf.clear();
+    struct DriverHandler {
+        root_validity: Option<SchemaValidity>,
     }
+    impl ValidationEventHandler for DriverHandler {
+        type Error = std::convert::Infallible;
+        fn after_end_element(
+            &mut self,
+            info: &EndElementInfo,
+            depth: usize,
+        ) -> Result<(), Self::Error> {
+            if depth == 1 {
+                self.root_validity = Some(info.validity);
+            }
+            Ok(())
+        }
+    }
+
+    let mut handler = DriverHandler { root_validity: None };
+    drive_quick_xml_with(content, &mut runtime, schema_set, &mut handler).map_err(|e| match e {
+        DriveWithError::Parse(e) => format!("XML parse error: {}", e),
+        DriveWithError::Utf8(e) => format!("UTF-8 error: {}", e),
+        DriveWithError::UnboundPrefix(p) => format!("Unbound prefix: {}", p),
+        DriveWithError::UnexpectedEof { depth } => {
+            format!("Unexpected EOF: {} element(s) still open", depth)
+        }
+        DriveWithError::Hook(_) => unreachable!("DriverHandler is infallible"),
+    })?;
 
     // Collect hints before end_validation consumes the runtime
     let sl_hints = runtime.schema_location_hints().to_vec();
@@ -1479,213 +1407,13 @@ fn validate_instance_pass(
     let actual_outcome = if !errors.is_empty() {
         InstanceActualOutcome::Invalid
     } else {
-        match root_validity.unwrap_or(SchemaValidity::NotKnown) {
+        match handler.root_validity.unwrap_or(SchemaValidity::NotKnown) {
             SchemaValidity::Valid => InstanceActualOutcome::Valid,
             SchemaValidity::Invalid => InstanceActualOutcome::Invalid,
             SchemaValidity::NotKnown => InstanceActualOutcome::NotKnown,
         }
     };
     Ok((actual_outcome, error_msgs, sl_hints, nnsl_hints))
-}
-
-/// Split a QName into (prefix_bytes, local_bytes).
-/// Returns empty prefix for unprefixed names.
-fn split_prefix_local(qname: &[u8]) -> (&[u8], &[u8]) {
-    match qname.iter().position(|&b| b == b':') {
-        Some(pos) => (&qname[..pos], &qname[pos + 1..]),
-        None => (&[], qname),
-    }
-}
-
-/// Process namespace declarations and scan for xsi:type / xsi:nil on
-/// an element start event. Returns (xsi_type, xsi_nil, ns_context).
-fn process_element_start(
-    e: &quick_xml::events::BytesStart<'_>,
-    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
-    scope_stack: &mut Vec<Vec<Vec<u8>>>,
-    schema_set: &xsd_schema::SchemaSet,
-) -> Result<
-    (
-        Option<String>,
-        Option<String>,
-        xsd_schema::namespace::context::NamespaceContextSnapshot,
-    ),
-    String,
-> {
-    let mut scope_prefixes: Vec<Vec<u8>> = Vec::new();
-
-    // First pass: collect namespace declarations
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" {
-            // Default namespace declaration
-            let value = attr
-                .unescape_value()
-                .map_err(|err| format!("Attribute unescape error: {}", err))?;
-            prefix_map
-                .entry(b"".to_vec())
-                .or_default()
-                .push(value.to_string());
-            scope_prefixes.push(b"".to_vec());
-        } else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
-            let value = attr
-                .unescape_value()
-                .map_err(|err| format!("Attribute unescape error: {}", err))?;
-            prefix_map
-                .entry(prefix.to_vec())
-                .or_default()
-                .push(value.to_string());
-            scope_prefixes.push(prefix.to_vec());
-        }
-    }
-    scope_stack.push(scope_prefixes);
-
-    // Second pass: scan for xsi:type and xsi:nil
-    let mut xsi_type: Option<String> = None;
-    let mut xsi_nil: Option<String> = None;
-
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            continue;
-        }
-        let (attr_prefix, attr_local) = split_prefix_local(key);
-        if attr_prefix.is_empty() {
-            continue;
-        }
-        // Check if this attribute is in the XSI namespace
-        if let Some(stack) = prefix_map.get(attr_prefix) {
-            if let Some(ns_uri) = stack.last() {
-                if ns_uri == XSI_NAMESPACE {
-                    let local = std::str::from_utf8(attr_local)
-                        .map_err(|err| format!("UTF-8 error: {}", err))?;
-                    let value = attr
-                        .unescape_value()
-                        .map_err(|err| format!("Attribute unescape error: {}", err))?;
-                    match local {
-                        "type" => xsi_type = Some(value.to_string()),
-                        "nil" => xsi_nil = Some(value.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // Build namespace context snapshot for xsi:type QName resolution
-    let ns_ctx = build_ns_context(prefix_map, schema_set);
-
-    Ok((xsi_type, xsi_nil, ns_ctx))
-}
-
-/// Resolve an element's namespace from its prefix using the current prefix map.
-fn resolve_element_name(
-    e: &quick_xml::events::BytesStart<'_>,
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
-) -> Result<(String, String), String> {
-    let name = e.name();
-    let (prefix, local) = split_prefix_local(name.as_ref());
-    let local_name = std::str::from_utf8(local)
-        .map_err(|err| format!("UTF-8 error: {}", err))?
-        .to_string();
-    let namespace = if prefix.is_empty() {
-        // Default namespace
-        prefix_map
-            .get(&b"".to_vec())
-            .and_then(|stack| stack.last())
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        prefix_map
-            .get(prefix)
-            .and_then(|stack| stack.last())
-            .cloned()
-            .unwrap_or_default()
-    };
-    Ok((local_name, namespace))
-}
-
-/// Validate all non-xmlns attributes on an element.
-fn validate_attributes<S: xsd_schema::validation::ValidationSink>(
-    e: &quick_xml::events::BytesStart<'_>,
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
-    runtime: &mut xsd_schema::validation::ValidationRuntime<'_, S>,
-) -> Result<(), String> {
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| format!("Attribute error: {}", err))?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            continue;
-        }
-        let (attr_prefix, attr_local_bytes) = split_prefix_local(key);
-        let attr_local =
-            std::str::from_utf8(attr_local_bytes).map_err(|err| format!("UTF-8 error: {}", err))?;
-        let attr_ns = if attr_prefix.is_empty() {
-            String::new()
-        } else {
-            prefix_map
-                .get(attr_prefix)
-                .and_then(|stack| stack.last())
-                .cloned()
-                .unwrap_or_default()
-        };
-        let value = attr
-            .unescape_value()
-            .map_err(|err| format!("Attribute unescape error: {}", err))?;
-        runtime.validate_attribute(attr_local, &attr_ns, &value);
-    }
-    Ok(())
-}
-
-/// Build a NamespaceContextSnapshot from the current prefix map.
-/// Uses the schema_set's name_table to intern strings as NameIds.
-fn build_ns_context(
-    prefix_map: &HashMap<Vec<u8>, Vec<String>>,
-    schema_set: &xsd_schema::SchemaSet,
-) -> xsd_schema::namespace::context::NamespaceContextSnapshot {
-    let default_ns = prefix_map
-        .get(&b"".to_vec())
-        .and_then(|stack| stack.last())
-        .filter(|s| !s.is_empty())
-        .map(|s| schema_set.name_table.add(s));
-
-    let mut bindings = Vec::new();
-    for (prefix_bytes, stack) in prefix_map {
-        if prefix_bytes.is_empty() {
-            continue; // default namespace handled above
-        }
-        if let (Ok(prefix), Some(uri)) = (std::str::from_utf8(prefix_bytes), stack.last()) {
-            if !uri.is_empty() {
-                let prefix_id = schema_set.name_table.add(prefix);
-                let uri_id = schema_set.name_table.add(uri);
-                bindings.push((prefix_id, uri_id));
-            }
-        }
-    }
-
-    xsd_schema::namespace::context::NamespaceContextSnapshot {
-        default_ns,
-        bindings,
-    }
-}
-
-/// Pop namespace declarations for the current element scope.
-fn pop_ns_scope(
-    prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
-    scope_stack: &mut Vec<Vec<Vec<u8>>>,
-) {
-    if let Some(scope_prefixes) = scope_stack.pop() {
-        for prefix in scope_prefixes {
-            if let Some(stack) = prefix_map.get_mut(&prefix) {
-                stack.pop();
-                if stack.is_empty() {
-                    prefix_map.remove(&prefix);
-                }
-            }
-        }
-    }
 }
 
 /// Schema loader that pre-processes DTD internal subset entity declarations.

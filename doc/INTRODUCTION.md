@@ -224,15 +224,25 @@ you ship XSD 1.1 validation:
 | XSD 1.1 with `xs:assert` evaluation, streaming | `SchemaValidator::new_fragment_buffer(...)` |
 | XSD 1.1 with `xs:assert` against an external `BufferDocument` | `SchemaValidator::new_main_document(...)` |
 
-Minimal `quick-xml` integration:
+### Driving validation from a `quick-xml` stream
+
+The push-based runtime in §2 needs an XML event source. Hand-rolling that
+plumbing means tracking xmlns scopes, scanning `xsi:type` / `xsi:nil`,
+building a `NamespaceContextSnapshot` per element, and dispatching whitespace
+vs character data correctly. Almost no caller wants to write that twice. The
+`validation::quick_xml_driver` module ships a reusable driver in two layers:
+
+| Layer | Entry points | Use when |
+| --- | --- | --- |
+| 1 — turn-key | `drive_quick_xml`, `drive_quick_xml_in` | All you want is for the runtime's sink to receive every diagnostic. The helper calls `runtime.end_validation()` for you. |
+| 2 — hooks | `drive_quick_xml_with`, `drive_quick_xml_with_in` | You need to interleave work between validator events — building a typed DOM, tracking source spans, mirroring events into a custom store. The caller is responsible for calling `end_validation` after collecting any post-stream runtime state (e.g. `schema_location_hints`). |
+
+Layer 1 in full:
 
 ```rust
-use quick_xml::events::Event;
-use quick_xml::Reader;
 use xsd_schema::{SchemaSet, load_and_process_schema};
-use xsd_schema::namespace::context::NamespaceContextSnapshot;
 use xsd_schema::validation::{
-    CollectingValidationSink, SchemaValidator, ValidationFlags,
+    drive_quick_xml, CollectingValidationSink, SchemaValidator, ValidationFlags,
 };
 
 fn validate(schema_xml: &str, instance_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -242,82 +252,62 @@ fn validate(schema_xml: &str, instance_xml: &str) -> Result<(), Box<dyn std::err
     let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-    let sink = CollectingValidationSink {
-        errors: &mut errors,
-        warnings: &mut warnings,
-    };
+    let sink = CollectingValidationSink { errors: &mut errors, warnings: &mut warnings };
     let mut runtime = validator.start_run(sink);
 
-    let mut reader = Reader::from_str(instance_xml);
-    reader.trim_text(false);
-    let mut buf = Vec::new();
-
-    // This simple example assumes a namespace-free instance document.
-    // For namespaces and xsi:type/xsi:nil, keep a live NamespaceContextSnapshot.
-    let ns = NamespaceContextSnapshot::default();
-
-    loop {
-        match reader.read_event_into(&mut buf)? {
-            Event::Start(e) => {
-                let local = std::str::from_utf8(e.local_name().as_ref())?;
-                runtime.validate_element(local, "", None, None, &ns);
-
-                for attr in e.attributes() {
-                    let attr = attr?;
-                    let name = std::str::from_utf8(attr.key.as_ref())?;
-                    let value = attr.unescape_value()?.into_owned();
-                    runtime.validate_attribute(name, "", &value);
-                }
-
-                runtime.validate_end_of_attributes();
-            }
-            Event::Empty(e) => {
-                let local = std::str::from_utf8(e.local_name().as_ref())?;
-                runtime.validate_element(local, "", None, None, &ns);
-
-                for attr in e.attributes() {
-                    let attr = attr?;
-                    let name = std::str::from_utf8(attr.key.as_ref())?;
-                    let value = attr.unescape_value()?.into_owned();
-                    runtime.validate_attribute(name, "", &value);
-                }
-
-                runtime.validate_end_of_attributes();
-                runtime.validate_end_element();
-            }
-            Event::Text(e) => {
-                let text = e.unescape()?.into_owned();
-                if text.trim().is_empty() {
-                    runtime.validate_whitespace(&text);
-                } else {
-                    runtime.validate_text(&text);
-                }
-            }
-            Event::CData(e) => {
-                let text = std::str::from_utf8(e.as_ref())?;
-                runtime.validate_text(text);
-            }
-            Event::End(_) => {
-                runtime.validate_end_element();
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-
-        buf.clear();
-    }
-
-    runtime.end_validation()?;
+    // Layer 1 internally: pushes xmlns scopes, scans xsi:type / xsi:nil,
+    // dispatches whitespace vs text, and calls runtime.end_validation()
+    // once the stream is drained. Comments and PIs are dropped.
+    let _outcome = drive_quick_xml(instance_xml.as_bytes(), &mut runtime, &schema_set)?;
 
     if !errors.is_empty() {
         for error in &errors {
             eprintln!("{error}");
         }
     }
-
     Ok(())
 }
 ```
+
+Layer 1 returns a `DriveOutcome { root_validity, max_depth }` and reports
+parse / UTF-8 / unbound-prefix / unexpected-EOF as `DriveError` variants;
+validation diagnostics flow through the sink, not the return type.
+
+#### Layer 2 — handler-driven (advanced)
+
+Layer 2 is `drive_quick_xml_with(reader, &mut runtime, &schema_set, &mut handler)`
+plus a `ValidationEventHandler` you implement. Every method has a default
+no-op, so a handler that only cares about (say) end-of-element fires exactly
+that one method. Hook ordering is documented on the trait; the most-used
+hooks are:
+
+| Hook | Fires when |
+| --- | --- |
+| `before_element(view)` | After the new element's xmlns scope is pushed and the namespace-context snapshot is built, but **before** `runtime.validate_element` is called. |
+| `after_element(view, info)` | After `validate_element` returns. `info.schema_type`, `info.is_nil`, `info.element_decl`, and `info.content_type` are stable here. |
+| `before_attribute(view)` / `after_attribute(view, info)` | Per-attribute, in document order. |
+| `after_end_of_attributes(view)` | After `validate_end_of_attributes`. `view.info` is the EOA `SchemaInfo` (CTA-selected type lives here); under `xsd11`, `view.deferred_attribute_results` carries any CTA-revalidated per-attribute results, in original encounter order. |
+| `after_end_element(end_info, depth)` | After `validate_end_element`, with the depth of the element that just closed (1 = root close). |
+| `on_text(kind, text)` / `on_comment(text)` / `on_processing_instruction(target, data)` | Body events. `kind` distinguishes whitespace text, character text, and CDATA. |
+
+Layer 2 does **not** call `runtime.end_validation()`; you do, after
+draining whatever runtime state your caller cares about (e.g.
+`schema_location_hints`).
+
+#### Source-span tracking (advanced)
+
+Two further hooks carry byte offsets from the reader's buffer:
+
+- `on_element_start_offset(byte_pos)` — fires immediately before
+  `before_element`; `byte_pos` is the `<` of the element being reported.
+- `on_element_end_offset(byte_pos)` — fires immediately after
+  `after_end_element`; `byte_pos` is one past the `>` of the closing tag,
+  whether the close came from `Event::End` or `Event::Empty`.
+
+Both default to no-ops, so non-span callers pay only the cost of two empty
+calls per element. Override them when building a span-aware DOM
+(`document::typed_builder` is the in-tree consumer; see
+`source_span_tracking` in its tests for a regression net).
 
 ### Unparsed entity declarations (ENTITY / ENTITIES types)
 

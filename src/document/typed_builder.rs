@@ -4,25 +4,24 @@
 //! validation calls so that each element and attribute node carries a
 //! [`NodeSchemaBinding`] (type key, declaration keys, content type).
 
-use std::collections::HashMap;
 use std::io::BufRead;
 
 use bumpalo::Bump;
-use quick_xml::events::Event;
-use quick_xml::Reader;
 
-use crate::namespace::context::NamespaceContextSnapshot;
-use crate::namespace::table::{XML_NAMESPACE, XSI_NAMESPACE};
+use crate::namespace::table::XML_NAMESPACE;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
 use crate::validation::errors::ValidationError;
-use crate::validation::info::ValidationFlags;
+use crate::validation::info::{SchemaInfo, ValidationFlags};
+use crate::validation::quick_xml_driver::{
+    drive_quick_xml_with, AttributeView, DriveWithError, ElementStartView, EndElementInfo,
+    EndOfAttributesView, TextKind, ValidationEventHandler,
+};
 use crate::validation::validator::{ValidationSink, ValidationWarning};
-use crate::validation::{SchemaValidator, ValidationRuntime};
-use crate::xpath::string_ops::is_xml_whitespace_str;
+use crate::validation::SchemaValidator;
 
 use super::buffer::BufferDocument;
-use super::builder::{parse_pi_content, split_prefix_local, BufferDocumentBuilder};
+use super::builder::BufferDocumentBuilder;
 use super::error::BufferDocumentError;
 use super::type_remap::NodeSchemaBinding;
 use super::BufferDocumentOptions;
@@ -38,6 +37,242 @@ pub struct SilentValidationSink;
 impl ValidationSink for SilentValidationSink {
     fn on_error(&mut self, _error: ValidationError) {}
     fn on_warning(&mut self, _warning: ValidationWarning) {}
+}
+
+// ── Handler ───────────────────────────────────────────────────────────
+
+/// Handler that mirrors validator events into a [`BufferDocumentBuilder`].
+///
+/// Holds the per-element bookkeeping the design doc separates out: the
+/// element-ref stack (so text/end events can correlate to the open element),
+/// the single-slot scratch for the current attribute being processed, the
+/// per-element queue of CTA-deferred attribute refs, and the source-span
+/// tracking pieces.
+struct TypedBuilderHandler<'b, 'a> {
+    builder: &'b mut BufferDocumentBuilder<'a>,
+    track: bool,
+    pending_start_offset: Option<usize>,
+    /// Currently open elements' refs. Pushed at `before_element`, popped at
+    /// `after_end_element`.
+    elem_ref_stack: Vec<u32>,
+    /// (elem_ref, start_byte) for each currently open element when
+    /// `track` is on. Popped at `on_element_end_offset` to set the span.
+    pending_spans: Vec<(u32, usize)>,
+    /// Single-slot scratch for the attribute currently between
+    /// `before_attribute` and `after_attribute`.
+    current_attr_ref: Option<u32>,
+    /// Per-element queue of attribute refs whose binding is deferred until
+    /// CTA reselection. Drained in `after_end_of_attributes`.
+    #[cfg(feature = "xsd11")]
+    deferred_attr_refs: Vec<u32>,
+    /// Element-decl key for the currently open element (used so we can
+    /// preserve `element_decl` when refreshing the binding after CTA).
+    element_decl_stack: Vec<Option<crate::ids::ElementKey>>,
+}
+
+impl<'b, 'a> TypedBuilderHandler<'b, 'a> {
+    fn new(builder: &'b mut BufferDocumentBuilder<'a>) -> Self {
+        let track = builder.track_source_locations();
+        Self {
+            builder,
+            track,
+            pending_start_offset: None,
+            elem_ref_stack: Vec::new(),
+            pending_spans: Vec::new(),
+            current_attr_ref: None,
+            #[cfg(feature = "xsd11")]
+            deferred_attr_refs: Vec::new(),
+            element_decl_stack: Vec::new(),
+        }
+    }
+}
+
+impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
+    type Error = BufferDocumentError;
+
+    fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+        if self.track {
+            self.pending_start_offset = Some(byte_pos);
+        }
+        Ok(())
+    }
+
+    fn before_element(&mut self, view: ElementStartView<'_>) -> Result<(), Self::Error> {
+        let elem_ref = self.builder.start_element(
+            view.local_name,
+            view.namespace_uri,
+            view.prefix,
+            view.namespace_decls,
+        )?;
+        self.elem_ref_stack.push(elem_ref);
+        if self.track {
+            if let Some(start) = self.pending_start_offset.take() {
+                self.pending_spans.push((elem_ref, start));
+            }
+        }
+        Ok(())
+    }
+
+    fn after_element(
+        &mut self,
+        _view: ElementStartView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), Self::Error> {
+        let elem_ref = *self
+            .elem_ref_stack
+            .last()
+            .expect("after_element with empty stack");
+        self.element_decl_stack.push(info.element_decl);
+        if let Some(tk) = info.schema_type {
+            let binding = NodeSchemaBinding {
+                type_key: tk,
+                element_decl: info.element_decl,
+                attribute_decl: None,
+                content_type: info.content_type,
+            };
+            self.builder.set_node_binding(elem_ref, binding)?;
+        }
+        if info.is_nil {
+            self.builder.set_nil(elem_ref);
+        }
+        Ok(())
+    }
+
+    fn before_attribute(&mut self, view: AttributeView<'_>) -> Result<(), Self::Error> {
+        let attr_ref = self.builder.attribute(
+            view.local_name,
+            view.namespace_uri,
+            view.prefix,
+            view.value,
+        )?;
+        self.current_attr_ref = Some(attr_ref);
+        Ok(())
+    }
+
+    fn after_attribute(
+        &mut self,
+        view: AttributeView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), Self::Error> {
+        let attr_ref = self
+            .current_attr_ref
+            .take()
+            .expect("after_attribute without matching before_attribute");
+        if let Some(tk) = info.schema_type {
+            let binding = NodeSchemaBinding {
+                type_key: tk,
+                element_decl: None,
+                attribute_decl: info.attribute_decl,
+                content_type: None,
+            };
+            self.builder.set_node_binding(attr_ref, binding)?;
+        }
+        if view.local_name == "id" && view.namespace_uri == XML_NAMESPACE {
+            let owner_elem = *self
+                .elem_ref_stack
+                .last()
+                .expect("xml:id without an open element");
+            self.builder.register_xml_id(view.value, owner_elem)?;
+        }
+        #[cfg(feature = "xsd11")]
+        if info.deferred_by_cta {
+            self.deferred_attr_refs.push(attr_ref);
+        }
+        Ok(())
+    }
+
+    fn after_end_of_attributes(
+        &mut self,
+        view: EndOfAttributesView<'_>,
+    ) -> Result<(), Self::Error> {
+        self.builder.end_of_attributes();
+        let elem_ref = *self
+            .elem_ref_stack
+            .last()
+            .expect("after_end_of_attributes without an open element");
+        let element_decl = *self
+            .element_decl_stack
+            .last()
+            .expect("after_end_of_attributes without an open element");
+
+        if let Some(tk) = view.info.schema_type {
+            let binding = NodeSchemaBinding {
+                type_key: tk,
+                element_decl,
+                attribute_decl: None,
+                content_type: view.info.content_type,
+            };
+            self.builder.set_node_binding(elem_ref, binding)?;
+        }
+
+        #[cfg(feature = "xsd11")]
+        {
+            let deferred_refs = std::mem::take(&mut self.deferred_attr_refs);
+            if deferred_refs.len() != view.deferred_attribute_results.len() {
+                return Err(BufferDocumentError::InternalError(
+                    "deferred attribute count mismatch".into(),
+                ));
+            }
+            for (attr_ref, attr_info) in deferred_refs
+                .iter()
+                .zip(view.deferred_attribute_results.iter())
+            {
+                if let Some(tk) = attr_info.schema_type {
+                    let binding = NodeSchemaBinding {
+                        type_key: tk,
+                        element_decl: None,
+                        attribute_decl: attr_info.attribute_decl,
+                        content_type: None,
+                    };
+                    self.builder.set_node_binding(*attr_ref, binding)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn after_end_element(
+        &mut self,
+        _info: &EndElementInfo,
+        _depth: usize,
+    ) -> Result<(), Self::Error> {
+        self.builder.end_element()?;
+        self.elem_ref_stack.pop();
+        self.element_decl_stack.pop();
+        Ok(())
+    }
+
+    fn on_element_end_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+        if self.track {
+            if let Some((elem_ref, start)) = self.pending_spans.pop() {
+                self.builder
+                    .set_source_span(elem_ref, SourceSpan::new(start, byte_pos));
+            }
+        }
+        Ok(())
+    }
+
+    fn on_text(&mut self, _kind: TextKind, text: &str) -> Result<(), Self::Error> {
+        if !self.elem_ref_stack.is_empty() {
+            self.builder.text(text);
+        }
+        Ok(())
+    }
+
+    fn on_comment(&mut self, text: &str) -> Result<(), Self::Error> {
+        self.builder.comment(text)?;
+        Ok(())
+    }
+
+    fn on_processing_instruction(
+        &mut self,
+        target: &str,
+        data: &str,
+    ) -> Result<(), Self::Error> {
+        self.builder.processing_instruction(target, data)?;
+        Ok(())
+    }
 }
 
 // ── build_typed_document ──────────────────────────────────────────────
@@ -63,416 +298,26 @@ pub fn build_typed_document<'a, R: BufRead>(
     let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
     let mut runtime = validator.start_run(SilentValidationSink);
 
-    let mut xml_reader = Reader::from_reader(reader);
-    xml_reader.trim_text(false);
-
-    // Transient prefix → URI mapping for namespace resolution
-    let mut prefix_map: HashMap<Box<[u8]>, Vec<String>> = HashMap::new();
-    prefix_map
-        .entry(b"xml".to_vec().into_boxed_slice())
-        .or_default()
-        .push(XML_NAMESPACE.to_string());
-    prefix_map
-        .entry(b"".to_vec().into_boxed_slice())
-        .or_default()
-        .push(String::new());
-
-    // Per-element declared prefixes for cleanup on close
-    let mut scope_decls: Vec<Vec<Box<[u8]>>> = Vec::new();
-
-    // Element ref stack for text/end correlation
-    let mut element_ref_stack: Vec<u32> = Vec::new();
-
-    let track = builder.track_source_locations();
-    // Pending spans: (elem_ref, start_position) — mirrors builder.rs:pending_spans
-    let mut pending_spans: Vec<(u32, usize)> = Vec::new();
-
-    let mut buf = Vec::with_capacity(1024);
-
-    loop {
-        let event_start = if track {
-            xml_reader.buffer_position()
-        } else {
-            0
-        };
-
-        match xml_reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) => {
-                let elem_ref = handle_start_or_empty(
-                    &mut builder,
-                    &mut runtime,
-                    e,
-                    false,
-                    &mut prefix_map,
-                    &mut scope_decls,
-                    schema_set,
-                )?;
-                element_ref_stack.push(elem_ref);
-                if track {
-                    pending_spans.push((elem_ref, event_start));
+    {
+        let mut handler = TypedBuilderHandler::new(&mut builder);
+        drive_quick_xml_with(reader, &mut runtime, schema_set, &mut handler).map_err(|e| {
+            match e {
+                DriveWithError::Parse(e) => BufferDocumentError::Parse(e),
+                DriveWithError::Utf8(e) => BufferDocumentError::Utf8(e),
+                DriveWithError::UnboundPrefix(p) => BufferDocumentError::UnboundPrefix(p),
+                DriveWithError::UnexpectedEof { depth } => {
+                    BufferDocumentError::InternalError(format!(
+                        "unexpected EOF: {} element(s) still open",
+                        depth
+                    ))
                 }
+                DriveWithError::Hook(e) => e,
             }
-            Ok(Event::Empty(ref e)) => {
-                let elem_ref = handle_start_or_empty(
-                    &mut builder,
-                    &mut runtime,
-                    e,
-                    true,
-                    &mut prefix_map,
-                    &mut scope_decls,
-                    schema_set,
-                )?;
-                if track {
-                    builder.set_source_span(
-                        elem_ref,
-                        SourceSpan::new(event_start, xml_reader.buffer_position()),
-                    );
-                }
-                // Empty elements don't push to element_ref_stack — they
-                // complete inline (handle_start_or_empty pops scope and
-                // calls end_element + validate_end_element).
-            }
-            Ok(Event::End(_)) => {
-                if track {
-                    if let Some((elem_ref, start)) = pending_spans.pop() {
-                        builder.set_source_span(
-                            elem_ref,
-                            SourceSpan::new(start, xml_reader.buffer_position()),
-                        );
-                    }
-                }
-                // Pop namespace scope
-                if let Some(decls) = scope_decls.pop() {
-                    for prefix_key in &decls {
-                        if let Some(stack) = prefix_map.get_mut(prefix_key.as_ref()) {
-                            stack.pop();
-                        }
-                    }
-                }
-                builder.end_element()?;
-                runtime.validate_end_element();
-                element_ref_stack.pop();
-            }
-            Ok(Event::Text(ref e)) => {
-                if !element_ref_stack.is_empty() {
-                    let text = e.unescape()?;
-                    builder.text(&text);
-                    if is_xml_whitespace_str(&text) {
-                        runtime.validate_whitespace(&text);
-                    } else {
-                        runtime.validate_text(&text);
-                    }
-                }
-            }
-            Ok(Event::CData(ref e)) => {
-                if !element_ref_stack.is_empty() {
-                    let text = std::str::from_utf8(e)?;
-                    builder.text(text);
-                    if is_xml_whitespace_str(text) {
-                        runtime.validate_whitespace(text);
-                    } else {
-                        runtime.validate_text(text);
-                    }
-                }
-            }
-            Ok(Event::Comment(ref e)) => {
-                let text = std::str::from_utf8(e)?;
-                builder.comment(text)?;
-            }
-            Ok(Event::PI(ref e)) => {
-                let raw = std::str::from_utf8(e)?;
-                let (target, data) = parse_pi_content(raw);
-                builder.processing_instruction(target, data)?;
-            }
-            Ok(Event::Decl(_) | Event::DocType(_)) => {}
-            Ok(Event::Eof) => break,
-            Err(e) => return Err(e.into()),
-        }
-        buf.clear();
+        })?;
     }
 
     let _ = runtime.end_validation();
     builder.finalize()
-}
-
-// ── handle_start_or_empty ─────────────────────────────────────────────
-
-/// Process an element start (or empty) event with interleaved validation.
-fn handle_start_or_empty<S: ValidationSink>(
-    builder: &mut BufferDocumentBuilder<'_>,
-    runtime: &mut ValidationRuntime<'_, S>,
-    e: &quick_xml::events::BytesStart<'_>,
-    is_empty: bool,
-    prefix_map: &mut HashMap<Box<[u8]>, Vec<String>>,
-    scope_decls: &mut Vec<Vec<Box<[u8]>>>,
-    schema_set: &SchemaSet,
-) -> Result<u32, BufferDocumentError> {
-    let mut local_decls: Vec<Box<[u8]>> = Vec::new();
-    let mut ns_decls_str: Vec<(String, String)> = Vec::new();
-
-    // ── First pass: collect xmlns declarations ────────────────────────
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        let key = attr.key.as_ref();
-
-        if key == b"xmlns" {
-            let value = attr.unescape_value()?;
-            let uri = value.to_string();
-            let prefix_key: Box<[u8]> = b"".to_vec().into_boxed_slice();
-            prefix_map
-                .entry(prefix_key.clone())
-                .or_default()
-                .push(uri.clone());
-            local_decls.push(prefix_key);
-            ns_decls_str.push((String::new(), uri));
-        } else if key.starts_with(b"xmlns:") {
-            let prefix_bytes = &key[6..];
-            let value = attr.unescape_value()?;
-            let uri = value.to_string();
-            let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
-            prefix_map
-                .entry(prefix_key.clone())
-                .or_default()
-                .push(uri.clone());
-            local_decls.push(prefix_key);
-            let prefix_str =
-                std::str::from_utf8(prefix_bytes).map_err(BufferDocumentError::Utf8)?;
-            ns_decls_str.push((prefix_str.to_string(), uri));
-        }
-    }
-
-    scope_decls.push(local_decls);
-
-    // Build ns_declarations slice for start_element
-    let ns_decl_refs: Vec<(&str, &str)> = ns_decls_str
-        .iter()
-        .map(|(p, u)| (p.as_str(), u.as_str()))
-        .collect();
-
-    // Resolve element name
-    let full_name = e.name();
-    let full_name_bytes = full_name.as_ref();
-    let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
-
-    let elem_local = std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
-    let elem_prefix_str =
-        std::str::from_utf8(elem_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
-
-    // Resolve element namespace
-    let elem_ns_uri = match prefix_map.get(elem_prefix_bytes) {
-        Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-        _ if elem_prefix_bytes.is_empty() => String::new(),
-        _ => {
-            return Err(BufferDocumentError::UnboundPrefix(
-                elem_prefix_str.to_string(),
-            ))
-        }
-    };
-
-    // ── Scan attributes for xsi:type and xsi:nil ──────────────────────
-    let mut xsi_type: Option<String> = None;
-    let mut xsi_nil: Option<String> = None;
-
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            continue;
-        }
-        let (attr_prefix_bytes, attr_local_bytes) = split_prefix_local(key);
-        if attr_prefix_bytes.is_empty() {
-            continue;
-        }
-        // Resolve attribute namespace to check for XSI
-        if let Some(stack) = prefix_map.get(attr_prefix_bytes) {
-            if let Some(ns_uri) = stack.last() {
-                if ns_uri == XSI_NAMESPACE {
-                    let local =
-                        std::str::from_utf8(attr_local_bytes).map_err(BufferDocumentError::Utf8)?;
-                    let value = attr.unescape_value()?;
-                    match local {
-                        "type" => xsi_type = Some(value.to_string()),
-                        "nil" => xsi_nil = Some(value.to_string()),
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Build NamespaceContextSnapshot for xsi:type resolution ────────
-    let ns_ctx = build_ns_context(prefix_map, schema_set);
-
-    // ── Push element to builder ───────────────────────────────────────
-    let elem_ref =
-        builder.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
-
-    // ── Validate element ──────────────────────────────────────────────
-    let info = runtime.validate_element(
-        elem_local,
-        &elem_ns_uri,
-        xsi_type.as_deref(),
-        xsi_nil.as_deref(),
-        &ns_ctx,
-    );
-
-    // Set schema binding on element
-    if let Some(tk) = info.schema_type {
-        let binding = NodeSchemaBinding {
-            type_key: tk,
-            element_decl: info.element_decl,
-            attribute_decl: None,
-            content_type: info.content_type,
-        };
-        builder.set_node_binding(elem_ref, binding)?;
-    }
-
-    // Set nil flag
-    if info.is_nil {
-        builder.set_nil(elem_ref);
-    }
-
-    // ── Second pass: non-xmlns attributes ─────────────────────────────
-    #[cfg(feature = "xsd11")]
-    let mut deferred_attr_refs: Vec<u32> = Vec::new();
-
-    for attr_result in e.attributes() {
-        let attr = attr_result?;
-        let key = attr.key.as_ref();
-
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            continue;
-        }
-
-        let (attr_prefix_bytes, attr_local_bytes) = split_prefix_local(key);
-        let attr_local =
-            std::str::from_utf8(attr_local_bytes).map_err(BufferDocumentError::Utf8)?;
-        let attr_prefix_str =
-            std::str::from_utf8(attr_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
-
-        // Resolve attr namespace
-        let attr_ns_uri = if attr_prefix_bytes.is_empty() {
-            String::new()
-        } else {
-            match prefix_map.get(attr_prefix_bytes) {
-                Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-                _ => {
-                    return Err(BufferDocumentError::UnboundPrefix(
-                        attr_prefix_str.to_string(),
-                    ))
-                }
-            }
-        };
-
-        let unescaped = attr.unescape_value()?;
-        let attr_ref = builder.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
-
-        // Validate all attributes including xsi:* (built-in XSI attributes
-        // return proper SchemaInfo with type information from the runtime).
-        let attr_info = runtime.validate_attribute(attr_local, &attr_ns_uri, &unescaped);
-
-        #[cfg(feature = "xsd11")]
-        if attr_info.deferred_by_cta {
-            deferred_attr_refs.push(attr_ref);
-        }
-
-        if let Some(tk) = attr_info.schema_type {
-            let binding = NodeSchemaBinding {
-                type_key: tk,
-                element_decl: None,
-                attribute_decl: attr_info.attribute_decl,
-                content_type: None,
-            };
-            builder.set_node_binding(attr_ref, binding)?;
-        }
-
-        // xml:id detection (mirrors builder.rs:706)
-        if attr_local == "id" && attr_ns_uri == XML_NAMESPACE {
-            builder.register_xml_id(&unescaped, elem_ref)?;
-        }
-    }
-
-    builder.end_of_attributes();
-    let eoa_info = runtime.validate_end_of_attributes();
-
-    // If CTA selected a new type, update the element's schema binding
-    if let Some(tk) = eoa_info.schema_type {
-        let binding = NodeSchemaBinding {
-            type_key: tk,
-            element_decl: info.element_decl,
-            attribute_decl: None,
-            content_type: eoa_info.content_type,
-        };
-        builder.set_node_binding(elem_ref, binding)?;
-    }
-
-    // Apply deferred attribute bindings from CTA processing
-    #[cfg(feature = "xsd11")]
-    {
-        let deferred_results = runtime.take_deferred_attribute_results();
-        if deferred_attr_refs.len() != deferred_results.len() {
-            return Err(BufferDocumentError::InternalError(
-                "deferred attribute count mismatch".into(),
-            ));
-        }
-        for (attr_ref, attr_info) in deferred_attr_refs.iter().zip(deferred_results.iter()) {
-            if let Some(tk) = attr_info.schema_type {
-                let binding = NodeSchemaBinding {
-                    type_key: tk,
-                    element_decl: None,
-                    attribute_decl: attr_info.attribute_decl,
-                    content_type: None,
-                };
-                builder.set_node_binding(*attr_ref, binding)?;
-            }
-        }
-    }
-
-    // ── Empty element: close immediately ──────────────────────────────
-    if is_empty {
-        if let Some(decls) = scope_decls.pop() {
-            for prefix_key in &decls {
-                if let Some(stack) = prefix_map.get_mut(prefix_key.as_ref()) {
-                    stack.pop();
-                }
-            }
-        }
-        builder.end_element()?;
-        runtime.validate_end_element();
-    }
-
-    Ok(elem_ref)
-}
-
-// ── Namespace context snapshot builder ────────────────────────────────
-
-/// Build a [`NamespaceContextSnapshot`] from the current `prefix_map`.
-fn build_ns_context(
-    prefix_map: &HashMap<Box<[u8]>, Vec<String>>,
-    schema_set: &SchemaSet,
-) -> NamespaceContextSnapshot {
-    let mut snapshot = NamespaceContextSnapshot::default();
-
-    for (prefix_bytes, stack) in prefix_map {
-        if let Some(uri) = stack.last() {
-            if uri.is_empty() && prefix_bytes.is_empty() {
-                continue; // default ns = "" → no binding
-            }
-            let uri_id = schema_set.name_table.add(uri);
-
-            if prefix_bytes.is_empty() {
-                snapshot.default_ns = Some(uri_id);
-            } else if let Ok(prefix_str) = std::str::from_utf8(prefix_bytes) {
-                // Skip well-known xml/xmlns prefixes (always in scope)
-                if prefix_str != "xml" && prefix_str != "xmlns" {
-                    let prefix_id = schema_set.name_table.add(prefix_str);
-                    snapshot.bindings.push((prefix_id, uri_id));
-                }
-            }
-        }
-    }
-
-    snapshot
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
@@ -823,6 +668,46 @@ mod tests {
             !doc.source_spans.is_empty(),
             "source spans should be recorded with full() options"
         );
+    }
+
+    // ── Test 13: comments and PIs preserved in typed document ────────
+
+    #[test]
+    fn comments_and_pis_preserved() {
+        use crate::document::node::NodeType;
+
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="child" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let xml = "<root><!-- before --><?p1 d1?><child>hi</child><!-- after --></root>";
+        let doc = build_typed_document(
+            xml.as_bytes(),
+            &arena,
+            &schema_set,
+            BufferDocumentOptions::default(),
+        )
+        .unwrap();
+
+        let mut comment_count = 0usize;
+        let mut pi_count = 0usize;
+        for i in 0..doc.nodes.len() {
+            match doc.nodes.get(i).node_type() {
+                NodeType::Comment => comment_count += 1,
+                NodeType::ProcessingInstruction => pi_count += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(comment_count, 2, "two comments should be preserved");
+        assert_eq!(pi_count, 1, "one PI should be preserved");
     }
 
     // ── Fragment mode tests ──────────────────────────────────────────────
