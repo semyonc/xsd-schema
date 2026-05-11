@@ -5233,9 +5233,10 @@ pub(crate) fn effective_attribute_wildcard(
 /// Returns the type's full effective `{attribute wildcard}` per §3.6.2.2
 /// (intersection of own + attribute groups) chained with §3.4.2.5's
 /// extension union over the base chain. Restriction picks the derived's
-/// own (§3.6.2.2 result), falling back to the base only when the derived
-/// has no own wildcard at all — matching the prior `find_effective_wildcard`
-/// runtime convention.
+/// own wildcard (§3.6.2.2 "complete wildcard") with no base inheritance
+/// — per §3.4.2.5 clause 2.1, a restriction's {attribute wildcard} IS
+/// the complete wildcard, which is absent when no local <anyAttribute>
+/// or attribute-group wildcard contributes one.
 ///
 /// The return value is target-namespace-free: all `##targetNamespace` /
 /// `##other` / list tokens have been resolved against each contributor's
@@ -5290,12 +5291,16 @@ fn compute_runtime_attribute_wildcard_bounded(
             }
         }
         // Restriction or no derivation: derived's own wildcard is
-        // authoritative. If the derived has no wildcard at all, fall
-        // back to the base for inheritance-style behaviour matching
-        // the prior runtime semantics.
-        _ => own.or_else(|| {
-            compute_runtime_attribute_wildcard_bounded(schema_set, base_key, depth + 1)
-        }),
+        // authoritative per XSD §3.4.2.5 clause 2.1 ("If {derivation
+        // method} = restriction, then the complete wildcard"). The
+        // base's wildcard is NOT inherited — a restriction with no
+        // local <anyAttribute> and no attribute-group ref wildcard
+        // has {attribute wildcard} = absent. This matches sunData
+        // combined/008 test.10/11.n: an `alias` element restriction
+        // of a base with `<anyAttribute namespace="urn:a urn:b"/>`
+        // and no own wildcard must reject all foreign-namespace
+        // attributes (cvc-complex-type.3.2 / cvc-assess-attr).
+        _ => own,
     }
 }
 
