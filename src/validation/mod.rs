@@ -17,6 +17,7 @@ pub mod identity;
 pub mod identity_lexer;
 pub mod identity_parser;
 pub mod info;
+pub mod navigator_driver;
 pub mod quick_xml_driver;
 pub mod runtime;
 pub mod simple;
@@ -45,6 +46,9 @@ pub use hint_loader::{
     enrich_schema_set, load_hints_into_builder, EnrichmentOutcome, HintLoadResult,
 };
 pub use identity::{KeyFieldValue, KeySequence, KeyTable};
+pub use navigator_driver::drive_navigator;
+#[cfg(feature = "xsd11")]
+pub use navigator_driver::drive_buffer_document;
 pub use quick_xml_driver::{
     drive_quick_xml, drive_quick_xml_in, drive_quick_xml_with, drive_quick_xml_with_in,
     AttributeView, DriveError, DriveOutcome, DriveWithError, ElementStartView, EndElementInfo,

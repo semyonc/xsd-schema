@@ -266,6 +266,81 @@ track spans, or otherwise interleave bookkeeping with validation should
 implement `ValidationEventHandler` rather than open-coding the
 `quick-xml` → push API translation.
 
+### Hint-Driven Schema Enrichment (Two-Pass Validation)
+
+The XSD spec says processors SHOULD attempt to locate schemas from
+`xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hints. Because
+`ValidationRuntime` borrows `&SchemaSet` immutably, schema loading cannot
+happen mid-validation — no schemas are loaded during an active run. Instead,
+hints are accumulated during a first pass (each carrying the instance base
+URI for relative resolution), then used to build an enriched schema set for a
+second pass.
+
+`enrich_schema_set` is the turn-key path. It re-loads the original schemas via
+`SchemaSetBuilder::add_from()` — reading back the original set's recorded
+locations, so the caller need not track file paths — adds the hinted schemas,
+and compiles once:
+
+```rust
+use xsd_schema::enrich_schema_set;
+
+// First pass: validate and collect hints
+let sl = runtime.schema_location_hints().to_vec();
+let nnsl = runtime.no_namespace_schema_location_hints().to_vec();
+
+let outcome = enrich_schema_set(&schema_set, &sl, &nnsl);
+if let Some(enriched) = outcome.schema_set.as_ref() {
+    // Second pass: re-validate with the enriched schema set
+} else if let Some(err) = outcome.compile_error.as_ref() {
+    eprintln!("hint enrichment failed at recompile: {err}");
+} else if !outcome.hint_errors.is_empty() {
+    // Hints were given but every one failed to load; the original
+    // SchemaSet is still usable without enrichment.
+    for e in &outcome.hint_errors {
+        eprintln!("hint load failure: {e}");
+    }
+}
+```
+
+The returned `EnrichmentOutcome` separates every failure mode the older
+`Option<SchemaSet>` shape conflated: `schema_set` (present only when the
+recompile succeeded), `hint_errors` (per-hint load failures — non-fatal, so
+partial success is possible), and `compile_error` (the recompile error, if
+any). `is_no_op()` distinguishes "no hints to apply" from "tried but failed".
+For finer control, drive a `SchemaSetBuilder` directly and inspect
+`HintLoadResult::errors`:
+
+```rust
+use xsd_schema::{SchemaSetBuilder, load_hints_into_builder};
+
+let mut builder = SchemaSetBuilder::new();
+builder.add_from(&schema_set);       // re-load original schemas
+load_hints_into_builder(&mut builder, &sl_hints, &nnsl_hints);
+let compiled = builder.compile()?;   // re-validate with compiled.schema_set()
+```
+
+**Base URI.** Set an absolute (canonicalized) path via
+`ValidationRuntime::set_instance_base_uri` before the first pass. Relative
+paths with `..` components can break hint resolution, because the resolver
+joins each hint location against the base URI's directory.
+
+**Driving the second pass.** Enrichment only produces a schema set; the
+instance still has to be validated against it. The push API is
+source-agnostic, so either driver works:
+
+- *Re-parse with `quick-xml`* (no `xsd11` requirement): keep the instance
+  bytes and call `drive_quick_xml` again with the enriched set. Simplest, but
+  the document is parsed twice.
+- *Re-walk a single parse* (`xsd11`): parse the instance once into a
+  `BufferDocument`, then validate it against the original and enriched sets by
+  re-walking the in-memory tree with `drive_navigator` /
+  `drive_buffer_document` (`src/validation/navigator_driver.rs`). The
+  tree-walk driver emits the same push-API sequence as the streaming driver
+  (same `NamespaceContextSnapshot`, `xsi:*` discovery, whitespace/character
+  split), so both passes produce identical diagnostics from one parse. See
+  *BufferDocument* below; `drive_navigator` is generic over `DomNavigator`, so
+  it also re-validates a `roxmltree` document through `RoXmlNavigator`.
+
 ### XSD 1.1 Assertion Buffering
 
 `xs:assert` does not require preloading the instance into a DOM. When an
