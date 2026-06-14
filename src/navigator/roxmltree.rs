@@ -366,17 +366,13 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
 
     fn move_to_first_attribute(&mut self) -> bool {
         match &self.cursor {
-            RoCursor::Node(n) if n.is_element() => {
-                if n.attributes().len() > 0 {
-                    self.cursor = RoCursor::Attribute {
-                        owner: *n,
-                        index: 0,
-                    };
-                    self.name_cache.clear();
-                    true
-                } else {
-                    false
-                }
+            RoCursor::Node(n) if n.is_element() && n.attributes().len() > 0 => {
+                self.cursor = RoCursor::Attribute {
+                    owner: *n,
+                    index: 0,
+                };
+                self.name_cache.clear();
+                true
             }
             _ => false,
         }

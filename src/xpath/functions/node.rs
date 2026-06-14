@@ -589,17 +589,16 @@ fn compute_base_uri<N: DomNavigator>(node: &N, static_base_uri: Option<&str>) ->
     let mut nav = node.clone();
 
     // For text, comment, PI nodes, start from parent
-    match nav.node_type() {
+    if matches!(
+        nav.node_type(),
         DomNodeType::Text
-        | DomNodeType::Whitespace
-        | DomNodeType::SignificantWhitespace
-        | DomNodeType::Comment
-        | DomNodeType::ProcessingInstruction => {
-            if !nav.move_to_parent() {
-                return None;
-            }
-        }
-        _ => {}
+            | DomNodeType::Whitespace
+            | DomNodeType::SignificantWhitespace
+            | DomNodeType::Comment
+            | DomNodeType::ProcessingInstruction
+    ) && !nav.move_to_parent()
+    {
+        return None;
     }
 
     // Walk up ancestor chain, collecting xml:base attributes

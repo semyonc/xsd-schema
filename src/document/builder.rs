@@ -1496,7 +1496,7 @@ mod tests {
         let doc_frag = b_frag.finalize().unwrap();
 
         assert_eq!(doc_full.nodes.len(), doc_frag.nodes.len());
-        for i in 0..doc_full.nodes.len() as u32 {
+        for i in 0..doc_full.nodes.len() {
             assert_eq!(
                 doc_full.nodes.get(i).node_type(),
                 doc_frag.nodes.get(i).node_type(),
