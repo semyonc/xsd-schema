@@ -1,8 +1,8 @@
 [package]
 name = "xsd-schema"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-authors = ["XmlPad Project"]
+authors = ["semyonc"]
 description = "XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in XPath 2.0 engine"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/semyonc/xsd-schema"

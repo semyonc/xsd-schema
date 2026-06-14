@@ -2239,28 +2239,65 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         };
 
+        // 1. Content model completion (NFA accept-state check, expected-element errors)
+        self.finish_content_model(&mut ev_state);
+
+        // 2. Simple-content / text validation (typed value, fixed/default)
+        self.finish_simple_content(&mut ev_state);
+
+        // 2c. Assertion evaluation (XSD 1.1)
+        #[cfg(feature = "xsd11")]
+        let assertion_outcome = self.finish_assertions(&mut ev_state);
+
+        // 3. Identity-constraint scope teardown (field values, scope exit, keyref retry)
+        self.finish_identity_constraints(&mut ev_state);
+
+        // 4. ID/IDREF/ENTITY bookkeeping
+        self.finish_id_bindings(&ev_state);
+
+        // 5. PSVI assembly (element-path pop, validity, validation-attempted, SchemaInfo)
+        self.assemble_schema_info(
+            ev_state,
+            #[cfg(feature = "xsd11")]
+            assertion_outcome,
+        )
+    }
+
+    /// F2/B1 step 1: content-model completion check (cvc-complex-type.2.4).
+    ///
+    /// For element-only or mixed content, verify the content model reached an
+    /// accept state; if not, report the "incomplete content" error.
+    fn finish_content_model(&mut self, ev_state: &mut ElementValidationState) {
         // 1. Check content model completion
         if !ev_state.is_nil {
             match ev_state.content_type {
-                Some(ContentType::ElementOnly) | Some(ContentType::Mixed) => {
-                    if !ev_state.content_state.is_complete() {
-                        let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
-                        let err = errors::error(
-                            "cvc-complex-type.2.4",
-                            format!(
-                                "Element '{}' content model is incomplete: expected more child elements",
-                                elem_name,
-                            ),
-                            self.current_location.clone(),
-                        );
-                        self.report_validation_error_to(err, &mut ev_state.error_codes);
-                        ev_state.validity = SchemaValidity::Invalid;
-                    }
+                Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
+                    if !ev_state.content_state.is_complete() =>
+                {
+                    let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
+                    let err = errors::error(
+                        "cvc-complex-type.2.4",
+                        format!(
+                            "Element '{}' content model is incomplete: expected more child elements",
+                            elem_name,
+                        ),
+                        self.current_location.clone(),
+                    );
+                    self.report_validation_error_to(err, &mut ev_state.error_codes);
+                    ev_state.validity = SchemaValidity::Invalid;
                 }
                 _ => {}
             }
         }
+    }
 
+    /// F2/B1 step 2: simple-content / text validation.
+    ///
+    /// For text-only content: substitute default/fixed for an empty element,
+    /// run simple-type validation, perform the QName/NOTATION prefix-binding
+    /// check, and verify any fixed value (cvc-elt.5.2.2). Also enforces the
+    /// mixed-content fixed-value rules (cvc-elt.5.2.2.1 / 5.2.2.2.1).
+    fn finish_simple_content(&mut self, ev_state: &mut ElementValidationState) {
         // 2. For TextOnly: validate text content against simple type
         if ev_state.content_type == Some(ContentType::TextOnly) && !ev_state.is_nil {
             // Handle default value before validation: if the element has no text
@@ -2421,9 +2458,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
         }
+    }
 
-        // 2c. Assertion evaluation hook (XSD 1.1)
-        #[cfg(feature = "xsd11")]
+    /// F2/B1 step 2c: XSD 1.1 assertion evaluation.
+    ///
+    /// Forwards the end-element event to the assertion fragment builder; when
+    /// the outermost asserted element closes, finalizes the buffered fragment
+    /// and evaluates all (deferred + current) assertions. Returns the
+    /// `AssertionOutcome` for the PSVI, or `None` when the type has none.
+    #[cfg(feature = "xsd11")]
+    fn finish_assertions(
+        &mut self,
+        ev_state: &mut ElementValidationState,
+    ) -> Option<AssertionOutcome> {
         let type_has_assertions = matches!(ev_state.schema_type,
             Some(TypeKey::Complex(ct_key)) if has_inherited_assertions(ct_key, &self.schema_set.arenas));
         #[cfg(feature = "xsd11")]
@@ -2519,7 +2566,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             } else {
                                 assertion_outcome = Some(AssertionOutcome::Failed);
                             }
-                            self.report_assertion_errors(errs, &mut ev_state);
+                            self.report_assertion_errors(errs, ev_state);
                         }
                         Err(e) => {
                             // Clear stale deferred frames — they reference
@@ -2557,6 +2604,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             assertion_outcome = Some(AssertionOutcome::NotEvaluated);
         }
 
+        assertion_outcome
+    }
+
+    /// F2/B1 step 3: identity-constraint scope teardown.
+    ///
+    /// Records selector/field values for this element, pops the IC scope table
+    /// and propagates key/unique tables to the parent (or saves the root
+    /// tables), then retries deferred keyrefs against the enriched parent scope.
+    fn finish_identity_constraints(&mut self, ev_state: &mut ElementValidationState) {
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
         let is_complex_content = matches!(
             ev_state.content_type,
@@ -2658,7 +2714,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.sink.on_error(err);
             }
         }
+    }
 
+    /// F2/B1 step 4: ID/IDREF/ENTITY bookkeeping.
+    ///
+    /// Collects ID/IDREF bindings from this element's typed value — owner is the
+    /// parent per §3.17.5.2 — and checks that ENTITY values are declared.
+    fn finish_id_bindings(&mut self, ev_state: &ElementValidationState) {
         // 4. ID/IDREF collection from element text content.
         // Owner is the parent element per §3.17.5.2: the binding is to the
         // element that has the ID-typed child in its [children].
@@ -2672,7 +2734,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.collect_id_idref(tv, &ev_state.text_content, parent_serial);
             self.check_entity_declared(tv);
         }
+    }
 
+    /// F2/B1 step 5: PSVI assembly (§3.3.5.1).
+    ///
+    /// Pops the element path, records `[validity]` and the `[validation
+    /// attempted]` property, propagates this element's assessment to the
+    /// parent, and builds the final `SchemaInfo`.
+    fn assemble_schema_info(
+        &mut self,
+        ev_state: ElementValidationState,
+        #[cfg(feature = "xsd11")] assertion_outcome: Option<AssertionOutcome>,
+    ) -> SchemaInfo {
         // 5. Update element path
         self.pop_element_path();
 
