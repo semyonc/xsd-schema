@@ -26,7 +26,7 @@ use crate::types::XmlTypeCode;
 #[cfg(feature = "xsd11")]
 use bumpalo::Bump;
 
-use super::content::ContentValidatorState;
+use super::content::{CompiledContentModel, ContentValidatorState};
 use super::context::{ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
@@ -126,6 +126,13 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     element_path: String,
     /// Pre-compiled identity constraints (lazy cache; None = compilation failed)
     compiled_constraints: HashMap<IdentityConstraintKey, Option<CompiledIdentityConstraint>>,
+    /// Per-complex-type compiled content models, built once by
+    /// `SchemaValidator` (see `build_content_models`) and borrowed — shared
+    /// across every run. The NFA / all-group automaton is identical for every
+    /// instance of a type, so each element only clones cheap `Arc`s from here
+    /// and allocates fresh active states, instead of recompiling the model per
+    /// element. See `PERF_ANALYZE`.
+    content_models: &'a HashMap<ComplexTypeKey, CompiledContentModel>,
     /// Active constraint state instances
     active_constraints: Vec<ConstraintStruct>,
     /// Collected ID values mapped to the owner element serial.
@@ -189,11 +196,172 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     _not_thread_safe: PhantomData<*const ()>,
 }
 
+/// Build the per-complex-type compiled content models once, at
+/// `SchemaValidator` construction. Mirrors how substitution groups are built
+/// once and reused across runs (`build_substitution_group_map`).
+///
+/// Only element-only / mixed types get a content model — exactly the set the
+/// per-element path consults — so no work is wasted on empty / simple-content
+/// types. The heavy automaton lives behind `Arc`s in [`CompiledContentModel`],
+/// so each element instance clones cheap handles instead of recompiling the NFA.
+///
+/// Compilation failures are simply omitted from the map; the runtime then falls
+/// back to empty content (matching the previous per-element error path) and
+/// never retries the failed compile.
+pub(crate) fn build_content_models(
+    schema_set: &SchemaSet,
+) -> HashMap<ComplexTypeKey, CompiledContentModel> {
+    let mut map = HashMap::new();
+    for (ct_key, ct_data) in schema_set.arenas.complex_types.iter() {
+        if matches!(
+            determine_content_type(schema_set, ct_data),
+            ContentType::ElementOnly | ContentType::Mixed
+        ) {
+            if let Ok(matcher) = compile_content_model_matcher(schema_set, ct_data) {
+                map.insert(ct_key, CompiledContentModel::from_matcher(matcher));
+            }
+        }
+    }
+    map
+}
+
+/// Determine the [`ContentType`] of a complex type from its `ComplexTypeDefData`.
+///
+/// Cheap and allocation-free; shared by the per-run content-model lookup in
+/// [`ValidationRuntime::init_content_model`] and the schema-load-time content
+/// model build in [`build_content_models`].
+pub(crate) fn determine_content_type(
+    schema_set: &SchemaSet,
+    ct_data: &ComplexTypeDefData,
+) -> ContentType {
+    use crate::parser::frames::ComplexContentResult;
+    use crate::parser::frames::DerivationMethod;
+    match &ct_data.content {
+        ComplexContentResult::Empty => {
+            // §3.4.2.3 step 5.2: a `<defaultOpenContent>` with
+            // `appliesToEmpty="true"` widens an otherwise-empty
+            // content type to element-only/mixed (XSD 1.1).
+            #[cfg(feature = "xsd11")]
+            if schema_set.is_xsd11()
+                && empty_ct_has_applicable_default_open_content(schema_set, ct_data)
+            {
+                return if ct_data.mixed {
+                    ContentType::Mixed
+                } else {
+                    ContentType::ElementOnly
+                };
+            }
+            if ct_data.mixed {
+                ContentType::Mixed
+            } else {
+                ContentType::Empty
+            }
+        }
+        ComplexContentResult::Simple(_) => ContentType::TextOnly,
+        ComplexContentResult::Complex(def) => {
+            // §3.4.2.3 step 4.1.1 / 4.2.1: explicit content type variety
+            // = empty when the effective content is empty (the explicit
+            // content is empty *and* effective mixed is false). Step 6
+            // then promotes variety to element-only/mixed if a wildcard
+            // element (open content) is present — without one, the final
+            // {content type} stays empty (no character or element items
+            // are allowed). Only apply the relaxed §3.4.2.3 step 2.1.x
+            // particle-shape recognition under XSD 1.1; XSD 1.0 tests
+            // historically rely on `def.particle.is_none()` strictness.
+            let particle_empty = match &def.particle {
+                None => true,
+                Some(p) => {
+                    schema_set.is_xsd11()
+                        && crate::parser::frames::particle_is_explicit_empty(p)
+                }
+            };
+            let has_open_content = type_has_effective_open_content(schema_set, ct_data, def);
+            if particle_empty && !ct_data.mixed && !def.mixed && !has_open_content {
+                // For extensions with no own particle, inherit base type's content type
+                if matches!(ct_data.derivation_method, Some(DerivationMethod::Extension)) {
+                    if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
+                        let base_data = &schema_set.arenas.complex_types[base_ct_key];
+                        return determine_content_type(schema_set, base_data);
+                    }
+                }
+                ContentType::Empty
+            } else if ct_data.mixed || def.mixed {
+                ContentType::Mixed
+            } else {
+                ContentType::ElementOnly
+            }
+        }
+    }
+}
+
+/// Whether an otherwise-empty (`ComplexContentResult::Empty`) complex type
+/// effectively gains a wildcard via the schema document's
+/// `<defaultOpenContent>` with `appliesToEmpty="true"`. Mirrors the
+/// `appliesToEmpty` half of [`type_has_effective_open_content`] for the
+/// shorter-syntax CTs that don't carry a `ComplexContentDefResult`.
+#[cfg(feature = "xsd11")]
+fn empty_ct_has_applicable_default_open_content(
+    schema_set: &SchemaSet,
+    ct_data: &ComplexTypeDefData,
+) -> bool {
+    let doc = ct_data
+        .source
+        .as_ref()
+        .and_then(|s| schema_set.documents.get(s.defaults_doc() as usize));
+    if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
+        if default.mode == crate::schema::model::OpenContentMode::None {
+            return false;
+        }
+        return default.applies_to_empty;
+    }
+    false
+}
+
+/// Whether a complex type effectively has open content per §3.4.2.3 step 5
+/// (the "wildcard element"). Used by [`determine_content_type`] to distinguish
+/// a truly empty content type from one whose explicit content type variety =
+/// empty but is widened to element-only by an open content wildcard (own
+/// `<openContent>` or applicable `<defaultOpenContent>`).
+#[allow(unused_variables)]
+fn type_has_effective_open_content(
+    schema_set: &SchemaSet,
+    ct_data: &ComplexTypeDefData,
+    def: &crate::parser::frames::ComplexContentDefResult,
+) -> bool {
+    #[cfg(feature = "xsd11")]
+    {
+        use crate::parser::frames::OpenContentMode;
+        // Step 5.1: own <openContent> child with mode != none.
+        if let Some(oc) = def.open_content.as_ref() {
+            return oc.mode != OpenContentMode::None;
+        }
+        // Step 5.2: schema's <defaultOpenContent>. Applies when
+        // appliesToEmpty=true OR explicit content type variety ≠ empty.
+        // Use the same gate as compile.rs `resolve_open_content`.
+        let doc = ct_data
+            .source
+            .as_ref()
+            .and_then(|s| schema_set.documents.get(s.defaults_doc() as usize));
+        if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
+            if default.mode == crate::schema::model::OpenContentMode::None {
+                return false;
+            }
+            if default.applies_to_empty {
+                return true;
+            }
+            return !ct_data.content.explicit_content_type_is_empty();
+        }
+    }
+    let _ = (schema_set, ct_data, def);
+    false
+}
+
 impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Create a new `ValidationRuntime` (called by `SchemaValidator::start_run()`).
     pub(crate) fn new(
         schema_set: &'a SchemaSet,
         subst_groups: &'a Option<SubstitutionGroupMap>,
+        content_models: &'a HashMap<ComplexTypeKey, CompiledContentModel>,
         flags: ValidationFlags,
         sink: S,
         #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
@@ -206,6 +374,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ValidationRuntime {
             schema_set,
             subst_groups,
+            content_models,
             flags,
             sink,
             validation_stack: Vec::new(),
@@ -4509,18 +4678,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         match type_key {
             Some(TypeKey::Complex(ct_key)) => {
                 let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-                let content_type = self.determine_content_type(ct_data);
+                let content_type = determine_content_type(self.schema_set, ct_data);
 
                 let content_state = match content_type {
                     ContentType::Empty => ContentValidatorState::Empty,
                     ContentType::TextOnly => ContentValidatorState::Simple,
                     ContentType::ElementOnly | ContentType::Mixed => {
-                        match compile_content_model_matcher(self.schema_set, ct_data) {
-                            Ok(matcher) => ContentValidatorState::from_matcher(matcher),
-                            Err(_) => {
-                                // Compilation error — treat as empty
-                                ContentValidatorState::Empty
-                            }
+                        // The content model is identical for every instance of
+                        // this complex type and was compiled once, at
+                        // `SchemaValidator` construction (`build_content_models`).
+                        // Per element we only clone the shared `Arc`s and build
+                        // fresh active states. A missing entry means compilation
+                        // failed at load time; fall back to empty content
+                        // (matching the previous per-element error path) without
+                        // retrying.
+                        match self.content_models.get(&ct_key) {
+                            Some(cm) => ContentValidatorState::from_compiled(cm),
+                            None => ContentValidatorState::Empty,
                         }
                     }
                 };
@@ -4530,127 +4704,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             Some(TypeKey::Simple(_)) => (ContentValidatorState::Simple, ContentType::TextOnly),
             None => (ContentValidatorState::Simple, ContentType::TextOnly),
         }
-    }
-
-    /// Determine the ContentType from a ComplexTypeDefData
-    fn determine_content_type(&self, ct_data: &ComplexTypeDefData) -> ContentType {
-        use crate::parser::frames::ComplexContentResult;
-        use crate::parser::frames::DerivationMethod;
-        match &ct_data.content {
-            ComplexContentResult::Empty => {
-                // §3.4.2.3 step 5.2: a `<defaultOpenContent>` with
-                // `appliesToEmpty="true"` widens an otherwise-empty
-                // content type to element-only/mixed (XSD 1.1).
-                #[cfg(feature = "xsd11")]
-                if self.schema_set.is_xsd11()
-                    && self.empty_ct_has_applicable_default_open_content(ct_data)
-                {
-                    return if ct_data.mixed {
-                        ContentType::Mixed
-                    } else {
-                        ContentType::ElementOnly
-                    };
-                }
-                if ct_data.mixed {
-                    ContentType::Mixed
-                } else {
-                    ContentType::Empty
-                }
-            }
-            ComplexContentResult::Simple(_) => ContentType::TextOnly,
-            ComplexContentResult::Complex(def) => {
-                // §3.4.2.3 step 4.1.1 / 4.2.1: explicit content type variety
-                // = empty when the effective content is empty (the explicit
-                // content is empty *and* effective mixed is false). Step 6
-                // then promotes variety to element-only/mixed if a wildcard
-                // element (open content) is present — without one, the final
-                // {content type} stays empty (no character or element items
-                // are allowed). Only apply the relaxed §3.4.2.3 step 2.1.x
-                // particle-shape recognition under XSD 1.1; XSD 1.0 tests
-                // historically rely on `def.particle.is_none()` strictness.
-                let particle_empty = match &def.particle {
-                    None => true,
-                    Some(p) => {
-                        self.schema_set.is_xsd11()
-                            && crate::parser::frames::particle_is_explicit_empty(p)
-                    }
-                };
-                let has_open_content = self.type_has_effective_open_content(ct_data, def);
-                if particle_empty && !ct_data.mixed && !def.mixed && !has_open_content {
-                    // For extensions with no own particle, inherit base type's content type
-                    if matches!(ct_data.derivation_method, Some(DerivationMethod::Extension)) {
-                        if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
-                            let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
-                            return self.determine_content_type(base_data);
-                        }
-                    }
-                    ContentType::Empty
-                } else if ct_data.mixed || def.mixed {
-                    ContentType::Mixed
-                } else {
-                    ContentType::ElementOnly
-                }
-            }
-        }
-    }
-
-    /// Whether a complex type effectively has open content per §3.4.2.3
-    /// step 5 (the "wildcard element"). Used by `determine_content_type` to
-    /// distinguish a truly empty content type from one whose explicit content
-    /// type variety = empty but is widened to element-only by an open content
-    /// wildcard (own `<openContent>` or applicable `<defaultOpenContent>`).
-    /// Whether an otherwise-empty (`ComplexContentResult::Empty`) complex
-    /// type effectively gains a wildcard via the schema document's
-    /// `<defaultOpenContent>` with `appliesToEmpty="true"`. Mirrors the
-    /// `appliesToEmpty` half of `type_has_effective_open_content` for the
-    /// shorter syntax CTs that don't carry a `ComplexContentDefResult`.
-    #[cfg(feature = "xsd11")]
-    fn empty_ct_has_applicable_default_open_content(&self, ct_data: &ComplexTypeDefData) -> bool {
-        let doc = ct_data
-            .source
-            .as_ref()
-            .and_then(|s| self.schema_set.documents.get(s.defaults_doc() as usize));
-        if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
-            if default.mode == crate::schema::model::OpenContentMode::None {
-                return false;
-            }
-            return default.applies_to_empty;
-        }
-        false
-    }
-
-    #[allow(unused_variables)]
-    fn type_has_effective_open_content(
-        &self,
-        ct_data: &ComplexTypeDefData,
-        def: &crate::parser::frames::ComplexContentDefResult,
-    ) -> bool {
-        #[cfg(feature = "xsd11")]
-        {
-            use crate::parser::frames::OpenContentMode;
-            // Step 5.1: own <openContent> child with mode != none.
-            if let Some(oc) = def.open_content.as_ref() {
-                return oc.mode != OpenContentMode::None;
-            }
-            // Step 5.2: schema's <defaultOpenContent>. Applies when
-            // appliesToEmpty=true OR explicit content type variety ≠ empty.
-            // Use the same gate as compile.rs `resolve_open_content`.
-            let doc = ct_data
-                .source
-                .as_ref()
-                .and_then(|s| self.schema_set.documents.get(s.defaults_doc() as usize));
-            if let Some(default) = doc.and_then(|d| d.default_open_content.as_ref()) {
-                if default.mode == crate::schema::model::OpenContentMode::None {
-                    return false;
-                }
-                if default.applies_to_empty {
-                    return true;
-                }
-                return !ct_data.content.explicit_content_type_is_empty();
-            }
-        }
-        let _ = (ct_data, def);
-        false
     }
 
     /// Resolve an xsi:type QName string to an [`XsiTypeOutcome`].

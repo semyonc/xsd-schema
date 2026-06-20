@@ -4,6 +4,8 @@
 //! providing a common interface for advancing the content model
 //! and checking completion.
 
+use std::sync::Arc;
+
 use crate::compiler::{
     term_matches_with_substitution, ActiveStates, AllGroupModel, AllGroupState,
     ContentModelMatcher, NfaTable, NfaTerm, OpenContentMode as AllGroupOpenContentMode,
@@ -52,20 +54,86 @@ pub enum AllGroupExtPhase {
 
 /// Unified content model validation state
 ///
+/// Immutable, shareable compiled content model for one complex type.
+///
+/// Built once per type at [`SchemaValidator`](crate::validation::SchemaValidator)
+/// construction and stored in its per-type map. The heavy automaton tables are
+/// wrapped in `Arc` so that constructing a per-element [`ContentValidatorState`]
+/// only bumps reference counts and allocates the small mutable execution state
+/// (active NFA states / all-group counters) — instead of deep-cloning the whole
+/// `NfaTable` (nested `Vec`s) for every element instance.
+#[derive(Debug, Clone)]
+pub enum CompiledContentModel {
+    /// Standard NFA content model.
+    Nfa(Arc<NfaTable>),
+    /// NFA content model carrying an open-content wildcard (XSD 1.1).
+    NfaWithOpenContent {
+        nfa: Arc<NfaTable>,
+        open_content: Option<OpenContentInfo>,
+    },
+    /// All-group content model (unordered particles).
+    AllGroup(Arc<AllGroupModel>),
+    /// All-group base + NFA extension (XSD 1.1 complex type extension).
+    #[cfg(feature = "xsd11")]
+    AllGroupExtension {
+        base_model: Arc<AllGroupModel>,
+        extension_nfa: Arc<NfaTable>,
+    },
+}
+
+impl CompiledContentModel {
+    /// Wrap a freshly compiled [`ContentModelMatcher`] into the shareable form,
+    /// moving its automaton tables behind `Arc`s. Called once per complex type.
+    pub fn from_matcher(matcher: ContentModelMatcher) -> Self {
+        match matcher {
+            ContentModelMatcher::Nfa(nfa) => Self::Nfa(Arc::new(nfa)),
+            ContentModelMatcher::AllGroup(model) => Self::AllGroup(Arc::new(model)),
+            ContentModelMatcher::WithOpenContent {
+                nfa,
+                mode,
+                wildcard,
+            } => {
+                let open_content = wildcard.map(|w| OpenContentInfo {
+                    mode,
+                    namespace_constraint: w.namespace_constraint,
+                    process_contents: w.process_contents,
+                    not_qnames: w.not_qnames,
+                });
+                Self::NfaWithOpenContent {
+                    nfa: Arc::new(nfa),
+                    open_content,
+                }
+            }
+            #[cfg(feature = "xsd11")]
+            ContentModelMatcher::AllGroupExtension {
+                base_model,
+                extension_nfa,
+            } => Self::AllGroupExtension {
+                base_model: Arc::new(base_model),
+                extension_nfa: Arc::new(extension_nfa),
+            },
+        }
+    }
+}
+
 /// Wraps either an NFA-based or AllGroup-based content model into a single
 /// enum so that `SchemaValidator` can advance the content model without
 /// caring which underlying representation is in use.
+///
+/// The compiled automaton tables (`NfaTable`, `AllGroupModel`) are held behind
+/// `Arc`s shared with the per-type [`CompiledContentModel`]; only the mutable
+/// execution state (`active_states`, all-group `state`) is owned per instance.
 #[derive(Debug, Clone)]
 pub enum ContentValidatorState {
     /// NFA-based content model (sequence, choice, etc.)
     Nfa {
-        nfa: NfaTable,
+        nfa: Arc<NfaTable>,
         active_states: ActiveStates,
         open_content: Option<OpenContentInfo>,
     },
     /// All-group content model (unordered particles)
     AllGroup {
-        model: AllGroupModel,
+        model: Arc<AllGroupModel>,
         state: AllGroupState,
         /// `true` once a suffix open-content element has been matched —
         /// further declared all-group particles are no longer accepted
@@ -75,9 +143,9 @@ pub enum ContentValidatorState {
     /// All-group base + NFA extension (XSD 1.1 complex type extension).
     #[cfg(feature = "xsd11")]
     AllGroupExtension {
-        model: AllGroupModel,
+        model: Arc<AllGroupModel>,
         state: AllGroupState,
-        extension_nfa: NfaTable,
+        extension_nfa: Arc<NfaTable>,
         phase: AllGroupExtPhase,
     },
     /// Simple content (text only, no child elements)
@@ -87,53 +155,72 @@ pub enum ContentValidatorState {
 }
 
 impl ContentValidatorState {
-    /// Create a content validator state from a compiled content model matcher
-    pub fn from_matcher(matcher: ContentModelMatcher) -> Self {
-        match matcher {
-            ContentModelMatcher::Nfa(nfa) => Self::from_nfa(nfa),
-            ContentModelMatcher::AllGroup(model) => Self::from_all_group(model),
-            ContentModelMatcher::WithOpenContent {
-                nfa,
-                mode,
-                wildcard,
-            } => {
-                let oc = wildcard.map(|w| OpenContentInfo {
-                    mode,
-                    namespace_constraint: w.namespace_constraint,
-                    process_contents: w.process_contents,
-                    not_qnames: w.not_qnames,
-                });
-                let initial = ActiveStates::from_nfa(&nfa);
-                Self::Nfa {
-                    nfa,
-                    active_states: initial,
-                    open_content: oc,
+    /// Create a per-element validator state from a shared, pre-compiled model.
+    ///
+    /// This is the hot path (one call per element instance). It clones only the
+    /// `Arc` handles (reference-count bumps) plus any small open-content
+    /// metadata, and creates fresh mutable execution state (active NFA states /
+    /// all-group counters) — it never deep-clones the automaton tables.
+    pub fn from_compiled(compiled: &CompiledContentModel) -> Self {
+        match compiled {
+            CompiledContentModel::Nfa(nfa) => {
+                let active_states = ActiveStates::from_nfa(nfa);
+                ContentValidatorState::Nfa {
+                    nfa: Arc::clone(nfa),
+                    active_states,
+                    open_content: None,
+                }
+            }
+            CompiledContentModel::NfaWithOpenContent { nfa, open_content } => {
+                let active_states = ActiveStates::from_nfa(nfa);
+                ContentValidatorState::Nfa {
+                    nfa: Arc::clone(nfa),
+                    active_states,
+                    open_content: open_content.clone(),
+                }
+            }
+            CompiledContentModel::AllGroup(model) => {
+                let state = AllGroupState::new(model);
+                ContentValidatorState::AllGroup {
+                    model: Arc::clone(model),
+                    state,
+                    suffix_locked: false,
                 }
             }
             #[cfg(feature = "xsd11")]
-            ContentModelMatcher::AllGroupExtension {
+            CompiledContentModel::AllGroupExtension {
                 base_model,
                 extension_nfa,
             } => {
-                let state = base_model.create_state();
-                Self::AllGroupExtension {
-                    model: base_model,
+                let state = AllGroupState::new(base_model);
+                ContentValidatorState::AllGroupExtension {
+                    model: Arc::clone(base_model),
                     state,
-                    extension_nfa,
+                    extension_nfa: Arc::clone(extension_nfa),
                     phase: AllGroupExtPhase::AllGroup,
                 }
             }
         }
     }
 
+    /// Create a content validator state from a compiled content model matcher.
+    ///
+    /// Convenience wrapper used by tests and ad-hoc callers; wraps the matcher
+    /// in a [`CompiledContentModel`] then builds the per-element state. The
+    /// per-run validation path uses [`Self::from_compiled`] against the
+    /// pre-built per-type map instead.
+    pub fn from_matcher(matcher: ContentModelMatcher) -> Self {
+        Self::from_compiled(&CompiledContentModel::from_matcher(matcher))
+    }
+
     /// Create a content validator state from an NFA table
     ///
     /// Computes the initial epsilon closure from the start state.
     pub fn from_nfa(nfa: NfaTable) -> Self {
-        let initial = ActiveStates::from_nfa(&nfa);
+        let active_states = ActiveStates::from_nfa(&nfa);
         ContentValidatorState::Nfa {
-            nfa,
-            active_states: initial,
+            nfa: Arc::new(nfa),
+            active_states,
             open_content: None,
         }
     }
@@ -142,7 +229,7 @@ impl ContentValidatorState {
     pub fn from_all_group(model: AllGroupModel) -> Self {
         let state = model.create_state();
         ContentValidatorState::AllGroup {
-            model,
+            model: Arc::new(model),
             state,
             suffix_locked: false,
         }
@@ -1109,7 +1196,7 @@ mod tests {
         };
         let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
-            nfa,
+            nfa: nfa.into(),
             active_states: initial,
             open_content: Some(oc),
         };
@@ -1142,7 +1229,7 @@ mod tests {
         };
         let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
-            nfa,
+            nfa: nfa.into(),
             active_states: initial,
             open_content: Some(oc),
         };
@@ -1226,7 +1313,7 @@ mod tests {
         };
         let initial = ActiveStates::from_nfa(&nfa);
         let state = ContentValidatorState::Nfa {
-            nfa,
+            nfa: nfa.into(),
             active_states: initial,
             open_content: Some(oc),
         };
@@ -1526,7 +1613,7 @@ mod tests {
         };
         let initial = ActiveStates::from_nfa(&nfa);
         let mut state = ContentValidatorState::Nfa {
-            nfa,
+            nfa: nfa.into(),
             active_states: initial,
             open_content: Some(oc),
         };

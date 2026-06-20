@@ -36,7 +36,7 @@ pub use info::{
     TypeSource, ValidationAttempted, ValidationFlags,
 };
 
-pub use content::{ContentValidatorState, ElementMatchInfo};
+pub use content::{CompiledContentModel, ContentValidatorState, ElementMatchInfo};
 
 pub use context::{ElementValidationState, ValidatorState};
 
