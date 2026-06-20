@@ -191,7 +191,14 @@ fn walk_element<N, S>(
         loop {
             match nav.node_type() {
                 DomNodeType::Element => {
-                    walk_element(nav, runtime, schema_set, depth + 1, max_depth, root_validity);
+                    walk_element(
+                        nav,
+                        runtime,
+                        schema_set,
+                        depth + 1,
+                        max_depth,
+                        root_validity,
+                    );
                 }
                 DomNodeType::Text
                 | DomNodeType::Whitespace
@@ -416,15 +423,9 @@ mod tests {
             r#"<e:root xmlns:e="urn:ex"><e:leaf>v</e:leaf></e:root>"#,
         );
         // Default-namespace form exercises the default_ns snapshot path.
-        assert_parity(
-            xsd,
-            r#"<root xmlns="urn:ex"><leaf>v</leaf></root>"#,
-        );
+        assert_parity(xsd, r#"<root xmlns="urn:ex"><leaf>v</leaf></root>"#);
         // Wrong namespace → invalid in both paths.
-        assert_parity(
-            xsd,
-            r#"<root xmlns="urn:wrong"><leaf>v</leaf></root>"#,
-        );
+        assert_parity(xsd, r#"<root xmlns="urn:wrong"><leaf>v</leaf></root>"#);
     }
 
     #[test]
@@ -495,8 +496,7 @@ mod tests {
             warnings: &mut warnings,
         };
         let mut runtime = validator.start_run(sink);
-        let outcome =
-            drive_buffer_document(&doc, &mut runtime, &schema_set).expect("buffer drive");
+        let outcome = drive_buffer_document(&doc, &mut runtime, &schema_set).expect("buffer drive");
         let mut be: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
         be.sort();
 

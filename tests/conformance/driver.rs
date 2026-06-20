@@ -1027,8 +1027,7 @@ impl TestRunner {
             (ExpectedOutcome::Valid, Some(e)) => {
                 // Auto-skip mistagged XSD-1.1-only schemas tested in 1.0 mode.
                 // Mirrors the same skip on instance tests at line 1063.
-                if test.version == "1.0"
-                    && e.contains("requires XSD 1.1 but schema is in XSD 1.0")
+                if test.version == "1.0" && e.contains("requires XSD 1.1 but schema is in XSD 1.0")
                 {
                     (
                         TestOutcome::Skip,
@@ -1382,7 +1381,9 @@ fn validate_instance_pass(
         }
     }
 
-    let mut handler = DriverHandler { root_validity: None };
+    let mut handler = DriverHandler {
+        root_validity: None,
+    };
     drive_quick_xml_with(content, &mut runtime, schema_set, &mut handler).map_err(|e| match e {
         DriveWithError::Parse(e) => format!("XML parse error: {}", e),
         DriveWithError::Utf8(e) => format!("UTF-8 error: {}", e),

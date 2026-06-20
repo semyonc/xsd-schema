@@ -129,9 +129,7 @@ impl EnrichmentOutcome {
     /// Returns `true` when no hints were provided — enrichment was a
     /// no-op rather than a failure.
     pub fn is_no_op(&self) -> bool {
-        self.schema_set.is_none()
-            && self.hint_errors.is_empty()
-            && self.compile_error.is_none()
+        self.schema_set.is_none() && self.hint_errors.is_empty() && self.compile_error.is_none()
     }
 
     /// Returns the enriched [`SchemaSet`] if available, otherwise the
@@ -202,7 +200,6 @@ pub fn enrich_schema_set(
         },
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -403,9 +400,7 @@ mod tests {
             location: "nonexistent_42.xsd".to_string(),
             base_uri: String::new(),
         }];
-        let enriched = enrich_schema_set(original, &hints, &[])
-            .schema_set
-            .unwrap();
+        let enriched = enrich_schema_set(original, &hints, &[]).schema_set.unwrap();
         assert_eq!(
             enriched.xsd_version,
             crate::schema::model::XsdVersion::V1_1,

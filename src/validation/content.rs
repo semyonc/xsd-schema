@@ -183,7 +183,7 @@ impl ContentValidatorState {
                 };
 
                 let next = match xsd_version {
-                    XsdVersion::V1_0 => active_states.clone().advance(
+                    XsdVersion::V1_0 => active_states.advance_from(
                         nfa,
                         name,
                         namespace,
@@ -191,7 +191,7 @@ impl ContentValidatorState {
                         subst_groups,
                         xsd_version,
                     ),
-                    XsdVersion::V1_1 => active_states.clone().advance_with_priority(
+                    XsdVersion::V1_1 => active_states.advance_with_priority_from(
                         nfa,
                         name,
                         namespace,
@@ -456,7 +456,7 @@ impl ContentValidatorState {
                             resolved_type: mi.resolved_type,
                             process_contents: mi.process_contents,
                         };
-                        let next = active_states.clone().advance_with_priority(
+                        let next = active_states.advance_with_priority_from(
                             extension_nfa,
                             name,
                             namespace,
@@ -570,7 +570,7 @@ impl ContentValidatorState {
                 open_content,
             } => {
                 let next = match xsd_version {
-                    XsdVersion::V1_0 => active_states.clone().advance(
+                    XsdVersion::V1_0 => active_states.advance_from(
                         nfa,
                         name,
                         namespace,
@@ -578,7 +578,7 @@ impl ContentValidatorState {
                         subst_groups,
                         xsd_version,
                     ),
-                    XsdVersion::V1_1 => active_states.clone().advance_with_priority(
+                    XsdVersion::V1_1 => active_states.advance_with_priority_from(
                         nfa,
                         name,
                         namespace,
@@ -719,7 +719,7 @@ impl ContentValidatorState {
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA lookahead
-                        let next = active_states.clone().advance_with_priority(
+                        let next = active_states.advance_with_priority_from(
                             extension_nfa,
                             name,
                             namespace,

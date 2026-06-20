@@ -791,9 +791,10 @@ fn namespace_already_covered(schema_set: &SchemaSet, namespace: Option<&str>) ->
     let Some(ns_id) = schema_set.name_table.get(ns_str) else {
         return false;
     };
-    schema_set.documents.iter().any(|d| {
-        d.declared_target_namespace == Some(ns_id) || d.target_namespace == Some(ns_id)
-    })
+    schema_set
+        .documents
+        .iter()
+        .any(|d| d.declared_target_namespace == Some(ns_id) || d.target_namespace == Some(ns_id))
 }
 
 fn validate_import_target_namespace(

@@ -1072,8 +1072,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ) {
                         XsiTypeOutcome::Applied(type_key) => {
                             let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
-                            let mut ev_state =
-                                ElementValidationState::new(local_name, namespace);
+                            let mut ev_state = ElementValidationState::new(local_name, namespace);
                             ev_state.ns_context = Some(ns_context.clone());
                             let (content_state, content_type) =
                                 self.init_content_model(Some(type_key));
@@ -1086,9 +1085,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             ev_state.process_contents = ContentProcessing::Strict;
                             ev_state.strictly_assessed = true;
                             self.push_element(ev_state);
-                            self.advance_constraints_start_element(
-                                local_name, namespace, None,
-                            );
+                            self.advance_constraints_start_element(local_name, namespace, None);
                             #[cfg(feature = "xsd11")]
                             self.detect_assertions_on_element(
                                 Some(type_key),
@@ -1123,12 +1120,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // Emit the deferred xsi:type diagnostic in
                             // addition, after push so attribution lands on
                             // the child.
-                            let mut ev_state =
-                                ElementValidationState::new(local_name, namespace);
+                            let mut ev_state = ElementValidationState::new(local_name, namespace);
                             ev_state.ns_context = Some(ns_context.clone());
                             ev_state.validity = SchemaValidity::Invalid;
-                            let (content_state, content_type) =
-                                self.lax_assessment_content_model();
+                            let (content_state, content_type) = self.lax_assessment_content_model();
                             ev_state.content_state = content_state;
                             ev_state.content_type = Some(content_type);
                             self.push_element(ev_state);
@@ -1139,9 +1134,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 format!("Element '{}' is not declared", elem_name),
                             );
                             self.emit_deferred_xsi_type_errors(deferred);
-                            self.advance_constraints_start_element(
-                                local_name, namespace, None,
-                            );
+                            self.advance_constraints_start_element(local_name, namespace, None);
                             #[cfg(feature = "xsd11")]
                             self.detect_assertions_on_element(None, local_name, namespace);
                             return SchemaInfo::invalid();
@@ -1400,10 +1393,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // 10. Return SchemaInfo
         #[allow(unused_mut)]
-        let mut validity = if xsi_type_invalid
-            || abstract_type_invalid
-            || has_deferred_type_error
-        {
+        let mut validity = if xsi_type_invalid || abstract_type_invalid || has_deferred_type_error {
             SchemaValidity::Invalid
         } else {
             SchemaValidity::Valid
@@ -2338,14 +2328,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // values — list-of-QName tokens are handled
                         // elsewhere and may legitimately use any prefix
                         // syntax in the joined text.
-                        let needs_qname_check =
-                            ev_state.typed_value.as_ref().is_some_and(|v| {
-                                matches!(
-                                    v.value,
-                                    crate::types::value::XmlValueKind::Atomic(_)
-                                ) && (v.type_code == XmlTypeCode::QName
+                        let needs_qname_check = ev_state.typed_value.as_ref().is_some_and(|v| {
+                            matches!(v.value, crate::types::value::XmlValueKind::Atomic(_))
+                                && (v.type_code == XmlTypeCode::QName
                                     || v.type_code == XmlTypeCode::Notation)
-                            });
+                        });
                         if needs_qname_check && ev_state.validity == SchemaValidity::Valid {
                             if let Some(ctx) = ev_state.ns_context.as_ref() {
                                 let raw = ev_state.text_content.trim();

@@ -71,7 +71,13 @@ pub(crate) fn check_namespace_visible(
     source: Option<&SourceRef>,
     kind_label: &str,
 ) -> SchemaResult<()> {
-    check_namespace_visible_ns(schema_set, qname.namespace, qname.local_name, source, kind_label)
+    check_namespace_visible_ns(
+        schema_set,
+        qname.namespace,
+        qname.local_name,
+        source,
+        kind_label,
+    )
 }
 
 /// Reference resolver for QName → component ID resolution
@@ -141,7 +147,9 @@ impl<'a> ReferenceResolver<'a> {
             return Ok(Some(type_key));
         }
         check_namespace_visible(self.schema_set, qname, source, "Type")?;
-        Ok(self.schema_set.lookup_type(qname.namespace, qname.local_name))
+        Ok(self
+            .schema_set
+            .lookup_type(qname.namespace, qname.local_name))
     }
 
     /// Lookup-only variant of [`resolve_element_ref`]: returns `Ok(None)` for
@@ -937,11 +945,7 @@ fn resolve_element_references(
 /// the `SimpleType` arena first and falling back to `ComplexType`. `label`
 /// is the human-facing kind ("Type", "List item type") prepended to the
 /// QName.
-fn format_type_not_found_message(
-    schema_set: &SchemaSet,
-    qname: &QNameRef,
-    label: &str,
-) -> String {
+fn format_type_not_found_message(schema_set: &SchemaSet, qname: &QNameRef, label: &str) -> String {
     let name_str = format_resolved_qname(&schema_set.name_table, qname.namespace, qname.local_name);
     let simple_note = schema_set.format_provenance_note(
         ComponentKind::SimpleType,

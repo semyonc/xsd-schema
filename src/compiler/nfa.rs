@@ -946,7 +946,7 @@ fn hybrid_epsilon_closure(
 ///   per reachable state, converging epsilon closure in O(states) instead of O(N).
 /// - `Hybrid`: multiple counters, one ranged (fast-forward) + others scalar.
 ///   Collapses the ranged counter's dimension; cost proportional to remaining scalar dims.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveStates {
     /// Fast path: no counters in this NFA (bit-identical to old code)
     Simple(HashSet<StateId>),
@@ -972,6 +972,297 @@ pub enum ActiveStates {
 }
 
 impl ActiveStates {
+    /// Borrowed transition helper used by content validation hot paths to
+    /// compute the next frontier without cloning the current one first.
+    pub(crate) fn advance_from(
+        &self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
+    ) -> Self {
+        match self {
+            ActiveStates::Simple(states) => ActiveStates::Simple(advance_states(
+                nfa,
+                states.iter().copied(),
+                element_name,
+                element_namespace,
+                target_namespace,
+                substitution_groups,
+                xsd_version,
+            )),
+            ActiveStates::Counted {
+                configs,
+                num_counters,
+            } => {
+                let mut next_configs = HashSet::new();
+                for config in configs {
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        next_configs.insert(config.with_state(trans.target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = ActiveStates::Counted {
+                    configs: next_configs,
+                    num_counters: *num_counters,
+                };
+                result.epsilon_closure(nfa)
+            }
+            ActiveStates::RangedSingle {
+                state_ranges,
+                counter_def,
+            } => {
+                let mut next_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+                for (&state_id, &range) in state_ranges {
+                    if let Some(state) = nfa.get_state(state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        next_seeds
+                                            .entry(trans.target)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = ActiveStates::RangedSingle {
+                    state_ranges: next_seeds,
+                    counter_def: *counter_def,
+                };
+                result.epsilon_closure(nfa)
+            }
+            ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            } => {
+                let mut next_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
+                for (key, &range) in configs {
+                    if let Some(state) = nfa.get_state(key.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        let new_key = key.with_state(trans.target);
+                                        next_configs
+                                            .entry(new_key)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                let result = ActiveStates::Hybrid {
+                    configs: next_configs,
+                    ranged_counter_idx: *ranged_counter_idx,
+                    num_counters: *num_counters,
+                };
+                result.epsilon_closure(nfa)
+            }
+        }
+    }
+
+    /// Borrowed priority transition helper used by content validation hot
+    /// paths to avoid cloning the current frontier before matching.
+    pub(crate) fn advance_with_priority_from(
+        &self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
+    ) -> Self {
+        match self {
+            ActiveStates::Simple(states) => ActiveStates::Simple(advance_with_priority(
+                nfa,
+                states.iter().copied(),
+                element_name,
+                element_namespace,
+                target_namespace,
+                substitution_groups,
+                xsd_version,
+            )),
+            ActiveStates::Counted {
+                configs,
+                num_counters,
+            } => {
+                let mut element_configs = HashSet::new();
+                let mut wildcard_configs = HashSet::new();
+
+                for config in configs {
+                    if let Some(state) = nfa.get_state(config.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                let target_set = match term_val {
+                                    NfaTerm::Element { .. } => &mut element_configs,
+                                    NfaTerm::Wildcard { .. } => &mut wildcard_configs,
+                                };
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        target_set.insert(config.with_state(trans.target));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next = if !element_configs.is_empty() {
+                    element_configs
+                } else {
+                    wildcard_configs
+                };
+
+                let result = ActiveStates::Counted {
+                    configs: next,
+                    num_counters: *num_counters,
+                };
+                result.epsilon_closure(nfa)
+            }
+            ActiveStates::RangedSingle {
+                state_ranges,
+                counter_def,
+            } => {
+                let mut element_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+                let mut wildcard_seeds: HashMap<StateId, CounterRange> = HashMap::new();
+
+                for (&state_id, &range) in state_ranges {
+                    if let Some(state) = nfa.get_state(state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                let target_map = match term_val {
+                                    NfaTerm::Element { .. } => &mut element_seeds,
+                                    NfaTerm::Wildcard { .. } => &mut wildcard_seeds,
+                                };
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        target_map
+                                            .entry(trans.target)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next = if !element_seeds.is_empty() {
+                    element_seeds
+                } else {
+                    wildcard_seeds
+                };
+
+                let result = ActiveStates::RangedSingle {
+                    state_ranges: next,
+                    counter_def: *counter_def,
+                };
+                result.epsilon_closure(nfa)
+            }
+            ActiveStates::Hybrid {
+                configs,
+                ranged_counter_idx,
+                num_counters,
+            } => {
+                let mut element_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
+                let mut wildcard_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
+
+                for (key, &range) in configs {
+                    if let Some(state) = nfa.get_state(key.state_id) {
+                        if let Some(ref term_val) = state.term {
+                            if term_matches(
+                                term_val,
+                                element_name,
+                                element_namespace,
+                                target_namespace,
+                                substitution_groups,
+                                xsd_version,
+                            ) {
+                                let target_map = match term_val {
+                                    NfaTerm::Element { .. } => &mut element_configs,
+                                    NfaTerm::Wildcard { .. } => &mut wildcard_configs,
+                                };
+                                for trans in &state.transitions {
+                                    if trans.kind == TransitionKind::Consume {
+                                        let new_key = key.with_state(trans.target);
+                                        target_map
+                                            .entry(new_key)
+                                            .and_modify(|r| *r = r.union(range))
+                                            .or_insert(range);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let next = if !element_configs.is_empty() {
+                    element_configs
+                } else {
+                    wildcard_configs
+                };
+
+                let result = ActiveStates::Hybrid {
+                    configs: next,
+                    ranged_counter_idx: *ranged_counter_idx,
+                    num_counters: *num_counters,
+                };
+                result.epsilon_closure(nfa)
+            }
+        }
+    }
+
     /// Create initial active states from an NFA, picking the right variant.
     pub fn from_nfa(nfa: &NfaTable) -> Self {
         use super::particle::COUNTED_THRESHOLD;
@@ -1244,121 +1535,14 @@ impl ActiveStates {
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
     ) -> Self {
-        match self {
-            ActiveStates::Simple(states) => ActiveStates::Simple(advance_states(
-                nfa,
-                states,
-                element_name,
-                element_namespace,
-                target_namespace,
-                substitution_groups,
-                xsd_version,
-            )),
-            ActiveStates::Counted {
-                configs,
-                num_counters,
-            } => {
-                // Configs are already closure-closed (invariant).
-                // Find matching terms and follow Consume transitions.
-                let mut next_configs = HashSet::new();
-                for config in &configs {
-                    if let Some(state) = nfa.get_state(config.state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        next_configs.insert(config.with_state(trans.target));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let result = ActiveStates::Counted {
-                    configs: next_configs,
-                    num_counters,
-                };
-                result.epsilon_closure(nfa)
-            }
-            ActiveStates::RangedSingle {
-                state_ranges,
-                counter_def,
-            } => {
-                let mut next_seeds: HashMap<StateId, CounterRange> = HashMap::new();
-                for (&state_id, &range) in &state_ranges {
-                    if let Some(state) = nfa.get_state(state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        next_seeds
-                                            .entry(trans.target)
-                                            .and_modify(|r| *r = r.union(range))
-                                            .or_insert(range);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let result = ActiveStates::RangedSingle {
-                    state_ranges: next_seeds,
-                    counter_def,
-                };
-                result.epsilon_closure(nfa)
-            }
-            ActiveStates::Hybrid {
-                configs,
-                ranged_counter_idx,
-                num_counters,
-            } => {
-                let mut next_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
-                for (key, &range) in &configs {
-                    if let Some(state) = nfa.get_state(key.state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        let new_key = key.with_state(trans.target);
-                                        next_configs
-                                            .entry(new_key)
-                                            .and_modify(|r| *r = r.union(range))
-                                            .or_insert(range);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                let result = ActiveStates::Hybrid {
-                    configs: next_configs,
-                    ranged_counter_idx,
-                    num_counters,
-                };
-                result.epsilon_closure(nfa)
-            }
-        }
+        self.advance_from(
+            nfa,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+            xsd_version,
+        )
     }
 
     /// Advance NFA states with element-over-wildcard priority (XSD 1.1).
@@ -1371,158 +1555,14 @@ impl ActiveStates {
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
     ) -> Self {
-        match self {
-            ActiveStates::Simple(states) => ActiveStates::Simple(advance_with_priority(
-                nfa,
-                states,
-                element_name,
-                element_namespace,
-                target_namespace,
-                substitution_groups,
-                xsd_version,
-            )),
-            ActiveStates::Counted {
-                configs,
-                num_counters,
-            } => {
-                let mut element_configs = HashSet::new();
-                let mut wildcard_configs = HashSet::new();
-
-                for config in &configs {
-                    if let Some(state) = nfa.get_state(config.state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                let target_set = match term_val {
-                                    NfaTerm::Element { .. } => &mut element_configs,
-                                    NfaTerm::Wildcard { .. } => &mut wildcard_configs,
-                                };
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        target_set.insert(config.with_state(trans.target));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let next = if !element_configs.is_empty() {
-                    element_configs
-                } else {
-                    wildcard_configs
-                };
-
-                let result = ActiveStates::Counted {
-                    configs: next,
-                    num_counters,
-                };
-                result.epsilon_closure(nfa)
-            }
-            ActiveStates::RangedSingle {
-                state_ranges,
-                counter_def,
-            } => {
-                let mut element_seeds: HashMap<StateId, CounterRange> = HashMap::new();
-                let mut wildcard_seeds: HashMap<StateId, CounterRange> = HashMap::new();
-
-                for (&state_id, &range) in &state_ranges {
-                    if let Some(state) = nfa.get_state(state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                let target_map = match term_val {
-                                    NfaTerm::Element { .. } => &mut element_seeds,
-                                    NfaTerm::Wildcard { .. } => &mut wildcard_seeds,
-                                };
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        target_map
-                                            .entry(trans.target)
-                                            .and_modify(|r| *r = r.union(range))
-                                            .or_insert(range);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let next = if !element_seeds.is_empty() {
-                    element_seeds
-                } else {
-                    wildcard_seeds
-                };
-
-                let result = ActiveStates::RangedSingle {
-                    state_ranges: next,
-                    counter_def,
-                };
-                result.epsilon_closure(nfa)
-            }
-            ActiveStates::Hybrid {
-                configs,
-                ranged_counter_idx,
-                num_counters,
-            } => {
-                let mut element_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
-                let mut wildcard_configs: HashMap<HybridKey, CounterRange> = HashMap::new();
-
-                for (key, &range) in &configs {
-                    if let Some(state) = nfa.get_state(key.state_id) {
-                        if let Some(ref term_val) = state.term {
-                            if term_matches(
-                                term_val,
-                                element_name,
-                                element_namespace,
-                                target_namespace,
-                                substitution_groups,
-                                xsd_version,
-                            ) {
-                                let target_map = match term_val {
-                                    NfaTerm::Element { .. } => &mut element_configs,
-                                    NfaTerm::Wildcard { .. } => &mut wildcard_configs,
-                                };
-                                for trans in &state.transitions {
-                                    if trans.kind == TransitionKind::Consume {
-                                        let new_key = key.with_state(trans.target);
-                                        target_map
-                                            .entry(new_key)
-                                            .and_modify(|r| *r = r.union(range))
-                                            .or_insert(range);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let next = if !element_configs.is_empty() {
-                    element_configs
-                } else {
-                    wildcard_configs
-                };
-
-                let result = ActiveStates::Hybrid {
-                    configs: next,
-                    ranged_counter_idx,
-                    num_counters,
-                };
-                result.epsilon_closure(nfa)
-            }
-        }
+        self.advance_with_priority_from(
+            nfa,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+            xsd_version,
+        )
     }
 
     /// Find the matching term info from active states (for content validation).
@@ -1908,6 +1948,57 @@ mod tests {
 
         let next = advance_with_priority(&nfa, [0], NameId(2), None, None, None, XsdVersion::V1_1);
         assert_eq!(next, make_set(&[4]));
+    }
+
+    #[test]
+    fn test_borrowed_advance_matches_owned() {
+        let simple_nfa = make_priority_nfa();
+        let simple = ActiveStates::from_nfa(&simple_nfa);
+        assert_eq!(
+            simple.advance_from(&simple_nfa, NameId(1), None, None, None, XsdVersion::V1_0),
+            simple
+                .clone()
+                .advance(&simple_nfa, NameId(1), None, None, None, XsdVersion::V1_0)
+        );
+        assert_eq!(
+            simple.advance_with_priority_from(
+                &simple_nfa,
+                NameId(1),
+                None,
+                None,
+                None,
+                XsdVersion::V1_1,
+            ),
+            simple.clone().advance_with_priority(
+                &simple_nfa,
+                NameId(1),
+                None,
+                None,
+                None,
+                XsdVersion::V1_1,
+            )
+        );
+
+        let (counted_nfa, counted_name) = make_counted_element_nfa(3, 5);
+        let counted = ActiveStates::from_nfa(&counted_nfa);
+        assert_eq!(
+            counted.advance_from(
+                &counted_nfa,
+                counted_name,
+                None,
+                None,
+                None,
+                XsdVersion::V1_0,
+            ),
+            counted.clone().advance(
+                &counted_nfa,
+                counted_name,
+                None,
+                None,
+                None,
+                XsdVersion::V1_0,
+            )
+        );
     }
 
     #[test]

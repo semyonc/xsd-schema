@@ -332,17 +332,23 @@ fn check_xsd10_plus_inf(val: &XmlValue, raw: &str) -> Result<(), ValidationError
     use crate::types::value::XmlAtomicValue;
     let is_float_or_double = matches!(
         val.value,
-        XmlValueKind::Atomic(XmlAtomicValue::Float(_)) | XmlValueKind::Atomic(XmlAtomicValue::Double(_))
+        XmlValueKind::Atomic(XmlAtomicValue::Float(_))
+            | XmlValueKind::Atomic(XmlAtomicValue::Double(_))
     );
     if !is_float_or_double {
         return Ok(());
     }
-    let collapsed =
-        crate::types::facets::normalize_whitespace(raw, crate::types::facets::WhitespaceMode::Collapse);
+    let collapsed = crate::types::facets::normalize_whitespace(
+        raw,
+        crate::types::facets::WhitespaceMode::Collapse,
+    );
     if collapsed == "+INF" {
         Err(errors::error(
             "cvc-datatype-valid",
-            format!("'+INF' is not a valid XSD 1.0 float/double lexical form (value '{}')", raw),
+            format!(
+                "'+INF' is not a valid XSD 1.0 float/double lexical form (value '{}')",
+                raw
+            ),
             None,
         ))
     } else {
@@ -398,11 +404,7 @@ fn validate_list_type(
         Some(tk) => tk,
         None => {
             if let Some(deferred) = &st_data.deferred_item_type_error {
-                return Err(errors::error(
-                    "src-resolve",
-                    deferred.message.clone(),
-                    None,
-                ));
+                return Err(errors::error("src-resolve", deferred.message.clone(), None));
             }
             // No item type resolved — cannot validate list items, accept as untyped
             return Ok(SimpleTypeResult {

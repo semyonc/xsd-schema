@@ -139,12 +139,9 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
     }
 
     fn before_attribute(&mut self, view: AttributeView<'_>) -> Result<(), Self::Error> {
-        let attr_ref = self.builder.attribute(
-            view.local_name,
-            view.namespace_uri,
-            view.prefix,
-            view.value,
-        )?;
+        let attr_ref =
+            self.builder
+                .attribute(view.local_name, view.namespace_uri, view.prefix, view.value)?;
         self.current_attr_ref = Some(attr_ref);
         Ok(())
     }
@@ -265,11 +262,7 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         Ok(())
     }
 
-    fn on_processing_instruction(
-        &mut self,
-        target: &str,
-        data: &str,
-    ) -> Result<(), Self::Error> {
+    fn on_processing_instruction(&mut self, target: &str, data: &str) -> Result<(), Self::Error> {
         self.builder.processing_instruction(target, data)?;
         Ok(())
     }
@@ -300,20 +293,17 @@ pub fn build_typed_document<'a, R: BufRead>(
 
     {
         let mut handler = TypedBuilderHandler::new(&mut builder);
-        drive_quick_xml_with(reader, &mut runtime, schema_set, &mut handler).map_err(|e| {
-            match e {
+        drive_quick_xml_with(reader, &mut runtime, schema_set, &mut handler).map_err(
+            |e| match e {
                 DriveWithError::Parse(e) => BufferDocumentError::Parse(e),
                 DriveWithError::Utf8(e) => BufferDocumentError::Utf8(e),
                 DriveWithError::UnboundPrefix(p) => BufferDocumentError::UnboundPrefix(p),
-                DriveWithError::UnexpectedEof { depth } => {
-                    BufferDocumentError::InternalError(format!(
-                        "unexpected EOF: {} element(s) still open",
-                        depth
-                    ))
-                }
+                DriveWithError::UnexpectedEof { depth } => BufferDocumentError::InternalError(
+                    format!("unexpected EOF: {} element(s) still open", depth),
+                ),
                 DriveWithError::Hook(e) => e,
-            }
-        })?;
+            },
+        )?;
     }
 
     let _ = runtime.end_validation();

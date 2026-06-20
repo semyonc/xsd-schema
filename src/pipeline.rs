@@ -700,7 +700,7 @@ fn check_no_nested_all_group(
     schema_set: &SchemaSet,
     visited: &mut std::collections::HashSet<crate::ids::ModelGroupKey>,
 ) -> SchemaResult<()> {
-    use crate::parser::frames::{Compositor, ParticleTerm, ParticleResult, ModelGroupDefResult};
+    use crate::parser::frames::{Compositor, ModelGroupDefResult, ParticleResult, ParticleTerm};
 
     fn placement_location(
         particle: &ParticleResult,

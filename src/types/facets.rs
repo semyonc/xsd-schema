@@ -1994,10 +1994,20 @@ mod tests {
     fn test_facet_set_patterns() {
         let mut facets = FacetSet::new();
         facets
-            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+            .add_pattern(
+                "[a-z]+".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
             .unwrap();
         facets
-            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+            .add_pattern(
+                "[0-9]+".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
             .unwrap();
 
         // Two adds within one FacetSet share the same derivation step (OR'd).
@@ -2022,8 +2032,13 @@ mod tests {
         let mut base = FacetSet::new();
         base.set_min_length(5, FacetFixed::Fixed, None);
         base.set_max_length(100, FacetFixed::Default, None);
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
-            .unwrap();
+        base.add_pattern(
+            "[a-z]+".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
 
         let mut derived = FacetSet::new();
         derived.set_max_length(50, FacetFixed::Default, None); // Override
@@ -2096,9 +2111,13 @@ mod tests {
 
     #[test]
     fn test_pattern_matching() {
-        let pattern =
-            PatternFacet::new("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
-                .unwrap();
+        let pattern = PatternFacet::new(
+            "[a-z]+".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
         assert!(pattern.matches("hello"));
         assert!(!pattern.matches("HELLO"));
         assert!(!pattern.matches("hello123"));
@@ -2107,9 +2126,13 @@ mod tests {
     #[test]
     fn test_pattern_xsd_anchoring() {
         // XSD patterns are implicitly anchored
-        let pattern =
-            PatternFacet::new("abc".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
-                .unwrap();
+        let pattern = PatternFacet::new(
+            "abc".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
         assert!(pattern.matches("abc"));
         assert!(!pattern.matches("xabc"));
         assert!(!pattern.matches("abcx"));
@@ -2118,9 +2141,13 @@ mod tests {
     #[test]
     fn test_pattern_xsd_name_chars() {
         // Test \i (initial name char) and \c (name char)
-        let pattern =
-            PatternFacet::new(r"\i\c*".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
-                .unwrap();
+        let pattern = PatternFacet::new(
+            r"\i\c*".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
         assert!(pattern.matches("foo"));
         assert!(pattern.matches("_bar"));
         assert!(pattern.matches("x123"));
@@ -2129,8 +2156,12 @@ mod tests {
 
     #[test]
     fn test_invalid_pattern() {
-        let result =
-            PatternFacet::new("[invalid".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict);
+        let result = PatternFacet::new(
+            "[invalid".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        );
         assert!(result.is_err());
     }
 
@@ -2191,7 +2222,12 @@ mod tests {
     fn test_validate_string_pattern() {
         let mut facets = FacetSet::new();
         facets
-            .add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+            .add_pattern(
+                "[a-z]+".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
             .unwrap();
 
         assert!(facets.validate_string("hello").is_ok());
@@ -2382,12 +2418,22 @@ mod tests {
     #[test]
     fn test_merge_with_base_patterns_cumulative() {
         let mut base = FacetSet::new();
-        base.add_pattern("[a-z]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
-            .unwrap();
+        base.add_pattern(
+            "[a-z]+".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
 
         let mut derived = FacetSet::new();
         derived
-            .add_pattern("[0-9]+".to_string(), None, XsdVersion::V1_1, RegexCompat::Strict)
+            .add_pattern(
+                "[0-9]+".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
             .unwrap();
 
         let merged = derived.merge_with_base(&base).unwrap();

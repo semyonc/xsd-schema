@@ -1191,7 +1191,8 @@ fn compile_top_level_all_group_ref_matcher(
     if let (Some(original_key), Some(name)) = (group_data.redefine_original, group_data.name) {
         ctx.redefine_redirect = Some((name, group_data.target_namespace, original_key));
     }
-    let mut model = ctx.compile_all_group_model(&group_data.particles, group_data.source.as_ref())?;
+    let mut model =
+        ctx.compile_all_group_model(&group_data.particles, group_data.source.as_ref())?;
     if particle.min_occurs == 0 {
         model.outer_optional = true;
     }

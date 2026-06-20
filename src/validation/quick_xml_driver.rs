@@ -222,11 +222,7 @@ pub trait ValidationEventHandler {
         Ok(())
     }
 
-    fn on_processing_instruction(
-        &mut self,
-        _target: &str,
-        _data: &str,
-    ) -> Result<(), Self::Error> {
+    fn on_processing_instruction(&mut self, _target: &str, _data: &str) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -284,16 +280,15 @@ where
     S: ValidationSink,
 {
     let mut handler = NoopHandler;
-    let outcome =
-        drive_quick_xml_with_in(reader, runtime, schema_set, &mut handler, buf).map_err(
-            |e| match e {
-                DriveWithError::Parse(e) => DriveError::Parse(e),
-                DriveWithError::Utf8(e) => DriveError::Utf8(e),
-                DriveWithError::UnboundPrefix(p) => DriveError::UnboundPrefix(p),
-                DriveWithError::UnexpectedEof { depth } => DriveError::UnexpectedEof { depth },
-                DriveWithError::Hook(_) => unreachable!("NoopHandler is infallible"),
-            },
-        )?;
+    let outcome = drive_quick_xml_with_in(reader, runtime, schema_set, &mut handler, buf).map_err(
+        |e| match e {
+            DriveWithError::Parse(e) => DriveError::Parse(e),
+            DriveWithError::Utf8(e) => DriveError::Utf8(e),
+            DriveWithError::UnboundPrefix(p) => DriveError::UnboundPrefix(p),
+            DriveWithError::UnexpectedEof { depth } => DriveError::UnexpectedEof { depth },
+            DriveWithError::Hook(_) => unreachable!("NoopHandler is infallible"),
+        },
+    )?;
     runtime.end_validation().map_err(DriveError::Validation)?;
     Ok(outcome)
 }
@@ -344,7 +339,10 @@ where
         .or_default()
         .push(XML_NAMESPACE.to_string());
     // Default-namespace seed; explicit declarations overwrite the top-of-stack.
-    prefix_map.entry(Vec::new()).or_default().push(String::new());
+    prefix_map
+        .entry(Vec::new())
+        .or_default()
+        .push(String::new());
 
     // Per-element list of prefixes that need popping at end-of-element.
     let mut scope_stack: Vec<Vec<Vec<u8>>> = Vec::new();
@@ -570,17 +568,12 @@ where
         let attr_ns = if prefix_bytes.is_empty() {
             String::new()
         } else {
-            match prefix_map
-                .get(prefix_bytes)
-                .and_then(|stack| stack.last())
-            {
+            match prefix_map.get(prefix_bytes).and_then(|stack| stack.last()) {
                 Some(uri) => uri.clone(),
                 None => return Err(DriveWithError::UnboundPrefix(attr_prefix.to_string())),
             }
         };
-        let value = attr
-            .unescape_value()
-            .map_err(DriveWithError::Parse)?;
+        let value = attr.unescape_value().map_err(DriveWithError::Parse)?;
 
         let av = AttributeView {
             local_name: attr_local,
@@ -804,8 +797,7 @@ mod tests {
 
     fn load_schema(xsd: &str) -> SchemaSet {
         let mut ss = SchemaSet::new();
-        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut ss, None)
-            .expect("schema parse");
+        load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut ss, None).expect("schema parse");
         ss
     }
 
@@ -819,8 +811,8 @@ mod tests {
             warnings: &mut warnings,
         };
         let mut runtime = validator.start_run(sink);
-        let outcome = drive_quick_xml(instance.as_bytes(), &mut runtime, &schema_set)
-            .expect("drive failed");
+        let outcome =
+            drive_quick_xml(instance.as_bytes(), &mut runtime, &schema_set).expect("drive failed");
         (outcome, errors.iter().map(|e| e.to_string()).collect())
     }
 
@@ -983,7 +975,10 @@ mod tests {
         )
         .expect("drive ok");
         assert_eq!(handler.comments, vec![" hi ".to_string()]);
-        assert_eq!(handler.pis, vec![("pi".to_string(), "target data".to_string())]);
+        assert_eq!(
+            handler.pis,
+            vec![("pi".to_string(), "target data".to_string())]
+        );
     }
 
     #[test]
