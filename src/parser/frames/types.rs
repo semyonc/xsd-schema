@@ -987,10 +987,10 @@ pub struct SimpleContentFrame {
     annotation: Option<Annotation>,
     source: Option<SourceRef>,
     foreign_attributes: Vec<ForeignAttribute>,
-    /// `true` after a <restriction> or <extension> child has been seen.
+    /// `true` after a `<restriction>` or `<extension>` child has been seen.
     /// The XSD schema-for-schemas content model `(annotation?, (restriction |
     /// extension))` forbids any further children — including a trailing
-    /// <annotation> — so we reject them via `allows`.
+    /// `<annotation>` — so we reject them via `allows`.
     derivation_seen: bool,
 }
 

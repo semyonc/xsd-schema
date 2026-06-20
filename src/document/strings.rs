@@ -38,7 +38,7 @@ impl<'a> StringStore<'a> {
 
     /// Stores a string and returns its 1-based index.
     ///
-    /// Strings up to [`SHORT_THRESHOLD`] bytes are copied into the arena;
+    /// Strings up to `SHORT_THRESHOLD` bytes are copied into the arena;
     /// longer strings are heap-allocated.
     pub fn store(&mut self, s: &str) -> u32 {
         let val = if s.len() <= SHORT_THRESHOLD {

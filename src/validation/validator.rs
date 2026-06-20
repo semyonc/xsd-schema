@@ -137,7 +137,7 @@ impl<'a> SchemaValidator<'a> {
     ///
     /// `PROCESS_ASSERTIONS` is silently stripped from `flags` because the
     /// default mode is `Disabled`, and the two must agree. Use
-    /// [`Self::new_fragment_buffer()`] or [`Self::new_main_document()`] to
+    /// `new_fragment_buffer()` or `new_main_document()` (XSD 1.1) to
     /// enable assertion processing.
     pub fn new(schema_set: &'a SchemaSet, flags: ValidationFlags) -> Self {
         #[cfg(feature = "xsd11")]

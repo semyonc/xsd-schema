@@ -131,7 +131,7 @@ impl<'a> ReferenceResolver<'a> {
         ))
     }
 
-    /// Lookup-only variant of [`resolve_type_ref`]: returns `Ok(None)` when
+    /// Lookup-only variant of [`Self::resolve_type_ref`]: returns `Ok(None)` when
     /// the QName resolves to no component, while still propagating
     /// namespace-visibility errors as `Err`. Used by callers that want to
     /// defer a missing-component miss instead of failing compilation.
@@ -152,7 +152,7 @@ impl<'a> ReferenceResolver<'a> {
             .lookup_type(qname.namespace, qname.local_name))
     }
 
-    /// Lookup-only variant of [`resolve_element_ref`]: returns `Ok(None)` for
+    /// Lookup-only variant of [`Self::resolve_element_ref`]: returns `Ok(None)` for
     /// the "not found" case, while still propagating visibility errors.
     pub fn try_resolve_element_ref(
         &self,

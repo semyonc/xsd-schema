@@ -252,7 +252,7 @@ impl SchemaSet {
 
     /// Iterate the normalized locations of all loaded schema documents.
     ///
-    /// Useful for seeding a new [`SchemaSetBuilder`] with the same schemas
+    /// Useful for seeding a new [`SchemaSetBuilder`](crate::builder::SchemaSetBuilder) with the same schemas
     /// when enriching with `xsi:schemaLocation` hints.
     pub fn loaded_schema_locations(&self) -> impl Iterator<Item = &str> {
         self.loaded_locations.keys().map(|s| s.as_str())

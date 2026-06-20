@@ -5,7 +5,7 @@
 //! to ensure deduplication and fast equality checks via NameId.
 //!
 //! Design per XML_NAME_TABLE.md:
-//! - Entry: {hash, next, text: Box<str>}
+//! - Entry: `{hash, next, text: Box<str>}`
 //! - NameId(0) reserved for empty string
 //! - Rehashing when entries.len() > buckets.len()
 //! - Pre-seed with standard namespaces

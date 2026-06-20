@@ -20,7 +20,7 @@ pub struct ValidationError {
     pub message: String,
     /// Source location in the instance document
     pub location: Option<SourceLocation>,
-    /// XPath-like path to the element (e.g., "/root/child[1]")
+    /// XPath-like path to the element (e.g., "/root/child\[1\]")
     pub element_path: Option<String>,
 }
 

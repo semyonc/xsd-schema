@@ -1019,14 +1019,14 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
 ///
 /// 1. Walks every element declaration whose alternatives have an
 ///    `inline_type` but no `resolved_type`.
-/// 2. Calls [`assemble_inline_type`] to add the inline complex/simple
+/// 2. Calls `assemble_inline_type` to add the inline complex/simple
 ///    type to the arena and stores the resulting `TypeKey` on the
 ///    alternative.
 /// 3. Returns the list of complex-type keys that were newly added so
 ///    the caller can re-run reference resolution and content-particle
 ///    allocation on them.
 ///
-/// The caller must also call [`resolve_all_references`] and
+/// The caller must also call [`resolve_all_references`](crate::schema::resolver::resolve_all_references) and
 /// [`allocate_content_particle_elements`] again so the new types get
 /// their `resolved_base_type`, `resolved_content_particle_types`, and
 /// `resolved_content_particle_elements` populated. Both passes are

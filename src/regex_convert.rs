@@ -66,7 +66,7 @@ impl ConvertOptions {
 }
 
 /// Apply MS dialect leniencies to a pattern when the schema set is
-/// configured with [`RegexCompat::LenientMs`].
+/// configured with [`RegexCompat::LenientMs`](crate::RegexCompat::LenientMs).
 ///
 /// The textual preprocess is intentionally narrow. It only rewrites
 /// constructs that *no* runtime backend accepts natively, so they would
@@ -93,7 +93,7 @@ impl ConvertOptions {
 /// `(?<=…)`) still fail at compile time even under `LenientMs` — that
 /// is an engine limit, not a grammar choice.
 ///
-/// Returns the (possibly rewritten) pattern. When [`RegexCompat::Strict`]
+/// Returns the (possibly rewritten) pattern. When [`RegexCompat::Strict`](crate::RegexCompat::Strict)
 /// is in effect, callers should not invoke this.
 pub fn lenient_ms_preprocess(pattern: &str) -> std::borrow::Cow<'_, str> {
     if !pattern.contains("(?#") {
@@ -371,7 +371,7 @@ fn expand_xsd10_class_escape(out: &mut String, escape: char, in_class: bool) -> 
 /// Validate XSD 1.0 regex character-class hyphen rules — stricter than the backend
 /// parsers and stricter than XSD 1.1.
 ///
-/// Per XSD 1.0 Datatypes §F (regex grammar productions [14]–[22]) under longest-match
+/// Per XSD 1.0 Datatypes §F (regex grammar productions \[14\]–\[22\]) under longest-match
 /// disambiguation, an unescaped `-` inside a character class must be (a) the first
 /// atom (immediately after `[` or `[^`), (b) the last atom (immediately before `]`),
 /// (c) the middle character of an `seRange` (e.g. `a-z`), or (d) the subtraction

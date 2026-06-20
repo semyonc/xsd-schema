@@ -46,8 +46,8 @@ impl<'a> NamespaceContext<'a> {
     /// Create a new namespace context with standard bindings
     ///
     /// Pre-binds:
-    /// - xml -> http://www.w3.org/XML/1998/namespace
-    /// - xmlns -> http://www.w3.org/2000/xmlns/
+    /// - xml -> <http://www.w3.org/XML/1998/namespace>
+    /// - xmlns -> <http://www.w3.org/2000/xmlns/>
     pub fn new(name_table: &'a mut NameTable) -> Self {
         let mut ctx = Self {
             name_table,

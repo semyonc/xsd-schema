@@ -23,7 +23,7 @@
 //! The streaming path consumes its input; collecting `xsi:schemaLocation`
 //! hints and then re-validating against an enriched [`SchemaSet`] would require
 //! a second `quick_xml` parse of the same bytes. With a buffered document
-//! (e.g. [`BufferDocument`](crate::document::BufferDocument)) the instance is
+//! (e.g. `BufferDocument`) the instance is
 //! parsed once and can be re-validated against any number of schema sets by
 //! re-walking the in-memory tree:
 //!
@@ -46,7 +46,7 @@
 //! ```
 //!
 //! Diagnostics are reported through the runtime's
-//! [`ValidationSink`](crate::validation::validator::ValidationSink), exactly as
+//! [`ValidationSink`], exactly as
 //! with the streaming driver. The returned [`DriveOutcome`] only carries the
 //! root validity and observed depth.
 
@@ -115,7 +115,7 @@ where
     })
 }
 
-/// Convenience wrapper that validates a whole [`BufferDocument`] without
+/// Convenience wrapper that validates a whole [`BufferDocument`](crate::document::buffer::BufferDocument) without
 /// re-parsing — the tree-walk counterpart to `drive_quick_xml` for the
 /// page-based document buffer.
 #[cfg(feature = "xsd11")]

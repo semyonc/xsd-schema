@@ -30,7 +30,7 @@ pub enum CompositionEdgeKind {
 ///
 /// `target_doc` is `None` for cycle edges discovered while the target is
 /// still mid-parse (in the resolver's `resolving` set). After directive
-/// resolution completes, call [`fixup_composition_edges`] to fill in
+/// resolution completes, call [`fixup_composition_edges`](crate::parser::resolver::fixup_composition_edges) to fill in
 /// any `None` targets from `loaded_locations`.
 #[derive(Debug, Clone)]
 pub struct CompositionEdge {

@@ -1,6 +1,6 @@
 //! `ValidationRuntime` — mutable per-run validation state.
 //!
-//! Created by [`SchemaValidator::start_run()`]. Holds the validation stack,
+//! Created by [`SchemaValidator::start_run()`](crate::validation::validator::SchemaValidator::start_run). Holds the validation stack,
 //! identity constraint tables, sink, and all other per-run mutable state.
 //! Method bodies are moved verbatim from the former monolithic `SchemaValidator`.
 

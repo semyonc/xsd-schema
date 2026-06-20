@@ -19,7 +19,7 @@ use super::info::{ContentProcessing, ContentType, SchemaValidity, TypeSource};
 
 /// An inherited attribute value flowing from an ancestor element (XSD 1.1).
 ///
-/// Stored in [`ElementValidationState::inherited_attributes`] and propagated
+/// Stored in [`ElementValidationState::incoming_inherited`] and propagated
 /// from parent to child on element open. See §3.3.5.6 *Inherited Attributes*.
 #[cfg(feature = "xsd11")]
 #[derive(Debug, Clone)]

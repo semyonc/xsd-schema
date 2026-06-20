@@ -3,11 +3,11 @@
 //! Complex types can carry `xs:assert` elements whose XPath 2.0 expressions
 //! are evaluated against the element subtree. This module provides:
 //!
-//! - [`AssertionBufferFrame`] — per-element bookkeeping for assertion buffering
-//! - [`has_inherited_assertions`] — cheap hot-path check for any assertions
-//! - [`collect_inherited_assertions`] — full base-first collection with owner keys
-//! - [`resolve_ct_assertion_default_ns`] — xpathDefaultNamespace cascade
-//! - [`evaluate_complex_type_assertions`] — core XPath evaluation
+//! - `AssertionBufferFrame` — per-element bookkeeping for assertion buffering
+//! - `has_inherited_assertions` — cheap hot-path check for any assertions
+//! - `collect_inherited_assertions` — full base-first collection with owner keys
+//! - `resolve_ct_assertion_default_ns` — xpathDefaultNamespace cascade
+//! - `evaluate_complex_type_assertions` — core XPath evaluation
 
 use crate::document::buffer::BufferDocument;
 use crate::document::navigator::BufferDocNavigator;

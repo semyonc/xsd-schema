@@ -4,10 +4,10 @@
 //! This module bridges parsed constraint definitions (`IdentityConstraintData`)
 //! to runtime validation by providing:
 //!
-//! - [`CompiledIdentityConstraint`] — pre-compiled selector/field Asttrees
+//! - `CompiledIdentityConstraint` — pre-compiled selector/field Asttrees
 //! - [`KeyFieldValue`] / [`KeySequence`] — extracted field values with XSD equality
 //! - [`KeyTable`] — duplicate detection for key/unique, deferred storage for keyref
-//! - [`ConstraintStruct`] — per-activation state driving `ActiveAxis` matchers
+//! - `ConstraintStruct` — per-activation state driving `ActiveAxis` matchers
 
 use crate::ids::NameId;
 use crate::namespace::table::NameTable;

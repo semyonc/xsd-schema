@@ -9,10 +9,10 @@
 //!
 //! `process_loaded_schemas()` is a whole-set compile pass that is not
 //! idempotent. Therefore this helper works with [`SchemaSetBuilder`]
-//! (pre-compile), not with an already-compiled [`SchemaSet`]. The caller
+//! (pre-compile), not with an already-compiled [`SchemaSet`](crate::SchemaSet). The caller
 //! adds their base schemas, enriches with hints, then compiles once.
 //!
-//! URI resolution is delegated to the builder's [`SchemaResolver`] so that
+//! URI resolution is delegated to the builder's [`SchemaResolver`](crate::parser::resolver::SchemaResolver) so that
 //! Windows paths, URL normalization, and other platform-specific handling
 //! are applied consistently.
 //!
@@ -51,7 +51,7 @@ pub struct HintLoadResult {
 ///
 /// Each hint carries its own base URI (from the instance document) so
 /// that relative schema locations are resolved correctly. URI resolution
-/// is performed by the builder's [`SchemaResolver`], which handles
+/// is performed by the builder's [`SchemaResolver`](crate::parser::resolver::SchemaResolver), which handles
 /// platform-specific paths and URL normalization.
 ///
 /// Schemas that are already loaded in the builder are silently skipped
@@ -132,7 +132,7 @@ impl EnrichmentOutcome {
         self.schema_set.is_none() && self.hint_errors.is_empty() && self.compile_error.is_none()
     }
 
-    /// Returns the enriched [`SchemaSet`] if available, otherwise the
+    /// Returns the enriched [`SchemaSet`](crate::SchemaSet) if available, otherwise the
     /// original. Convenient when you want to "use enriched if it
     /// worked, fall back to the original".
     pub fn schema_set_or<'a>(
@@ -143,7 +143,7 @@ impl EnrichmentOutcome {
     }
 }
 
-/// Build an enriched [`SchemaSet`] by re-loading the original schemas and
+/// Build an enriched [`SchemaSet`](crate::SchemaSet) by re-loading the original schemas and
 /// adding any `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hints
 /// collected during a validation run.
 ///

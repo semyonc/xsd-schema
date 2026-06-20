@@ -4,7 +4,7 @@
 //! type is selected at runtime based on XPath test expressions evaluated
 //! against the element's attributes. This module provides:
 //!
-//! - [`evaluate_type_alternatives`] — core evaluation: builds a minimal
+//! - `evaluate_type_alternatives` — core evaluation: builds a minimal
 //!   document fragment, evaluates each alternative's test, and returns
 //!   the first matching alternative's resolved type.
 
