@@ -174,14 +174,16 @@ with `-`, and test with `.contains(...)`.
 | Flag | Default | Purpose |
 | --- | --- | --- |
 | `REPORT_WARNINGS` | **on** | Emit XSD warnings (non-fatal diagnostics) to the sink alongside errors. Clear this if you only want hard errors. |
+| `BUILD_PSVI_TYPED_VALUES` | **on** | Retain the typed value and whitespace-normalized value (PSVI `[schema actual value]` / `[schema normalized value]`) on the returned `SchemaInfo`, so callers can read `typed_value` / `normalized_value`. On by default for back-compat. **Clear it for validity-only streaming**: the runtime then skips building and keeping values the caller would discard — including an allocation-free fast path for the string family and for the integer hierarchy / `xs:decimal` (no per-value `BigInt`). **Validity and diagnostics are never affected** — values are still materialized internally wherever something *needs* one: a value-space facet (numeric range, `totalDigits`, value-space `enumeration`), a `fixed`/`default` comparison, ID/IDREF/ENTITY, an identity constraint, QName/NOTATION prefix binding, or an XSD 1.1 assertion. The fast paths only *accept* values they can prove valid; anything else defers to the normal path, so the emitted error codes are identical too. Only the *retained output* is dropped: with the bit clear, `SchemaInfo.typed_value` / `normalized_value` are `None` for nodes nothing else consumed. The W3C suite pass/fail set is identical with the bit on or off. |
 | `PROCESS_IDENTITY_CONSTRAINTS` | off | Evaluate `xs:key`, `xs:unique`, and `xs:keyref` during instance validation. Declarations are always *parsed*; this bit controls whether their constraints are *enforced*. Leave off when you only need type-level validation — saves the per-element key/keyref bookkeeping. |
 | `ALLOW_XML_ATTRIBUTES` | off | Accept every attribute in the reserved `http://www.w3.org/XML/1998/namespace` namespace (`xml:lang`, `xml:space`, `xml:base`, `xml:id`) **without** checking the element's complex type for an allowing declaration or wildcard. This is a lenient-parser convenience and is **not** XSD-conformant: the spec requires every attribute (including those in the xml namespace) to be matched by a declared `{attribute use}` or an `{attribute wildcard}` whose namespace constraint admits the xml namespace. Set this bit when you want `xml:lang` to "just work" against schemas that don't explicitly import the xml namespace; leave it clear for strict conformance (e.g. when running the W3C XSD test suite). `xml:base` base-URI tracking for `xsi:schemaLocation` hint resolution happens **regardless** of this flag — the flag only affects whether the attribute itself participates in type-level attribute validation. |
 | `STRICT_MODE` | off | Promote warnings to errors. Combine with `REPORT_WARNINGS`. |
 | `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. **Must** be paired with a fragment-buffering validator constructed via `SchemaValidator::new_fragment_buffer(...)` — that constructor sets the bit for you. Passing `PROCESS_ASSERTIONS` to plain `SchemaValidator::new(...)` does **not** error; the flag is silently stripped (the constructor ensures the flag and `AssertionSource::Disabled` agree), so assertions will not run. If you build XSD 1.1 instance validation by hand and forget to use `new_fragment_buffer`, every `xs:assert` is skipped — negative instances will appear valid. |
 
-The default — `ValidationFlags::default()` — enables only `REPORT_WARNINGS`.
-This matches the strict-conformance posture: identity constraints, `xml:*`
-leniency, and strict-mode warning promotion are all opt-in. Two common
+The default — `ValidationFlags::default()` — enables `REPORT_WARNINGS` and
+`BUILD_PSVI_TYPED_VALUES`. This matches the strict-conformance posture:
+identity constraints, `xml:*` leniency, and strict-mode warning promotion are
+all opt-in, and the PSVI typed values are populated for back-compat. Two common
 recipes:
 
 ```rust
@@ -196,6 +198,12 @@ let strict = ValidationFlags::default()
 let lenient = ValidationFlags::default()
     | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
     | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+
+// Lean streaming: only need valid/invalid + errors, not the PSVI typed values.
+// Drops per-value materialization (incl. BigInt per integer) where nothing
+// else needs it; validity is unchanged.
+let lean = ValidationFlags::default()
+    & !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
 ```
 
 For XSD 1.1 assertion-backed types, use the fragment-buffering validator

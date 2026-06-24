@@ -9275,3 +9275,228 @@ fn test_effective_facets_cache_correct_after_incremental_load() {
         "maxLength on a type added after the cache was populated must still be enforced"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PERF_LAZY_PSVI Phase 3: allocation-free numeric (`i128`) fast path. With PSVI
+// retention off, integer-hierarchy and `xs:decimal` values are range/facet
+// checked without building a `BigInt` or retaining an `XmlValue`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_psvi_optout_int_typed_value_none() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_none(),
+        "opt-out: int typed_value should not be retained (no BigInt built)"
+    );
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_psvi_default_retains_int_typed_value() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_some(),
+        "default: int typed_value must still be retained"
+    );
+    assert!(v.end_validation().is_ok());
+}
+
+#[test]
+fn test_psvi_optout_int_out_of_range_rejected() {
+    // Out of the native xs:int range but within i128: the built-in maxInclusive
+    // facet must still reject it on the fast path.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("9999999999");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(
+        end_info.validity,
+        SchemaValidity::Invalid,
+        "out-of-range int must be rejected with PSVI off"
+    );
+    v.end_validation().ok();
+    assert!(!v.sink.errors.is_empty());
+}
+
+#[test]
+fn test_psvi_optout_integer_restriction_bounds_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:simpleType>
+                    <xs:restriction base="xs:integer">
+                        <xs:minInclusive value="0"/>
+                        <xs:maxInclusive value="100"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    for (text, expect_valid) in [("50", true), ("150", false), ("-1", false)] {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text(text);
+        let end_info = v.validate_end_element();
+        let expected = if expect_valid {
+            SchemaValidity::Valid
+        } else {
+            SchemaValidity::Invalid
+        };
+        assert_eq!(
+            end_info.validity, expected,
+            "value {text} should be {expected:?} with PSVI off"
+        );
+        if expect_valid {
+            assert!(
+                end_info.typed_value.is_none(),
+                "opt-out: in-bounds integer typed_value should not be retained"
+            );
+        }
+        v.end_validation().ok();
+    }
+}
+
+#[test]
+fn test_psvi_optout_huge_integer_valid() {
+    // A 40-digit xs:integer overflows i128, so the fast path defers to the
+    // BigInt full path, which validates it — verdict must stay valid.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:integer"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("1234567890123456789012345678901234567890");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_psvi_optout_numeric_attribute_facet_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="n" type="xs:unsignedByte"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let attr_info = v.validate_attribute("n", "", "300"); // > 255
+    assert_eq!(
+        attr_info.validity,
+        SchemaValidity::Invalid,
+        "unsignedByte attribute range must be enforced with PSVI off"
+    );
+    assert!(
+        attr_info.typed_value.is_none(),
+        "opt-out: numeric attribute typed_value should not be retained"
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_optout_numeric_diagnostics_match_psvi_on() {
+    // Flipping BUILD_PSVI_TYPED_VALUES is a pure perf toggle: the diagnostics
+    // (constraint codes) emitted for invalid numeric values must be identical
+    // whether retention is on or off. The numeric fast path guarantees this by
+    // *deferring* every error to the full path rather than synthesizing its own.
+    let cases: &[(&str, &str)] = &[
+        ("xs:int", "9999999999"),        // over native range (cvc-datatype-valid)
+        ("xs:byte", "200"),              // over native range
+        ("xs:unsignedByte", "-1"),       // negative for unsigned
+        ("xs:nonNegativeInteger", "-5"), // negative
+        ("xs:positiveInteger", "0"),     // zero
+        ("xs:integer", "12.5"),          // not an integer
+        ("xs:decimal", "x"),             // not a number
+    ];
+
+    for &(ty, value) in cases {
+        let schema_set = load_schema(&format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="{ty}"/>
+            </xs:schema>"#
+        ));
+
+        let codes = |flags: ValidationFlags| -> Vec<String> {
+            let validator = SchemaValidator::new(&schema_set, flags);
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            v.validate_element("root", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text(value);
+            v.validate_end_element();
+            v.end_validation().ok();
+            let mut c: Vec<String> = v.sink.errors.iter().map(|e| e.constraint.to_string()).collect();
+            c.sort();
+            c
+        };
+
+        let on = codes(ValidationFlags::default());
+        let off = codes(psvi_off_flags());
+        assert!(!on.is_empty(), "<root>{value}</root> ({ty}) should be invalid");
+        assert_eq!(
+            on, off,
+            "diagnostics for <root>{value}</root> ({ty}) must match on/off: on={on:?} off={off:?}"
+        );
+    }
+}

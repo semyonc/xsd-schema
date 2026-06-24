@@ -13,6 +13,7 @@ use crate::types::facets::{normalize_whitespace, WhitespaceMode};
 use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use rust_decimal::Decimal;
 
 use super::errors::{self, ValidationError};
 
@@ -98,16 +99,30 @@ pub fn fixed_matches_typed(
 ///
 /// Returns:
 /// - `Some(Ok(()))` — validated, no value built;
-/// - `Some(Err(_))` — invalid (same error the full path would produce);
-/// - `None` — not eligible; the caller must fall back to [`validate_simple_type`],
-///   which builds the value (needed for lexical-validity of constrained types,
-///   value-space facets, ID/QName/list/union, and XSD 1.1 assertions).
+/// - `Some(Err(_))` — invalid (only the string family; the error is identical to
+///   the full path because it reuses the same validator);
+/// - `None` — not eligible, *or* a numeric value the fast check could not accept;
+///   the caller must fall back to [`validate_simple_type`], which builds the value
+///   (needed for lexical-validity of constrained types, value-space facets,
+///   ID/QName/list/union, XSD 1.1 assertions) and is the single source of truth
+///   for diagnostics.
 ///
-/// Only `xs:string` / `xs:normalizedString` / `xs:token` (and restrictions
-/// thereof) qualify: their lexical space accepts any whitespace-normalized
-/// input, so skipping the parse cannot miss a lexical-validity error. Any
-/// facets present are still enforced by reusing the registered validator's
-/// facet logic and discarding the produced value.
+/// Two atomic-type families qualify:
+///
+/// - **String family** (`xs:string` / `xs:normalizedString` / `xs:token` and
+///   restrictions): their lexical space accepts any whitespace-normalized input,
+///   so skipping the parse cannot miss a lexical-validity error. Any facets are
+///   enforced by reusing the registered validator's facet logic and discarding
+///   the produced value — so an emitted error matches the full path exactly.
+/// - **Numeric family** (`xs:decimal` and the integer hierarchy — Phase 3): a
+///   *definitively valid* value is accepted via an `i128` (integer) or stack
+///   `Decimal` parse, *without* heap-allocating a `BigInt` or building an
+///   `XmlValue`. Anything the fast check cannot accept (invalid lexical, facet
+///   violation, integer past `i128`) returns `None` and defers to the full path,
+///   keeping diagnostics byte-identical — the built-in integer validators reject
+///   out-of-range values via native parse / `RangeError`, not via bound facets.
+///   See [`validate_numeric_lexical`]. Floats/doubles, lists, and unions also
+///   fall back.
 pub(crate) fn try_validate_lexical_only(
     value: &str,
     type_key: TypeKey,
@@ -121,10 +136,12 @@ pub(crate) fn try_validate_lexical_only(
         return None;
     }
     let code = resolve_type_code(sk, schema_set)?;
-    if !matches!(
+    let is_string = matches!(
         code,
         XmlTypeCode::String | XmlTypeCode::NormalizedString | XmlTypeCode::Token
-    ) {
+    );
+    let is_numeric = is_numeric_fast_eligible(code);
+    if !is_string && !is_numeric {
         return None;
     }
     let facets = schema_set.effective_facets(sk);
@@ -133,17 +150,98 @@ pub(crate) fn try_validate_lexical_only(
     if !facets.assertions.is_empty() {
         return None;
     }
-    if facets.is_empty() {
-        // No constraints and any input is lexically valid — nothing to do.
-        return Some(Ok(()));
+
+    if is_string {
+        if facets.is_empty() {
+            // No constraints and any input is lexically valid — nothing to do.
+            return Some(Ok(()));
+        }
+        // Reuse the registered validator's facet logic for identical semantics,
+        // discarding the produced value.
+        let validator = VALIDATOR_REGISTRY.get_by_code(code)?;
+        return Some(match validator.validate_with_facets(value, &facets) {
+            Ok(_) => Ok(()),
+            Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
+        });
     }
-    // Reuse the registered validator's facet logic for identical semantics,
-    // discarding the produced value.
-    let validator = VALIDATOR_REGISTRY.get_by_code(code)?;
-    Some(match validator.validate_with_facets(value, &facets) {
-        Ok(_) => Ok(()),
-        Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
-    })
+
+    // Numeric (Phase 3): accept only a definitively-valid value without building
+    // a `BigInt` / `XmlValue`; defer everything else (including errors) to the
+    // full path so diagnostics stay identical to the PSVI-on path.
+    let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+    validate_numeric_lexical(code, &normalized, &facets).map(|()| Ok(()))
+}
+
+/// Integer-hierarchy and `xs:decimal` atomic codes eligible for the Phase 3
+/// allocation-free numeric fast path (PERF_LAZY_PSVI). `Float`/`Double` are
+/// excluded (already `Copy`/heap-free, and their NaN/INF facet semantics differ).
+fn is_numeric_fast_eligible(code: XmlTypeCode) -> bool {
+    matches!(
+        code,
+        XmlTypeCode::Decimal
+            | XmlTypeCode::Integer
+            | XmlTypeCode::Long
+            | XmlTypeCode::Int
+            | XmlTypeCode::Short
+            | XmlTypeCode::Byte
+            | XmlTypeCode::NonNegativeInteger
+            | XmlTypeCode::UnsignedLong
+            | XmlTypeCode::UnsignedInt
+            | XmlTypeCode::UnsignedShort
+            | XmlTypeCode::UnsignedByte
+            | XmlTypeCode::NonPositiveInteger
+            | XmlTypeCode::NegativeInteger
+            | XmlTypeCode::PositiveInteger
+    )
+}
+
+/// Phase 3 numeric fast path: decide whether a whitespace-collapsed
+/// integer-hierarchy or `xs:decimal` lexical is *definitively valid* against
+/// `facets`, without building a `BigInt` or an `XmlValue`.
+///
+/// Returns `Some(())` only when the value is valid (so the caller can accept it
+/// with nothing materialized). Returns `None` in every other case — invalid
+/// lexical, any facet violation, or an integer beyond `i128` — so the caller
+/// falls back to [`validate_simple_type`], the single source of truth for the
+/// *diagnostic*. Deferring errors rather than synthesizing them keeps the
+/// emitted constraint code / message byte-identical to the PSVI-on path: the
+/// built-in integer validators reject out-of-range values via native parse /
+/// `RangeError` (e.g. `cvc-datatype-valid`), not via the bound facets this fast
+/// check consults. The win is on the common valid path; the error path is cold.
+fn validate_numeric_lexical(
+    code: XmlTypeCode,
+    normalized: &str,
+    facets: &crate::types::facets::FacetSet,
+) -> Option<()> {
+    // Integer-lexical gate: `parse::<i128>` accepts exactly the XSD integer
+    // lexical space and rejects fractional/garbage input. `Err` is either an
+    // invalid lexical or an integer that does not fit `i128`; both defer to the
+    // full (`BigInt`) path. (`xs:decimal` is gated by the `Decimal` parse below
+    // — the same parse `DecimalValidator::validate` uses.)
+    if code != XmlTypeCode::Decimal && normalized.parse::<i128>().is_err() {
+        return None;
+    }
+
+    // Value-space facets (totalDigits / fractionDigits / min* / max*) need the
+    // value as a `Decimal`. This is the same decimal-string conversion
+    // `XmlValue::as_decimal` performs (never `Decimal::from_i128`, whose
+    // num-traits default downcasts through `i64`).
+    match normalized.parse::<Decimal>() {
+        Ok(d) if facets.validate_decimal(&d).is_err() => return None,
+        Ok(_) => {}
+        // `xs:decimal`: an unparseable lexical defers to the full path. Integer
+        // family: a valid integer (the i128 gate passed) beyond `Decimal`'s
+        // range — `as_decimal` returns `None` there too, so the full path also
+        // skips value-space facets; nothing more to check here.
+        Err(_) if code == XmlTypeCode::Decimal => return None,
+        Err(_) => {}
+    }
+
+    // Lexical pattern / enumeration facets — what the numeric validators apply.
+    if facets.validate_string_patterns_enums(normalized).is_err() {
+        return None;
+    }
+    Some(())
 }
 
 fn validate_simple_type_inner(
@@ -870,6 +968,210 @@ mod tests {
 
         let err = validate_simple_type("-1", tk, &schema).unwrap_err();
         assert_eq!(err.constraint, "cvc-minInclusive-valid");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: allocation-free numeric fast path (`try_validate_lexical_only`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_numeric_fast_path_builtin_int() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="e" type="xs:int"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+
+        // In-range value handled by the fast path, no value built.
+        assert!(matches!(
+            try_validate_lexical_only("42", tk, &schema),
+            Some(Ok(()))
+        ));
+        assert!(matches!(
+            try_validate_lexical_only("+42", tk, &schema),
+            Some(Ok(()))
+        ));
+        assert!(matches!(
+            try_validate_lexical_only("2147483647", tk, &schema),
+            Some(Ok(()))
+        ));
+
+        // Out of the native xs:int range but within i128: the fast path defers
+        // (returns None) so the full path emits its canonical diagnostic.
+        assert!(try_validate_lexical_only("9999999999", tk, &schema).is_none());
+        // And that canonical diagnostic is the native-parse one, unchanged.
+        let err = validate_simple_type("9999999999", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-datatype-valid");
+    }
+
+    #[test]
+    fn test_numeric_fast_path_restriction_bounds_defer_to_full_path() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="score">
+                    <xs:restriction base="xs:integer">
+                        <xs:minInclusive value="0"/>
+                        <xs:maxInclusive value="100"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="score"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+
+        for ok in ["0", "50", "100"] {
+            assert!(
+                matches!(try_validate_lexical_only(ok, tk, &schema), Some(Ok(()))),
+                "fast path should accept {ok}"
+            );
+        }
+
+        // Out-of-bounds values defer; the full path keeps the same cvc codes
+        // whether PSVI retention is on or off.
+        for (val, code) in [("101", "cvc-maxInclusive-valid"), ("-1", "cvc-minInclusive-valid")] {
+            assert!(
+                try_validate_lexical_only(val, tk, &schema).is_none(),
+                "fast path should defer {val}"
+            );
+            assert_eq!(validate_simple_type(val, tk, &schema).unwrap_err().constraint, code);
+        }
+    }
+
+    #[test]
+    fn test_numeric_fast_path_total_digits() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="t">
+                    <xs:restriction base="xs:integer">
+                        <xs:totalDigits value="3"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="t"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(matches!(
+            try_validate_lexical_only("123", tk, &schema),
+            Some(Ok(()))
+        ));
+        // Violation defers to the full path, which reports it.
+        assert!(try_validate_lexical_only("1234", tk, &schema).is_none());
+        let err = validate_simple_type("1234", tk, &schema).unwrap_err();
+        assert_eq!(err.constraint, "cvc-totalDigits-valid");
+    }
+
+    #[test]
+    fn test_numeric_fast_path_decimal() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="t">
+                    <xs:restriction base="xs:decimal">
+                        <xs:maxInclusive value="9.99"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="t"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        assert!(matches!(
+            try_validate_lexical_only("3.14", tk, &schema),
+            Some(Ok(()))
+        ));
+        // Out-of-bounds decimal defers; full path reports the canonical code.
+        assert!(try_validate_lexical_only("10.5", tk, &schema).is_none());
+        assert_eq!(
+            validate_simple_type("10.5", tk, &schema).unwrap_err().constraint,
+            "cvc-maxInclusive-valid"
+        );
+    }
+
+    #[test]
+    fn test_numeric_fast_path_falls_back_when_out_of_i128() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="e" type="xs:integer"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+
+        // 40-digit integer overflows i128 → defer to the BigInt full path.
+        let big = "1234567890123456789012345678901234567890";
+        assert!(try_validate_lexical_only(big, tk, &schema).is_none());
+        // The full path validates it (a valid, very large xs:integer).
+        assert!(validate_simple_type(big, tk, &schema).is_ok());
+
+        // Invalid lexical also defers, so the full path reports the exact error.
+        assert!(try_validate_lexical_only("abc", tk, &schema).is_none());
+    }
+
+    /// Core Phase 3 correctness gate: the numeric fast path must never
+    /// synthesize an error and must never accept a value the full path rejects.
+    /// It either accepts a genuinely-valid value (`Some(Ok)`) or defers (`None`);
+    /// every invalid value defers so the full path owns the diagnostic.
+    #[test]
+    fn test_numeric_fast_path_verdict_parity() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="i" type="xs:int"/>
+                <xs:element name="l" type="xs:long"/>
+                <xs:element name="b" type="xs:byte"/>
+                <xs:element name="ub" type="xs:unsignedByte"/>
+                <xs:element name="ul" type="xs:unsignedLong"/>
+                <xs:element name="nni" type="xs:nonNegativeInteger"/>
+                <xs:element name="pi" type="xs:positiveInteger"/>
+                <xs:element name="dec" type="xs:decimal"/>
+            </xs:schema>"#,
+        );
+
+        let cases: &[(&str, &str)] = &[
+            ("i", "0"),
+            ("i", "-2147483648"),
+            ("i", "2147483647"),
+            ("i", "2147483648"),  // over xs:int max
+            ("i", "-2147483649"), // under xs:int min
+            ("l", "9223372036854775807"),
+            ("l", "9223372036854775808"), // over xs:long max
+            ("b", "127"),
+            ("b", "128"), // over xs:byte max
+            ("b", "-128"),
+            ("ub", "0"),
+            ("ub", "255"),
+            ("ub", "256"), // over xs:unsignedByte max
+            ("ub", "-1"),  // negative for unsigned
+            ("ul", "18446744073709551615"),
+            ("ul", "18446744073709551616"), // over u64 max, fits i128
+            ("nni", "0"),
+            ("nni", "-1"), // negative for nonNegativeInteger
+            ("pi", "1"),
+            ("pi", "0"), // zero for positiveInteger
+            ("dec", "3.14"),
+            ("dec", "-0.001"),
+        ];
+
+        let mut fast_accepts = 0;
+        for (elem, value) in cases {
+            let tk = element_type(&schema, elem);
+            let full_ok = validate_simple_type(value, tk, &schema).is_ok();
+            // A `None` means the fast path deferred (invalid, or integer past
+            // i128) — the full path owns the verdict and diagnostic. A `Some`
+            // must be `Ok` (numerics never synthesize an error) and a genuine
+            // accept (no false accept).
+            if let Some(fast) = try_validate_lexical_only(value, tk, &schema) {
+                assert!(fast.is_ok(), "numeric fast path must not emit errors");
+                assert!(
+                    full_ok,
+                    "false accept for <{elem}>{value}</{elem}>: full path rejects it"
+                );
+                fast_accepts += 1;
+            }
+        }
+        // Guard against a vacuous test: the valid in-range cases must be taken
+        // by the fast path, not all deferred.
+        assert!(
+            fast_accepts >= 8,
+            "expected the fast path to accept the valid in-range cases, got {fast_accepts}"
+        );
     }
 
     #[test]
