@@ -271,8 +271,7 @@ pub(crate) fn determine_content_type(
             let particle_empty = match &def.particle {
                 None => true,
                 Some(p) => {
-                    schema_set.is_xsd11()
-                        && crate::parser::frames::particle_is_explicit_empty(p)
+                    schema_set.is_xsd11() && crate::parser::frames::particle_is_explicit_empty(p)
                 }
             };
             let has_open_content = type_has_effective_open_content(schema_set, ct_data, def);
@@ -2450,6 +2449,58 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// PERF_LAZY_PSVI Phase 2: when PSVI value retention is opted out
+    /// (`BUILD_PSVI_TYPED_VALUES` clear) and no consumer needs the typed value,
+    /// validate the element's simple content without materializing an
+    /// `XmlValue`. Returns `true` if it handled validation (the caller then
+    /// skips the value-building path); `false` to fall back.
+    ///
+    /// Gated off when an identity constraint is active (its fields may read the
+    /// value) or the declaration has a fixed/default (compared in value space);
+    /// [`super::simple::try_validate_lexical_only`] further restricts
+    /// eligibility to accept-any-input string-family types.
+    /// PERF_LAZY_PSVI Phase 2 gate shared by the element and attribute fast
+    /// paths: PSVI value retention is opted out (`BUILD_PSVI_TYPED_VALUES`
+    /// clear) *and* no identity constraint is active that might read this
+    /// node's value. Callers additionally exclude nodes with a fixed/default
+    /// value, which need a value-space comparison.
+    fn psvi_retention_disabled(&self) -> bool {
+        !self
+            .flags
+            .contains(ValidationFlags::BUILD_PSVI_TYPED_VALUES)
+            && self.active_constraints.is_empty()
+    }
+
+    fn try_fast_simple_content(
+        &mut self,
+        ev_state: &mut ElementValidationState,
+        schema_type: TypeKey,
+    ) -> bool {
+        if !self.psvi_retention_disabled() {
+            return false;
+        }
+        let has_fixed_or_default = ev_state.element_decl.is_some_and(|k| {
+            let d = &self.schema_set.arenas.elements[k];
+            d.default_value.is_some() || d.fixed_value.is_some()
+        });
+        if has_fixed_or_default {
+            return false;
+        }
+        match super::simple::try_validate_lexical_only(
+            &ev_state.text_content,
+            schema_type,
+            self.schema_set,
+        ) {
+            Some(Ok(())) => true,
+            Some(Err(err)) => {
+                self.report_validation_error_to(err, &mut ev_state.error_codes);
+                ev_state.validity = SchemaValidity::Invalid;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// F2/B1 step 2: simple-content / text validation.
     ///
     /// For text-only content: substitute default/fixed for an empty element,
@@ -2478,43 +2529,45 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
 
             if let Some(schema_type) = ev_state.schema_type {
-                match super::simple::validate_simple_type(
-                    &ev_state.text_content,
-                    schema_type,
-                    self.schema_set,
-                ) {
-                    Ok(result) => {
-                        ev_state.member_type = result.member_type;
-                        ev_state.typed_value = Some(result.typed_value);
-                        ev_state.normalized_value = result.normalized_value;
+                if !self.try_fast_simple_content(ev_state, schema_type) {
+                    match super::simple::validate_simple_type(
+                        &ev_state.text_content,
+                        schema_type,
+                        self.schema_set,
+                    ) {
+                        Ok(result) => {
+                            ev_state.member_type = result.member_type;
+                            ev_state.typed_value = Some(result.typed_value);
+                            ev_state.normalized_value = result.normalized_value;
 
-                        // QName/NOTATION prefix-binding check (Datatypes
-                        // §3.3.18 / §3.3.19): the simple-type validator
-                        // doesn't see namespaces, so an undeclared prefix
-                        // (e.g. `xmlns:xsi` per W3C bug 4053) must be
-                        // flagged here against the element's snapshot.
-                        // Apply only to single (atomic) QName/NOTATION
-                        // values — list-of-QName tokens are handled
-                        // elsewhere and may legitimately use any prefix
-                        // syntax in the joined text.
-                        let needs_qname_check = ev_state.typed_value.as_ref().is_some_and(|v| {
-                            matches!(v.value, crate::types::value::XmlValueKind::Atomic(_))
-                                && (v.type_code == XmlTypeCode::QName
-                                    || v.type_code == XmlTypeCode::Notation)
-                        });
-                        if needs_qname_check && ev_state.validity == SchemaValidity::Valid {
-                            if let Some(ctx) = ev_state.ns_context.as_ref() {
-                                let raw = ev_state.text_content.trim();
-                                if let Some(colon_pos) = raw.find(':') {
-                                    let prefix = &raw[..colon_pos];
-                                    let prefix_id = self.schema_set.name_table.add(prefix);
-                                    if ctx.resolve_prefix(prefix_id).is_none() {
-                                        let elem_name = self
-                                            .schema_set
-                                            .name_table
-                                            .resolve(ev_state.local_name)
-                                            .to_string();
-                                        let err = errors::error(
+                            // QName/NOTATION prefix-binding check (Datatypes
+                            // §3.3.18 / §3.3.19): the simple-type validator
+                            // doesn't see namespaces, so an undeclared prefix
+                            // (e.g. `xmlns:xsi` per W3C bug 4053) must be
+                            // flagged here against the element's snapshot.
+                            // Apply only to single (atomic) QName/NOTATION
+                            // values — list-of-QName tokens are handled
+                            // elsewhere and may legitimately use any prefix
+                            // syntax in the joined text.
+                            let needs_qname_check =
+                                ev_state.typed_value.as_ref().is_some_and(|v| {
+                                    matches!(v.value, crate::types::value::XmlValueKind::Atomic(_))
+                                        && (v.type_code == XmlTypeCode::QName
+                                            || v.type_code == XmlTypeCode::Notation)
+                                });
+                            if needs_qname_check && ev_state.validity == SchemaValidity::Valid {
+                                if let Some(ctx) = ev_state.ns_context.as_ref() {
+                                    let raw = ev_state.text_content.trim();
+                                    if let Some(colon_pos) = raw.find(':') {
+                                        let prefix = &raw[..colon_pos];
+                                        let prefix_id = self.schema_set.name_table.add(prefix);
+                                        if ctx.resolve_prefix(prefix_id).is_none() {
+                                            let elem_name = self
+                                                .schema_set
+                                                .name_table
+                                                .resolve(ev_state.local_name)
+                                                .to_string();
+                                            let err = errors::error(
                                             "cvc-datatype-valid.1.2.1",
                                             format!(
                                                 "Element '{}' has QName value '{}' with undeclared prefix '{}'",
@@ -2522,19 +2575,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                             ),
                                             self.current_location.clone(),
                                         );
-                                        self.report_validation_error_to(
-                                            err,
-                                            &mut ev_state.error_codes,
-                                        );
-                                        ev_state.validity = SchemaValidity::Invalid;
+                                            self.report_validation_error_to(
+                                                err,
+                                                &mut ev_state.error_codes,
+                                            );
+                                            ev_state.validity = SchemaValidity::Invalid;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    Err(err) => {
-                        self.report_validation_error_to(err, &mut ev_state.error_codes);
-                        ev_state.validity = SchemaValidity::Invalid;
+                        Err(err) => {
+                            self.report_validation_error_to(err, &mut ev_state.error_codes);
+                            ev_state.validity = SchemaValidity::Invalid;
+                        }
                     }
                 }
             }
@@ -4221,24 +4275,47 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut typed_value = None;
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
+                // PERF_LAZY_PSVI Phase 2: skip materialization when opted out and
+                // no consumer needs the value (no fixed, no active IC; the fast
+                // path itself excludes ID/QName/value-space types).
+                let mut used_fast_path = false;
                 if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
-                        Ok(result) => {
-                            member_type = result.member_type;
-                            typed_value = Some(result.typed_value);
-                            normalized_value = result.normalized_value;
+                    let try_fast = self.psvi_retention_disabled() && fixed_value.is_none();
+                    if try_fast {
+                        if let Some(res) = super::simple::try_validate_lexical_only(
+                            value,
+                            type_key,
+                            self.schema_set,
+                        ) {
+                            used_fast_path = true;
+                            if let Err(err) = res {
+                                self.report_validation_error(err);
+                                attr_validity = SchemaValidity::Invalid;
+                                self.mark_current_invalid();
+                            }
                         }
-                        Err(err) => {
-                            self.report_validation_error(err);
-                            attr_validity = SchemaValidity::Invalid;
-                            self.mark_current_invalid();
+                    }
+                    if !used_fast_path {
+                        match super::simple::validate_simple_type(value, type_key, self.schema_set)
+                        {
+                            Ok(result) => {
+                                member_type = result.member_type;
+                                typed_value = Some(result.typed_value);
+                                normalized_value = result.normalized_value;
+                            }
+                            Err(err) => {
+                                self.report_validation_error(err);
+                                attr_validity = SchemaValidity::Invalid;
+                                self.mark_current_invalid();
+                            }
                         }
                     }
                 }
 
                 // QName/NOTATION prefix-binding check (Datatypes §3.3.18 /
                 // §3.3.19) — the simple-type validator can't see namespaces.
-                if attr_validity == SchemaValidity::Valid {
+                // Skipped on the fast path (string-family types are never QName).
+                if !used_fast_path && attr_validity == SchemaValidity::Valid {
                     match self.resolve_attribute_qname_typed_value(typed_value.as_ref(), value) {
                         Ok(Some(resolved)) => typed_value = Some(resolved),
                         Ok(None) => {}

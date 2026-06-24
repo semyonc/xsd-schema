@@ -7,7 +7,9 @@
 use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
 use crate::schema::SchemaSet;
-use crate::types::facets::{normalize_whitespace, FacetSet, WhitespaceMode};
+#[cfg(feature = "xsd11")]
+use crate::types::facets::FacetSet;
+use crate::types::facets::{normalize_whitespace, WhitespaceMode};
 use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
@@ -85,6 +87,63 @@ pub fn fixed_matches_typed(
         return false;
     };
     *instance_typed == fixed_result.typed_value
+}
+
+/// PERF_LAZY_PSVI Phase 2 — opt-out fast path.
+///
+/// When the caller has cleared `BUILD_PSVI_TYPED_VALUES` and no consumer needs
+/// the typed value (the runtime checks fixed/default, identity constraints,
+/// etc. before calling), validate "accept-any-input" string-family atomic
+/// types *without materializing an `XmlValue`*.
+///
+/// Returns:
+/// - `Some(Ok(()))` — validated, no value built;
+/// - `Some(Err(_))` — invalid (same error the full path would produce);
+/// - `None` — not eligible; the caller must fall back to [`validate_simple_type`],
+///   which builds the value (needed for lexical-validity of constrained types,
+///   value-space facets, ID/QName/list/union, and XSD 1.1 assertions).
+///
+/// Only `xs:string` / `xs:normalizedString` / `xs:token` (and restrictions
+/// thereof) qualify: their lexical space accepts any whitespace-normalized
+/// input, so skipping the parse cannot miss a lexical-validity error. Any
+/// facets present are still enforced by reusing the registered validator's
+/// facet logic and discarding the produced value.
+pub(crate) fn try_validate_lexical_only(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<Result<(), ValidationError>> {
+    let TypeKey::Simple(sk) = type_key else {
+        return None;
+    };
+    let st = schema_set.arenas.simple_types.get(sk)?;
+    if st.variety != SimpleTypeVariety::Atomic {
+        return None;
+    }
+    let code = resolve_type_code(sk, schema_set)?;
+    if !matches!(
+        code,
+        XmlTypeCode::String | XmlTypeCode::NormalizedString | XmlTypeCode::Token
+    ) {
+        return None;
+    }
+    let facets = schema_set.effective_facets(sk);
+    // XSD 1.1 assertions bind `$value`; they need the materialized value.
+    #[cfg(feature = "xsd11")]
+    if !facets.assertions.is_empty() {
+        return None;
+    }
+    if facets.is_empty() {
+        // No constraints and any input is lexically valid — nothing to do.
+        return Some(Ok(()));
+    }
+    // Reuse the registered validator's facet logic for identical semantics,
+    // discarding the produced value.
+    let validator = VALIDATOR_REGISTRY.get_by_code(code)?;
+    Some(match validator.validate_with_facets(value, &facets) {
+        Ok(_) => Ok(()),
+        Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
+    })
 }
 
 fn validate_simple_type_inner(
@@ -180,7 +239,7 @@ fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTyp
 /// Walk the simple-type derivation chain and return `true` if any
 /// ancestor (including `sk` itself) declares an `enumeration` facet.
 /// `FacetSet::inherit_from` does not propagate enumeration through base
-/// types, so [`collect_facets`] alone cannot answer this question.
+/// types, so the merged effective facet set alone cannot answer this question.
 fn has_enumeration_in_chain(sk: SimpleTypeKey, schema_set: &SchemaSet) -> bool {
     let mut current = sk;
     for _ in 0..100 {
@@ -198,34 +257,9 @@ fn has_enumeration_in_chain(sk: SimpleTypeKey, schema_set: &SchemaSet) -> bool {
     false
 }
 
-/// Collect the effective facet set for a simple type by walking the derivation chain.
-///
-/// Starts from the most-derived type's facets, then inherits from each base type.
-/// `inherit_from` only fills missing values, so derived facets take priority.
-fn collect_facets(sk: SimpleTypeKey, schema_set: &SchemaSet) -> FacetSet {
-    let st_data = match schema_set.arenas.simple_types.get(sk) {
-        Some(d) => d,
-        None => return FacetSet::new(),
-    };
-    let mut facets = st_data.facets.clone();
-
-    // Walk the base type chain
-    let mut current_base = st_data.resolved_base_type;
-    for _ in 0..100 {
-        match current_base {
-            Some(TypeKey::Simple(base_sk)) => {
-                if let Some(base_data) = schema_set.arenas.simple_types.get(base_sk) {
-                    facets.inherit_from(&base_data.facets);
-                    current_base = base_data.resolved_base_type;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-    facets
-}
+// Effective (base-chain-merged) facet sets are memoized by
+// `SchemaSet::effective_facets`; the hot path clones a cached `Arc<FacetSet>`
+// instead of re-walking the derivation chain per value.
 
 // ---------------------------------------------------------------------------
 // Atomic
@@ -262,7 +296,7 @@ fn validate_atomic_type(
         }
     };
 
-    let facets = collect_facets(sk, schema_set);
+    let facets = schema_set.effective_facets(sk);
 
     // XSD Part 2 §3.2 / W3C bug 14388: `xs:NOTATION` is only usable via
     // restriction with an `enumeration` facet binding the value to a
@@ -317,10 +351,7 @@ fn validate_atomic_type(
                 normalized_value: Some(normalized),
             })
         }
-        Err(type_err) => {
-            let code = errors::value_error_constraint_code(&type_err);
-            Err(errors::from_value_error(code, type_err, None))
-        }
+        Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
     }
 }
 
@@ -443,7 +474,7 @@ fn validate_list_type(
     }
 
     // Check list-level facets (length, minLength, maxLength, pattern, enumeration)
-    let facets = collect_facets(sk, schema_set);
+    let facets = schema_set.effective_facets(sk);
     if !facets.is_empty() {
         // Length constraints on list are item count
         facets
@@ -516,7 +547,7 @@ fn validate_union_type(
     for &member_key in &st_data.resolved_member_types {
         if let Ok(result) = validate_simple_type_inner(value, member_key, schema_set) {
             // Match found — check union-level facets (pattern, enumeration)
-            let facets = collect_facets(sk, schema_set);
+            let facets = schema_set.effective_facets(sk);
             if !facets.is_empty() {
                 let check_value = result.typed_value.to_string_value();
                 // §cvc-pattern-valid: patterns apply to the LEXICAL form (original value),

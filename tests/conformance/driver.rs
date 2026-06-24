@@ -1316,8 +1316,16 @@ fn validate_instance_pass(
     // xml:lang / xml:space / xml:base must be matched by a declared attribute
     // use or an attribute wildcard whose namespace constraint admits the
     // xml namespace (e.g. open044/open045).
-    let flags = xsd_schema::validation::ValidationFlags::default()
+    let mut flags = xsd_schema::validation::ValidationFlags::default()
         | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+
+    // Acceptance check for PERF_LAZY_PSVI Phase 2: CONF_NO_PSVI=1 clears
+    // BUILD_PSVI_TYPED_VALUES so the whole suite runs the opt-out path. Pass/fail
+    // counts MUST be identical to the default run — validity must never depend on
+    // PSVI value retention.
+    if std::env::var_os("CONF_NO_PSVI").is_some() {
+        flags &= !xsd_schema::validation::ValidationFlags::BUILD_PSVI_TYPED_VALUES;
+    }
 
     // XSD 1.1 `xs:assert` evaluation requires the fragment-buffer validator;
     // `SchemaValidator::new` silently strips PROCESS_ASSERTIONS and disables
