@@ -3,6 +3,7 @@
 //! This module defines the core NFA (Nondeterministic Finite Automaton) structures
 //! used to represent compiled XSD content models.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::substitution::SubstitutionGroupMap;
@@ -439,6 +440,168 @@ impl TransitionKind {
     }
 }
 
+/// A set of NFA `StateId`s backed by a bitset.
+///
+/// `StateId` is a dense `u32` (`0..state_count`), so a bitset replaces the old
+/// `HashSet<StateId>` on the counter-free (`Simple`) content-model hot path,
+/// removing the per-element heap allocation, the per-`StateId` SipHash, and the
+/// rehash memcpys. The common case (≤256 NFA states) is stored inline with **no
+/// heap allocation**; larger automata spill to a heap `Vec<u64>`.
+///
+/// Pure safe Rust (no `unsafe`) so it stays trivial under Miri. Iteration order
+/// is ascending by `StateId` (deterministic), unlike the previous `HashSet`.
+#[derive(Debug, Clone)]
+pub enum StateSet {
+    /// Up to 256 states stored inline (4 × 64-bit words), zero allocation.
+    Inline([u64; STATE_SET_INLINE_WORDS]),
+    /// More than 256 states: all words live on the heap.
+    Heap(Vec<u64>),
+}
+
+/// Inline capacity of [`StateSet`] in 64-bit words (256 states).
+pub const STATE_SET_INLINE_WORDS: usize = 4;
+
+impl Default for StateSet {
+    fn default() -> Self {
+        StateSet::Inline([0; STATE_SET_INLINE_WORDS])
+    }
+}
+
+impl StateSet {
+    /// An empty set with inline storage.
+    pub fn new() -> Self {
+        StateSet::default()
+    }
+
+    /// An empty set pre-sized to hold every state of an NFA of `state_count`
+    /// states without growing during insertion (keeps the closure DFS inner
+    /// loop free of inline→heap promotion).
+    pub fn with_capacity_for(state_count: usize) -> Self {
+        let words = state_count.div_ceil(64);
+        if words <= STATE_SET_INLINE_WORDS {
+            StateSet::Inline([0; STATE_SET_INLINE_WORDS])
+        } else {
+            StateSet::Heap(vec![0; words])
+        }
+    }
+
+    /// A singleton set containing just `id`.
+    pub fn single(id: StateId) -> Self {
+        let mut set = StateSet::with_capacity_for(id as usize + 1);
+        set.insert(id);
+        set
+    }
+
+    /// Read-only view of the backing words.
+    #[inline]
+    fn words(&self) -> &[u64] {
+        match self {
+            StateSet::Inline(w) => w,
+            StateSet::Heap(w) => w,
+        }
+    }
+
+    /// Ensure word index `word` is addressable, promoting Inline→Heap if needed,
+    /// and return the mutable word slice.
+    #[inline]
+    fn ensure_words(&mut self, word: usize) -> &mut [u64] {
+        // Promote inline → heap first when the word is out of inline range, so
+        // the final borrow below is conflict-free.
+        if let StateSet::Inline(w) = self {
+            if word >= STATE_SET_INLINE_WORDS {
+                let mut v = w.to_vec();
+                v.resize(word + 1, 0);
+                *self = StateSet::Heap(v);
+            }
+        }
+        match self {
+            StateSet::Inline(w) => w.as_mut_slice(),
+            StateSet::Heap(v) => {
+                if word >= v.len() {
+                    v.resize(word + 1, 0);
+                }
+                v.as_mut_slice()
+            }
+        }
+    }
+
+    /// Insert `id`; returns `true` if it was newly added (mirrors
+    /// `HashSet::insert`, used to prune the closure DFS).
+    #[inline]
+    pub fn insert(&mut self, id: StateId) -> bool {
+        let word = id as usize / 64;
+        let bit = 1u64 << (id as usize % 64);
+        let words = self.ensure_words(word);
+        let already = words[word] & bit != 0;
+        words[word] |= bit;
+        !already
+    }
+
+    /// Test membership.
+    #[inline]
+    pub fn contains(&self, id: StateId) -> bool {
+        let word = id as usize / 64;
+        let bit = 1u64 << (id as usize % 64);
+        self.words().get(word).is_some_and(|w| w & bit != 0)
+    }
+
+    /// True if no states are set.
+    pub fn is_empty(&self) -> bool {
+        self.words().iter().all(|&w| w == 0)
+    }
+
+    /// Iterate the set states in ascending `StateId` order.
+    pub fn iter(&self) -> impl Iterator<Item = StateId> + '_ {
+        self.words().iter().enumerate().flat_map(|(wi, &word)| {
+            let base = (wi * 64) as StateId;
+            StateSetWordIter { word, base }
+        })
+    }
+}
+
+/// Iterator over the set bits of one 64-bit word (ascending), used by
+/// [`StateSet::iter`]. Repeatedly extracts the lowest set bit.
+struct StateSetWordIter {
+    word: u64,
+    base: StateId,
+}
+
+impl Iterator for StateSetWordIter {
+    type Item = StateId;
+    #[inline]
+    fn next(&mut self) -> Option<StateId> {
+        if self.word == 0 {
+            return None;
+        }
+        let bit = self.word.trailing_zeros();
+        self.word &= self.word - 1; // clear lowest set bit
+        Some(self.base + bit)
+    }
+}
+
+impl PartialEq for StateSet {
+    /// Representation-agnostic: equal iff the same bits are set. Compares the
+    /// logical bit content, treating any surplus high words as zero — required
+    /// because a pre-sized `Heap` operand and an `Inline` literal can hold the
+    /// same set with different word counts.
+    fn eq(&self, other: &Self) -> bool {
+        let a = self.words();
+        let b = other.words();
+        let n = a.len().max(b.len());
+        (0..n).all(|i| a.get(i).copied().unwrap_or(0) == b.get(i).copied().unwrap_or(0))
+    }
+}
+
+impl Eq for StateSet {}
+
+thread_local! {
+    /// Reusable DFS work-stack for [`epsilon_closure`], so the content-model hot
+    /// path does not allocate a fresh `Vec` per call. Cleared on entry. It is
+    /// never borrowed re-entrantly: the closure walk only touches `NfaTable` data
+    /// and the result `StateSet`, none of which re-enter `epsilon_closure`.
+    static EPSILON_STACK: RefCell<Vec<StateId>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Compute the epsilon closure for a set of start states.
 ///
 /// Only follows `TransitionKind::Epsilon` transitions. For NFAs with counter
@@ -447,26 +610,30 @@ impl TransitionKind {
 pub fn epsilon_closure(
     nfa: &NfaTable,
     start_states: impl IntoIterator<Item = StateId>,
-) -> HashSet<StateId> {
+) -> StateSet {
     debug_assert!(
         !nfa.has_counters(),
         "epsilon_closure called on counted NFA; use ActiveStates instead"
     );
-    let mut closure = HashSet::new();
-    let mut stack: Vec<StateId> = start_states.into_iter().collect();
+    let mut closure = StateSet::with_capacity_for(nfa.state_count());
+    EPSILON_STACK.with(|cell| {
+        let mut stack = cell.borrow_mut();
+        stack.clear();
+        stack.extend(start_states);
 
-    while let Some(state_id) = stack.pop() {
-        if !closure.insert(state_id) {
-            continue;
-        }
-        if let Some(state) = nfa.get_state(state_id) {
-            for target in state.epsilon_transitions() {
-                if !closure.contains(&target) {
-                    stack.push(target);
+        while let Some(state_id) = stack.pop() {
+            if !closure.insert(state_id) {
+                continue;
+            }
+            if let Some(state) = nfa.get_state(state_id) {
+                for target in state.epsilon_transitions() {
+                    if !closure.contains(target) {
+                        stack.push(target);
+                    }
                 }
             }
         }
-    }
+    });
 
     closure
 }
@@ -519,11 +686,11 @@ pub fn advance_states(
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
     xsd_version: XsdVersion,
-) -> HashSet<StateId> {
+) -> StateSet {
     let closure = epsilon_closure(nfa, start_states);
-    let mut next = HashSet::new();
+    let mut next = StateSet::with_capacity_for(nfa.state_count());
 
-    for state_id in closure {
+    for state_id in closure.iter() {
         let state = match nfa.get_state(state_id) {
             Some(state) => state,
             None => continue,
@@ -547,7 +714,7 @@ pub fn advance_states(
         }
     }
 
-    epsilon_closure(nfa, next)
+    epsilon_closure(nfa, next.iter())
 }
 
 /// Advance NFA states with element-over-wildcard priority (XSD 1.1).
@@ -562,12 +729,12 @@ pub fn advance_with_priority(
     target_namespace: Option<NameId>,
     substitution_groups: Option<&SubstitutionGroupMap>,
     xsd_version: XsdVersion,
-) -> HashSet<StateId> {
+) -> StateSet {
     let closure = epsilon_closure(nfa, start_states);
-    let mut element_targets = HashSet::new();
-    let mut wildcard_targets = HashSet::new();
+    let mut element_targets = StateSet::with_capacity_for(nfa.state_count());
+    let mut wildcard_targets = StateSet::with_capacity_for(nfa.state_count());
 
-    for state_id in closure {
+    for state_id in closure.iter() {
         let state = match nfa.get_state(state_id) {
             Some(state) => state,
             None => continue,
@@ -608,7 +775,7 @@ pub fn advance_with_priority(
         wildcard_targets
     };
 
-    epsilon_closure(nfa, next)
+    epsilon_closure(nfa, next.iter())
 }
 
 // ---------------------------------------------------------------------------
@@ -940,7 +1107,7 @@ fn hybrid_epsilon_closure(
 /// **Invariant**: values are always closure-closed (epsilon closure has been
 /// applied). All constructors and advance methods enforce this.
 ///
-/// - `Simple`: counter-free NFA — delegates to existing `HashSet<StateId>` functions.
+/// - `Simple`: counter-free NFA — stores reachable states in a [`StateSet`] bitset.
 /// - `Counted`: NFA with multiple counters — tracks `HashSet<ActiveConfig>` (scalar).
 /// - `RangedSingle`: single counter with nullable body — stores one `CounterRange`
 ///   per reachable state, converging epsilon closure in O(states) instead of O(N).
@@ -948,8 +1115,8 @@ fn hybrid_epsilon_closure(
 ///   Collapses the ranged counter's dimension; cost proportional to remaining scalar dims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveStates {
-    /// Fast path: no counters in this NFA (bit-identical to old code)
-    Simple(HashSet<StateId>),
+    /// Fast path: no counters in this NFA — reachable states in a bitset.
+    Simple(StateSet),
     /// Scalar counted path: configurations carry individual counter values
     Counted {
         configs: HashSet<ActiveConfig>,
@@ -972,6 +1139,149 @@ pub enum ActiveStates {
 }
 
 impl ActiveStates {
+    /// Fused "find match info + advance" for the content-model hot path.
+    ///
+    /// Replaces the previous two passes over the active set (`find_match_info`
+    /// then `advance_from`/`advance_with_priority_from`) with a **single
+    /// traversal** for the `Simple` (counter-free) variant. Returns:
+    /// - the element/wildcard [`MatchInfo`] using element-over-wildcard priority,
+    ///   which is **version-independent** (mirrors `find_match_info_in_states`), and
+    /// - the next frontier, whose target selection **is** version-dependent:
+    ///   V1.0 unions element+wildcard targets (mirrors `advance_states`), V1.1
+    ///   prefers element targets over wildcard (mirrors `advance_with_priority`).
+    ///
+    /// Counter-bearing variants delegate to the existing methods with no
+    /// behavior change.
+    pub(crate) fn advance_element_with_info(
+        &self,
+        nfa: &NfaTable,
+        name: NameId,
+        namespace: Option<NameId>,
+        target_ns: Option<NameId>,
+        subst_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
+    ) -> (MatchInfo, ActiveStates) {
+        let states = match self {
+            ActiveStates::Simple(states) => states,
+            // Counter-bearing variants keep the existing two-call behavior.
+            _ => {
+                let info = self.find_match_info(
+                    nfa,
+                    name,
+                    namespace,
+                    target_ns,
+                    subst_groups,
+                    xsd_version,
+                );
+                let next = match xsd_version {
+                    XsdVersion::V1_0 => self.advance_from(
+                        nfa,
+                        name,
+                        namespace,
+                        target_ns,
+                        subst_groups,
+                        xsd_version,
+                    ),
+                    XsdVersion::V1_1 => self.advance_with_priority_from(
+                        nfa,
+                        name,
+                        namespace,
+                        target_ns,
+                        subst_groups,
+                        xsd_version,
+                    ),
+                };
+                return (info, next);
+            }
+        };
+
+        // Single pass over the (already closure-closed) Simple active set,
+        // capturing MatchInfo and collecting consuming targets at once.
+        let mut element_info: Option<MatchInfo> = None;
+        let mut wildcard_info: Option<MatchInfo> = None;
+        let mut element_targets = StateSet::with_capacity_for(nfa.state_count());
+        let mut wildcard_targets = StateSet::with_capacity_for(nfa.state_count());
+
+        for state_id in states.iter() {
+            let state = match nfa.get_state(state_id) {
+                Some(state) => state,
+                None => continue,
+            };
+            let term = match state.term.as_ref() {
+                Some(term) => term,
+                None => continue,
+            };
+            if !term_matches(term, name, namespace, target_ns, subst_groups, xsd_version) {
+                continue;
+            }
+            match term {
+                NfaTerm::Element {
+                    name: term_name,
+                    namespace: term_ns,
+                    element_key,
+                    resolved_type,
+                } => {
+                    for target in state.consuming_transitions() {
+                        element_targets.insert(target);
+                    }
+                    // First matching element wins (element-over-wildcard priority).
+                    if element_info.is_none() {
+                        element_info = Some(if *term_name == name && *term_ns == namespace {
+                            // Direct match — return the term's declaration info.
+                            MatchInfo {
+                                element_key: *element_key,
+                                resolved_type: *resolved_type,
+                                process_contents: None,
+                            }
+                        } else {
+                            // Substitution match — runtime resolves the actual member.
+                            MatchInfo::default()
+                        });
+                    }
+                }
+                NfaTerm::Wildcard {
+                    process_contents, ..
+                } => {
+                    for target in state.consuming_transitions() {
+                        wildcard_targets.insert(target);
+                    }
+                    // Keep the first matching wildcard as the fallback.
+                    if wildcard_info.is_none() {
+                        wildcard_info = Some(MatchInfo {
+                            element_key: None,
+                            resolved_type: None,
+                            process_contents: Some(*process_contents),
+                        });
+                    }
+                }
+            }
+        }
+
+        let match_info = element_info.or(wildcard_info).unwrap_or_default();
+
+        // Target selection mirrors the free advance functions exactly.
+        let chosen = match xsd_version {
+            XsdVersion::V1_0 => {
+                // Union element + wildcard targets (mirrors `advance_states`).
+                let mut all = element_targets;
+                for t in wildcard_targets.iter() {
+                    all.insert(t);
+                }
+                all
+            }
+            // Element targets, else wildcard (mirrors `advance_with_priority`).
+            XsdVersion::V1_1 => {
+                if !element_targets.is_empty() {
+                    element_targets
+                } else {
+                    wildcard_targets
+                }
+            }
+        };
+        let next = ActiveStates::Simple(epsilon_closure(nfa, chosen.iter()));
+        (match_info, next)
+    }
+
     /// Borrowed transition helper used by content validation hot paths to
     /// compute the next frontier without cloning the current one first.
     pub(crate) fn advance_from(
@@ -986,7 +1296,7 @@ impl ActiveStates {
         match self {
             ActiveStates::Simple(states) => ActiveStates::Simple(advance_states(
                 nfa,
-                states.iter().copied(),
+                states.iter(),
                 element_name,
                 element_namespace,
                 target_namespace,
@@ -1112,7 +1422,7 @@ impl ActiveStates {
         match self {
             ActiveStates::Simple(states) => ActiveStates::Simple(advance_with_priority(
                 nfa,
-                states.iter().copied(),
+                states.iter(),
                 element_name,
                 element_namespace,
                 target_namespace,
@@ -1337,7 +1647,7 @@ impl ActiveStates {
     /// Check if any active state is the NFA accept state.
     pub fn contains_accept(&self, nfa: &NfaTable) -> bool {
         match self {
-            ActiveStates::Simple(s) => s.iter().any(|&id| nfa.is_accept(id)),
+            ActiveStates::Simple(s) => s.contains(nfa.accept_state),
             ActiveStates::Counted { configs, .. } => {
                 configs.iter().any(|c| nfa.is_accept(c.state_id))
             }
@@ -1353,7 +1663,9 @@ impl ActiveStates {
     /// Compute epsilon closure (including counter transitions for Counted path).
     pub fn epsilon_closure(self, nfa: &NfaTable) -> Self {
         match self {
-            ActiveStates::Simple(states) => ActiveStates::Simple(epsilon_closure(nfa, states)),
+            ActiveStates::Simple(states) => {
+                ActiveStates::Simple(epsilon_closure(nfa, states.iter()))
+            }
             ActiveStates::Counted {
                 configs,
                 num_counters,
@@ -1581,12 +1893,11 @@ impl ActiveStates {
     ) -> MatchInfo {
         match self {
             ActiveStates::Simple(states) => {
-                // Delegate to existing function (it does epsilon_closure internally,
-                // which is redundant but harmless since states are already closed)
-                let closure = epsilon_closure(nfa, states.iter().copied());
+                // States are already closure-closed (the `ActiveStates` invariant),
+                // so iterate them directly — no epsilon closure needed.
                 find_match_info_in_states(
                     nfa,
-                    closure.iter().copied(),
+                    states.iter(),
                     name,
                     namespace,
                     target_ns,
@@ -1637,8 +1948,8 @@ impl ActiveStates {
         let mut result = Vec::new();
         match self {
             ActiveStates::Simple(states) => {
-                let closure = epsilon_closure(nfa, states.iter().copied());
-                for state_id in closure {
+                // States are already closure-closed — iterate directly.
+                for state_id in states.iter() {
                     if let Some(state) = nfa.get_state(state_id) {
                         if let Some(NfaTerm::Element {
                             name,
@@ -1822,8 +2133,54 @@ mod tests {
         }
     }
 
-    fn make_set(ids: &[StateId]) -> HashSet<StateId> {
-        ids.iter().copied().collect()
+    fn make_set(ids: &[StateId]) -> StateSet {
+        let mut set = StateSet::new();
+        for &id in ids {
+            set.insert(id);
+        }
+        set
+    }
+
+    #[test]
+    fn test_state_set_basic_ops() {
+        let mut s = StateSet::new();
+        assert!(s.is_empty());
+        assert!(s.insert(3)); // newly set
+        assert!(!s.insert(3)); // already present
+        assert!(s.insert(70)); // crosses a 64-bit word boundary
+        assert!(s.contains(3) && s.contains(70));
+        assert!(!s.contains(4));
+        assert!(!s.is_empty());
+        // Iteration is ascending by StateId.
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![3, 70]);
+    }
+
+    #[test]
+    fn test_state_set_eq_across_inline_and_heap() {
+        // An inline literal vs a pre-sized Heap holding the same bits must compare
+        // equal despite different word counts / representations.
+        let inline = make_set(&[1, 200]);
+        let mut heap = StateSet::with_capacity_for(5000); // forces Heap
+        heap.insert(1);
+        heap.insert(200);
+        assert!(matches!(heap, StateSet::Heap(_)));
+        assert!(matches!(inline, StateSet::Inline(_)));
+        assert_eq!(inline, heap);
+        heap.insert(4096);
+        assert_ne!(inline, heap);
+    }
+
+    #[test]
+    fn test_state_set_spill_promotes_to_heap() {
+        // Inserting an id beyond the inline range promotes to Heap and preserves
+        // previously-set bits.
+        let mut s = StateSet::new();
+        s.insert(5);
+        assert!(matches!(s, StateSet::Inline(_)));
+        s.insert(1000); // beyond 256 inline bits
+        assert!(matches!(s, StateSet::Heap(_)));
+        assert_eq!(s.iter().collect::<Vec<_>>(), vec![5, 1000]);
+        assert_eq!(s, make_set(&[5, 1000]));
     }
 
     #[test]

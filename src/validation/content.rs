@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use crate::compiler::{
-    term_matches_with_substitution, ActiveStates, AllGroupModel, AllGroupState,
-    ContentModelMatcher, NfaTable, NfaTerm, OpenContentMode as AllGroupOpenContentMode,
+    epsilon_closure, term_matches_with_substitution, ActiveStates, AllGroupModel, AllGroupState,
+    ContentModelMatcher, NfaTable, NfaTerm, OpenContentMode as AllGroupOpenContentMode, StateSet,
     SubstitutionGroupMap, TermMatchResult,
 };
 use crate::ids::{ElementKey, NameId, TypeKey};
@@ -254,8 +254,10 @@ impl ContentValidatorState {
                 active_states,
                 open_content,
             } => {
-                // First, find the matching element info before advancing
-                let mi = active_states.find_match_info(
+                // Fused single pass: capture the match info and compute the next
+                // frontier together (the open-content fallback below still reads
+                // the *old* `active_states`, so don't move `next` in until then).
+                let (mi, next) = active_states.advance_element_with_info(
                     nfa,
                     name,
                     namespace,
@@ -269,24 +271,6 @@ impl ContentValidatorState {
                     process_contents: mi.process_contents,
                 };
 
-                let next = match xsd_version {
-                    XsdVersion::V1_0 => active_states.advance_from(
-                        nfa,
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
-                        xsd_version,
-                    ),
-                    XsdVersion::V1_1 => active_states.advance_with_priority_from(
-                        nfa,
-                        name,
-                        namespace,
-                        target_ns,
-                        subst_groups,
-                        xsd_version,
-                    ),
-                };
                 if next.is_empty() {
                     // No NFA transition matched — try open content wildcard
                     if let Some(oc) = open_content {
@@ -307,7 +291,18 @@ impl ContentValidatorState {
                             // Suffix mode: lock NFA to accept-only so no declared elements
                             // are accepted after the first open-content element (§3.10.4 suffix semantics).
                             if matches!(oc.mode, TypesOpenContentMode::Suffix) {
-                                *active_states = ActiveStates::Simple([nfa.accept_state].into());
+                                // Lock to the accept state only. The accept state is a
+                                // terminal sink, so the singleton is already closure-closed;
+                                // for a counted NFA we must NOT call the counter-free
+                                // `epsilon_closure` (it asserts no counters and ignores
+                                // counter transitions). Use the explicit closure only on
+                                // the counter-free path to keep the invariant defensively.
+                                let accept_only = if nfa.has_counters() {
+                                    StateSet::single(nfa.accept_state)
+                                } else {
+                                    epsilon_closure(nfa, std::iter::once(nfa.accept_state))
+                                };
+                                *active_states = ActiveStates::Simple(accept_only);
                             }
                             return Some(ElementMatchInfo {
                                 element_key: None,

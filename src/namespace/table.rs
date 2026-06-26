@@ -18,9 +18,8 @@
 //! during XPath function evaluation).
 
 use crate::ids::NameId;
+use ahash::RandomState;
 use std::cell::RefCell;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Entry in the name table
 ///
@@ -64,6 +63,12 @@ pub struct NameTable {
     entries: RefCell<Vec<Entry>>,
     /// Hash buckets (index into entries via first entry in chain)
     buckets: RefCell<Vec<i32>>,
+    /// Per-table keyed hasher (ahash). Fast and DoS-resistant: the random seed
+    /// is fixed for this table's lifetime (so cached `Entry.hash` stays valid)
+    /// but unpredictable across tables, defeating hash-collision attacks on
+    /// names interned from untrusted input. `NameId` is assigned by insertion
+    /// order, independent of the hash, so interning results stay deterministic.
+    hasher: RandomState,
 }
 
 impl NameTable {
@@ -75,6 +80,7 @@ impl NameTable {
         let table = Self {
             entries: RefCell::new(Vec::with_capacity(Self::INITIAL_BUCKETS)),
             buckets: RefCell::new(vec![-1; Self::INITIAL_BUCKETS]),
+            hasher: RandomState::new(),
         };
 
         // Pre-seed standard values
@@ -110,7 +116,7 @@ impl NameTable {
     ///
     /// Uses interior mutability, so this can be called through a shared reference.
     pub fn add(&self, value: &str) -> NameId {
-        let hash = Self::hash_str(value);
+        let hash = self.hash_str(value);
 
         // Check if already present (read-only borrow)
         if let Some(id) = self.find(value, hash) {
@@ -123,7 +129,7 @@ impl NameTable {
 
     /// Get the NameId for a string if it exists
     pub fn get(&self, value: &str) -> Option<NameId> {
-        let hash = Self::hash_str(value);
+        let hash = self.hash_str(value);
         self.find(value, hash)
     }
 
@@ -188,11 +194,14 @@ impl NameTable {
         self.entries.borrow().is_empty()
     }
 
-    /// Hash a string
-    fn hash_str(value: &str) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        value.hash(&mut hasher);
-        hasher.finish()
+    /// Hash a string with this table's keyed `ahash` hasher.
+    ///
+    /// `ahash` is much faster than SipHash but, unlike `FxHash`, keeps
+    /// hash-collision DoS resistance via a random per-table seed — important
+    /// because names are interned from untrusted XML/schema input. The seed is
+    /// fixed for the table's lifetime so cached `Entry.hash` values stay valid.
+    fn hash_str(&self, value: &str) -> u64 {
+        self.hasher.hash_one(value)
     }
 
     /// Find an existing entry

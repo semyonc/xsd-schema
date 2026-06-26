@@ -22,6 +22,7 @@ roxmltree = "0.19"           # Read-only tree for W3C test suite parsing
 # Data structures
 slotmap = "1.0"              # Arena storage with typed keys
 bitflags = "2.4"             # DerivationSet flags
+ahash = "0.8"                # Fast, DoS-resistant (keyed) hashing for name interning
 
 # Error handling
 thiserror = "1.0"            # Error derive macros
