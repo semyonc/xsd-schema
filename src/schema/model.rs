@@ -7,9 +7,9 @@
 
 use bitflags::bitflags;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
-use crate::arenas::SchemaArenas;
+use crate::arenas::ArenasGuard;
 use crate::ids::*;
 use crate::namespace::table::well_known;
 use crate::namespace::NameTable;
@@ -147,7 +147,7 @@ pub struct SchemaSet {
     pub regex_compatibility: RegexCompat,
 
     /// Arena storage for all components
-    pub arenas: SchemaArenas,
+    pub arenas: ArenasGuard,
 
     /// Loaded schema locations (for cycle detection)
     pub loaded_locations: HashMap<String, DocumentId>,
@@ -173,16 +173,6 @@ pub struct SchemaSet {
     /// These are structural errors that make the schema invalid but
     /// were deferred so parsing could continue for better diagnostics.
     pub parsing_errors: Vec<crate::error::SchemaError>,
-
-    /// Per-simple-type effective (base-chain-merged) facet sets, memoized on
-    /// first access. Replaces the per-value `collect_facets` base-chain walk +
-    /// clone on the validation hot path. Computed lazily *per entry* (not as a
-    /// single write-once snapshot) so the cache stays correct when more schemas
-    /// are loaded into a reused `SchemaSet` after an earlier validation pass —
-    /// a newly-added simple type is simply a cache miss that gets computed,
-    /// never a silent empty fallback. See `effective_facets` and
-    /// `PERF_LAZY_PSVI.md` (Phase 1).
-    effective_facets_cache: RwLock<HashMap<SimpleTypeKey, Arc<crate::types::facets::FacetSet>>>,
 }
 
 impl SchemaSet {
@@ -210,14 +200,13 @@ impl SchemaSet {
             namespaces: HashMap::new(),
             xsd_version: version,
             regex_compatibility: RegexCompat::Strict,
-            arenas: SchemaArenas::new(),
+            arenas: ArenasGuard::new(),
             loaded_locations: HashMap::new(),
             chameleon_cache: HashMap::new(),
             composition_edges: Vec::new(),
             effective_components: HashMap::new(),
             builtin_types: None,
             parsing_errors: Vec::new(),
-            effective_facets_cache: RwLock::new(HashMap::new()),
         };
 
         // Initialize built-in types
@@ -237,53 +226,15 @@ impl SchemaSet {
         self.xsd_version == XsdVersion::V1_1
     }
 
-    /// The effective facet set for a simple type — the type's own facets merged
-    /// with every base type's facets up the derivation chain (most-derived wins,
-    /// matching the inheritance rules `inherit_from` applies).
-    ///
-    /// Memoized per simple type so the validation hot path does a single map
-    /// lookup instead of re-walking the base chain and cloning a `FacetSet` per
-    /// value. The cache is filled on demand (cache miss → compute → insert), so
-    /// simple types added to a reused `SchemaSet` after an earlier validation
-    /// pass are computed correctly rather than silently treated as facet-free.
+    /// The effective (base-chain-merged) facet set for a simple type, memoized
+    /// on the arenas guard. Thin forwarder to [`ArenasGuard::effective_facets`];
+    /// the memo lives next to the arenas it caches so the guard's mutation gate
+    /// can invalidate it, keeping the cache consistent with the live arenas.
     pub(crate) fn effective_facets(
         &self,
         sk: SimpleTypeKey,
     ) -> Arc<crate::types::facets::FacetSet> {
-        if let Some(facets) = self.effective_facets_cache.read().unwrap().get(&sk) {
-            return Arc::clone(facets);
-        }
-        let computed = Arc::new(self.compute_effective_facets(sk));
-        self.effective_facets_cache
-            .write()
-            .unwrap()
-            .insert(sk, Arc::clone(&computed));
-        computed
-    }
-
-    /// Compute the effective (base-chain-merged) facet set for one simple type.
-    /// Mirrors the former `validation::simple::collect_facets`: start from the
-    /// most-derived facets, then `inherit_from` each base (fills only missing
-    /// values, so derived facets take priority). Cycle-guarded at depth 100.
-    fn compute_effective_facets(&self, sk: SimpleTypeKey) -> crate::types::facets::FacetSet {
-        let Some(st) = self.arenas.simple_types.get(sk) else {
-            return crate::types::facets::FacetSet::new();
-        };
-        let mut facets = st.facets.clone();
-        let mut current_base = st.resolved_base_type;
-        for _ in 0..100 {
-            match current_base {
-                Some(TypeKey::Simple(base_sk)) => match self.arenas.simple_types.get(base_sk) {
-                    Some(base_data) => {
-                        facets.inherit_from(&base_data.facets);
-                        current_base = base_data.resolved_base_type;
-                    }
-                    None => break,
-                },
-                _ => break,
-            }
-        }
-        facets
+        self.arenas.effective_facets(sk)
     }
 
     /// Set the regex compatibility mode for this schema set.

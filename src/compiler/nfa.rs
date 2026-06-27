@@ -2393,6 +2393,7 @@ mod tests {
 
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -2428,6 +2429,7 @@ mod tests {
 
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -2475,6 +2477,7 @@ mod tests {
 
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()

@@ -993,6 +993,7 @@ pub fn allocate_content_particle_elements(schema_set: &mut SchemaSet) -> SchemaR
 
         if let Some(ct) = schema_set
             .arenas
+            .entries_mut()
             .complex_types
             .get_mut(job.complex_type_key)
         {
@@ -1057,7 +1058,7 @@ pub fn resolve_local_element_alternatives(
     for (elem_key, alt_idx, qname, src) in qname_pending {
         let resolver = crate::schema::resolver::ReferenceResolver::new(schema_set);
         let type_key = resolver.resolve_type_ref(&qname, src.as_ref())?;
-        if let Some(elem) = schema_set.arenas.elements.get_mut(elem_key) {
+        if let Some(elem) = schema_set.arenas.entries_mut().elements.get_mut(elem_key) {
             if let Some(alt) = elem.alternatives.get_mut(alt_idx) {
                 alt.resolved_type = Some(type_key);
             }
@@ -1085,7 +1086,7 @@ pub fn resolve_local_element_alternatives(
         if let TypeKey::Complex(ct_key) = type_key {
             new_complex_keys.push(ct_key);
         }
-        if let Some(elem) = schema_set.arenas.elements.get_mut(elem_key) {
+        if let Some(elem) = schema_set.arenas.entries_mut().elements.get_mut(elem_key) {
             if let Some(alt) = elem.alternatives.get_mut(alt_idx) {
                 alt.resolved_type = Some(type_key);
             }
@@ -1269,7 +1270,12 @@ pub fn allocate_model_group_particle_elements(schema_set: &mut SchemaSet) -> Sch
 
         let elem_key = schema_set.arenas.alloc_element(elem_data);
 
-        if let Some(group) = schema_set.arenas.model_groups.get_mut(job.group_key) {
+        if let Some(group) = schema_set
+            .arenas
+            .entries_mut()
+            .model_groups
+            .get_mut(job.group_key)
+        {
             while group.resolved_particle_elements.len() <= job.particle_idx {
                 group.resolved_particle_elements.push(None);
             }
@@ -1416,7 +1422,7 @@ fn update_owner(
 ) -> SchemaResult<()> {
     match job.owner {
         InlineOwner::Element(key) => {
-            if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+            if let Some(elem) = schema_set.arenas.entries_mut().elements.get_mut(key) {
                 match job.role {
                     #[cfg(feature = "xsd11")]
                     InlineRole::AlternativeType(idx) => {
@@ -1433,14 +1439,14 @@ fn update_owner(
             }
         }
         InlineOwner::Attribute(key) => {
-            if let Some(attr) = schema_set.arenas.attributes.get_mut(key) {
+            if let Some(attr) = schema_set.arenas.entries_mut().attributes.get_mut(key) {
                 attr.resolved_type = Some(type_key);
                 stats.attribute_inline_types += 1;
                 stats.total_inline_types += 1;
             }
         }
         InlineOwner::SimpleType(key) => {
-            if let Some(simple) = schema_set.arenas.simple_types.get_mut(key) {
+            if let Some(simple) = schema_set.arenas.entries_mut().simple_types.get_mut(key) {
                 match job.role {
                     InlineRole::SimpleTypeBase => {
                         simple.resolved_base_type = Some(type_key);
@@ -1465,7 +1471,7 @@ fn update_owner(
             }
         }
         InlineOwner::ComplexType(key) => {
-            if let Some(complex) = schema_set.arenas.complex_types.get_mut(key) {
+            if let Some(complex) = schema_set.arenas.entries_mut().complex_types.get_mut(key) {
                 match job.role {
                     InlineRole::ComplexTypeBase => {
                         complex.resolved_base_type = Some(type_key);
@@ -1499,7 +1505,7 @@ fn update_owner(
             }
         }
         InlineOwner::ModelGroup(key) => {
-            if let Some(group) = schema_set.arenas.model_groups.get_mut(key) {
+            if let Some(group) = schema_set.arenas.entries_mut().model_groups.get_mut(key) {
                 if let InlineRole::ModelGroupParticle(flat_idx) = job.role {
                     // Store in flat-indexed resolved_particle_types
                     while group.resolved_particle_types.len() <= flat_idx {
@@ -1512,7 +1518,12 @@ fn update_owner(
             }
         }
         InlineOwner::AttributeGroup(key) => {
-            if let Some(group) = schema_set.arenas.attribute_groups.get_mut(key) {
+            if let Some(group) = schema_set
+                .arenas
+                .entries_mut()
+                .attribute_groups
+                .get_mut(key)
+            {
                 if let InlineRole::AttributeGroupAttribute(idx) = job.role {
                     // Ensure resolved_attributes vec is large enough
                     while group.resolved_attributes.len() <= idx {

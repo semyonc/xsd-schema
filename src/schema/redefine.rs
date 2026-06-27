@@ -115,7 +115,12 @@ fn apply_simple_type_redefine(
 
     // Store original type key for base-type redirection during resolution
     if let TypeKey::Simple(orig_key) = original_key {
-        if let Some(st) = schema_set.arenas.simple_types.get_mut(new_key) {
+        if let Some(st) = schema_set
+            .arenas
+            .entries_mut()
+            .simple_types
+            .get_mut(new_key)
+        {
             st.redefine_original = Some(orig_key);
         }
     }
@@ -206,7 +211,12 @@ fn apply_complex_type_redefine(
 
     // Store original type key for base-type redirection during resolution
     if let TypeKey::Complex(orig_key) = original_key {
-        if let Some(ct) = schema_set.arenas.complex_types.get_mut(new_key) {
+        if let Some(ct) = schema_set
+            .arenas
+            .entries_mut()
+            .complex_types
+            .get_mut(new_key)
+        {
             ct.redefine_original = Some(orig_key);
         }
     }
@@ -295,7 +305,12 @@ fn apply_model_group_redefine(
     // Store original key so self-references can be redirected during resolution.
     // When the redefine has zero self-references, flag it for the deferred
     // §src-redefine 6.2.2 restriction check in `validate_all_derivations`.
-    if let Some(group) = schema_set.arenas.model_groups.get_mut(new_key) {
+    if let Some(group) = schema_set
+        .arenas
+        .entries_mut()
+        .model_groups
+        .get_mut(new_key)
+    {
         group.redefine_original = Some(original_key);
         group.redefine_requires_restriction_check = !has_self_ref;
     }
@@ -384,7 +399,12 @@ fn apply_attribute_group_redefine(
     // Store original key so self-references can be redirected during resolution.
     // When the redefine has zero self-references, flag it for the deferred
     // §src-redefine 7.2.2 restriction check in `validate_all_derivations`.
-    if let Some(group) = schema_set.arenas.attribute_groups.get_mut(new_key) {
+    if let Some(group) = schema_set
+        .arenas
+        .entries_mut()
+        .attribute_groups
+        .get_mut(new_key)
+    {
         group.redefine_original = Some(original_key);
         group.redefine_requires_restriction_check = !has_self_ref;
     }

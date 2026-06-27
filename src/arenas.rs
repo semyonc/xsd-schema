@@ -5,6 +5,10 @@
 //!
 //! Uses slotmap for O(1) insertion, lookup, and removal with generation tracking.
 
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::{Arc, RwLock};
+
 use slotmap::SlotMap;
 
 use crate::ids::*;
@@ -431,6 +435,152 @@ impl SchemaArenas {
         key: IdentityConstraintKey,
     ) -> Option<&mut IdentityConstraintData> {
         self.identity_constraints.get_mut(key)
+    }
+}
+
+/// Read-transparent, mutation-gated wrapper around [`SchemaArenas`].
+///
+/// `SchemaSet` stores its arenas behind this guard so the lazily-computed
+/// effective-facet cache (the `effective_facets` memo) can never go
+/// stale. That cache is keyed solely by `SimpleTypeKey`, so it is only correct
+/// as long as no *already-cached* simple type is mutated in place after the
+/// entry was filled. The guard makes that invariant **structural** rather than
+/// a load-bearing-but-undocumented convention:
+///
+/// * Shared access derefs straight through to `&SchemaArenas`, so every read
+///   (`arenas.simple_types.get(..)`, `arenas.get_element(..)`, …) is unchanged
+///   and zero-cost.
+/// * There is intentionally no `DerefMut`. The only way to obtain
+///   `&mut SchemaArenas` — and therefore to `get_mut`/index-mut an *existing*
+///   component — is [`ArenasGuard::entries_mut`], which **clears the
+///   effective-facet cache first**. A facet/base-chain edit can never outlive
+///   the cache entry it would invalidate.
+/// * Allocating a *new* component is always cache-safe (a fresh `SimpleTypeKey`
+///   is a cache miss that recomputes correctly), so the `alloc_*` paths are
+///   forwarded without clearing the cache.
+///
+/// This realizes the "move the mutate-phase behind a `&mut` gate" fix: every
+/// mutation of existing arena state passes through the cache-clearing gate, so
+/// the cache is provably consistent with the live arenas at all times.
+#[derive(Debug, Default)]
+pub struct ArenasGuard {
+    inner: SchemaArenas,
+    /// Per-simple-type effective (base-chain-merged) facet sets, memoized on
+    /// first access and invalidated by [`entries_mut`](Self::entries_mut).
+    /// Computed lazily *per entry* (not a write-once snapshot), so a simple type
+    /// added to a reused `SchemaSet` after an earlier validation pass is a cache
+    /// miss that gets computed, never a silent empty fallback.
+    effective_facets_cache: RwLock<HashMap<SimpleTypeKey, Arc<FacetSet>>>,
+}
+
+impl ArenasGuard {
+    /// Create an empty guard wrapping empty arenas.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Borrow the arenas mutably to mutate *existing* components in place (e.g.
+    /// filling `resolved_*` fields during compilation, applying redefine/override),
+    /// clearing the effective-facet cache first so no stale entry can survive the
+    /// edit. This is the sole source of `&mut SchemaArenas` (see the type docs).
+    /// Allocating new components needs no gate — use the `alloc_*` forwarders.
+    pub fn entries_mut(&mut self) -> &mut SchemaArenas {
+        // `&mut self` already guarantees exclusivity, so `get_mut` needs no lock.
+        self.effective_facets_cache.get_mut().unwrap().clear();
+        &mut self.inner
+    }
+
+    // -- Allocation forwarders (new key => always cache-safe) ---------------
+
+    pub fn alloc_simple_type(&mut self, data: SimpleTypeDefData) -> SimpleTypeKey {
+        self.inner.alloc_simple_type(data)
+    }
+
+    pub fn alloc_complex_type(&mut self, data: ComplexTypeDefData) -> ComplexTypeKey {
+        self.inner.alloc_complex_type(data)
+    }
+
+    pub fn alloc_element(&mut self, data: ElementDeclData) -> ElementKey {
+        self.inner.alloc_element(data)
+    }
+
+    pub fn alloc_attribute(&mut self, data: AttributeDeclData) -> AttributeKey {
+        self.inner.alloc_attribute(data)
+    }
+
+    pub fn alloc_attribute_group(&mut self, data: AttributeGroupData) -> AttributeGroupKey {
+        self.inner.alloc_attribute_group(data)
+    }
+
+    pub fn alloc_model_group(&mut self, data: ModelGroupData) -> ModelGroupKey {
+        self.inner.alloc_model_group(data)
+    }
+
+    pub fn alloc_notation(&mut self, data: NotationData) -> NotationKey {
+        self.inner.alloc_notation(data)
+    }
+
+    pub fn alloc_identity_constraint(
+        &mut self,
+        data: IdentityConstraintData,
+    ) -> IdentityConstraintKey {
+        self.inner.alloc_identity_constraint(data)
+    }
+
+    // -- Effective-facet cache ----------------------------------------------
+
+    /// The effective facet set for a simple type — the type's own facets merged
+    /// with every base type's facets up the derivation chain (most-derived
+    /// wins, matching the inheritance rules `inherit_from` applies).
+    ///
+    /// Memoized per simple type so the validation hot path does a single map
+    /// lookup instead of re-walking the base chain and cloning a `FacetSet` per
+    /// value. Filled on demand (miss → compute → insert); wiped wholesale by
+    /// [`entries_mut`](Self::entries_mut), so it is always consistent with the
+    /// current arena contents.
+    pub(crate) fn effective_facets(&self, sk: SimpleTypeKey) -> Arc<FacetSet> {
+        if let Some(facets) = self.effective_facets_cache.read().unwrap().get(&sk) {
+            return Arc::clone(facets);
+        }
+        let computed = Arc::new(self.compute_effective_facets(sk));
+        self.effective_facets_cache
+            .write()
+            .unwrap()
+            .insert(sk, Arc::clone(&computed));
+        computed
+    }
+
+    /// Compute the effective (base-chain-merged) facet set for one simple type.
+    /// Start from the most-derived facets, then `inherit_from` each base (fills
+    /// only missing values, so derived facets take priority). Cycle-guarded at
+    /// depth 100.
+    fn compute_effective_facets(&self, sk: SimpleTypeKey) -> FacetSet {
+        let Some(st) = self.inner.simple_types.get(sk) else {
+            return FacetSet::new();
+        };
+        let mut facets = st.facets.clone();
+        let mut current_base = st.resolved_base_type;
+        for _ in 0..100 {
+            match current_base {
+                Some(TypeKey::Simple(base_sk)) => match self.inner.simple_types.get(base_sk) {
+                    Some(base_data) => {
+                        facets.inherit_from(&base_data.facets);
+                        current_base = base_data.resolved_base_type;
+                    }
+                    None => break,
+                },
+                _ => break,
+            }
+        }
+        facets
+    }
+}
+
+impl Deref for ArenasGuard {
+    type Target = SchemaArenas;
+
+    fn deref(&self) -> &SchemaArenas {
+        &self.inner
     }
 }
 

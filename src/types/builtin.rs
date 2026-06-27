@@ -494,7 +494,11 @@ impl BuiltinTypes {
             (entities, entity),
             (xsi_schema_location_type, any_uri),
         ] {
-            if let Some(st) = schema_set.arenas.get_simple_type_mut(list_key) {
+            if let Some(st) = schema_set
+                .arenas
+                .entries_mut()
+                .get_simple_type_mut(list_key)
+            {
                 st.resolved_item_type = Some(TypeKey::Simple(item_key));
             }
         }

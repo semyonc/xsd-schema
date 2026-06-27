@@ -1029,12 +1029,20 @@ mod tests {
 
         // Out-of-bounds values defer; the full path keeps the same cvc codes
         // whether PSVI retention is on or off.
-        for (val, code) in [("101", "cvc-maxInclusive-valid"), ("-1", "cvc-minInclusive-valid")] {
+        for (val, code) in [
+            ("101", "cvc-maxInclusive-valid"),
+            ("-1", "cvc-minInclusive-valid"),
+        ] {
             assert!(
                 try_validate_lexical_only(val, tk, &schema).is_none(),
                 "fast path should defer {val}"
             );
-            assert_eq!(validate_simple_type(val, tk, &schema).unwrap_err().constraint, code);
+            assert_eq!(
+                validate_simple_type(val, tk, &schema)
+                    .unwrap_err()
+                    .constraint,
+                code
+            );
         }
     }
 
@@ -1081,7 +1089,9 @@ mod tests {
         // Out-of-bounds decimal defers; full path reports the canonical code.
         assert!(try_validate_lexical_only("10.5", tk, &schema).is_none());
         assert_eq!(
-            validate_simple_type("10.5", tk, &schema).unwrap_err().constraint,
+            validate_simple_type("10.5", tk, &schema)
+                .unwrap_err()
+                .constraint,
             "cvc-maxInclusive-valid"
         );
     }

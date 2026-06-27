@@ -397,10 +397,12 @@ fn apply_d2_defaults(
     d2_final_default: DerivationSet,
     d2_doc_id: Option<DocumentId>,
 ) {
+    // Single mutation borrow through the cache-clearing gate for the whole batch.
+    let arenas = schema_set.arenas.entries_mut();
     for component in components {
         match component {
             OverrideComponent::SimpleType(key) => {
-                if let Some(st) = schema_set.arenas.get_simple_type_mut(*key) {
+                if let Some(st) = arenas.get_simple_type_mut(*key) {
                     if st.final_derivation.is_empty() {
                         st.final_derivation = d2_final_default;
                     }
@@ -408,7 +410,7 @@ fn apply_d2_defaults(
                 }
             }
             OverrideComponent::ComplexType(key) => {
-                if let Some(ct) = schema_set.arenas.get_complex_type_mut(*key) {
+                if let Some(ct) = arenas.get_complex_type_mut(*key) {
                     if ct.final_derivation.is_empty() {
                         ct.final_derivation = d2_final_default;
                     }
@@ -421,7 +423,7 @@ fn apply_d2_defaults(
                 }
             }
             OverrideComponent::Element(key) => {
-                if let Some(elem) = schema_set.arenas.get_element_mut(*key) {
+                if let Some(elem) = arenas.get_element_mut(*key) {
                     if elem.ref_name.is_none() {
                         if elem.block.is_empty() {
                             elem.block = d2_block_default;
@@ -437,23 +439,23 @@ fn apply_d2_defaults(
                 }
             }
             OverrideComponent::Attribute(key) => {
-                if let Some(attr) = schema_set.arenas.get_attribute_mut(*key) {
+                if let Some(attr) = arenas.get_attribute_mut(*key) {
                     set_defaults_doc(&mut attr.source, d2_doc_id);
                 }
             }
             OverrideComponent::Group(key) => {
-                if let Some(group) = schema_set.arenas.get_model_group_mut(*key) {
+                if let Some(group) = arenas.get_model_group_mut(*key) {
                     set_defaults_doc(&mut group.source, d2_doc_id);
                     set_defaults_doc_on_particles(&mut group.particles, d2_doc_id);
                 }
             }
             OverrideComponent::AttributeGroup(key) => {
-                if let Some(ag) = schema_set.arenas.get_attribute_group_mut(*key) {
+                if let Some(ag) = arenas.get_attribute_group_mut(*key) {
                     set_defaults_doc(&mut ag.source, d2_doc_id);
                 }
             }
             OverrideComponent::Notation(key) => {
-                if let Some(n) = schema_set.arenas.get_notation_mut(*key) {
+                if let Some(n) = arenas.get_notation_mut(*key) {
                     set_defaults_doc(&mut n.source, d2_doc_id);
                 }
             }

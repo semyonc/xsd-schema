@@ -366,6 +366,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -394,6 +395,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -418,7 +420,12 @@ mod tests {
         let member_type = TypeKey::Simple(schema_set.builtin_types().int);
 
         // Mark the head *type* as final for restriction — this must not block the member.
-        if let Some(type_def) = schema_set.arenas.simple_types.get_mut(head_type) {
+        if let Some(type_def) = schema_set
+            .arenas
+            .entries_mut()
+            .simple_types
+            .get_mut(head_type)
+        {
             type_def.final_derivation = DerivationSet::RESTRICTION;
         }
 
@@ -433,6 +440,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -462,6 +470,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -493,6 +502,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -524,6 +534,7 @@ mod tests {
                 .alloc_element(element_data(member_name, member_type, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()

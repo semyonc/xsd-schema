@@ -643,6 +643,7 @@ mod tests {
 
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()
@@ -679,6 +680,7 @@ mod tests {
             .alloc_element(element_data(member_name, None));
         schema_set
             .arenas
+            .entries_mut()
             .elements
             .get_mut(member_key)
             .unwrap()

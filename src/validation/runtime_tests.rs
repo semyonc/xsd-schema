@@ -9276,6 +9276,72 @@ fn test_effective_facets_cache_correct_after_incremental_load() {
     );
 }
 
+/// Regression guard for the effective-facet cache *invalidation* path (see
+/// `ArenasGuard`): populate the cache for a faceted type, mutate its facets
+/// *through `entries_mut()`*, and assert the next read reflects the new value —
+/// i.e. the gate invalidated the stale entry. (The bypassing form,
+/// `schema_set.arenas.simple_types.get_mut(key)`, does not even compile: the
+/// guard has no `DerefMut`.)
+#[test]
+fn test_effective_facets_cache_invalidated_on_mutation_through_gate() {
+    let mut schema_set = SchemaSet::new();
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="capped">
+                <xs:simpleType>
+                    <xs:restriction base="xs:string">
+                        <xs:maxLength value="3"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#
+            .as_bytes(),
+        "capped.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("failed to load schema");
+
+    // The single user-defined simple type — the one carrying a maxLength facet.
+    let key = schema_set
+        .arenas
+        .simple_types
+        .iter()
+        .find(|(_, data)| data.facets.max_length.is_some())
+        .map(|(k, _)| k)
+        .expect("faceted simple type should exist");
+
+    // First read populates the cache.
+    let before = schema_set.effective_facets(key);
+    assert_eq!(
+        before.max_length.as_ref().map(|f| f.value),
+        Some(3),
+        "effective maxLength should start at 3"
+    );
+
+    // Mutate the cached type's facets *through the cache-clearing gate*.
+    schema_set
+        .arenas
+        .entries_mut()
+        .simple_types
+        .get_mut(key)
+        .expect("type still present")
+        .facets
+        .max_length
+        .as_mut()
+        .expect("maxLength facet present")
+        .value = 5;
+
+    // The next read must reflect the mutation — the gate invalidated the stale
+    // cache entry. A non-invalidating cache would still return 3 here.
+    let after = schema_set.effective_facets(key);
+    assert_eq!(
+        after.max_length.as_ref().map(|f| f.value),
+        Some(5),
+        "mutating facets through entries_mut() must invalidate the effective-facet cache"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // PERF_LAZY_PSVI Phase 3: allocation-free numeric (`i128`) fast path. With PSVI
 // retention off, integer-hierarchy and `xs:decimal` values are range/facet
@@ -9486,14 +9552,22 @@ fn test_psvi_optout_numeric_diagnostics_match_psvi_on() {
             v.validate_text(value);
             v.validate_end_element();
             v.end_validation().ok();
-            let mut c: Vec<String> = v.sink.errors.iter().map(|e| e.constraint.to_string()).collect();
+            let mut c: Vec<String> = v
+                .sink
+                .errors
+                .iter()
+                .map(|e| e.constraint.to_string())
+                .collect();
             c.sort();
             c
         };
 
         let on = codes(ValidationFlags::default());
         let off = codes(psvi_off_flags());
-        assert!(!on.is_empty(), "<root>{value}</root> ({ty}) should be invalid");
+        assert!(
+            !on.is_empty(),
+            "<root>{value}</root> ({ty}) should be invalid"
+        );
         assert_eq!(
             on, off,
             "diagnostics for <root>{value}</root> ({ty}) must match on/off: on={on:?} off={off:?}"
