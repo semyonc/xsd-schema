@@ -100,6 +100,19 @@ pub fn from_value_error(
     }
 }
 
+/// Convert a type validation error using its default cvc-* constraint code.
+///
+/// Convenience over [`from_value_error`] for callers that don't override the
+/// code: it derives the constraint via [`value_error_constraint_code`] and
+/// builds the [`ValidationError`].
+pub fn from_value_error_default(
+    err: TypeValidationError,
+    location: Option<SourceLocation>,
+) -> ValidationError {
+    let constraint = value_error_constraint_code(&err);
+    from_value_error(constraint, err, location)
+}
+
 /// Convert a facet error to an instance validation error
 ///
 /// Use this when a `FacetError` needs to be reported with a specific cvc-* code.

@@ -53,7 +53,7 @@ pub use fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
 pub use nfa::{
     advance_states, advance_with_priority, epsilon_closure, term_matches as nfa_term_matches,
     ActiveConfig, ActiveStates, CounterDef, CounterId, MatchInfo, NfaState, NfaTable, NfaTerm,
-    NfaTransition, StateId, TransitionKind,
+    NfaTransition, StateId, StateSet, TransitionKind,
 };
 pub use particle::{apply_occurs, MaxOccurs};
 pub use substitution::{

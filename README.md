@@ -19,6 +19,24 @@
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,313 | 6 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 -- -s ../../XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
 
+## Benchmark
+
+Instance-validation throughput and memory for `xsd-schema`'s three ingestion
+strategies, over a synthetic dataset ≈ 15.56 MB — validated against its XSD. Each
+strategy runs in its own subprocess (so RSS deltas are clean), timing is averaged
+over 10 iterations, and the schema is compiled **once, off the clock**.
+
+- **streaming** — push-based, no DOM (`drive_quick_xml` + `SchemaValidator`)
+- **DOM (roxmltree)** — third-party tree via the `DomNavigator` trait
+- **DOM (BufferDoc)** — built-in compact 16-byte-node document
+
+| Strategy | Parser | Time | Throughput | RSS delta |
+| --- | --- | ---: | ---: | ---: | 
+| streaming | quick-xml | 438 ms | 35.5 MB/s | **752 KB** | 
+| DOM (roxmltree) | roxmltree | 435 ms | 35.7 MB/s | 88.6 MB |
+| DOM (BufferDoc) | quick-xml | 579 ms | 26.9 MB/s | 92.9 MB |
+
+
 
 # AI Disclosure
 

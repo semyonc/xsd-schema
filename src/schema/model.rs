@@ -7,8 +7,9 @@
 
 use bitflags::bitflags;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use crate::arenas::SchemaArenas;
+use crate::arenas::ArenasGuard;
 use crate::ids::*;
 use crate::namespace::table::well_known;
 use crate::namespace::NameTable;
@@ -146,7 +147,7 @@ pub struct SchemaSet {
     pub regex_compatibility: RegexCompat,
 
     /// Arena storage for all components
-    pub arenas: SchemaArenas,
+    pub arenas: ArenasGuard,
 
     /// Loaded schema locations (for cycle detection)
     pub loaded_locations: HashMap<String, DocumentId>,
@@ -199,7 +200,7 @@ impl SchemaSet {
             namespaces: HashMap::new(),
             xsd_version: version,
             regex_compatibility: RegexCompat::Strict,
-            arenas: SchemaArenas::new(),
+            arenas: ArenasGuard::new(),
             loaded_locations: HashMap::new(),
             chameleon_cache: HashMap::new(),
             composition_edges: Vec::new(),
@@ -223,6 +224,17 @@ impl SchemaSet {
     /// Returns `true` if this schema set is configured for XSD 1.1.
     pub fn is_xsd11(&self) -> bool {
         self.xsd_version == XsdVersion::V1_1
+    }
+
+    /// The effective (base-chain-merged) facet set for a simple type, memoized
+    /// on the arenas guard. Thin forwarder to [`ArenasGuard::effective_facets`];
+    /// the memo lives next to the arenas it caches so the guard's mutation gate
+    /// can invalidate it, keeping the cache consistent with the live arenas.
+    pub(crate) fn effective_facets(
+        &self,
+        sk: SimpleTypeKey,
+    ) -> Arc<crate::types::facets::FacetSet> {
+        self.arenas.effective_facets(sk)
     }
 
     /// Set the regex compatibility mode for this schema set.

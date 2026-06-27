@@ -375,7 +375,8 @@ fn drain_pending_ic_refs_for(
     defer_failures: bool,
     errors: &mut Vec<SchemaError>,
 ) {
-    let pending = std::mem::take(&mut schema_set.arenas.elements[key].pending_ic_refs);
+    let pending =
+        std::mem::take(&mut schema_set.arenas.entries_mut().elements[key].pending_ic_refs);
     if pending.is_empty() {
         return;
     }
@@ -390,7 +391,7 @@ fn drain_pending_ic_refs_for(
             schema_set,
         ) {
             Ok(target_key) => {
-                schema_set.arenas.elements[key]
+                schema_set.arenas.entries_mut().elements[key]
                     .identity_constraints
                     .push(target_key);
             }
@@ -404,7 +405,7 @@ fn drain_pending_ic_refs_for(
         }
     }
     if !still_pending.is_empty() {
-        schema_set.arenas.elements[key].pending_ic_refs = still_pending;
+        schema_set.arenas.entries_mut().elements[key].pending_ic_refs = still_pending;
     }
 }
 
@@ -487,7 +488,12 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                             .get(head_key)
                             .and_then(|h| h.resolved_type)
                         {
-                            let elem = schema_set.arenas.elements.get_mut(key).unwrap();
+                            let elem = schema_set
+                                .arenas
+                                .entries_mut()
+                                .elements
+                                .get_mut(key)
+                                .unwrap();
                             assign_element_type(elem, head_type);
                             changed = true;
                             break;
@@ -529,7 +535,7 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
                     })
             };
             if let Some(deferred) = inherited {
-                if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+                if let Some(elem) = schema_set.arenas.entries_mut().elements.get_mut(key) {
                     elem.deferred_type_error = Some(deferred);
                 }
             }
@@ -540,8 +546,9 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         // `type` attribute — runtime must report the deferred error rather than
         // silently substituting `xs:anyType`.
         let any_type = TypeKey::Complex(schema_set.any_type_key());
+        let arenas = schema_set.arenas.entries_mut();
         for &key in &element_keys {
-            if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+            if let Some(elem) = arenas.elements.get_mut(key) {
                 if elem.resolved_type.is_none()
                     && elem.resolved_ref.is_none()
                     && elem.deferred_type_error.is_none()
@@ -689,7 +696,12 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         };
         if let Some(Some(group_key)) = doc_default_attr_groups.get(doc_id as usize) {
             let group_key = *group_key;
-            let type_def = schema_set.arenas.complex_types.get_mut(key).unwrap();
+            let type_def = schema_set
+                .arenas
+                .entries_mut()
+                .complex_types
+                .get_mut(key)
+                .unwrap();
             if !type_def.resolved_attribute_groups.contains(&group_key) {
                 type_def.resolved_attribute_groups.push(group_key);
             }
@@ -924,7 +936,7 @@ fn resolve_element_references(
     };
 
     // Store resolved references back
-    if let Some(elem) = schema_set.arenas.elements.get_mut(key) {
+    if let Some(elem) = schema_set.arenas.entries_mut().elements.get_mut(key) {
         elem.resolved_type = resolved_type;
         elem.resolved_ref = resolved_ref;
         elem.resolved_substitution_groups = resolved_subst_groups;
@@ -1031,7 +1043,7 @@ fn resolve_attribute_references(
     };
 
     // Store resolved references back
-    if let Some(attr) = schema_set.arenas.attributes.get_mut(key) {
+    if let Some(attr) = schema_set.arenas.entries_mut().attributes.get_mut(key) {
         attr.resolved_type = resolved_type;
         attr.resolved_ref = resolved_ref;
     }
@@ -1187,7 +1199,7 @@ fn resolve_simple_type_references(
     };
 
     // Store resolved references back
-    if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
+    if let Some(type_def) = schema_set.arenas.entries_mut().simple_types.get_mut(key) {
         type_def.resolved_base_type = resolved_base;
         type_def.resolved_item_type = resolved_item;
         type_def.resolved_member_types = resolved_members;
@@ -1210,7 +1222,7 @@ fn resolve_simple_type_references(
                 (SimpleTypeVariety::Atomic, Vec::new(), None, None)
             }
         };
-        if let Some(type_def) = schema_set.arenas.simple_types.get_mut(key) {
+        if let Some(type_def) = schema_set.arenas.entries_mut().simple_types.get_mut(key) {
             if type_def.variety == SimpleTypeVariety::Atomic
                 && base_variety != SimpleTypeVariety::Atomic
             {
@@ -1358,7 +1370,7 @@ fn resolve_complex_type_references(
     }
 
     // Store resolved references back
-    if let Some(type_def) = schema_set.arenas.complex_types.get_mut(key) {
+    if let Some(type_def) = schema_set.arenas.entries_mut().complex_types.get_mut(key) {
         type_def.resolved_base_type = resolved_base;
         type_def.resolved_attribute_groups = resolved_attr_groups;
         type_def.resolved_attributes = resolved_attrs;
@@ -1507,7 +1519,7 @@ fn resolve_model_group_references(
     )?;
 
     // Store resolved references back
-    if let Some(group) = schema_set.arenas.model_groups.get_mut(key) {
+    if let Some(group) = schema_set.arenas.entries_mut().model_groups.get_mut(key) {
         group.resolved_ref = resolved_ref;
         group.resolved_particles = resolved_particles;
         group.resolved_particle_types = resolved_particle_types;
@@ -1667,7 +1679,12 @@ fn resolve_attribute_group_references(
     }
 
     // Store resolved references back
-    if let Some(group) = schema_set.arenas.attribute_groups.get_mut(key) {
+    if let Some(group) = schema_set
+        .arenas
+        .entries_mut()
+        .attribute_groups
+        .get_mut(key)
+    {
         group.resolved_ref = resolved_ref;
         group.resolved_attribute_groups = resolved_nested;
         group.resolved_attributes = resolved_attrs;

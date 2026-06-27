@@ -8970,3 +8970,607 @@ fn test_root_xsi_type_unresolved_emits_cvc_elt_1() {
         codes
     );
 }
+
+// ---------------------------------------------------------------------------
+// PERF_LAZY_PSVI: BUILD_PSVI_TYPED_VALUES opt-out (Phase 2) + facet cache
+// correctness (Phase 1). The contract: clearing the flag must never change
+// validity — values are still materialized internally wherever a facet,
+// fixed/default, ID, QName, or identity constraint needs them; the only
+// observable change is that PSVI typed/normalized values may be `None` on the
+// returned `SchemaInfo` for nodes whose value nothing else needed.
+// ---------------------------------------------------------------------------
+
+/// Flags with PSVI value retention opted out (everything else at defaults).
+fn psvi_off_flags() -> ValidationFlags {
+    ValidationFlags::default() & !ValidationFlags::BUILD_PSVI_TYPED_VALUES
+}
+
+#[test]
+fn test_psvi_optout_string_typed_value_none() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello world");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_none(),
+        "opt-out: string typed_value should not be retained"
+    );
+    assert!(
+        end_info.normalized_value.is_none(),
+        "opt-out: normalized_value should not be retained"
+    );
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_psvi_default_retains_string_typed_value() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string"/>
+        </xs:schema>"#,
+    );
+    // Default flags keep BUILD_PSVI_TYPED_VALUES — back-compat contract.
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("hello world");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_some(),
+        "default: typed_value must still be retained"
+    );
+    assert!(v.end_validation().is_ok());
+}
+
+#[test]
+fn test_psvi_optout_string_maxlength_facet_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:simpleType>
+                    <xs:restriction base="xs:string">
+                        <xs:maxLength value="3"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    // Violation is rejected even though no value is materialized.
+    {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("toolong");
+        let end_info = v.validate_end_element();
+        assert_eq!(
+            end_info.validity,
+            SchemaValidity::Invalid,
+            "maxLength must be enforced with PSVI off"
+        );
+        v.end_validation().ok();
+        assert!(!v.sink.errors.is_empty());
+    }
+
+    // In-bounds value passes, still without a retained typed value.
+    {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("ok");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+        assert!(end_info.typed_value.is_none());
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+}
+
+#[test]
+fn test_psvi_optout_element_fixed_value_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:string" fixed="yes"/>
+        </xs:schema>"#,
+    );
+
+    // Mismatch: the fast path is gated off when a fixed value is present, so the
+    // value is built and the fixed-value check (cvc-elt.5.2.2) still runs.
+    {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("no");
+        let end_info = v.validate_end_element();
+        assert_eq!(
+            end_info.validity,
+            SchemaValidity::Invalid,
+            "fixed-value mismatch must fail with PSVI off"
+        );
+        v.end_validation().ok();
+    }
+
+    // Match passes.
+    {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("yes");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+}
+
+#[test]
+fn test_psvi_optout_attribute_facet_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="code">
+                        <xs:simpleType>
+                            <xs:restriction base="xs:string">
+                                <xs:maxLength value="3"/>
+                            </xs:restriction>
+                        </xs:simpleType>
+                    </xs:attribute>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let attr_info = v.validate_attribute("code", "", "toolong");
+    assert_eq!(
+        attr_info.validity,
+        SchemaValidity::Invalid,
+        "attribute maxLength must be enforced with PSVI off"
+    );
+    assert!(
+        attr_info.typed_value.is_none(),
+        "opt-out: attribute typed_value should not be retained"
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_optout_id_duplicate_still_detected() {
+    // xs:ID is not string-family, so it takes the full (value-building) path
+    // even with PSVI off — ID collection must still fire.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="id" type="xs:ID" use="required"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "a1");
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_element("item", "", None, None, &ns);
+    v.validate_attribute("id", "", "a1"); // duplicate
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+
+    v.validate_end_element();
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-id.2"),
+        "duplicate ID must be detected with PSVI off, got: {:?}",
+        v.sink.errors
+    );
+}
+
+/// Regression guard for the Phase-1 cache: a simple type added to a reused
+/// `SchemaSet` *after* an earlier validation pass populated the effective-facet
+/// cache must still have its facets enforced. A write-once snapshot cache would
+/// miss the new type and silently skip its facets.
+#[test]
+fn test_effective_facets_cache_correct_after_incremental_load() {
+    let mut schema_set = SchemaSet::new();
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="alpha" type="xs:string"/>
+        </xs:schema>"#
+            .as_bytes(),
+        "a.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("failed to load schema A");
+
+    // First pass — touches the effective-facets cache.
+    {
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("alpha", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("anything");
+        v.validate_end_element();
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    }
+
+    // Add a NEW faceted simple type after the cache was populated.
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="beta">
+                <xs:simpleType>
+                    <xs:restriction base="xs:string">
+                        <xs:maxLength value="3"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#
+            .as_bytes(),
+        "b.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("failed to load schema B");
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("beta", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("toolong");
+    let end_info = v.validate_end_element();
+    v.end_validation().ok();
+
+    assert_eq!(
+        end_info.validity,
+        SchemaValidity::Invalid,
+        "maxLength on a type added after the cache was populated must still be enforced"
+    );
+}
+
+/// Regression guard for the effective-facet cache *invalidation* path (see
+/// `ArenasGuard`): populate the cache for a faceted type, mutate its facets
+/// *through `entries_mut()`*, and assert the next read reflects the new value —
+/// i.e. the gate invalidated the stale entry. (The bypassing form,
+/// `schema_set.arenas.simple_types.get_mut(key)`, does not even compile: the
+/// guard has no `DerefMut`.)
+#[test]
+fn test_effective_facets_cache_invalidated_on_mutation_through_gate() {
+    let mut schema_set = SchemaSet::new();
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="capped">
+                <xs:simpleType>
+                    <xs:restriction base="xs:string">
+                        <xs:maxLength value="3"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#
+            .as_bytes(),
+        "capped.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("failed to load schema");
+
+    // The single user-defined simple type — the one carrying a maxLength facet.
+    let key = schema_set
+        .arenas
+        .simple_types
+        .iter()
+        .find(|(_, data)| data.facets.max_length.is_some())
+        .map(|(k, _)| k)
+        .expect("faceted simple type should exist");
+
+    // First read populates the cache.
+    let before = schema_set.effective_facets(key);
+    assert_eq!(
+        before.max_length.as_ref().map(|f| f.value),
+        Some(3),
+        "effective maxLength should start at 3"
+    );
+
+    // Mutate the cached type's facets *through the cache-clearing gate*.
+    schema_set
+        .arenas
+        .entries_mut()
+        .simple_types
+        .get_mut(key)
+        .expect("type still present")
+        .facets
+        .max_length
+        .as_mut()
+        .expect("maxLength facet present")
+        .value = 5;
+
+    // The next read must reflect the mutation — the gate invalidated the stale
+    // cache entry. A non-invalidating cache would still return 3 here.
+    let after = schema_set.effective_facets(key);
+    assert_eq!(
+        after.max_length.as_ref().map(|f| f.value),
+        Some(5),
+        "mutating facets through entries_mut() must invalidate the effective-facet cache"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PERF_LAZY_PSVI Phase 3: allocation-free numeric (`i128`) fast path. With PSVI
+// retention off, integer-hierarchy and `xs:decimal` values are range/facet
+// checked without building a `BigInt` or retaining an `XmlValue`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_psvi_optout_int_typed_value_none() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_none(),
+        "opt-out: int typed_value should not be retained (no BigInt built)"
+    );
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_psvi_default_retains_int_typed_value() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("42");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    assert!(
+        end_info.typed_value.is_some(),
+        "default: int typed_value must still be retained"
+    );
+    assert!(v.end_validation().is_ok());
+}
+
+#[test]
+fn test_psvi_optout_int_out_of_range_rejected() {
+    // Out of the native xs:int range but within i128: the built-in maxInclusive
+    // facet must still reject it on the fast path.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:int"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("9999999999");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(
+        end_info.validity,
+        SchemaValidity::Invalid,
+        "out-of-range int must be rejected with PSVI off"
+    );
+    v.end_validation().ok();
+    assert!(!v.sink.errors.is_empty());
+}
+
+#[test]
+fn test_psvi_optout_integer_restriction_bounds_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:simpleType>
+                    <xs:restriction base="xs:integer">
+                        <xs:minInclusive value="0"/>
+                        <xs:maxInclusive value="100"/>
+                    </xs:restriction>
+                </xs:simpleType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+
+    for (text, expect_valid) in [("50", true), ("150", false), ("-1", false)] {
+        let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text(text);
+        let end_info = v.validate_end_element();
+        let expected = if expect_valid {
+            SchemaValidity::Valid
+        } else {
+            SchemaValidity::Invalid
+        };
+        assert_eq!(
+            end_info.validity, expected,
+            "value {text} should be {expected:?} with PSVI off"
+        );
+        if expect_valid {
+            assert!(
+                end_info.typed_value.is_none(),
+                "opt-out: in-bounds integer typed_value should not be retained"
+            );
+        }
+        v.end_validation().ok();
+    }
+}
+
+#[test]
+fn test_psvi_optout_huge_integer_valid() {
+    // A 40-digit xs:integer overflows i128, so the fast path defers to the
+    // BigInt full path, which validates it — verdict must stay valid.
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root" type="xs:integer"/>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("1234567890123456789012345678901234567890");
+    let end_info = v.validate_end_element();
+
+    assert_eq!(end_info.validity, SchemaValidity::Valid);
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+#[test]
+fn test_psvi_optout_numeric_attribute_facet_enforced() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="n" type="xs:unsignedByte"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, psvi_off_flags());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    v.validate_element("root", "", None, None, &ns);
+    let attr_info = v.validate_attribute("n", "", "300"); // > 255
+    assert_eq!(
+        attr_info.validity,
+        SchemaValidity::Invalid,
+        "unsignedByte attribute range must be enforced with PSVI off"
+    );
+    assert!(
+        attr_info.typed_value.is_none(),
+        "opt-out: numeric attribute typed_value should not be retained"
+    );
+    v.validate_end_of_attributes();
+    v.validate_end_element();
+    v.end_validation().ok();
+}
+
+#[test]
+fn test_psvi_optout_numeric_diagnostics_match_psvi_on() {
+    // Flipping BUILD_PSVI_TYPED_VALUES is a pure perf toggle: the diagnostics
+    // (constraint codes) emitted for invalid numeric values must be identical
+    // whether retention is on or off. The numeric fast path guarantees this by
+    // *deferring* every error to the full path rather than synthesizing its own.
+    let cases: &[(&str, &str)] = &[
+        ("xs:int", "9999999999"),        // over native range (cvc-datatype-valid)
+        ("xs:byte", "200"),              // over native range
+        ("xs:unsignedByte", "-1"),       // negative for unsigned
+        ("xs:nonNegativeInteger", "-5"), // negative
+        ("xs:positiveInteger", "0"),     // zero
+        ("xs:integer", "12.5"),          // not an integer
+        ("xs:decimal", "x"),             // not a number
+    ];
+
+    for &(ty, value) in cases {
+        let schema_set = load_schema(&format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="{ty}"/>
+            </xs:schema>"#
+        ));
+
+        let codes = |flags: ValidationFlags| -> Vec<String> {
+            let validator = SchemaValidator::new(&schema_set, flags);
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            v.validate_element("root", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_text(value);
+            v.validate_end_element();
+            v.end_validation().ok();
+            let mut c: Vec<String> = v
+                .sink
+                .errors
+                .iter()
+                .map(|e| e.constraint.to_string())
+                .collect();
+            c.sort();
+            c
+        };
+
+        let on = codes(ValidationFlags::default());
+        let off = codes(psvi_off_flags());
+        assert!(
+            !on.is_empty(),
+            "<root>{value}</root> ({ty}) should be invalid"
+        );
+        assert_eq!(
+            on, off,
+            "diagnostics for <root>{value}</root> ({ty}) must match on/off: on={on:?} off={off:?}"
+        );
+    }
+}

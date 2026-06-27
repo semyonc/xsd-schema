@@ -116,15 +116,31 @@ bitflags! {
         /// Enable XSD 1.1 assertion processing (fragment buffering).
         #[cfg(feature = "xsd11")]
         const PROCESS_ASSERTIONS = 0x0010;
+        /// Retain the typed value (`SchemaInfo::typed_value`) and the schema
+        /// normalized value (`SchemaInfo::normalized_value`) for caller
+        /// consumption (PSVI). **On by default.**
+        ///
+        /// Clear this bit in streaming mode when you only need validity and
+        /// errors. The runtime still materializes a typed value *internally*
+        /// wherever validation requires it — a value-space facet (numeric
+        /// range, `totalDigits`, value-space `enumeration`), a `fixed`/`default`
+        /// comparison, an ID/IDREF/ENTITY or QName/NOTATION type, an active
+        /// identity constraint, or an XSD 1.1 assertion — so validity is
+        /// unaffected. The only observable change is that `typed_value` /
+        /// `normalized_value` may be `None` on the returned `SchemaInfo` for
+        /// nodes whose value nothing else needed. See `PERF_LAZY_PSVI.md`.
+        const BUILD_PSVI_TYPED_VALUES = 0x0020;
     }
 }
 
 impl Default for ValidationFlags {
     /// The strict-conformance defaults.
     ///
-    /// The default only enables `REPORT_WARNINGS`. Identity constraints,
-    /// `xml:*` leniency, strict-mode warning promotion, and XSD 1.1 assertion
-    /// processing are all opt-in — combine them with `|`:
+    /// The default enables `REPORT_WARNINGS` and `BUILD_PSVI_TYPED_VALUES`
+    /// (PSVI typed/normalized values are retained for back-compat). Identity
+    /// constraints, `xml:*` leniency, strict-mode warning promotion, and XSD
+    /// 1.1 assertion processing are all opt-in — combine them with `|`; PSVI
+    /// retention is opt-*out* — remove it with `& !`:
     ///
     /// ```
     /// use xsd_schema::validation::ValidationFlags;
@@ -132,10 +148,12 @@ impl Default for ValidationFlags {
     /// let flags = ValidationFlags::default()
     ///     | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
     ///     | ValidationFlags::ALLOW_XML_ATTRIBUTES;
-    /// # let _ = flags;
+    /// // Opt out of PSVI value retention for faster streaming:
+    /// let lean = ValidationFlags::default() & !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
+    /// # let _ = (flags, lean);
     /// ```
     fn default() -> Self {
-        ValidationFlags::REPORT_WARNINGS
+        ValidationFlags::REPORT_WARNINGS | ValidationFlags::BUILD_PSVI_TYPED_VALUES
     }
 }
 
@@ -453,6 +471,8 @@ mod tests {
     fn test_validation_flags_default() {
         let flags = ValidationFlags::default();
         assert!(flags.contains(ValidationFlags::REPORT_WARNINGS));
+        // PSVI typed/normalized values are retained by default (opt-out).
+        assert!(flags.contains(ValidationFlags::BUILD_PSVI_TYPED_VALUES));
         // Strict-conformance defaults: ALLOW_XML_ATTRIBUTES, identity
         // constraints, and strict-mode warning promotion are all opt-in.
         assert!(!flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));

@@ -394,6 +394,7 @@ fn test_substitution_group_head_member_conflict() {
         .alloc_element(element_data(member_name, None));
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(member_key)
         .unwrap()
@@ -432,6 +433,7 @@ fn test_substitution_group_transitive_conflict() {
 
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(mid_key)
         .unwrap()
@@ -439,6 +441,7 @@ fn test_substitution_group_transitive_conflict() {
         .push(head_key);
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(leaf_key)
         .unwrap()
@@ -472,12 +475,19 @@ fn test_substitution_group_blocked_no_conflict() {
         .alloc_element(element_data(member_name, None));
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(member_key)
         .unwrap()
         .resolved_substitution_groups
         .push(head_key);
-    schema_set.arenas.elements.get_mut(head_key).unwrap().block = DerivationSet::SUBSTITUTION;
+    schema_set
+        .arenas
+        .entries_mut()
+        .elements
+        .get_mut(head_key)
+        .unwrap()
+        .block = DerivationSet::SUBSTITUTION;
 
     let builder = FragmentBuilder::new();
     let term1 = NfaTerm::element(head_name, None, Some(head_key));
@@ -797,6 +807,7 @@ fn test_element_wildcard_subst_member_namespace_conflict() {
         .alloc_element(element_data(member_name, Some(other_ns)));
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(member_key)
         .unwrap()
@@ -840,6 +851,7 @@ fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
         .alloc_element(element_data(member_name, None));
     schema_set
         .arenas
+        .entries_mut()
         .elements
         .get_mut(member_key)
         .unwrap()
