@@ -103,14 +103,28 @@ pub enum XmlNodeOrder {
     Unknown,
 }
 
-/// Scope filter for namespace axis traversal
+/// Scope filter for namespace axis traversal.
+///
+/// Contract shared by every [`DomNavigator`] backend (BufferDoc, roxmltree):
+///
+/// * `All` follows the **XDM data model** — it yields every in-scope namespace,
+///   inherited declarations included, and **always** the implicit `xml:` binding
+///   (even on an element with no declarations of its own). This is what the
+///   `namespace::` axis needs. Use it only where XDM semantics are required;
+///   it allocates at least the `xml:` node on every element.
+/// * `ExcludeXml` is `All` minus the `xml:` binding (implicit or explicit). It is
+///   the right scope for callers that treat `xml:` specially or discard it —
+///   e.g. validation's namespace snapshot — and it returns nothing (heap-free)
+///   on a namespace-free element.
+/// * `Local` yields only the namespaces declared on the element itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceAxisScope {
-    /// Include all in-scope namespaces (including inherited)
+    /// Every in-scope namespace (inherited included) plus the implicit `xml:`
+    /// binding — the XDM `namespace::` axis contract.
     All,
-    /// Only locally declared namespaces
+    /// Only locally declared namespaces.
     Local,
-    /// All namespaces except the xml namespace
+    /// All in-scope namespaces *except* the `xml:` binding.
     ExcludeXml,
 }
 

@@ -196,6 +196,38 @@ impl<'a> BufferDocNavigator<'a> {
         result
     }
 
+    /// Borrowing fast path for the element/root string-value.
+    ///
+    /// When the subtree has at most one text-class descendant — the common case
+    /// for simple-content leaves like `<id>42</id>` — its string-value *is* that
+    /// single interned `StringStore` slice, so it can be borrowed with no
+    /// concatenation. Returns:
+    ///
+    /// * `Some(slice)` — exactly one text node; borrow it.
+    /// * `Some("")` — no text content at all.
+    /// * `None` — two or more text nodes; the caller must concatenate via
+    ///   [`compute_element_value`](Self::compute_element_value).
+    fn single_text_value(&self) -> Option<&str> {
+        let end = self.doc.subtree_end(self.current);
+        let mut found: Option<&str> = None;
+        let mut i = self.current + 1;
+        while i < end {
+            let node = self.doc.nodes.get(i);
+            match node.node_type() {
+                NodeType::Text | NodeType::Whitespace | NodeType::SignificantWhitespace => {
+                    if found.is_some() {
+                        // ≥2 text runs → genuine concatenation required.
+                        return None;
+                    }
+                    found = Some(self.doc.strings.get(node.value));
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Some(found.unwrap_or(""))
+    }
+
     /// Walks ancestors looking for `xml:base` attribute.
     fn resolve_base_uri(&self) -> &'a str {
         let mut nav = self.clone();
@@ -281,8 +313,17 @@ impl<'a> BufferDocNavigator<'a> {
                 result
             }
             NamespaceAxisScope::All | NamespaceAxisScope::ExcludeXml => {
-                let mut result = Vec::new();
-                let mut seen_prefixes: HashSet<NameId> = HashSet::new();
+                // Lazily allocate the result Vec and the dedup set: an element
+                // with no declarations on any ancestor-or-self collects nothing,
+                // so for `ExcludeXml` both stay unallocated and we return empty
+                // — the common case on the validation hot path (which uses
+                // `ExcludeXml`, see `build_ns_snapshot`). `All` follows the XDM
+                // contract and *always* surfaces the implicit `xml:` binding
+                // (appended below), so it allocates a one-element Vec even on a
+                // namespace-free element — that is fine, `All` is only reached by
+                // the (deprecated) `namespace::` axis, not validation.
+                let mut result: Vec<NsRef> = Vec::new();
+                let mut seen_prefixes: Option<HashSet<NameId>> = None;
 
                 let mut cursor = elem;
                 loop {
@@ -293,7 +334,8 @@ impl<'a> BufferDocNavigator<'a> {
                             let mut ns_ref = ns_head;
                             while !ns_ref.is_null() {
                                 let ns_node = self.doc.namespace_pages.get(ns_ref);
-                                if seen_prefixes.insert(ns_node.prefix) {
+                                let seen = seen_prefixes.get_or_insert_with(HashSet::new);
+                                if seen.insert(ns_node.prefix) {
                                     if scope == NamespaceAxisScope::ExcludeXml {
                                         let prefix_str = self.doc.names.resolve_ref(ns_node.prefix);
                                         if prefix_str == "xml" {
@@ -313,12 +355,15 @@ impl<'a> BufferDocNavigator<'a> {
                     cursor = node.parent;
                 }
 
-                // For All scope: append implicit xml: namespace if not yet seen
+                // XDM contract: `All` always exposes the implicit `xml:` binding,
+                // regardless of whether any real namespace is in scope. Dedup
+                // against an explicitly declared `xml` prefix.
                 if scope == NamespaceAxisScope::All {
                     let xml_ns = self.doc.xml_namespace;
                     if !xml_ns.is_null() {
                         let xml_node = self.doc.namespace_pages.get(xml_ns);
-                        if seen_prefixes.insert(xml_node.prefix) {
+                        let seen = seen_prefixes.get_or_insert_with(HashSet::new);
+                        if seen.insert(xml_node.prefix) {
                             result.push(xml_ns);
                         }
                     }
@@ -820,8 +865,13 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             | NodeType::Whitespace
             | NodeType::SignificantWhitespace
             | NodeType::Comment => Cow::Borrowed(self.doc.strings.get(node.value)),
-            // Element/Root concatenate descendant text → must allocate.
-            NodeType::Element | NodeType::Root => Cow::Owned(self.compute_element_value()),
+            // Element/Root: borrow the single interned text run when there is
+            // one (the simple-content leaf case); only true mixed/multi-text
+            // content falls back to allocating a concatenation.
+            NodeType::Element | NodeType::Root => match self.single_text_value() {
+                Some(s) => Cow::Borrowed(s),
+                None => Cow::Owned(self.compute_element_value()),
+            },
             _ => Cow::Borrowed(""),
         }
     }
@@ -869,21 +919,23 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             }
         }
 
-        let value_str = self.value();
+        // Borrow the lexical value (single-text leaves borrow; only true mixed
+        // content allocates) so simple-content elements cost no per-element copy.
+        let value_str = self.value_ref();
 
         // Default/fixed-aware value resolution (cvc-elt.5.2):
         // Substitute element default or fixed only when there is no text
         // content AND no child elements (matching runtime.rs semantics).
         // XSD spec forbids both default and fixed on the same element,
         // so at most one will be Some.  Priority matches runtime.rs.
-        let effective_value = if value_str.is_empty() && !self.has_element_children() {
+        let effective_value: Cow<'_, str> = if value_str.is_empty() && !self.has_element_children() {
             if let Some(elem_key) = binding.element_decl {
                 let elem_data = &schema_set.arenas.elements[elem_key];
                 if let Some(default_val) = &elem_data.default_value {
-                    default_val.clone()
+                    Cow::Owned(default_val.clone())
                 } else if let Some(fixed_val) = &elem_data.fixed_value {
                     // §3.3.4.3: fixed behaves as default when element is empty
-                    fixed_val.clone()
+                    Cow::Owned(fixed_val.clone())
                 } else {
                     value_str
                 }
@@ -1076,6 +1128,32 @@ mod tests {
             uris.contains("http://www.w3.org/XML/1998/namespace"),
             "Should see implicit xml namespace"
         );
+    }
+
+    #[test]
+    fn namespace_all_bare_element_includes_xml() {
+        // XDM contract (A): `All` exposes the implicit `xml:` binding even on a
+        // namespace-free element. (`ExcludeXml` — used by validation — is empty
+        // here, which is what keeps the validation hot path allocation-free.)
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<root/>"#, &arena, &names);
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // root
+
+        assert!(
+            nav.move_to_first_namespace(NamespaceAxisScope::All),
+            "All scope must expose the implicit xml namespace on a bare element"
+        );
+        assert_eq!(
+            nav.value(),
+            "http://www.w3.org/XML/1998/namespace",
+            "the only in-scope namespace on <root/> is the implicit xml binding"
+        );
+        assert!(!nav.move_to_next_namespace(NamespaceAxisScope::All));
+
+        // ExcludeXml on the same bare element is empty (no per-element alloc).
+        assert!(!nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
     }
 
     #[test]

@@ -229,34 +229,41 @@ fn walk_element<N, S>(
 }
 
 /// Build the in-scope namespace snapshot for the current element by walking the
-/// namespace axis (scope `All` → inherited + local), mirroring the streaming
-/// driver's `build_ns_context`. The cursor is restored to the element.
+/// namespace axis, mirroring the streaming driver's `build_ns_context`. The
+/// cursor is restored to the element.
+///
+/// Uses `ExcludeXml` scope deliberately: validation treats the `xml` prefix as
+/// implicit and discards it anyway, and `ExcludeXml` never materializes the
+/// always-in-scope `xml:` binding — so on a namespace-free document the axis is
+/// empty and no per-element `Vec`/`HashSet` is allocated (the common hot-path
+/// case). This decouples validation from the (XDM) `All`-axis contract, which
+/// the deprecated `namespace::` axis still needs but validation does not.
 fn build_ns_snapshot<N>(nav: &mut N, schema_set: &SchemaSet) -> NamespaceContextSnapshot
 where
     N: DomNavigator,
 {
     let mut snapshot = NamespaceContextSnapshot::default();
 
-    if nav.move_to_first_namespace(NamespaceAxisScope::All) {
+    if nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml) {
         loop {
             // Namespace node: local_name() = prefix ("" for default), value() = URI.
-            // The URI is consumed immediately (fed to `name_table.add`, which takes
-            // `&str`) before the cursor moves, so it can borrow without owning.
-            let prefix = nav.local_name().to_string();
+            // Both are consumed immediately (fed to `name_table.add`, which takes
+            // `&str`) before the cursor moves, so they borrow without owning.
+            let prefix = nav.local_name();
             let uri = nav.value_ref();
             if prefix.is_empty() {
                 // Default namespace; skip an empty binding.
                 if !uri.is_empty() {
                     snapshot.default_ns = Some(schema_set.name_table.add(&uri));
                 }
-            } else if prefix != "xml" && prefix != "xmlns" && !uri.is_empty() {
-                // Skip the always-in-scope xml prefix; the runtime treats it
-                // (and any xmlns binding) as implicit.
-                let prefix_id = schema_set.name_table.add(&prefix);
+            } else if prefix != "xmlns" && !uri.is_empty() {
+                // `ExcludeXml` already drops the `xml` prefix; the runtime treats
+                // any `xmlns` binding as implicit too.
+                let prefix_id = schema_set.name_table.add(prefix);
                 let uri_id = schema_set.name_table.add(&uri);
                 snapshot.bindings.push((prefix_id, uri_id));
             }
-            if !nav.move_to_next_namespace(NamespaceAxisScope::All) {
+            if !nav.move_to_next_namespace(NamespaceAxisScope::ExcludeXml) {
                 break;
             }
         }
