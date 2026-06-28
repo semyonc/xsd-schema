@@ -23,7 +23,7 @@ use crate::schema::wildcard::ElementWildcard;
 use crate::types::{BuiltinTypes, XmlTypeCode};
 
 /// XSD version mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum XsdVersion {
     #[default]
     V1_0,
@@ -40,7 +40,7 @@ pub enum XsdVersion {
 ///
 /// This is an enum (not a bool) so future modes can be added without
 /// breaking the API.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum RegexCompat {
     /// Strict XSD Part 2 regex grammar. Default.
     #[default]

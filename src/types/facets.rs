@@ -39,6 +39,135 @@ use std::sync::Arc;
 
 use super::XmlTypeCode;
 
+/// Process-global cache of compiled XSD pattern regexes (`xsd11` / `regexml`
+/// backend only).
+///
+/// `regexml` 0.2 rebuilds the Unicode category sets behind `\d`, `\w`, and
+/// `\p{…}` from the ICU code-point trie on **every** `Regex::new` — it memoizes
+/// nothing — which is the dominant cost when compiling pattern-heavy schemas
+/// (see `validation-bench/PERF_PROFILE_CONFORMANCE.md`). The same pattern
+/// strings recur constantly: built-in datatype facets are re-compiled for every
+/// `SchemaSet`, the conformance harness re-compiles per test, and the two-pass
+/// `xsi:schemaLocation` enrichment flow re-compiles a whole schema's patterns.
+/// Caching the compiled program turns those repeats into an `Arc` clone.
+///
+/// ## Design — direct-mapped, like a CPU cache
+///
+/// A **fixed-size** table of [`SLOTS`] entries. A key hashes to exactly one slot
+/// (`index = hash & MASK`); a colliding key simply **overwrites** the resident
+/// entry (no probing, no chaining). Properties:
+///
+/// - **Bounded by construction** — memory is `O(SLOTS)`, never grows, no
+///   eviction-policy bookkeeping. This degrades gracefully in a long-running
+///   process that sees an unbounded variety of schemas: recent patterns stay
+///   resident, cold ones fall out — unlike an unbounded map, which would either
+///   grow without limit or freeze at a cap and never cache anything new.
+/// - **Verified hits** — each slot stores its full key; a probe is a hit only
+///   when the resident key equals the lookup key, so collisions are correctness-
+///   safe (they just miss and recompile).
+/// - **Clearable** — [`clear_pattern_cache`] empties it (reclaim between
+///   workloads, or for deterministic benchmark timings).
+///
+/// Keyed by everything that determines the compiled program —
+/// `(pattern, xsd_version, regex_compat)`. Only **successful** compiles are
+/// stored (an invalid pattern must keep reporting its error). *Distinct*
+/// patterns still pay full price; removing that needs an upstream `regexml`
+/// category memoization, which this cache deliberately does not require.
+#[cfg(feature = "xsd11")]
+mod pattern_cache {
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    use crate::schema::model::{RegexCompat, XsdVersion};
+
+    /// (pattern, version, compat) — everything that affects the result.
+    pub(super) type Key = (String, XsdVersion, RegexCompat);
+
+    struct Slot {
+        key: Key,
+        regex: Arc<regexml::Regex>,
+    }
+
+    /// Number of cache lines. Power of two so `index = hash & MASK`. At 4096
+    /// the table itself is ~4096 × `size_of::<Option<Slot>>()` ≈ 130 KB plus the
+    /// resident pattern strings — far smaller than the working set of *all*
+    /// distinct patterns, but large enough that the heavily-repeated ones
+    /// (built-ins, two-pass enrichment recompiles, shared test fixtures) rarely
+    /// collide.
+    const SLOTS: usize = 4096;
+    const MASK: u64 = (SLOTS as u64) - 1;
+
+    fn table() -> &'static RwLock<Box<[Option<Slot>]>> {
+        static TABLE: OnceLock<RwLock<Box<[Option<Slot>]>>> = OnceLock::new();
+        TABLE.get_or_init(|| {
+            let slots = (0..SLOTS).map(|_| None).collect::<Vec<_>>().into_boxed_slice();
+            RwLock::new(slots)
+        })
+    }
+
+    /// Slot index for a key. Fixed-seed `ahash` so a given key maps to the same
+    /// line for the whole process (the seed need not be secret — the index is
+    /// never exposed and collisions are correctness-safe).
+    fn index(key: &Key) -> usize {
+        static HASHER: OnceLock<ahash::RandomState> = OnceLock::new();
+        let state = HASHER.get_or_init(|| {
+            ahash::RandomState::with_seeds(
+                0xa5a5_5a5a_3c3c_c3c3,
+                0x1234_5678_9abc_def0,
+                0x9e37_79b9_7f4a_7c15,
+                0xc2b2_ae35_5d12_3456,
+            )
+        });
+        (state.hash_one(key) & MASK) as usize
+    }
+
+    /// Look up a previously-compiled regex. A hit requires the resident slot to
+    /// hold this exact key (guards against hash collisions). The lock is held
+    /// only for the probe — never across a compile — so poisoning is effectively
+    /// impossible; recover rather than propagate a panic.
+    pub(super) fn get(key: &Key) -> Option<Arc<regexml::Regex>> {
+        let idx = index(key);
+        let guard = table().read().unwrap_or_else(|e| e.into_inner());
+        match &guard[idx] {
+            Some(slot) if &slot.key == key => Some(Arc::clone(&slot.regex)),
+            _ => None,
+        }
+    }
+
+    /// Record a successfully-compiled regex, replacing whatever shared its line.
+    pub(super) fn store(key: Key, regex: Arc<regexml::Regex>) {
+        let idx = index(&key);
+        let mut guard = table().write().unwrap_or_else(|e| e.into_inner());
+        guard[idx] = Some(Slot { key, regex });
+    }
+
+    /// Drop every cached entry.
+    pub(super) fn clear() {
+        let mut guard = table().write().unwrap_or_else(|e| e.into_inner());
+        for slot in guard.iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// Clear the process-global compiled-pattern regex cache.
+///
+/// The cache (a small fixed-size, direct-mapped table; see the module-level
+/// `pattern_cache`) lives for the life of the process and speeds up recompiling
+/// identical `xs:pattern` facets. Call this to reclaim it — e.g. between
+/// unrelated workloads in a long-running service, or for deterministic timings
+/// in a benchmark. Safe to call concurrently with compilation. Without the
+/// `xsd11` feature there is no such cache and this is a no-op.
+#[cfg(feature = "xsd11")]
+pub fn clear_pattern_cache() {
+    pattern_cache::clear();
+}
+
+/// Clear the process-global compiled-pattern regex cache. No-op without the
+/// `xsd11` feature (the XSD 1.0 backend compiles via the `regex` crate and does
+/// not cache).
+#[cfg(not(feature = "xsd11"))]
+pub fn clear_pattern_cache() {}
+
 /// Fixed vs default facet values
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FacetFixed {
@@ -178,6 +307,15 @@ impl PatternFacet {
         regex_compat: RegexCompat,
     ) -> FacetResult<()> {
         if self.compiled.is_none() {
+            // Content-addressed fast path: identical (pattern, version, compat)
+            // reuses the already-compiled program instead of rebuilding the ICU
+            // category sets via regexml. See [`pattern_cache`].
+            let cache_key: pattern_cache::Key = (self.value.clone(), xsd_version, regex_compat);
+            if let Some(cached) = pattern_cache::get(&cache_key) {
+                self.compiled = Some(cached);
+                return Ok(());
+            }
+
             let strict = regex_compat == RegexCompat::Strict;
             // Apply MS dialect preprocess (closed list) before grammar
             // validation when LenientMs is on. Owned to keep one stable
@@ -237,7 +375,9 @@ impl PatternFacet {
                     pattern: self.value.clone(),
                     message: format!("{:?}", e),
                 })?;
-            self.compiled = Some(Arc::new(compiled));
+            let arc = Arc::new(compiled);
+            pattern_cache::store(cache_key, Arc::clone(&arc));
+            self.compiled = Some(arc);
         }
         Ok(())
     }
@@ -2163,6 +2303,33 @@ mod tests {
         assert!(pattern.matches("hello"));
         assert!(!pattern.matches("HELLO"));
         assert!(!pattern.matches("hello123"));
+    }
+
+    #[test]
+    fn test_pattern_cache_reuse_and_clear() {
+        // Compile the same category-using pattern twice: the second compile
+        // should be served from the regex cache (xsd11) yet behave identically.
+        let mk = || {
+            PatternFacet::new(
+                r"\d{3}-\d{4}".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
+            .unwrap()
+        };
+        let a = mk();
+        let b = mk(); // cache hit under xsd11; full recompile otherwise
+        for p in [&a, &b] {
+            assert!(p.matches("123-4567"));
+            assert!(!p.matches("12-4567"));
+            assert!(!p.matches("123-456"));
+        }
+        // Clearing must not corrupt anything: a fresh compile still works.
+        crate::clear_pattern_cache();
+        let c = mk();
+        assert!(c.matches("123-4567"));
+        assert!(!c.matches("xx-yyyy"));
     }
 
     #[test]
