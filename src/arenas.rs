@@ -5,11 +5,10 @@
 //!
 //! Uses slotmap for O(1) insertion, lookup, and removal with generation tracking.
 
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
-use slotmap::SlotMap;
+use slotmap::{SecondaryMap, SlotMap};
 
 use crate::ids::*;
 #[cfg(feature = "xsd11")]
@@ -470,7 +469,10 @@ pub struct ArenasGuard {
     /// Computed lazily *per entry* (not a write-once snapshot), so a simple type
     /// added to a reused `SchemaSet` after an earlier validation pass is a cache
     /// miss that gets computed, never a silent empty fallback.
-    effective_facets_cache: RwLock<HashMap<SimpleTypeKey, Arc<FacetSet>>>,
+    /// Dense `SecondaryMap` keyed by the `SimpleTypeKey` slotmap index — lookup
+    /// is an array index with a generation check, **no hashing** (the key is a
+    /// dense generational index, so SipHashing it was the worst possible choice).
+    effective_facets_cache: RwLock<SecondaryMap<SimpleTypeKey, Arc<FacetSet>>>,
 }
 
 impl ArenasGuard {
@@ -539,7 +541,7 @@ impl ArenasGuard {
     /// [`entries_mut`](Self::entries_mut), so it is always consistent with the
     /// current arena contents.
     pub(crate) fn effective_facets(&self, sk: SimpleTypeKey) -> Arc<FacetSet> {
-        if let Some(facets) = self.effective_facets_cache.read().unwrap().get(&sk) {
+        if let Some(facets) = self.effective_facets_cache.read().unwrap().get(sk) {
             return Arc::clone(facets);
         }
         let computed = Arc::new(self.compute_effective_facets(sk));
@@ -721,5 +723,32 @@ mod tests {
         assert_eq!(pairs.len(), 2);
         assert!(pairs.iter().any(|(k, _)| *k == key1));
         assert!(pairs.iter().any(|(k, _)| *k == key2));
+    }
+
+    #[test]
+    fn test_effective_facets_cached_and_recomputed_after_entries_mut() {
+        use crate::types::facets::FacetFixed;
+
+        let mut guard = ArenasGuard::new();
+        let key = guard.alloc_simple_type(simple_type_data(NameId(1)));
+
+        // First access: computes from the (empty) facets and caches.
+        let first = guard.effective_facets(key);
+        assert!(first.min_length.is_none());
+
+        // Second access without mutation returns the *same* cached Arc.
+        let second = guard.effective_facets(key);
+        assert!(Arc::ptr_eq(&first, &second));
+
+        // Mutate the type's own facets through the cache-clearing gate.
+        guard.entries_mut().simple_types[key]
+            .facets
+            .set_min_length(3, FacetFixed::Default, None);
+
+        // Next access must recompute (cache was cleared by entries_mut), so the
+        // new min_length is reflected — never a stale empty/cached fallback.
+        let recomputed = guard.effective_facets(key);
+        assert!(!Arc::ptr_eq(&first, &recomputed));
+        assert_eq!(recomputed.min_length.as_ref().map(|f| f.value), Some(3));
     }
 }

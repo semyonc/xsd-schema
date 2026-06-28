@@ -10,6 +10,7 @@
 //! | Attribute | element ref | `NsRef::NULL` | Attribute virtual node |
 //! | Namespace | element ref | non-NULL | Namespace virtual node |
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::ids::{NameId, SimpleTypeKey, TypeKey};
@@ -799,6 +800,29 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             | NodeType::SignificantWhitespace
             | NodeType::Comment => self.doc.strings.get(node.value).to_string(),
             _ => String::new(),
+        }
+    }
+
+    fn value_ref(&self) -> Cow<'_, str> {
+        if self.is_on_namespace() {
+            // Namespace node value = the bound namespace URI (interned name).
+            return Cow::Borrowed(self.doc.names.resolve_ref(self.ns_node().namespace_uri));
+        }
+        let node = self.node();
+        match node.node_type() {
+            // Attribute/PI values live in the following value node's StringStore
+            // slot — borrow the contiguous interned bytes, no copy.
+            NodeType::Attribute | NodeType::ProcessingInstruction => {
+                let val_node = self.doc.nodes.get(self.current + 1);
+                Cow::Borrowed(self.doc.strings.get(val_node.value))
+            }
+            NodeType::Text
+            | NodeType::Whitespace
+            | NodeType::SignificantWhitespace
+            | NodeType::Comment => Cow::Borrowed(self.doc.strings.get(node.value)),
+            // Element/Root concatenate descendant text → must allocate.
+            NodeType::Element | NodeType::Root => Cow::Owned(self.compute_element_value()),
+            _ => Cow::Borrowed(""),
         }
     }
 

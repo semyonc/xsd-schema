@@ -4,6 +4,7 @@
 //! Since roxmltree is a read-only, schema-unaware parser, typed value hooks
 //! always return `None`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ::roxmltree::{Document, Node, NodeType};
@@ -612,6 +613,26 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
                 .get(*index)
                 .map(|(_, uri)| uri.clone())
                 .unwrap_or_default(),
+        }
+    }
+
+    fn value_ref(&self) -> Cow<'_, str> {
+        // Mirror of `value()`: roxmltree returns document-lifetime `&'a str` for
+        // text/PI/comment nodes and attribute values, so borrow them; only the
+        // element/root descendant concatenation must allocate.
+        match &self.cursor {
+            RoCursor::Node(n) => match n.node_type() {
+                NodeType::Text | NodeType::Comment | NodeType::PI => {
+                    Cow::Borrowed(n.text().unwrap_or(""))
+                }
+                NodeType::Element | NodeType::Root => Cow::Owned(self.value()),
+            },
+            RoCursor::Attribute { owner, index } => {
+                Cow::Borrowed(owner.attributes().nth(*index).map(|a| a.value()).unwrap_or(""))
+            }
+            RoCursor::Namespace {
+                namespaces, index, ..
+            } => Cow::Borrowed(namespaces.get(*index).map(|(_, uri)| uri.as_str()).unwrap_or("")),
         }
     }
 

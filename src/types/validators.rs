@@ -9,6 +9,7 @@
 //! - `ValidatorRegistry` provides lookup and registration of validators
 //! - Built-in validators cover all 19 primitive XSD types
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -293,7 +294,7 @@ impl TypeValidator for StringValidator {
             .unwrap_or(WhitespaceMode::Preserve);
         let normalized = normalize_whitespace(value, ws);
         facets.validate_string(&normalized)?;
-        Ok(XmlValue::string(normalized))
+        Ok(XmlValue::string(normalized.into_owned()))
     }
 
     fn facet_applicable(&self, facet: &str) -> bool {
@@ -325,7 +326,7 @@ impl TypeValidator for NormalizedStringValidator {
         let normalized = normalize_whitespace(value, WhitespaceMode::Replace);
         Ok(XmlValue::new(
             XmlTypeCode::NormalizedString,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -345,7 +346,7 @@ impl TypeValidator for NormalizedStringValidator {
         facets.validate_string(&normalized)?;
         Ok(XmlValue::new(
             XmlTypeCode::NormalizedString,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -378,7 +379,7 @@ impl TypeValidator for TokenValidator {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         Ok(XmlValue::new(
             XmlTypeCode::Token,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -387,7 +388,7 @@ impl TypeValidator for TokenValidator {
         facets.validate_string(&normalized)?;
         Ok(XmlValue::new(
             XmlTypeCode::Token,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -428,7 +429,7 @@ impl TypeValidator for LanguageValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::Language,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -474,7 +475,7 @@ impl TypeValidator for NmTokenValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::NmToken,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -520,7 +521,7 @@ impl TypeValidator for NameValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::Name,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -566,7 +567,7 @@ impl TypeValidator for NCNameValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::NCName,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -612,7 +613,7 @@ impl TypeValidator for IdValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::Id,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -658,7 +659,7 @@ impl TypeValidator for IdRefValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::IdRef,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -704,7 +705,7 @@ impl TypeValidator for EntityValidator {
         }
         Ok(XmlValue::new(
             XmlTypeCode::Entity,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -745,7 +746,7 @@ impl TypeValidator for BooleanValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        match normalized.as_str() {
+        match normalized.as_ref() {
             "true" | "1" => Ok(XmlValue::boolean(true)),
             "false" | "0" => Ok(XmlValue::boolean(false)),
             _ => Err(ValidationError::InvalidLexical {
@@ -764,7 +765,7 @@ impl TypeValidator for BooleanValidator {
         // §cvc-enumeration-valid: compare in value space ("1" == "true" == true)
         if let XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) = result.value {
             facets.validate_enum_value_space(
-                |s| match normalize_whitespace(s, WhitespaceMode::Collapse).as_str() {
+                |s| match normalize_whitespace(s, WhitespaceMode::Collapse).as_ref() {
                     "true" | "1" => b,
                     "false" | "0" => !b,
                     _ => false,
@@ -1719,7 +1720,7 @@ impl TypeValidator for HexBinaryValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        hex::decode(&normalized)
+        hex::decode(normalized.as_bytes())
             .map(|bytes| {
                 XmlValue::new(
                     XmlTypeCode::HexBinary,
@@ -1772,7 +1773,7 @@ impl TypeValidator for Base64BinaryValidator {
         use base64::Engine;
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         base64::engine::general_purpose::STANDARD
-            .decode(&normalized)
+            .decode(normalized.as_bytes())
             .map(|bytes| {
                 XmlValue::new(
                     XmlTypeCode::Base64Binary,
@@ -1831,7 +1832,7 @@ impl TypeValidator for AnyUriValidator {
         // (actual URI validation is application-specific)
         Ok(XmlValue::new(
             XmlTypeCode::AnyUri,
-            XmlValueKind::Atomic(XmlAtomicValue::AnyUri(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::AnyUri(normalized.into_owned())),
         ))
     }
 
@@ -1881,10 +1882,10 @@ pub fn is_valid_uri_scheme(s: &str) -> bool {
 /// annotation `source` value has no whitespace at all, so we skip the
 /// allocation entirely unless the input actually contains whitespace.
 pub fn is_strict_xsd10_anyuri(value: &str) -> bool {
-    let collapsed: String;
+    let collapsed: Cow<str>;
     let value: &str = if value.chars().any(char::is_whitespace) {
         collapsed = normalize_whitespace(value, WhitespaceMode::Collapse);
-        collapsed.as_str()
+        &collapsed
     } else {
         value
     };
@@ -3662,7 +3663,7 @@ impl TypeValidator for QNameValidator {
             let local = &normalized[colon_pos + 1..];
             (Some(prefix), local)
         } else {
-            (None, normalized.as_str())
+            (None, normalized.as_ref())
         };
 
         // Validate prefix is NCName (if present)
@@ -3689,7 +3690,7 @@ impl TypeValidator for QNameValidator {
         // which is not available at basic validation time
         Ok(XmlValue::new(
             XmlTypeCode::QName,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 
@@ -3737,7 +3738,7 @@ impl TypeValidator for NotationValidator {
             let local = &normalized[colon_pos + 1..];
             (Some(prefix), local)
         } else {
-            (None, normalized.as_str())
+            (None, normalized.as_ref())
         };
 
         if let Some(p) = prefix {
@@ -3761,7 +3762,7 @@ impl TypeValidator for NotationValidator {
         // Store as string for now - notation declaration checking requires schema context
         Ok(XmlValue::new(
             XmlTypeCode::Notation,
-            XmlValueKind::Atomic(XmlAtomicValue::String(normalized)),
+            XmlValueKind::Atomic(XmlAtomicValue::String(normalized.into_owned())),
         ))
     }
 

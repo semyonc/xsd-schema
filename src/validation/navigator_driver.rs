@@ -149,18 +149,16 @@ fn walk_element<N, S>(
         *max_depth = depth;
     }
 
-    // Capture the element identity before moving the cursor onto the
-    // namespace / attribute axes (both restore the cursor afterwards).
-    let local = nav.local_name().to_string();
-    let ns_uri = nav.namespace_uri().to_string();
-
+    // The namespace / attribute scans both restore the cursor to the element,
+    // so the element identity can be read as a borrow *after* them — no clone.
     let ns_ctx = build_ns_snapshot(nav, schema_set);
     let (xsi_type, xsi_nil) = scan_xsi(nav);
 
-    // 1. Element.
+    // 1. Element. `local_name()`/`namespace_uri()` are already `&str` (no copy);
+    //    the cursor is back on the element after the two scans above.
     runtime.validate_element(
-        &local,
-        &ns_uri,
+        nav.local_name(),
+        nav.namespace_uri(),
         xsi_type.as_deref(),
         xsi_nil.as_deref(),
         &ns_ctx,
@@ -170,10 +168,11 @@ fn walk_element<N, S>(
     //    the streaming driver forwards those to validate_attribute too).
     if nav.move_to_first_attribute() {
         loop {
-            let alocal = nav.local_name().to_string();
-            let ans = nav.namespace_uri().to_string();
-            let aval = nav.value();
-            runtime.validate_attribute(&alocal, &ans, &aval);
+            // Names are already `&str`; `value_ref()` borrows the interned bytes
+            // for DOM backends. All three are shared borrows of `nav` that end
+            // before the next `&mut nav` cursor move (NLL).
+            let aval = nav.value_ref();
+            runtime.validate_attribute(nav.local_name(), nav.namespace_uri(), &aval);
             if !nav.move_to_next_attribute() {
                 break;
             }
@@ -203,7 +202,7 @@ fn walk_element<N, S>(
                 DomNodeType::Text
                 | DomNodeType::Whitespace
                 | DomNodeType::SignificantWhitespace => {
-                    let text = nav.value();
+                    let text = nav.value_ref();
                     // Classify by content, exactly as the streaming driver
                     // does, rather than trusting the node-type label.
                     if text.chars().all(|c| c.is_whitespace()) {
@@ -241,8 +240,10 @@ where
     if nav.move_to_first_namespace(NamespaceAxisScope::All) {
         loop {
             // Namespace node: local_name() = prefix ("" for default), value() = URI.
+            // The URI is consumed immediately (fed to `name_table.add`, which takes
+            // `&str`) before the cursor moves, so it can borrow without owning.
             let prefix = nav.local_name().to_string();
-            let uri = nav.value();
+            let uri = nav.value_ref();
             if prefix.is_empty() {
                 // Default namespace; skip an empty binding.
                 if !uri.is_empty() {

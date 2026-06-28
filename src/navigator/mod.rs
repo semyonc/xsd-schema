@@ -19,6 +19,8 @@ pub mod roxmltree;
 
 pub use self::roxmltree::RoXmlNavigator;
 
+use std::borrow::Cow;
+
 use crate::ids::SimpleTypeKey;
 use crate::types::value::XmlValue;
 
@@ -196,6 +198,17 @@ pub trait DomNavigator: Clone {
 
     /// Get the string value of the current node
     fn value(&self) -> String;
+
+    /// Borrowed string value of the current node when the backing store can
+    /// supply one without allocating; owned otherwise.
+    ///
+    /// The default delegates to [`value`](Self::value) (always owned), so existing
+    /// implementors need no change. DOM backends whose text/attribute values are
+    /// interned contiguously (e.g. `BufferDocNavigator`, `RoXmlNavigator`) override
+    /// this to borrow, eliminating a per-value allocation in the validation walk.
+    fn value_ref(&self) -> Cow<'_, str> {
+        Cow::Owned(self.value())
+    }
 
     /// Get the base URI of the current node
     fn base_uri(&self) -> &str;

@@ -31,6 +31,7 @@ use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use crate::schema::model::{RegexCompat, XsdVersion};
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 #[cfg(feature = "xsd11")]
@@ -1289,9 +1290,9 @@ impl FacetSet {
         // Apply whitespace normalization for length calculation
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
-        let check_value = &normalized;
+        let check_value: &str = &normalized;
 
         // Check length facet
         if let Some(ref length) = self.length {
@@ -1345,9 +1346,9 @@ impl FacetSet {
     pub fn validate_string_patterns_enums(&self, value: &str) -> FacetResult<()> {
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
-        let check_value = &normalized;
+        let check_value: &str = &normalized;
 
         self.check_patterns(check_value)?;
 
@@ -1365,7 +1366,7 @@ impl FacetSet {
     pub fn validate_patterns_only(&self, value: &str) -> FacetResult<()> {
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
         self.check_patterns(&normalized)
     }
@@ -1684,33 +1685,49 @@ fn compare_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     a_val.partial_cmp(&b_val)
 }
 
-/// Apply whitespace normalization to a string
-pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> String {
+/// Apply whitespace normalization to a string.
+///
+/// Returns [`Cow::Borrowed`] when the input is already in the target form (the
+/// common case for clean instance values) — no allocation — and
+/// [`Cow::Owned`] only when a transformation is actually required. The produced
+/// string is byte-identical to the previous always-allocating implementation.
+pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> Cow<'_, str> {
     match mode {
-        WhitespaceMode::Preserve => s.to_string(),
+        WhitespaceMode::Preserve => Cow::Borrowed(s),
         WhitespaceMode::Replace => {
-            // Replace tab, CR, LF with space
-            s.chars()
-                .map(|c| match c {
-                    '\t' | '\r' | '\n' => ' ',
-                    _ => c,
-                })
-                .collect()
+            // Replace tab, CR, LF with space — but only allocate if any present.
+            if !s
+                .as_bytes()
+                .iter()
+                .any(|&b| b == b'\t' || b == b'\r' || b == b'\n')
+            {
+                return Cow::Borrowed(s);
+            }
+            Cow::Owned(
+                s.chars()
+                    .map(|c| match c {
+                        '\t' | '\r' | '\n' => ' ',
+                        _ => c,
+                    })
+                    .collect(),
+            )
         }
         WhitespaceMode::Collapse => {
-            // Replace, then collapse consecutive spaces, then trim
-            let replaced: String = s
-                .chars()
-                .map(|c| match c {
-                    '\t' | '\r' | '\n' => ' ',
-                    _ => c,
-                })
-                .collect();
+            // Borrow iff already collapsed: no \t\r\n, no leading/trailing space,
+            // and no run of two or more consecutive spaces.
+            if is_already_collapsed(s) {
+                return Cow::Borrowed(s);
+            }
 
-            let mut result = String::with_capacity(replaced.len());
+            // Replace, then collapse consecutive spaces, then trim.
+            let mut result = String::with_capacity(s.len());
             let mut prev_space = true; // Start true to trim leading spaces
 
-            for c in replaced.chars() {
+            for c in s.chars() {
+                let c = match c {
+                    '\t' | '\r' | '\n' => ' ',
+                    other => other,
+                };
                 if c == ' ' {
                     if !prev_space {
                         result.push(' ');
@@ -1727,9 +1744,34 @@ pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> String {
                 result.pop();
             }
 
-            result
+            Cow::Owned(result)
         }
     }
+}
+
+/// Returns `true` if `s` is already in collapsed form — i.e. it contains no
+/// tab/CR/LF, no leading or trailing ASCII space, and no run of two or more
+/// consecutive spaces. A single cheap byte scan, no allocation; when it returns
+/// `true`, `normalize_whitespace(.., Collapse)` can borrow the input unchanged.
+fn is_already_collapsed(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.first() == Some(&b' ') || bytes.last() == Some(&b' ') {
+        return false;
+    }
+    let mut prev_space = false;
+    for &b in bytes {
+        match b {
+            b'\t' | b'\r' | b'\n' => return false,
+            b' ' => {
+                if prev_space {
+                    return false; // two consecutive spaces
+                }
+                prev_space = true;
+            }
+            _ => prev_space = false,
+        }
+    }
+    true
 }
 
 /// Count total significant digits in a decimal value.
@@ -2172,25 +2214,70 @@ mod tests {
     #[test]
     fn test_whitespace_preserve() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Preserve);
-        assert_eq!(result, "  hello\t\nworld  ");
+        assert_eq!(&*result, "  hello\t\nworld  ");
     }
 
     #[test]
     fn test_whitespace_replace() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Replace);
-        assert_eq!(result, "  hello  world  ");
+        assert_eq!(&*result, "  hello  world  ");
     }
 
     #[test]
     fn test_whitespace_collapse() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Collapse);
-        assert_eq!(result, "hello world");
+        assert_eq!(&*result, "hello world");
     }
 
     #[test]
     fn test_whitespace_collapse_multiple_spaces() {
         let result = normalize_whitespace("a     b", WhitespaceMode::Collapse);
-        assert_eq!(result, "a b");
+        assert_eq!(&*result, "a b");
+    }
+
+    #[test]
+    fn test_whitespace_borrows_when_already_normalized() {
+        // Preserve always borrows.
+        assert!(matches!(
+            normalize_whitespace("anything\t\n", WhitespaceMode::Preserve),
+            Cow::Borrowed(_)
+        ));
+        // Replace borrows when there is no tab/CR/LF to replace.
+        assert!(matches!(
+            normalize_whitespace("no special ws", WhitespaceMode::Replace),
+            Cow::Borrowed(_)
+        ));
+        // Collapse borrows when already collapsed (no edge/double spaces, no \t\r\n).
+        assert!(matches!(
+            normalize_whitespace("a b c", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_whitespace_owns_when_transformation_needed() {
+        // Replace owns when a tab/CR/LF must become a space.
+        assert!(matches!(
+            normalize_whitespace("has\ttab", WhitespaceMode::Replace),
+            Cow::Owned(_)
+        ));
+        // Collapse owns for leading/trailing/double spaces or \t\r\n.
+        assert!(matches!(
+            normalize_whitespace(" leading", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("trailing ", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("a  b", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("tab\there", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
     }
 
     // =========================================================================

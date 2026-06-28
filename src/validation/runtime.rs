@@ -27,7 +27,7 @@ use crate::types::XmlTypeCode;
 use bumpalo::Bump;
 
 use super::content::{CompiledContentModel, ContentValidatorState};
-use super::context::{ElementValidationState, ValidatorState};
+use super::context::{AttrNameSet, ElementValidationState, ValidatorState};
 use super::errors::{self, ValidationError};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 #[cfg(feature = "xsd11")]
@@ -1707,7 +1707,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // attribute uses targeting xsi:type / xsi:nil / xsi:schemaLocation /
                 // xsi:noNamespaceSchemaLocation (use="required") are satisfied
                 // by the matching instance attribute. Without this insert,
-                // `check_required_attributes` would always report a missing
+                // `missing_required_attributes` would always report a missing
                 // required xsi:* attribute (saxon complex009/complex010).
                 ev.seen_attributes.insert((namespace, local_name));
                 // Extract attribute-specific error codes (mirrors normal attribute path)
@@ -2022,14 +2022,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.record_inheritable_defaults(ct_key);
         }
 
-        // Check required attributes (clone seen_attributes to avoid borrow conflict)
+        // Check required attributes. Detection is `&self` and borrows `seen`
+        // straight from the validation stack — no per-element clone of
+        // `seen_attributes` — then reporting is a separate `&mut self` pass.
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
-            let seen_attributes = match self.validation_stack.last() {
-                Some(s) => s.seen_attributes.clone(),
-                None => HashSet::new(),
+            let missing = {
+                let empty = AttrNameSet::default();
+                let seen = self
+                    .validation_stack
+                    .last()
+                    .map(|s| &s.seen_attributes)
+                    .unwrap_or(&empty);
+                let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+                self.missing_required_attributes(ct_data, seen)
             };
-            let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-            if self.check_required_attributes(ct_data, &seen_attributes) {
+            if !missing.is_empty() {
+                for (_ns, name) in missing {
+                    let name_str = self.schema_set.name_table.resolve(name);
+                    self.report_error(
+                        "cvc-complex-type.4",
+                        format!("Required attribute '{}' is missing", name_str),
+                    );
+                }
                 self.mark_current_invalid();
             }
         }
@@ -2039,7 +2053,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // ID/IDREF collection (§3.3.4 cvc-id.2) to avoid iterating twice.
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
             let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-            let empty_seen = HashSet::new();
+            let empty_seen = AttrNameSet::default();
             let seen = self
                 .validation_stack
                 .last()
@@ -5374,13 +5388,26 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Walks the base type chain to find inherited required attributes
     /// (XSD spec §3.4.2.4). Attributes already declared or prohibited in
     /// derived types are skipped via `checked_names`.
-    fn check_required_attributes(
-        &mut self,
+    /// Read-only detection half of the required-attribute check (§3.4.4
+    /// cvc-complex-type.4). Returns the `(namespace, local-name)` identities of
+    /// every *required* attribute declared by `ct_data` — including its
+    /// attribute groups and inherited from its base-type chain — that is absent
+    /// from `seen`, in the exact order the inline check used to report them.
+    ///
+    /// Pure computation: no error emission and no `&mut self`, so the caller can
+    /// borrow `seen` straight from the validation stack without cloning it. The
+    /// detection helpers it uses (`resolve_attr_use_name_ns`,
+    /// `collect_group_attributes`) are already `&self`. The caller
+    /// (`validate_end_of_attributes`) emits one `cvc-complex-type.4` error per
+    /// returned identity in order — the reporting half is intentionally split out.
+    fn missing_required_attributes(
+        &self,
         ct_data: &ComplexTypeDefData,
-        seen: &HashSet<(Option<NameId>, NameId)>,
-    ) -> bool {
-        let mut has_missing = false;
-        let mut checked_names: HashSet<(Option<NameId>, NameId)> = HashSet::new();
+        seen: &AttrNameSet,
+    ) -> Vec<(Option<NameId>, NameId)> {
+        let mut missing: Vec<(Option<NameId>, NameId)> = Vec::new();
+        // `checked_names` keys are dense interned-int tuples → ahash, not SipHash.
+        let mut checked_names: AttrNameSet = AttrNameSet::default();
 
         for (i, attr_use) in ct_data.attributes.iter().enumerate() {
             let resolved = ct_data.resolved_attributes.get(i);
@@ -5392,28 +5419,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 continue;
             }
             if !seen.contains(&(attr_ns, attr_name)) {
-                let name_str = self.schema_set.name_table.resolve(attr_name);
-                self.report_error(
-                    "cvc-complex-type.4",
-                    format!("Required attribute '{}' is missing", name_str),
-                );
-                has_missing = true;
+                missing.push((attr_ns, attr_name));
             }
         }
 
-        // Check required attributes from attribute groups
+        // Required attributes from attribute groups
         for ga in self.collect_group_attributes(ct_data) {
             checked_names.insert((ga.namespace, ga.name));
             if ga.use_kind != AttributeUseKind::Required {
                 continue;
             }
             if !seen.contains(&(ga.namespace, ga.name)) {
-                let name_str = self.schema_set.name_table.resolve(ga.name);
-                self.report_error(
-                    "cvc-complex-type.4",
-                    format!("Required attribute '{}' is missing", name_str),
-                );
-                has_missing = true;
+                missing.push((ga.namespace, ga.name));
             }
         }
 
@@ -5437,12 +5454,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     continue;
                 }
                 if !seen.contains(&(attr_ns, attr_name)) {
-                    let name_str = self.schema_set.name_table.resolve(attr_name);
-                    self.report_error(
-                        "cvc-complex-type.4",
-                        format!("Required attribute '{}' is missing", name_str),
-                    );
-                    has_missing = true;
+                    missing.push((attr_ns, attr_name));
                 }
             }
 
@@ -5454,19 +5466,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     continue;
                 }
                 if !seen.contains(&(ga.namespace, ga.name)) {
-                    let name_str = self.schema_set.name_table.resolve(ga.name);
-                    self.report_error(
-                        "cvc-complex-type.4",
-                        format!("Required attribute '{}' is missing", name_str),
-                    );
-                    has_missing = true;
+                    missing.push((ga.namespace, ga.name));
                 }
             }
 
             base_type = base_data.resolved_base_type;
         }
 
-        has_missing
+        missing
     }
 }
 

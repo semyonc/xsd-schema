@@ -39,7 +39,7 @@ use crate::types::facets::{normalize_whitespace, WhitespaceMode};
 /// trailing, and runs of internal whitespace are normalized away before the value
 /// is interpreted lexically.
 fn collapsed(value: &str) -> String {
-    normalize_whitespace(value, WhitespaceMode::Collapse)
+    normalize_whitespace(value, WhitespaceMode::Collapse).into_owned()
 }
 
 /// Validation context for structural checks

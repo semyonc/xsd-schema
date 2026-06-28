@@ -446,7 +446,7 @@ fn validate_atomic_type(
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
-                normalized_value: Some(normalized),
+                normalized_value: Some(normalized.into_owned()),
             })
         }
         Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
@@ -617,7 +617,7 @@ fn validate_list_type(
     Ok(SimpleTypeResult {
         typed_value,
         member_type: None,
-        normalized_value: Some(normalized),
+        normalized_value: Some(normalized.into_owned()),
     })
 }
 
