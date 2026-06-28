@@ -24,7 +24,8 @@ use crate::types::complex::{not_qnames_exclude, other_matches_namespace, Namespa
 use super::all_group::AllGroupModel;
 use super::nfa::{NfaTable, NfaTerm, StateId, TransitionKind};
 use super::substitution::{
-    build_substitution_group_map, build_substitution_group_map_with_abstract, SubstitutionGroupMap,
+    build_substitution_group_map, build_substitution_group_map_with_abstract, SubstitutableNameSet,
+    SubstitutionGroupMap,
 };
 
 /// Result type for internal UPA checking operations
@@ -203,7 +204,7 @@ fn elements_overlap(
 fn element_substitutable_names(
     term: &NfaTerm,
     substitution_sets: &SubstitutionGroupMap,
-) -> HashSet<(NameId, Option<NameId>)> {
+) -> SubstitutableNameSet {
     match term {
         NfaTerm::Element {
             name,
@@ -217,18 +218,15 @@ fn element_substitutable_names(
                 }
             }
 
-            let mut names = HashSet::new();
+            let mut names = SubstitutableNameSet::default();
             names.insert((*name, *namespace));
             names
         }
-        NfaTerm::Wildcard { .. } => HashSet::new(),
+        NfaTerm::Wildcard { .. } => SubstitutableNameSet::default(),
     }
 }
 
-fn name_sets_overlap(
-    names1: &HashSet<(NameId, Option<NameId>)>,
-    names2: &HashSet<(NameId, Option<NameId>)>,
-) -> bool {
+fn name_sets_overlap(names1: &SubstitutableNameSet, names2: &SubstitutableNameSet) -> bool {
     if names1.len() > names2.len() {
         return names2.iter().any(|name| names1.contains(name));
     }
@@ -348,7 +346,7 @@ fn check_element_element_conflicts(
     schema_set: &SchemaSet,
     substitution_sets: &SubstitutionGroupMap,
 ) -> UpaResult<()> {
-    let element_sets: Vec<HashSet<(NameId, Option<NameId>)>> = elements
+    let element_sets: Vec<SubstitutableNameSet> = elements
         .iter()
         .map(|elem| element_substitutable_names(&elem.term, substitution_sets))
         .collect();

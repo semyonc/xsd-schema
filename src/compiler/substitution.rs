@@ -2,11 +2,24 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ahash::RandomState;
+
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::schema::model::{DerivationSet, SchemaSet};
 
+/// Set of `(local-name, namespace)` substitutable element identities.
+///
+/// Keys are interned integer `NameId`s, not strings, so this uses `ahash`
+/// (fast, keyed) instead of SipHash — mirroring [`AttrNameSet`] in
+/// `validation::context` and the UPA conflict sets that clone these. The UPA
+/// overlap check (`check_element_element_conflicts`) does O(n²) `contains`
+/// lookups over these, so the default-SipHash cost was a top compiler hot spot.
+///
+/// [`AttrNameSet`]: crate::validation::context::AttrNameSet
+pub type SubstitutableNameSet = HashSet<(NameId, Option<NameId>), RandomState>;
+
 /// Map from substitution group head to all substitutable element names.
-pub type SubstitutionGroupMap = HashMap<ElementKey, HashSet<(NameId, Option<NameId>)>>;
+pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet>;
 
 /// Build a substitution group membership map for the schema set.
 pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroupMap {
@@ -46,7 +59,7 @@ fn build_substitution_group_map_inner(
             Some(elem) => elem,
             None => continue,
         };
-        let mut names = HashSet::new();
+        let mut names = SubstitutableNameSet::default();
         if let Some(name) = head_elem.name {
             if !head_elem.is_abstract || include_abstract {
                 names.insert((name, head_elem.target_namespace));
