@@ -51,6 +51,14 @@ impl<'a> StringStore<'a> {
         self.values.len() as u32 // 1-based
     }
 
+    /// Releases spare capacity in the index vector once the document is fully
+    /// built. The `Vec<StringValue>` grows geometrically during the build, so it
+    /// can hold up to ~2× the entries it actually needs; this hands the slack
+    /// back to the allocator. The arena (the string bytes) is untouched.
+    pub fn shrink_to_fit(&mut self) {
+        self.values.shrink_to_fit();
+    }
+
     /// Returns the string at the given index.
     ///
     /// Index 0 returns `""` (empty-string sentinel).

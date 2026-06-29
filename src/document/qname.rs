@@ -141,6 +141,28 @@ impl QNameTable {
         new_idx
     }
 
+    /// Returns the index of an existing atom whose identity fields match
+    /// `qname` (the same comparison `atomize` uses — `qualified_name_idx` is
+    /// ignored), or `None` if absent. No insertion, no mutation.
+    ///
+    /// Lets a caller probe before materializing the qualified-name string, so a
+    /// repeated qname does not leave an orphaned `StringStore` entry: the string
+    /// is only stored on a genuine miss, then handed to [`atomize`].
+    ///
+    /// [`atomize`]: QNameTable::atomize
+    pub fn lookup(&self, qname: &QNameAtom) -> Option<u32> {
+        let hash = self.hash_atom(qname);
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let mut entry_idx = self.buckets[bucket_idx];
+        while entry_idx >= 0 {
+            if self.atoms[entry_idx as usize] == *qname {
+                return Some(entry_idx as u32);
+            }
+            entry_idx = self.nexts[entry_idx as usize];
+        }
+        None
+    }
+
     /// Returns the [`QNameAtom`] at the given index.
     ///
     /// # Panics
