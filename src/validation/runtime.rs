@@ -5,7 +5,10 @@
 //! Method bodies are moved verbatim from the former monolithic `SchemaValidator`.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 use std::marker::PhantomData;
+
+use ahash::AHasher;
 
 use crate::arenas::{ComplexTypeDefData, ResolvedAttributeUse};
 use crate::compiler::{compile_content_model_matcher, SubstitutionGroupMap};
@@ -184,7 +187,11 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// an `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` hint that
     /// announces a namespace whose first element appeared earlier than the
     /// current element is rejected (XSD 1.0 only — XSD 1.1 §G.1.15 relaxes).
-    first_namespace_use: HashMap<Option<NameId>, u64>,
+    // `ahash` (ZST fixed-key build-hasher), not the default SipHash: this map is
+    // `.entry()`-probed on **every element** in XSD 1.0 (see `validate_*`), and
+    // the key is an interned `NameId` (not attacker-controlled hash bytes), so the
+    // per-element SipHash it used to pay was pure overhead (`PERF_PROFILE_VALIDATE_ONLY`).
+    first_namespace_use: HashMap<Option<NameId>, u64, BuildHasherDefault<AHasher>>,
     /// Base URI of the instance document (set by caller for relative URI resolution).
     instance_base_uri: String,
     /// Cached `xs:ID` simple-type key for XSD 1.0's ct-props-correct.5
@@ -391,7 +398,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             final_ic_tables: None,
             schema_location_hints: Vec::new(),
             no_namespace_schema_location_hints: Vec::new(),
-            first_namespace_use: HashMap::new(),
+            first_namespace_use: HashMap::default(),
             instance_base_uri: String::new(),
             #[cfg(feature = "xsd11")]
             assertion_source,

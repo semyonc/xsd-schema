@@ -129,12 +129,21 @@ pub trait TypeValidator: Send + Sync {
     fn facet_applicable(&self, facet: &str) -> bool;
 }
 
+/// Number of `XmlTypeCode` discriminants, `0..=Error` inclusive. `by_code` has
+/// one slot per code, so a lookup is a bounds-checked array index. Stays correct
+/// as long as `Error` remains the highest discriminant (it is the bottom type,
+/// added last); a new higher variant would need this bumped.
+const XML_TYPE_CODE_COUNT: usize = XmlTypeCode::Error as usize + 1;
+
 /// Registry of type validators
 pub struct ValidatorRegistry {
-    /// Validators by type name
+    /// Validators by type name — consulted during schema setup, not per value.
     validators: HashMap<&'static str, Arc<dyn TypeValidator>>,
-    /// Validators by type code
-    by_code: HashMap<XmlTypeCode, Arc<dyn TypeValidator>>,
+    /// Validators by type code — a **dense array** indexed by the `XmlTypeCode`
+    /// discriminant. `get_by_code` runs per simple value (~1.8M/run on a
+    /// record-heavy document); array indexing avoids the per-lookup SipHash a
+    /// `HashMap<XmlTypeCode, _>` paid on every value (`PERF_PROFILE_VALIDATE_ONLY`).
+    by_code: [Option<Arc<dyn TypeValidator>>; XML_TYPE_CODE_COUNT],
 }
 
 impl ValidatorRegistry {
@@ -142,7 +151,7 @@ impl ValidatorRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             validators: HashMap::new(),
-            by_code: HashMap::new(),
+            by_code: std::array::from_fn(|_| None),
         };
 
         // Register all primitive type validators
@@ -212,7 +221,7 @@ impl ValidatorRegistry {
         let name = validator.type_name();
         let code = validator.type_code();
         self.validators.insert(name, validator.clone());
-        self.by_code.insert(code, validator);
+        self.by_code[code as usize] = Some(validator);
     }
 
     /// Get a validator by type name
@@ -222,7 +231,9 @@ impl ValidatorRegistry {
 
     /// Get a validator by type code
     pub fn get_by_code(&self, code: XmlTypeCode) -> Option<&dyn TypeValidator> {
-        self.by_code.get(&code).map(|v| v.as_ref())
+        self.by_code
+            .get(code as usize)
+            .and_then(|slot| slot.as_ref().map(|v| v.as_ref()))
     }
 
     /// Validate a value using the appropriate validator

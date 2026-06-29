@@ -9,7 +9,9 @@ use std::collections::HashSet;
 #[cfg(feature = "xsd11")]
 use std::collections::HashMap;
 
-use ahash::RandomState;
+use std::hash::BuildHasherDefault;
+
+use ahash::AHasher;
 
 #[cfg(feature = "xsd11")]
 use crate::ids::AttributeKey;
@@ -19,17 +21,28 @@ use crate::types::value::XmlValue;
 use super::content::ContentValidatorState;
 use super::info::{ContentProcessing, ContentType, SchemaValidity, TypeSource};
 
-/// Set of `(namespace, local-name)` attribute identities, keyed by `ahash`.
+/// Set of `(namespace, local-name)` attribute identities, hashed with `ahash`.
 ///
 /// The keys are tuples of dense interned-name integers (`Option<NameId>`,
-/// `NameId`), so `ahash` (fast, keyed) is used instead of SipHash to cheapen
-/// the per-element `seen_attributes` inserts and required-attribute checks.
-pub type AttrNameSet = HashSet<(Option<NameId>, NameId), RandomState>;
+/// `NameId`), so `ahash` is used instead of SipHash to cheapen the per-element
+/// `seen_attributes` inserts and required-attribute checks.
+///
+/// The build-hasher is the zero-sized [`BuildHasherDefault<AHasher>`] (ahash's
+/// fixed-key default), **not** `RandomState`. A fresh `ElementValidationState`
+/// is created for every element, and `RandomState`'s `Default` re-seeds a
+/// hasher (an `ahash::RandomState::from_keys` fold) on *each* construction —
+/// ~2.2% of pure-validation CPU, almost all of it on maps that stay empty (the
+/// leaf elements carry no attributes). `BuildHasherDefault` is a ZST whose
+/// `Default` is free, so empty per-element maps cost nothing to construct. The
+/// keys are interned `NameId`s minted by our own name table (not attacker-
+/// controlled hash bytes) in maps of at most a handful of entries, so the
+/// HashDoS surface that motivates a randomized seed is negligible here.
+pub type AttrNameSet = HashSet<(Option<NameId>, NameId), BuildHasherDefault<AHasher>>;
 
-/// Map keyed by `(namespace, local-name)` attribute identity, hashed with
-/// `ahash` (see [`AttrNameSet`]).
+/// Map keyed by `(namespace, local-name)` attribute identity, hashed with the
+/// same zero-sized fixed-key `ahash` build-hasher as [`AttrNameSet`].
 #[cfg(feature = "xsd11")]
-pub type AttrNameMap<V> = HashMap<(Option<NameId>, NameId), V, RandomState>;
+pub type AttrNameMap<V> = HashMap<(Option<NameId>, NameId), V, BuildHasherDefault<AHasher>>;
 
 /// An inherited attribute value flowing from an ancestor element (XSD 1.1).
 ///
