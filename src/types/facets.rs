@@ -1834,84 +1834,115 @@ fn compare_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
 pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> Cow<'_, str> {
     match mode {
         WhitespaceMode::Preserve => Cow::Borrowed(s),
-        WhitespaceMode::Replace => {
-            // Replace tab, CR, LF with space — but only allocate if any present.
-            if !s
-                .as_bytes()
-                .iter()
-                .any(|&b| b == b'\t' || b == b'\r' || b == b'\n')
-            {
-                return Cow::Borrowed(s);
-            }
-            Cow::Owned(
-                s.chars()
-                    .map(|c| match c {
-                        '\t' | '\r' | '\n' => ' ',
-                        _ => c,
-                    })
-                    .collect(),
-            )
-        }
-        WhitespaceMode::Collapse => {
-            // Borrow iff already collapsed: no \t\r\n, no leading/trailing space,
-            // and no run of two or more consecutive spaces.
-            if is_already_collapsed(s) {
-                return Cow::Borrowed(s);
-            }
-
-            // Replace, then collapse consecutive spaces, then trim.
-            let mut result = String::with_capacity(s.len());
-            let mut prev_space = true; // Start true to trim leading spaces
-
-            for c in s.chars() {
-                let c = match c {
-                    '\t' | '\r' | '\n' => ' ',
-                    other => other,
-                };
-                if c == ' ' {
-                    if !prev_space {
-                        result.push(' ');
-                        prev_space = true;
-                    }
-                } else {
-                    result.push(c);
-                    prev_space = false;
-                }
-            }
-
-            // Trim trailing space
-            if result.ends_with(' ') {
-                result.pop();
-            }
-
-            Cow::Owned(result)
-        }
+        WhitespaceMode::Replace => replace_whitespace(s),
+        WhitespaceMode::Collapse => collapse_whitespace(s),
     }
 }
 
-/// Returns `true` if `s` is already in collapsed form — i.e. it contains no
-/// tab/CR/LF, no leading or trailing ASCII space, and no run of two or more
-/// consecutive spaces. A single cheap byte scan, no allocation; when it returns
-/// `true`, `normalize_whitespace(.., Collapse)` can borrow the input unchanged.
-fn is_already_collapsed(s: &str) -> bool {
+/// `true` for exactly the four XSD whitespace characters #x20 #x9 #xD #xA.
+///
+/// Deliberately byte-level and *not* [`char::is_whitespace`] / [`str::trim`] /
+/// [`str::split_whitespace`]: those match Unicode whitespace (U+00A0, U+2028, …),
+/// which XSD `whiteSpace` must leave untouched. All four are ASCII, so trimming
+/// or splitting on them never lands inside a multi-byte UTF-8 sequence.
+#[inline]
+fn is_xsd_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
+
+/// `replace` whitespace normalization: each #x9/#xD/#xA becomes #x20 (a #x20 is
+/// already itself). Borrows when there is nothing to replace; otherwise allocates
+/// once and bulk-copies the unchanged runs around each replaced byte.
+fn replace_whitespace(s: &str) -> Cow<'_, str> {
     let bytes = s.as_bytes();
-    if bytes.first() == Some(&b' ') || bytes.last() == Some(&b' ') {
-        return false;
+    if !bytes.iter().any(|&b| matches!(b, b'\t' | b'\r' | b'\n')) {
+        return Cow::Borrowed(s);
     }
-    let mut prev_space = false;
-    for &b in bytes {
-        match b {
-            b'\t' | b'\r' | b'\n' => return false,
-            b' ' => {
-                if prev_space {
-                    return false; // two consecutive spaces
-                }
-                prev_space = true;
-            }
-            _ => prev_space = false,
+    let mut out = String::with_capacity(s.len());
+    let mut chunk_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(b, b'\t' | b'\r' | b'\n') {
+            out.push_str(&s[chunk_start..i]); // unchanged run before this byte
+            out.push(' ');
+            chunk_start = i + 1;
         }
     }
-    true
+    out.push_str(&s[chunk_start..]); // trailing unchanged run
+    Cow::Owned(out)
+}
+
+/// `collapse` whitespace normalization: `replace`, then squeeze each run of
+/// whitespace to a single #x20, then strip leading/trailing whitespace.
+///
+/// Two no-alloc fast paths cover the common shapes:
+/// * all-whitespace (or empty) → the empty string;
+/// * a trimmed core that needs no internal rewriting (no #x9/#xD/#xA and no
+///   double whitespace) → a borrowed sub-slice, so `" 123 "` / `"\nfoo\t"`
+///   borrow instead of allocating.
+///
+/// Only genuinely dirty input (internal tabs/newlines or multi-space runs)
+/// allocates, and then the rewrite copies whole words with `push_str` rather
+/// than one `char` at a time.
+fn collapse_whitespace(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    // Trim XSD whitespace from both ends. The cut points are ASCII bytes, hence
+    // always char boundaries.
+    let Some(start) = bytes.iter().position(|&b| !is_xsd_ws(b)) else {
+        return Cow::Borrowed(""); // all whitespace (or empty) collapses to ""
+    };
+    let end = bytes.iter().rposition(|&b| !is_xsd_ws(b)).unwrap() + 1;
+    let mid = &s[start..end];
+
+    // Borrow the trimmed core unless it needs internal rewriting: any #x9/#xD/#xA
+    // (which `replace` would turn into a space) or any run of two+ whitespace
+    // (which `collapse` would squeeze). The core has no leading/trailing ws.
+    let mut prev_ws = false;
+    let mut needs_rewrite = false;
+    for &b in mid.as_bytes() {
+        match b {
+            b'\t' | b'\r' | b'\n' => {
+                needs_rewrite = true;
+                break;
+            }
+            b' ' => {
+                if prev_ws {
+                    needs_rewrite = true;
+                    break;
+                }
+                prev_ws = true;
+            }
+            _ => prev_ws = false,
+        }
+    }
+    if !needs_rewrite {
+        return Cow::Borrowed(mid);
+    }
+
+    // Rewrite: emit each non-whitespace word, separated by a single space. `mid`
+    // is already trimmed, so there is exactly one space between words and none at
+    // the ends — byte-identical to the previous char-by-char implementation.
+    let mut out = String::with_capacity(mid.len());
+    let mbytes = mid.as_bytes();
+    let mut i = 0;
+    let mut first_word = true;
+    while i < mbytes.len() {
+        while i < mbytes.len() && is_xsd_ws(mbytes[i]) {
+            i += 1; // skip a whitespace run
+        }
+        if i >= mbytes.len() {
+            break;
+        }
+        if !first_word {
+            out.push(' ');
+        }
+        first_word = false;
+        let word_start = i;
+        while i < mbytes.len() && !is_xsd_ws(mbytes[i]) {
+            i += 1;
+        }
+        out.push_str(&mid[word_start..i]);
+    }
+    Cow::Owned(out)
 }
 
 /// Count total significant digits in a decimal value.
@@ -2419,6 +2450,38 @@ mod tests {
             normalize_whitespace("a b c", WhitespaceMode::Collapse),
             Cow::Borrowed(_)
         ));
+        // Collapse also borrows the trimmed core when only leading/trailing XSD
+        // whitespace differs — the core needs no internal rewriting.
+        assert!(matches!(
+            normalize_whitespace(" leading", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("trailing ", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("\n a b \t", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        // …and these still produce the correct collapsed value.
+        assert_eq!(
+            &*normalize_whitespace(" leading", WhitespaceMode::Collapse),
+            "leading"
+        );
+        assert_eq!(
+            &*normalize_whitespace("\n a b \t", WhitespaceMode::Collapse),
+            "a b"
+        );
+        // Whitespace-only / empty collapse to the empty string, also borrowed.
+        assert!(matches!(
+            normalize_whitespace("   \t\n", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            &*normalize_whitespace("   \t\n", WhitespaceMode::Collapse),
+            ""
+        );
     }
 
     #[test]
@@ -2428,15 +2491,9 @@ mod tests {
             normalize_whitespace("has\ttab", WhitespaceMode::Replace),
             Cow::Owned(_)
         ));
-        // Collapse owns for leading/trailing/double spaces or \t\r\n.
-        assert!(matches!(
-            normalize_whitespace(" leading", WhitespaceMode::Collapse),
-            Cow::Owned(_)
-        ));
-        assert!(matches!(
-            normalize_whitespace("trailing ", WhitespaceMode::Collapse),
-            Cow::Owned(_)
-        ));
+        // Collapse owns only when the *core* needs rewriting: an internal
+        // double space or an internal \t\r\n. (Leading/trailing-only whitespace
+        // now borrows the trimmed core — see the borrow test above.)
         assert!(matches!(
             normalize_whitespace("a  b", WhitespaceMode::Collapse),
             Cow::Owned(_)
@@ -2445,6 +2502,39 @@ mod tests {
             normalize_whitespace("tab\there", WhitespaceMode::Collapse),
             Cow::Owned(_)
         ));
+        // Owns when there are both edge whitespace and an internal run to squeeze.
+        assert!(matches!(
+            normalize_whitespace(" a  b ", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert_eq!(
+            &*normalize_whitespace(" a  b ", WhitespaceMode::Collapse),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_xsd_whitespace_not_unicode() {
+        // XSD whiteSpace is exactly #x20 #x9 #xD #xA. Unicode whitespace such as
+        // NBSP (U+00A0) or LINE SEPARATOR (U+2028) must be left untouched — both
+        // as content and at the edges (str::trim / split_whitespace would eat it).
+        let nbsp = "\u{00A0}"; // not XSD whitespace
+
+        let collapse_in = format!(" a{nbsp}{nbsp}b ");
+        let collapsed = normalize_whitespace(&collapse_in, WhitespaceMode::Collapse);
+        assert_eq!(&*collapsed, format!("a{nbsp}{nbsp}b")); // edges trimmed, NBSP kept (incl. the run)
+        assert!(matches!(collapsed, Cow::Borrowed(_))); // NBSP is not ws, so the core borrows
+
+        // A leading NBSP is content, so nothing is trimmed and the whole thing borrows.
+        let lead_in = format!("{nbsp}x");
+        let lead = normalize_whitespace(&lead_in, WhitespaceMode::Collapse);
+        assert_eq!(&*lead, format!("{nbsp}x"));
+        assert!(matches!(lead, Cow::Borrowed(_)));
+
+        // Replace only maps #x9/#xD/#xA → #x20; NBSP and multi-byte content survive.
+        let repl_in = format!("café\tx{nbsp}y");
+        let repl = normalize_whitespace(&repl_in, WhitespaceMode::Replace);
+        assert_eq!(&*repl, format!("café x{nbsp}y"));
     }
 
     // =========================================================================
