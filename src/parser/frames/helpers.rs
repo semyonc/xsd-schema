@@ -229,8 +229,20 @@ fn parse_qname_ref(
     let prefix_id = prefix.and_then(|p| name_table.get(p));
 
     // Resolve namespace immediately using the snapshot
-    let namespace = if let Some(pid) = prefix_id {
-        ns_snapshot.resolve_prefix(pid)
+    let namespace = if let Some(p) = prefix {
+        // src-qname: a prefixed QName whose prefix has no in-scope namespace
+        // binding is a schema representation error (msData stE008:
+        // memberTypes="foo:listOfMyInt" with xmlns:foo undeclared).
+        match prefix_id.and_then(|pid| ns_snapshot.resolve_prefix(pid)) {
+            Some(ns) => Some(ns),
+            None => {
+                return Err(SchemaError::structural(
+                    "src-qname",
+                    format!("QName '{}' uses undeclared namespace prefix '{}'", value, p),
+                    None,
+                ));
+            }
+        }
     } else {
         // For unprefixed QNames in XSD attribute values (type, ref, base, etc.),
         // use the default namespace if one is declared. Per XML namespace rules,
@@ -456,7 +468,7 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
 
     match facet.kind {
         FacetKind::Enumeration => {
-            facets.add_enumeration(facet.value, facet.source);
+            facets.add_enumeration_with_ns(facet.value, facet.ns_snapshot, facet.source);
         }
         FacetKind::Pattern => {
             // Use unchecked to defer pattern compilation to validation phase

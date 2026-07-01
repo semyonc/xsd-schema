@@ -56,12 +56,37 @@ fn xml_value_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
     if a.type_code == b.type_code && a.value == b.value {
         return true;
     }
-    if a.type_code == b.type_code && xml_value_datetime_eq(a, b) {
+    if a.type_code == b.type_code && (xml_value_datetime_eq(a, b) || xml_value_nan_eq(a, b)) {
         return true;
     }
     // Singleton-list ↔ atomic equality (XSD §3.11.4)
     match (extract_single_atomic(a), extract_single_atomic(b)) {
-        (Some(va), Some(vb)) => va == vb || xml_atomic_datetime_eq(va, vb),
+        (Some(va), Some(vb)) => {
+            va == vb || xml_atomic_datetime_eq(va, vb) || xml_atomic_nan_eq(va, vb)
+        }
+        _ => false,
+    }
+}
+
+/// For identity-constraint purposes NaN is *identical* to NaN (XSD 1.1
+/// Datatypes §2.2.1 "identity" / W3C bug 9196 — saxonData Complex
+/// unique003): two NaN fields must collide, unlike IEEE `==`.
+fn xml_atomic_nan_eq(
+    a: &crate::types::value::XmlAtomicValue,
+    b: &crate::types::value::XmlAtomicValue,
+) -> bool {
+    use crate::types::value::XmlAtomicValue as V;
+    match (a, b) {
+        (V::Double(x), V::Double(y)) => x.is_nan() && y.is_nan(),
+        (V::Float(x), V::Float(y)) => x.is_nan() && y.is_nan(),
+        _ => false,
+    }
+}
+
+fn xml_value_nan_eq(a: &XmlValue, b: &XmlValue) -> bool {
+    use crate::types::value::XmlValueKind;
+    match (&a.value, &b.value) {
+        (XmlValueKind::Atomic(va), XmlValueKind::Atomic(vb)) => xml_atomic_nan_eq(va, vb),
         _ => false,
     }
 }

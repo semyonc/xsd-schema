@@ -718,12 +718,87 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         stats.errors += 1;
     }
 
+    // Datatypes §3.3.20 — enumeration values on NOTATION-derived types must
+    // resolve to declared notations. Runs here so notations from every
+    // schema document are already registered.
+    if let Err(e) = validate_notation_enumerations(schema_set) {
+        errors.push(e);
+        stats.errors += 1;
+    }
+
     // If there were errors, return the first one
     if let Some(first_error) = errors.into_iter().next() {
         return Err(first_error);
     }
 
     Ok(stats)
+}
+
+/// Datatypes §3.3.20: "The value space of NOTATION is the set of QNames of
+/// notations declared in the current schema." An enumeration facet value on
+/// a NOTATION-derived simple type that does not resolve to a declared
+/// notation is therefore outside the base value space
+/// (enumeration-valid-restriction).
+fn validate_notation_enumerations(schema_set: &SchemaSet) -> SchemaResult<()> {
+    let notation_base = schema_set.builtin_types().notation;
+    for (sk, st) in schema_set.arenas.simple_types.iter() {
+        if sk == notation_base || !schema_set.derives_from(sk, notation_base) {
+            continue;
+        }
+        let Some(enum_facet) = st.facets.enumeration.as_ref() else {
+            continue;
+        };
+        for (raw_value, snapshot) in &enum_facet.qname_contexts {
+            let value = raw_value.trim();
+            let (prefix, local) = match value.split_once(':') {
+                Some((p, l)) => (Some(p), l),
+                None => (None, value),
+            };
+            let type_name = st
+                .name
+                .map(|n| schema_set.name_table.resolve(n))
+                .unwrap_or_else(|| "(anonymous)".to_string());
+            let location = schema_set.locate(enum_facet.source.as_ref());
+            let ns = match prefix {
+                Some(p) => {
+                    let resolved = schema_set
+                        .name_table
+                        .get(p)
+                        .and_then(|pid| snapshot.resolve_prefix(pid));
+                    match resolved {
+                        Some(ns) => Some(ns),
+                        None => {
+                            return Err(SchemaError::structural(
+                                "enumeration-valid-restriction",
+                                format!(
+                                    "Enumeration value '{}' in NOTATION type '{}' uses an unbound namespace prefix",
+                                    value, type_name
+                                ),
+                                location,
+                            ));
+                        }
+                    }
+                }
+                None => snapshot.default_ns,
+            };
+            let declared = schema_set
+                .name_table
+                .get(local)
+                .and_then(|lid| schema_set.lookup_notation(ns, lid))
+                .is_some();
+            if !declared {
+                return Err(SchemaError::structural(
+                    "enumeration-valid-restriction",
+                    format!(
+                        "Enumeration value '{}' in NOTATION type '{}' does not match any declared notation",
+                        value, type_name
+                    ),
+                    location,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Walk complex-type content particles, enforcing §3.17.6.2 clause 4 on every
@@ -750,6 +825,41 @@ fn validate_particle_qname_visibility(schema_set: &SchemaSet) -> SchemaResult<()
                     let src = elem.source.as_ref().or(particle.source.as_ref());
                     if let Some(ref_qn) = &elem.ref_name {
                         check_namespace_visible(schema_set, ref_qn, src, "Element")?;
+                        // src-resolve: a dangling element ref is fatal
+                        // (msData elemL002: ref="foo" where foo is an
+                        // attribute declaration). Exception: chameleon-
+                        // adopted documents, whose no-namespace refs may
+                        // have been rewritten to the adopting namespace —
+                        // the NFA compiler stays lenient for those (see
+                        // `build_element_term`).
+                        if schema_set
+                            .lookup_element(ref_qn.namespace, ref_qn.local_name)
+                            .is_none()
+                        {
+                            let from_chameleon = src
+                                .map(|s| s.doc_id)
+                                .and_then(|id| schema_set.documents.get(id as usize))
+                                .is_some_and(|d| d.is_chameleon());
+                            if !from_chameleon {
+                                let name_str = format_resolved_qname(
+                                    &schema_set.name_table,
+                                    ref_qn.namespace,
+                                    ref_qn.local_name,
+                                );
+                                let location = schema_set
+                                    .locate(src)
+                                    .or_else(|| schema_set.locate(particle.source.as_ref()));
+                                return Err(SchemaError::structural(
+                                    "src-resolve",
+                                    format!(
+                                        "Element reference '{}' does not resolve to a \
+                                         global element declaration",
+                                        name_str
+                                    ),
+                                    location,
+                                ));
+                            }
+                        }
                     }
                     if let Some(TypeRefResult::QName(qname)) = &elem.type_ref {
                         check_namespace_visible(schema_set, qname, src, "Type")?;

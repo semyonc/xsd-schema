@@ -15,9 +15,14 @@
 
 | Suite | Command | Total | Passed | Failed | Skipped | Errors | Pass rate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,429 | 47 | 34 | 0 | 99.9% |
+| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,457 | 19 | 34 | 0 | 99.95% |
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,313 | 6 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 -- -s ../../XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
+
+All 19 remaining XSD 1.0 failures and all 6 XSD 1.1 failures are documented
+disputes: W3C-queried tests (Bugzilla 4146/4680/4957/6901/29085), tests that
+contradict other accepted tests in the same suite (the `elemM002` /
+`xsd015.e` family vs. Saxon's `Missing` group), or documented waivers.
 
 ## Benchmark
 
@@ -32,9 +37,9 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 | Strategy | Parser | Time | Throughput | RSS delta |
 | --- | --- | ---: | ---: | ---: | 
-| streaming | quick-xml | 325 ms | 47.5 MB/s | **736 KB** |
-| DOM (roxmltree) | roxmltree | 294 ms | 52.8 MB/s | 88.6 MB |
-| DOM (BufferDoc) | quick-xml | 363 ms | 42.7 MB/s | 61.7 MB |
+| streaming | quick-xml | 325 ms | 47.8 MB/s | **704 KB** |
+| DOM (roxmltree) | roxmltree | 299 ms | 51.9 MB/s | 88.5 MB |
+| DOM (BufferDoc) | quick-xml | 370 ms | 42.0 MB/s | 61.7 MB |
 
 
 

@@ -605,6 +605,25 @@ fn validate_simple_restriction(
             "cos-st-restricts",
             "restrict",
         )?;
+
+        // cos-st-restricts.1.1: an atomic restriction's {base type definition}
+        // must be an atomic simple type or a built-in primitive.
+        // xs:anySimpleType has no {variety}, so a user-defined
+        // <xs:restriction base="xs:anySimpleType"/> is invalid (msData
+        // addB110, stZ005/stZ006/stZ011). Built-in primitives themselves
+        // never reach this check — they carry no resolved base.
+        if base_simple_key == schema_set.builtin_types().any_simple_type {
+            let (location, type_name) = type_error_context(schema_set, type_def);
+            return Err(SchemaError::structural(
+                "cos-st-restricts",
+                format!(
+                    "Simple type '{}' cannot restrict xs:anySimpleType directly \
+                     (cos-st-restricts.1.1: base must be atomic or a built-in primitive)",
+                    type_name
+                ),
+                location,
+            ));
+        }
     }
 
     stats.restrictions_validated += 1;
@@ -1001,6 +1020,12 @@ fn validate_complex_extension(
 
                 validate_extension_mixed_parity(schema_set, type_def, base_type)?;
 
+                validate_xsd10_attribute_wildcard_union_expressible(
+                    schema_set,
+                    type_def,
+                    base_complex_key,
+                )?;
+
                 // cos-ct-extends / cos-particle-extend: Cannot extend non-empty
                 // non-all content with an all compositor.  The effective content
                 // type of an extension is sequence(base, extension) per §3.4.2.3.3.
@@ -1236,6 +1261,60 @@ fn validate_complex_restriction(
                         ),
                         location,
                     ));
+                }
+
+                // cos-applicable-facets: facets in a simpleContent restriction
+                // constrain the base's effective simple content type. When that
+                // content type is xs:anySimpleType (absent {variety}), no
+                // constraining facet is applicable (msData stZ010: minLength
+                // over an anySimpleType content type).
+                if let ComplexContentResult::Simple(sc) = &type_def.content {
+                    if !sc.facets.is_empty() {
+                        if let Some(TypeKey::Simple(sk)) =
+                            effective_simple_content_type_key(schema_set, base_type)
+                        {
+                            if sk == schema_set.builtin_types().any_simple_type {
+                                let (location, type_name) =
+                                    type_error_context(schema_set, type_def);
+                                return Err(SchemaError::structural(
+                                    "cos-applicable-facets",
+                                    format!(
+                                        "Complex type '{}': constraining facets are not \
+                                         applicable to xs:anySimpleType content \
+                                         (absent variety)",
+                                        type_name
+                                    ),
+                                    location,
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // src-ct.2.2: when the base qualifies only via clause 2.1.2
+                // (mixed content with emptiable particle, e.g. xs:anyType),
+                // the <xs:restriction> must supply the simple content type
+                // itself via an inline <xs:simpleType> child (msData ctD004).
+                if let ComplexContentResult::Simple(sc) = &type_def.content {
+                    let base_has_simple_content =
+                        matches!(base_type.content, ComplexContentResult::Simple(_));
+                    if !base_has_simple_content && sc.content_type.is_none() {
+                        let (location, type_name) = type_error_context(schema_set, type_def);
+                        let base_name = format_type_name(
+                            schema_set,
+                            base_type.name,
+                            base_type.target_namespace,
+                        );
+                        return Err(SchemaError::structural(
+                            "src-ct",
+                            format!(
+                                "Complex type '{}': simpleContent restriction of mixed base '{}' \
+                                 requires an inline <simpleType> child (src-ct.2.2)",
+                                type_name, base_name,
+                            ),
+                            location,
+                        ));
+                    }
                 }
 
                 validate_content_particle_restriction(schema_set, type_def, base_type)?;
@@ -4455,6 +4534,32 @@ fn validate_facet_values_against_base_type(
         return Ok(());
     }
 
+    // XSD 1.0 strict anyURI lexical rules for enumeration facet values
+    // (msData anyURI_a003/b004/b006: bad scheme, bare `%`, `^`, `\`).
+    // XSD 1.1 dropped the RFC 2396 tie, so this is version-gated; instance
+    // values keep the permissive path.
+    if schema_set.is_xsd10() {
+        if let (TypeKey::Simple(base_sk), Some(enum_facet)) =
+            (base_key, type_def.facets.enumeration.as_ref())
+        {
+            if schema_set.derives_from(base_sk, schema_set.builtin_types().any_uri) {
+                for value in &enum_facet.values {
+                    if !crate::types::validators::is_strict_xsd10_anyuri_enum_value(value) {
+                        return Err(SchemaError::structural(
+                            "enumeration-valid-restriction",
+                            format!(
+                                "Enumeration value '{}' in type '{}' is not a valid xs:anyURI \
+                                 (XSD 1.0 / RFC 2396 lexical rules)",
+                                value, type_name
+                            ),
+                            location.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     // Validate enumeration values.
     // Walk past any base with its own enumeration to avoid string-equality comparison
     // (canonical-form mismatch). merge_with_base already checks the subset rule.
@@ -5063,6 +5168,90 @@ fn intersect_canonical_ns(a: &CanonicalNs, b: &CanonicalNs) -> CanonicalNs {
 
 /// §3.10.6.3 cos-aw-union on the canonical namespace lattice.
 /// Mirror of `intersect_canonical_ns` for the union side.
+/// XSD 1.0 §3.10.6 "Attribute Wildcard Union" clauses 4/5: unlike XSD 1.1,
+/// the 1.0 union of a negation with a set that does NOT contain the negated
+/// namespace name — or of two negations of different values — is **not
+/// expressible**, and a complex-type extension requiring such a union is a
+/// schema error (msData wildZ013: base `##other` extended with
+/// `##local b c`). XSD 1.1 §3.10.6.3 made every union expressible, so this
+/// check is version-gated.
+fn validate_xsd10_attribute_wildcard_union_expressible(
+    schema_set: &SchemaSet,
+    derived: &crate::arenas::ComplexTypeDefData,
+    base_key: ComplexTypeKey,
+) -> SchemaResult<()> {
+    if !schema_set.is_xsd10() {
+        return Ok(());
+    }
+    let own_local = own_attribute_wildcard_ref(derived);
+    let Some(own) = effective_attribute_wildcard(
+        schema_set,
+        own_local,
+        derived.target_namespace,
+        &derived.resolved_attribute_groups,
+    )
+    .ok()
+    .flatten() else {
+        return Ok(());
+    };
+    let Some(base_wc) = compute_runtime_attribute_wildcard_bounded(schema_set, base_key, 0) else {
+        return Ok(());
+    };
+
+    // Recover the intensionally negated namespace name from the canonical
+    // form. Under XSD 1.0 a `Not` set always stems from `##other`
+    // (canonicalized as {tns, absent}); the negated *name* is the non-absent
+    // member, or absent itself for a no-targetNamespace schema.
+    let negated_of = |ns: &CanonicalNs| -> Option<Option<NameId>> {
+        match ns {
+            CanonicalNs::Not(set) => Some(
+                set.iter()
+                    .copied()
+                    .flatten()
+                    .next()
+                    .map(Some)
+                    .unwrap_or(None),
+            ),
+            _ => None,
+        }
+    };
+
+    // §3.10.6 union of not(ns) with a set S (per the wording the W3C suite
+    // enforces — wildZ013 vs wildZ013a):
+    //   S ∋ ns and S ∋ absent  → any                (expressible)
+    //   S ∋ ns, S ∌ absent     → not(absent)        (expressible)
+    //   S ∌ ns, S ∋ absent     → NOT EXPRESSIBLE
+    //   S ∌ ns, S ∌ absent     → not(ns)            (expressible)
+    let neg_vs_set = |neg: Option<NameId>,
+                      s: &std::collections::HashSet<Option<NameId>>|
+     -> bool { s.contains(&None) && !s.contains(&neg) };
+
+    let not_expressible = match (&own.namespace, &base_wc.namespace) {
+        (CanonicalNs::Not(_), CanonicalNs::Enum(s)) => {
+            neg_vs_set(negated_of(&own.namespace).unwrap(), s)
+        }
+        (CanonicalNs::Enum(s), CanonicalNs::Not(_)) => {
+            neg_vs_set(negated_of(&base_wc.namespace).unwrap(), s)
+        }
+        _ => false,
+    };
+
+    if not_expressible {
+        let (location, type_name) = type_error_context(schema_set, derived);
+        return Err(SchemaError::structural(
+            "cos-aw-union",
+            format!(
+                "Complex type '{}': the union of the extension's attribute wildcard \
+                 with the base's is not expressible in XSD 1.0 (§3.10.6 attribute \
+                 wildcard union)",
+                type_name
+            ),
+            location,
+        ));
+    }
+    Ok(())
+}
+
 fn union_canonical_ns(a: &CanonicalNs, b: &CanonicalNs) -> CanonicalNs {
     use std::collections::HashSet;
     match (a, b) {
@@ -5774,6 +5963,51 @@ fn validate_attribute_restriction(
                 ),
                 location,
             ));
+        }
+    }
+
+    // §3.4.6.3 derivation-ok-restriction clause 2: an attribute use declared
+    // in the restriction with no matching attribute use in the base must be
+    // admitted by the base's complete {attribute wildcard} (msData ctO004:
+    // unqualified attribute vs a base wildcard of ##other). xs:anyType's
+    // wildcard admits everything, so restrictions of anyType are exempt.
+    if let Some(TypeKey::Complex(base_key)) = derived.resolved_base_type {
+        if base_key != schema_set.any_type_key() {
+            let base_wildcard =
+                compute_runtime_attribute_wildcard_bounded(schema_set, base_key, 0);
+            for derived_attr in &derived_attrs {
+                if derived_attr.use_kind == AttributeUseKind::Prohibited {
+                    continue;
+                }
+                let matches_base = base_attrs.iter().any(|a| {
+                    a.name == derived_attr.name
+                        && a.target_namespace == derived_attr.target_namespace
+                });
+                if matches_base {
+                    continue;
+                }
+                let admitted = base_wildcard.as_ref().is_some_and(|wc| {
+                    effective_wildcard_allows_attribute(
+                        schema_set,
+                        wc,
+                        derived_attr.target_namespace,
+                        derived_attr.name,
+                    )
+                });
+                if !admitted {
+                    let attr_name_str = schema_set.name_table.resolve(derived_attr.name);
+                    return Err(SchemaError::structural(
+                        "derivation-ok-restriction",
+                        format!(
+                            "Complex type '{}' restricting '{}': attribute '{}' matches no \
+                             attribute use of the base and is not admitted by the base's \
+                             attribute wildcard (derivation-ok-restriction.2)",
+                            type_name, base_name, attr_name_str,
+                        ),
+                        location,
+                    ));
+                }
+            }
         }
     }
 
@@ -8011,6 +8245,42 @@ pub fn validate_substitution_group_element_consistency(schema_set: &SchemaSet) -
             &mut entries,
             0,
         );
+
+        // An extension's effective content model prepends the base chain's
+        // content, so EDC spans the merge: base `child1: xs:integer` plus an
+        // extension's own `child1: xs:date` is one content model with an
+        // inconsistent QName (saxon complex017). Walk each extension
+        // ancestor's own particle into the same entry map.
+        let mut current = ct;
+        let mut chain_guard = 0usize;
+        while matches!(current.derivation_method, Some(DerivationMethod::Extension)) {
+            chain_guard += 1;
+            if chain_guard > 100 {
+                break;
+            }
+            let Some(TypeKey::Complex(base_key)) = current.resolved_base_type else {
+                break;
+            };
+            let Some(base_ct) = schema_set.arenas.complex_types.get(base_key) else {
+                break;
+            };
+            if let ComplexContentResult::Complex(base_cc) = &base_ct.content {
+                if let Some(base_particle) = base_cc.particle.as_ref() {
+                    let mut base_flat_idx = 0usize;
+                    walk_particle(
+                        schema_set,
+                        base_particle,
+                        base_ct.target_namespace,
+                        &base_ct.resolved_content_particle_elements,
+                        &mut base_flat_idx,
+                        &subst_index,
+                        &mut entries,
+                        0,
+                    );
+                }
+            }
+            current = base_ct;
+        }
 
         for ((ns, name), list) in &entries {
             if list.len() < 2 {

@@ -1037,25 +1037,15 @@ pub fn validate_notation_structure(
         }
     }
 
-    match ctx.xsd_version {
-        XsdVersion::V1_0 => {
-            if !has_public {
-                return Err(SchemaError::structural(
-                    "n-props-correct",
-                    "Notation must have 'public' attribute in XSD 1.0",
-                    None,
-                ));
-            }
-        }
-        XsdVersion::V1_1 => {
-            if !has_public && !has_system {
-                return Err(SchemaError::structural(
-                    "n-props-correct",
-                    "Notation must have 'public' or 'system' attribute in XSD 1.1",
-                    None,
-                ));
-            }
-        }
+    // XSD 1.0 as published required `public`, but errata (E1-1, adopted by
+    // the second edition schema-for-schemas and the W3C suite's errata10
+    // group — errC004) relaxed it to "public or system", matching XSD 1.1.
+    if !has_public && !has_system {
+        let msg = match ctx.xsd_version {
+            XsdVersion::V1_0 => "Notation must have 'public' or 'system' attribute in XSD 1.0",
+            XsdVersion::V1_1 => "Notation must have 'public' or 'system' attribute in XSD 1.1",
+        };
+        return Err(SchemaError::structural("n-props-correct", msg, None));
     }
 
     Ok(())
@@ -1299,12 +1289,24 @@ mod tests {
     }
 
     #[test]
-    fn test_notation_requires_public_in_1_0() {
+    fn test_notation_system_only_ok_in_1_0() {
+        // XSD 1.0 as published required `public`, but the errata (W3C suite
+        // errata10 group, errC004) relaxed it to "public or system".
         let mut name_table = NameTable::new();
         let attrs = make_attr_map(
             &mut name_table,
             &[("name", "myNotation"), ("system", "foo")],
         );
+        let ctx = ValidationContext::new(XsdVersion::V1_0, true);
+
+        let result = validate_notation_structure(&attrs, &name_table, &ctx);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_notation_requires_public_or_system_in_1_0() {
+        let mut name_table = NameTable::new();
+        let attrs = make_attr_map(&mut name_table, &[("name", "myNotation")]);
         let ctx = ValidationContext::new(XsdVersion::V1_0, true);
 
         let result = validate_notation_structure(&attrs, &name_table, &ctx);

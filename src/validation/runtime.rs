@@ -2845,9 +2845,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// tables), then retries deferred keyrefs against the enriched parent scope.
     fn finish_identity_constraints(&mut self, ev_state: &mut ElementValidationState) {
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
+        // §3.11.4 Identity-constraint Satisfied clause 3: a field node must have
+        // a simple type or a complex type with simple content. Element-only,
+        // mixed, AND empty content types all lack a simple {variety} — an
+        // attribute-only complex type (ContentType::Empty) is equally invalid
+        // as a field value (msData idH006).
         let is_complex_content = matches!(
             ev_state.content_type,
-            Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
+            Some(ContentType::ElementOnly) | Some(ContentType::Mixed) | Some(ContentType::Empty)
         );
         // Resolve QName/NOTATION typed values for IC comparison (namespace-aware).
         // Use a separate copy to preserve the original PSVI typed_value.

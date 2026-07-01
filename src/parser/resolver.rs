@@ -539,12 +539,12 @@ impl SchemaResolver {
     pub fn resolve_location(&self, schema_location: &str, base_uri: &str) -> SchemaResult<String> {
         // Check if it's already absolute
         if is_absolute_uri(schema_location) {
-            return Ok(schema_location.to_string());
+            return Ok(canonicalize_file_location(schema_location.to_string()));
         }
 
         // Try to resolve relative to base URI
         let resolved = resolve_relative_uri(schema_location, base_uri)?;
-        Ok(resolved)
+        Ok(canonicalize_file_location(resolved))
     }
 
     /// Load and parse a schema from a location.
@@ -1199,6 +1199,26 @@ fn resolve_relative_path(relative: &str, base: &str) -> SchemaResult<String> {
     let normalized = normalize_path(&resolved);
 
     Ok(normalized.to_string_lossy().into_owned())
+}
+
+/// Map a resolved plain file path to its on-disk canonical form when the
+/// file exists. Schema-document identity (dedup in `loaded_locations`)
+/// keys on this string, so two spellings of the same file — e.g. case
+/// variants on a case-insensitive filesystem (msData schZ012_b/c) or a
+/// symlinked path — must collapse to one location. Non-file locations
+/// (http, embedded, file:// URIs) and missing files pass through.
+pub(crate) fn canonicalize_file_location(resolved: String) -> String {
+    let has_scheme = resolved.starts_with("http://")
+        || resolved.starts_with("https://")
+        || resolved.starts_with("file://")
+        || resolved.starts_with("embedded://");
+    if has_scheme {
+        return resolved;
+    }
+    match std::fs::canonicalize(Path::new(&resolved)) {
+        Ok(canonical) => canonical.to_string_lossy().into_owned(),
+        Err(_) => resolved,
+    }
 }
 
 /// Normalize a path by resolving . and .. components

@@ -331,9 +331,14 @@ impl<'a> CompileContext<'a> {
         // Get the compositor, default to sequence
         let compositor = group.compositor.unwrap_or(Compositor::Sequence);
 
-        // Handle empty particle list
+        // Handle empty particle list. An empty sequence/all matches empty
+        // content; an empty choice is unsatisfiable (§3.4.2.3).
         if group.particles.is_empty() {
-            return Ok(self.builder.epsilon_fragment());
+            return Ok(if compositor == Compositor::Choice {
+                self.builder.dead_fragment()
+            } else {
+                self.builder.epsilon_fragment()
+            });
         }
 
         // Compile based on compositor type
@@ -384,7 +389,8 @@ impl<'a> CompileContext<'a> {
     /// Compile a choice (xs:choice)
     fn compile_choice(&mut self, particles: &[ParticleResult]) -> NfaCompileResult<NfaFragment> {
         if particles.is_empty() {
-            return Ok(self.builder.epsilon_fragment());
+            // A choice with no particles is unsatisfiable (§3.4.2.3).
+            return Ok(self.builder.dead_fragment());
         }
 
         // Set sibling elements for ##definedSibling expansion in wildcards
@@ -727,8 +733,14 @@ impl<'a> CompileContext<'a> {
     ) -> NfaCompileResult<NfaFragment> {
         let compositor = group.compositor.unwrap_or(Compositor::Sequence);
 
+        // Empty sequence/all matches empty content; empty choice is
+        // unsatisfiable (§3.4.2.3).
         if group.particles.is_empty() {
-            return Ok(self.builder.epsilon_fragment());
+            return Ok(if compositor == Compositor::Choice {
+                self.builder.dead_fragment()
+            } else {
+                self.builder.epsilon_fragment()
+            });
         }
 
         // Save context and set up flat indexing for the named group

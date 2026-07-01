@@ -70,7 +70,10 @@ fn build_substitution_group_map_inner(
             effective_element_constraints(schema_set, head_elem);
         if !effective_block.contains_substitution() {
             let head_type = head_elem.resolved_type;
-            let exclude = derivation_exclusions(effective_block, effective_final);
+            // Clause 2.3 item (2): fold in the head type's {prohibited
+            // substitutions}.
+            let type_block = head_type_prohibited_substitutions(schema_set, head_type);
+            let exclude = derivation_exclusions(effective_block | type_block, effective_final);
 
             let mut stack = member_map.get(&head_key).cloned().unwrap_or_default();
             let mut visited = HashSet::new();
@@ -166,6 +169,27 @@ pub(crate) fn effective_element_constraints(
     (element.block, element.final_derivation)
 }
 
+/// §3.3.6.3 Substitution Group OK (Transitive) clause 2.3, item (2): the
+/// blocking union includes the head's {type definition}.{prohibited
+/// substitutions} when that type is complex (sunData disallowedSubst005:
+/// `<xs:complexType block="restriction">` on the head's type forbids
+/// substitution by restriction-derived members even though the head
+/// *element* carries no block).
+pub(crate) fn head_type_prohibited_substitutions(
+    schema_set: &SchemaSet,
+    head_type: Option<TypeKey>,
+) -> DerivationSet {
+    match head_type {
+        Some(TypeKey::Complex(ct_key)) => schema_set
+            .arenas
+            .complex_types
+            .get(ct_key)
+            .map(|ct| ct.block)
+            .unwrap_or_else(DerivationSet::empty),
+        _ => DerivationSet::empty(),
+    }
+}
+
 /// Check if `candidate_key` is validly substitutable for `head_key`
 /// per XSD §3.3.6.3 / §3.9.6 NameAndTypeOK.
 pub(crate) fn is_element_substitutable_for(
@@ -207,8 +231,10 @@ pub(crate) fn is_element_substitutable_for(
         return false;
     }
 
-    // Check type derivation with exclusion mask
-    let exclude = derivation_exclusions(effective_block, effective_final);
+    // Check type derivation with exclusion mask (clause 2.3 items (1)+(2):
+    // head element block ∪ head type {prohibited substitutions}).
+    let type_block = head_type_prohibited_substitutions(schema_set, head_elem.resolved_type);
+    let exclude = derivation_exclusions(effective_block | type_block, effective_final);
     is_substitutable(
         schema_set,
         head_elem.resolved_type,
