@@ -18,6 +18,9 @@
 
 use std::collections::HashMap;
 
+use ahash::RandomState;
+use slotmap::SecondaryMap;
+
 use super::{BuiltInType, XmlTypeCode};
 use crate::arenas::{ComplexTypeDefData, SimpleTypeDefData};
 use crate::ids::{AttributeKey, ComplexTypeKey, NameId, SimpleTypeKey, TypeKey};
@@ -172,13 +175,16 @@ pub struct BuiltinTypes {
     /// xs:ENTITIES
     pub entities: SimpleTypeKey,
 
-    // Lookup maps for fast access
+    // Lookup maps for fast access. Keys are small internal integers (enum
+    // discriminants / dense indices), so these use `ahash` (fast, keyed) instead
+    // of SipHash, and a dense `SecondaryMap` where the key is a slotmap key.
     /// Map from XmlTypeCode to SimpleTypeKey
-    by_type_code: HashMap<XmlTypeCode, SimpleTypeKey>,
+    by_type_code: HashMap<XmlTypeCode, SimpleTypeKey, RandomState>,
     /// Reverse map from SimpleTypeKey to XmlTypeCode, so `get_type_code` is O(1).
-    by_key: HashMap<SimpleTypeKey, XmlTypeCode>,
+    /// Dense array index by slotmap key — zero hashing.
+    by_key: SecondaryMap<SimpleTypeKey, XmlTypeCode>,
     /// Map from local name NameId to SimpleTypeKey (for XS namespace)
-    by_local_name: HashMap<NameId, SimpleTypeKey>,
+    by_local_name: HashMap<NameId, SimpleTypeKey, RandomState>,
 
     // Built-in XSI attribute declarations (§3.2.7)
     /// `xsi:type` built-in attribute declaration
@@ -403,10 +409,12 @@ impl BuiltinTypes {
             schema_set.arenas.alloc_simple_type(data)
         };
 
-        // Build lookup maps
-        let mut by_type_code = HashMap::new();
-        let mut by_key = HashMap::new();
-        let mut by_local_name = HashMap::new();
+        // Build lookup maps (ahash for the small-int keyed maps; dense
+        // SecondaryMap for the slotmap-keyed reverse map — no SipHash).
+        let mut by_type_code: HashMap<XmlTypeCode, SimpleTypeKey, RandomState> =
+            HashMap::default();
+        let mut by_key: SecondaryMap<SimpleTypeKey, XmlTypeCode> = SecondaryMap::new();
+        let mut by_local_name: HashMap<NameId, SimpleTypeKey, RandomState> = HashMap::default();
 
         // Helper to add to lookup maps
         let mut add_to_maps = |builtin: BuiltInType, key: SimpleTypeKey| {
@@ -685,7 +693,7 @@ impl BuiltinTypes {
     ///
     /// Returns `None` if the key is not a built-in type.
     pub fn get_type_code(&self, key: SimpleTypeKey) -> Option<XmlTypeCode> {
-        self.by_key.get(&key).copied()
+        self.by_key.get(key).copied()
     }
 
     /// Check if a type key is a built-in type.

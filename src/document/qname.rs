@@ -5,8 +5,8 @@
 //! (same pattern as [`NameTable`](crate::namespace::NameTable)).
 
 use crate::ids::NameId;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use ahash::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
 
 /// Atomized qualified name — 20 bytes, `Copy`.
 ///
@@ -79,6 +79,13 @@ pub struct QNameTable {
     nexts: Vec<i32>,
     /// Bucket heads (-1 = empty bucket).
     buckets: Vec<i32>,
+    /// Per-table keyed hasher (ahash). Seeded **once** at construction and held
+    /// for the table's lifetime so the bucket hash of a given atom is stable
+    /// across insert / lookup / rehash. Atom content comes from untrusted XML,
+    /// so the keyed hasher provides DoS resistance (same rationale as
+    /// [`NameTable`](crate::namespace::NameTable)). Constructing a fresh
+    /// `RandomState` per `hash_atom` call would reseed and break bucket chains.
+    hasher: RandomState,
 }
 
 impl QNameTable {
@@ -97,6 +104,7 @@ impl QNameTable {
             atoms,
             nexts,
             buckets: vec![-1; Self::INITIAL_BUCKETS],
+            hasher: RandomState::new(),
         }
     }
 
@@ -105,7 +113,7 @@ impl QNameTable {
     /// Deduplication compares the four identity fields (including prefix,
     /// but excluding `qualified_name_idx`).
     pub fn atomize(&mut self, qname: QNameAtom) -> u32 {
-        let hash = Self::hash_atom(&qname);
+        let hash = self.hash_atom(&qname);
 
         // Probe the chain for a match on the identity fields (via PartialEq).
         let bucket_idx = (hash as usize) % self.buckets.len();
@@ -133,6 +141,28 @@ impl QNameTable {
         new_idx
     }
 
+    /// Returns the index of an existing atom whose identity fields match
+    /// `qname` (the same comparison `atomize` uses — `qualified_name_idx` is
+    /// ignored), or `None` if absent. No insertion, no mutation.
+    ///
+    /// Lets a caller probe before materializing the qualified-name string, so a
+    /// repeated qname does not leave an orphaned `StringStore` entry: the string
+    /// is only stored on a genuine miss, then handed to [`atomize`].
+    ///
+    /// [`atomize`]: QNameTable::atomize
+    pub fn lookup(&self, qname: &QNameAtom) -> Option<u32> {
+        let hash = self.hash_atom(qname);
+        let bucket_idx = (hash as usize) % self.buckets.len();
+        let mut entry_idx = self.buckets[bucket_idx];
+        while entry_idx >= 0 {
+            if self.atoms[entry_idx as usize] == *qname {
+                return Some(entry_idx as u32);
+            }
+            entry_idx = self.nexts[entry_idx as usize];
+        }
+        None
+    }
+
     /// Returns the [`QNameAtom`] at the given index.
     ///
     /// # Panics
@@ -147,8 +177,14 @@ impl QNameTable {
 
     /// Hash the four identity fields for bucket placement
     /// (`qualified_name_idx` excluded — see [`QNameAtom`] doc).
-    fn hash_atom(qname: &QNameAtom) -> u64 {
-        let mut hasher = DefaultHasher::new();
+    ///
+    /// Hashes the four identity fields manually (not `RandomState::hash_one`)
+    /// because `QNameAtom`'s `Hash` impl intentionally hashes only
+    /// `local_name` + `namespace_uri`, whereas the bucket hash must also include
+    /// `prefix` + `local_name_hash` so atoms differing only in prefix land in
+    /// different buckets.
+    fn hash_atom(&self, qname: &QNameAtom) -> u64 {
+        let mut hasher = self.hasher.build_hasher();
         qname.local_name.hash(&mut hasher);
         qname.namespace_uri.hash(&mut hasher);
         qname.prefix.hash(&mut hasher);
@@ -168,7 +204,7 @@ impl QNameTable {
 
         // Re-insert entries 1..len (skip sentinel at 0).
         for idx in 1..self.atoms.len() {
-            let hash = Self::hash_atom(&self.atoms[idx]);
+            let hash = self.hash_atom(&self.atoms[idx]);
             let bucket_idx = (hash as usize) % new_size;
             self.nexts[idx] = self.buckets[bucket_idx];
             self.buckets[bucket_idx] = idx as i32;
@@ -185,6 +221,7 @@ impl Default for QNameTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::hash_map::DefaultHasher;
 
     fn make_qname(local: u32, ns: u32, prefix: u32, hash: u32) -> QNameAtom {
         QNameAtom {

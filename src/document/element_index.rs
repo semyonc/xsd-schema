@@ -4,6 +4,7 @@
 //! values to lists of node references, giving O(1) lookup by element name.
 //! Callers **must** filter results by full QName because hash collisions are expected.
 
+use ahash::RandomState;
 use std::collections::HashMap;
 
 /// Index from `local_name_hash` → list of node references.
@@ -12,9 +13,12 @@ use std::collections::HashMap;
 /// full document scan.  Because different QNames may share the same
 /// `local_name_hash`, callers must perform a secondary equality check
 /// against the full [`QNameAtom`](super::qname::QNameAtom).
+///
+/// The key is itself a precomputed `local_name_hash`, so the map uses `ahash`
+/// (fast, keyed) rather than SipHash.
 #[derive(Debug, Default)]
 pub struct ElementIndex {
-    map: HashMap<u32, Vec<u32>>,
+    map: HashMap<u32, Vec<u32>, RandomState>,
 }
 
 impl ElementIndex {

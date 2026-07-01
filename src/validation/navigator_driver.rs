@@ -149,18 +149,16 @@ fn walk_element<N, S>(
         *max_depth = depth;
     }
 
-    // Capture the element identity before moving the cursor onto the
-    // namespace / attribute axes (both restore the cursor afterwards).
-    let local = nav.local_name().to_string();
-    let ns_uri = nav.namespace_uri().to_string();
-
+    // The namespace / attribute scans both restore the cursor to the element,
+    // so the element identity can be read as a borrow *after* them — no clone.
     let ns_ctx = build_ns_snapshot(nav, schema_set);
     let (xsi_type, xsi_nil) = scan_xsi(nav);
 
-    // 1. Element.
+    // 1. Element. `local_name()`/`namespace_uri()` are already `&str` (no copy);
+    //    the cursor is back on the element after the two scans above.
     runtime.validate_element(
-        &local,
-        &ns_uri,
+        nav.local_name(),
+        nav.namespace_uri(),
         xsi_type.as_deref(),
         xsi_nil.as_deref(),
         &ns_ctx,
@@ -170,10 +168,11 @@ fn walk_element<N, S>(
     //    the streaming driver forwards those to validate_attribute too).
     if nav.move_to_first_attribute() {
         loop {
-            let alocal = nav.local_name().to_string();
-            let ans = nav.namespace_uri().to_string();
-            let aval = nav.value();
-            runtime.validate_attribute(&alocal, &ans, &aval);
+            // Names are already `&str`; `value_ref()` borrows the interned bytes
+            // for DOM backends. All three are shared borrows of `nav` that end
+            // before the next `&mut nav` cursor move (NLL).
+            let aval = nav.value_ref();
+            runtime.validate_attribute(nav.local_name(), nav.namespace_uri(), &aval);
             if !nav.move_to_next_attribute() {
                 break;
             }
@@ -203,7 +202,7 @@ fn walk_element<N, S>(
                 DomNodeType::Text
                 | DomNodeType::Whitespace
                 | DomNodeType::SignificantWhitespace => {
-                    let text = nav.value();
+                    let text = nav.value_ref();
                     // Classify by content, exactly as the streaming driver
                     // does, rather than trusting the node-type label.
                     if text.chars().all(|c| c.is_whitespace()) {
@@ -230,32 +229,41 @@ fn walk_element<N, S>(
 }
 
 /// Build the in-scope namespace snapshot for the current element by walking the
-/// namespace axis (scope `All` → inherited + local), mirroring the streaming
-/// driver's `build_ns_context`. The cursor is restored to the element.
+/// namespace axis, mirroring the streaming driver's `build_ns_context`. The
+/// cursor is restored to the element.
+///
+/// Uses `ExcludeXml` scope deliberately: validation treats the `xml` prefix as
+/// implicit and discards it anyway, and `ExcludeXml` never materializes the
+/// always-in-scope `xml:` binding — so on a namespace-free document the axis is
+/// empty and no per-element `Vec`/`HashSet` is allocated (the common hot-path
+/// case). This decouples validation from the (XDM) `All`-axis contract, which
+/// the deprecated `namespace::` axis still needs but validation does not.
 fn build_ns_snapshot<N>(nav: &mut N, schema_set: &SchemaSet) -> NamespaceContextSnapshot
 where
     N: DomNavigator,
 {
     let mut snapshot = NamespaceContextSnapshot::default();
 
-    if nav.move_to_first_namespace(NamespaceAxisScope::All) {
+    if nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml) {
         loop {
             // Namespace node: local_name() = prefix ("" for default), value() = URI.
-            let prefix = nav.local_name().to_string();
-            let uri = nav.value();
+            // Both are consumed immediately (fed to `name_table.add`, which takes
+            // `&str`) before the cursor moves, so they borrow without owning.
+            let prefix = nav.local_name();
+            let uri = nav.value_ref();
             if prefix.is_empty() {
                 // Default namespace; skip an empty binding.
                 if !uri.is_empty() {
                     snapshot.default_ns = Some(schema_set.name_table.add(&uri));
                 }
-            } else if prefix != "xml" && prefix != "xmlns" && !uri.is_empty() {
-                // Skip the always-in-scope xml prefix; the runtime treats it
-                // (and any xmlns binding) as implicit.
-                let prefix_id = schema_set.name_table.add(&prefix);
+            } else if prefix != "xmlns" && !uri.is_empty() {
+                // `ExcludeXml` already drops the `xml` prefix; the runtime treats
+                // any `xmlns` binding as implicit too.
+                let prefix_id = schema_set.name_table.add(prefix);
                 let uri_id = schema_set.name_table.add(&uri);
                 snapshot.bindings.push((prefix_id, uri_id));
             }
-            if !nav.move_to_next_namespace(NamespaceAxisScope::All) {
+            if !nav.move_to_next_namespace(NamespaceAxisScope::ExcludeXml) {
                 break;
             }
         }

@@ -19,6 +19,8 @@ pub mod roxmltree;
 
 pub use self::roxmltree::RoXmlNavigator;
 
+use std::borrow::Cow;
+
 use crate::ids::SimpleTypeKey;
 use crate::types::value::XmlValue;
 
@@ -101,14 +103,28 @@ pub enum XmlNodeOrder {
     Unknown,
 }
 
-/// Scope filter for namespace axis traversal
+/// Scope filter for namespace axis traversal.
+///
+/// Contract shared by every [`DomNavigator`] backend (BufferDoc, roxmltree):
+///
+/// * `All` follows the **XDM data model** — it yields every in-scope namespace,
+///   inherited declarations included, and **always** the implicit `xml:` binding
+///   (even on an element with no declarations of its own). This is what the
+///   `namespace::` axis needs. Use it only where XDM semantics are required;
+///   it allocates at least the `xml:` node on every element.
+/// * `ExcludeXml` is `All` minus the `xml:` binding (implicit or explicit). It is
+///   the right scope for callers that treat `xml:` specially or discard it —
+///   e.g. validation's namespace snapshot — and it returns nothing (heap-free)
+///   on a namespace-free element.
+/// * `Local` yields only the namespaces declared on the element itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NamespaceAxisScope {
-    /// Include all in-scope namespaces (including inherited)
+    /// Every in-scope namespace (inherited included) plus the implicit `xml:`
+    /// binding — the XDM `namespace::` axis contract.
     All,
-    /// Only locally declared namespaces
+    /// Only locally declared namespaces.
     Local,
-    /// All namespaces except the xml namespace
+    /// All in-scope namespaces *except* the `xml:` binding.
     ExcludeXml,
 }
 
@@ -196,6 +212,17 @@ pub trait DomNavigator: Clone {
 
     /// Get the string value of the current node
     fn value(&self) -> String;
+
+    /// Borrowed string value of the current node when the backing store can
+    /// supply one without allocating; owned otherwise.
+    ///
+    /// The default delegates to [`value`](Self::value) (always owned), so existing
+    /// implementors need no change. DOM backends whose text/attribute values are
+    /// interned contiguously (e.g. `BufferDocNavigator`, `RoXmlNavigator`) override
+    /// this to borrow, eliminating a per-value allocation in the validation walk.
+    fn value_ref(&self) -> Cow<'_, str> {
+        Cow::Owned(self.value())
+    }
 
     /// Get the base URI of the current node
     fn base_uri(&self) -> &str;

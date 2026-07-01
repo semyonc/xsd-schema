@@ -165,19 +165,31 @@ impl<'a> BufferDocumentBuilder<'a> {
         let prefix_id = self.doc.names.add(prefix);
         let local_hash = hash_name(local_name);
 
-        let qualified_name_idx = if prefix.is_empty() {
-            self.doc.strings.store(local_name)
-        } else {
-            self.doc.strings.store(&format!("{prefix}:{local_name}"))
-        };
-        let qname = QNameAtom {
+        // Dedup the qname BEFORE materializing its qualified-name string. The
+        // qualified name is fully determined by prefix+local_name, so a table hit
+        // reuses the first occurrence's stored string. Storing unconditionally
+        // (as before) left one orphaned `StringStore` entry per element
+        // occurrence — the atom dedups, but the string does not.
+        let probe = QNameAtom {
             local_name: local_id,
             namespace_uri: uri_id,
             prefix: prefix_id,
             local_name_hash: local_hash,
-            qualified_name_idx,
+            qualified_name_idx: 0,
         };
-        let qname_idx = self.doc.qname_table.atomize(qname);
+        let qname_idx = match self.doc.qname_table.lookup(&probe) {
+            Some(idx) => idx,
+            None => {
+                let qualified_name_idx = if prefix.is_empty() {
+                    self.doc.strings.store(local_name)
+                } else {
+                    self.doc.strings.store(&format!("{prefix}:{local_name}"))
+                };
+                self.doc
+                    .qname_table
+                    .atomize(QNameAtom { qualified_name_idx, ..probe })
+            }
+        };
 
         // Allocate element node
         let elem_ref = self.doc.nodes.alloc()?;
@@ -240,19 +252,29 @@ impl<'a> BufferDocumentBuilder<'a> {
         let uri_id = self.doc.names.add(ns_uri);
         let prefix_id = self.doc.names.add(prefix);
 
-        let qualified_name_idx = if prefix.is_empty() {
-            self.doc.strings.store(local_name)
-        } else {
-            self.doc.strings.store(&format!("{prefix}:{local_name}"))
-        };
-        let qname = QNameAtom {
+        // Same dedup-before-store as element starts: avoid an orphaned
+        // `StringStore` entry per attribute occurrence (only the first sighting
+        // of a unique qname materializes its qualified-name string).
+        let probe = QNameAtom {
             local_name: local_id,
             namespace_uri: uri_id,
             prefix: prefix_id,
             local_name_hash: 0, // attrs not indexed
-            qualified_name_idx,
+            qualified_name_idx: 0,
         };
-        let qname_idx = self.doc.qname_table.atomize(qname);
+        let qname_idx = match self.doc.qname_table.lookup(&probe) {
+            Some(idx) => idx,
+            None => {
+                let qualified_name_idx = if prefix.is_empty() {
+                    self.doc.strings.store(local_name)
+                } else {
+                    self.doc.strings.store(&format!("{prefix}:{local_name}"))
+                };
+                self.doc
+                    .qname_table
+                    .atomize(QNameAtom { qualified_name_idx, ..probe })
+            }
+        };
 
         // Attribute node
         let attr_ref = self.doc.nodes.alloc()?;
@@ -389,6 +411,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         let nul_ref = self.doc.nodes.alloc()?;
         let nul_node = Node::default(); // NodeType::Nul by default
         self.doc.nodes.set(nul_ref, nul_node);
+
+        // No more strings will be added — return the index vector's
+        // geometric-growth slack to the allocator.
+        self.doc.strings.shrink_to_fit();
 
         Ok(self.doc)
     }

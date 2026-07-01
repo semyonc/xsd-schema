@@ -4,6 +4,7 @@
 //! Since roxmltree is a read-only, schema-unaware parser, typed value hooks
 //! always return `None`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use ::roxmltree::{Document, Node, NodeType};
@@ -175,16 +176,32 @@ impl<'a> RoXmlNavigator<'a> {
 
                 for ns in node.namespaces() {
                     let prefix = ns.name();
-                    if !seen_prefixes.contains(&prefix) {
-                        seen_prefixes.insert(prefix);
+                    if seen_prefixes.insert(prefix) {
                         result.push((prefix.map(String::from), ns.uri().to_string()));
                     }
                 }
 
-                // Filter out xml namespace if ExcludeXml
-                if scope == NamespaceAxisScope::ExcludeXml {
-                    result
-                        .retain(|(prefix, _)| prefix.as_ref().map(|p| p != "xml").unwrap_or(true));
+                match scope {
+                    NamespaceAxisScope::ExcludeXml => {
+                        // Drop the xml prefix; the implicit binding is not
+                        // surfaced as a namespace node under this scope.
+                        result.retain(|(prefix, _)| prefix.as_deref() != Some("xml"));
+                    }
+                    NamespaceAxisScope::All => {
+                        // XDM contract: `All` always exposes the implicit `xml:`
+                        // binding. roxmltree's `Node::namespaces()` seeds `xml`
+                        // internally and does NOT emit it here, so inject it when
+                        // absent — matching `BufferDocNavigator` so both backends
+                        // agree on the `namespace::` axis.
+                        let has_xml = result.iter().any(|(p, _)| p.as_deref() == Some("xml"));
+                        if !has_xml {
+                            result.push((
+                                Some("xml".to_string()),
+                                "http://www.w3.org/XML/1998/namespace".to_string(),
+                            ));
+                        }
+                    }
+                    NamespaceAxisScope::Local => unreachable!("handled above"),
                 }
             }
         }
@@ -615,6 +632,26 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         }
     }
 
+    fn value_ref(&self) -> Cow<'_, str> {
+        // Mirror of `value()`: roxmltree returns document-lifetime `&'a str` for
+        // text/PI/comment nodes and attribute values, so borrow them; only the
+        // element/root descendant concatenation must allocate.
+        match &self.cursor {
+            RoCursor::Node(n) => match n.node_type() {
+                NodeType::Text | NodeType::Comment | NodeType::PI => {
+                    Cow::Borrowed(n.text().unwrap_or(""))
+                }
+                NodeType::Element | NodeType::Root => Cow::Owned(self.value()),
+            },
+            RoCursor::Attribute { owner, index } => {
+                Cow::Borrowed(owner.attributes().nth(*index).map(|a| a.value()).unwrap_or(""))
+            }
+            RoCursor::Namespace {
+                namespaces, index, ..
+            } => Cow::Borrowed(namespaces.get(*index).map(|(_, uri)| uri.as_str()).unwrap_or("")),
+        }
+    }
+
     fn base_uri(&self) -> &str {
         &self.base_uri
     }
@@ -891,6 +928,30 @@ mod tests {
         nav.move_to_first_child(); // root
 
         assert!(!nav.move_to_first_namespace(NamespaceAxisScope::Local));
+    }
+
+    #[test]
+    fn test_all_axis_exposes_implicit_xml_on_bare_element() {
+        // XDM contract (A): `All` always exposes the implicit `xml:` binding,
+        // even on an element with no declarations. roxmltree's `namespaces()`
+        // omits it, so RoXmlNavigator injects it — matching BufferDocNavigator.
+        let doc = parse("<root/>");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::All));
+        let mut uris = std::collections::HashSet::new();
+        uris.insert(nav.value());
+        while nav.move_to_next_namespace(NamespaceAxisScope::All) {
+            uris.insert(nav.value());
+        }
+        assert!(
+            uris.contains("http://www.w3.org/XML/1998/namespace"),
+            "All scope must expose the implicit xml namespace on a bare element"
+        );
+
+        // ExcludeXml on the same bare element is empty.
+        assert!(!nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
     }
 
     #[test]

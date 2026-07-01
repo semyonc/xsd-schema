@@ -157,6 +157,10 @@ pub use types::{
     FacetFixed, FacetKind, FacetSet, WhitespaceMode,
 };
 
+/// Clear the process-global compiled-pattern regex cache (see
+/// [`types::facets::clear_pattern_cache`]).
+pub use types::facets::clear_pattern_cache;
+
 // Re-export navigator types (always available)
 pub use navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, RoXmlNavigator, XmlNodeOrder,

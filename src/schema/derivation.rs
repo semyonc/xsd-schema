@@ -6360,11 +6360,11 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                 attr_use.attribute.fixed_value.as_deref(),
                 ref_decl.and_then(|d| d.fixed_value.as_deref()),
             ) {
+                use crate::types::facets::normalize_whitespace;
                 use crate::types::WhitespaceMode;
-                let normalize = |s: &str| -> String {
-                    crate::types::facets::normalize_whitespace(s, WhitespaceMode::Collapse)
-                };
-                if normalize(use_fixed) != normalize(decl_fixed) {
+                let use_norm = normalize_whitespace(use_fixed, WhitespaceMode::Collapse);
+                let decl_norm = normalize_whitespace(decl_fixed, WhitespaceMode::Collapse);
+                if use_norm != decl_norm {
                     let attr_name = ref_decl
                         .and_then(|d| d.name)
                         .map(|n| schema_set.name_table.resolve(n).to_string())

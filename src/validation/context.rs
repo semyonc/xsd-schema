@@ -9,6 +9,10 @@ use std::collections::HashSet;
 #[cfg(feature = "xsd11")]
 use std::collections::HashMap;
 
+use std::hash::BuildHasherDefault;
+
+use ahash::AHasher;
+
 #[cfg(feature = "xsd11")]
 use crate::ids::AttributeKey;
 use crate::ids::{ElementKey, NameId, TypeKey};
@@ -16,6 +20,29 @@ use crate::types::value::XmlValue;
 
 use super::content::ContentValidatorState;
 use super::info::{ContentProcessing, ContentType, SchemaValidity, TypeSource};
+
+/// Set of `(namespace, local-name)` attribute identities, hashed with `ahash`.
+///
+/// The keys are tuples of dense interned-name integers (`Option<NameId>`,
+/// `NameId`), so `ahash` is used instead of SipHash to cheapen the per-element
+/// `seen_attributes` inserts and required-attribute checks.
+///
+/// The build-hasher is the zero-sized [`BuildHasherDefault<AHasher>`] (ahash's
+/// fixed-key default), **not** `RandomState`. A fresh `ElementValidationState`
+/// is created for every element, and `RandomState`'s `Default` re-seeds a
+/// hasher (an `ahash::RandomState::from_keys` fold) on *each* construction —
+/// ~2.2% of pure-validation CPU, almost all of it on maps that stay empty (the
+/// leaf elements carry no attributes). `BuildHasherDefault` is a ZST whose
+/// `Default` is free, so empty per-element maps cost nothing to construct. The
+/// keys are interned `NameId`s minted by our own name table (not attacker-
+/// controlled hash bytes) in maps of at most a handful of entries, so the
+/// HashDoS surface that motivates a randomized seed is negligible here.
+pub type AttrNameSet = HashSet<(Option<NameId>, NameId), BuildHasherDefault<AHasher>>;
+
+/// Map keyed by `(namespace, local-name)` attribute identity, hashed with the
+/// same zero-sized fixed-key `ahash` build-hasher as [`AttrNameSet`].
+#[cfg(feature = "xsd11")]
+pub type AttrNameMap<V> = HashMap<(Option<NameId>, NameId), V, BuildHasherDefault<AHasher>>;
 
 /// An inherited attribute value flowing from an ancestor element (XSD 1.1).
 ///
@@ -94,7 +121,7 @@ pub struct ElementValidationState {
     /// Start index of this element's `xsi:noNamespaceSchemaLocation` hints in the runtime buffer.
     pub no_namespace_schema_location_hint_start: usize,
     /// Set of (namespace, local_name) pairs for attributes already seen
-    pub seen_attributes: HashSet<(Option<NameId>, NameId)>,
+    pub seen_attributes: AttrNameSet,
     /// Whether an ID-typed attribute has already been seen on this element.
     /// Used to enforce the "at most one ID-type attribute per element" rule
     /// (XSD 1.0 §3.4.4 / §3.5.6 ct-props-correct.5) at runtime, after
@@ -132,7 +159,7 @@ pub struct ElementValidationState {
     /// returns and what CTA XDM construction reads. Never mutated after
     /// `push_element()`.
     #[cfg(feature = "xsd11")]
-    pub incoming_inherited: HashMap<(Option<NameId>, NameId), InheritedAttributeValue>,
+    pub incoming_inherited: AttrNameMap<InheritedAttributeValue>,
     /// **Outgoing** inherited attributes: the propagation map for this
     /// element's descendants.
     ///
@@ -142,7 +169,7 @@ pub struct ElementValidationState {
     /// structures.html line 5205). Children clone this map as their
     /// `incoming_inherited`.
     #[cfg(feature = "xsd11")]
-    pub outgoing_inherited: HashMap<(Option<NameId>, NameId), InheritedAttributeValue>,
+    pub outgoing_inherited: AttrNameMap<InheritedAttributeValue>,
 }
 
 impl ElementValidationState {
@@ -175,7 +202,7 @@ impl ElementValidationState {
             base_uri_set_by_xml_base: false,
             schema_location_hint_start: 0,
             no_namespace_schema_location_hint_start: 0,
-            seen_attributes: HashSet::new(),
+            seen_attributes: AttrNameSet::default(),
             seen_id_attr: false,
             text_content: String::new(),
             has_text: false,
@@ -192,9 +219,9 @@ impl ElementValidationState {
             #[cfg(feature = "xsd11")]
             assertion_element_ref: None,
             #[cfg(feature = "xsd11")]
-            incoming_inherited: HashMap::new(),
+            incoming_inherited: AttrNameMap::default(),
             #[cfg(feature = "xsd11")]
-            outgoing_inherited: HashMap::new(),
+            outgoing_inherited: AttrNameMap::default(),
         }
     }
 }

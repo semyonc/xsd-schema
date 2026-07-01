@@ -31,12 +31,142 @@ use crate::regex_convert::{convert_xml_pattern, ConvertOptions};
 use crate::schema::model::{RegexCompat, XsdVersion};
 #[cfg(not(feature = "xsd11"))]
 use regex::Regex;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 #[cfg(feature = "xsd11")]
 use std::sync::Arc;
 
 use super::XmlTypeCode;
+
+/// Process-global cache of compiled XSD pattern regexes (`xsd11` / `regexml`
+/// backend only).
+///
+/// `regexml` 0.2 rebuilds the Unicode category sets behind `\d`, `\w`, and
+/// `\p{…}` from the ICU code-point trie on **every** `Regex::new` — it memoizes
+/// nothing — which is the dominant cost when compiling pattern-heavy schemas
+/// (see `validation-bench/PERF_PROFILE_CONFORMANCE.md`). The same pattern
+/// strings recur constantly: built-in datatype facets are re-compiled for every
+/// `SchemaSet`, the conformance harness re-compiles per test, and the two-pass
+/// `xsi:schemaLocation` enrichment flow re-compiles a whole schema's patterns.
+/// Caching the compiled program turns those repeats into an `Arc` clone.
+///
+/// ## Design — direct-mapped, like a CPU cache
+///
+/// A **fixed-size** table of [`SLOTS`] entries. A key hashes to exactly one slot
+/// (`index = hash & MASK`); a colliding key simply **overwrites** the resident
+/// entry (no probing, no chaining). Properties:
+///
+/// - **Bounded by construction** — memory is `O(SLOTS)`, never grows, no
+///   eviction-policy bookkeeping. This degrades gracefully in a long-running
+///   process that sees an unbounded variety of schemas: recent patterns stay
+///   resident, cold ones fall out — unlike an unbounded map, which would either
+///   grow without limit or freeze at a cap and never cache anything new.
+/// - **Verified hits** — each slot stores its full key; a probe is a hit only
+///   when the resident key equals the lookup key, so collisions are correctness-
+///   safe (they just miss and recompile).
+/// - **Clearable** — [`clear_pattern_cache`] empties it (reclaim between
+///   workloads, or for deterministic benchmark timings).
+///
+/// Keyed by everything that determines the compiled program —
+/// `(pattern, xsd_version, regex_compat)`. Only **successful** compiles are
+/// stored (an invalid pattern must keep reporting its error). *Distinct*
+/// patterns still pay full price; removing that needs an upstream `regexml`
+/// category memoization, which this cache deliberately does not require.
+#[cfg(feature = "xsd11")]
+mod pattern_cache {
+    use std::sync::{Arc, OnceLock, RwLock};
+
+    use crate::schema::model::{RegexCompat, XsdVersion};
+
+    /// (pattern, version, compat) — everything that affects the result.
+    pub(super) type Key = (String, XsdVersion, RegexCompat);
+
+    struct Slot {
+        key: Key,
+        regex: Arc<regexml::Regex>,
+    }
+
+    /// Number of cache lines. Power of two so `index = hash & MASK`. At 4096
+    /// the table itself is ~4096 × `size_of::<Option<Slot>>()` ≈ 130 KB plus the
+    /// resident pattern strings — far smaller than the working set of *all*
+    /// distinct patterns, but large enough that the heavily-repeated ones
+    /// (built-ins, two-pass enrichment recompiles, shared test fixtures) rarely
+    /// collide.
+    const SLOTS: usize = 4096;
+    const MASK: u64 = (SLOTS as u64) - 1;
+
+    fn table() -> &'static RwLock<Box<[Option<Slot>]>> {
+        static TABLE: OnceLock<RwLock<Box<[Option<Slot>]>>> = OnceLock::new();
+        TABLE.get_or_init(|| {
+            let slots = (0..SLOTS).map(|_| None).collect::<Vec<_>>().into_boxed_slice();
+            RwLock::new(slots)
+        })
+    }
+
+    /// Slot index for a key. Fixed-seed `ahash` so a given key maps to the same
+    /// line for the whole process (the seed need not be secret — the index is
+    /// never exposed and collisions are correctness-safe).
+    fn index(key: &Key) -> usize {
+        static HASHER: OnceLock<ahash::RandomState> = OnceLock::new();
+        let state = HASHER.get_or_init(|| {
+            ahash::RandomState::with_seeds(
+                0xa5a5_5a5a_3c3c_c3c3,
+                0x1234_5678_9abc_def0,
+                0x9e37_79b9_7f4a_7c15,
+                0xc2b2_ae35_5d12_3456,
+            )
+        });
+        (state.hash_one(key) & MASK) as usize
+    }
+
+    /// Look up a previously-compiled regex. A hit requires the resident slot to
+    /// hold this exact key (guards against hash collisions). The lock is held
+    /// only for the probe — never across a compile — so poisoning is effectively
+    /// impossible; recover rather than propagate a panic.
+    pub(super) fn get(key: &Key) -> Option<Arc<regexml::Regex>> {
+        let idx = index(key);
+        let guard = table().read().unwrap_or_else(|e| e.into_inner());
+        match &guard[idx] {
+            Some(slot) if &slot.key == key => Some(Arc::clone(&slot.regex)),
+            _ => None,
+        }
+    }
+
+    /// Record a successfully-compiled regex, replacing whatever shared its line.
+    pub(super) fn store(key: Key, regex: Arc<regexml::Regex>) {
+        let idx = index(&key);
+        let mut guard = table().write().unwrap_or_else(|e| e.into_inner());
+        guard[idx] = Some(Slot { key, regex });
+    }
+
+    /// Drop every cached entry.
+    pub(super) fn clear() {
+        let mut guard = table().write().unwrap_or_else(|e| e.into_inner());
+        for slot in guard.iter_mut() {
+            *slot = None;
+        }
+    }
+}
+
+/// Clear the process-global compiled-pattern regex cache.
+///
+/// The cache (a small fixed-size, direct-mapped table; see the module-level
+/// `pattern_cache`) lives for the life of the process and speeds up recompiling
+/// identical `xs:pattern` facets. Call this to reclaim it — e.g. between
+/// unrelated workloads in a long-running service, or for deterministic timings
+/// in a benchmark. Safe to call concurrently with compilation. Without the
+/// `xsd11` feature there is no such cache and this is a no-op.
+#[cfg(feature = "xsd11")]
+pub fn clear_pattern_cache() {
+    pattern_cache::clear();
+}
+
+/// Clear the process-global compiled-pattern regex cache. No-op without the
+/// `xsd11` feature (the XSD 1.0 backend compiles via the `regex` crate and does
+/// not cache).
+#[cfg(not(feature = "xsd11"))]
+pub fn clear_pattern_cache() {}
 
 /// Fixed vs default facet values
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -177,6 +307,15 @@ impl PatternFacet {
         regex_compat: RegexCompat,
     ) -> FacetResult<()> {
         if self.compiled.is_none() {
+            // Content-addressed fast path: identical (pattern, version, compat)
+            // reuses the already-compiled program instead of rebuilding the ICU
+            // category sets via regexml. See [`pattern_cache`].
+            let cache_key: pattern_cache::Key = (self.value.clone(), xsd_version, regex_compat);
+            if let Some(cached) = pattern_cache::get(&cache_key) {
+                self.compiled = Some(cached);
+                return Ok(());
+            }
+
             let strict = regex_compat == RegexCompat::Strict;
             // Apply MS dialect preprocess (closed list) before grammar
             // validation when LenientMs is on. Owned to keep one stable
@@ -236,7 +375,9 @@ impl PatternFacet {
                     pattern: self.value.clone(),
                     message: format!("{:?}", e),
                 })?;
-            self.compiled = Some(Arc::new(compiled));
+            let arc = Arc::new(compiled);
+            pattern_cache::store(cache_key, Arc::clone(&arc));
+            self.compiled = Some(arc);
         }
         Ok(())
     }
@@ -1289,9 +1430,9 @@ impl FacetSet {
         // Apply whitespace normalization for length calculation
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
-        let check_value = &normalized;
+        let check_value: &str = &normalized;
 
         // Check length facet
         if let Some(ref length) = self.length {
@@ -1345,9 +1486,9 @@ impl FacetSet {
     pub fn validate_string_patterns_enums(&self, value: &str) -> FacetResult<()> {
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
-        let check_value = &normalized;
+        let check_value: &str = &normalized;
 
         self.check_patterns(check_value)?;
 
@@ -1365,7 +1506,7 @@ impl FacetSet {
     pub fn validate_patterns_only(&self, value: &str) -> FacetResult<()> {
         let normalized = match &self.whitespace {
             Some(ws) => normalize_whitespace(value, ws.value),
-            None => value.to_string(),
+            None => Cow::Borrowed(value),
         };
         self.check_patterns(&normalized)
     }
@@ -1684,52 +1825,124 @@ fn compare_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
     a_val.partial_cmp(&b_val)
 }
 
-/// Apply whitespace normalization to a string
-pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> String {
+/// Apply whitespace normalization to a string.
+///
+/// Returns [`Cow::Borrowed`] when the input is already in the target form (the
+/// common case for clean instance values) — no allocation — and
+/// [`Cow::Owned`] only when a transformation is actually required. The produced
+/// string is byte-identical to the previous always-allocating implementation.
+pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> Cow<'_, str> {
     match mode {
-        WhitespaceMode::Preserve => s.to_string(),
-        WhitespaceMode::Replace => {
-            // Replace tab, CR, LF with space
-            s.chars()
-                .map(|c| match c {
-                    '\t' | '\r' | '\n' => ' ',
-                    _ => c,
-                })
-                .collect()
-        }
-        WhitespaceMode::Collapse => {
-            // Replace, then collapse consecutive spaces, then trim
-            let replaced: String = s
-                .chars()
-                .map(|c| match c {
-                    '\t' | '\r' | '\n' => ' ',
-                    _ => c,
-                })
-                .collect();
+        WhitespaceMode::Preserve => Cow::Borrowed(s),
+        WhitespaceMode::Replace => replace_whitespace(s),
+        WhitespaceMode::Collapse => collapse_whitespace(s),
+    }
+}
 
-            let mut result = String::with_capacity(replaced.len());
-            let mut prev_space = true; // Start true to trim leading spaces
+/// `true` for exactly the four XSD whitespace characters #x20 #x9 #xD #xA.
+///
+/// Deliberately byte-level and *not* [`char::is_whitespace`] / [`str::trim`] /
+/// [`str::split_whitespace`]: those match Unicode whitespace (U+00A0, U+2028, …),
+/// which XSD `whiteSpace` must leave untouched. All four are ASCII, so trimming
+/// or splitting on them never lands inside a multi-byte UTF-8 sequence.
+#[inline]
+fn is_xsd_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | b'\n')
+}
 
-            for c in replaced.chars() {
-                if c == ' ' {
-                    if !prev_space {
-                        result.push(' ');
-                        prev_space = true;
-                    }
-                } else {
-                    result.push(c);
-                    prev_space = false;
-                }
-            }
-
-            // Trim trailing space
-            if result.ends_with(' ') {
-                result.pop();
-            }
-
-            result
+/// `replace` whitespace normalization: each #x9/#xD/#xA becomes #x20 (a #x20 is
+/// already itself). Borrows when there is nothing to replace; otherwise allocates
+/// once and bulk-copies the unchanged runs around each replaced byte.
+fn replace_whitespace(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    if !bytes.iter().any(|&b| matches!(b, b'\t' | b'\r' | b'\n')) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chunk_start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if matches!(b, b'\t' | b'\r' | b'\n') {
+            out.push_str(&s[chunk_start..i]); // unchanged run before this byte
+            out.push(' ');
+            chunk_start = i + 1;
         }
     }
+    out.push_str(&s[chunk_start..]); // trailing unchanged run
+    Cow::Owned(out)
+}
+
+/// `collapse` whitespace normalization: `replace`, then squeeze each run of
+/// whitespace to a single #x20, then strip leading/trailing whitespace.
+///
+/// Two no-alloc fast paths cover the common shapes:
+/// * all-whitespace (or empty) → the empty string;
+/// * a trimmed core that needs no internal rewriting (no #x9/#xD/#xA and no
+///   double whitespace) → a borrowed sub-slice, so `" 123 "` / `"\nfoo\t"`
+///   borrow instead of allocating.
+///
+/// Only genuinely dirty input (internal tabs/newlines or multi-space runs)
+/// allocates, and then the rewrite copies whole words with `push_str` rather
+/// than one `char` at a time.
+fn collapse_whitespace(s: &str) -> Cow<'_, str> {
+    let bytes = s.as_bytes();
+    // Trim XSD whitespace from both ends. The cut points are ASCII bytes, hence
+    // always char boundaries.
+    let Some(start) = bytes.iter().position(|&b| !is_xsd_ws(b)) else {
+        return Cow::Borrowed(""); // all whitespace (or empty) collapses to ""
+    };
+    let end = bytes.iter().rposition(|&b| !is_xsd_ws(b)).unwrap() + 1;
+    let mid = &s[start..end];
+
+    // Borrow the trimmed core unless it needs internal rewriting: any #x9/#xD/#xA
+    // (which `replace` would turn into a space) or any run of two+ whitespace
+    // (which `collapse` would squeeze). The core has no leading/trailing ws.
+    let mut prev_ws = false;
+    let mut needs_rewrite = false;
+    for &b in mid.as_bytes() {
+        match b {
+            b'\t' | b'\r' | b'\n' => {
+                needs_rewrite = true;
+                break;
+            }
+            b' ' => {
+                if prev_ws {
+                    needs_rewrite = true;
+                    break;
+                }
+                prev_ws = true;
+            }
+            _ => prev_ws = false,
+        }
+    }
+    if !needs_rewrite {
+        return Cow::Borrowed(mid);
+    }
+
+    // Rewrite: emit each non-whitespace word, separated by a single space. `mid`
+    // is already trimmed, so there is exactly one space between words and none at
+    // the ends — byte-identical to the previous char-by-char implementation.
+    let mut out = String::with_capacity(mid.len());
+    let mbytes = mid.as_bytes();
+    let mut i = 0;
+    let mut first_word = true;
+    while i < mbytes.len() {
+        while i < mbytes.len() && is_xsd_ws(mbytes[i]) {
+            i += 1; // skip a whitespace run
+        }
+        if i >= mbytes.len() {
+            break;
+        }
+        if !first_word {
+            out.push(' ');
+        }
+        first_word = false;
+        let word_start = i;
+        while i < mbytes.len() && !is_xsd_ws(mbytes[i]) {
+            i += 1;
+        }
+        out.push_str(&mid[word_start..i]);
+    }
+    Cow::Owned(out)
 }
 
 /// Count total significant digits in a decimal value.
@@ -2124,6 +2337,33 @@ mod tests {
     }
 
     #[test]
+    fn test_pattern_cache_reuse_and_clear() {
+        // Compile the same category-using pattern twice: the second compile
+        // should be served from the regex cache (xsd11) yet behave identically.
+        let mk = || {
+            PatternFacet::new(
+                r"\d{3}-\d{4}".to_string(),
+                None,
+                XsdVersion::V1_1,
+                RegexCompat::Strict,
+            )
+            .unwrap()
+        };
+        let a = mk();
+        let b = mk(); // cache hit under xsd11; full recompile otherwise
+        for p in [&a, &b] {
+            assert!(p.matches("123-4567"));
+            assert!(!p.matches("12-4567"));
+            assert!(!p.matches("123-456"));
+        }
+        // Clearing must not corrupt anything: a fresh compile still works.
+        crate::clear_pattern_cache();
+        let c = mk();
+        assert!(c.matches("123-4567"));
+        assert!(!c.matches("xx-yyyy"));
+    }
+
+    #[test]
     fn test_pattern_xsd_anchoring() {
         // XSD patterns are implicitly anchored
         let pattern = PatternFacet::new(
@@ -2172,25 +2412,129 @@ mod tests {
     #[test]
     fn test_whitespace_preserve() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Preserve);
-        assert_eq!(result, "  hello\t\nworld  ");
+        assert_eq!(&*result, "  hello\t\nworld  ");
     }
 
     #[test]
     fn test_whitespace_replace() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Replace);
-        assert_eq!(result, "  hello  world  ");
+        assert_eq!(&*result, "  hello  world  ");
     }
 
     #[test]
     fn test_whitespace_collapse() {
         let result = normalize_whitespace("  hello\t\nworld  ", WhitespaceMode::Collapse);
-        assert_eq!(result, "hello world");
+        assert_eq!(&*result, "hello world");
     }
 
     #[test]
     fn test_whitespace_collapse_multiple_spaces() {
         let result = normalize_whitespace("a     b", WhitespaceMode::Collapse);
-        assert_eq!(result, "a b");
+        assert_eq!(&*result, "a b");
+    }
+
+    #[test]
+    fn test_whitespace_borrows_when_already_normalized() {
+        // Preserve always borrows.
+        assert!(matches!(
+            normalize_whitespace("anything\t\n", WhitespaceMode::Preserve),
+            Cow::Borrowed(_)
+        ));
+        // Replace borrows when there is no tab/CR/LF to replace.
+        assert!(matches!(
+            normalize_whitespace("no special ws", WhitespaceMode::Replace),
+            Cow::Borrowed(_)
+        ));
+        // Collapse borrows when already collapsed (no edge/double spaces, no \t\r\n).
+        assert!(matches!(
+            normalize_whitespace("a b c", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        // Collapse also borrows the trimmed core when only leading/trailing XSD
+        // whitespace differs — the core needs no internal rewriting.
+        assert!(matches!(
+            normalize_whitespace(" leading", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("trailing ", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("\n a b \t", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        // …and these still produce the correct collapsed value.
+        assert_eq!(
+            &*normalize_whitespace(" leading", WhitespaceMode::Collapse),
+            "leading"
+        );
+        assert_eq!(
+            &*normalize_whitespace("\n a b \t", WhitespaceMode::Collapse),
+            "a b"
+        );
+        // Whitespace-only / empty collapse to the empty string, also borrowed.
+        assert!(matches!(
+            normalize_whitespace("   \t\n", WhitespaceMode::Collapse),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            &*normalize_whitespace("   \t\n", WhitespaceMode::Collapse),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_whitespace_owns_when_transformation_needed() {
+        // Replace owns when a tab/CR/LF must become a space.
+        assert!(matches!(
+            normalize_whitespace("has\ttab", WhitespaceMode::Replace),
+            Cow::Owned(_)
+        ));
+        // Collapse owns only when the *core* needs rewriting: an internal
+        // double space or an internal \t\r\n. (Leading/trailing-only whitespace
+        // now borrows the trimmed core — see the borrow test above.)
+        assert!(matches!(
+            normalize_whitespace("a  b", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert!(matches!(
+            normalize_whitespace("tab\there", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        // Owns when there are both edge whitespace and an internal run to squeeze.
+        assert!(matches!(
+            normalize_whitespace(" a  b ", WhitespaceMode::Collapse),
+            Cow::Owned(_)
+        ));
+        assert_eq!(
+            &*normalize_whitespace(" a  b ", WhitespaceMode::Collapse),
+            "a b"
+        );
+    }
+
+    #[test]
+    fn test_whitespace_only_xsd_whitespace_not_unicode() {
+        // XSD whiteSpace is exactly #x20 #x9 #xD #xA. Unicode whitespace such as
+        // NBSP (U+00A0) or LINE SEPARATOR (U+2028) must be left untouched — both
+        // as content and at the edges (str::trim / split_whitespace would eat it).
+        let nbsp = "\u{00A0}"; // not XSD whitespace
+
+        let collapse_in = format!(" a{nbsp}{nbsp}b ");
+        let collapsed = normalize_whitespace(&collapse_in, WhitespaceMode::Collapse);
+        assert_eq!(&*collapsed, format!("a{nbsp}{nbsp}b")); // edges trimmed, NBSP kept (incl. the run)
+        assert!(matches!(collapsed, Cow::Borrowed(_))); // NBSP is not ws, so the core borrows
+
+        // A leading NBSP is content, so nothing is trimmed and the whole thing borrows.
+        let lead_in = format!("{nbsp}x");
+        let lead = normalize_whitespace(&lead_in, WhitespaceMode::Collapse);
+        assert_eq!(&*lead, format!("{nbsp}x"));
+        assert!(matches!(lead, Cow::Borrowed(_)));
+
+        // Replace only maps #x9/#xD/#xA → #x20; NBSP and multi-byte content survive.
+        let repl_in = format!("café\tx{nbsp}y");
+        let repl = normalize_whitespace(&repl_in, WhitespaceMode::Replace);
+        assert_eq!(&*repl, format!("café x{nbsp}y"));
     }
 
     // =========================================================================
