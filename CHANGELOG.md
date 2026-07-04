@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-07-04
+
 Conformance sweep: W3C XSD 1.0 suite failures reduced 47 → 19 (99.95%);
 every remaining failure in both suites is a documented W3C dispute or an
 intra-suite contradiction. Per-element allocation cleanup on the validation
@@ -110,5 +112,6 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
+[0.1.2]: https://github.com/semyonc/xsd-schema/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/semyonc/xsd-schema/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/semyonc/xsd-schema/releases/tag/v0.1.0
