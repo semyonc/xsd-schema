@@ -553,6 +553,10 @@ fn rewrite_pattern_isblock_token(pattern: &str, block_name: &str) -> Option<Stri
 pub struct EnumerationFacet {
     /// Set of allowed values (as strings)
     pub values: HashSet<String>,
+    /// Per-value namespace bindings captured at parse time, for values that
+    /// are QNames (NOTATION/QName bases). Parallel to `values`; only
+    /// populated when the parser supplies a snapshot.
+    pub qname_contexts: Vec<(String, NamespaceContextSnapshot)>,
     pub source: Option<SourceRef>,
 }
 
@@ -804,10 +808,26 @@ impl FacetSet {
 
     /// Add an enumeration value
     pub fn add_enumeration(&mut self, value: String, source: Option<SourceRef>) {
+        self.add_enumeration_with_ns(value, None, source);
+    }
+
+    /// Add an enumeration value, capturing the namespace bindings in scope
+    /// at the `<xs:enumeration>` element (needed to resolve QName-valued
+    /// enumerations against NOTATION/QName bases).
+    pub fn add_enumeration_with_ns(
+        &mut self,
+        value: String,
+        ns_snapshot: Option<NamespaceContextSnapshot>,
+        source: Option<SourceRef>,
+    ) {
         let enumeration = self.enumeration.get_or_insert_with(|| EnumerationFacet {
             values: HashSet::new(),
+            qname_contexts: Vec::new(),
             source: source.clone(),
         });
+        if let Some(snapshot) = ns_snapshot {
+            enumeration.qname_contexts.push((value.clone(), snapshot));
+        }
         enumeration.values.insert(value);
     }
 
@@ -1013,20 +1033,40 @@ impl FacetSet {
     /// Returns a new FacetSet combining base and derived facets, or an error
     /// if the derivation rules are violated.
     pub fn merge_with_base(&self, base: &FacetSet) -> FacetResult<FacetSet> {
-        // XSD Datatypes Part 2 §4.3.1.4 / §4.3.2.4 / §4.3.3.4 same-step rule:
-        // It is an error for both `length` and `minLength` (or `length` and
-        // `maxLength`) to be members of {facets} in the same derivation step.
-        // `self` represents this step's locally declared facets before the
-        // base merge, so this is the correct moment to detect the conflict.
-        if self.length.is_some() && self.min_length.is_some() {
-            return Err(FacetError::conflicting(
-                "length and minLength cannot both appear in the same restriction step",
-            ));
+        // XSD Datatypes Part 2 §4.3.1.4 "length and minLength or maxLength":
+        // both `length` and `minLength` in {facets} is an error UNLESS
+        // (1.1) minLength <= length AND (1.2) some restriction ancestor has
+        // minLength with the same {value} and no length. The base's merged
+        // facet set stands in for "some ancestor": if it carries the same
+        // minLength without a length, clause 1.2 holds (e.g. xs:IDREFS whose
+        // built-in minLength=1 licenses re-stating minLength=1 next to a new
+        // length — W3C bug 6446, msData IDREFS_length006). Symmetrically for
+        // maxLength via clauses 2.1/2.2.
+        if let (Some(len), Some(min)) = (&self.length, &self.min_length) {
+            let permitted = min.value <= len.value
+                && base.length.is_none()
+                && base
+                    .min_length
+                    .as_ref()
+                    .is_some_and(|b| b.value == min.value);
+            if !permitted {
+                return Err(FacetError::conflicting(
+                    "length and minLength cannot both appear in the same restriction step",
+                ));
+            }
         }
-        if self.length.is_some() && self.max_length.is_some() {
-            return Err(FacetError::conflicting(
-                "length and maxLength cannot both appear in the same restriction step",
-            ));
+        if let (Some(len), Some(max)) = (&self.length, &self.max_length) {
+            let permitted = len.value <= max.value
+                && base.length.is_none()
+                && base
+                    .max_length
+                    .as_ref()
+                    .is_some_and(|b| b.value == max.value);
+            if !permitted {
+                return Err(FacetError::conflicting(
+                    "length and maxLength cannot both appear in the same restriction step",
+                ));
+            }
         }
 
         let mut result = self.clone();

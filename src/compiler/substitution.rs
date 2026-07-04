@@ -19,7 +19,13 @@ use crate::schema::model::{DerivationSet, SchemaSet};
 pub type SubstitutableNameSet = HashSet<(NameId, Option<NameId>), RandomState>;
 
 /// Map from substitution group head to all substitutable element names.
-pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet>;
+///
+/// Keys are interned slotmap `ElementKey`s (not attacker-controlled bytes) and
+/// this map is `.get()`-probed per candidate NFA `Element` term in
+/// `term_matches` on the per-child validation hot path, so it uses keyed
+/// `ahash` rather than the default SipHash — same rationale as the inner
+/// [`SubstitutableNameSet`].
+pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet, RandomState>;
 
 /// Build a substitution group membership map for the schema set.
 pub fn build_substitution_group_map(schema_set: &SchemaSet) -> SubstitutionGroupMap {
@@ -47,7 +53,7 @@ fn build_substitution_group_map_inner(
         }
     }
 
-    let mut result = HashMap::new();
+    let mut result = SubstitutionGroupMap::default();
     let mut seen_heads = HashSet::new();
     for (head_key, _) in schema_set.arenas.elements.iter() {
         let head_key = resolve_element_key(schema_set, head_key);
@@ -70,7 +76,10 @@ fn build_substitution_group_map_inner(
             effective_element_constraints(schema_set, head_elem);
         if !effective_block.contains_substitution() {
             let head_type = head_elem.resolved_type;
-            let exclude = derivation_exclusions(effective_block, effective_final);
+            // Clause 2.3 item (2): fold in the head type's {prohibited
+            // substitutions}.
+            let type_block = head_type_prohibited_substitutions(schema_set, head_type);
+            let exclude = derivation_exclusions(effective_block | type_block, effective_final);
 
             let mut stack = member_map.get(&head_key).cloned().unwrap_or_default();
             let mut visited = HashSet::new();
@@ -102,7 +111,24 @@ fn build_substitution_group_map_inner(
             }
         }
 
-        result.insert(head_key, names);
+        // Prune the trivial entry: a head whose substitutable set is exactly
+        // its own name adds no information — every consumer of this map
+        // (`term_matches`, `term_matches_with_substitution`, EDC's member
+        // expansion, UPA's `element_substitutable_names`) falls back to the
+        // same direct self-match when the entry is absent. Pruning makes the
+        // map *empty* for the common substitution-free schema, letting
+        // `SchemaValidator::new` drop it to `None` so the per-child hash
+        // probes in `term_matches` disappear entirely. Entries that differ
+        // from the trivial self-match must stay: abstract heads (their set
+        // omits the self-name — that omission is what blocks abstract
+        // elements from matching in instances) and heads with substitutable
+        // members.
+        let is_trivial_self_match = head_elem
+            .name
+            .is_some_and(|n| names.len() == 1 && names.contains(&(n, head_elem.target_namespace)));
+        if !is_trivial_self_match {
+            result.insert(head_key, names);
+        }
     }
 
     result
@@ -166,6 +192,27 @@ pub(crate) fn effective_element_constraints(
     (element.block, element.final_derivation)
 }
 
+/// §3.3.6.3 Substitution Group OK (Transitive) clause 2.3, item (2): the
+/// blocking union includes the head's {type definition}.{prohibited
+/// substitutions} when that type is complex (sunData disallowedSubst005:
+/// `<xs:complexType block="restriction">` on the head's type forbids
+/// substitution by restriction-derived members even though the head
+/// *element* carries no block).
+pub(crate) fn head_type_prohibited_substitutions(
+    schema_set: &SchemaSet,
+    head_type: Option<TypeKey>,
+) -> DerivationSet {
+    match head_type {
+        Some(TypeKey::Complex(ct_key)) => schema_set
+            .arenas
+            .complex_types
+            .get(ct_key)
+            .map(|ct| ct.block)
+            .unwrap_or_else(DerivationSet::empty),
+        _ => DerivationSet::empty(),
+    }
+}
+
 /// Check if `candidate_key` is validly substitutable for `head_key`
 /// per XSD §3.3.6.3 / §3.9.6 NameAndTypeOK.
 pub(crate) fn is_element_substitutable_for(
@@ -207,8 +254,10 @@ pub(crate) fn is_element_substitutable_for(
         return false;
     }
 
-    // Check type derivation with exclusion mask
-    let exclude = derivation_exclusions(effective_block, effective_final);
+    // Check type derivation with exclusion mask (clause 2.3 items (1)+(2):
+    // head element block ∪ head type {prohibited substitutions}).
+    let type_block = head_type_prohibited_substitutions(schema_set, head_elem.resolved_type);
+    let exclude = derivation_exclusions(effective_block | type_block, effective_final);
     is_substitutable(
         schema_set,
         head_elem.resolved_type,
@@ -362,6 +411,49 @@ mod tests {
         }
     }
 
+    /// Substitution-free schemas must produce an *empty* map: the builder
+    /// prunes trivial self-match entries, and `SchemaValidator::new` relies on
+    /// emptiness to drop the map to `None` (skipping the per-child hash probes
+    /// in `term_matches` entirely).
+    #[test]
+    fn test_substitution_group_map_empty_without_substitution() {
+        let mut schema_set = SchemaSet::new();
+        let a_name = schema_set.name_table.add("a");
+        let b_name = schema_set.name_table.add("b");
+        let ty = TypeKey::Simple(schema_set.builtin_types().decimal);
+        schema_set.arenas.alloc_element(element_data(a_name, ty, None));
+        schema_set.arenas.alloc_element(element_data(b_name, ty, None));
+
+        let map = build_substitution_group_map(&schema_set);
+        assert!(map.is_empty());
+    }
+
+    /// An abstract element's entry must NOT be pruned even when it has no
+    /// members: its set omits the self-name, and that omission is what stops
+    /// `term_matches` from accepting the abstract element in instances. An
+    /// absent entry would fall back to the direct self-match and wrongly
+    /// accept it.
+    #[test]
+    fn test_substitution_group_abstract_head_entry_kept() {
+        let mut schema_set = SchemaSet::new();
+        let head_name = schema_set.name_table.add("head");
+        let head_type = TypeKey::Simple(schema_set.builtin_types().decimal);
+
+        let mut head = element_data(head_name, head_type, None);
+        head.is_abstract = true;
+        let head_key = schema_set.arenas.alloc_element(head);
+
+        let map = build_substitution_group_map(&schema_set);
+        let names = map.get(&head_key).expect("abstract entry must be kept");
+        assert!(!names.contains(&(head_name, None)));
+
+        // Under the with-abstract variant (schema-time UPA/EDC) the entry IS
+        // the trivial self-match, so it is pruned there — equivalent to the
+        // consumers' direct-match fallback.
+        let map = build_substitution_group_map_with_abstract(&schema_set);
+        assert!(!map.contains_key(&head_key));
+    }
+
     #[test]
     fn test_substitution_group_type_derivation_allows_member() {
         let mut schema_set = SchemaSet::new();
@@ -416,8 +508,10 @@ mod tests {
             .push(head_key);
 
         let map = build_substitution_group_map(&schema_set);
-        let names = map.get(&head_key).unwrap();
-        assert!(!names.contains(&(member_name, None)));
+        // The member is blocked, so the head's substitutable set collapses to
+        // the trivial self-match — which the builder prunes (an absent entry
+        // means "matches only its own name" to every consumer).
+        assert!(!map.contains_key(&head_key));
     }
 
     // Per §3.3.4 the {substitution group exclusions} are derived solely from the
@@ -491,9 +585,10 @@ mod tests {
             .push(head_key);
 
         let map = build_substitution_group_map(&schema_set);
-        let names = map.get(&head_key).unwrap();
-        assert!(names.contains(&(head_name, None)));
-        assert!(!names.contains(&(member_name, None)));
+        // The member is blocked, so the head's substitutable set collapses to
+        // the trivial self-match — which the builder prunes (an absent entry
+        // means "matches only its own name" to every consumer).
+        assert!(!map.contains_key(&head_key));
     }
 
     #[test]
@@ -523,9 +618,10 @@ mod tests {
             .push(head_key);
 
         let map = build_substitution_group_map(&schema_set);
-        let names = map.get(&head_key).unwrap();
-        assert!(names.contains(&(head_name, None)));
-        assert!(!names.contains(&(member_name, None)));
+        // The member is blocked, so the head's substitutable set collapses to
+        // the trivial self-match — which the builder prunes (an absent entry
+        // means "matches only its own name" to every consumer).
+        assert!(!map.contains_key(&head_key));
     }
 
     #[test]
@@ -555,8 +651,9 @@ mod tests {
             .push(head_key);
 
         let map = build_substitution_group_map(&schema_set);
-        let names = map.get(&head_key).unwrap();
-        assert!(names.contains(&(head_name, None)));
-        assert!(!names.contains(&(member_name, None)));
+        // The member is blocked, so the head's substitutable set collapses to
+        // the trivial self-match — which the builder prunes (an absent entry
+        // means "matches only its own name" to every consumer).
+        assert!(!map.contains_key(&head_key));
     }
 }

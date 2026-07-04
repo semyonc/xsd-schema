@@ -65,10 +65,19 @@ pub enum AllGroupExtPhase {
 #[derive(Debug, Clone)]
 pub enum CompiledContentModel {
     /// Standard NFA content model.
-    Nfa(Arc<NfaTable>),
+    ///
+    /// `initial` is the start-state epsilon closure, computed once here so that
+    /// each per-element [`ContentValidatorState`] clones it (a cheap `StateSet`
+    /// copy for the common counter-free case) instead of re-running the closure
+    /// DFS on every element instance.
+    Nfa {
+        nfa: Arc<NfaTable>,
+        initial: ActiveStates,
+    },
     /// NFA content model carrying an open-content wildcard (XSD 1.1).
     NfaWithOpenContent {
         nfa: Arc<NfaTable>,
+        initial: ActiveStates,
         open_content: Option<OpenContentInfo>,
     },
     /// All-group content model (unordered particles).
@@ -86,7 +95,13 @@ impl CompiledContentModel {
     /// moving its automaton tables behind `Arc`s. Called once per complex type.
     pub fn from_matcher(matcher: ContentModelMatcher) -> Self {
         match matcher {
-            ContentModelMatcher::Nfa(nfa) => Self::Nfa(Arc::new(nfa)),
+            ContentModelMatcher::Nfa(nfa) => {
+                let initial = ActiveStates::from_nfa(&nfa);
+                Self::Nfa {
+                    nfa: Arc::new(nfa),
+                    initial,
+                }
+            }
             ContentModelMatcher::AllGroup(model) => Self::AllGroup(Arc::new(model)),
             ContentModelMatcher::WithOpenContent {
                 nfa,
@@ -99,8 +114,10 @@ impl CompiledContentModel {
                     process_contents: w.process_contents,
                     not_qnames: w.not_qnames,
                 });
+                let initial = ActiveStates::from_nfa(&nfa);
                 Self::NfaWithOpenContent {
                     nfa: Arc::new(nfa),
+                    initial,
                     open_content,
                 }
             }
@@ -163,19 +180,21 @@ impl ContentValidatorState {
     /// all-group counters) — it never deep-clones the automaton tables.
     pub fn from_compiled(compiled: &CompiledContentModel) -> Self {
         match compiled {
-            CompiledContentModel::Nfa(nfa) => {
-                let active_states = ActiveStates::from_nfa(nfa);
+            CompiledContentModel::Nfa { nfa, initial } => {
                 ContentValidatorState::Nfa {
                     nfa: Arc::clone(nfa),
-                    active_states,
+                    active_states: initial.clone(),
                     open_content: None,
                 }
             }
-            CompiledContentModel::NfaWithOpenContent { nfa, open_content } => {
-                let active_states = ActiveStates::from_nfa(nfa);
+            CompiledContentModel::NfaWithOpenContent {
+                nfa,
+                initial,
+                open_content,
+            } => {
                 ContentValidatorState::Nfa {
                     nfa: Arc::clone(nfa),
-                    active_states,
+                    active_states: initial.clone(),
                     open_content: open_content.clone(),
                 }
             }

@@ -6,16 +6,12 @@
 //! Callers create a per-run [`super::runtime::ValidationRuntime`] via
 //! [`SchemaValidator::start_run()`] to perform actual validation.
 
-use std::collections::HashMap;
-
 use crate::compiler::{build_substitution_group_map, SubstitutionGroupMap};
-use crate::ids::ComplexTypeKey;
 use crate::schema::SchemaSet;
 
-use super::content::CompiledContentModel;
 use super::errors::ValidationError;
 use super::info::ValidationFlags;
-use super::runtime::{build_content_models, ValidationRuntime};
+use super::runtime::{build_content_models, ContentModelMap, ValidationRuntime};
 
 // ---------------------------------------------------------------------------
 // ValidationSink trait
@@ -124,7 +120,7 @@ pub struct SchemaValidator<'a> {
     /// Per-complex-type compiled content models, built once here and shared
     /// (borrowed) by every [`ValidationRuntime`]. Moves the content-model NFA
     /// compilation out of the per-element hot path. See `build_content_models`.
-    pub(crate) content_models: HashMap<ComplexTypeKey, CompiledContentModel>,
+    pub(crate) content_models: ContentModelMap,
     /// Validation flags controlling behaviour
     pub(crate) flags: ValidationFlags,
     /// Which assertion evaluation path is active (XSD 1.1 only)
@@ -146,7 +142,12 @@ impl<'a> SchemaValidator<'a> {
         let content_models = build_content_models(schema_set);
         SchemaValidator {
             schema_set,
-            subst_groups: Some(subst_groups),
+            // The builder prunes trivial self-match entries, so the map is empty —
+            // and dropped to `None` here — whenever the schema has no substitutable
+            // members and no abstract elements (the common case). `term_matches`
+            // short-circuits on `None` and falls through to the identical direct
+            // self-match, eliminating the per-term hash probes on every child.
+            subst_groups: (!subst_groups.is_empty()).then_some(subst_groups),
             content_models,
             flags,
             #[cfg(feature = "xsd11")]

@@ -1925,6 +1925,41 @@ pub fn is_strict_xsd10_anyuri(value: &str) -> bool {
     is_valid_uri_scheme(&value[..end])
 }
 
+/// Extended XSD 1.0 lexical check for `xs:anyURI` used on enumeration facet
+/// values (msData anyURI_a003/b004/b006). On top of the malformed-scheme
+/// shape caught by [`is_strict_xsd10_anyuri`], RFC 2396 excludes the
+/// backslash and caret characters entirely (§2.4.3 "unwise") and requires
+/// every `%` to introduce a two-hex-digit escape (§2.4.1).
+///
+/// Deliberately NOT applied to instance validation — only to schema-side
+/// facet values — to keep the long-standing permissive instance behavior
+/// (the corpus contains many sloppy-but-accepted instance URIs).
+pub fn is_strict_xsd10_anyuri_enum_value(value: &str) -> bool {
+    if !is_strict_xsd10_anyuri(value) {
+        return false;
+    }
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' | b'^' => return false,
+            b'%' => {
+                let ok = bytes.len() > i + 2
+                    && bytes[i + 1].is_ascii_hexdigit()
+                    && bytes[i + 2].is_ascii_hexdigit();
+                if !ok {
+                    return false;
+                }
+                i += 3;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
 // ============================================================================
 // Date/Time Parsing Helpers
 // ============================================================================

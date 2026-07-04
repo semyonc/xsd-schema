@@ -272,12 +272,18 @@ impl SchemaSet {
 
     /// Check if a schema location has already been loaded
     pub fn is_loaded(&self, location: &str) -> bool {
-        self.loaded_locations.contains_key(location)
+        // Schema-document identity is canonical-path based (symlinks and
+        // case variants on case-insensitive filesystems collapse), so
+        // normalize the probe the same way `mark_loaded` normalizes keys.
+        let canonical =
+            crate::parser::resolver::canonicalize_file_location(location.to_string());
+        self.loaded_locations.contains_key(canonical.as_str())
     }
 
     /// Mark a schema location as loaded
     pub fn mark_loaded(&mut self, location: String, doc_id: DocumentId) {
-        self.loaded_locations.insert(location, doc_id);
+        let canonical = crate::parser::resolver::canonicalize_file_location(location);
+        self.loaded_locations.insert(canonical, doc_id);
     }
 
     /// Get or create namespace table for a namespace

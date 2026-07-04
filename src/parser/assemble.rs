@@ -377,30 +377,41 @@ impl<'a> SchemaAssembler<'a> {
         )?;
 
         // Allocate identity constraints into the arena and register in namespace table
-        let identity_constraint_keys: Vec<IdentityConstraintKey> = identity_constraints
-            .into_iter()
-            .map(|ic| {
-                let ic_name = ic.name;
-                let key =
-                    self.schema_set
-                        .arenas
-                        .alloc_identity_constraint(IdentityConstraintData {
-                            kind: ic.kind,
-                            name: ic.name,
-                            ref_name: ic.ref_name,
-                            refer: ic.refer,
-                            selector: ic.selector,
-                            fields: ic.fields,
-                            id: ic.id,
-                            annotation: ic.annotation,
-                            source: ic.source,
-                        });
-                // Register in namespace table for @ref resolution
-                let ns_table = self.schema_set.get_or_create_namespace(target_namespace);
-                ns_table.identity_constraints.insert(ic_name, key);
-                key
-            })
-            .collect();
+        let mut identity_constraint_keys: Vec<IdentityConstraintKey> =
+            Vec::with_capacity(identity_constraints.len());
+        for ic in identity_constraints {
+            let ic_name = ic.name;
+            let ic_source = ic.source.clone();
+            let key = self
+                .schema_set
+                .arenas
+                .alloc_identity_constraint(IdentityConstraintData {
+                    kind: ic.kind,
+                    name: ic.name,
+                    ref_name: ic.ref_name,
+                    refer: ic.refer,
+                    selector: ic.selector,
+                    fields: ic.fields,
+                    id: ic.id,
+                    annotation: ic.annotation,
+                    source: ic.source,
+                });
+            // Register in namespace table for @ref resolution. Identity
+            // constraints share one symbol space per namespace (§3.11.1),
+            // so a name already registered by another schema document of
+            // the same namespace is a collision, not an overwrite.
+            let ns_table = self.schema_set.get_or_create_namespace(target_namespace);
+            if ns_table.identity_constraints.insert(ic_name, key).is_some() {
+                let location = self.schema_set.locate(ic_source.as_ref());
+                let name_str = self.schema_set.name_table.resolve(ic_name);
+                return Err(SchemaError::structural(
+                    "ic-unique",
+                    format!("Duplicate identity constraint name '{}' in schema", name_str),
+                    location,
+                ));
+            }
+            identity_constraint_keys.push(key);
+        }
 
         // Defer XSD 1.1 @ref identity constraint references for resolution
         // in resolve_all_references() — the target IC may not exist yet

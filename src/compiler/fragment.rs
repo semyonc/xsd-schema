@@ -393,6 +393,21 @@ impl FragmentBuilder {
         frag.nullable = true;
         frag
     }
+
+    /// Build a fragment that matches nothing — not even the empty sequence.
+    ///
+    /// Used for an empty `<xs:choice/>`: a choice with no particles is
+    /// unsatisfiable (§3.4.2.3 — only a sequence/all with no children, or a
+    /// choice with no children *and* minOccurs=0, yields empty content).
+    /// When the particle carries minOccurs=0, the occurrence wrapper adds
+    /// the epsilon bypass that makes it skippable; otherwise the content
+    /// model rejects all input, including empty content (saxon complex022).
+    pub fn dead_fragment(&self) -> NfaFragment {
+        let start = NfaState::epsilon(0, None);
+        let end = NfaState::epsilon(1, None);
+        // No transition from start to end — the accept state is unreachable.
+        NfaFragment::new(vec![start, end], 0, 1)
+    }
 }
 
 impl Default for FragmentBuilder {

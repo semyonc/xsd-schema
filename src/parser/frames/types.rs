@@ -121,6 +121,23 @@ impl Frame for SimpleTypeFrame {
                         None,
                     ));
                 }
+                // The restriction element inside <simpleType> only admits
+                // annotation, an inline simpleType, and facets (§3.16.2 XML
+                // representation). Attribute uses, attribute groups, wildcards
+                // and particles belong to simpleContent/complexContent
+                // restrictions and are syntax errors here (msData stC029).
+                if res.attribute_wildcard.is_some()
+                    || !res.attributes.is_empty()
+                    || !res.attribute_groups.is_empty()
+                    || res.particle.is_some()
+                {
+                    return Err(SchemaError::structural(
+                        "src-simple-type",
+                        "Simple type restriction only allows annotation, an inline simpleType, \
+                         and facet elements",
+                        None,
+                    ));
+                }
                 let base = if let Some(inline) = res.inline_type.clone() {
                     Some(TypeRefResult::Inline(Box::new(TypeFrameResult::Simple(Box::new(inline)))))
                 } else {
@@ -1221,6 +1238,17 @@ impl Frame for ComplexContentFrame {
                 self.annotation = Some(ann);
             }
             FrameResult::Restriction(res) => {
+                // src-ct: the schema-for-schemas content model of
+                // <xs:complexContent>/<xs:restriction> has no facet elements —
+                // facets belong to simple type / simpleContent restrictions
+                // (msData addB112: <xs:length> under complexContent).
+                if !res.facets.is_empty() {
+                    return Err(SchemaError::structural(
+                        "src-ct",
+                        "Facet elements are not allowed in a complexContent restriction",
+                        None,
+                    ));
+                }
                 self.base_type = res.base_type.clone();
                 self.derivation = Some(DerivationMethod::Restriction);
                 self.particle = res.particle.clone();

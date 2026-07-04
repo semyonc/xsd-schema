@@ -121,6 +121,12 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     pub sink: S,
     /// Stack of per-element validation states
     validation_stack: Vec<ElementValidationState>,
+    /// Free-list of `ElementValidationState` shells recycled on element close,
+    /// so a child element reuses the retained collection capacity
+    /// (`text_content`, `seen_attributes`, …) of a closed sibling/ancestor
+    /// instead of allocating fresh. Depth-bounded by the element nesting depth;
+    /// no cap needed. See `acquire_state` / the recycle in `validate_end_element`.
+    state_pool: Vec<ElementValidationState>,
     /// Current state machine state
     current_state: ValidatorState,
     /// Current source location (updated by caller)
@@ -135,7 +141,7 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// instance of a type, so each element only clones cheap `Arc`s from here
     /// and allocates fresh active states, instead of recompiling the model per
     /// element. See `PERF_ANALYZE`.
-    content_models: &'a HashMap<ComplexTypeKey, CompiledContentModel>,
+    content_models: &'a ContentModelMap,
     /// Active constraint state instances
     active_constraints: Vec<ConstraintStruct>,
     /// Collected ID values mapped to the owner element serial.
@@ -199,8 +205,98 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// under XSD 1.1 (the rule was removed) so the per-attribute hot path
     /// short-circuits without any built-in hash lookup or chain walk.
     cached_xsd10_id_key: Option<SimpleTypeKey>,
+    /// Whether the compiled schema declares **any** inheritable attribute
+    /// (XSD 1.1 §3.2.6 `{inheritable}`). Computed once from the arenas at
+    /// construction. When `false`, `[inherited attributes]` is always empty,
+    /// so `push_element` skips the parent→child map propagation and
+    /// `validate_end_of_attributes` skips `record_inheritable_defaults`
+    /// entirely — both are no-ops on such schemas (every XSD 1.0 schema, and
+    /// any XSD 1.1 schema without an `inheritable="true"` attribute).
+    #[cfg(feature = "xsd11")]
+    has_inheritable_attributes: bool,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
+}
+
+/// Whether the schema declares any attribute with `{inheritable}` = true
+/// (XSD 1.1 §3.2.6). Scans a strict superset of every runtime read site of
+/// `inheritable`: the attribute-declaration arena (wildcard-resolved
+/// governing decls), every complex type's attribute uses, and every attribute
+/// group's attribute uses. `false` guarantees `[inherited attributes]` stays
+/// empty for every element, so the per-element propagation and default-record
+/// work can be skipped without any semantic change.
+#[cfg(feature = "xsd11")]
+fn schema_has_inheritable_attributes(schema_set: &SchemaSet) -> bool {
+    let arenas = &schema_set.arenas;
+    arenas.attributes.values().any(|d| d.inheritable)
+        || arenas
+            .complex_types
+            .values()
+            .any(|ct| ct.attributes.iter().any(|au| au.attribute.inheritable))
+        || arenas
+            .attribute_groups
+            .values()
+            .any(|g| g.attributes.iter().any(|au| au.attribute.inheritable))
+}
+
+/// Per-complex-type compiled content models, keyed by the interned slotmap
+/// `ComplexTypeKey`. Probed once per element in `init_content_model`, so it uses
+/// keyed `ahash` (ZST build-hasher) rather than the default SipHash — same
+/// rationale as [`first_namespace_use`]: the key is a dense interned key, not
+/// attacker-controlled bytes.
+///
+/// [`first_namespace_use`]: ValidationRuntime::first_namespace_use
+pub(crate) type ContentModelMap =
+    HashMap<ComplexTypeKey, CompiledContentModel, BuildHasherDefault<AHasher>>;
+
+/// The finished top element handed back by
+/// [`ValidationRuntime::finish_top_element`]: the popped, completion-processed
+/// state, plus (under XSD 1.1) the assertion outcome the value-returning
+/// end-element path folds into the `SchemaInfo`.
+#[cfg(feature = "xsd11")]
+type FinishedElement = (ElementValidationState, Option<AssertionOutcome>);
+#[cfg(not(feature = "xsd11"))]
+type FinishedElement = ElementValidationState;
+
+/// Scalar outcome of the element-start step (`start_element_by_id`), shared by
+/// the value-returning and value-free entry points. `Start` carries exactly
+/// the fields the start-side `SchemaInfo` can populate — every other field of
+/// that struct is always empty/default at element start — so the value wrapper
+/// assembles the `SchemaInfo` from it and the `_novalue` wrapper skips the
+/// construction entirely. See `PERF_P1_PLAN` §Step 4.
+#[derive(Clone, Copy)]
+enum ElementStartOutcome {
+    /// Out-of-sequence call or undeclared/unresolvable governing type under
+    /// strict assessment — maps to [`SchemaInfo::invalid()`].
+    Invalid,
+    /// Skip- or lax-assessed element with no governing type — maps to
+    /// [`SchemaInfo::empty()`].
+    Empty,
+    /// Assessed element start (declared, wildcard-typed, or xsi:type-governed).
+    Start {
+        element_decl: Option<ElementKey>,
+        schema_type: Option<TypeKey>,
+        validity: SchemaValidity,
+        is_nil: bool,
+        content_type: Option<ContentType>,
+        type_source: Option<TypeSource>,
+    },
+}
+
+/// Scalar outcome of the end-of-attributes step (`end_of_attributes_inner`),
+/// shared by the value-returning and value-free entry points; same pattern as
+/// [`ElementStartOutcome`].
+enum EndOfAttributesOutcome {
+    /// Out-of-sequence call — maps to [`SchemaInfo::invalid()`].
+    Invalid,
+    /// Normal completion — maps to [`SchemaInfo::empty()`].
+    Done,
+    /// CTA evaluated and selected (and possibly switched) the governing type
+    /// (XSD 1.1): the value wrapper rebuilds the type/content/validity info
+    /// from the stack top so callers (e.g. the typed builder) can update
+    /// element bindings.
+    #[cfg(feature = "xsd11")]
+    CtaUpdated,
 }
 
 /// Build the per-complex-type compiled content models once, at
@@ -215,10 +311,8 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
 /// Compilation failures are simply omitted from the map; the runtime then falls
 /// back to empty content (matching the previous per-element error path) and
 /// never retries the failed compile.
-pub(crate) fn build_content_models(
-    schema_set: &SchemaSet,
-) -> HashMap<ComplexTypeKey, CompiledContentModel> {
-    let mut map = HashMap::new();
+pub(crate) fn build_content_models(schema_set: &SchemaSet) -> ContentModelMap {
+    let mut map = ContentModelMap::default();
     for (ct_key, ct_data) in schema_set.arenas.complex_types.iter() {
         if matches!(
             determine_content_type(schema_set, ct_data),
@@ -367,7 +461,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     pub(crate) fn new(
         schema_set: &'a SchemaSet,
         subst_groups: &'a Option<SubstitutionGroupMap>,
-        content_models: &'a HashMap<ComplexTypeKey, CompiledContentModel>,
+        content_models: &'a ContentModelMap,
         flags: ValidationFlags,
         sink: S,
         #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
@@ -377,6 +471,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             None
         };
+        #[cfg(feature = "xsd11")]
+        let has_inheritable_attributes = schema_has_inheritable_attributes(schema_set);
         ValidationRuntime {
             schema_set,
             subst_groups,
@@ -384,6 +480,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             flags,
             sink,
             validation_stack: Vec::new(),
+            state_pool: Vec::new(),
             current_state: ValidatorState::None,
             current_location: None,
             element_path: String::new(),
@@ -413,6 +510,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             #[cfg(feature = "xsd11")]
             deferred_attribute_results: Vec::new(),
             cached_xsd10_id_key,
+            #[cfg(feature = "xsd11")]
+            has_inheritable_attributes,
             _not_thread_safe: PhantomData,
         }
     }
@@ -877,14 +976,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Push a skip-wildcard-matched element onto the stack with
     /// `process_contents=Skip`, `validity=NotKnown`, and no content-model
-    /// validation. Returns the empty SchemaInfo callers propagate on skip.
+    /// validation. Callers propagate [`ElementStartOutcome::Empty`] on skip.
     fn push_skipped_element(
         &mut self,
         local_name: NameId,
         namespace: Option<NameId>,
         ns_context: &NamespaceContextSnapshot,
-    ) -> SchemaInfo {
-        let mut ev_state = ElementValidationState::new(local_name, namespace);
+    ) {
+        let mut ev_state = self.acquire_state(local_name, namespace);
         ev_state.ns_context = Some(ns_context.clone());
         ev_state.process_contents = ContentProcessing::Skip;
         ev_state.content_state = ContentValidatorState::Simple;
@@ -893,7 +992,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.advance_constraints_start_element_skipped(local_name, namespace);
         #[cfg(feature = "xsd11")]
         self.detect_assertions_on_element(None, local_name, namespace);
-        SchemaInfo::empty()
     }
 
     /// XSD 1.1 dynamic EDC (§3.4.6.4 / cvc-complex-type rule 5): when a
@@ -931,7 +1029,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Validate an element start event (NameId fast-path)
+    /// Value-free variant of [`validate_element`](Self::validate_element) for
+    /// throughput drivers that discard the start-side `SchemaInfo`. Runs the
+    /// identical element-start step but skips constructing the returned
+    /// `SchemaInfo`. See `PERF_P1_PLAN` §Step 4.
+    pub fn validate_element_novalue(
+        &mut self,
+        local_name: &str,
+        namespace_uri: &str,
+        xsi_type: Option<&str>,
+        xsi_nil: Option<&str>,
+        ns_context: &NamespaceContextSnapshot,
+    ) {
+        let name_id = self.schema_set.name_table.add(local_name);
+        let ns_id = if namespace_uri.is_empty() {
+            None
+        } else {
+            Some(self.schema_set.name_table.add(namespace_uri))
+        };
+        self.validate_element_by_id_novalue(name_id, ns_id, xsi_type, xsi_nil, ns_context);
+    }
+
+    /// Validate an element start event (NameId fast-path), returning the
+    /// element's start-side [`SchemaInfo`].
     pub fn validate_element_by_id(
         &mut self,
         local_name: NameId,
@@ -940,6 +1060,66 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         xsi_nil: Option<&str>,
         ns_context: &NamespaceContextSnapshot,
     ) -> SchemaInfo {
+        match self.start_element_by_id(local_name, namespace, xsi_type, xsi_nil, ns_context) {
+            ElementStartOutcome::Invalid => SchemaInfo::invalid(),
+            ElementStartOutcome::Empty => SchemaInfo::empty(),
+            ElementStartOutcome::Start {
+                element_decl,
+                schema_type,
+                validity,
+                is_nil,
+                content_type,
+                type_source,
+            } => SchemaInfo {
+                element_decl,
+                attribute_decl: None,
+                schema_type,
+                member_type: None,
+                validity,
+                validation_attempted: ValidationAttempted::None,
+                is_default: false,
+                is_nil,
+                content_type,
+                typed_value: None,
+                normalized_value: None,
+                schema_error_codes: Vec::new(),
+                notation: None,
+                deferred_by_cta: false,
+                type_source,
+                #[cfg(feature = "xsd11")]
+                cta_selected: false,
+                #[cfg(feature = "xsd11")]
+                assertion_outcome: None,
+            },
+        }
+    }
+
+    /// Value-free variant of
+    /// [`validate_element_by_id`](Self::validate_element_by_id); same
+    /// element-start step, no `SchemaInfo` construction.
+    pub fn validate_element_by_id_novalue(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        xsi_type: Option<&str>,
+        xsi_nil: Option<&str>,
+        ns_context: &NamespaceContextSnapshot,
+    ) {
+        let _ = self.start_element_by_id(local_name, namespace, xsi_type, xsi_nil, ns_context);
+    }
+
+    /// The element-start step shared by both entry points above: state-machine
+    /// check, parent content-model advance, declaration/type resolution
+    /// (xsi:type, wildcards, substitution), state push, and deferred error
+    /// emission — everything except assembling the returned `SchemaInfo`.
+    fn start_element_by_id(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        xsi_type: Option<&str>,
+        xsi_nil: Option<&str>,
+        ns_context: &NamespaceContextSnapshot,
+    ) -> ElementStartOutcome {
         // 1. State machine check
         if !self.current_state.can_start_element() {
             self.report_error(
@@ -949,7 +1129,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.current_state
                 ),
             );
-            return SchemaInfo::invalid();
+            return ElementStartOutcome::Invalid;
         }
 
         // 1b. Root element: verify PROCESS_ASSERTIONS ↔ AssertionSource consistency
@@ -974,7 +1154,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if parent.process_contents == ContentProcessing::Skip {
                 // Skipped element: don't validate content model, push as skip, return
                 parent.has_element_children = true;
-                return self.push_skipped_element(local_name, namespace, ns_context);
+                self.push_skipped_element(local_name, namespace, ns_context);
+                return ElementStartOutcome::Empty;
             } else if parent.is_nil {
                 let parent_name = self
                     .schema_set
@@ -1067,13 +1248,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if element_key.is_none() {
             if content_model_accepted {
                 if process_contents == ContentProcessing::Skip {
-                    return self.push_skipped_element(local_name, namespace, ns_context);
+                    self.push_skipped_element(local_name, namespace, ns_context);
+                    return ElementStartOutcome::Empty;
                 }
 
                 // Content model accepted this element (wildcard in content model)
                 // but no global declaration exists.
                 let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
-                let mut ev_state = ElementValidationState::new(local_name, namespace);
+                let mut ev_state = self.acquire_state(local_name, namespace);
                 ev_state.ns_context = Some(ns_context.clone());
                 ev_state.validity = SchemaValidity::Valid;
                 ev_state.process_contents = process_contents;
@@ -1206,26 +1388,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
                 self.detect_assertions_on_element(schema_type, local_name, namespace);
-                return SchemaInfo {
+                return ElementStartOutcome::Start {
                     element_decl: None,
-                    attribute_decl: None,
                     schema_type,
-                    member_type: None,
                     validity,
-                    validation_attempted: ValidationAttempted::None,
-                    is_default: false,
                     is_nil,
                     content_type,
-                    typed_value: None,
-                    normalized_value: None,
-                    schema_error_codes: Vec::new(),
-                    notation: None,
-                    deferred_by_cta: false,
                     type_source,
-                    #[cfg(feature = "xsd11")]
-                    cta_selected: false,
-                    #[cfg(feature = "xsd11")]
-                    assertion_outcome: None,
                 };
             }
 
@@ -1247,7 +1416,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ) {
                         XsiTypeOutcome::Applied(type_key) => {
                             let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
-                            let mut ev_state = ElementValidationState::new(local_name, namespace);
+                            let mut ev_state = self.acquire_state(local_name, namespace);
                             ev_state.ns_context = Some(ns_context.clone());
                             let (content_state, content_type) =
                                 self.init_content_model(Some(type_key));
@@ -1267,26 +1436,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 local_name,
                                 namespace,
                             );
-                            return SchemaInfo {
+                            return ElementStartOutcome::Start {
                                 element_decl: None,
-                                attribute_decl: None,
                                 schema_type: Some(type_key),
-                                member_type: None,
                                 validity: SchemaValidity::Valid,
-                                validation_attempted: ValidationAttempted::None,
-                                is_default: false,
                                 is_nil,
                                 content_type: Some(content_type),
-                                typed_value: None,
-                                normalized_value: None,
-                                schema_error_codes: Vec::new(),
-                                notation: None,
-                                deferred_by_cta: false,
                                 type_source: Some(TypeSource::XsiType),
-                                #[cfg(feature = "xsd11")]
-                                cta_selected: false,
-                                #[cfg(feature = "xsd11")]
-                                assertion_outcome: None,
                             };
                         }
                         XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
@@ -1295,7 +1451,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // Emit the deferred xsi:type diagnostic in
                             // addition, after push so attribution lands on
                             // the child.
-                            let mut ev_state = ElementValidationState::new(local_name, namespace);
+                            let mut ev_state = self.acquire_state(local_name, namespace);
                             ev_state.ns_context = Some(ns_context.clone());
                             ev_state.validity = SchemaValidity::Invalid;
                             let (content_state, content_type) = self.lax_assessment_content_model();
@@ -1312,7 +1468,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             self.advance_constraints_start_element(local_name, namespace, None);
                             #[cfg(feature = "xsd11")]
                             self.detect_assertions_on_element(None, local_name, namespace);
-                            return SchemaInfo::invalid();
+                            return ElementStartOutcome::Invalid;
                         }
                     }
                 }
@@ -1321,7 +1477,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             match process_contents {
                 ContentProcessing::Skip => {
                     // Skip validation entirely
-                    let mut ev_state = ElementValidationState::new(local_name, namespace);
+                    let mut ev_state = self.acquire_state(local_name, namespace);
                     ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Skip;
                     ev_state.content_state = ContentValidatorState::Simple; // accept anything
@@ -1330,11 +1486,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.advance_constraints_start_element(local_name, namespace, None);
                     #[cfg(feature = "xsd11")]
                     self.detect_assertions_on_element(None, local_name, namespace);
-                    return SchemaInfo::empty();
+                    return ElementStartOutcome::Empty;
                 }
                 ContentProcessing::Lax => {
                     // Lax: no declaration found — lax assessment via xs:anyType
-                    let mut ev_state = ElementValidationState::new(local_name, namespace);
+                    let mut ev_state = self.acquire_state(local_name, namespace);
                     ev_state.ns_context = Some(ns_context.clone());
                     ev_state.process_contents = ContentProcessing::Lax;
                     let (content_state, content_type) = self.lax_assessment_content_model();
@@ -1346,10 +1502,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.advance_constraints_start_element(local_name, namespace, None);
                     #[cfg(feature = "xsd11")]
                     self.detect_assertions_on_element(None, local_name, namespace);
-                    return SchemaInfo::empty();
+                    return ElementStartOutcome::Empty;
                 }
                 ContentProcessing::Strict => {
-                    let mut ev_state = ElementValidationState::new(local_name, namespace);
+                    let mut ev_state = self.acquire_state(local_name, namespace);
                     ev_state.ns_context = Some(ns_context.clone());
                     ev_state.validity = SchemaValidity::Invalid;
                     // Lax assessment for content (same PSVI as lax when no declaration found)
@@ -1367,7 +1523,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.advance_constraints_start_element(local_name, namespace, None);
                     #[cfg(feature = "xsd11")]
                     self.detect_assertions_on_element(None, local_name, namespace);
-                    return SchemaInfo::invalid();
+                    return ElementStartOutcome::Invalid;
                 }
             }
         }
@@ -1469,7 +1625,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         );
 
         // 9. Push ElementValidationState
-        let mut ev_state = ElementValidationState::new(local_name, namespace);
+        let mut ev_state = self.acquire_state(local_name, namespace);
         ev_state.ns_context = Some(ns_context.clone());
         ev_state.element_decl = Some(elem_key);
         ev_state.schema_type = type_key;
@@ -1566,7 +1722,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         #[cfg(feature = "xsd11")]
         self.detect_assertions_on_element(type_key, local_name, namespace);
 
-        // 10. Return SchemaInfo
+        // 10. Return the start outcome
         #[allow(unused_mut)]
         let mut validity = if xsi_type_invalid || abstract_type_invalid || has_deferred_type_error {
             SchemaValidity::Invalid
@@ -1577,26 +1733,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if edc_violation_a.is_some() {
             validity = SchemaValidity::Invalid;
         }
-        SchemaInfo {
+        ElementStartOutcome::Start {
             element_decl: Some(elem_key),
-            attribute_decl: None,
             schema_type: type_key,
-            member_type: None,
             validity,
-            validation_attempted: ValidationAttempted::None,
-            is_default: false,
             is_nil,
             content_type: Some(content_type),
-            typed_value: None,
-            normalized_value: None,
-            schema_error_codes: Vec::new(),
-            notation: None,
-            deferred_by_cta: false,
             type_source: Some(type_source),
-            #[cfg(feature = "xsd11")]
-            cta_selected: false,
-            #[cfg(feature = "xsd11")]
-            assertion_outcome: None,
         }
     }
 
@@ -1919,8 +2062,45 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let _ = self.install_fragment_binding(attr_ref, binding, "attr binding");
     }
 
-    /// Signal end of attributes; checks for missing required attributes
+    /// Signal end of attributes; checks for missing required attributes and
+    /// returns the (possibly CTA-updated) type info as a [`SchemaInfo`].
     pub fn validate_end_of_attributes(&mut self) -> SchemaInfo {
+        match self.end_of_attributes_inner() {
+            EndOfAttributesOutcome::Invalid => SchemaInfo::invalid(),
+            EndOfAttributesOutcome::Done => SchemaInfo::empty(),
+            // CTA selected (and possibly switched) the governing type: rebuild
+            // the updated binding info from the stack top — `schema_type`,
+            // `content_type`, `validity`, `type_source`, and `cta_selected`
+            // were all recorded there by the CTA step.
+            #[cfg(feature = "xsd11")]
+            EndOfAttributesOutcome::CtaUpdated => {
+                let ev = self.validation_stack.last();
+                SchemaInfo {
+                    schema_type: ev.and_then(|s| s.schema_type),
+                    content_type: ev.and_then(|s| s.content_type),
+                    validity: ev.map(|s| s.validity).unwrap_or(SchemaValidity::NotKnown),
+                    type_source: ev.and_then(|s| s.type_source),
+                    cta_selected: ev.map(|s| s.cta_selected).unwrap_or(false),
+                    assertion_outcome: None,
+                    ..SchemaInfo::empty()
+                }
+            }
+        }
+    }
+
+    /// Value-free variant of
+    /// [`validate_end_of_attributes`](Self::validate_end_of_attributes) for
+    /// throughput drivers that discard the returned `SchemaInfo`. Runs the
+    /// identical end-of-attributes step (CTA evaluation, required-attribute
+    /// checks, default/fixed processing) without constructing it.
+    /// See `PERF_P1_PLAN` §Step 4.
+    pub fn validate_end_of_attributes_novalue(&mut self) {
+        let _ = self.end_of_attributes_inner();
+    }
+
+    /// The end-of-attributes step shared by both entry points above:
+    /// everything except assembling the returned `SchemaInfo`.
+    fn end_of_attributes_inner(&mut self) -> EndOfAttributesOutcome {
         if !self.current_state.can_end_attributes() {
             self.report_error(
                 "cvc-complex-type",
@@ -1929,14 +2109,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.current_state
                 ),
             );
-            return SchemaInfo::invalid();
+            return EndOfAttributesOutcome::Invalid;
         }
 
         let schema_type = match self.validation_stack.last() {
             Some(s) => s.schema_type,
             None => {
                 self.current_state = ValidatorState::EndOfAttributes;
-                return SchemaInfo::empty();
+                return EndOfAttributesOutcome::Done;
             }
         };
 
@@ -2008,9 +2188,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             (schema_type, false, false)
         };
 
-        #[cfg(not(feature = "xsd11"))]
-        let cta_switched = false;
-
         // When attributes were deferred for CTA, always validate them
         // against the (possibly unchanged) type.
         #[cfg(feature = "xsd11")]
@@ -2023,10 +2200,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.validate_deferred_attributes(schema_type);
         }
 
-        // Record inheritable attributes with default values for propagation (XSD 1.1)
+        // Record inheritable attributes with default values for propagation (XSD 1.1).
+        // Skipped wholesale when the schema declares no inheritable attribute —
+        // there is then nothing for `record_inheritable_defaults` to record, and
+        // this avoids its per-element attribute-use / attribute-group scan.
         #[cfg(feature = "xsd11")]
-        if let Some(TypeKey::Complex(ct_key)) = schema_type {
-            self.record_inheritable_defaults(ct_key);
+        if self.has_inheritable_attributes {
+            if let Some(TypeKey::Complex(ct_key)) = schema_type {
+                self.record_inheritable_defaults(ct_key);
+            }
         }
 
         // Check required attributes. Detection is `&self` and borrows `seen`
@@ -2176,41 +2358,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         self.current_state = ValidatorState::EndOfAttributes;
 
-        // When CTA switched the type or selected a type, return updated SchemaInfo
-        // so callers (e.g. typed_builder) can update element bindings. Preserve prior
-        // invalidity (e.g. from a bad xsi:type).
-        if cta_switched {
-            let ev = self.validation_stack.last();
-            let content_type = ev.and_then(|s| s.content_type);
-            let validity = ev.map(|s| s.validity).unwrap_or(SchemaValidity::NotKnown);
-            return SchemaInfo {
-                schema_type,
-                content_type,
-                validity,
-                type_source: ev.and_then(|s| s.type_source),
-                #[cfg(feature = "xsd11")]
-                cta_selected: ev.map(|s| s.cta_selected).unwrap_or(false),
-                #[cfg(feature = "xsd11")]
-                assertion_outcome: None,
-                ..SchemaInfo::empty()
-            };
-        }
+        // When CTA switched the type or selected a type, signal it so the
+        // value wrapper returns updated binding info (callers such as the
+        // typed builder update element bindings from it). The stack top
+        // already carries the post-CTA `schema_type`/`content_type`/
+        // `validity`/`type_source`/`cta_selected`, so no data needs to flow
+        // through the outcome. `cta_switched` implies `cta_selected`; both
+        // are spelled out for clarity.
         #[cfg(feature = "xsd11")]
-        if cta_selected {
-            let ev = self.validation_stack.last();
-            let content_type = ev.and_then(|s| s.content_type);
-            let validity = ev.map(|s| s.validity).unwrap_or(SchemaValidity::NotKnown);
-            return SchemaInfo {
-                schema_type,
-                content_type,
-                validity,
-                type_source: ev.and_then(|s| s.type_source),
-                cta_selected: true,
-                assertion_outcome: None,
-                ..SchemaInfo::empty()
-            };
+        if cta_switched || cta_selected {
+            return EndOfAttributesOutcome::CtaUpdated;
         }
-        SchemaInfo::empty()
+        EndOfAttributesOutcome::Done
     }
 
     /// Validate a text content event
@@ -2394,8 +2553,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.current_state = ValidatorState::Whitespace;
     }
 
-    /// Validate an element end event
-    pub fn validate_end_element(&mut self) -> SchemaInfo {
+    /// Shared prologue for both end-element paths: validate the call-sequence
+    /// state, pop the top element, and run the five completion steps (content
+    /// model, simple content, assertions, identity constraints, ID bindings) —
+    /// all of which mutate stack/runtime state and emit errors as side effects.
+    ///
+    /// Returns the finished top element (plus, under XSD 1.1, the assertion
+    /// outcome the value path folds into the `SchemaInfo`), or `None` if the
+    /// call was out of sequence / the stack was empty (the caller then returns
+    /// its own invalid sentinel, matching the previous inline behaviour).
+    fn finish_top_element(&mut self) -> Option<FinishedElement> {
         if !self.current_state.can_end_element() {
             self.report_error(
                 "cvc-complex-type",
@@ -2404,7 +2571,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     self.current_state
                 ),
             );
-            return SchemaInfo::invalid();
+            return None;
         }
 
         let mut ev_state = match self.validation_stack.pop() {
@@ -2414,7 +2581,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     "cvc-complex-type",
                     "End element called but validation stack is empty",
                 );
-                return SchemaInfo::invalid();
+                return None;
             }
         };
 
@@ -2434,12 +2601,61 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // 4. ID/IDREF/ENTITY bookkeeping
         self.finish_id_bindings(&ev_state);
 
+        #[cfg(feature = "xsd11")]
+        {
+            Some((ev_state, assertion_outcome))
+        }
+        #[cfg(not(feature = "xsd11"))]
+        {
+            Some(ev_state)
+        }
+    }
+
+    /// Validate an element end event, returning the element's [`SchemaInfo`].
+    pub fn validate_end_element(&mut self) -> SchemaInfo {
+        let finished = match self.finish_top_element() {
+            Some(f) => f,
+            None => return SchemaInfo::invalid(),
+        };
+        #[cfg(feature = "xsd11")]
+        let (mut ev_state, assertion_outcome) = finished;
+        #[cfg(not(feature = "xsd11"))]
+        let mut ev_state = finished;
+
         // 5. PSVI assembly (element-path pop, validity, validation-attempted, SchemaInfo)
-        self.assemble_schema_info(
-            ev_state,
+        let info = self.assemble_schema_info(
+            &mut ev_state,
             #[cfg(feature = "xsd11")]
             assertion_outcome,
-        )
+        );
+        // Recycle the shell — its collection capacity (`text_content`,
+        // `seen_attributes`, the inherited maps) is reused by the next element.
+        self.state_pool.push(ev_state);
+        info
+    }
+
+    /// Value-free variant of [`validate_end_element`](Self::validate_end_element)
+    /// for throughput drivers that only need the element's validity and discard
+    /// the `SchemaInfo`. Runs the identical completion + PSVI side-effect steps
+    /// but skips constructing (and dropping) the per-element `SchemaInfo`. The
+    /// typed-builder / push-API callers keep the value-returning method.
+    /// See `PERF_P1_PLAN` §Step 4.
+    pub fn validate_end_element_novalue(&mut self) -> SchemaValidity {
+        let finished = match self.finish_top_element() {
+            Some(f) => f,
+            None => return SchemaValidity::Invalid,
+        };
+        #[cfg(feature = "xsd11")]
+        let (ev_state, _assertion_outcome) = finished;
+        #[cfg(not(feature = "xsd11"))]
+        let ev_state = finished;
+
+        // Same PSVI side effects (path pop, state machine, [validation attempted]
+        // propagation) as the value path — only the `SchemaInfo` literal is skipped.
+        let _ = self.finalize_element(&ev_state);
+        let validity = ev_state.validity;
+        self.state_pool.push(ev_state);
+        validity
     }
 
     /// F2/B1 step 1: content-model completion check (cvc-complex-type.2.4).
@@ -2845,9 +3061,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// tables), then retries deferred keyrefs against the enriched parent scope.
     fn finish_identity_constraints(&mut self, ev_state: &mut ElementValidationState) {
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
+        // §3.11.4 Identity-constraint Satisfied clause 3: a field node must have
+        // a simple type or a complex type with simple content. Element-only,
+        // mixed, AND empty content types all lack a simple {variety} — an
+        // attribute-only complex type (ContentType::Empty) is equally invalid
+        // as a field value (msData idH006).
         let is_complex_content = matches!(
             ev_state.content_type,
-            Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
+            Some(ContentType::ElementOnly) | Some(ContentType::Mixed) | Some(ContentType::Empty)
         );
         // Resolve QName/NOTATION typed values for IC comparison (namespace-aware).
         // Use a separate copy to preserve the original PSVI typed_value.
@@ -2972,15 +3193,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Pops the element path, records `[validity]` and the `[validation
     /// attempted]` property, propagates this element's assessment to the
     /// parent, and builds the final `SchemaInfo`.
-    fn assemble_schema_info(
-        &mut self,
-        ev_state: ElementValidationState,
-        #[cfg(feature = "xsd11")] assertion_outcome: Option<AssertionOutcome>,
-    ) -> SchemaInfo {
+    /// PSVI element-close side effects shared by the value-returning
+    /// ([`assemble_schema_info`](Self::assemble_schema_info)) and value-free
+    /// ([`validate_end_element_novalue`](Self::validate_end_element_novalue))
+    /// end-element paths: pop the element path, advance the state machine,
+    /// compute `[validation attempted]` (§3.3.5.1) and propagate it to the
+    /// parent. Returns the computed `[validation attempted]` so the value path
+    /// can place it in the `SchemaInfo`.
+    fn finalize_element(&mut self, ev_state: &ElementValidationState) -> ValidationAttempted {
         // 5. Update element path
         self.pop_element_path();
-
-        let validity = ev_state.validity;
         self.current_state = ValidatorState::EndElement;
 
         // Compute [validation attempted] per spec §3.3.5.1
@@ -3010,6 +3232,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
+        validation_attempted
+    }
+
+    fn assemble_schema_info(
+        &mut self,
+        ev_state: &mut ElementValidationState,
+        #[cfg(feature = "xsd11")] assertion_outcome: Option<AssertionOutcome>,
+    ) -> SchemaInfo {
+        let validation_attempted = self.finalize_element(ev_state);
+        let validity = ev_state.validity;
+
         SchemaInfo {
             element_decl: ev_state.element_decl,
             attribute_decl: None,
@@ -3020,9 +3253,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             is_default: ev_state.is_default,
             is_nil: ev_state.is_nil,
             content_type: ev_state.content_type,
-            typed_value: ev_state.typed_value,
-            normalized_value: ev_state.normalized_value,
-            schema_error_codes: ev_state.error_codes,
+            typed_value: ev_state.typed_value.take(),
+            normalized_value: ev_state.normalized_value.take(),
+            schema_error_codes: std::mem::take(&mut ev_state.error_codes),
             notation: ev_state.notation,
             deferred_by_cta: false,
             type_source: ev_state.type_source,
@@ -3365,6 +3598,25 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     // Internal helpers
     // -----------------------------------------------------------------------
 
+    /// Obtain an `ElementValidationState` for a newly opened element, reusing a
+    /// recycled shell from `state_pool` (resetting it) when one is available,
+    /// else allocating a fresh one. The returned state is equivalent to
+    /// `ElementValidationState::new(local_name, namespace)` in every observable
+    /// field; only heap capacity is carried over.
+    fn acquire_state(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+    ) -> ElementValidationState {
+        match self.state_pool.pop() {
+            Some(mut state) => {
+                state.reset(local_name, namespace);
+                state
+            }
+            None => ElementValidationState::new(local_name, namespace),
+        }
+    }
+
     /// Push a new element onto the validation stack and update the element path
     fn push_element(&mut self, mut ev_state: ElementValidationState) {
         // Assign a unique serial for ID/IDREF owner-element binding (§3.17.5.2)
@@ -3380,11 +3632,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .or_insert(ev_state.element_serial);
         }
 
-        let local_name = self.schema_set.name_table.resolve(ev_state.local_name);
+        // Copy the `&'a SchemaSet` reference out first so the borrow of the
+        // interned name (`resolve_ref`, zero-alloc) is tied to `'a` and does
+        // not conflict with the `&mut self.element_path` push below.
+        let schema_set = self.schema_set;
+        let local_name = schema_set.name_table.resolve_ref(ev_state.local_name);
         if !self.element_path.is_empty() || self.validation_stack.is_empty() {
             self.element_path.push('/');
         }
-        self.element_path.push_str(&local_name);
+        self.element_path.push_str(local_name);
 
         // Inherit base URI from parent element, or from the document-level
         // base URI for the root element.
@@ -3407,13 +3663,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Parent's outgoing_inherited becomes the child's incoming_inherited
         // (frozen PSVI view) and outgoing_inherited (mutable for this
         // element's own inheritable attrs to shadow).
+        //
+        // Skipped entirely when the schema has no inheritable attributes (the
+        // common case): the maps are then always empty and empty→empty
+        // propagation is the identity. The `!is_empty()` guard makes the same
+        // short-circuit hold dynamically for the (inheritable-declaring) schemas
+        // whose current parent simply carries nothing inheritable.
         #[cfg(feature = "xsd11")]
-        {
+        if self.has_inheritable_attributes {
             let len = self.validation_stack.len();
             if len >= 2 {
                 let parent_pc = self.validation_stack[len - 2].process_contents;
                 let child_pc = self.validation_stack[len - 1].process_contents;
-                if parent_pc != ContentProcessing::Skip && child_pc != ContentProcessing::Skip {
+                if parent_pc != ContentProcessing::Skip
+                    && child_pc != ContentProcessing::Skip
+                    && !self.validation_stack[len - 2].outgoing_inherited.is_empty()
+                {
                     let from_parent = self.validation_stack[len - 2].outgoing_inherited.clone();
                     self.validation_stack[len - 1].incoming_inherited = from_parent.clone();
                     self.validation_stack[len - 1].outgoing_inherited = from_parent;

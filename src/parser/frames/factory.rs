@@ -62,9 +62,13 @@ pub fn create_frame(
         xsd_names::ALTERNATIVE => Box::new(AlternativeFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
         #[cfg(feature = "xsd11")]
         xsd_names::ASSERT => Box::new(AssertFrame::new(attrs, name_table, source, ns_snapshot.clone())?),
-        xsd_names::ENUMERATION => {
-            Box::new(FacetFrame::new(FacetKind::Enumeration, attrs, name_table, source, None)?)
-        }
+        xsd_names::ENUMERATION => Box::new(FacetFrame::new(
+            FacetKind::Enumeration,
+            attrs,
+            name_table,
+            source,
+            Some(ns_snapshot.clone()),
+        )?),
         xsd_names::PATTERN => Box::new(FacetFrame::new(FacetKind::Pattern, attrs, name_table, source, None)?),
         xsd_names::MIN_INCLUSIVE => {
             Box::new(FacetFrame::new(FacetKind::MinInclusive, attrs, name_table, source, None)?)

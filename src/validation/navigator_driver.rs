@@ -155,8 +155,9 @@ fn walk_element<N, S>(
     let (xsi_type, xsi_nil) = scan_xsi(nav);
 
     // 1. Element. `local_name()`/`namespace_uri()` are already `&str` (no copy);
-    //    the cursor is back on the element after the two scans above.
-    runtime.validate_element(
+    //    the cursor is back on the element after the two scans above. The DOM
+    //    driver discards all start-side PSVI, so use the value-free path.
+    runtime.validate_element_novalue(
         nav.local_name(),
         nav.namespace_uri(),
         xsi_type.as_deref(),
@@ -166,6 +167,9 @@ fn walk_element<N, S>(
 
     // 2. Attributes (all non-xmlns attributes, including xsi:type / xsi:nil —
     //    the streaming driver forwards those to validate_attribute too).
+    //    Attributes have no value-free twin: their SchemaInfo is consumed
+    //    *inside* the runtime (IC field matching, ID/IDREF, NOTATION read its
+    //    typed_value), so only the returned copy is discarded here.
     if nav.move_to_first_attribute() {
         loop {
             // Names are already `&str`; `value_ref()` borrows the interned bytes
@@ -180,8 +184,8 @@ fn walk_element<N, S>(
         nav.move_to_parent();
     }
 
-    // 3. End of attributes.
-    runtime.validate_end_of_attributes();
+    // 3. End of attributes (value-free: the DOM driver discards its PSVI).
+    runtime.validate_end_of_attributes_novalue();
     #[cfg(feature = "xsd11")]
     let _ = runtime.take_deferred_attribute_results();
 
@@ -221,10 +225,11 @@ fn walk_element<N, S>(
         nav.move_to_parent();
     }
 
-    // 5. End element.
-    let end_info = runtime.validate_end_element();
+    // 5. End element. The DOM driver discards every element's PSVI except the
+    //    root's validity, so use the value-free path (no per-element SchemaInfo).
+    let end_validity = runtime.validate_end_element_novalue();
     if depth == 1 {
-        *root_validity = Some(end_info.validity);
+        *root_validity = Some(end_validity);
     }
 }
 

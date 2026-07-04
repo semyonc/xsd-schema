@@ -224,6 +224,60 @@ impl ElementValidationState {
             outgoing_inherited: AttrNameMap::default(),
         }
     }
+
+    /// Reset this state for reuse by the element-state pool, leaving it exactly
+    /// as a fresh [`new`](Self::new) for `local_name`/`namespace` — but keeping
+    /// the heap capacity of the per-element collections so the next element
+    /// avoids re-allocating them.
+    ///
+    /// Implemented by rebuilding through `Self::new` and then re-injecting only
+    /// the (cleared) capacity-bearing collections. This is deliberately robust
+    /// against future struct changes: any field added later is reset correctly
+    /// by `Self::new` with no edit here, so pooled reuse can never silently
+    /// carry stale state from a previous element.
+    pub fn reset(&mut self, local_name: NameId, namespace: Option<NameId>) {
+        // Salvage the capacity-bearing allocations before the wholesale reset,
+        // clearing each so no value survives into the next element.
+        let mut error_codes = std::mem::take(&mut self.error_codes);
+        error_codes.clear();
+        let mut base_uri = std::mem::take(&mut self.base_uri);
+        base_uri.clear();
+        let mut seen_attributes = std::mem::take(&mut self.seen_attributes);
+        seen_attributes.clear();
+        let mut text_content = std::mem::take(&mut self.text_content);
+        text_content.clear();
+        #[cfg(feature = "xsd11")]
+        let collected_attributes = {
+            let mut v = std::mem::take(&mut self.collected_attributes);
+            v.clear();
+            v
+        };
+        #[cfg(feature = "xsd11")]
+        let incoming_inherited = {
+            let mut m = std::mem::take(&mut self.incoming_inherited);
+            m.clear();
+            m
+        };
+        #[cfg(feature = "xsd11")]
+        let outgoing_inherited = {
+            let mut m = std::mem::take(&mut self.outgoing_inherited);
+            m.clear();
+            m
+        };
+
+        *self = Self::new(local_name, namespace);
+
+        self.error_codes = error_codes;
+        self.base_uri = base_uri;
+        self.seen_attributes = seen_attributes;
+        self.text_content = text_content;
+        #[cfg(feature = "xsd11")]
+        {
+            self.collected_attributes = collected_attributes;
+            self.incoming_inherited = incoming_inherited;
+            self.outgoing_inherited = outgoing_inherited;
+        }
+    }
 }
 
 /// State machine for the validator's call sequence
@@ -340,6 +394,81 @@ mod tests {
         let state = ElementValidationState::new(NameId(5), Some(NameId(10)));
         assert_eq!(state.local_name, NameId(5));
         assert_eq!(state.namespace, Some(NameId(10)));
+    }
+
+    /// Drift guard for the pooling `reset()`: after mutating a representative
+    /// spread of fields (scalars, options, and every capacity-bearing
+    /// collection), `reset()` must leave the state observably identical to a
+    /// fresh `new()` — and it must not carry any stale collection entries.
+    /// `reset()` rebuilds via `Self::new`, so this also protects future fields.
+    #[test]
+    fn test_reset_matches_new() {
+        let mut state = ElementValidationState::new(NameId(1), None);
+        // Scalars / options to non-default values.
+        state.is_nil = true;
+        state.is_default = true;
+        state.validity = SchemaValidity::Invalid;
+        state.process_contents = ContentProcessing::Skip;
+        state.has_text = true;
+        state.has_element_children = true;
+        state.seen_id_attr = true;
+        state.base_uri_set_by_xml_base = true;
+        state.element_serial = 42;
+        state.schema_location_hint_start = 7;
+        state.no_namespace_schema_location_hint_start = 9;
+        state.normalized_value = Some("normalized".to_string());
+        state.content_state = ContentValidatorState::Simple;
+        // Every capacity-bearing collection populated.
+        state.error_codes.push("cvc-test");
+        state.base_uri.push_str("http://example.com/base");
+        state.text_content.push_str("some accumulated text");
+        state.seen_attributes.insert((None, NameId(100)));
+        #[cfg(feature = "xsd11")]
+        {
+            state.cta_selected = true;
+            state.owns_assertion_buffer = true;
+            state.has_type_alternatives = true;
+            state.assertion_element_ref = Some(3);
+            state
+                .collected_attributes
+                .push((None, NameId(1), "v".to_string()));
+            state.incoming_inherited.insert(
+                (None, NameId(2)),
+                InheritedAttributeValue {
+                    value: "a".to_string(),
+                    attribute_key: None,
+                },
+            );
+            state.outgoing_inherited.insert(
+                (None, NameId(3)),
+                InheritedAttributeValue {
+                    value: "b".to_string(),
+                    attribute_key: None,
+                },
+            );
+        }
+
+        state.reset(NameId(5), Some(NameId(10)));
+
+        // Observably identical to a fresh construction for the new identity.
+        let fresh = ElementValidationState::new(NameId(5), Some(NameId(10)));
+        assert_eq!(format!("{state:?}"), format!("{fresh:?}"));
+
+        // No stale entries survive in any reused collection.
+        assert!(state.error_codes.is_empty());
+        assert!(state.base_uri.is_empty());
+        assert!(state.text_content.is_empty());
+        assert!(state.seen_attributes.is_empty());
+        #[cfg(feature = "xsd11")]
+        {
+            assert!(state.collected_attributes.is_empty());
+            assert!(state.incoming_inherited.is_empty());
+            assert!(state.outgoing_inherited.is_empty());
+        }
+
+        // Capacity is retained — the reason the pool exists.
+        assert!(state.text_content.capacity() > 0);
+        assert!(state.base_uri.capacity() > 0);
     }
 
     #[test]
