@@ -9,7 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Conformance sweep: W3C XSD 1.0 suite failures reduced 47 → 19 (99.95%);
 every remaining failure in both suites is a documented W3C dispute or an
-intra-suite contradiction. No public API changes.
+intra-suite contradiction. Per-element allocation cleanup on the validation
+hot path (+6–8% pure-validation throughput on the synthetic corpus; both
+W3C suites byte-identical). API-additive only.
+
+### Performance
+
+- Build the element path without a per-element `String` (zero-alloc
+  interned-name lookup in `push_element`).
+- Skip XSD 1.1 inherited-attribute propagation and default recording
+  entirely when the schema declares no `inheritable` attribute (every
+  XSD 1.0 schema, most XSD 1.1 schemas).
+- Prune trivial self-match entries from the substitution-group map and
+  drop the map altogether for substitution-free, abstract-free schemas,
+  so content-model term matching does no hash probes per child in the
+  common case. Abstract-head entries are kept — their self-name omission
+  is what blocks abstract elements from matching in instances.
+- Precompute each content model's initial NFA state set once per compiled
+  complex type instead of re-running the epsilon closure per element.
+- Pool `ElementValidationState` shells across elements, retaining
+  collection capacity (`text_content`, `seen_attributes`, …); a
+  drift-guard test keeps `reset()` equivalent to a fresh state.
+- Key the per-type content-model map and the outer substitution-group map
+  with `ahash` instead of SipHash (interned keys, hot-path probes).
+
+### Added
+
+- Value-free push-API twins for throughput drivers that discard
+  per-element PSVI: `validate_element_novalue`,
+  `validate_element_by_id_novalue`, `validate_end_of_attributes_novalue`,
+  and `validate_end_element_novalue` (returns `SchemaValidity`). The DOM
+  driver uses all of them; the existing value-returning methods are
+  unchanged.
 
 ### Fixed
 

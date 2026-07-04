@@ -37,9 +37,9 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 | Strategy | Parser | Time | Throughput | RSS delta |
 | --- | --- | ---: | ---: | ---: | 
-| streaming | quick-xml | 325 ms | 47.8 MB/s | **704 KB** |
-| DOM (roxmltree) | roxmltree | 299 ms | 51.9 MB/s | 88.5 MB |
-| DOM (BufferDoc) | quick-xml | 370 ms | 42.0 MB/s | 61.7 MB |
+| streaming | quick-xml | 322 ms | 48.4 MB/s | **688 KB** |
+| DOM (roxmltree) | roxmltree | 285 ms | 54.7 MB/s | 88.5 MB |
+| DOM (BufferDoc) | quick-xml | 344 ms | 45.2 MB/s | 61.6 MB |
 
 
 

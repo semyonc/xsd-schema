@@ -389,9 +389,11 @@ where
                 )?;
             }
             Ok(Event::End(_)) => {
-                let end_info = runtime.validate_end_element();
+                // Streaming consumers receive only `[validity]` per element, so
+                // use the value-free end path (no per-element SchemaInfo).
+                let end_validity = runtime.validate_end_element_novalue();
                 let end = EndElementInfo {
-                    validity: end_info.validity,
+                    validity: end_validity,
                 };
                 handler
                     .after_end_element(&end, depth)
@@ -401,7 +403,7 @@ where
                     .on_element_end_offset(end_pos)
                     .map_err(DriveWithError::Hook)?;
                 if depth == 1 {
-                    root_validity = Some(end_info.validity);
+                    root_validity = Some(end_validity);
                 }
                 pop_xmlns_scope(&mut prefix_map, &mut scope_stack);
                 depth = depth.saturating_sub(1);
@@ -603,9 +605,11 @@ where
 
     // 7. For empty elements, close inline.
     if is_empty {
-        let end_info = runtime.validate_end_element();
+        // Streaming consumers receive only `[validity]` per element (the handler
+        // hook takes an `EndElementInfo`), so use the value-free end path.
+        let end_validity = runtime.validate_end_element_novalue();
         let end = EndElementInfo {
-            validity: end_info.validity,
+            validity: end_validity,
         };
         handler
             .after_end_element(&end, *depth)
@@ -615,7 +619,7 @@ where
             .on_element_end_offset(end_pos)
             .map_err(DriveWithError::Hook)?;
         if *depth == 1 {
-            *root_validity = Some(end_info.validity);
+            *root_validity = Some(end_validity);
         }
         pop_xmlns_scope(prefix_map, scope_stack);
         *depth -= 1;
