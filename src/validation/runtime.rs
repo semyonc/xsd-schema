@@ -1593,6 +1593,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             None
         };
+        #[cfg(feature = "xsd11")]
+        let has_type_alternatives = !self.schema_set.arenas.elements[elem_key]
+            .alternatives
+            .is_empty();
+        // §3.12.4 (XSD 1.1): when an element declaration carries type
+        // alternatives, the *governing* type is not known until after attribute
+        // processing (conditional type assignment). The declared type may be
+        // abstract (e.g. OpenDRIVE `t_junction`), but a concrete alternative
+        // is always selected. Defer the `cvc-type.2` abstract-type check to
+        // `end_of_attributes_inner`, which re-checks the *final* governing type.
+        // This avoids a false-positive on every CTA-resolved abstract type.
+        #[cfg(feature = "xsd11")]
+        let abstract_type_invalid = if has_type_alternatives {
+            false
+        } else {
+            abstract_ct_info.is_some()
+        };
+        #[cfg(not(feature = "xsd11"))]
         let abstract_type_invalid = abstract_ct_info.is_some();
 
         // 7. xsi:nil
@@ -1653,9 +1671,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             && process_contents != ContentProcessing::Skip;
         #[cfg(feature = "xsd11")]
         {
-            ev_state.has_type_alternatives = !self.schema_set.arenas.elements[elem_key]
-                .alternatives
-                .is_empty();
+            ev_state.has_type_alternatives = has_type_alternatives;
         }
         self.push_element(ev_state);
         #[cfg(feature = "xsd11")]
@@ -1687,15 +1703,40 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             );
         }
         if let Some((ct_name, ct_ns)) = abstract_ct_info {
-            let type_name =
-                crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
-            self.report_error(
-                "cvc-type.2",
-                format!(
-                    "Type '{}' is abstract and cannot be used to validate an element",
-                    type_name
-                ),
-            );
+            // Skip here when CTA will re-evaluate the abstract check against the
+            // final governing type (see `end_of_attributes_inner`).
+            #[cfg(feature = "xsd11")]
+            if has_type_alternatives {
+                // deferred to end_of_attributes_inner
+            } else {
+                let type_name = crate::schema::derivation::format_type_name(
+                    self.schema_set,
+                    ct_name,
+                    ct_ns,
+                );
+                self.report_error(
+                    "cvc-type.2",
+                    format!(
+                        "Type '{}' is abstract and cannot be used to validate an element",
+                        type_name
+                    ),
+                );
+            }
+            #[cfg(not(feature = "xsd11"))]
+            {
+                let type_name = crate::schema::derivation::format_type_name(
+                    self.schema_set,
+                    ct_name,
+                    ct_ns,
+                );
+                self.report_error(
+                    "cvc-type.2",
+                    format!(
+                        "Type '{}' is abstract and cannot be used to validate an element",
+                        type_name
+                    ),
+                );
+            }
         }
         if nillable_violation {
             let elem_name = self.schema_set.name_table.resolve(local_name);
@@ -2187,6 +2228,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         } else {
             (schema_type, false, false)
         };
+
+        // §3.12.4 / §3.3.4.4 (XSD 1.1): when type alternatives were present,
+        // the `cvc-type.2` abstract-type check was deferred from element start
+        // (the declared type may be abstract, e.g. OpenDRIVE `t_junction`).
+        // Now that CTA has selected the *final* governing type, re-check it.
+        // A correctly-authored CTA always selects a concrete type, so a clean
+        // instance validates; only a genuinely abstract governing type errors.
+        #[cfg(feature = "xsd11")]
+        if has_type_alternatives {
+            if let Some(TypeKey::Complex(k)) = schema_type {
+                if let Some(ct) = self.schema_set.arenas.complex_types.get(k) {
+                    if ct.is_abstract {
+                        let type_name = crate::schema::derivation::format_type_name(
+                            self.schema_set,
+                            ct.name,
+                            ct.target_namespace,
+                        );
+                        self.report_error(
+                            "cvc-type.2",
+                            format!(
+                                "Type '{}' is abstract and cannot be used to validate an element",
+                                type_name
+                            ),
+                        );
+                        self.mark_current_invalid();
+                    }
+                }
+            }
+        }
 
         // When attributes were deferred for CTA, always validate them
         // against the (possibly unchanged) type.
