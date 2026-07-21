@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-21
+
+### Fixed
+
+- Defer the `cvc-type.2` abstract-type check for XSD 1.1 element
+  declarations carrying `xs:alternative` (conditional type assignment).
+  The governing type is not known until after attribute processing, so
+  the check now runs against the final CTA-selected type in
+  `end_of_attributes_inner` rather than the declared type at element
+  start. This removes false-positive errors on elements whose *declared*
+  type is abstract but whose CTA always resolves to a concrete
+  alternative (e.g. OpenDRIVE 1.8 `<junction>`). A genuinely abstract
+  governing type still errors.
+
 ## [0.1.2] - 2026-07-04
 
 Conformance sweep: W3C XSD 1.0 suite failures reduced 47 → 19 (99.95%);
