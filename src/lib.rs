@@ -126,6 +126,9 @@ pub mod builder;
 pub mod regex_convert;
 pub(crate) mod regex_xsd_unicode;
 
+/// Resolution of XML general references (`&amp;`, `&#65;`) from the event stream.
+pub(crate) mod xml_entity;
+
 // NFA compiler for content models
 pub mod compiler;
 

@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn from_quick_xml_error() {
-        let qx_err = quick_xml::Error::TextNotFound;
+        let qx_err = quick_xml::Error::Syntax(quick_xml::errors::SyntaxError::UnclosedTag);
         let err: BufferDocumentError = qx_err.into();
         assert!(matches!(err, BufferDocumentError::Parse(_)));
         assert!(err.to_string().contains("XML parsing error"));

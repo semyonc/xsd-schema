@@ -330,7 +330,7 @@ impl TestSuiteParser {
             .ok_or_else(|| format!("Cannot determine parent directory of {:?}", path))?;
 
         let mut reader = Reader::from_str(&content);
-        reader.trim_text(true);
+        reader.config_mut().trim_text(true);
 
         let mut tests = Vec::new();
         let mut buf = Vec::new();

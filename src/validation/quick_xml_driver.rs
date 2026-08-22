@@ -26,6 +26,7 @@ use std::io::BufRead;
 
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use thiserror::Error;
 
 use crate::namespace::context::NamespaceContextSnapshot;
@@ -35,6 +36,7 @@ use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, SchemaValidity};
 use crate::validation::runtime::ValidationRuntime;
 use crate::validation::validator::ValidationSink;
+use crate::xml_entity::resolve_general_ref;
 
 // ── Public types ──────────────────────────────────────────────────────────
 
@@ -329,7 +331,7 @@ where
     H: ValidationEventHandler,
 {
     let mut xml_reader = Reader::from_reader(reader);
-    xml_reader.trim_text(false);
+    xml_reader.config_mut().trim_text(false);
 
     // prefix bytes -> stack of URI strings (top-of-stack = current binding)
     let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
@@ -350,12 +352,39 @@ where
     let mut depth: usize = 0;
     let mut max_depth: usize = 0;
     let mut root_validity: Option<SchemaValidity> = None;
+    // Character data is reported in pieces: a run containing `&amp;` arrives as
+    // Text / GeneralRef / Text. Collect a whole run here so it is classified and
+    // validated as one chunk, the way a single unsplit text event would be.
+    let mut pending_text = String::new();
 
     buf.clear();
 
     loop {
-        let event_start = xml_reader.buffer_position();
-        match xml_reader.read_event_into(buf) {
+        let event_start = xml_reader.buffer_position() as usize;
+        let event = xml_reader.read_event_into(buf);
+
+        // A run of character data containing `&amp;` or `&#65;` is reported as
+        // Text / GeneralRef / Text, so gather the whole run before validating
+        // it — splitting it would classify the pieces separately and report a
+        // single ill-placed run more than once.
+        match &event {
+            Ok(Event::Text(e)) if depth > 0 => {
+                pending_text.push_str(
+                    &e.xml10_content()
+                        .map_err(|err| DriveWithError::Parse(quick_xml::Error::Encoding(err)))?,
+                );
+                buf.clear();
+                continue;
+            }
+            Ok(Event::GeneralRef(e)) if depth > 0 => {
+                pending_text.push_str(&resolve_general_ref(e).map_err(DriveWithError::Parse)?);
+                buf.clear();
+                continue;
+            }
+            _ => flush_text_run(&mut pending_text, runtime, handler)?,
+        }
+
+        match event {
             Ok(Event::Start(ref e)) => {
                 handle_start_or_empty(
                     e,
@@ -398,7 +427,7 @@ where
                 handler
                     .after_end_element(&end, depth)
                     .map_err(DriveWithError::Hook)?;
-                let end_pos = xml_reader.buffer_position();
+                let end_pos = xml_reader.buffer_position() as usize;
                 handler
                     .on_element_end_offset(end_pos)
                     .map_err(DriveWithError::Hook)?;
@@ -408,20 +437,6 @@ where
                 pop_xmlns_scope(&mut prefix_map, &mut scope_stack);
                 depth = depth.saturating_sub(1);
             }
-            Ok(Event::Text(ref e)) if depth > 0 => {
-                let text = e.unescape().map_err(DriveWithError::Parse)?;
-                if text.chars().all(|c| c.is_whitespace()) {
-                    runtime.validate_whitespace(&text);
-                    handler
-                        .on_text(TextKind::Whitespace, &text)
-                        .map_err(DriveWithError::Hook)?;
-                } else {
-                    runtime.validate_text(&text);
-                    handler
-                        .on_text(TextKind::Character, &text)
-                        .map_err(DriveWithError::Hook)?;
-                }
-            }
             Ok(Event::CData(ref e)) if depth > 0 => {
                 let s = std::str::from_utf8(e.as_ref()).map_err(DriveWithError::Utf8)?;
                 runtime.validate_text(s);
@@ -429,7 +444,7 @@ where
                     .on_text(TextKind::CData, s)
                     .map_err(DriveWithError::Hook)?;
             }
-            Ok(Event::Text(_) | Event::CData(_)) => {
+            Ok(Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)) => {
                 // Outside any element — significant for neither validator nor handler.
             }
             Ok(Event::Comment(ref e)) => {
@@ -462,6 +477,35 @@ where
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────
+
+/// Validate and forward an accumulated run of character data, then reset it.
+///
+/// Whitespace-only runs go through the whitespace path, which element-only
+/// content models ignore; anything else is character content.
+fn flush_text_run<S, H>(
+    pending: &mut String,
+    runtime: &mut ValidationRuntime<'_, S>,
+    handler: &mut H,
+) -> Result<(), DriveWithError<H::Error>>
+where
+    S: ValidationSink,
+    H: ValidationEventHandler,
+{
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let kind = if pending.chars().all(|c| c.is_whitespace()) {
+        runtime.validate_whitespace(pending);
+        TextKind::Whitespace
+    } else {
+        runtime.validate_text(pending);
+        TextKind::Character
+    };
+    let result = handler.on_text(kind, pending).map_err(DriveWithError::Hook);
+    pending.clear();
+    result
+}
 
 #[allow(clippy::too_many_arguments)]
 fn handle_start_or_empty<R, S, H>(
@@ -575,7 +619,9 @@ where
                 None => return Err(DriveWithError::UnboundPrefix(attr_prefix.to_string())),
             }
         };
-        let value = attr.unescape_value().map_err(DriveWithError::Parse)?;
+        let value = attr
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(DriveWithError::Parse)?;
 
         let av = AttributeView {
             local_name: attr_local,
@@ -614,7 +660,7 @@ where
         handler
             .after_end_element(&end, *depth)
             .map_err(DriveWithError::Hook)?;
-        let end_pos = xml_reader.buffer_position();
+        let end_pos = xml_reader.buffer_position() as usize;
         handler
             .on_element_end_offset(end_pos)
             .map_err(DriveWithError::Hook)?;
@@ -651,7 +697,9 @@ fn push_xmlns_scope<E>(
         } else {
             continue;
         };
-        let value = attr.unescape_value().map_err(DriveWithError::Parse)?;
+        let value = attr
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(DriveWithError::Parse)?;
         let uri = value.into_owned();
         prefix_map
             .entry(prefix_bytes.clone())
@@ -732,7 +780,9 @@ fn scan_xsi_attributes<E>(
             continue;
         }
         let local = std::str::from_utf8(local_bytes).map_err(DriveWithError::Utf8)?;
-        let value = attr.unescape_value().map_err(DriveWithError::Parse)?;
+        let value = attr
+            .normalized_value(XmlVersion::Implicit1_0)
+            .map_err(DriveWithError::Parse)?;
         match local {
             "type" => xsi_type = Some(value.into_owned()),
             "nil" => xsi_nil = Some(value.into_owned()),
@@ -927,6 +977,139 @@ mod tests {
             assert!(matches!(outcome.root_validity, Some(SchemaValidity::Valid)));
             assert!(errors.is_empty());
         }
+    }
+
+    /// Handler that records every text run the driver reports, tagged with the
+    /// dispatch path it took.
+    struct TextRuns {
+        runs: Vec<(&'static str, String)>,
+    }
+
+    impl ValidationEventHandler for TextRuns {
+        type Error = Infallible;
+        fn on_text(&mut self, kind: TextKind, text: &str) -> Result<(), Self::Error> {
+            let tag = match kind {
+                TextKind::Whitespace => "ws",
+                TextKind::Character => "chars",
+                TextKind::CData => "cdata",
+            };
+            self.runs.push((tag, text.to_string()));
+            Ok(())
+        }
+    }
+
+    fn text_runs(xsd: &str, instance: &str) -> (Vec<(&'static str, String)>, Vec<String>) {
+        let schema_set = load_schema(xsd);
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut errors = Vec::new();
+        let mut warnings: Vec<ValidationWarning> = Vec::new();
+        let sink = CollectingValidationSink {
+            errors: &mut errors,
+            warnings: &mut warnings,
+        };
+        let mut runtime = validator.start_run(sink);
+        let mut handler = TextRuns { runs: Vec::new() };
+        drive_quick_xml_with(instance.as_bytes(), &mut runtime, &schema_set, &mut handler)
+            .expect("drive ok");
+        (handler.runs, errors.iter().map(|e| e.to_string()).collect())
+    }
+
+    #[test]
+    fn general_references_rejoin_the_surrounding_text_run() {
+        let (runs, errors) = text_runs(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+            "<root>a &amp; b&#33;</root>",
+        );
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert_eq!(runs, vec![("chars", "a & b!".to_string())]);
+    }
+
+    #[test]
+    fn character_reference_to_space_stays_whitespace() {
+        // Element-only content ignores whitespace, so a run that resolves to
+        // nothing but spaces must not be reported as character content.
+        let (runs, errors) = text_runs(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="b" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            "<root> &#32; <b>x</b></root>",
+        );
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert_eq!(runs[0], ("ws", "   ".to_string()));
+    }
+
+    #[test]
+    fn entity_in_element_only_content_is_reported_once() {
+        let (_runs, errors) = text_runs(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="b" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            "<root> &amp; <b>x</b></root>",
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "one ill-placed text run must yield one error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_entity_is_a_parse_error() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut errors = Vec::new();
+        let mut warnings: Vec<ValidationWarning> = Vec::new();
+        let sink = CollectingValidationSink {
+            errors: &mut errors,
+            warnings: &mut warnings,
+        };
+        let mut runtime = validator.start_run(sink);
+        let res = drive_quick_xml("<root>&nope;</root>".as_bytes(), &mut runtime, &schema_set);
+        assert!(matches!(res, Err(DriveError::Parse(_))), "got {res:?}");
+    }
+
+    #[test]
+    fn attribute_values_are_xml_normalized() {
+        // XML attribute-value normalization (XML 1.0 §3.3.3) turns the literal
+        // tab and newline into spaces before the value reaches the validator,
+        // so the enumeration below matches.
+        let (outcome, errors) = run(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="a">
+                            <xs:simpleType>
+                                <xs:restriction base="xs:string">
+                                    <xs:enumeration value="x   y &amp; z"/>
+                                </xs:restriction>
+                            </xs:simpleType>
+                        </xs:attribute>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+            "<root a='x	
+ y &amp; z'/>",
+        );
+        assert!(errors.is_empty(), "expected no errors, got {errors:?}");
+        assert!(matches!(outcome.root_validity, Some(SchemaValidity::Valid)));
     }
 
     #[test]
