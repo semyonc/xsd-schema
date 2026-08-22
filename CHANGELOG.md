@@ -5,7 +5,43 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.4] - 2026-08-22
+
+Security release. Upgrades `quick-xml` past two denial-of-service advisories
+and adopts the XML attribute-value and line-end normalization that the newer
+parser performs. No public API change. W3C XSD 1.0 suite failures 19 → 18;
+XSD 1.1 suite and the XQTS XPath suite are unchanged, as is instance-validation
+throughput (within run-to-run measurement noise).
+
+### Security
+
+- Upgrade `quick-xml` from 0.31 to 0.41, which fixes two denial-of-service
+  advisories that affected every parse of untrusted XML through this crate
+  (the schema parser, the streaming validation driver and `BufferDocument`
+  all read through `quick-xml`):
+  - [RUSTSEC-2026-0194] — quadratic run time when checking a start tag for
+    duplicate attribute names.
+  - [RUSTSEC-2026-0195] — unbounded namespace-declaration allocation in
+    `NsReader`.
+
+### Fixed
+
+- Attribute values are now normalized as XML 1.0 §3.3.3 requires before they
+  reach the validator: a literal tab, carriage return or line feed inside an
+  attribute value becomes a space. Previously the raw character was validated,
+  so patterns and facets saw content no conforming XML processor would produce
+  (W3C XSD 1.0 suite: `RegexTest_63.i`; suite failures 19 → 18).
+
+### Changed
+
+- Character data containing general references (`&amp;`, `&#65;`) is reported
+  by `quick-xml` 0.38+ as separate `Text` and `GeneralRef` events. The schema
+  parser, the streaming driver and the `BufferDocument` builder rejoin the run
+  before validating it, so a reference no longer splits one text run into
+  several validator events. Only the five predefined entities and character
+  references are resolved; any other entity is a parse error, as before.
+- Line endings in character data are normalized (`\r\n` and `\r` → `\n`)
+  per XML 1.0 §2.11, which `quick-xml` 0.31 did not do for text events.
 
 ## [0.1.3] - 2026-07-21
 
@@ -126,6 +162,10 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
+[0.1.4]: https://github.com/semyonc/xsd-schema/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/semyonc/xsd-schema/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/semyonc/xsd-schema/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/semyonc/xsd-schema/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/semyonc/xsd-schema/releases/tag/v0.1.0
+[RUSTSEC-2026-0194]: https://rustsec.org/advisories/RUSTSEC-2026-0194
+[RUSTSEC-2026-0195]: https://rustsec.org/advisories/RUSTSEC-2026-0195

@@ -3,6 +3,7 @@
 //! This module handles parsing and validation of XSD element attributes.
 
 use quick_xml::events::attributes::Attribute;
+use quick_xml::XmlVersion;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::NameId;
@@ -56,9 +57,10 @@ pub fn parse_attributes<'a>(
         })?;
 
         let name = attr.key.as_ref();
-        // Use unescape_value which works without encoding feature
+        // XML attribute-value normalization (XML 1.0 §3.3.3) plus predefined-
+        // entity resolution; works without quick-xml's `encoding` feature.
         let value = attr
-            .unescape_value()
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|e| SchemaError::XmlError {
                 message: format!("Attribute value decode error: {}", e),
                 location: None,

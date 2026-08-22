@@ -12,11 +12,13 @@ use std::io::BufRead;
 use bumpalo::Bump;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 
 use crate::namespace::table::XML_NAMESPACE;
 use crate::namespace::NameTable;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
+use crate::xml_entity::resolve_general_ref;
 
 use super::buffer::BufferDocument;
 use super::error::BufferDocumentError;
@@ -547,7 +549,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         reader: R,
     ) -> Result<BufferDocument<'a>, BufferDocumentError> {
         let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.trim_text(false);
+        xml_reader.config_mut().trim_text(false);
 
         // Transient prefix → URI mapping for namespace resolution
         let mut prefix_map: HashMap<Box<[u8]>, Vec<String>> = HashMap::new();
@@ -568,7 +570,7 @@ impl<'a> BufferDocumentBuilder<'a> {
 
         loop {
             let event_start = if track {
-                xml_reader.buffer_position()
+                xml_reader.buffer_position() as usize
             } else {
                 0
             };
@@ -587,7 +589,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                     if track {
                         self.doc.source_spans.set(
                             elem_ref,
-                            SourceSpan::new(event_start, xml_reader.buffer_position()),
+                            SourceSpan::new(event_start, xml_reader.buffer_position() as usize),
                         );
                     }
                 }
@@ -596,7 +598,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                         if let Some((elem_ref, start)) = self.pending_spans.pop() {
                             self.doc.source_spans.set(
                                 elem_ref,
-                                SourceSpan::new(start, xml_reader.buffer_position()),
+                                SourceSpan::new(start, xml_reader.buffer_position() as usize),
                             );
                         }
                     }
@@ -612,7 +614,15 @@ impl<'a> BufferDocumentBuilder<'a> {
                 }
                 Ok(Event::Text(ref e)) => {
                     if !self.element_stack.is_empty() {
-                        let text = e.unescape()?;
+                        let text = e.xml10_content().map_err(quick_xml::Error::from)?;
+                        self.text(&text);
+                    }
+                }
+                // References are reported apart from the surrounding text; the
+                // builder merges consecutive text anyway, so the run is rejoined.
+                Ok(Event::GeneralRef(ref e)) => {
+                    if !self.element_stack.is_empty() {
+                        let text = resolve_general_ref(e)?;
                         self.text(&text);
                     }
                 }
@@ -659,7 +669,7 @@ impl<'a> BufferDocumentBuilder<'a> {
 
             if key == b"xmlns" {
                 // Default namespace declaration
-                let value = attr.unescape_value()?;
+                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
                 let uri = value.to_string();
                 let prefix_key: Box<[u8]> = b"".to_vec().into_boxed_slice();
                 prefix_map
@@ -670,7 +680,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 ns_decls_str.push((String::new(), uri));
             } else if key.starts_with(b"xmlns:") {
                 let prefix_bytes = &key[6..];
-                let value = attr.unescape_value()?;
+                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
                 let uri = value.to_string();
                 let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
                 prefix_map
@@ -746,7 +756,7 @@ impl<'a> BufferDocumentBuilder<'a> {
                 }
             };
 
-            let unescaped = attr.unescape_value()?;
+            let unescaped = attr.normalized_value(XmlVersion::Implicit1_0)?;
             self.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
 
             // Detect xml:id
@@ -1195,6 +1205,29 @@ mod tests {
         let text = doc.nodes.get(3);
         assert_eq!(text.node_type(), NodeType::Text);
         assert_eq!(doc.strings.get(text.value), "text");
+    }
+
+    #[test]
+    fn test_build_text_with_general_references() {
+        // References arrive as their own events; the builder must still produce
+        // a single text node holding the whole run.
+        let doc = build_from_str("<a>x &amp; y&#33;</a>");
+        // Root(0), a(1), Text(2), Nul(3)
+        assert_eq!(doc.nodes.len(), 4);
+        let text = doc.nodes.get(2);
+        assert_eq!(text.node_type(), NodeType::Text);
+        assert_eq!(doc.strings.get(text.value), "x & y!");
+    }
+
+    #[test]
+    fn test_build_rejects_unknown_entity() {
+        let arena = Box::leak(Box::new(Bump::new()));
+        let names = Box::leak(Box::new(NameTable::new()));
+        let builder =
+            BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
+                .unwrap();
+        let result = builder.build("<a>&nope;</a>".as_bytes());
+        assert!(matches!(result, Err(BufferDocumentError::Parse(_))));
     }
 
     #[test]

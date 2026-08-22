@@ -31,6 +31,7 @@
 use std::collections::HashSet;
 
 use quick_xml::events::Event;
+use quick_xml::XmlVersion;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
@@ -314,6 +315,9 @@ pub fn parse_schema_with_chameleon(
             Event::Text(ref e) => {
                 handle_text(&mut state, e, span)?;
             }
+            Event::GeneralRef(ref e) => {
+                handle_general_ref(&mut state, e, span)?;
+            }
             Event::CData(ref e) => {
                 handle_cdata(&mut state, e, span)?;
             }
@@ -486,7 +490,7 @@ fn handle_start_element(
 
         let attr_name = attr.key.as_ref();
         let attr_value = attr
-            .unescape_value()
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|e| SchemaError::xml(format!("Attribute value error: {}", e), None))?;
 
         // Check for xmlns declarations
@@ -913,16 +917,36 @@ fn handle_text(
     span: SourceSpan,
 ) -> SchemaResult<()> {
     let text_content = text
-        .unescape()
+        .xml10_content()
         .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
 
+    apply_text(state, &text_content, span)
+}
+
+/// Handle a general reference (`&amp;`, `&#65;`) appearing in character data.
+///
+/// quick-xml reports references as their own events, so the replacement text is
+/// resolved here and then fed through the same checks as a plain text run.
+fn handle_general_ref(
+    state: &mut ParserState,
+    reference: &quick_xml::events::BytesRef,
+    span: SourceSpan,
+) -> SchemaResult<()> {
+    let text_content = crate::xml_entity::resolve_general_ref(reference)
+        .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
+
+    apply_text(state, &text_content, span)
+}
+
+/// Route a resolved run of character data to the current frame.
+fn apply_text(state: &mut ParserState, text_content: &str, span: SourceSpan) -> SchemaResult<()> {
     // Pass text to current frame if it accepts text content; otherwise reject
     // any non-whitespace text. XSD elements like xs:notation, xs:complexType,
     // xs:sequence, etc. only allow inter-element whitespace as text content
     // (sch-props-correct / element-specific content models).
     if let Some(mut frame) = state.frame_stack.pop() {
         if frame.accepts_text() {
-            frame.on_text(&text_content);
+            frame.on_text(text_content);
         } else if !frame.is_skip_frame() && !text_content.trim().is_empty() {
             let source_ref = state.source_ref(span);
             state.frame_stack.push(frame);

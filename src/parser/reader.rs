@@ -65,7 +65,7 @@ impl<'a> TrackedReader<&'a [u8]> {
     /// Create a new reader from a byte slice
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         let mut reader = Reader::from_reader(bytes);
-        reader.trim_text(true);
+        reader.config_mut().trim_text(true);
 
         Self {
             reader,
@@ -78,7 +78,7 @@ impl<R: BufRead> TrackedReader<R> {
     /// Create a new reader from a BufRead source
     pub fn from_reader(reader: R) -> Self {
         let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.trim_text(true);
+        xml_reader.config_mut().trim_text(true);
 
         Self {
             reader: xml_reader,
@@ -88,7 +88,7 @@ impl<R: BufRead> TrackedReader<R> {
 
     /// Read the next XML event with its source span
     pub fn read_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> SchemaResult<TrackedEvent<'b>> {
-        let start = self.reader.buffer_position();
+        let start = self.reader.buffer_position() as usize;
         self.last_position = start;
 
         let event = self.reader.read_event_into(buf).map_err(|e| {
@@ -98,7 +98,7 @@ impl<R: BufRead> TrackedReader<R> {
             }
         })?;
 
-        let end = self.reader.buffer_position();
+        let end = self.reader.buffer_position() as usize;
         let span = SourceSpan { start, end };
 
         Ok(TrackedEvent::new(event, span))
@@ -106,7 +106,7 @@ impl<R: BufRead> TrackedReader<R> {
 
     /// Get the current buffer position
     pub fn buffer_position(&self) -> usize {
-        self.reader.buffer_position()
+        self.reader.buffer_position() as usize
     }
 
     /// Get the last event's start position
