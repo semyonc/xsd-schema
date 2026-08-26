@@ -208,7 +208,7 @@ pub fn apply_redefine_override(schema_set: &mut SchemaSet) -> SchemaResult<()> {
 
 /// Validate that every `<xs:redefine>` directive's redefined components
 /// have a real *parse-time* original in the target schema, reachable via a
-/// non-cyclic chain of redefines.
+/// non-cyclic chain of redefines and includes.
 ///
 /// ## Why this exists
 ///
@@ -238,7 +238,7 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
     // break: callers seed it with documents that must NOT be revisited
     // (typically the redefining document itself), and the walker
     // inserts/removes its own ancestors.
-    fn lookup_via_redefine_chain(
+    fn lookup_via_composition_chain(
         schema_set: &SchemaSet,
         start_doc: DocumentId,
         kind: ComponentKind,
@@ -275,9 +275,18 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
             if direct {
                 return true;
             }
-            for r in &doc.redefines {
-                if let Some(target) = r.resolved_doc_id {
-                    if lookup_via_redefine_chain(
+            for redefine in &doc.redefines {
+                if let Some(target) = redefine.resolved_doc_id {
+                    if lookup_via_composition_chain(
+                        schema_set, target, kind, namespace, name, visiting,
+                    ) {
+                        return true;
+                    }
+                }
+            }
+            for include in &doc.includes {
+                if let Some(target) = include.resolved_doc_id {
+                    if lookup_via_composition_chain(
                         schema_set, target, kind, namespace, name, visiting,
                     ) {
                         return true;
@@ -375,7 +384,7 @@ fn validate_redefine_originals_exist(schema_set: &SchemaSet) -> SchemaResult<()>
             for (kind, namespace, name, label) in
                 simples.chain(complexes).chain(groups).chain(attr_groups)
             {
-                if !lookup_via_redefine_chain(
+                if !lookup_via_composition_chain(
                     schema_set,
                     target_doc_id,
                     kind,

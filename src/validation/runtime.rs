@@ -3958,7 +3958,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut validity = SchemaValidity::Valid;
 
         // Even token count check (namespace/location pairs)
-        if !tokens.len().is_multiple_of(2) {
+        if tokens.len() % 2 != 0 {
             self.report_error(
                 "cvc-schema-location",
                 format!(

@@ -124,7 +124,7 @@ fn sniff_utf16_no_bom(bytes: &[u8]) -> Option<Endian> {
 }
 
 fn decode_utf16(bytes: &[u8], endian: Endian) -> SchemaResult<String> {
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() % 2 != 0 {
         return Err(SchemaError::resolution(
             "UTF-16 byte stream has an odd number of bytes".to_string(),
         ));

@@ -92,6 +92,32 @@ impl PipelineConfig {
     }
 }
 
+/// Policy for optional schema-processing validation stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaProcessingOptions {
+    validate_schema_derivations: bool,
+}
+
+impl Default for SchemaProcessingOptions {
+    fn default() -> Self {
+        Self {
+            validate_schema_derivations: true,
+        }
+    }
+}
+
+impl SchemaProcessingOptions {
+    /// Enable or disable structural derivation checks.
+    ///
+    /// Disable this only for a trusted schema set with independently verified
+    /// derivation-checker incompatibilities. Other processing and instance
+    /// validation remain enabled.
+    pub fn with_schema_derivation_validation(mut self, enabled: bool) -> Self {
+        self.validate_schema_derivations = enabled;
+        self
+    }
+}
+
 /// Statistics from processing the entire pipeline
 #[derive(Debug, Default)]
 pub struct PipelineStats {
@@ -176,6 +202,23 @@ pub fn load_and_process_schema(
     base_uri: &str,
     schema_set: &mut SchemaSet,
     config: Option<PipelineConfig>,
+) -> SchemaResult<PipelineStats> {
+    load_and_process_schema_with_options(
+        xml,
+        base_uri,
+        schema_set,
+        config,
+        SchemaProcessingOptions::default(),
+    )
+}
+
+/// Load and process a schema with explicit optional-stage policy.
+pub fn load_and_process_schema_with_options(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: Option<PipelineConfig>,
+    options: SchemaProcessingOptions,
 ) -> SchemaResult<PipelineStats> {
     let config = config.unwrap_or_default();
     let mut stats = PipelineStats::default();
@@ -272,7 +315,7 @@ pub fn load_and_process_schema(
     }
 
     // Phase 4.7: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
-    if config.resolve_references {
+    if config.resolve_references && options.validate_schema_derivations {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
     }
@@ -352,6 +395,18 @@ pub fn parse_schema_only(
 pub fn process_loaded_schemas(
     schema_set: &mut SchemaSet,
 ) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
+    process_loaded_schemas_with_options(schema_set, SchemaProcessingOptions::default())
+}
+
+/// Process manually loaded schemas with explicit optional-stage policy.
+///
+/// This is the configured counterpart to [`process_loaded_schemas`]. The
+/// schema derivation-validation policy is honored; all other processing
+/// stages always run.
+pub fn process_loaded_schemas_with_options(
+    schema_set: &mut SchemaSet,
+    options: SchemaProcessingOptions,
+) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     // Fail early if parsing collected structural errors (error-recovery mode)
     if !schema_set.parsing_errors.is_empty() {
         let errors = std::mem::take(&mut schema_set.parsing_errors);
@@ -371,9 +426,13 @@ pub fn process_loaded_schemas(
     #[cfg(feature = "xsd11")]
     crate::compiler::validate_all_default_open_content(schema_set)?;
 
-    // Validate type derivation constraints
-    let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
-    validate_all_derivations(schema_set, &dep_graph)?;
+    // Validate type derivation constraints when requested. This permits trusted,
+    // manually assembled schema sets to use the same explicit opt-out as the
+    // automatic pipeline.
+    if options.validate_schema_derivations {
+        let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
+        validate_all_derivations(schema_set, &dep_graph)?;
+    }
 
     // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     validate_attribute_id_constraints(schema_set)?;
@@ -890,6 +949,25 @@ pub async fn load_and_process_schema_async(
     schema_set: &mut SchemaSet,
     config: Option<PipelineConfig>,
 ) -> SchemaResult<PipelineStats> {
+    load_and_process_schema_async_with_options(
+        xml,
+        base_uri,
+        schema_set,
+        config,
+        SchemaProcessingOptions::default(),
+    )
+    .await
+}
+
+/// Async schema processing with explicit optional-stage policy.
+#[cfg(feature = "async")]
+pub async fn load_and_process_schema_async_with_options(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: Option<PipelineConfig>,
+    options: SchemaProcessingOptions,
+) -> SchemaResult<PipelineStats> {
     let config = config.unwrap_or_default();
     let mut stats = PipelineStats::default();
 
@@ -973,7 +1051,7 @@ pub async fn load_and_process_schema_async(
     }
 
     // Phase 4.7: Validate type derivation constraints
-    if config.resolve_references {
+    if config.resolve_references && options.validate_schema_derivations {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
         validate_all_derivations(schema_set, &dep_graph)?;
     }

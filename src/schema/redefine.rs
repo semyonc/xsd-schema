@@ -24,6 +24,121 @@ use crate::schema::composition::{
 };
 use crate::schema::model::RedefineDirective;
 use crate::schema::SchemaSet;
+use std::collections::HashSet;
+
+fn lookup_simple_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<TypeKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let doc = schema_set.documents.get(doc_id as usize)?;
+    let found = doc
+        .component_index
+        .lookup_simple_type(namespace, name)
+        .or_else(|| doc.component_index.lookup_simple_type(None, name))
+        .map(TypeKey::Simple)
+        .or_else(|| {
+            doc.redefines
+                .iter()
+                .filter_map(|r| r.resolved_doc_id)
+                .chain(doc.includes.iter().filter_map(|i| i.resolved_doc_id))
+                .find_map(|target| {
+                    lookup_simple_original(schema_set, target, namespace, name, visited)
+                })
+        });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_complex_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<TypeKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let doc = schema_set.documents.get(doc_id as usize)?;
+    let found = doc
+        .component_index
+        .lookup_complex_type(namespace, name)
+        .or_else(|| doc.component_index.lookup_complex_type(None, name))
+        .map(TypeKey::Complex)
+        .or_else(|| {
+            doc.redefines
+                .iter()
+                .filter_map(|r| r.resolved_doc_id)
+                .chain(doc.includes.iter().filter_map(|i| i.resolved_doc_id))
+                .find_map(|target| {
+                    lookup_complex_original(schema_set, target, namespace, name, visited)
+                })
+        });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_model_group_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<ModelGroupKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let doc = schema_set.documents.get(doc_id as usize)?;
+    let found = doc
+        .component_index
+        .lookup_model_group(namespace, name)
+        .or_else(|| doc.component_index.lookup_model_group(None, name))
+        .or_else(|| {
+            doc.redefines
+                .iter()
+                .filter_map(|r| r.resolved_doc_id)
+                .chain(doc.includes.iter().filter_map(|i| i.resolved_doc_id))
+                .find_map(|target| {
+                    lookup_model_group_original(schema_set, target, namespace, name, visited)
+                })
+        });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_attribute_group_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<AttributeGroupKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let doc = schema_set.documents.get(doc_id as usize)?;
+    let found = doc
+        .component_index
+        .lookup_attribute_group(namespace, name)
+        .or_else(|| doc.component_index.lookup_attribute_group(None, name))
+        .or_else(|| {
+            doc.redefines
+                .iter()
+                .filter_map(|r| r.resolved_doc_id)
+                .chain(doc.includes.iter().filter_map(|i| i.resolved_doc_id))
+                .find_map(|target| {
+                    lookup_attribute_group_original(schema_set, target, namespace, name, visited)
+                })
+        });
+    visited.remove(&doc_id);
+    found
+}
 
 /// Apply a redefine directive to the schema set.
 ///
@@ -89,12 +204,10 @@ fn apply_simple_type_redefine(
     // Kind-specific, document-scoped lookup; global fallback only when
     // resolved_doc_id is None (pre-loaded schemas without resolution).
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_simple_type(namespace, name))
-            .map(TypeKey::Simple),
-        None => schema_set.lookup_type(namespace, name),
+        Some(id) => lookup_simple_original(schema_set, id, namespace, name, &mut HashSet::new()),
+        None => schema_set
+            .lookup_type(namespace, name)
+            .or_else(|| schema_set.lookup_type(None, name)),
     }
     .ok_or_else(|| {
         SchemaError::structural(
@@ -185,12 +298,10 @@ fn apply_complex_type_redefine(
     let namespace = new_type.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_complex_type(namespace, name))
-            .map(TypeKey::Complex),
-        None => schema_set.lookup_type(namespace, name),
+        Some(id) => lookup_complex_original(schema_set, id, namespace, name, &mut HashSet::new()),
+        None => schema_set
+            .lookup_type(namespace, name)
+            .or_else(|| schema_set.lookup_type(None, name)),
     }
     .ok_or_else(|| {
         SchemaError::structural(
@@ -279,11 +390,12 @@ fn apply_model_group_redefine(
     let namespace = new_group.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_model_group(namespace, name)),
-        None => schema_set.lookup_model_group(namespace, name),
+        Some(id) => {
+            lookup_model_group_original(schema_set, id, namespace, name, &mut HashSet::new())
+        }
+        None => schema_set
+            .lookup_model_group(namespace, name)
+            .or_else(|| schema_set.lookup_model_group(None, name)),
     }
     .ok_or_else(|| {
         SchemaError::structural(
@@ -373,11 +485,12 @@ fn apply_attribute_group_redefine(
     let namespace = new_group.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_attribute_group(namespace, name)),
-        None => schema_set.lookup_attribute_group(namespace, name),
+        Some(id) => {
+            lookup_attribute_group_original(schema_set, id, namespace, name, &mut HashSet::new())
+        }
+        None => schema_set
+            .lookup_attribute_group(namespace, name)
+            .or_else(|| schema_set.lookup_attribute_group(None, name)),
     }
     .ok_or_else(|| {
         SchemaError::structural(

@@ -3601,3 +3601,171 @@ fn test_accept_xsd11_intensional_restriction_z028() {
         result
     );
 }
+
+#[test]
+fn test_nested_chameleon_redefine_resolves_all_component_kinds() {
+    for (case, middle_schema) in [
+        (
+            "redefine",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:redefine schemaLocation="base.xsd">
+<xs:simpleType name="Marker"><xs:restriction base="Marker"><xs:maxLength value="8"/></xs:restriction></xs:simpleType>
+</xs:redefine>
+</xs:schema>"#,
+        ),
+        (
+            "include",
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:include schemaLocation="base.xsd"/>
+</xs:schema>"#,
+        ),
+    ] {
+        let tmp = std::env::temp_dir().join(format!(
+            "xsd_test_nested_chameleon_redefine_{}_{}",
+            std::process::id(),
+            case
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        std::fs::write(
+        tmp.join("base.xsd"),
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:simpleType name="Code"><xs:restriction base="xs:string"/></xs:simpleType>
+<xs:simpleType name="Marker"><xs:restriction base="xs:string"/></xs:simpleType>
+<xs:simpleType name="Inherited"><xs:restriction base="xs:normalizedString"/></xs:simpleType>
+<xs:complexType name="Record"><xs:sequence><xs:element name="value" type="xs:string"/></xs:sequence></xs:complexType>
+<xs:group name="Rows"><xs:sequence><xs:element name="row" type="xs:string"/></xs:sequence></xs:group>
+<xs:attributeGroup name="Flags"><xs:attribute name="flag" type="xs:string"/></xs:attributeGroup>
+</xs:schema>"#,
+    )
+    .unwrap();
+        std::fs::write(tmp.join("middle.xsd"), middle_schema).unwrap();
+        let outer = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+ targetNamespace="urn:test" xmlns:t="urn:test" elementFormDefault="qualified">
+<xs:redefine schemaLocation="middle.xsd">
+<xs:simpleType name="Code"><xs:restriction base="t:Code"><xs:maxLength value="4"/></xs:restriction></xs:simpleType>
+<xs:complexType name="Record"><xs:complexContent><xs:restriction base="t:Record">
+<xs:sequence><xs:element name="value" type="t:Inherited"/></xs:sequence>
+</xs:restriction></xs:complexContent></xs:complexType>
+<xs:group name="Rows"><xs:sequence><xs:group ref="t:Rows"/><xs:element name="extra" type="xs:string"/></xs:sequence></xs:group>
+<xs:attributeGroup name="Flags"><xs:attributeGroup ref="t:Flags"/><xs:attribute name="extraFlag" type="xs:string"/></xs:attributeGroup>
+</xs:redefine>
+<xs:element name="root" type="t:Code"/>
+<xs:element name="inherited" type="t:Inherited"/>
+<xs:element name="record" type="t:Record"/>
+</xs:schema>"#;
+        let outer_path = tmp.join("outer.xsd");
+        let mut schema_set = SchemaSet::new();
+        let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
+        let result = load_and_process_schema_with_options(
+            outer.as_bytes(),
+            &outer_path.to_string_lossy(),
+            &mut schema_set,
+            None,
+            options,
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            result.is_ok(),
+            "nested chameleon redefine should resolve its transitive original: {result:?}"
+        );
+
+        let namespace = schema_set.name_table.get("urn:test").unwrap();
+        let code = schema_set.name_table.get("Code").unwrap();
+        assert!(matches!(
+            schema_set.lookup_type(Some(namespace), code),
+            Some(TypeKey::Simple(_))
+        ));
+        let inherited = schema_set.name_table.get("inherited").unwrap();
+        let inherited = schema_set
+            .lookup_element(Some(namespace), inherited)
+            .and_then(|key| schema_set.arenas.elements.get(key));
+        assert!(matches!(
+            inherited.and_then(|element| element.resolved_type),
+            Some(TypeKey::Simple(_))
+        ));
+        let record = schema_set.name_table.get("Record").unwrap();
+        assert!(matches!(
+            schema_set.lookup_type(Some(namespace), record),
+            Some(TypeKey::Complex(_))
+        ));
+
+        let rows_name = schema_set.name_table.get("Rows").unwrap();
+        let rows_key = schema_set
+            .lookup_model_group(Some(namespace), rows_name)
+            .unwrap();
+        let rows = schema_set.arenas.model_groups.get(rows_key).unwrap();
+        let rows_original = rows
+            .redefine_original
+            .expect("redefined model group must retain its transitive original");
+        assert!(rows.resolved_particles.iter().any(|particle| matches!(
+            particle,
+            crate::arenas::ResolvedParticleTerm::Group {
+                resolved_ref: Some(key)
+            } if *key == rows_original
+        )));
+
+        let flags_name = schema_set.name_table.get("Flags").unwrap();
+        let flags_key = schema_set
+            .lookup_attribute_group(Some(namespace), flags_name)
+            .unwrap();
+        let flags = schema_set.arenas.attribute_groups.get(flags_key).unwrap();
+        let flags_original = flags
+            .redefine_original
+            .expect("redefined attribute group must retain its transitive original");
+        assert!(flags.resolved_attribute_groups.contains(&flags_original));
+    }
+}
+
+#[test]
+fn test_schema_derivation_validation_can_be_disabled_explicitly() {
+    let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
+
+    let schema = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:complexType name="Base"><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence></xs:complexType>
+<xs:complexType name="InvalidRestriction"><xs:complexContent><xs:restriction base="Base">
+<xs:sequence><xs:element name="b" type="xs:string"/></xs:sequence>
+</xs:restriction></xs:complexContent></xs:complexType>
+</xs:schema>"#;
+    let mut strict_set = SchemaSet::new();
+    let strict = load_and_process_schema(schema, "memory:///strict.xsd", &mut strict_set, None);
+    assert!(
+        strict.is_err(),
+        "strict processing must check derivation constraints"
+    );
+
+    let mut trusted_set = SchemaSet::new();
+    let trusted = load_and_process_schema_with_options(
+        schema,
+        "memory:///trusted.xsd",
+        &mut trusted_set,
+        None,
+        options,
+    );
+    assert!(
+        trusted.is_ok(),
+        "explicitly disabling the schema-level checker should preserve the remaining pipeline: {trusted:?}"
+    );
+
+    let mut manual_strict_set = SchemaSet::new();
+    parse_schema_only(
+        schema,
+        "memory:///manual-strict.xsd",
+        &mut manual_strict_set,
+    )
+    .unwrap();
+    assert!(process_loaded_schemas(&mut manual_strict_set).is_err());
+
+    let mut manual_trusted_set = SchemaSet::new();
+    parse_schema_only(
+        schema,
+        "memory:///manual-trusted.xsd",
+        &mut manual_trusted_set,
+    )
+    .unwrap();
+    assert!(
+        process_loaded_schemas_with_options(&mut manual_trusted_set, options).is_ok(),
+        "the explicit policy must also apply to manually loaded schema sets"
+    );
+}
