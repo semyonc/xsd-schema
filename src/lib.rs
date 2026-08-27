@@ -179,13 +179,16 @@ pub use xpath::{
 
 // Re-export pipeline functions
 pub use pipeline::{
-    load_and_process_schema, load_schema, parse_schema_only, process_loaded_schemas,
-    DirectiveStats, PipelineConfig, PipelineStats,
+    load_and_process_schema, load_and_process_schema_with_options, load_schema, parse_schema_only,
+    process_loaded_schemas, process_loaded_schemas_with_options, DirectiveStats, PipelineConfig,
+    PipelineStats, SchemaProcessingOptions,
 };
 
 // Re-export async pipeline functions
 #[cfg(feature = "async")]
-pub use pipeline::{load_and_process_schema_async, load_schema_async};
+pub use pipeline::{
+    load_and_process_schema_async, load_and_process_schema_async_with_options, load_schema_async,
+};
 
 // Re-export builder types
 pub use builder::{CompilationStats, CompiledSchemaSet, SchemaSetBuilder};
