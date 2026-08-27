@@ -216,9 +216,17 @@ fn validate_numeric_lexical(
     // Integer-lexical gate: `parse::<i128>` accepts exactly the XSD integer
     // lexical space and rejects fractional/garbage input. `Err` is either an
     // invalid lexical or an integer that does not fit `i128`; both defer to the
-    // full (`BigInt`) path. (`xs:decimal` is gated by the `Decimal` parse below
-    // — the same parse `DecimalValidator::validate` uses.)
+    // full (`BigInt`) path. (`xs:decimal` is gated separately just below.)
     if code != XmlTypeCode::Decimal && normalized.parse::<i128>().is_err() {
+        return None;
+    }
+    // `xs:decimal` lexical gate: `parse::<Decimal>` below is NOT a lexical
+    // check — `rust_decimal` accepts forms outside the XSD decimal lexical
+    // space (scientific notation as of 1.42). Defer those to the full path,
+    // where `DecimalValidator` rejects them with the proper diagnostic.
+    if code == XmlTypeCode::Decimal
+        && !crate::types::validators::is_valid_xsd_decimal_lexical(normalized)
+    {
         return None;
     }
 
