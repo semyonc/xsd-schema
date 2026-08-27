@@ -24,6 +24,130 @@ use crate::schema::composition::{
 };
 use crate::schema::model::RedefineDirective;
 use crate::schema::SchemaSet;
+use std::collections::HashSet;
+
+// ---------------------------------------------------------------------------
+// Transitive original lookup
+// ---------------------------------------------------------------------------
+//
+// `src-redefine` requires the redefined component's original to be found in
+// "the schema corresponding to" the redefined document — i.e. the *effective
+// view* of that document, which per §4.2.1/§4.2.3 includes everything its own
+// `xs:include` and `xs:redefine` directives pull in transitively, not merely
+// its own top-level declarations.
+//
+// The lookups below therefore start at the redefine target document and walk
+// its `redefines` + `includes` edges (via `resolved_doc_id`) depth-first,
+// guarded by a `HashSet<DocumentId>` so include/redefine cycles — which are
+// legal, see `topologically_ordered_redefines` — terminate. Each helper is
+// kind-scoped so a name collision across component kinds cannot satisfy the
+// lookup, and the walk never leaves the composition closure of the redefined
+// document, so it cannot "find" an original that lives in an unrelated schema.
+
+fn lookup_simple_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<TypeKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let found = schema_set.documents.get(doc_id as usize).and_then(|doc| {
+        doc.component_index
+            .lookup_simple_type(namespace, name)
+            .map(TypeKey::Simple)
+            .or_else(|| {
+                composition_targets(doc).find_map(|target| {
+                    lookup_simple_original(schema_set, target, namespace, name, visited)
+                })
+            })
+    });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_complex_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<TypeKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let found = schema_set.documents.get(doc_id as usize).and_then(|doc| {
+        doc.component_index
+            .lookup_complex_type(namespace, name)
+            .map(TypeKey::Complex)
+            .or_else(|| {
+                composition_targets(doc).find_map(|target| {
+                    lookup_complex_original(schema_set, target, namespace, name, visited)
+                })
+            })
+    });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_model_group_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<ModelGroupKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let found = schema_set.documents.get(doc_id as usize).and_then(|doc| {
+        doc.component_index
+            .lookup_model_group(namespace, name)
+            .or_else(|| {
+                composition_targets(doc).find_map(|target| {
+                    lookup_model_group_original(schema_set, target, namespace, name, visited)
+                })
+            })
+    });
+    visited.remove(&doc_id);
+    found
+}
+
+fn lookup_attribute_group_original(
+    schema_set: &SchemaSet,
+    doc_id: DocumentId,
+    namespace: Option<NameId>,
+    name: NameId,
+    visited: &mut HashSet<DocumentId>,
+) -> Option<AttributeGroupKey> {
+    if !visited.insert(doc_id) {
+        return None;
+    }
+    let found = schema_set.documents.get(doc_id as usize).and_then(|doc| {
+        doc.component_index
+            .lookup_attribute_group(namespace, name)
+            .or_else(|| {
+                composition_targets(doc).find_map(|target| {
+                    lookup_attribute_group_original(schema_set, target, namespace, name, visited)
+                })
+            })
+    });
+    visited.remove(&doc_id);
+    found
+}
+
+/// Documents that contribute to `doc`'s effective view: its redefine targets
+/// followed by its include targets. Unresolved directives are skipped.
+fn composition_targets(
+    doc: &crate::schema::model::SchemaDocument,
+) -> impl Iterator<Item = DocumentId> + '_ {
+    doc.redefines
+        .iter()
+        .filter_map(|r| r.resolved_doc_id)
+        .chain(doc.includes.iter().filter_map(|i| i.resolved_doc_id))
+}
 
 /// Apply a redefine directive to the schema set.
 ///
@@ -86,14 +210,12 @@ fn apply_simple_type_redefine(
     })?;
     let namespace = new_type.target_namespace;
 
-    // Kind-specific, document-scoped lookup; global fallback only when
-    // resolved_doc_id is None (pre-loaded schemas without resolution).
+    // Kind-specific lookup scoped to the redefined document's *effective view*
+    // (itself plus everything it includes/redefines transitively); global
+    // fallback only when resolved_doc_id is None (pre-loaded schemas without
+    // resolution).
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_simple_type(namespace, name))
-            .map(TypeKey::Simple),
+        Some(id) => lookup_simple_original(schema_set, id, namespace, name, &mut HashSet::new()),
         None => schema_set.lookup_type(namespace, name),
     }
     .ok_or_else(|| {
@@ -185,11 +307,7 @@ fn apply_complex_type_redefine(
     let namespace = new_type.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_complex_type(namespace, name))
-            .map(TypeKey::Complex),
+        Some(id) => lookup_complex_original(schema_set, id, namespace, name, &mut HashSet::new()),
         None => schema_set.lookup_type(namespace, name),
     }
     .ok_or_else(|| {
@@ -279,10 +397,9 @@ fn apply_model_group_redefine(
     let namespace = new_group.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_model_group(namespace, name)),
+        Some(id) => {
+            lookup_model_group_original(schema_set, id, namespace, name, &mut HashSet::new())
+        }
         None => schema_set.lookup_model_group(namespace, name),
     }
     .ok_or_else(|| {
@@ -373,10 +490,9 @@ fn apply_attribute_group_redefine(
     let namespace = new_group.target_namespace;
 
     let original_key = match target_doc_id {
-        Some(id) => schema_set
-            .documents
-            .get(id as usize)
-            .and_then(|doc| doc.component_index.lookup_attribute_group(namespace, name)),
+        Some(id) => {
+            lookup_attribute_group_original(schema_set, id, namespace, name, &mut HashSet::new())
+        }
         None => schema_set.lookup_attribute_group(namespace, name),
     }
     .ok_or_else(|| {
