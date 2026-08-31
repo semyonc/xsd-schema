@@ -9,19 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Composition and complex-type restriction fixes, prompted by the official GAEB
 DA XML 3.3 schema corpus (<https://www.gaeb.de>) — 32 schemas built on chained,
-chameleon `xs:redefine`. All 32 now load in strict mode with no processing
-options when the schema set is XSD 1.1. Under XSD 1.0 nine still fail, all on
-the "intensional restriction" class that the W3C suite itself accepts only for
-1.1. Both W3C suites are unchanged by this work (XSD 1.0 39458/39510, XSD 1.1
+chameleon `xs:redefine`. All 32 now load with every check enabled when the
+schema set is XSD 1.1 — no opt-out, and none was added. Under XSD 1.0 nine
+still fail, all on the "intensional restriction" class that the W3C suite
+itself accepts only for 1.1. Both W3C suites are unchanged by this work (XSD 1.0 39458/39510, XSD 1.1
 2313/2319, byte-identical failure sets).
-
-### Added
-
-- `SchemaProcessingOptions` and the `*_with_options` entry points
-  (`load_and_process_schema_with_options`, `process_loaded_schemas_with_options`,
-  `load_and_process_schema_async_with_options`, `SchemaSetBuilder::compile_with_options`)
-  select which optional schema component constraint checks run. The default is
-  strict, and derivation-graph cycle detection runs in both modes.
 
 ### Fixed
 
