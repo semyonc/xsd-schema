@@ -344,10 +344,17 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
                 Decimal::ZERO
             }
         }
-        _ => string_val
-            .trim()
-            .parse::<Decimal>()
-            .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
+        _ => {
+            // F&O casting to xs:decimal uses the XSD lexical mapping, which is
+            // narrower than what `rust_decimal`'s parser accepts (no exponent).
+            let trimmed = string_val.trim();
+            if !crate::types::validators::is_valid_xsd_decimal_lexical(trimmed) {
+                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
+            }
+            trimmed
+                .parse::<Decimal>()
+                .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?
+        }
     };
     Ok(XmlValue::decimal(result))
 }

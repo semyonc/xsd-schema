@@ -796,6 +796,44 @@ impl TypeValidator for BooleanValidator {
 // Numeric Validators
 // ============================================================================
 
+/// Validate strict XSD lexical form for `xs:decimal`.
+///
+/// Datatypes 1.1 §3.3.3 (`decimalLexicalRep ::= decimalPtNumeral |
+/// noDecimalPtNumeral`, productions [45]–[51]) admits only
+/// `('+'|'-')? (digits ('.' digits?)? | '.' digits)` — no exponent and no
+/// `INF`/`NaN` (those enter the grammar at `scientificNotationNumeral`,
+/// which decimal's lexical mapping never references). `rust_decimal`'s
+/// `from_str` accepts additional forms (scientific notation as of 1.42,
+/// underscore separators) — we pre-validate to reject them so conformance
+/// does not track that crate's parser behavior.
+pub fn is_valid_xsd_decimal_lexical(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    if bytes[i] == b'+' || bytes[i] == b'-' {
+        i += 1;
+    }
+    let mut has_int_digits = false;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        has_int_digits = true;
+        i += 1;
+    }
+    let mut has_frac_digits = false;
+    if i < bytes.len() && bytes[i] == b'.' {
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            has_frac_digits = true;
+            i += 1;
+        }
+    }
+    if !has_int_digits && !has_frac_digits {
+        return false;
+    }
+    i == bytes.len()
+}
+
 /// Validator for xs:decimal
 pub struct DecimalValidator;
 
@@ -815,6 +853,13 @@ impl TypeValidator for DecimalValidator {
 
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
+        if !is_valid_xsd_decimal_lexical(&normalized) {
+            return Err(ValidationError::InvalidLexical {
+                value: value.to_string(),
+                type_name: "decimal",
+                message: format!("Invalid xs:decimal lexical form: '{}'", normalized),
+            });
+        }
         normalized
             .parse::<Decimal>()
             .map(XmlValue::decimal)
@@ -4242,6 +4287,41 @@ mod tests {
         let result = v.validate("123.45").unwrap();
         assert_eq!(result.type_code, XmlTypeCode::Decimal);
         assert!(result.as_decimal().is_some());
+    }
+
+    #[test]
+    fn test_decimal_lexical_space() {
+        // Datatypes 1.1 §3.3.3: sign, digits, optional decimal point — nothing else.
+        for valid in ["210", "-1.23", "+100000.00", "0.5", ".5", "-.5", "5.", "+0"] {
+            assert!(
+                is_valid_xsd_decimal_lexical(valid),
+                "expected valid: {valid:?}"
+            );
+        }
+        for invalid in [
+            "", "+", "-", ".", "+.", "1E4", "-1E4", "123.456E4", "1e4", "1.2e-3", "INF", "-INF",
+            "NaN", "1_000", "1.2.3", "1 2", "0x1F",
+        ] {
+            assert!(
+                !is_valid_xsd_decimal_lexical(invalid),
+                "expected invalid: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_decimal_validator_rejects_exponent_forms() {
+        // W3C decimal019 / decimal025: the xs:decimal lexical space has no
+        // exponent. Must hold regardless of how permissive `rust_decimal`'s
+        // own parser is (1.42 started accepting scientific notation).
+        let v = DecimalValidator;
+        assert!(v.validate("-1E4").is_err());
+        assert!(v.validate("123.456E4").is_err());
+        assert!(v.validate("1e2").is_err());
+        assert!(v.validate("INF").is_err());
+        assert!(v.validate("NaN").is_err());
+        // Whitespace collapse still applies before the lexical check.
+        assert!(v.validate("  -1.23  ").is_ok());
     }
 
     #[test]

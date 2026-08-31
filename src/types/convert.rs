@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 
 #[cfg(feature = "xsd11")]
 use super::sequence::{ItemType, SequenceType};
-use super::validators::{ValidationError, ValidatorRegistry};
+use super::validators::{is_valid_xsd_decimal_lexical, ValidationError, ValidatorRegistry};
 use super::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use super::{PrimitiveTypeCode, XmlTypeCode};
 
@@ -237,7 +237,21 @@ impl TypeConverter {
                 Ok(if *b { Decimal::ONE } else { Decimal::ZERO })
             }
             XmlValueKind::UntypedAtomic(s) => {
-                s.trim().parse().map_err(|_| ConversionError::InvalidValue {
+                // Casting untypedAtomic to xs:decimal uses the XSD lexical
+                // mapping (Datatypes 1.1 §3.3.3, productions [45]-[51]), which is
+                // narrower than what `rust_decimal`'s parser accepts (scientific
+                // notation as of 1.42). Gate explicitly so this API does not
+                // track the crate's parser behaviour for downstream consumers,
+                // which resolve their own `rust_decimal` version.
+                let trimmed = s.trim();
+                if !is_valid_xsd_decimal_lexical(trimmed) {
+                    return Err(ConversionError::InvalidValue {
+                        value: s.clone(),
+                        target_type: "decimal",
+                        message: "Not a valid decimal".to_string(),
+                    });
+                }
+                trimmed.parse().map_err(|_| ConversionError::InvalidValue {
                     value: s.clone(),
                     target_type: "decimal",
                     message: "Not a valid decimal".to_string(),
@@ -739,6 +753,80 @@ mod tests {
                 .to_integer(&XmlValue::decimal(Decimal::new(99, 1)))
                 .unwrap(),
             BigInt::from(9) // Truncated from 9.9
+        );
+    }
+
+    #[test]
+    fn test_to_decimal_untyped_lexical_gate() {
+        let converter = TypeConverter::new();
+
+        // Accepted: the XSD decimal lexical space, Datatypes 1.1 §3.3.3
+        // (`decimalLexicalRep`, productions [45]-[51]).
+        for (lexical, expected) in [
+            ("123", Decimal::from(123)),
+            ("-1.5", Decimal::new(-15, 1)),
+            ("+.5", Decimal::new(5, 1)),
+            (".5", Decimal::new(5, 1)),
+            ("12.", Decimal::from(12)),
+            ("  12.5  ", Decimal::new(125, 1)),
+        ] {
+            assert_eq!(
+                converter.to_decimal(&XmlValue::untyped(lexical)).unwrap(),
+                expected,
+                "expected '{}' to convert to decimal",
+                lexical
+            );
+        }
+
+        // Rejected: forms outside that lexical space which `rust_decimal`'s
+        // own parser accepts, or may accept in a future version. Downstream
+        // consumers resolve their own `rust_decimal`, so this must not depend
+        // on the crate's parser: `1_0` is accepted by 1.39, scientific
+        // notation by 1.42.
+        for lexical in [
+            "1_0", "1E4", "1e4", "1.5E2", "NaN", "INF", "-INF", "", "+", ".", "0x1f", "1 2",
+        ] {
+            assert!(
+                matches!(
+                    converter.to_decimal(&XmlValue::untyped(lexical)),
+                    Err(ConversionError::InvalidValue { .. })
+                ),
+                "expected '{}' to be rejected as xs:decimal",
+                lexical
+            );
+        }
+    }
+
+    #[test]
+    fn test_promote_to_decimal_inherits_lexical_gate() {
+        let converter = TypeConverter::new();
+
+        assert_eq!(
+            converter
+                .promote_to(&XmlValue::untyped("12.5"), XmlTypeCode::Decimal)
+                .unwrap()
+                .as_decimal(),
+            Some(Decimal::new(125, 1))
+        );
+        for lexical in ["1_0", "1E4"] {
+            assert!(
+                converter
+                    .promote_to(&XmlValue::untyped(lexical), XmlTypeCode::Decimal)
+                    .is_err(),
+                "expected promote_to to reject '{}' as xs:decimal",
+                lexical
+            );
+        }
+        // `cast` reaches the same lexical space through `DecimalValidator`.
+        assert!(converter
+            .cast(&XmlValue::untyped("1_0"), XmlTypeCode::Decimal)
+            .is_err());
+        assert_eq!(
+            converter
+                .cast(&XmlValue::untyped("12.5"), XmlTypeCode::Decimal)
+                .unwrap()
+                .as_decimal(),
+            Some(Decimal::new(125, 1))
         );
     }
 
