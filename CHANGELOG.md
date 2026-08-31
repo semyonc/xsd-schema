@@ -5,6 +5,65 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Composition and complex-type restriction fixes, prompted by the official GAEB
+DA XML 3.3 schema corpus (<https://www.gaeb.de>) — 32 schemas built on chained,
+chameleon `xs:redefine`. All 32 now load in strict mode with no processing
+options when the schema set is XSD 1.1. Under XSD 1.0 nine still fail, all on
+the "intensional restriction" class that the W3C suite itself accepts only for
+1.1. Both W3C suites are unchanged by this work (XSD 1.0 39458/39510, XSD 1.1
+2313/2319, byte-identical failure sets).
+
+### Added
+
+- `SchemaProcessingOptions` and the `*_with_options` entry points
+  (`load_and_process_schema_with_options`, `process_loaded_schemas_with_options`,
+  `load_and_process_schema_async_with_options`, `SchemaSetBuilder::compile_with_options`)
+  select which optional schema component constraint checks run. The default is
+  strict, and derivation-graph cycle detection runs in both modes.
+
+### Fixed
+
+- `xs:redefine` now resolves the component it redefines through the *effective
+  view* of the redefined document — its transitive `include` and `redefine`
+  edges — instead of only that document's own component index. A schema whose
+  original is declared one hop below the redefine target failed to load with
+  `src-redefine: Original ... not found`, which rejected valid chained and
+  chameleon redefine graphs (six files of the GAEB corpus).
+- Eight defects in `derivation-ok-restriction` (§3.4.6.3 / §3.9.6), each of
+  which rejected valid restrictions or accepted invalid ones:
+  - `Choice:Choice` (RecurseLax) folded the parent choice's occurrence range
+    into every branch. An optional choice therefore made each derived branch
+    optional, so it could no longer map onto a base branch whose first child is
+    required — and, in the other direction, an optional choice was accepted as a
+    restriction of a required one whenever every branch happened to be optional.
+    The two choices' own ranges are now compared directly and the mapping runs
+    over their raw `{particles}`.
+  - Particles whose term is an empty model group were not removed as pointless,
+    so `<xs:choice minOccurs="0"/>` still had to map onto something in the base.
+    A required empty `choice` is still kept: it accepts no sequence at all.
+  - Attribute uses with `use="prohibited"` were run through the attribute-type,
+    `fixed`-value and (XSD 1.1) `{inheritable}` checks. Per §3.4.2.4 such an
+    `<attribute>` corresponds to no component — it only suppresses the base's
+    use — so its declared type no longer takes part in the derivation.
+    Prohibiting a *required* base attribute remains an error.
+  - Restricting a type derived by extension was checked against the extension's
+    own particle alone. §3.4.2.3 makes the content type
+    `sequence(inherited-particle, own-particle)`; without the inherited half,
+    every element the base contributed looked like one the restriction invented.
+  - The base side of a restriction reported only the attribute uses the type
+    declares itself, never the ones it inherits, with the same consequence for
+    inherited attributes.
+  - Under XSD 1.1, a single-child group folded away by particle normalization
+    (`<C minOccurs="m" maxOccurs="n">X</C>` → `X{m,n}`) is now also offered to
+    the base in its original shape. XSD 1.1 restriction is language subsumption
+    (§3.4.6.4), so the folded and unfolded spellings must be treated alike.
+    XSD 1.0 is deliberately unchanged here: there the fold is what makes a
+    single-branch `<choice>` restricting a multi-branch base choice invalid
+    (W3C `msData` `groupH021v`, `particlesZ024`, both marked invalid for 1.0 and
+    valid for 1.1).
+
 ## [0.1.4] - 2026-08-22
 
 Security release. Upgrades `quick-xml` past two denial-of-service advisories

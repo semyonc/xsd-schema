@@ -1461,6 +1461,11 @@ struct NormalizedParticle {
     min_occurs: u32,
     max_occurs: Option<u32>,
     source: Option<SourceRef>,
+    /// Compositor of the single-child group that `collapse_single_child_groups`
+    /// folded away to produce this particle, if any.  §3.9.6's rules are
+    /// structural, so the restriction check has to be able to put that group
+    /// back; see the re-expansion step in `particle_restricts`.
+    collapsed_from: Option<Compositor>,
 }
 
 #[derive(Debug, Clone)]
@@ -1551,6 +1556,7 @@ impl<'a> ParticleNormalizer<'a> {
             min_occurs: particle.min_occurs,
             max_occurs: particle.max_occurs,
             source: particle.source.clone(),
+            collapsed_from: None,
         }))
     }
 
@@ -1702,9 +1708,11 @@ fn validate_content_particle_restriction(
     base: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     let derived_particle = complex_content_particle(&derived.content);
-    // For the base, resolve effective content by walking up extension chain.
-    // An empty extension inherits its base type's content model.
-    let (effective_base, base_particle) = effective_base_content_particle(schema_set, base);
+    // For the base, resolve effective content by walking up the extension
+    // chain: an empty extension inherits its base's content model, and a
+    // non-empty one is `sequence(inherited, own)` per §3.4.2.3.
+    let (effective_base, _) = effective_base_content_particle(schema_set, base);
+    let base_particle = normalized_effective_base_particle(schema_set, base, 0)?;
 
     let location = derived
         .source
@@ -1734,7 +1742,6 @@ fn validate_content_particle_restriction(
             }
         }
         (None, Some(base_particle)) => {
-            let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
             if particle_is_emptiable(&base_particle) {
                 Ok(())
             } else {
@@ -1750,7 +1757,6 @@ fn validate_content_particle_restriction(
         }
         (Some(derived_particle), Some(base_particle)) => {
             let derived_particle = normalize_type_particle(schema_set, derived, derived_particle)?;
-            let base_particle = normalize_type_particle(schema_set, effective_base, base_particle)?;
 
             if is_effectively_empty(&derived_particle) {
                 if particle_is_emptiable(&base_particle) {
@@ -1840,6 +1846,63 @@ fn effective_base_content_particle<'a>(
     }
 }
 
+/// The base type's *effective* content particle, already normalized.
+///
+/// §3.4.2.3 (complex content extension): when a type is derived by extension
+/// and both the base and the extension contribute a non-empty particle, the
+/// resulting {content type} particle is `sequence(base-particle,
+/// own-particle)` — not just the extension's own contribution.  A restriction
+/// of such a type has to be checked against the whole model, otherwise every
+/// element the base contributed looks like an element the restriction invented.
+///
+/// `effective_base_content_particle` only covers the degenerate case of an
+/// extension that adds nothing; this walks the whole extension chain and
+/// re-assembles the model.
+fn normalized_effective_base_particle(
+    schema_set: &SchemaSet,
+    base: &crate::arenas::ComplexTypeDefData,
+    depth: usize,
+) -> SchemaResult<Option<NormalizedParticle>> {
+    let own = match complex_content_particle(&base.content) {
+        Some(particle) => Some(normalize_type_particle(schema_set, base, particle)?),
+        None => None,
+    };
+
+    if depth > 50 || base.derivation_method != Some(DerivationMethod::Extension) {
+        return Ok(own);
+    }
+    let Some(TypeKey::Complex(base_key)) = base.resolved_base_type else {
+        return Ok(own);
+    };
+    let Some(base_type) = schema_set.arenas.complex_types.get(base_key) else {
+        return Ok(own);
+    };
+    let inherited = normalized_effective_base_particle(schema_set, base_type, depth + 1)?;
+
+    Ok(match (inherited, own) {
+        (None, own) => own,
+        (inherited, None) => inherited,
+        (Some(inherited), Some(own)) => {
+            if contributes_only_the_empty_sequence(&inherited) {
+                Some(own)
+            } else if contributes_only_the_empty_sequence(&own) {
+                Some(inherited)
+            } else {
+                Some(NormalizedParticle {
+                    term: NormalizedParticleTerm::Group(NormalizedGroup {
+                        compositor: Compositor::Sequence,
+                        particles: vec![inherited, own],
+                    }),
+                    min_occurs: 1,
+                    max_occurs: Some(1),
+                    source: None,
+                    collapsed_from: None,
+                })
+            }
+        }
+    })
+}
+
 fn normalize_type_particle(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
@@ -1900,6 +1963,7 @@ fn normalize_model_group_as_particle(
         min_occurs: group_data.min_occurs,
         max_occurs: group_data.max_occurs,
         source: group_data.source.clone(),
+        collapsed_from: None,
     };
 
     // `normalize_particle` collapses every child; the outer wrapper we
@@ -1925,10 +1989,39 @@ fn remove_pointless_particles(mut particle: NormalizedParticle) -> NormalizedPar
             .particles
             .drain(..)
             .map(remove_pointless_particles)
-            .filter(|p| p.max_occurs != Some(0))
+            .filter(|p| p.max_occurs != Some(0) && !is_pointless_empty_group(p))
             .collect();
     }
     particle
+}
+
+/// True when a particle accepts the empty sequence and nothing else, so it can
+/// be dropped when assembling `sequence(inherited, own)` for an extension.
+///
+/// Deliberately narrower than [`is_effectively_empty`]: a *required* empty
+/// choice accepts no sequence at all, so dropping it would turn an
+/// unsatisfiable content type into a satisfiable one and let a restriction of
+/// it be checked against the inherited half alone.
+fn contributes_only_the_empty_sequence(particle: &NormalizedParticle) -> bool {
+    particle.max_occurs == Some(0) || is_pointless_empty_group(particle)
+}
+
+/// A child group particle that contributes nothing to the content model.
+///
+/// `sequence`/`all` with no particles accepts only the empty sequence however
+/// often it is repeated.  An empty `choice` accepts nothing at all, so it is
+/// only pointless when it is optional — `<choice minOccurs="1"/>` makes the
+/// content model unsatisfiable and must be kept.
+fn is_pointless_empty_group(particle: &NormalizedParticle) -> bool {
+    match &particle.term {
+        NormalizedParticleTerm::Group(group) if group.particles.is_empty() => {
+            match group.compositor {
+                Compositor::Sequence | Compositor::All => true,
+                Compositor::Choice => particle.min_occurs == 0,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Flatten nested groups with unit occurs and the same compositor into
@@ -1994,11 +2087,16 @@ fn collapse_single_child_groups(mut particle: NormalizedParticle) -> NormalizedP
             child.min_occurs,
             child.max_occurs,
         );
+        let compositor = match &particle.term {
+            NormalizedParticleTerm::Group(group) => Some(group.compositor),
+            _ => None,
+        };
         particle = NormalizedParticle {
             term: child.term,
             min_occurs,
             max_occurs,
             source: particle.source.clone().or(child.source),
+            collapsed_from: compositor,
         };
     }
 }
@@ -2054,6 +2152,7 @@ fn fold_single_child_group(particle: &NormalizedParticle) -> Option<NormalizedPa
                 min_occurs,
                 max_occurs,
                 source: particle.source.clone().or(child.source.clone()),
+                collapsed_from: None,
             });
         }
     }
@@ -2073,6 +2172,77 @@ fn particle_restricts(
         }
         if let Some(folded_base) = fold_single_child_group(base) {
             return particle_restricts(schema_set, derived, &folded_base);
+        }
+    }
+
+    particle_restricts_unfolded(schema_set, derived, base)
+}
+
+/// `particle_restricts` minus the XSD 1.1 single-child fold.
+///
+/// The re-expansion step below deliberately re-introduces a single-child
+/// group; re-entering through `particle_restricts` would fold it straight back
+/// out again.
+fn particle_restricts_unfolded(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+) -> bool {
+    // XSD 1.1 only: undo `collapse_single_child_groups` for the derived side.
+    //
+    // Normalization folds a single-child group `<C minOccurs="m"
+    // maxOccurs="n">X</C>` down to `X{m,n}`.  That is language-preserving —
+    // the two accept exactly the same sequences — but it destroys the
+    // structure XSD 1.0's §3.9.6 rules match on, and under XSD 1.0 that is
+    // deliberate: the pointless-particle collapse is what makes a
+    // single-branch `<choice>` restricting a multi-branch base choice invalid
+    // (msData groupH021v, particlesZ024, both marked "invalid in 1.0, valid
+    // in 1.1" by the W3C suite).  Under XSD 1.1 the rule is language
+    // subsumption (§3.4.6.4), so the folded and unfolded spellings must be
+    // treated alike; re-offering the derived particle in its group form
+    // admits exactly those restrictions.
+    //
+    // The same-compositor guard keeps this from recursing: the re-expanded
+    // particle is a group with the base's compositor, so it cannot be
+    // re-expanded against the same base.
+    if let NormalizedParticleTerm::Group(base_group) = &base.term {
+        let already_grouped = matches!(
+            &derived.term,
+            NormalizedParticleTerm::Group(derived_group)
+                if derived_group.compositor == base_group.compositor
+        );
+        let wrappable = match base_group.compositor {
+            Compositor::Sequence | Compositor::Choice => true,
+            // `all_particles_restrict` only handles element/wildcard children.
+            Compositor::All => matches!(
+                &derived.term,
+                NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_)
+            ),
+        };
+        if schema_set.is_xsd11()
+            && derived.collapsed_from == Some(base_group.compositor)
+            && !already_grouped
+            && wrappable
+        {
+            let expanded = NormalizedParticle {
+                term: NormalizedParticleTerm::Group(NormalizedGroup {
+                    compositor: base_group.compositor,
+                    particles: vec![NormalizedParticle {
+                        term: derived.term.clone(),
+                        min_occurs: 1,
+                        max_occurs: Some(1),
+                        source: derived.source.clone(),
+                        collapsed_from: None,
+                    }],
+                }),
+                min_occurs: derived.min_occurs,
+                max_occurs: derived.max_occurs,
+                source: derived.source.clone(),
+                collapsed_from: None,
+            };
+            if particle_restricts_unfolded(schema_set, &expanded, base) {
+                return true;
+            }
         }
     }
 
@@ -2096,6 +2266,50 @@ fn particle_restricts(
         )
     {
         return false;
+    }
+
+    // §3.9.6 Particle Derivation OK (Choice:Choice -- RecurseLax): compare the
+    // two choice particles' own occurrence ranges, then map R's *raw*
+    // {particles} onto B's raw {particles} order-preservingly.
+    //
+    // The occurs-folding path below multiplies the parent choice's occurs into
+    // every branch, which is unsound as soon as a base branch is a group: the
+    // branch particle's range is multiplied but its children's are not.  An
+    // optional choice (min=0) then makes every derived branch optional, and an
+    // optional branch can no longer map onto a base branch whose first child is
+    // required.  Try the literal spec rule first and only fall through to the
+    // folding approximation when it does not apply.
+    if let (
+        NormalizedParticleTerm::Group(derived_choice),
+        NormalizedParticleTerm::Group(base_choice),
+    ) = (&derived.term, &base.term)
+    {
+        if derived_choice.compositor == Compositor::Choice
+            && base_choice.compositor == Compositor::Choice
+        {
+            if occurs_range_is_subset(
+                derived.min_occurs,
+                derived.max_occurs,
+                base.min_occurs,
+                base.max_occurs,
+            ) && choice_branches_restrict_ordered(
+                schema_set,
+                &derived_choice.particles,
+                &base_choice.particles,
+            ) {
+                return true;
+            }
+            // Under XSD 1.0 RecurseLax *is* the whole rule for choice:choice,
+            // so a failure is final.  Falling through to the occurs-folding
+            // path would smuggle the choices' own ranges into the branches and
+            // accept, for instance, an optional choice restricting a required
+            // one whenever every branch happens to be optional.  XSD 1.1
+            // compares languages (§3.4.6.4), where that restriction is genuinely
+            // valid, so there the laxer path below still applies.
+            if schema_set.is_xsd10() {
+                return false;
+            }
+        }
     }
 
     if let Some(base_branches) = expand_choice_branches(base) {
@@ -2307,24 +2521,20 @@ fn particle_restricts(
         (
             NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
             NormalizedParticleTerm::Group(base_group),
-        ) if base_group.compositor == Compositor::Sequence => {
+        ) if matches!(
+            base_group.compositor,
+            Compositor::Sequence | Compositor::All
+        ) =>
+        {
+            let match_children = |children: &[NormalizedParticle]| match base_group.compositor {
+                Compositor::All => {
+                    all_particles_restrict(schema_set, children, &base_group.particles)
+                }
+                _ => sequence_particles_restrict(schema_set, children, &base_group.particles),
+            };
+
             occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
-                && sequence_particles_restrict(
-                    schema_set,
-                    std::slice::from_ref(derived),
-                    &base_group.particles,
-                )
-        }
-        (
-            NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_),
-            NormalizedParticleTerm::Group(base_group),
-        ) if base_group.compositor == Compositor::All => {
-            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
-                && all_particles_restrict(
-                    schema_set,
-                    std::slice::from_ref(derived),
-                    &base_group.particles,
-                )
+                && match_children(std::slice::from_ref(derived))
         }
         _ => false,
     }
@@ -2385,6 +2595,7 @@ fn expand_choice_branches(particle: &NormalizedParticle) -> Option<Vec<Normalize
                     min_occurs,
                     max_occurs,
                     source: particle.source.clone().or(child.source.clone()),
+                    collapsed_from: None,
                 })
             })
             .collect(),
@@ -2905,6 +3116,7 @@ fn expand_top_level_choices_for_unordered(
                         min_occurs: 0,
                         max_occurs: new_max,
                         source: branch.source.clone(),
+                        collapsed_from: None,
                     });
                 }
             }
@@ -5005,6 +5217,50 @@ fn collect_effective_attribute_uses(
     result
 }
 
+/// The complete `{attribute uses}` of a complex type, including the ones it
+/// inherits from its base type definition (§3.4.2.4).
+///
+/// `collect_effective_attribute_uses` only reports what a type declares
+/// itself (plus its attribute groups).  That is the right input for the
+/// *derived* side of a restriction — the checks below are written around
+/// "not re-declared here means inherited unchanged" — but the *base* side
+/// needs the full picture, or every attribute the base itself inherited looks
+/// like an attribute the restriction invented.
+///
+/// Uses declared locally win over inherited ones of the same expanded name;
+/// `use="prohibited"` therefore removes the inherited use, and per §3.4.2.4
+/// contributes no attribute use of its own.
+fn collect_inherited_attribute_uses(
+    schema_set: &SchemaSet,
+    type_def: &crate::arenas::ComplexTypeDefData,
+    depth: usize,
+) -> Vec<EffectiveAttributeUse> {
+    let mut result = collect_effective_attribute_uses(schema_set, type_def);
+
+    if depth < 50 {
+        if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
+            if base_key != schema_set.any_type_key() {
+                if let Some(base_type) = schema_set.arenas.complex_types.get(base_key) {
+                    for inherited in
+                        collect_inherited_attribute_uses(schema_set, base_type, depth + 1)
+                    {
+                        let overridden = result.iter().any(|a| {
+                            a.name == inherited.name
+                                && a.target_namespace == inherited.target_namespace
+                        });
+                        if !overridden {
+                            result.push(inherited);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    result.retain(|a| a.use_kind != AttributeUseKind::Prohibited);
+    result
+}
+
 // ---------------------------------------------------------------------------
 // §3.6.2.2 Effective Attribute Wildcard + §3.10.6.4 Intersection
 // ---------------------------------------------------------------------------
@@ -5222,9 +5478,9 @@ fn validate_xsd10_attribute_wildcard_union_expressible(
     //   S ∋ ns, S ∌ absent     → not(absent)        (expressible)
     //   S ∌ ns, S ∋ absent     → NOT EXPRESSIBLE
     //   S ∌ ns, S ∌ absent     → not(ns)            (expressible)
-    let neg_vs_set = |neg: Option<NameId>,
-                      s: &std::collections::HashSet<Option<NameId>>|
-     -> bool { s.contains(&None) && !s.contains(&neg) };
+    let neg_vs_set = |neg: Option<NameId>, s: &std::collections::HashSet<Option<NameId>>| -> bool {
+        s.contains(&None) && !s.contains(&neg)
+    };
 
     let not_expressible = match (&own.namespace, &base_wc.namespace) {
         (CanonicalNs::Not(_), CanonicalNs::Enum(s)) => {
@@ -5882,7 +6138,7 @@ fn validate_attribute_restriction(
     base: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     let derived_attrs = collect_effective_attribute_uses(schema_set, derived);
-    let base_attrs = collect_effective_attribute_uses(schema_set, base);
+    let base_attrs = collect_inherited_attribute_uses(schema_set, base, 0);
 
     let location = derived
         .source
@@ -5936,6 +6192,12 @@ fn validate_attribute_restriction(
 
     // Check clause 4: attribute type derivation
     for derived_attr in &derived_attrs {
+        // §3.4.2.3: an <attribute> with use="prohibited" contributes no
+        // attribute use to {attribute uses} — it only removes the base's.
+        // Its `type` is therefore not part of the derivation at all.
+        if derived_attr.use_kind == AttributeUseKind::Prohibited {
+            continue;
+        }
         let Some(derived_type_key) = derived_attr.resolved_type else {
             continue;
         };
@@ -5973,8 +6235,7 @@ fn validate_attribute_restriction(
     // wildcard admits everything, so restrictions of anyType are exempt.
     if let Some(TypeKey::Complex(base_key)) = derived.resolved_base_type {
         if base_key != schema_set.any_type_key() {
-            let base_wildcard =
-                compute_runtime_attribute_wildcard_bounded(schema_set, base_key, 0);
+            let base_wildcard = compute_runtime_attribute_wildcard_bounded(schema_set, base_key, 0);
             for derived_attr in &derived_attrs {
                 if derived_attr.use_kind == AttributeUseKind::Prohibited {
                     continue;
@@ -6028,6 +6289,12 @@ fn validate_attribute_restriction(
             // Inherited unchanged: OK.
             continue;
         };
+        // Prohibited: the attribute use is removed, not re-declared with a
+        // weaker value constraint (clause 3 above already rejects removing a
+        // *required* base attribute).
+        if derived_attr.use_kind == AttributeUseKind::Prohibited {
+            continue;
+        }
         match derived_attr.fixed_value.as_deref() {
             Some(d_fixed)
                 if crate::validation::simple::fixed_values_equal(
@@ -6078,6 +6345,9 @@ fn validate_attribute_restriction(
     // restriction.
     if schema_set.is_xsd11() {
         for derived_attr in &derived_attrs {
+            if derived_attr.use_kind == AttributeUseKind::Prohibited {
+                continue;
+            }
             let Some(base_attr) = base_attrs.iter().find(|a| {
                 a.name == derived_attr.name && a.target_namespace == derived_attr.target_namespace
             }) else {
@@ -9602,6 +9872,7 @@ mod tests {
             min_occurs,
             max_occurs,
             source: None,
+            collapsed_from: None,
         };
 
         let derived = NormalizedParticle {
@@ -9612,6 +9883,7 @@ mod tests {
             min_occurs: 1,
             max_occurs: Some(1),
             source: None,
+            collapsed_from: None,
         };
         let base_empty_all = NormalizedParticle {
             term: NormalizedParticleTerm::Group(NormalizedGroup {
@@ -9621,6 +9893,7 @@ mod tests {
             min_occurs: 1,
             max_occurs: Some(1),
             source: None,
+            collapsed_from: None,
         };
 
         assert!(

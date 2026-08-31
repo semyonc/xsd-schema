@@ -3981,3 +3981,347 @@ fn test_derivation_cycle_still_detected_with_validation_disabled() {
         "cycle detection must stay on for manually loaded schema sets too"
     );
 }
+
+// ---------------------------------------------------------------------------
+// derivation-ok-restriction regressions found while loading the official
+// GAEB DA XML 3.3 schema corpus (https://www.gaeb.de) in strict mode.
+// ---------------------------------------------------------------------------
+
+/// Helper: load `xsd` into a fresh schema set of the requested XSD version.
+fn load_strict(xsd: &str, xsd11: bool) -> SchemaResult<PipelineStats> {
+    let mut schema_set = if xsd11 {
+        SchemaSet::xsd11()
+    } else {
+        SchemaSet::new()
+    };
+    load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+}
+
+/// §3.9.6 RecurseLax maps the *raw* {particles} of the two choices and checks
+/// the choices' own occurrence ranges separately.  Folding the parent choice's
+/// occurs into every branch makes each derived branch optional as soon as the
+/// choice is, and an optional branch can no longer map onto a base branch whose
+/// first child is required.
+#[test]
+fn test_optional_choice_branch_maps_onto_group_branch() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="0">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                    <xs:element name="c" type="xs:string"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:element name="a" type="xs:string"/>
+                            <xs:element name="c" type="xs:string"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        let result = load_strict(xsd, xsd11);
+        assert!(
+            result.is_ok(),
+            "RecurseLax should accept this (xsd11={xsd11}): {result:?}"
+        );
+    }
+}
+
+/// §3.4.2.4: an `<attribute>` with `use="prohibited"` in a restriction
+/// contributes no attribute use — it only suppresses the base's.  Its `type`
+/// therefore plays no part in derivation-ok-restriction.
+#[test]
+fn test_prohibited_attribute_type_is_not_checked_for_derivation() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token"/>
+            </xs:complexType>
+            <!-- xs:boolean is *not* derived from xs:token: if the prohibited
+                 use were treated as a real attribute use, clause 4 would fire. -->
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:boolean" use="prohibited"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_strict(xsd, false);
+    assert!(
+        result.is_ok(),
+        "a prohibited attribute's type is irrelevant: {result:?}"
+    );
+}
+
+/// Prohibiting a *required* base attribute is still a clause-3 violation.
+#[test]
+fn test_prohibiting_a_required_base_attribute_is_still_rejected() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token" use="required"/>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:token" use="prohibited"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    assert!(load_strict(xsd, false).is_err());
+}
+
+/// `<xs:choice minOccurs="0"/>` is a pointless particle: it accepts exactly the
+/// empty sequence and must not have to map onto anything in the base.
+#[test]
+fn test_empty_optional_choice_is_a_pointless_particle() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:choice minOccurs="0"/>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        let result = load_strict(xsd, xsd11);
+        assert!(result.is_ok(), "(xsd11={xsd11}): {result:?}");
+    }
+}
+
+/// §3.4.2.3: restricting a type that was itself derived by extension must be
+/// checked against `sequence(inherited-particle, own-particle)`, not against
+/// the extension's own contribution alone.
+#[test]
+fn test_restriction_of_extension_sees_the_inherited_content() {
+    let schema = |derived_body: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:sequence>
+                            <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">{derived_body}</xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#
+        )
+    };
+
+    // Keeps the inherited `a`: valid.
+    let ok = schema(
+        r#"<xs:sequence>
+               <xs:element name="a" type="xs:string"/>
+               <xs:element name="b" type="xs:string"/>
+           </xs:sequence>"#,
+    );
+    assert!(
+        load_strict(&ok, false).is_ok(),
+        "{:?}",
+        load_strict(&ok, false)
+    );
+
+    // Drops the inherited, required `a`: invalid.
+    let bad = schema(
+        r#"<xs:sequence>
+               <xs:element name="b" type="xs:string" minOccurs="0"/>
+           </xs:sequence>"#,
+    );
+    assert!(load_strict(&bad, false).is_err());
+}
+
+/// The base side of a restriction must present its complete `{attribute uses}`,
+/// including the ones it inherited, or every inherited attribute the derived
+/// type re-declares looks like an attribute it invented.
+#[test]
+fn test_restriction_sees_attributes_the_base_inherited() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token"/>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:sequence/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:NCName"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_strict(xsd, false);
+    assert!(
+        result.is_ok(),
+        "`id` is inherited by Base from Root: {result:?}"
+    );
+}
+
+/// A single-branch `<choice>` restricting a multi-branch base choice: the
+/// pointless-particle collapse turns it into a sequence, and XSD 1.0's
+/// structural rules then reject it (msData groupH021v / particlesZ024).  XSD
+/// 1.1 compares languages, so the same schema is valid there.
+#[test]
+fn test_single_branch_choice_restriction_is_version_dependent() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="0">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                    <xs:sequence>
+                        <xs:element name="c" type="xs:string"/>
+                        <xs:element name="d" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                                <xs:element name="d" type="xs:string" minOccurs="0"/>
+                            </xs:sequence>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    assert!(
+        load_strict(xsd, false).is_err(),
+        "XSD 1.0 rejects intensional restrictions of this shape"
+    );
+    let xsd11 = load_strict(xsd, true);
+    assert!(xsd11.is_ok(), "XSD 1.1 accepts it: {xsd11:?}");
+}
+
+/// §3.9.6 RecurseLax clause 1: the two choices' own occurrence ranges are
+/// compared directly.  An optional choice is not a valid XSD 1.0 restriction of
+/// a required one, even when every branch is individually optional — folding
+/// the ranges into the branches hides the violation.  XSD 1.1 compares
+/// languages (§3.4.6.4), and there the two accept the same sequences.
+#[test]
+fn test_optional_choice_restricting_required_choice_is_version_dependent() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="1" maxOccurs="1">
+                    <xs:element name="a" type="xs:string" minOccurs="0"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                            <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    match load_strict(xsd, false) {
+        Err(SchemaError::StructuralError { constraint, .. }) => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("XSD 1.0 must reject the widened occurrence range: {other:?}"),
+    }
+    let xsd11 = load_strict(xsd, true);
+    assert!(xsd11.is_ok(), "XSD 1.1 accepts it: {xsd11:?}");
+}
+
+/// A `<xs:choice/>` with no branches and `minOccurs="1"` accepts no sequence at
+/// all, so an extension carrying one has an unsatisfiable content type.  It
+/// must not be discarded while re-assembling `sequence(inherited, own)`, or a
+/// restriction gets checked against the inherited half alone and is wrongly
+/// accepted.
+#[test]
+fn test_required_empty_choice_in_an_extension_is_not_discarded() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:choice/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        assert!(
+            load_strict(xsd, xsd11).is_err(),
+            "Base accepts no sequence, so nothing restricts it (xsd11={xsd11})"
+        );
+    }
+}
