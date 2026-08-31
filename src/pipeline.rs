@@ -92,6 +92,67 @@ impl PipelineConfig {
     }
 }
 
+/// Policy for optional schema-processing validation stages.
+///
+/// Unlike [`PipelineConfig`], which selects *which phases run at all*, this
+/// type only relaxes optional **schema component constraint** checks for
+/// callers who knowingly accept a non-conformant schema corpus. The default is
+/// strict (every check enabled).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SchemaProcessingOptions {
+    validate_schema_derivations: bool,
+}
+
+impl Default for SchemaProcessingOptions {
+    fn default() -> Self {
+        Self {
+            validate_schema_derivations: true,
+        }
+    }
+}
+
+impl SchemaProcessingOptions {
+    /// Enable (default) or disable the structural type-derivation checks.
+    ///
+    /// Disabling skips, and only skips:
+    ///
+    /// * `cos-st-restricts` — simple-type facet-restriction checks
+    ///   (facet applicability, narrowing, fixed-facet overrides).
+    /// * The list/union derivation constraints (`cos-list-of-atomic`,
+    ///   `st-props-correct` item/member-type rules).
+    /// * The complex-type derivation checks `cos-ct-extends` and
+    ///   `derivation-ok-restriction` (with `cos-particle-restrict` /
+    ///   `cos-content-act-restrict` beneath them).
+    /// * The deferred `src-redefine` 6.2.2 / 7.2.2 checks that a redefined
+    ///   model group / attribute group is a valid restriction of its original.
+    /// * (XSD 1.0 only) `src-attribute_group` attribute-group circularity.
+    ///
+    /// Everything else is unaffected. In particular:
+    ///
+    /// * **Derivation-graph cycle detection still runs** — a circular type
+    ///   derivation is still reported, in both modes, because the schema is
+    ///   unusable without a topological compilation order.
+    /// * Parsing, composition (`include`/`redefine`/`override`/`import`),
+    ///   reference resolution, pattern compilation, UPA, particle allocation
+    ///   and all the other schema-correctness passes still run.
+    /// * **Instance validation is completely unaffected**; the resulting
+    ///   schema set validates documents exactly as it otherwise would.
+    ///
+    /// # When to use this
+    ///
+    /// This exists for *trusted, real-world schema corpora* that violate schema
+    /// component constraints yet are accepted by laxer validators (.NET's
+    /// `XmlSchemaSet`, libxml2), so that such a corpus can still be compiled
+    /// and used. It is **not** an admission that the checker is wrong: a schema
+    /// rejected in strict mode is, to the best of this implementation's
+    /// knowledge, invalid per the specification. Turn this off only when the
+    /// specific violations have been reviewed independently.
+    pub fn with_schema_derivation_validation(mut self, enabled: bool) -> Self {
+        self.validate_schema_derivations = enabled;
+        self
+    }
+}
+
 /// Statistics from processing the entire pipeline
 #[derive(Debug, Default)]
 pub struct PipelineStats {
@@ -176,6 +237,27 @@ pub fn load_and_process_schema(
     base_uri: &str,
     schema_set: &mut SchemaSet,
     config: Option<PipelineConfig>,
+) -> SchemaResult<PipelineStats> {
+    load_and_process_schema_with_options(
+        xml,
+        base_uri,
+        schema_set,
+        config,
+        SchemaProcessingOptions::default(),
+    )
+}
+
+/// Load and process a schema with an explicit optional-stage policy.
+///
+/// Identical to [`load_and_process_schema`] except that `options` selects which
+/// optional schema component constraint checks run; see
+/// [`SchemaProcessingOptions::with_schema_derivation_validation`].
+pub fn load_and_process_schema_with_options(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: Option<PipelineConfig>,
+    options: SchemaProcessingOptions,
 ) -> SchemaResult<PipelineStats> {
     let config = config.unwrap_or_default();
     let mut stats = PipelineStats::default();
@@ -272,9 +354,16 @@ pub fn load_and_process_schema(
     }
 
     // Phase 4.7: Validate type derivation constraints (cos-ct-extends, derivation-ok-restriction, etc.)
+    //
+    // The dependency graph is built unconditionally: its toposort is the only
+    // place circular type derivations are detected, and a cycle leaves the type
+    // system with no valid compilation order regardless of the derivation
+    // policy. Only the constraint checks themselves honour `options`.
     if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
-        validate_all_derivations(schema_set, &dep_graph)?;
+        if options.validate_schema_derivations {
+            validate_all_derivations(schema_set, &dep_graph)?;
+        }
     }
 
     // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
@@ -352,6 +441,19 @@ pub fn parse_schema_only(
 pub fn process_loaded_schemas(
     schema_set: &mut SchemaSet,
 ) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
+    process_loaded_schemas_with_options(schema_set, SchemaProcessingOptions::default())
+}
+
+/// Process manually loaded schemas with an explicit optional-stage policy.
+///
+/// The configured counterpart to [`process_loaded_schemas`]. Only the schema
+/// derivation-validation policy is honoured; every other processing stage
+/// always runs. See
+/// [`SchemaProcessingOptions::with_schema_derivation_validation`].
+pub fn process_loaded_schemas_with_options(
+    schema_set: &mut SchemaSet,
+    options: SchemaProcessingOptions,
+) -> SchemaResult<(InlineAssemblyStats, ResolutionStats)> {
     // Fail early if parsing collected structural errors (error-recovery mode)
     if !schema_set.parsing_errors.is_empty() {
         let errors = std::mem::take(&mut schema_set.parsing_errors);
@@ -371,9 +473,13 @@ pub fn process_loaded_schemas(
     #[cfg(feature = "xsd11")]
     crate::compiler::validate_all_default_open_content(schema_set)?;
 
-    // Validate type derivation constraints
+    // Validate type derivation constraints. The dependency graph is always
+    // built — its toposort is the only circular-derivation detector — while the
+    // constraint checks themselves honour `options`.
     let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
-    validate_all_derivations(schema_set, &dep_graph)?;
+    if options.validate_schema_derivations {
+        validate_all_derivations(schema_set, &dep_graph)?;
+    }
 
     // Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)
     validate_attribute_id_constraints(schema_set)?;
@@ -890,6 +996,28 @@ pub async fn load_and_process_schema_async(
     schema_set: &mut SchemaSet,
     config: Option<PipelineConfig>,
 ) -> SchemaResult<PipelineStats> {
+    load_and_process_schema_async_with_options(
+        xml,
+        base_uri,
+        schema_set,
+        config,
+        SchemaProcessingOptions::default(),
+    )
+    .await
+}
+
+/// Async schema processing with an explicit optional-stage policy.
+///
+/// Async variant of [`load_and_process_schema_with_options`]; see
+/// [`SchemaProcessingOptions::with_schema_derivation_validation`].
+#[cfg(feature = "async")]
+pub async fn load_and_process_schema_async_with_options(
+    xml: &[u8],
+    base_uri: &str,
+    schema_set: &mut SchemaSet,
+    config: Option<PipelineConfig>,
+    options: SchemaProcessingOptions,
+) -> SchemaResult<PipelineStats> {
     let config = config.unwrap_or_default();
     let mut stats = PipelineStats::default();
 
@@ -972,10 +1100,14 @@ pub async fn load_and_process_schema_async(
         crate::compiler::validate_all_default_open_content(schema_set)?;
     }
 
-    // Phase 4.7: Validate type derivation constraints
+    // Phase 4.7: Validate type derivation constraints. The dependency graph is
+    // built unconditionally so circular derivations are always reported; only
+    // the constraint checks honour `options`.
     if config.resolve_references {
         let (dep_graph, _dep_stats) = build_dependency_graph(schema_set)?;
-        validate_all_derivations(schema_set, &dep_graph)?;
+        if options.validate_schema_derivations {
+            validate_all_derivations(schema_set, &dep_graph)?;
+        }
     }
 
     // Phase 4.75: Validate cos-attribute-decl (XSD 1.0: ID attrs must not have default/fixed)

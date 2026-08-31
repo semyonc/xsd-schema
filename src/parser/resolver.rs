@@ -124,7 +124,10 @@ fn sniff_utf16_no_bom(bytes: &[u8]) -> Option<Endian> {
 }
 
 fn decode_utf16(bytes: &[u8], endian: Endian) -> SchemaResult<String> {
-    if !bytes.len().is_multiple_of(2) {
+    // `usize::is_multiple_of` was stabilized in Rust 1.87; the modulo keeps
+    // the crate buildable on older toolchains.
+    #[allow(clippy::manual_is_multiple_of)]
+    if bytes.len() % 2 != 0 {
         return Err(SchemaError::resolution(
             "UTF-16 byte stream has an odd number of bytes".to_string(),
         ));

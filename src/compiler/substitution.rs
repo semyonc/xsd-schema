@@ -24,7 +24,7 @@ pub type SubstitutableNameSet = HashSet<(NameId, Option<NameId>), RandomState>;
 /// this map is `.get()`-probed per candidate NFA `Element` term in
 /// `term_matches` on the per-child validation hot path, so it uses keyed
 /// `ahash` rather than the default SipHash — same rationale as the inner
-/// [`SubstitutableNameSet`].
+/// `SubstitutableNameSet`.
 pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet, RandomState>;
 
 /// Build a substitution group membership map for the schema set.
@@ -421,8 +421,12 @@ mod tests {
         let a_name = schema_set.name_table.add("a");
         let b_name = schema_set.name_table.add("b");
         let ty = TypeKey::Simple(schema_set.builtin_types().decimal);
-        schema_set.arenas.alloc_element(element_data(a_name, ty, None));
-        schema_set.arenas.alloc_element(element_data(b_name, ty, None));
+        schema_set
+            .arenas
+            .alloc_element(element_data(a_name, ty, None));
+        schema_set
+            .arenas
+            .alloc_element(element_data(b_name, ty, None));
 
         let map = build_substitution_group_map(&schema_set);
         assert!(map.is_empty());

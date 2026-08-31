@@ -187,9 +187,10 @@ impl<'a> BufferDocumentBuilder<'a> {
                 } else {
                     self.doc.strings.store(&format!("{prefix}:{local_name}"))
                 };
-                self.doc
-                    .qname_table
-                    .atomize(QNameAtom { qualified_name_idx, ..probe })
+                self.doc.qname_table.atomize(QNameAtom {
+                    qualified_name_idx,
+                    ..probe
+                })
             }
         };
 
@@ -272,9 +273,10 @@ impl<'a> BufferDocumentBuilder<'a> {
                 } else {
                     self.doc.strings.store(&format!("{prefix}:{local_name}"))
                 };
-                self.doc
-                    .qname_table
-                    .atomize(QNameAtom { qualified_name_idx, ..probe })
+                self.doc.qname_table.atomize(QNameAtom {
+                    qualified_name_idx,
+                    ..probe
+                })
             }
         };
 

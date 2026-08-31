@@ -799,7 +799,7 @@ impl TypeValidator for BooleanValidator {
 /// Validate strict XSD lexical form for `xs:decimal`.
 ///
 /// Datatypes 1.1 §3.3.3 (`decimalLexicalRep ::= decimalPtNumeral |
-/// noDecimalPtNumeral`, productions [45]–[51]) admits only
+/// noDecimalPtNumeral`, productions \[45\]–\[51\]) admits only
 /// `('+'|'-')? (digits ('.' digits?)? | '.' digits)` — no exponent and no
 /// `INF`/`NaN` (those enter the grammar at `scientificNotationNumeral`,
 /// which decimal's lexical mapping never references). `rust_decimal`'s
@@ -4299,8 +4299,23 @@ mod tests {
             );
         }
         for invalid in [
-            "", "+", "-", ".", "+.", "1E4", "-1E4", "123.456E4", "1e4", "1.2e-3", "INF", "-INF",
-            "NaN", "1_000", "1.2.3", "1 2", "0x1F",
+            "",
+            "+",
+            "-",
+            ".",
+            "+.",
+            "1E4",
+            "-1E4",
+            "123.456E4",
+            "1e4",
+            "1.2e-3",
+            "INF",
+            "-INF",
+            "NaN",
+            "1_000",
+            "1.2.3",
+            "1 2",
+            "0x1F",
         ] {
             assert!(
                 !is_valid_xsd_decimal_lexical(invalid),

@@ -180,24 +180,20 @@ impl ContentValidatorState {
     /// all-group counters) — it never deep-clones the automaton tables.
     pub fn from_compiled(compiled: &CompiledContentModel) -> Self {
         match compiled {
-            CompiledContentModel::Nfa { nfa, initial } => {
-                ContentValidatorState::Nfa {
-                    nfa: Arc::clone(nfa),
-                    active_states: initial.clone(),
-                    open_content: None,
-                }
-            }
+            CompiledContentModel::Nfa { nfa, initial } => ContentValidatorState::Nfa {
+                nfa: Arc::clone(nfa),
+                active_states: initial.clone(),
+                open_content: None,
+            },
             CompiledContentModel::NfaWithOpenContent {
                 nfa,
                 initial,
                 open_content,
-            } => {
-                ContentValidatorState::Nfa {
-                    nfa: Arc::clone(nfa),
-                    active_states: initial.clone(),
-                    open_content: open_content.clone(),
-                }
-            }
+            } => ContentValidatorState::Nfa {
+                nfa: Arc::clone(nfa),
+                active_states: initial.clone(),
+                open_content: open_content.clone(),
+            },
             CompiledContentModel::AllGroup(model) => {
                 let state = AllGroupState::new(model);
                 ContentValidatorState::AllGroup {

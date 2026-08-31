@@ -99,7 +99,10 @@ mod pattern_cache {
     fn table() -> &'static RwLock<Box<[Option<Slot>]>> {
         static TABLE: OnceLock<RwLock<Box<[Option<Slot>]>>> = OnceLock::new();
         TABLE.get_or_init(|| {
-            let slots = (0..SLOTS).map(|_| None).collect::<Vec<_>>().into_boxed_slice();
+            let slots = (0..SLOTS)
+                .map(|_| None)
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
             RwLock::new(slots)
         })
     }

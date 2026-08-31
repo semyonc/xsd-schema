@@ -3601,3 +3601,727 @@ fn test_accept_xsd11_intensional_restriction_z028() {
         result
     );
 }
+
+// ===========================================================================
+// Nested redefine: the original lives in the redefined document's *effective
+// view*, not necessarily in its own top-level declarations.
+// ===========================================================================
+
+/// XSD 1.0 §4.2.2 / XSD 1.1 §4.2.3 `src-redefine`: the original of a redefined
+/// component must be found in "the schema corresponding to" the redefined
+/// document. That schema is the document's **effective view** — everything it
+/// pulls in transitively via its own `xs:include` / `xs:redefine` — and not
+/// merely its own top-level declarations.
+///
+/// Here `outer.xsd` redefines `middle.xsd`, while every original is declared
+/// one composition hop further down, in `base.xsd`. The matrix covers:
+///
+/// * all four redefinable component kinds (simpleType, complexType, group,
+///   attributeGroup),
+/// * a namespaced composition and a chameleon one (`middle`/`base` without a
+///   `targetNamespace`, adopting `urn:test` from the redefining document),
+/// * `middle` reaching `base` through `xs:include` and through a chained
+///   `xs:redefine`.
+///
+/// Every fixture is spec-**valid**: in particular each document that declares
+/// or restricts the local element `value` agrees on
+/// `elementFormDefault="qualified"`, so the redefined `Record` really is a
+/// valid restriction of the original (rcase-NameAndTypeOK). They therefore
+/// must load in STRICT mode, with no `SchemaProcessingOptions` opt-out.
+#[test]
+fn test_nested_redefine_resolves_original_through_effective_view() {
+    for ns_case in ["namespaced", "chameleon"] {
+        // In the chameleon case `middle.xsd`/`base.xsd` carry no
+        // targetNamespace (and hence no prefix for their self-references);
+        // they adopt `urn:test` from the redefining document per §4.2.3.
+        let (ns_attrs, self_prefix) = match ns_case {
+            "namespaced" => (r#" targetNamespace="urn:test" xmlns:t="urn:test""#, "t:"),
+            _ => ("", ""),
+        };
+
+        for link_case in ["include", "redefine"] {
+            let middle_body = match link_case {
+                "include" => r#"<xs:include schemaLocation="base.xsd"/>"#.to_string(),
+                _ => format!(
+                    r#"<xs:redefine schemaLocation="base.xsd">
+<xs:simpleType name="Marker"><xs:restriction base="{self_prefix}Marker"><xs:maxLength value="8"/></xs:restriction></xs:simpleType>
+</xs:redefine>"#
+                ),
+            };
+
+            let base = format!(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"{ns_attrs} elementFormDefault="qualified">
+<xs:simpleType name="Code"><xs:restriction base="xs:string"/></xs:simpleType>
+<xs:simpleType name="Marker"><xs:restriction base="xs:string"/></xs:simpleType>
+<xs:simpleType name="Inherited"><xs:restriction base="xs:normalizedString"/></xs:simpleType>
+<xs:complexType name="Record"><xs:sequence><xs:element name="value" type="xs:string"/></xs:sequence></xs:complexType>
+<xs:group name="Rows"><xs:sequence><xs:element name="row" type="xs:string"/></xs:sequence></xs:group>
+<xs:attributeGroup name="Flags"><xs:attribute name="flag" type="xs:string"/></xs:attributeGroup>
+</xs:schema>"#
+            );
+            let middle = format!(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"{ns_attrs} elementFormDefault="qualified">
+{middle_body}
+</xs:schema>"#
+            );
+            let outer = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+ targetNamespace="urn:test" xmlns:t="urn:test" elementFormDefault="qualified">
+<xs:redefine schemaLocation="middle.xsd">
+<xs:simpleType name="Code"><xs:restriction base="t:Code"><xs:maxLength value="4"/></xs:restriction></xs:simpleType>
+<xs:complexType name="Record"><xs:complexContent><xs:restriction base="t:Record">
+<xs:sequence><xs:element name="value" type="t:Inherited"/></xs:sequence>
+</xs:restriction></xs:complexContent></xs:complexType>
+<xs:group name="Rows"><xs:sequence><xs:group ref="t:Rows"/><xs:element name="extra" type="xs:string"/></xs:sequence></xs:group>
+<xs:attributeGroup name="Flags"><xs:attributeGroup ref="t:Flags"/><xs:attribute name="extraFlag" type="xs:string"/></xs:attributeGroup>
+</xs:redefine>
+<xs:element name="root" type="t:Code"/>
+<xs:element name="inherited" type="t:Inherited"/>
+<xs:element name="record" type="t:Record"/>
+</xs:schema>"#;
+
+            let tmp = std::env::temp_dir().join(format!(
+                "xsd_test_nested_redefine_{}_{}_{}",
+                std::process::id(),
+                ns_case,
+                link_case
+            ));
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::fs::write(tmp.join("base.xsd"), base).unwrap();
+            std::fs::write(tmp.join("middle.xsd"), middle).unwrap();
+            let outer_path = tmp.join("outer.xsd");
+
+            let mut schema_set = SchemaSet::new();
+            // Strict processing on purpose: the fixture is spec-valid, so the
+            // derivation checker must accept it.
+            let result = load_and_process_schema(
+                outer.as_bytes(),
+                &outer_path.to_string_lossy(),
+                &mut schema_set,
+                None,
+            );
+            let _ = std::fs::remove_dir_all(&tmp);
+            assert!(
+                result.is_ok(),
+                "{ns_case}/{link_case}: nested redefine must resolve its transitive \
+                 original in strict mode: {result:?}"
+            );
+
+            let namespace = schema_set.name_table.get("urn:test").unwrap();
+
+            // simpleType: redefined `Code` found its original in base.xsd.
+            let code = schema_set.name_table.get("Code").unwrap();
+            let code_key = match schema_set.lookup_type(Some(namespace), code) {
+                Some(TypeKey::Simple(key)) => key,
+                other => panic!("{ns_case}/{link_case}: expected simple type Code, got {other:?}"),
+            };
+            assert!(
+                schema_set
+                    .arenas
+                    .simple_types
+                    .get(code_key)
+                    .and_then(|st| st.redefine_original)
+                    .is_some(),
+                "{ns_case}/{link_case}: redefined simple type must retain its \
+                 transitive original"
+            );
+
+            // The type declared only in base.xsd is reachable from the outer
+            // document, so the element referencing it resolves.
+            let inherited = schema_set.name_table.get("inherited").unwrap();
+            let inherited = schema_set
+                .lookup_element(Some(namespace), inherited)
+                .and_then(|key| schema_set.arenas.elements.get(key));
+            assert!(
+                matches!(
+                    inherited.and_then(|element| element.resolved_type),
+                    Some(TypeKey::Simple(_))
+                ),
+                "{ns_case}/{link_case}: element referencing a base.xsd type must resolve"
+            );
+
+            // complexType: redefined `Record` found its original in base.xsd.
+            let record = schema_set.name_table.get("Record").unwrap();
+            let record_key = match schema_set.lookup_type(Some(namespace), record) {
+                Some(TypeKey::Complex(key)) => key,
+                other => {
+                    panic!("{ns_case}/{link_case}: expected complex type Record, got {other:?}")
+                }
+            };
+            assert!(
+                schema_set
+                    .arenas
+                    .complex_types
+                    .get(record_key)
+                    .and_then(|ct| ct.redefine_original)
+                    .is_some(),
+                "{ns_case}/{link_case}: redefined complex type must retain its \
+                 transitive original"
+            );
+
+            // group: the self-reference inside the redefinition is rewired to
+            // the original group from base.xsd.
+            let rows_name = schema_set.name_table.get("Rows").unwrap();
+            let rows_key = schema_set
+                .lookup_model_group(Some(namespace), rows_name)
+                .unwrap();
+            let rows = schema_set.arenas.model_groups.get(rows_key).unwrap();
+            let rows_original = rows
+                .redefine_original
+                .expect("redefined model group must retain its transitive original");
+            assert!(
+                rows.resolved_particles.iter().any(|particle| matches!(
+                    particle,
+                    crate::arenas::ResolvedParticleTerm::Group {
+                        resolved_ref: Some(key)
+                    } if *key == rows_original
+                )),
+                "{ns_case}/{link_case}: redefined group's self-reference must point \
+                 at the original group"
+            );
+
+            // attributeGroup: same, via resolved_attribute_groups.
+            let flags_name = schema_set.name_table.get("Flags").unwrap();
+            let flags_key = schema_set
+                .lookup_attribute_group(Some(namespace), flags_name)
+                .unwrap();
+            let flags = schema_set.arenas.attribute_groups.get(flags_key).unwrap();
+            let flags_original = flags
+                .redefine_original
+                .expect("redefined attribute group must retain its transitive original");
+            assert!(
+                flags.resolved_attribute_groups.contains(&flags_original),
+                "{ns_case}/{link_case}: redefined attribute group's self-reference must \
+                 point at the original attribute group"
+            );
+        }
+    }
+}
+
+/// `SchemaProcessingOptions::with_schema_derivation_validation(false)` skips
+/// the structural derivation checks for callers who knowingly accept a
+/// non-conformant but trusted schema corpus.
+///
+/// The fixture below is deliberately schema-INVALID: `InvalidRestriction`
+/// declares an element `b` that does not appear in `Base`'s content model, so
+/// no rcase in XSD 1.0 §3.9.6 (nor §3.4.6.4 `cos-content-act-restrict` in
+/// XSD 1.1) can hold. Strict processing is right to reject it; the opt-out
+/// exists only so that such a corpus can still be compiled.
+#[test]
+fn test_schema_derivation_validation_can_be_disabled_explicitly() {
+    let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
+
+    let schema = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:complexType name="Base"><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence></xs:complexType>
+<xs:complexType name="InvalidRestriction"><xs:complexContent><xs:restriction base="Base">
+<xs:sequence><xs:element name="b" type="xs:string"/></xs:sequence>
+</xs:restriction></xs:complexContent></xs:complexType>
+</xs:schema>"#;
+
+    let mut strict_set = SchemaSet::new();
+    let strict = load_and_process_schema(schema, "memory:///strict.xsd", &mut strict_set, None);
+    let strict_err = strict.expect_err("strict processing must check derivation constraints");
+    assert!(
+        strict_err.to_string().contains("derivation-ok-restriction"),
+        "expected a derivation-ok-restriction failure, got: {strict_err:?}"
+    );
+
+    let mut trusted_set = SchemaSet::new();
+    let trusted = load_and_process_schema_with_options(
+        schema,
+        "memory:///trusted.xsd",
+        &mut trusted_set,
+        None,
+        options,
+    );
+    assert!(
+        trusted.is_ok(),
+        "disabling the derivation checker must preserve the rest of the pipeline: {trusted:?}"
+    );
+
+    // The same policy must reach the manual (parse-then-process) entry points.
+    let mut manual_strict_set = SchemaSet::new();
+    parse_schema_only(
+        schema,
+        "memory:///manual-strict.xsd",
+        &mut manual_strict_set,
+    )
+    .unwrap();
+    assert!(process_loaded_schemas(&mut manual_strict_set).is_err());
+
+    let mut manual_trusted_set = SchemaSet::new();
+    parse_schema_only(
+        schema,
+        "memory:///manual-trusted.xsd",
+        &mut manual_trusted_set,
+    )
+    .unwrap();
+    assert!(
+        process_loaded_schemas_with_options(&mut manual_trusted_set, options).is_ok(),
+        "the explicit policy must also apply to manually loaded schema sets"
+    );
+}
+
+/// Companion to the nested-redefine test above, with the one difference that
+/// makes the composition schema-**invalid**: `base.xsd` omits
+/// `elementFormDefault`, so its local element `value` is *unqualified* (absent
+/// namespace), while the redefining `outer.xsd` declares
+/// `elementFormDefault="qualified"` and therefore restricts a `{urn:test}value`
+/// that has no counterpart in the base content model.
+///
+/// That violates XSD 1.0 §3.9.6 `rcase-NameAndTypeOK` clause 1 (R's name and
+/// target namespace must equal B's) — equivalently XSD 1.1 §3.4.6.3
+/// `derivation-ok-restriction` clause 2.4.2 reached through §3.4.6.4
+/// `cos-content-act-restrict` clause 1. Strict processing is CORRECT to reject
+/// it; the opt-out exists so a trusted real-world corpus containing such a
+/// document (accepted by laxer validators like .NET's `XmlSchemaSet` or
+/// libxml2) can still be compiled and used for instance validation.
+#[test]
+fn test_nested_redefine_with_element_form_mismatch_requires_opt_out() {
+    let base = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:simpleType name="Code"><xs:restriction base="xs:string"/></xs:simpleType>
+<xs:simpleType name="Inherited"><xs:restriction base="xs:normalizedString"/></xs:simpleType>
+<xs:complexType name="Record"><xs:sequence><xs:element name="value" type="xs:string"/></xs:sequence></xs:complexType>
+</xs:schema>"#;
+    let middle = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:include schemaLocation="base.xsd"/>
+</xs:schema>"#;
+    let outer = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+ targetNamespace="urn:test" xmlns:t="urn:test" elementFormDefault="qualified">
+<xs:redefine schemaLocation="middle.xsd">
+<xs:complexType name="Record"><xs:complexContent><xs:restriction base="t:Record">
+<xs:sequence><xs:element name="value" type="t:Inherited"/></xs:sequence>
+</xs:restriction></xs:complexContent></xs:complexType>
+</xs:redefine>
+<xs:element name="record" type="t:Record"/>
+</xs:schema>"#;
+
+    let tmp = std::env::temp_dir().join(format!(
+        "xsd_test_redefine_form_mismatch_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("base.xsd"), base).unwrap();
+    std::fs::write(tmp.join("middle.xsd"), middle).unwrap();
+    let outer_path = tmp.join("outer.xsd").to_string_lossy().into_owned();
+
+    let mut strict_set = SchemaSet::new();
+    let strict = load_and_process_schema(outer.as_bytes(), &outer_path, &mut strict_set, None);
+
+    let mut trusted_set = SchemaSet::new();
+    let trusted = load_and_process_schema_with_options(
+        outer.as_bytes(),
+        &outer_path,
+        &mut trusted_set,
+        None,
+        SchemaProcessingOptions::default().with_schema_derivation_validation(false),
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // The transitive original IS found (that is the lookup fix); what fails is
+    // the derivation check on the mismatched local element name.
+    let strict_err = strict.expect_err("element-form mismatch must fail in strict mode");
+    assert!(
+        strict_err.to_string().contains("derivation-ok-restriction"),
+        "expected a derivation-ok-restriction failure, got: {strict_err:?}"
+    );
+    assert!(
+        trusted.is_ok(),
+        "the explicit opt-out must accept this trusted-corpus shape: {trusted:?}"
+    );
+}
+
+/// Turning the derivation checker off must NOT turn off circular-derivation
+/// detection: `build_dependency_graph`'s toposort is the only place a cycle is
+/// reported, and a cycle leaves the type system with no valid compilation
+/// order. It therefore runs in both modes, and only
+/// `validate_all_derivations` is gated.
+#[test]
+fn test_derivation_cycle_still_detected_with_validation_disabled() {
+    // A restricts B, B restricts A.
+    let schema = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+<xs:simpleType name="A"><xs:restriction base="B"><xs:maxLength value="4"/></xs:restriction></xs:simpleType>
+<xs:simpleType name="B"><xs:restriction base="A"><xs:maxLength value="8"/></xs:restriction></xs:simpleType>
+</xs:schema>"#;
+
+    let mut strict_set = SchemaSet::new();
+    let strict =
+        load_and_process_schema(schema, "memory:///cycle-strict.xsd", &mut strict_set, None);
+    let strict_err = strict.expect_err("a circular derivation must fail in strict mode");
+    assert!(
+        strict_err.to_string().contains("Circular type dependency"),
+        "expected a circular-dependency failure, got: {strict_err:?}"
+    );
+
+    let mut trusted_set = SchemaSet::new();
+    let trusted = load_and_process_schema_with_options(
+        schema,
+        "memory:///cycle-trusted.xsd",
+        &mut trusted_set,
+        None,
+        SchemaProcessingOptions::default().with_schema_derivation_validation(false),
+    );
+    let trusted_err =
+        trusted.expect_err("cycle detection must stay on when derivation checks are disabled");
+    assert!(
+        trusted_err.to_string().contains("Circular type dependency"),
+        "expected a circular-dependency failure, got: {trusted_err:?}"
+    );
+
+    // Same guarantee on the manual entry point.
+    let mut manual_set = SchemaSet::new();
+    parse_schema_only(schema, "memory:///cycle-manual.xsd", &mut manual_set).unwrap();
+    assert!(
+        process_loaded_schemas_with_options(
+            &mut manual_set,
+            SchemaProcessingOptions::default().with_schema_derivation_validation(false),
+        )
+        .is_err(),
+        "cycle detection must stay on for manually loaded schema sets too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// derivation-ok-restriction regressions found while loading the official
+// GAEB DA XML 3.3 schema corpus (https://www.gaeb.de) in strict mode.
+// ---------------------------------------------------------------------------
+
+/// Helper: load `xsd` into a fresh schema set of the requested XSD version.
+fn load_strict(xsd: &str, xsd11: bool) -> SchemaResult<PipelineStats> {
+    let mut schema_set = if xsd11 {
+        SchemaSet::xsd11()
+    } else {
+        SchemaSet::new()
+    };
+    load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+}
+
+/// §3.9.6 RecurseLax maps the *raw* {particles} of the two choices and checks
+/// the choices' own occurrence ranges separately.  Folding the parent choice's
+/// occurs into every branch makes each derived branch optional as soon as the
+/// choice is, and an optional branch can no longer map onto a base branch whose
+/// first child is required.
+#[test]
+fn test_optional_choice_branch_maps_onto_group_branch() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="0">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                    <xs:element name="c" type="xs:string"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:element name="a" type="xs:string"/>
+                            <xs:element name="c" type="xs:string"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        let result = load_strict(xsd, xsd11);
+        assert!(
+            result.is_ok(),
+            "RecurseLax should accept this (xsd11={xsd11}): {result:?}"
+        );
+    }
+}
+
+/// §3.4.2.4: an `<attribute>` with `use="prohibited"` in a restriction
+/// contributes no attribute use — it only suppresses the base's.  Its `type`
+/// therefore plays no part in derivation-ok-restriction.
+#[test]
+fn test_prohibited_attribute_type_is_not_checked_for_derivation() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token"/>
+            </xs:complexType>
+            <!-- xs:boolean is *not* derived from xs:token: if the prohibited
+                 use were treated as a real attribute use, clause 4 would fire. -->
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:boolean" use="prohibited"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_strict(xsd, false);
+    assert!(
+        result.is_ok(),
+        "a prohibited attribute's type is irrelevant: {result:?}"
+    );
+}
+
+/// Prohibiting a *required* base attribute is still a clause-3 violation.
+#[test]
+fn test_prohibiting_a_required_base_attribute_is_still_rejected() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token" use="required"/>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:token" use="prohibited"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    assert!(load_strict(xsd, false).is_err());
+}
+
+/// `<xs:choice minOccurs="0"/>` is a pointless particle: it accepts exactly the
+/// empty sequence and must not have to map onto anything in the base.
+#[test]
+fn test_empty_optional_choice_is_a_pointless_particle() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:choice minOccurs="0"/>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        let result = load_strict(xsd, xsd11);
+        assert!(result.is_ok(), "(xsd11={xsd11}): {result:?}");
+    }
+}
+
+/// §3.4.2.3: restricting a type that was itself derived by extension must be
+/// checked against `sequence(inherited-particle, own-particle)`, not against
+/// the extension's own contribution alone.
+#[test]
+fn test_restriction_of_extension_sees_the_inherited_content() {
+    let schema = |derived_body: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:sequence>
+                            <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        </xs:sequence>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">{derived_body}</xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#
+        )
+    };
+
+    // Keeps the inherited `a`: valid.
+    let ok = schema(
+        r#"<xs:sequence>
+               <xs:element name="a" type="xs:string"/>
+               <xs:element name="b" type="xs:string"/>
+           </xs:sequence>"#,
+    );
+    assert!(
+        load_strict(&ok, false).is_ok(),
+        "{:?}",
+        load_strict(&ok, false)
+    );
+
+    // Drops the inherited, required `a`: invalid.
+    let bad = schema(
+        r#"<xs:sequence>
+               <xs:element name="b" type="xs:string" minOccurs="0"/>
+           </xs:sequence>"#,
+    );
+    assert!(load_strict(&bad, false).is_err());
+}
+
+/// The base side of a restriction must present its complete `{attribute uses}`,
+/// including the ones it inherited, or every inherited attribute the derived
+/// type re-declares looks like an attribute it invented.
+#[test]
+fn test_restriction_sees_attributes_the_base_inherited() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence/>
+                <xs:attribute name="id" type="xs:token"/>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:sequence/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence/>
+                        <xs:attribute name="id" type="xs:NCName"/>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    let result = load_strict(xsd, false);
+    assert!(
+        result.is_ok(),
+        "`id` is inherited by Base from Root: {result:?}"
+    );
+}
+
+/// A single-branch `<choice>` restricting a multi-branch base choice: the
+/// pointless-particle collapse turns it into a sequence, and XSD 1.0's
+/// structural rules then reject it (msData groupH021v / particlesZ024).  XSD
+/// 1.1 compares languages, so the same schema is valid there.
+#[test]
+fn test_single_branch_choice_restriction_is_version_dependent() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="0">
+                    <xs:sequence>
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                    <xs:sequence>
+                        <xs:element name="c" type="xs:string"/>
+                        <xs:element name="d" type="xs:string" minOccurs="0"/>
+                    </xs:sequence>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                                <xs:element name="d" type="xs:string" minOccurs="0"/>
+                            </xs:sequence>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    assert!(
+        load_strict(xsd, false).is_err(),
+        "XSD 1.0 rejects intensional restrictions of this shape"
+    );
+    let xsd11 = load_strict(xsd, true);
+    assert!(xsd11.is_ok(), "XSD 1.1 accepts it: {xsd11:?}");
+}
+
+/// §3.9.6 RecurseLax clause 1: the two choices' own occurrence ranges are
+/// compared directly.  An optional choice is not a valid XSD 1.0 restriction of
+/// a required one, even when every branch is individually optional — folding
+/// the ranges into the branches hides the violation.  XSD 1.1 compares
+/// languages (§3.4.6.4), and there the two accept the same sequences.
+#[test]
+fn test_optional_choice_restricting_required_choice_is_version_dependent() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Base">
+                <xs:choice minOccurs="1" maxOccurs="1">
+                    <xs:element name="a" type="xs:string" minOccurs="0"/>
+                    <xs:element name="b" type="xs:string" minOccurs="0"/>
+                </xs:choice>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:choice minOccurs="0">
+                            <xs:element name="a" type="xs:string" minOccurs="0"/>
+                            <xs:element name="b" type="xs:string" minOccurs="0"/>
+                        </xs:choice>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    match load_strict(xsd, false) {
+        Err(SchemaError::StructuralError { constraint, .. }) => {
+            assert_eq!(constraint, "derivation-ok-restriction");
+        }
+        other => panic!("XSD 1.0 must reject the widened occurrence range: {other:?}"),
+    }
+    let xsd11 = load_strict(xsd, true);
+    assert!(xsd11.is_ok(), "XSD 1.1 accepts it: {xsd11:?}");
+}
+
+/// A `<xs:choice/>` with no branches and `minOccurs="1"` accepts no sequence at
+/// all, so an extension carrying one has an unsatisfiable content type.  It
+/// must not be discarded while re-assembling `sequence(inherited, own)`, or a
+/// restriction gets checked against the inherited half alone and is wrongly
+/// accepted.
+#[test]
+fn test_required_empty_choice_in_an_extension_is_not_discarded() {
+    let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
+        <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="Root">
+                <xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:complexType name="Base">
+                <xs:complexContent>
+                    <xs:extension base="Root">
+                        <xs:choice/>
+                    </xs:extension>
+                </xs:complexContent>
+            </xs:complexType>
+            <xs:complexType name="Restricted">
+                <xs:complexContent>
+                    <xs:restriction base="Base">
+                        <xs:sequence>
+                            <xs:element name="a" type="xs:string"/>
+                        </xs:sequence>
+                    </xs:restriction>
+                </xs:complexContent>
+            </xs:complexType>
+        </xs:schema>"#;
+
+    for xsd11 in [false, true] {
+        assert!(
+            load_strict(xsd, xsd11).is_err(),
+            "Base accepts no sequence, so nothing restricts it (xsd11={xsd11})"
+        );
+    }
+}

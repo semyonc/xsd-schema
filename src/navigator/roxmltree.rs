@@ -643,12 +643,21 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
                 }
                 NodeType::Element | NodeType::Root => Cow::Owned(self.value()),
             },
-            RoCursor::Attribute { owner, index } => {
-                Cow::Borrowed(owner.attributes().nth(*index).map(|a| a.value()).unwrap_or(""))
-            }
+            RoCursor::Attribute { owner, index } => Cow::Borrowed(
+                owner
+                    .attributes()
+                    .nth(*index)
+                    .map(|a| a.value())
+                    .unwrap_or(""),
+            ),
             RoCursor::Namespace {
                 namespaces, index, ..
-            } => Cow::Borrowed(namespaces.get(*index).map(|(_, uri)| uri.as_str()).unwrap_or("")),
+            } => Cow::Borrowed(
+                namespaces
+                    .get(*index)
+                    .map(|(_, uri)| uri.as_str())
+                    .unwrap_or(""),
+            ),
         }
     }
 

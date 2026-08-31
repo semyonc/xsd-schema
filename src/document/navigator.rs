@@ -928,7 +928,8 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         // content AND no child elements (matching runtime.rs semantics).
         // XSD spec forbids both default and fixed on the same element,
         // so at most one will be Some.  Priority matches runtime.rs.
-        let effective_value: Cow<'_, str> = if value_str.is_empty() && !self.has_element_children() {
+        let effective_value: Cow<'_, str> = if value_str.is_empty() && !self.has_element_children()
+        {
             if let Some(elem_key) = binding.element_decl {
                 let elem_data = &schema_set.arenas.elements[elem_key];
                 if let Some(default_val) = &elem_data.default_value {

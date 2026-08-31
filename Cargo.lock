@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "xsd-schema"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "ahash 0.8.12",
  "base64",

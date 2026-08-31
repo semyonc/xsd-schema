@@ -1709,11 +1709,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if has_type_alternatives {
                 // deferred to end_of_attributes_inner
             } else {
-                let type_name = crate::schema::derivation::format_type_name(
-                    self.schema_set,
-                    ct_name,
-                    ct_ns,
-                );
+                let type_name =
+                    crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
                 self.report_error(
                     "cvc-type.2",
                     format!(
@@ -1724,11 +1721,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             #[cfg(not(feature = "xsd11"))]
             {
-                let type_name = crate::schema::derivation::format_type_name(
-                    self.schema_set,
-                    ct_name,
-                    ct_ns,
-                );
+                let type_name =
+                    crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
                 self.report_error(
                     "cvc-type.2",
                     format!(
@@ -3958,7 +3952,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut validity = SchemaValidity::Valid;
 
         // Even token count check (namespace/location pairs)
-        if !tokens.len().is_multiple_of(2) {
+        // `usize::is_multiple_of` was stabilized in Rust 1.87; the modulo keeps
+        // the crate buildable on older toolchains.
+        #[allow(clippy::manual_is_multiple_of)]
+        if tokens.len() % 2 != 0 {
             self.report_error(
                 "cvc-schema-location",
                 format!(
