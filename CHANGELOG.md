@@ -64,6 +64,13 @@ the "intensional restriction" class that the W3C suite itself accepts only for
     (W3C `msData` `groupH021v`, `particlesZ024`, both marked invalid for 1.0 and
     valid for 1.1).
 
+### Changed
+
+- Replaced the two uses of `usize::is_multiple_of`, stabilized in Rust 1.87,
+  with the equivalent modulo, so the crate builds on older toolchains. Verified
+  against rustc 1.85.0 with `--all-features`. No `rust-version` is declared: the
+  crate does not commit to a minimum supported version.
+
 ## [0.1.4] - 2026-08-22
 
 Security release. Upgrades `quick-xml` past two denial-of-service advisories
