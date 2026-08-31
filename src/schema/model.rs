@@ -275,8 +275,7 @@ impl SchemaSet {
         // Schema-document identity is canonical-path based (symlinks and
         // case variants on case-insensitive filesystems collapse), so
         // normalize the probe the same way `mark_loaded` normalizes keys.
-        let canonical =
-            crate::parser::resolver::canonicalize_file_location(location.to_string());
+        let canonical = crate::parser::resolver::canonicalize_file_location(location.to_string());
         self.loaded_locations.contains_key(canonical.as_str())
     }
 

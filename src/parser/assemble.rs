@@ -406,7 +406,10 @@ impl<'a> SchemaAssembler<'a> {
                 let name_str = self.schema_set.name_table.resolve(ic_name);
                 return Err(SchemaError::structural(
                     "ic-unique",
-                    format!("Duplicate identity constraint name '{}' in schema", name_str),
+                    format!(
+                        "Duplicate identity constraint name '{}' in schema",
+                        name_str
+                    ),
                     location,
                 ));
             }

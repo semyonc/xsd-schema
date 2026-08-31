@@ -411,8 +411,7 @@ impl BuiltinTypes {
 
         // Build lookup maps (ahash for the small-int keyed maps; dense
         // SecondaryMap for the slotmap-keyed reverse map — no SipHash).
-        let mut by_type_code: HashMap<XmlTypeCode, SimpleTypeKey, RandomState> =
-            HashMap::default();
+        let mut by_type_code: HashMap<XmlTypeCode, SimpleTypeKey, RandomState> = HashMap::default();
         let mut by_key: SecondaryMap<SimpleTypeKey, XmlTypeCode> = SecondaryMap::new();
         let mut by_local_name: HashMap<NameId, SimpleTypeKey, RandomState> = HashMap::default();
 

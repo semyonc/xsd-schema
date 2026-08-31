@@ -1709,11 +1709,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if has_type_alternatives {
                 // deferred to end_of_attributes_inner
             } else {
-                let type_name = crate::schema::derivation::format_type_name(
-                    self.schema_set,
-                    ct_name,
-                    ct_ns,
-                );
+                let type_name =
+                    crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
                 self.report_error(
                     "cvc-type.2",
                     format!(
@@ -1724,11 +1721,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             #[cfg(not(feature = "xsd11"))]
             {
-                let type_name = crate::schema::derivation::format_type_name(
-                    self.schema_set,
-                    ct_name,
-                    ct_ns,
-                );
+                let type_name =
+                    crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
                 self.report_error(
                     "cvc-type.2",
                     format!(

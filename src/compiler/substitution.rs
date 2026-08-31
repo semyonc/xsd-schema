@@ -421,8 +421,12 @@ mod tests {
         let a_name = schema_set.name_table.add("a");
         let b_name = schema_set.name_table.add("b");
         let ty = TypeKey::Simple(schema_set.builtin_types().decimal);
-        schema_set.arenas.alloc_element(element_data(a_name, ty, None));
-        schema_set.arenas.alloc_element(element_data(b_name, ty, None));
+        schema_set
+            .arenas
+            .alloc_element(element_data(a_name, ty, None));
+        schema_set
+            .arenas
+            .alloc_element(element_data(b_name, ty, None));
 
         let map = build_substitution_group_map(&schema_set);
         assert!(map.is_empty());
