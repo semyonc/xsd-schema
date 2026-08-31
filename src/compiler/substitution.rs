@@ -24,7 +24,7 @@ pub type SubstitutableNameSet = HashSet<(NameId, Option<NameId>), RandomState>;
 /// this map is `.get()`-probed per candidate NFA `Element` term in
 /// `term_matches` on the per-child validation hot path, so it uses keyed
 /// `ahash` rather than the default SipHash — same rationale as the inner
-/// [`SubstitutableNameSet`].
+/// `SubstitutableNameSet`.
 pub type SubstitutionGroupMap = HashMap<ElementKey, SubstitutableNameSet, RandomState>;
 
 /// Build a substitution group membership map for the schema set.

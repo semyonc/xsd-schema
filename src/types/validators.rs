@@ -799,7 +799,7 @@ impl TypeValidator for BooleanValidator {
 /// Validate strict XSD lexical form for `xs:decimal`.
 ///
 /// Datatypes 1.1 §3.3.3 (`decimalLexicalRep ::= decimalPtNumeral |
-/// noDecimalPtNumeral`, productions [45]–[51]) admits only
+/// noDecimalPtNumeral`, productions \[45\]–\[51\]) admits only
 /// `('+'|'-')? (digits ('.' digits?)? | '.' digits)` — no exponent and no
 /// `INF`/`NaN` (those enter the grammar at `scientificNotationNumeral`,
 /// which decimal's lexical mapping never references). `rust_decimal`'s
