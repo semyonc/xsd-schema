@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.5] - 2026-08-31
 
 Composition and complex-type restriction fixes, prompted by the official GAEB
 DA XML 3.3 schema corpus (<https://www.gaeb.de>) — 32 schemas built on chained,
@@ -63,6 +63,12 @@ the "intensional restriction" class that the W3C suite itself accepts only for
     single-branch `<choice>` restricting a multi-branch base choice invalid
     (W3C `msData` `groupH021v`, `particlesZ024`, both marked invalid for 1.0 and
     valid for 1.1).
+
+- Three `cargo doc` intra-doc-link warnings: the Datatypes 1.1 production
+  numbers in `is_valid_xsd_decimal_lexical` were read as item links, and
+  `SubstitutionGroupMap` linked to a `pub(crate)` item absent from the
+  rendered docs. `cargo doc --no-deps` is now warning-free with and without
+  `--features xsd11`.
 
 ### Changed
 
@@ -228,6 +234,7 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
+[0.1.5]: https://github.com/semyonc/xsd-schema/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/semyonc/xsd-schema/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/semyonc/xsd-schema/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/semyonc/xsd-schema/compare/v0.1.1...v0.1.2

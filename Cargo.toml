@@ -1,6 +1,6 @@
 [package]
 name = "xsd-schema"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 authors = ["semyonc"]
 description = "XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in XPath 2.0 engine"
