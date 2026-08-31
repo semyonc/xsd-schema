@@ -3627,7 +3627,7 @@ fn test_accept_xsd11_intensional_restriction_z028() {
 /// or restricts the local element `value` agrees on
 /// `elementFormDefault="qualified"`, so the redefined `Record` really is a
 /// valid restriction of the original (rcase-NameAndTypeOK). They therefore
-/// must load in STRICT mode, with no `SchemaProcessingOptions` opt-out.
+/// must load with the derivation checks fully enabled.
 #[test]
 fn test_nested_redefine_resolves_original_through_effective_view() {
     for ns_case in ["namespaced", "chameleon"] {
@@ -3798,19 +3798,15 @@ fn test_nested_redefine_resolves_original_through_effective_view() {
     }
 }
 
-/// `SchemaProcessingOptions::with_schema_derivation_validation(false)` skips
-/// the structural derivation checks for callers who knowingly accept a
-/// non-conformant but trusted schema corpus.
+/// The derivation checks run on both the one-shot and the manual
+/// (parse-then-process) entry points.
 ///
 /// The fixture below is deliberately schema-INVALID: `InvalidRestriction`
 /// declares an element `b` that does not appear in `Base`'s content model, so
 /// no rcase in XSD 1.0 §3.9.6 (nor §3.4.6.4 `cos-content-act-restrict` in
-/// XSD 1.1) can hold. Strict processing is right to reject it; the opt-out
-/// exists only so that such a corpus can still be compiled.
+/// XSD 1.1) can hold.
 #[test]
-fn test_schema_derivation_validation_can_be_disabled_explicitly() {
-    let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
-
+fn test_derivation_validation_runs_on_every_entry_point() {
     let schema = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:complexType name="Base"><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence></xs:complexType>
 <xs:complexType name="InvalidRestriction"><xs:complexContent><xs:restriction base="Base">
@@ -3818,47 +3814,19 @@ fn test_schema_derivation_validation_can_be_disabled_explicitly() {
 </xs:restriction></xs:complexContent></xs:complexType>
 </xs:schema>"#;
 
-    let mut strict_set = SchemaSet::new();
-    let strict = load_and_process_schema(schema, "memory:///strict.xsd", &mut strict_set, None);
-    let strict_err = strict.expect_err("strict processing must check derivation constraints");
+    let mut set = SchemaSet::new();
+    let err = load_and_process_schema(schema, "memory:///strict.xsd", &mut set, None)
+        .expect_err("processing must check derivation constraints");
     assert!(
-        strict_err.to_string().contains("derivation-ok-restriction"),
-        "expected a derivation-ok-restriction failure, got: {strict_err:?}"
+        err.to_string().contains("derivation-ok-restriction"),
+        "expected a derivation-ok-restriction failure, got: {err:?}"
     );
 
-    let mut trusted_set = SchemaSet::new();
-    let trusted = load_and_process_schema_with_options(
-        schema,
-        "memory:///trusted.xsd",
-        &mut trusted_set,
-        None,
-        options,
-    );
+    let mut manual_set = SchemaSet::new();
+    parse_schema_only(schema, "memory:///manual.xsd", &mut manual_set).unwrap();
     assert!(
-        trusted.is_ok(),
-        "disabling the derivation checker must preserve the rest of the pipeline: {trusted:?}"
-    );
-
-    // The same policy must reach the manual (parse-then-process) entry points.
-    let mut manual_strict_set = SchemaSet::new();
-    parse_schema_only(
-        schema,
-        "memory:///manual-strict.xsd",
-        &mut manual_strict_set,
-    )
-    .unwrap();
-    assert!(process_loaded_schemas(&mut manual_strict_set).is_err());
-
-    let mut manual_trusted_set = SchemaSet::new();
-    parse_schema_only(
-        schema,
-        "memory:///manual-trusted.xsd",
-        &mut manual_trusted_set,
-    )
-    .unwrap();
-    assert!(
-        process_loaded_schemas_with_options(&mut manual_trusted_set, options).is_ok(),
-        "the explicit policy must also apply to manually loaded schema sets"
+        process_loaded_schemas(&mut manual_set).is_err(),
+        "the manual entry point must check them too"
     );
 }
 
@@ -3872,12 +3840,12 @@ fn test_schema_derivation_validation_can_be_disabled_explicitly() {
 /// That violates XSD 1.0 §3.9.6 `rcase-NameAndTypeOK` clause 1 (R's name and
 /// target namespace must equal B's) — equivalently XSD 1.1 §3.4.6.3
 /// `derivation-ok-restriction` clause 2.4.2 reached through §3.4.6.4
-/// `cos-content-act-restrict` clause 1. Strict processing is CORRECT to reject
-/// it; the opt-out exists so a trusted real-world corpus containing such a
-/// document (accepted by laxer validators like .NET's `XmlSchemaSet` or
-/// libxml2) can still be compiled and used for instance validation.
+/// `cos-content-act-restrict` clause 1, so processing is CORRECT to reject it.
+/// What this test pins down is *which* check fires: the transitive original is
+/// found (that is the redefine lookup working), and the failure comes from the
+/// derivation check on the mismatched local element name.
 #[test]
-fn test_nested_redefine_with_element_form_mismatch_requires_opt_out() {
+fn test_nested_redefine_with_element_form_mismatch_is_rejected() {
     let base = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:simpleType name="Code"><xs:restriction base="xs:string"/></xs:simpleType>
 <xs:simpleType name="Inherited"><xs:restriction base="xs:normalizedString"/></xs:simpleType>
@@ -3906,39 +3874,24 @@ fn test_nested_redefine_with_element_form_mismatch_requires_opt_out() {
     std::fs::write(tmp.join("middle.xsd"), middle).unwrap();
     let outer_path = tmp.join("outer.xsd").to_string_lossy().into_owned();
 
-    let mut strict_set = SchemaSet::new();
-    let strict = load_and_process_schema(outer.as_bytes(), &outer_path, &mut strict_set, None);
-
-    let mut trusted_set = SchemaSet::new();
-    let trusted = load_and_process_schema_with_options(
-        outer.as_bytes(),
-        &outer_path,
-        &mut trusted_set,
-        None,
-        SchemaProcessingOptions::default().with_schema_derivation_validation(false),
-    );
+    let mut schema_set = SchemaSet::new();
+    let result = load_and_process_schema(outer.as_bytes(), &outer_path, &mut schema_set, None);
     let _ = std::fs::remove_dir_all(&tmp);
 
     // The transitive original IS found (that is the lookup fix); what fails is
     // the derivation check on the mismatched local element name.
-    let strict_err = strict.expect_err("element-form mismatch must fail in strict mode");
+    let err = result.expect_err("element-form mismatch must be rejected");
     assert!(
-        strict_err.to_string().contains("derivation-ok-restriction"),
-        "expected a derivation-ok-restriction failure, got: {strict_err:?}"
-    );
-    assert!(
-        trusted.is_ok(),
-        "the explicit opt-out must accept this trusted-corpus shape: {trusted:?}"
+        err.to_string().contains("derivation-ok-restriction"),
+        "expected a derivation-ok-restriction failure, got: {err:?}"
     );
 }
 
-/// Turning the derivation checker off must NOT turn off circular-derivation
-/// detection: `build_dependency_graph`'s toposort is the only place a cycle is
-/// reported, and a cycle leaves the type system with no valid compilation
-/// order. It therefore runs in both modes, and only
-/// `validate_all_derivations` is gated.
+/// `build_dependency_graph`'s toposort is the only place a circular derivation
+/// is reported, and a cycle leaves the type system with no valid compilation
+/// order — so both entry points must reject one.
 #[test]
-fn test_derivation_cycle_still_detected_with_validation_disabled() {
+fn test_derivation_cycle_is_detected() {
     // A restricts B, B restricts A.
     let schema = br#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:simpleType name="A"><xs:restriction base="B"><xs:maxLength value="4"/></xs:restriction></xs:simpleType>
@@ -3954,31 +3907,12 @@ fn test_derivation_cycle_still_detected_with_validation_disabled() {
         "expected a circular-dependency failure, got: {strict_err:?}"
     );
 
-    let mut trusted_set = SchemaSet::new();
-    let trusted = load_and_process_schema_with_options(
-        schema,
-        "memory:///cycle-trusted.xsd",
-        &mut trusted_set,
-        None,
-        SchemaProcessingOptions::default().with_schema_derivation_validation(false),
-    );
-    let trusted_err =
-        trusted.expect_err("cycle detection must stay on when derivation checks are disabled");
-    assert!(
-        trusted_err.to_string().contains("Circular type dependency"),
-        "expected a circular-dependency failure, got: {trusted_err:?}"
-    );
-
     // Same guarantee on the manual entry point.
     let mut manual_set = SchemaSet::new();
     parse_schema_only(schema, "memory:///cycle-manual.xsd", &mut manual_set).unwrap();
     assert!(
-        process_loaded_schemas_with_options(
-            &mut manual_set,
-            SchemaProcessingOptions::default().with_schema_derivation_validation(false),
-        )
-        .is_err(),
-        "cycle detection must stay on for manually loaded schema sets too"
+        process_loaded_schemas(&mut manual_set).is_err(),
+        "cycle detection must apply to manually loaded schema sets too"
     );
 }
 

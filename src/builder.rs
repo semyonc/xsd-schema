@@ -30,7 +30,7 @@ use crate::parser::resolver::{
 };
 #[cfg(feature = "async")]
 use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
-use crate::pipeline::{process_loaded_schemas_with_options, SchemaProcessingOptions};
+use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
 use std::path::{Path, PathBuf};
@@ -340,19 +340,7 @@ impl SchemaSetBuilder {
     /// # Errors
     ///
     /// Returns an error if any phase fails (invalid schema, missing references, etc.)
-    pub fn compile(self) -> SchemaResult<CompiledSchemaSet> {
-        self.compile_with_options(SchemaProcessingOptions::default())
-    }
-
-    /// Compile all added schemas with an explicit schema-processing policy.
-    ///
-    /// Directive loading and reference resolution run regardless of `options`;
-    /// the options only relax optional schema component constraint checks. See
-    /// [`SchemaProcessingOptions::with_schema_derivation_validation`].
-    pub fn compile_with_options(
-        mut self,
-        options: SchemaProcessingOptions,
-    ) -> SchemaResult<CompiledSchemaSet> {
+    pub fn compile(mut self) -> SchemaResult<CompiledSchemaSet> {
         // Phase 1: Resolve directives for all pending documents
         // Collect into a temp vec to avoid borrow issues
         let pending: Vec<_> = self.pending_docs.drain(..).collect();
@@ -379,8 +367,7 @@ impl SchemaSetBuilder {
 
         // Phases 2-5: Delegate to the pipeline's shared processing function
         // (redefine/override, inline assembly, reference resolution, particle allocation)
-        let (inline_stats, resolution_stats) =
-            process_loaded_schemas_with_options(&mut self.schema_set, options)?;
+        let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
 
         let documents_loaded = self.schema_set.documents.len();
         Ok(CompiledSchemaSet {
@@ -452,21 +439,7 @@ impl SchemaSetBuilder {
     /// Async variant of [`compile`](SchemaSetBuilder::compile). Only directive
     /// resolution (I/O) is async; all computation phases remain synchronous.
     #[cfg(feature = "async")]
-    pub async fn compile_async(self) -> SchemaResult<CompiledSchemaSet> {
-        self.compile_async_with_options(SchemaProcessingOptions::default())
-            .await
-    }
-
-    /// Compile all added schemas asynchronously with an explicit
-    /// schema-processing policy.
-    ///
-    /// Async counterpart of
-    /// [`compile_with_options`](SchemaSetBuilder::compile_with_options).
-    #[cfg(feature = "async")]
-    pub async fn compile_async_with_options(
-        mut self,
-        options: SchemaProcessingOptions,
-    ) -> SchemaResult<CompiledSchemaSet> {
+    pub async fn compile_async(mut self) -> SchemaResult<CompiledSchemaSet> {
         // Phase 1: Resolve directives asynchronously for all pending documents
         let pending: Vec<_> = self.pending_docs.drain(..).collect();
         for doc_id in pending {
@@ -487,8 +460,7 @@ impl SchemaSetBuilder {
         }
 
         // Phases 2-5: Delegate to the pipeline's shared processing function (sync)
-        let (inline_stats, resolution_stats) =
-            process_loaded_schemas_with_options(&mut self.schema_set, options)?;
+        let (inline_stats, resolution_stats) = process_loaded_schemas(&mut self.schema_set)?;
 
         let documents_loaded = self.schema_set.documents.len();
         Ok(CompiledSchemaSet {
@@ -653,14 +625,13 @@ mod tests {
         assert!(compiled.stats.inline_types_assembled > 0);
     }
 
-    /// `compile()` stays strict; `compile_with_options` exposes the same
-    /// trusted-corpus policy as the pipeline entry points.
+    /// The builder validates type derivations.
     ///
     /// The fixture is deliberately schema-INVALID: `InvalidRestriction`
     /// declares an element `b` absent from `Base`'s content model, so no rcase
     /// in XSD 1.0 §3.9.6 can hold and `derivation-ok-restriction` must fail.
     #[test]
-    fn builder_options_preserve_strict_default_and_enable_trusted_schema_policy() {
+    fn builder_rejects_invalid_derivation() {
         let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:complexType name="Base"><xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence></xs:complexType>
 <xs:complexType name="InvalidRestriction"><xs:complexContent><xs:restriction base="Base">
@@ -672,34 +643,25 @@ mod tests {
             .add_source(schema, "strict-builder.xsd")
             .unwrap()
             .compile();
-        assert!(strict.is_err(), "compile() must remain strict by default");
-
-        let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
-        let trusted = SchemaSetBuilder::new()
-            .add_source(schema, "trusted-builder.xsd")
-            .unwrap()
-            .compile_with_options(options);
         assert!(
-            trusted.is_ok(),
-            "configured builder compilation must expose the trusted-schema policy: {:?}",
-            trusted.err()
+            strict.is_err(),
+            "compile() must reject an invalid derivation"
         );
     }
 
-    /// Cycle detection is not part of the opt-out: a circular derivation still
-    /// fails the builder with the checks disabled.
+    /// A circular derivation has no valid compilation order, so the builder
+    /// must reject it rather than loop.
     #[test]
-    fn builder_options_keep_circular_derivation_detection() {
+    fn builder_detects_circular_derivation() {
         let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
 <xs:simpleType name="A"><xs:restriction base="B"><xs:maxLength value="4"/></xs:restriction></xs:simpleType>
 <xs:simpleType name="B"><xs:restriction base="A"><xs:maxLength value="8"/></xs:restriction></xs:simpleType>
 </xs:schema>"#;
 
-        let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
         let result = SchemaSetBuilder::new()
             .add_source(schema, "cycle-builder.xsd")
             .unwrap()
-            .compile_with_options(options);
+            .compile();
         let err = result.err().expect("circular derivation must still fail");
         assert!(
             err.to_string().contains("Circular type dependency"),
@@ -709,13 +671,12 @@ mod tests {
 
     #[cfg(feature = "async")]
     #[test]
-    fn async_builder_exposes_explicit_processing_options() {
+    fn async_builder_exposes_compile_async() {
         let schema = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"/>"#;
-        let options = SchemaProcessingOptions::default().with_schema_derivation_validation(false);
         let future = SchemaSetBuilder::new()
-            .add_source(schema, "async-options-builder.xsd")
+            .add_source(schema, "async-builder.xsd")
             .unwrap()
-            .compile_async_with_options(options);
+            .compile_async();
         drop(future);
     }
 
