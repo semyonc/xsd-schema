@@ -207,9 +207,10 @@ pub use embedded::{
 
 // Re-export compiler types
 pub use compiler::{
-    compile_model_group, compile_particle, fragment_to_table, CompileContext, FragmentBuilder,
-    NfaCompileError, NfaCompileResult, NfaFragment, NfaState, NfaTable, NfaTerm, NfaTransition,
-    StateId, TransitionKind,
+    compile_model_group, compile_particle, find_complex_type, fragment_to_table,
+    inspect_content_model, CompileContext, ContentModelReport, FragmentBuilder, NfaCompileError,
+    NfaCompileResult, NfaFragment, NfaState, NfaTable, NfaTerm, NfaTransition, StateId,
+    TransitionKind,
 };
 
 // Re-export instance validation types

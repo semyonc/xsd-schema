@@ -30,6 +30,7 @@ mod all_group;
 mod compile;
 mod error;
 mod fragment;
+pub mod inspect;
 mod nfa;
 #[cfg(feature = "xsd11")]
 mod open_content;
@@ -50,6 +51,13 @@ pub(crate) use compile::{
 };
 pub use error::{NfaCompileError, NfaCompileResult};
 pub use fragment::{fragment_to_table, FragmentBuilder, NfaFragment};
+pub use inspect::{
+    find_complex_type, inspect_content_model, AllGroupView, AllMemberView, AuthoredKind,
+    AuthoredNode, AuthoredSection, AuthoredView, CompiledView, ContentModelReport, CounterView,
+    DeclarationBinding, ElementTermView, ExposureView, FrontierView, GroupRefView, NfaView,
+    OccurrenceCompilation, OpenContentView, SourceView, StateRow, SubstitutionGroupView, TermView,
+    WildcardTermView,
+};
 pub use nfa::{
     advance_states, advance_with_priority, epsilon_closure, term_matches as nfa_term_matches,
     ActiveConfig, ActiveStates, ContentModelLimit, ContentModelLimitExceeded, CounterDef,
