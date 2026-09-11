@@ -199,10 +199,7 @@ fn check_config_limit(observed: usize) -> Result<(), ContentModelLimitExceeded> 
 /// configuration per way of partitioning the input into iterations —
 /// O(k²) after k children — although all but a bounded few are dominated.
 /// The former 10 000 cutoff hid this by turning such bounds into stars.
-fn prune_dominated(
-    configs: HashSet<ActiveConfig>,
-    defs: &[CounterDef],
-) -> HashSet<ActiveConfig> {
+fn prune_dominated(configs: HashSet<ActiveConfig>, defs: &[CounterDef]) -> HashSet<ActiveConfig> {
     if configs.len() < 2 {
         return configs;
     }
@@ -1227,12 +1224,14 @@ fn hybrid_epsilon_closure(
                         key.with_scalar_counter(trans.target, c, 0, ranged_counter_idx),
                         range,
                     )),
-                    TransitionKind::CounterIncrement(c) => key.counter(c).checked_add(1).map(|val| {
-                        (
-                            key.with_scalar_counter(trans.target, c, val, ranged_counter_idx),
-                            range,
-                        )
-                    }),
+                    TransitionKind::CounterIncrement(c) => {
+                        key.counter(c).checked_add(1).map(|val| {
+                            (
+                                key.with_scalar_counter(trans.target, c, val, ranged_counter_idx),
+                                range,
+                            )
+                        })
+                    }
                     TransitionKind::CounterMaxGuard(c) => {
                         if key.counter(c) < nfa.counter_defs[c as usize].max {
                             Some((key.with_state(trans.target), range))
@@ -1844,8 +1843,9 @@ impl ActiveStates {
 
     /// Compute epsilon closure (including counter transitions for Counted path).
     pub fn epsilon_closure(self, nfa: &NfaTable) -> Self {
-        self.try_epsilon_closure(nfa)
-            .unwrap_or_else(|e| panic!("ActiveStates::epsilon_closure: {e}; use try_epsilon_closure"))
+        self.try_epsilon_closure(nfa).unwrap_or_else(|e| {
+            panic!("ActiveStates::epsilon_closure: {e}; use try_epsilon_closure")
+        })
     }
 
     /// Fallible form of [`epsilon_closure`](Self::epsilon_closure): enforces
@@ -1853,10 +1853,7 @@ impl ActiveStates {
     /// (the counter-free `Simple` path is bounded by the state count and
     /// cannot fail). Limits are checked *while* the configuration set grows,
     /// so peak memory is bounded, not just the final size.
-    pub fn try_epsilon_closure(
-        self,
-        nfa: &NfaTable,
-    ) -> Result<Self, ContentModelLimitExceeded> {
+    pub fn try_epsilon_closure(self, nfa: &NfaTable) -> Result<Self, ContentModelLimitExceeded> {
         match self {
             ActiveStates::Simple(states) => {
                 Ok(ActiveStates::Simple(epsilon_closure(nfa, states.iter())))
@@ -1883,8 +1880,7 @@ impl ActiveStates {
                                 TransitionKind::CounterReset(c) => {
                                     Some(config.with_counter_set(trans.target, c, 0))
                                 }
-                                TransitionKind::CounterIncrement(c) => config.counters
-                                    [c as usize]
+                                TransitionKind::CounterIncrement(c) => config.counters[c as usize]
                                     .checked_add(1)
                                     .map(|val| config.with_counter_set(trans.target, c, val)),
                                 TransitionKind::CounterMaxGuard(c) => {
@@ -3875,13 +3871,19 @@ mod exact_bounds_tests {
     #[test]
     fn bound_10001_is_exact() {
         let nfa = counted_a(0, 10_001);
-        assert!(nfa.has_counters(), "bounds above the unroll threshold are counted");
+        assert!(
+            nfa.has_counters(),
+            "bounds above the unroll threshold are counted"
+        );
         let mut active = ActiveStates::try_from_nfa(&nfa).unwrap();
         for _ in 0..10_001 {
             active = step(active, &nfa);
             assert!(!active.is_empty());
         }
-        assert!(active.contains_accept(&nfa), "10 001 children satisfy a{{0,10001}}");
+        assert!(
+            active.contains_accept(&nfa),
+            "10 001 children satisfy a{{0,10001}}"
+        );
         let over = step(active, &nfa);
         assert!(over.is_empty(), "the 10 002nd child must be rejected");
     }
@@ -3903,7 +3905,10 @@ mod exact_bounds_tests {
             let nfa = counted_a(min, max);
             let mut active = ActiveStates::try_from_nfa(&nfa).unwrap();
             if min > 0 {
-                assert!(!active.contains_accept(&nfa), "{min}..{max}: empty content is invalid");
+                assert!(
+                    !active.contains_accept(&nfa),
+                    "{min}..{max}: empty content is invalid"
+                );
             }
             for i in 1..=max {
                 active = step(active, &nfa);
@@ -3914,7 +3919,11 @@ mod exact_bounds_tests {
                     "{min}..{max}: completion after {i} children"
                 );
             }
-            assert!(step(active, &nfa).is_empty(), "{min}..{max}: child {} rejected", max + 1);
+            assert!(
+                step(active, &nfa).is_empty(),
+                "{min}..{max}: child {} rejected",
+                max + 1
+            );
         }
     }
 
@@ -3945,7 +3954,10 @@ mod exact_bounds_tests {
         // One below the maximum: the next child completes the maximum, the one after is rejected.
         let active = step(at(u32::MAX - 1), &nfa);
         assert!(active.contains_accept(&nfa));
-        assert!(step(active, &nfa).is_empty(), "u32::MAX + 1 children must be rejected");
+        assert!(
+            step(active, &nfa).is_empty(),
+            "u32::MAX + 1 children must be rejected"
+        );
 
         // Two below: two more children fit, the third does not.
         let active = step(at(u32::MAX - 2), &nfa);
@@ -3999,7 +4011,9 @@ mod exact_bounds_tests {
     /// unroll threshold; otherwise the bounds are unrolled (counter-free).
     fn choice_seq_model(cmin: u32, cmax: u32, smin: u32, smax: u32, counted: bool) -> NfaTable {
         let builder = FragmentBuilder::new();
-        let a_plus = builder.single_term(NfaTerm::element(A, None, None), None).repeat_plus();
+        let a_plus = builder
+            .single_term(NfaTerm::element(A, None, None), None)
+            .repeat_plus();
         let seq = if counted {
             a_plus.repeat_counted(smin, smax)
         } else {
@@ -4067,7 +4081,12 @@ mod exact_bounds_tests {
     /// side of the dominance rule) and both XSD versions' advance rules.
     #[test]
     fn counted_with_pruning_matches_unrolled() {
-        for &(cmin, cmax, smin, smax) in &[(1u32, 3u32, 1u32, 4u32), (2, 3, 2, 4), (0, 2, 1, 2), (1, 2, 0, 3)] {
+        for &(cmin, cmax, smin, smax) in &[
+            (1u32, 3u32, 1u32, 4u32),
+            (2, 3, 2, 4),
+            (0, 2, 1, 2),
+            (1, 2, 0, 3),
+        ] {
             let counted = choice_seq_model(cmin, cmax, smin, smax, true);
             let unrolled = choice_seq_model(cmin, cmax, smin, smax, false);
             assert!(counted.has_counters() && !unrolled.has_counters());
@@ -4076,18 +4095,32 @@ mod exact_bounds_tests {
                     for bits in 0..(1u32 << len) {
                         let mut c = ActiveStates::try_from_nfa(&counted).unwrap();
                         let mut u = ActiveStates::try_from_nfa(&unrolled).unwrap();
-                        let tag = format!("{cmin},{cmax},{smin},{smax} {version:?} len={len} bits={bits:b}");
-                        assert_eq!(c.contains_accept(&counted), u.contains_accept(&unrolled), "{tag}: empty input");
+                        let tag = format!(
+                            "{cmin},{cmax},{smin},{smax} {version:?} len={len} bits={bits:b}"
+                        );
+                        assert_eq!(
+                            c.contains_accept(&counted),
+                            u.contains_accept(&unrolled),
+                            "{tag}: empty input"
+                        );
                         for i in 0..len {
                             let sym = if bits & (1 << i) == 0 { A } else { B };
                             c = match version {
-                                XsdVersion::V1_0 => c.try_advance(&counted, sym, None, None, None, version),
-                                XsdVersion::V1_1 => c.try_advance_with_priority(&counted, sym, None, None, None, version),
+                                XsdVersion::V1_0 => {
+                                    c.try_advance(&counted, sym, None, None, None, version)
+                                }
+                                XsdVersion::V1_1 => c.try_advance_with_priority(
+                                    &counted, sym, None, None, None, version,
+                                ),
                             }
                             .unwrap();
                             u = match version {
-                                XsdVersion::V1_0 => u.try_advance(&unrolled, sym, None, None, None, version),
-                                XsdVersion::V1_1 => u.try_advance_with_priority(&unrolled, sym, None, None, None, version),
+                                XsdVersion::V1_0 => {
+                                    u.try_advance(&unrolled, sym, None, None, None, version)
+                                }
+                                XsdVersion::V1_1 => u.try_advance_with_priority(
+                                    &unrolled, sym, None, None, None, version,
+                                ),
                             }
                             .unwrap();
                             assert_eq!(c.is_empty(), u.is_empty(), "{tag}: rejection at {i}");

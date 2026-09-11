@@ -105,12 +105,20 @@ fn dom(schema_set: &SchemaSet, xml: &str) -> Run {
 }
 
 fn assert_valid(run: &Run, what: &str) {
-    assert_eq!(run.outcome, Ok(Some(SchemaValidity::Valid)), "{what}: outcome");
+    assert_eq!(
+        run.outcome,
+        Ok(Some(SchemaValidity::Valid)),
+        "{what}: outcome"
+    );
     assert!(run.errors.is_empty(), "{what}: errors {:?}", run.errors);
 }
 
 fn assert_invalid_content_model(run: &Run, what: &str) {
-    assert_eq!(run.outcome, Ok(Some(SchemaValidity::Invalid)), "{what}: outcome");
+    assert_eq!(
+        run.outcome,
+        Ok(Some(SchemaValidity::Invalid)),
+        "{what}: outcome"
+    );
     assert!(
         run.errors
             .iter()
@@ -128,7 +136,10 @@ fn max_occurs_10001_is_exact() {
         ("stream", stream as fn(&SchemaSet, &str) -> Run),
         ("dom", dom as fn(&SchemaSet, &str) -> Run),
     ] {
-        assert_valid(&run(&ss, &instance_with_a(10_001)), &format!("{name}: 10001 children"));
+        assert_valid(
+            &run(&ss, &instance_with_a(10_001)),
+            &format!("{name}: 10001 children"),
+        );
         assert_invalid_content_model(
             &run(&ss, &instance_with_a(10_002)),
             &format!("{name}: 10002 children"),
@@ -155,8 +166,14 @@ fn occurrence_boundary_matrix() {
                     &format!("{tag}: {} children", min - 1),
                 );
             }
-            assert_valid(&stream(&ss, &instance_with_a(min)), &format!("{tag}: {min} children"));
-            assert_valid(&stream(&ss, &instance_with_a(max)), &format!("{tag}: {max} children"));
+            assert_valid(
+                &stream(&ss, &instance_with_a(min)),
+                &format!("{tag}: {min} children"),
+            );
+            assert_valid(
+                &stream(&ss, &instance_with_a(max)),
+                &format!("{tag}: {max} children"),
+            );
             assert_invalid_content_model(
                 &stream(&ss, &instance_with_a(max + 1)),
                 &format!("{tag}: {} children", max + 1),
@@ -169,7 +186,10 @@ fn occurrence_boundary_matrix() {
 #[test]
 fn unbounded_stays_unbounded() {
     let ss = schema(&element_a_schema("0", "unbounded"));
-    assert_valid(&stream(&ss, &instance_with_a(25_000)), "unbounded: 25000 children");
+    assert_valid(
+        &stream(&ss, &instance_with_a(25_000)),
+        "unbounded: 25000 children",
+    );
 }
 
 /// A literal beyond `u32` is schema-valid (nonNegativeInteger has no bound);
@@ -178,7 +198,10 @@ fn unbounded_stays_unbounded() {
 #[test]
 fn huge_occurrence_literal_loads_and_validates() {
     let ss = schema(&element_a_schema("0", "79228162514264337593543950335"));
-    assert_valid(&stream(&ss, &instance_with_a(5)), "huge literal: 5 children");
+    assert_valid(
+        &stream(&ss, &instance_with_a(5)),
+        "huge literal: 5 children",
+    );
     let ss = schema(&element_a_schema("2", "4294967296"));
     assert_invalid_content_model(&stream(&ss, &instance_with_a(1)), "huge literal: below min");
     assert_valid(&stream(&ss, &instance_with_a(2)), "huge literal: at min");
@@ -213,8 +236,16 @@ fn unpreparable_content_model_is_an_operational_failure() {
     let ss = schema(&nested_nullable_schema(""));
     let validator = SchemaValidator::new(&ss, ValidationFlags::default());
     let failures = validator.content_model_failures();
-    assert_eq!(failures.len(), 1, "exactly the root type fails: {failures:?}");
-    assert!(failures[0].1.contains("execution limit exceeded"), "{}", failures[0].1);
+    assert_eq!(
+        failures.len(),
+        1,
+        "exactly the root type fails: {failures:?}"
+    );
+    assert!(
+        failures[0].1.contains("execution limit exceeded"),
+        "{}",
+        failures[0].1
+    );
 
     for (name, run) in [
         ("stream", stream as fn(&SchemaSet, &str) -> Run),
@@ -227,7 +258,11 @@ fn unpreparable_content_model_is_an_operational_failure() {
             "{name}: completion must fail"
         );
         let codes: Vec<_> = run.errors.iter().map(|e| e.constraint).collect();
-        assert_eq!(codes, ["validation-preparation-failed"], "{name}: exactly one diagnostic");
+        assert_eq!(
+            codes,
+            ["validation-preparation-failed"],
+            "{name}: exactly one diagnostic"
+        );
     }
 }
 
@@ -237,9 +272,14 @@ fn unpreparable_content_model_is_an_operational_failure() {
 /// gets exactly one diagnostic, and no validity verdict is produced.
 #[test]
 fn execution_limit_mid_document_is_an_operational_failure() {
-    let ss = schema(&nested_nullable_schema(r#"<xs:element name="b" type="xs:string"/>"#));
+    let ss = schema(&nested_nullable_schema(
+        r#"<xs:element name="b" type="xs:string"/>"#,
+    ));
     let validator = SchemaValidator::new(&ss, ValidationFlags::default());
-    assert!(validator.content_model_failures().is_empty(), "initial state is small");
+    assert!(
+        validator.content_model_failures().is_empty(),
+        "initial state is small"
+    );
 
     for (name, run) in [
         ("stream", stream as fn(&SchemaSet, &str) -> Run),
@@ -252,9 +292,16 @@ fn execution_limit_mid_document_is_an_operational_failure() {
             "{name}: completion must fail"
         );
         let codes: Vec<_> = run.errors.iter().map(|e| e.constraint).collect();
-        assert_eq!(codes, ["validation-resource-limit"], "{name}: exactly one diagnostic");
+        assert_eq!(
+            codes,
+            ["validation-resource-limit"],
+            "{name}: exactly one diagnostic"
+        );
         let msg = &run.errors[0].message;
         assert!(msg.contains("execution limit"), "{msg}");
-        assert!(msg.contains("'r'"), "names the element whose model failed: {msg}");
+        assert!(
+            msg.contains("'r'"),
+            "names the element whose model failed: {msg}"
+        );
     }
 }

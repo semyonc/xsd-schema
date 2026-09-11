@@ -697,8 +697,9 @@ impl ContentValidatorState {
     /// If computing the completion state of an XSD 1.1 all-group extension
     /// exceeds an execution limit; see [`try_is_complete`](Self::try_is_complete).
     pub fn is_complete(&self) -> bool {
-        self.try_is_complete()
-            .unwrap_or_else(|e| panic!("ContentValidatorState::is_complete: {e}; use try_is_complete"))
+        self.try_is_complete().unwrap_or_else(|e| {
+            panic!("ContentValidatorState::is_complete: {e}; use try_is_complete")
+        })
     }
 
     /// Fallible form of [`is_complete`](Self::is_complete).

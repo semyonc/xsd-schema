@@ -147,7 +147,9 @@ mod tests {
         }
         // Unbounded stays a star: no counter.
         let frag = builder.single_term(NfaTerm::element(NameId(1), None, None), None);
-        assert!(apply_occurs(frag, 0, MaxOccurs::Unbounded).counter_defs.is_empty());
+        assert!(apply_occurs(frag, 0, MaxOccurs::Unbounded)
+            .counter_defs
+            .is_empty());
     }
 
     #[test]
