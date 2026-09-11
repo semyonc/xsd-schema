@@ -354,14 +354,6 @@ pub enum CompiledView {
     Nfa(NfaView),
     /// An all-group model (unordered particles).
     AllGroup(AllGroupView),
-    /// XSD 1.1: an all-group base with an NFA extension.
-    #[cfg(feature = "xsd11")]
-    AllGroupExtension {
-        /// The base type's all-group.
-        base: AllGroupView,
-        /// The extension's NFA. Boxed to keep [`CompiledView`] small.
-        extension: Box<NfaView>,
-    },
     /// The validator could not prepare a model for this type.
     Failed {
         /// The compiler error or execution-limit message.
@@ -377,8 +369,6 @@ impl CompiledView {
         match self {
             CompiledView::Nfa(view) => view.note = Some(note.to_string()),
             CompiledView::AllGroup(view) => view.note = Some(note.to_string()),
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { base, .. } => base.note = Some(note.to_string()),
             CompiledView::Failed { .. } => {}
         }
     }
@@ -388,8 +378,6 @@ impl CompiledView {
         match self {
             CompiledView::Nfa(view) => &view.matcher,
             CompiledView::AllGroup(view) => &view.matcher,
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { .. } => "all-group extension",
             CompiledView::Failed { .. } => "(preparation failed)",
         }
     }
@@ -722,8 +710,6 @@ fn source_view(
     let open_content = match compiled {
         CompiledView::Nfa(view) => view.open_content.clone(),
         CompiledView::AllGroup(view) => view.open_content.clone(),
-        #[cfg(feature = "xsd11")]
-        CompiledView::AllGroupExtension { base, .. } => base.open_content.clone(),
         CompiledView::Failed { .. } => None,
     };
     SourceView {
@@ -750,9 +736,6 @@ fn authored_view(
     compiled: &CompiledView,
 ) -> AuthoredView {
     let all_group_model = matches!(compiled, CompiledView::AllGroup(_));
-    #[cfg(feature = "xsd11")]
-    let all_group_model =
-        all_group_model || matches!(compiled, CompiledView::AllGroupExtension { .. });
 
     let mut sections = Vec::new();
     collect_sections(
@@ -1127,20 +1110,6 @@ fn compiled_view_from_matcher(
         ContentModelMatcher::AllGroup(model) => {
             CompiledView::AllGroup(all_group_view(schema_set, subst, model))
         }
-        #[cfg(feature = "xsd11")]
-        ContentModelMatcher::AllGroupExtension {
-            base_model,
-            extension_nfa,
-        } => CompiledView::AllGroupExtension {
-            base: all_group_view(schema_set, subst, base_model),
-            extension: Box::new(nfa_view(
-                schema_set,
-                subst,
-                extension_nfa,
-                None,
-                frontier_of(extension_nfa),
-            )),
-        },
     }
 }
 
@@ -1175,20 +1144,6 @@ fn compiled_view_from_prepared(
         CompiledContentModel::AllGroup(model) => {
             CompiledView::AllGroup(all_group_view(schema_set, subst, model))
         }
-        #[cfg(feature = "xsd11")]
-        CompiledContentModel::AllGroupExtension {
-            base_model,
-            extension_nfa,
-        } => CompiledView::AllGroupExtension {
-            base: all_group_view(schema_set, subst, base_model),
-            extension: Box::new(nfa_view(
-                schema_set,
-                subst,
-                extension_nfa,
-                None,
-                frontier_of(extension_nfa),
-            )),
-        },
     }
 }
 
@@ -1729,16 +1684,6 @@ impl fmt::Display for CompiledView {
         match self {
             CompiledView::Nfa(view) => view.fmt(f),
             CompiledView::AllGroup(view) => view.fmt(f),
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { base, extension } => {
-                kv(f, "matcher", "all-group extension (base all-group + NFA)")?;
-                writeln!(f)?;
-                writeln!(f, "  base all-group")?;
-                base.fmt(f)?;
-                writeln!(f)?;
-                writeln!(f, "  extension NFA")?;
-                extension.fmt(f)
-            }
             CompiledView::Failed { reason } => {
                 kv(f, "matcher", "(none — preparation failed)")?;
                 kv(f, "failure", reason)?;

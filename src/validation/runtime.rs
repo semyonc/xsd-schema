@@ -4011,64 +4011,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
                 result
             }
-            #[cfg(feature = "xsd11")]
-            ContentValidatorState::AllGroupExtension {
-                model,
-                state,
-                extension_nfa,
-                phase,
-            } => {
-                use super::content::AllGroupExtPhase;
-
-                let mut result = Vec::new();
-                match phase {
-                    AllGroupExtPhase::AllGroup => {
-                        // Include acceptable all-group particles
-                        for (i, particle) in model.particles.iter().enumerate() {
-                            if state.can_accept(model, i) {
-                                if let crate::compiler::NfaTerm::Element {
-                                    ref name,
-                                    ref namespace,
-                                    ref element_key,
-                                    ..
-                                } = particle.term
-                                {
-                                    result.push(ExpectedElement {
-                                        local_name: *name,
-                                        namespace: *namespace,
-                                        element_key: *element_key,
-                                    });
-                                }
-                            }
-                        }
-                        // If all-group is satisfied, also include extension NFA elements
-                        if state.is_satisfied(model) {
-                            let initial = crate::compiler::ActiveStates::from_nfa(extension_nfa);
-                            for (name, namespace, element_key) in
-                                initial.expected_element_terms(extension_nfa)
-                            {
-                                result.push(ExpectedElement {
-                                    local_name: name,
-                                    namespace,
-                                    element_key,
-                                });
-                            }
-                        }
-                    }
-                    AllGroupExtPhase::Nfa(active_states) => {
-                        for (name, namespace, element_key) in
-                            active_states.expected_element_terms(extension_nfa)
-                        {
-                            result.push(ExpectedElement {
-                                local_name: name,
-                                namespace,
-                                element_key,
-                            });
-                        }
-                    }
-                }
-                result
-            }
             _ => Vec::new(),
         }
     }

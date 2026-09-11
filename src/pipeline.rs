@@ -854,18 +854,6 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                     type_def.target_namespace,
                 )?;
             }
-            #[cfg(feature = "xsd11")]
-            crate::compiler::ContentModelMatcher::AllGroupExtension {
-                base_model,
-                extension_nfa,
-            } => {
-                crate::compiler::check_all_group_upa(
-                    &base_model,
-                    schema_set,
-                    type_def.target_namespace,
-                )?;
-                crate::compiler::check_upa(&extension_nfa, schema_set, type_def.target_namespace)?;
-            }
         }
     }
 

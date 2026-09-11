@@ -11,6 +11,28 @@ Phases P0 and P1 of `XSD_COMPILER_REWORK.md` (branch
 `perf/compiler-rework-p0-p1`): the exact-occurrence correction with its
 resource-failure contract, plus the two measurement-phase allocation gates.
 
+### Removed
+
+- **The never-constructed all-group-extension composite matcher.**
+  `ContentModelMatcher::AllGroupExtension`, `CompiledContentModel::AllGroupExtension`,
+  `ContentValidatorState::AllGroupExtension`, `validation::content::AllGroupExtPhase`
+  and `compiler::inspect::CompiledView::AllGroupExtension` modelled an
+  all-group base followed by an NFA extension. No compile path ever built one:
+  Structures §3.4.2.3.3 clause 4.2.3 gives an extension of an all-group base a
+  `{particle}` that is the base particle itself (4.2.3.1), one merged all group
+  — "a model group whose {compositor} is all and whose {particles} are the
+  {particles} of the {term} of the ·base particle· followed by the {particles}
+  of the {term} of the ·effective content·" (4.2.3.2) — or, in the "otherwise"
+  case 4.2.3.3, a sequence containing the base's all group, which All Group
+  Limited (§3.8.6.2) clause 1 forbids. The compiler already produced the merged
+  all group and rejected the third case, so the composite was unreachable in
+  every configuration. These are public enum variants, so this is a breaking
+  change for exhaustive `match`es on them (the unreleased set already carries
+  the `NfaTable` change). No validation verdict, diagnostic or W3C conformance
+  outcome changes. `ContentValidatorState::try_is_complete` now always returns
+  `Ok`, and `is_complete` no longer panics — the one execution limit it could
+  hit lived in the removed arm.
+
 ### Fixed
 
 - **Finite `maxOccurs` above 10 000 is now enforced exactly.** The compiler

@@ -745,8 +745,8 @@ validation hot path.
   wildcards with namespace constraint and `processContents`, each with its
   `minOccurs..maxOccurs` and whether that range is *unrolled* (max ≤ 16) or
   compiled to a *counter*, plus its source location.
-- **Compiled** — the matcher kind (NFA, all-group, NFA with open content, or
-  the XSD 1.1 all-group extension), state and transition counts, counters
+- **Compiled** — the matcher kind (NFA, all-group, or NFA with open content),
+  state and transition counts, counters
   (`c0: min..max`, nullable body or not), the initial frontier variant the
   runtime will use, an *exposure* line for models that can reach the execution
   limits, a per-state table (term, transitions including counter operations,

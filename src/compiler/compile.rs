@@ -1301,10 +1301,37 @@ fn compile_all_group_matcher(
     Ok(None)
 }
 
-/// XSD 1.1: Extension from an all-group base type — produce AllGroup or
-/// AllGroupExtension instead of the lossy NFA conversion. Returns `None` when
-/// the base type does not compile to an all-group, leaving the caller to fall
-/// through to the standard NFA path.
+/// XSD 1.1: extension from an all-group base type — produce the all-group
+/// `{content type}` the specification prescribes instead of the lossy NFA
+/// conversion. Returns `None` when the base type does not compile to an
+/// all-group, leaving the caller to fall through to the standard NFA path.
+///
+/// Structures §3.4.2.3.3 clause 4.2.3 enumerates every `{particle}` an
+/// extension of an all-group base can have, and each case is either a single
+/// all group or a schema error — never an "all group plus something else"
+/// composite, which is why there is no composite matcher:
+///
+/// * 4.2.3.1 "If the {term} of the ·base particle· has {compositor} all and
+///   the ·explicit content· is empty, then the ·base particle·." — the base
+///   all-group, unchanged.
+/// * 4.2.3.2 "If the {term} of the ·base particle· has {compositor} all and
+///   the {term} of the ·effective content· also has {compositor} all, then a
+///   Particle whose properties are as follows: {min occurs} the {min occurs}
+///   of the ·effective content·. {max occurs} 1 {term} a model group whose
+///   {compositor} is all and whose {particles} are the {particles} of the
+///   {term} of the ·base particle· followed by the {particles} of the {term}
+///   of the ·effective content·." — one merged all group.
+/// * 4.2.3.3 "otherwise … {term} a model group whose {compositor} is sequence
+///   and whose {particles} are the ·base particle· followed by the ·effective
+///   content·." — this nests the base's all group inside a sequence, which
+///   All Group Limited (§3.8.6.2) clause 1 forbids: an all group "appears
+///   only as" 1.1 "the {model group} property of a model group definition",
+///   1.2 "the {term} property of a Particle with {max occurs} = 1 which is
+///   the {particle} of the {content type} of a complex type definition", or
+///   1.3 "the {term} property of a Particle P with {min occurs} = {max
+///   occurs} = 1, where P is among the {particles} of a Model Group whose
+///   {compositor} is all". A sequence member is none of the three, so the
+///   schema is in error and the case below rejects it.
 #[cfg(feature = "xsd11")]
 fn compile_all_group_extension_matcher(
     schema_set: &SchemaSet,
@@ -1469,11 +1496,6 @@ fn compile_nfa_matcher(
                     // (XSD 1.0 path; XSD 1.1 is handled above via compile_base_all_group)
                     Some(all_group_to_nfa(model))
                 }
-                #[cfg(feature = "xsd11")]
-                ContentModelMatcher::AllGroupExtension { .. } => {
-                    // Should not occur: base type should not produce AllGroupExtension
-                    unreachable!("base type produced AllGroupExtension")
-                }
             }
         } else {
             None
@@ -1553,8 +1575,8 @@ fn compile_content_model_matcher_impl(
         return Ok(matcher);
     }
 
-    // XSD 1.1: Extension from an all-group base type — produce AllGroup or
-    // AllGroupExtension instead of the lossy NFA conversion.
+    // XSD 1.1: extension from an all-group base type — produce the all-group
+    // §3.4.2.3.3 clause 4.2.3 prescribes instead of the lossy NFA conversion.
     #[cfg(feature = "xsd11")]
     if let Some(matcher) =
         compile_all_group_extension_matcher(schema_set, type_def, is_extension, upa_mode)?
@@ -1777,39 +1799,6 @@ fn attach_open_content(
                 });
             }
             ContentModelMatcher::AllGroup(model)
-        }
-        #[cfg(feature = "xsd11")]
-        ContentModelMatcher::AllGroupExtension {
-            mut base_model,
-            extension_nfa,
-        } => {
-            if let Some(mut wildcard_ref) = open_content.wildcard {
-                if wildcard_ref.has_defined_sibling {
-                    // Collect siblings from both the base all-group and extension NFA
-                    wildcard_ref
-                        .not_qnames
-                        .extend(collect_all_group_element_qnames(schema_set, &base_model));
-                    wildcard_ref
-                        .not_qnames
-                        .extend(collect_nfa_element_qnames(schema_set, &extension_nfa));
-                    wildcard_ref.has_defined_sibling = false;
-                }
-                let mode = match open_content.mode {
-                    TypesOpenContentMode::Interleave => AllGroupOpenContentMode::Interleave,
-                    TypesOpenContentMode::Suffix => AllGroupOpenContentMode::Suffix,
-                    TypesOpenContentMode::None => AllGroupOpenContentMode::None,
-                };
-                base_model.open_content = Some(OpenContentWildcard {
-                    namespace_constraint: wildcard_ref.namespace_constraint,
-                    process_contents: wildcard_ref.process_contents,
-                    mode,
-                    not_qnames: wildcard_ref.not_qnames,
-                });
-            }
-            ContentModelMatcher::AllGroupExtension {
-                base_model,
-                extension_nfa,
-            }
         }
         other => other,
     }

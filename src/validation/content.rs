@@ -42,16 +42,6 @@ pub struct ElementMatchInfo {
     pub process_contents: Option<ProcessContents>,
 }
 
-/// Phase of AllGroupExtension composite validation.
-#[cfg(feature = "xsd11")]
-#[derive(Debug, Clone)]
-pub enum AllGroupExtPhase {
-    /// Validating the all-group part (base type particles).
-    AllGroup,
-    /// Transitioned to the NFA extension part.
-    Nfa(ActiveStates),
-}
-
 /// Unified content model validation state
 ///
 /// Immutable, shareable compiled content model for one complex type.
@@ -82,12 +72,6 @@ pub enum CompiledContentModel {
     },
     /// All-group content model (unordered particles).
     AllGroup(Arc<AllGroupModel>),
-    /// All-group base + NFA extension (XSD 1.1 complex type extension).
-    #[cfg(feature = "xsd11")]
-    AllGroupExtension {
-        base_model: Arc<AllGroupModel>,
-        extension_nfa: Arc<NfaTable>,
-    },
 }
 
 impl CompiledContentModel {
@@ -137,14 +121,6 @@ impl CompiledContentModel {
                     open_content,
                 }
             }
-            #[cfg(feature = "xsd11")]
-            ContentModelMatcher::AllGroupExtension {
-                base_model,
-                extension_nfa,
-            } => Self::AllGroupExtension {
-                base_model: Arc::new(base_model),
-                extension_nfa: Arc::new(extension_nfa),
-            },
         })
     }
 }
@@ -172,14 +148,6 @@ pub enum ContentValidatorState {
         /// further declared all-group particles are no longer accepted
         /// (§3.10.4 suffix semantics: declared content first, then wildcard).
         suffix_locked: bool,
-    },
-    /// All-group base + NFA extension (XSD 1.1 complex type extension).
-    #[cfg(feature = "xsd11")]
-    AllGroupExtension {
-        model: Arc<AllGroupModel>,
-        state: AllGroupState,
-        extension_nfa: Arc<NfaTable>,
-        phase: AllGroupExtPhase,
     },
     /// Simple content (text only, no child elements)
     Simple,
@@ -216,19 +184,6 @@ impl ContentValidatorState {
                     model: Arc::clone(model),
                     state,
                     suffix_locked: false,
-                }
-            }
-            #[cfg(feature = "xsd11")]
-            CompiledContentModel::AllGroupExtension {
-                base_model,
-                extension_nfa,
-            } => {
-                let state = AllGroupState::new(base_model);
-                ContentValidatorState::AllGroupExtension {
-                    model: Arc::clone(base_model),
-                    state,
-                    extension_nfa: Arc::clone(extension_nfa),
-                    phase: AllGroupExtPhase::AllGroup,
                 }
             }
         }
@@ -496,190 +451,6 @@ impl ContentValidatorState {
                 }
                 None
             }
-            #[cfg(feature = "xsd11")]
-            ContentValidatorState::AllGroupExtension {
-                model,
-                state,
-                extension_nfa,
-                phase,
-            } => {
-                match phase {
-                    AllGroupExtPhase::AllGroup => {
-                        // Try to match against all-group particles first
-                        for (i, particle) in model.particles.iter().enumerate() {
-                            if !state.can_accept(model, i) {
-                                continue;
-                            }
-                            let result = term_matches_with_substitution(
-                                &particle.term,
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
-                                xsd_version,
-                            );
-                            if result == TermMatchResult::Match {
-                                if state.accept(model, i) {
-                                    let info = match &particle.term {
-                                        NfaTerm::Element {
-                                            name: term_name,
-                                            namespace: term_ns,
-                                            element_key,
-                                            resolved_type,
-                                        } => {
-                                            if *term_name == name && *term_ns == namespace {
-                                                ElementMatchInfo {
-                                                    element_key: *element_key,
-                                                    resolved_type: *resolved_type,
-                                                    process_contents: None,
-                                                }
-                                            } else {
-                                                // Substitution match — let runtime resolve
-                                                ElementMatchInfo {
-                                                    element_key: None,
-                                                    resolved_type: None,
-                                                    process_contents: None,
-                                                }
-                                            }
-                                        }
-                                        NfaTerm::Wildcard {
-                                            process_contents, ..
-                                        } => ElementMatchInfo {
-                                            element_key: None,
-                                            resolved_type: None,
-                                            process_contents: Some(*process_contents),
-                                        },
-                                    };
-                                    return Some(info);
-                                }
-                                return None;
-                            }
-                        }
-
-                        // No all-group particle matched — if all-group is satisfied,
-                        // try transitioning to the extension NFA
-                        if state.is_satisfied(model) {
-                            let initial = match ActiveStates::try_from_nfa(extension_nfa) {
-                                Ok(initial) => initial,
-                                Err(limit) => {
-                                    *limit_out = Some(limit);
-                                    return None;
-                                }
-                            };
-                            let mi = initial.find_match_info(
-                                extension_nfa,
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
-                                xsd_version,
-                            );
-                            let match_info = ElementMatchInfo {
-                                element_key: mi.element_key,
-                                resolved_type: mi.resolved_type,
-                                process_contents: mi.process_contents,
-                            };
-                            let next = initial.advance_with_priority(
-                                extension_nfa,
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
-                                xsd_version,
-                            );
-                            if !next.is_empty() {
-                                *phase = AllGroupExtPhase::Nfa(next);
-                                return Some(match_info);
-                            }
-                        }
-
-                        // Try open content wildcard as final fallback
-                        if let Some(oc) = &model.open_content {
-                            let allow = match oc.mode {
-                                AllGroupOpenContentMode::Interleave => true,
-                                AllGroupOpenContentMode::Suffix => state.is_satisfied(model),
-                                AllGroupOpenContentMode::None => false,
-                            };
-                            if allow
-                                && open_content_allows(
-                                    &oc.namespace_constraint,
-                                    &oc.not_qnames,
-                                    name,
-                                    namespace,
-                                    target_ns,
-                                )
-                            {
-                                return Some(ElementMatchInfo {
-                                    element_key: None,
-                                    resolved_type: None,
-                                    process_contents: Some(oc.process_contents),
-                                });
-                            }
-                        }
-                        None
-                    }
-                    AllGroupExtPhase::Nfa(active_states) => {
-                        // Standard NFA advancement in extension phase
-                        let mi = active_states.find_match_info(
-                            extension_nfa,
-                            name,
-                            namespace,
-                            target_ns,
-                            subst_groups,
-                            xsd_version,
-                        );
-                        let match_info = ElementMatchInfo {
-                            element_key: mi.element_key,
-                            resolved_type: mi.resolved_type,
-                            process_contents: mi.process_contents,
-                        };
-                        let next = match active_states.advance_with_priority_from(
-                            extension_nfa,
-                            name,
-                            namespace,
-                            target_ns,
-                            subst_groups,
-                            xsd_version,
-                        ) {
-                            Ok(next) => next,
-                            Err(limit) => {
-                                *limit_out = Some(limit);
-                                return None;
-                            }
-                        };
-                        if next.is_empty() {
-                            // Try open content wildcard fallback
-                            if let Some(oc) = &model.open_content {
-                                let allow = match oc.mode {
-                                    AllGroupOpenContentMode::Interleave => true,
-                                    AllGroupOpenContentMode::Suffix => {
-                                        active_states.contains_accept(extension_nfa)
-                                    }
-                                    AllGroupOpenContentMode::None => false,
-                                };
-                                if allow
-                                    && open_content_allows(
-                                        &oc.namespace_constraint,
-                                        &oc.not_qnames,
-                                        name,
-                                        namespace,
-                                        target_ns,
-                                    )
-                                {
-                                    return Some(ElementMatchInfo {
-                                        element_key: None,
-                                        resolved_type: None,
-                                        process_contents: Some(oc.process_contents),
-                                    });
-                                }
-                            }
-                            return None;
-                        }
-                        *active_states = next;
-                        Some(match_info)
-                    }
-                }
-            }
             ContentValidatorState::Simple | ContentValidatorState::Empty => {
                 // Simple and Empty content models do not accept child elements
                 None
@@ -691,29 +462,7 @@ impl ContentValidatorState {
     ///
     /// For NFA: any active state is the accept state.
     /// For AllGroup: all required particles have been satisfied.
-    ///
-    /// # Panics
-    ///
-    /// If computing the completion state of an XSD 1.1 all-group extension
-    /// exceeds an execution limit; see [`try_is_complete`](Self::try_is_complete).
     pub fn is_complete(&self) -> bool {
-        self.try_is_complete().unwrap_or_else(|e| {
-            panic!("ContentValidatorState::is_complete: {e}; use try_is_complete")
-        })
-    }
-
-    /// Fallible form of [`is_complete`](Self::is_complete).
-    pub fn try_is_complete(&self) -> Result<bool, ContentModelLimitExceeded> {
-        let mut limit: Option<ContentModelLimitExceeded> = None;
-        let complete = self.is_complete_impl(&mut limit);
-        match limit {
-            Some(e) => Err(e),
-            None => Ok(complete),
-        }
-    }
-
-    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))]
-    fn is_complete_impl(&self, limit_out: &mut Option<ContentModelLimitExceeded>) -> bool {
         match self {
             ContentValidatorState::Nfa {
                 nfa, active_states, ..
@@ -726,40 +475,17 @@ impl ContentValidatorState {
                 }
                 state.is_satisfied(model)
             }
-            #[cfg(feature = "xsd11")]
-            ContentValidatorState::AllGroupExtension {
-                model,
-                state,
-                extension_nfa,
-                phase,
-            } => {
-                // All-group must be satisfied (or skipped if outer-optional)
-                let all_satisfied = if model.outer_optional && !state.has_any_consumed() {
-                    true
-                } else {
-                    state.is_satisfied(model)
-                };
-                if !all_satisfied {
-                    return false;
-                }
-                match phase {
-                    AllGroupExtPhase::AllGroup => {
-                        // Still in all-group phase — extension NFA must accept empty
-                        match ActiveStates::try_from_nfa(extension_nfa) {
-                            Ok(initial) => initial.contains_accept(extension_nfa),
-                            Err(limit) => {
-                                *limit_out = Some(limit);
-                                false
-                            }
-                        }
-                    }
-                    AllGroupExtPhase::Nfa(active_states) => {
-                        active_states.contains_accept(extension_nfa)
-                    }
-                }
-            }
             ContentValidatorState::Simple | ContentValidatorState::Empty => true,
         }
+    }
+
+    /// Fallible form of [`is_complete`](Self::is_complete).
+    ///
+    /// Completion is a pure inspection of the already-computed state and never
+    /// runs the automaton, so this cannot exceed an execution limit; it is kept
+    /// for symmetry with the advancing entry points and always returns `Ok`.
+    pub fn try_is_complete(&self) -> Result<bool, ContentModelLimitExceeded> {
+        Ok(self.is_complete())
     }
 
     /// Non-mutating lookahead: would the given element be accepted?
@@ -869,112 +595,6 @@ impl ContentValidatorState {
                     }
                 }
                 false
-            }
-            #[cfg(feature = "xsd11")]
-            ContentValidatorState::AllGroupExtension {
-                model,
-                state,
-                extension_nfa,
-                phase,
-            } => {
-                match phase {
-                    AllGroupExtPhase::AllGroup => {
-                        // Check all-group particles
-                        for (i, particle) in model.particles.iter().enumerate() {
-                            if !state.can_accept(model, i) {
-                                continue;
-                            }
-                            let result = term_matches_with_substitution(
-                                &particle.term,
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
-                                xsd_version,
-                            );
-                            if result == TermMatchResult::Match {
-                                return true;
-                            }
-                        }
-                        // If all-group is satisfied, check extension NFA start
-                        if state.is_satisfied(model) {
-                            let Ok(initial) = ActiveStates::try_from_nfa(extension_nfa) else {
-                                return false;
-                            };
-                            let Ok(next) = initial.try_advance_with_priority(
-                                extension_nfa,
-                                name,
-                                namespace,
-                                target_ns,
-                                subst_groups,
-                                xsd_version,
-                            ) else {
-                                return false;
-                            };
-                            if !next.is_empty() {
-                                return true;
-                            }
-                        }
-                        // Try open content wildcard fallback
-                        if let Some(oc) = &model.open_content {
-                            let allow = match oc.mode {
-                                AllGroupOpenContentMode::Interleave => true,
-                                AllGroupOpenContentMode::Suffix => state.is_satisfied(model),
-                                AllGroupOpenContentMode::None => false,
-                            };
-                            if allow
-                                && open_content_allows(
-                                    &oc.namespace_constraint,
-                                    &oc.not_qnames,
-                                    name,
-                                    namespace,
-                                    target_ns,
-                                )
-                            {
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    AllGroupExtPhase::Nfa(active_states) => {
-                        // Standard NFA lookahead
-                        let Ok(next) = active_states.advance_with_priority_from(
-                            extension_nfa,
-                            name,
-                            namespace,
-                            target_ns,
-                            subst_groups,
-                            xsd_version,
-                        ) else {
-                            return false;
-                        };
-                        if !next.is_empty() {
-                            return true;
-                        }
-                        // Try open content wildcard fallback
-                        if let Some(oc) = &model.open_content {
-                            let allow = match oc.mode {
-                                AllGroupOpenContentMode::Interleave => true,
-                                AllGroupOpenContentMode::Suffix => {
-                                    active_states.contains_accept(extension_nfa)
-                                }
-                                AllGroupOpenContentMode::None => false,
-                            };
-                            if allow
-                                && open_content_allows(
-                                    &oc.namespace_constraint,
-                                    &oc.not_qnames,
-                                    name,
-                                    namespace,
-                                    target_ns,
-                                )
-                            {
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                }
             }
             ContentValidatorState::Simple | ContentValidatorState::Empty => false,
         }
@@ -1453,204 +1073,6 @@ mod tests {
         };
         assert!(state.would_accept(a, None, None, XsdVersion::V1_1, None));
         assert!(state.would_accept(extra, None, None, XsdVersion::V1_1, None));
-    }
-
-    // -- AllGroupExtension tests (XSD 1.1) ------------------------------------
-
-    #[cfg(feature = "xsd11")]
-    fn make_all_group_extension_state(
-        all_particles: Vec<AllParticle>,
-        ext_nfa: NfaTable,
-    ) -> ContentValidatorState {
-        let model = AllGroupModel::new(all_particles);
-        let matcher = ContentModelMatcher::AllGroupExtension {
-            base_model: model,
-            extension_nfa: ext_nfa,
-        };
-        ContentValidatorState::from_matcher(matcher)
-    }
-
-    /// all(A, B) + seq(C): accepts A,B,C and B,A,C; rejects C,A,B and A,C,B
-    #[cfg(feature = "xsd11")]
-    #[test]
-    fn test_all_group_extension_basic_composite() {
-        let a = NameId(10);
-        let b = NameId(20);
-        let c = NameId(30);
-
-        let particles = vec![
-            AllParticle::new(
-                NfaTerm::element(a, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-            AllParticle::new(
-                NfaTerm::element(b, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-        ];
-        let ext_nfa = single_element_nfa(c, None);
-
-        // A, B, C → accepted
-        let mut state = make_all_group_extension_state(particles.clone(), ext_nfa.clone());
-        assert!(state
-            .advance_element(a, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state
-            .advance_element(b, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state.is_complete());
-
-        // B, A, C → accepted (reversed all-group order)
-        let mut state = make_all_group_extension_state(particles.clone(), ext_nfa.clone());
-        assert!(state
-            .advance_element(b, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state
-            .advance_element(a, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state.is_complete());
-
-        // C, A, B → rejected (C before all-group is satisfied)
-        let mut state = make_all_group_extension_state(particles.clone(), ext_nfa.clone());
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_none());
-
-        // A, C, B → rejected (C before B satisfies all-group)
-        let mut state = make_all_group_extension_state(particles, ext_nfa);
-        assert!(state
-            .advance_element(a, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_none());
-    }
-
-    /// all(A?, B?) + seq(C): accepts C alone (all-group satisfied empty)
-    #[cfg(feature = "xsd11")]
-    #[test]
-    fn test_all_group_extension_optional_all_group() {
-        let a = NameId(10);
-        let b = NameId(20);
-        let c = NameId(30);
-
-        let particles = vec![
-            AllParticle::new(
-                NfaTerm::element(a, None, None),
-                0,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-            AllParticle::new(
-                NfaTerm::element(b, None, None),
-                0,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-        ];
-        let ext_nfa = single_element_nfa(c, None);
-
-        // C alone → accepted (all-group is satisfied with zero occurrences)
-        let mut state = make_all_group_extension_state(particles, ext_nfa);
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state.is_complete());
-    }
-
-    /// is_complete checks: after A,B,C → complete; after A,B → not complete
-    #[cfg(feature = "xsd11")]
-    #[test]
-    fn test_all_group_extension_is_complete() {
-        let a = NameId(10);
-        let b = NameId(20);
-        let c = NameId(30);
-
-        let particles = vec![
-            AllParticle::new(
-                NfaTerm::element(a, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-            AllParticle::new(
-                NfaTerm::element(b, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-        ];
-        let ext_nfa = single_element_nfa(c, None);
-
-        let mut state = make_all_group_extension_state(particles, ext_nfa);
-        assert!(!state.is_complete(), "not complete initially");
-
-        assert!(state
-            .advance_element(a, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(!state.is_complete(), "not complete after A only");
-
-        assert!(state
-            .advance_element(b, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(
-            !state.is_complete(),
-            "not complete after A,B — extension C still required"
-        );
-
-        assert!(state
-            .advance_element(c, None, None, XsdVersion::V1_1, None)
-            .is_some());
-        assert!(state.is_complete(), "complete after A,B,C");
-    }
-
-    /// would_accept lookahead: initially A/B accepted, C not; after A,B only C accepted
-    #[cfg(feature = "xsd11")]
-    #[test]
-    fn test_all_group_extension_would_accept() {
-        let a = NameId(10);
-        let b = NameId(20);
-        let c = NameId(30);
-
-        let particles = vec![
-            AllParticle::new(
-                NfaTerm::element(a, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-            AllParticle::new(
-                NfaTerm::element(b, None, None),
-                1,
-                MaxOccurs::Bounded(1),
-                None,
-            ),
-        ];
-        let ext_nfa = single_element_nfa(c, None);
-
-        let mut state = make_all_group_extension_state(particles, ext_nfa);
-
-        // Initially: A and B accepted, C not (all-group not yet satisfied)
-        assert!(state.would_accept(a, None, None, XsdVersion::V1_1, None));
-        assert!(state.would_accept(b, None, None, XsdVersion::V1_1, None));
-        assert!(!state.would_accept(c, None, None, XsdVersion::V1_1, None));
-
-        // After A,B: only C is accepted
-        state.advance_element(a, None, None, XsdVersion::V1_1, None);
-        state.advance_element(b, None, None, XsdVersion::V1_1, None);
-        assert!(!state.would_accept(a, None, None, XsdVersion::V1_1, None));
-        assert!(!state.would_accept(b, None, None, XsdVersion::V1_1, None));
-        assert!(state.would_accept(c, None, None, XsdVersion::V1_1, None));
     }
 
     // -- Not constraint and notQName tests -----------------------------------
