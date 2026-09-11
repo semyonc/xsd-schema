@@ -115,6 +115,23 @@ resource-failure contract, plus the two measurement-phase allocation gates.
 
 ### Performance
 
+- **Precomputed successor closures for counter-free content models**
+  (`NfaTable::successor_closure`, `StateSet::union_with`). Each NFA state's
+  epsilon closure of its consuming successors is computed once per table
+  (lazily, shared through the `Arc`), so one child step is the OR of a few
+  4-word bitsets over the matching frontier states instead of a depth-first
+  epsilon search per child — the "precomputed epsilon-closed NFA successors"
+  option of `XSD_COMPILER_REWORK.md` §6.7, exact by distributivity of the
+  closure over unions. Paired A/B on the 47 MiB catalog against the
+  integrated refactor branch: validate-only 67.4 → 72.4 MiB/s (roxmltree),
+  64.1 → 68.6 (BufferDoc), streaming 47.2 → 50.0, streaming without PSVI
+  52.4 → 55.5; libxml2 control flat. A differential test compares the step
+  with the previous algorithm on every string up to length 5–7 over unrolled,
+  nullable epsilon-cycle, wildcard-priority and substitution-group models in
+  both XSD versions. Counted models are unchanged. `NfaTable` gained a private
+  cache field: it can no longer be built with a struct literal (use `new` /
+  `with_counters`), and code that mutates `states` directly after a table has
+  been executed must go through `get_state_mut`, which invalidates the cache.
 - Two per-element allocation gates in the validation runtime: the element
   path and location are no longer cloned at every element end, and the
   attribute typed value is no longer cloned at every attribute, unless an

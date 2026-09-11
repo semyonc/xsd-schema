@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::OnceLock;
 
 use super::substitution::SubstitutionGroupMap;
 use crate::ids::{ElementKey, NameId, TypeKey};
@@ -271,6 +272,12 @@ pub struct NfaTable {
     pub accept_state: StateId,
     /// Counter definitions for counted loops (empty if no counted repeats)
     pub counter_defs: Vec<CounterDef>,
+    /// Per-state successor closures for the counter-free execution path,
+    /// built once per table on first use — see
+    /// [`successor_closure`](Self::successor_closure). Invalidated by
+    /// [`get_state_mut`](Self::get_state_mut); code that mutates `states`
+    /// directly after the table has been executed must rebuild the table.
+    succ_closure: OnceLock<Box<[StateSet]>>,
 }
 
 impl NfaTable {
@@ -281,6 +288,7 @@ impl NfaTable {
             start_state,
             accept_state,
             counter_defs: Vec::new(),
+            succ_closure: OnceLock::new(),
         }
     }
 
@@ -296,6 +304,7 @@ impl NfaTable {
             start_state,
             accept_state,
             counter_defs,
+            succ_closure: OnceLock::new(),
         }
     }
 
@@ -311,7 +320,38 @@ impl NfaTable {
 
     /// Get a mutable reference to a state by ID
     pub fn get_state_mut(&mut self, id: StateId) -> Option<&mut NfaState> {
+        // Any structural edit invalidates the cached successor closures.
+        self.succ_closure.take();
         self.states.get_mut(id as usize)
+    }
+
+    /// The epsilon closure of the *consuming* successors of `state`: exactly
+    /// the states reachable after `state`'s term has matched one child.
+    ///
+    /// Because the epsilon closure of a union is the union of the closures,
+    /// one child step on a counter-free model is the OR of these precomputed
+    /// bitsets over the matching frontier states — no per-child depth-first
+    /// search (XSD_COMPILER_REWORK.md §6.7, "precomputed epsilon-closed NFA
+    /// successors"). Built lazily, once per table, and shared by every
+    /// element instance through the `Arc<NfaTable>`. Counter-free tables
+    /// only; counted models keep their configuration-based closures.
+    #[inline]
+    pub fn successor_closure(&self, state: StateId) -> &StateSet {
+        let table = self
+            .succ_closure
+            .get_or_init(|| self.build_successor_closures());
+        &table[state as usize]
+    }
+
+    fn build_successor_closures(&self) -> Box<[StateSet]> {
+        debug_assert!(
+            !self.has_counters(),
+            "successor closures are only defined for counter-free tables"
+        );
+        self.states
+            .iter()
+            .map(|s| epsilon_closure(self, s.consuming_transitions()))
+            .collect()
     }
 
     /// Get the number of states
@@ -686,6 +726,24 @@ impl StateSet {
         !already
     }
 
+    /// `self |= other`: word-wise OR. Promotes to the heap representation only
+    /// if `other` has a set bit beyond the inline capacity.
+    #[inline]
+    pub fn union_with(&mut self, other: &StateSet) {
+        let ow = other.words();
+        let mut last = ow.len();
+        while last > 0 && ow[last - 1] == 0 {
+            last -= 1;
+        }
+        if last == 0 {
+            return;
+        }
+        let words = self.ensure_words(last - 1);
+        for (w, &o) in words.iter_mut().zip(&ow[..last]) {
+            *w |= o;
+        }
+    }
+
     /// Test membership.
     #[inline]
     pub fn contains(&self, id: StateId) -> bool {
@@ -857,13 +915,11 @@ pub fn advance_states(
             substitution_groups,
             xsd_version,
         ) {
-            for target in state.consuming_transitions() {
-                next.insert(target);
-            }
+            next.union_with(nfa.successor_closure(state_id));
         }
     }
 
-    epsilon_closure(nfa, next.iter())
+    next
 }
 
 /// Advance NFA states with element-over-wildcard priority (XSD 1.1).
@@ -906,25 +962,19 @@ pub fn advance_with_priority(
 
         match term {
             NfaTerm::Element { .. } => {
-                for target in state.consuming_transitions() {
-                    element_targets.insert(target);
-                }
+                element_targets.union_with(nfa.successor_closure(state_id));
             }
             NfaTerm::Wildcard { .. } => {
-                for target in state.consuming_transitions() {
-                    wildcard_targets.insert(target);
-                }
+                wildcard_targets.union_with(nfa.successor_closure(state_id));
             }
         }
     }
 
-    let next = if !element_targets.is_empty() {
+    if !element_targets.is_empty() {
         element_targets
     } else {
         wildcard_targets
-    };
-
-    epsilon_closure(nfa, next.iter())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1391,9 +1441,7 @@ impl ActiveStates {
                     element_key,
                     resolved_type,
                 } => {
-                    for target in state.consuming_transitions() {
-                        element_targets.insert(target);
-                    }
+                    element_targets.union_with(nfa.successor_closure(state_id));
                     // First matching element wins (element-over-wildcard priority).
                     if element_info.is_none() {
                         element_info = Some(if *term_name == name && *term_ns == namespace {
@@ -1412,9 +1460,7 @@ impl ActiveStates {
                 NfaTerm::Wildcard {
                     process_contents, ..
                 } => {
-                    for target in state.consuming_transitions() {
-                        wildcard_targets.insert(target);
-                    }
+                    wildcard_targets.union_with(nfa.successor_closure(state_id));
                     // Keep the first matching wildcard as the fallback.
                     if wildcard_info.is_none() {
                         wildcard_info = Some(MatchInfo {
@@ -1434,9 +1480,7 @@ impl ActiveStates {
             XsdVersion::V1_0 => {
                 // Union element + wildcard targets (mirrors `advance_states`).
                 let mut all = element_targets;
-                for t in wildcard_targets.iter() {
-                    all.insert(t);
-                }
+                all.union_with(&wildcard_targets);
                 all
             }
             // Element targets, else wildcard (mirrors `advance_with_priority`).
@@ -1448,7 +1492,8 @@ impl ActiveStates {
                 }
             }
         };
-        let next = ActiveStates::Simple(epsilon_closure(nfa, chosen.iter()));
+        // `chosen` is a union of precomputed closures, hence already closed.
+        let next = ActiveStates::Simple(chosen);
         Ok((match_info, next))
     }
 
@@ -2344,7 +2389,7 @@ mod tests {
     use crate::compiler::build_substitution_group_map;
     use crate::schema::model::{DerivationSet, SchemaSet};
 
-    fn element_data(name: NameId) -> crate::arenas::ElementDeclData {
+    pub(super) fn element_data(name: NameId) -> crate::arenas::ElementDeclData {
         crate::arenas::ElementDeclData {
             name: Some(name),
             target_namespace: None,
@@ -4137,5 +4182,261 @@ mod exact_bounds_tests {
                 }
             }
         }
+    }
+}
+
+/// Precomputed successor closures (XSD_COMPILER_REWORK §6.7): the one-child
+/// step must equal the reference algorithm — collect the consuming targets of
+/// the matching frontier states, then one epsilon-closure DFS — on every
+/// counter-free model shape, for every short input, in both XSD versions.
+#[cfg(test)]
+mod closure_cache_tests {
+    use super::tests::element_data;
+    use super::*;
+    use crate::compiler::fragment::{fragment_to_table, FragmentBuilder};
+    use crate::compiler::substitution::build_substitution_group_map;
+    use crate::schema::model::XsdVersion;
+    use crate::schema::SchemaSet;
+
+    const A: NameId = NameId(100);
+    const B: NameId = NameId(101);
+    const C: NameId = NameId(102);
+    const NS: NameId = NameId(900);
+
+    /// The pre-cache algorithm, kept verbatim as the oracle.
+    fn reference_step(
+        frontier: &StateSet,
+        nfa: &NfaTable,
+        name: NameId,
+        ns: Option<NameId>,
+        subst: Option<&SubstitutionGroupMap>,
+        version: XsdVersion,
+    ) -> StateSet {
+        let mut element_targets = StateSet::with_capacity_for(nfa.state_count());
+        let mut wildcard_targets = StateSet::with_capacity_for(nfa.state_count());
+        for state_id in frontier.iter() {
+            let Some(state) = nfa.get_state(state_id) else {
+                continue;
+            };
+            let Some(term) = state.term.as_ref() else {
+                continue;
+            };
+            if !term_matches(term, name, ns, None, subst, version) {
+                continue;
+            }
+            let targets = match term {
+                NfaTerm::Element { .. } => &mut element_targets,
+                NfaTerm::Wildcard { .. } => &mut wildcard_targets,
+            };
+            for t in state.consuming_transitions() {
+                targets.insert(t);
+            }
+        }
+        let chosen = match version {
+            XsdVersion::V1_0 => {
+                let mut all = element_targets;
+                for t in wildcard_targets.iter() {
+                    all.insert(t);
+                }
+                all
+            }
+            XsdVersion::V1_1 => {
+                if !element_targets.is_empty() {
+                    element_targets
+                } else {
+                    wildcard_targets
+                }
+            }
+        };
+        epsilon_closure(nfa, chosen.iter())
+    }
+
+    fn simple(active: &ActiveStates) -> StateSet {
+        match active {
+            ActiveStates::Simple(s) => s.clone(),
+            other => panic!("expected the counter-free path, got {other:?}"),
+        }
+    }
+
+    /// Enumerate every string over `alphabet` up to `max_len` and compare the
+    /// cached step with the oracle after every child.
+    fn check_model(
+        nfa: &NfaTable,
+        alphabet: &[(NameId, Option<NameId>)],
+        subst: Option<&SubstitutionGroupMap>,
+        max_len: u32,
+    ) {
+        assert!(!nfa.has_counters());
+        let k = alphabet.len() as u32;
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            for len in 0..=max_len {
+                for code in 0..k.pow(len) {
+                    let mut fast = ActiveStates::try_from_nfa(nfa).unwrap();
+                    let mut slow = simple(&fast);
+                    let mut c = code;
+                    for step in 0..len {
+                        let (name, ns) = alphabet[(c % k) as usize];
+                        c /= k;
+                        let tag = format!("{version:?} len={len} code={code} step={step}");
+                        let ref_info = ActiveStates::Simple(slow.clone())
+                            .find_match_info(nfa, name, ns, None, subst, version);
+                        let (info, next) = fast
+                            .advance_element_with_info(nfa, name, ns, None, subst, version)
+                            .unwrap();
+                        let expected = reference_step(&slow, nfa, name, ns, subst, version);
+                        let got = simple(&next);
+                        assert!(got == expected, "{tag}: frontier differs");
+                        assert_eq!(info.element_key, ref_info.element_key, "{tag}");
+                        assert_eq!(info.resolved_type, ref_info.resolved_type, "{tag}");
+                        assert_eq!(info.process_contents, ref_info.process_contents, "{tag}");
+                        if got.is_empty() {
+                            break;
+                        }
+                        assert_eq!(
+                            next.contains_accept(nfa),
+                            expected.contains(nfa.accept_state),
+                            "{tag}: completion"
+                        );
+                        fast = next;
+                        slow = expected;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unrolled_choice_of_sequences_matches_reference() {
+        // (sequence(a+){1,4} | b){1,3}, fully unrolled (no counters).
+        let b = FragmentBuilder::new();
+        let a_plus = b
+            .single_term(NfaTerm::element(A, None, None), None)
+            .repeat_plus();
+        let seq = a_plus.repeat_range(1, Some(4));
+        let choice = seq.alternate(b.single_term(NfaTerm::element(B, None, None), None));
+        let nfa = fragment_to_table(choice.repeat_range(1, Some(3)));
+        check_model(&nfa, &[(A, None), (B, None)], None, 7);
+    }
+
+    #[test]
+    fn nullable_epsilon_cycles_match_reference() {
+        // (a? b?)* and ((a?)*)* — dense epsilon cycles through nullable bodies.
+        let b = FragmentBuilder::new();
+        let ab = b
+            .single_term(NfaTerm::element(A, None, None), None)
+            .optional()
+            .concat(
+                b.single_term(NfaTerm::element(B, None, None), None)
+                    .optional(),
+            )
+            .repeat_star();
+        check_model(&fragment_to_table(ab), &[(A, None), (B, None)], None, 6);
+        let nested = b
+            .single_term(NfaTerm::element(A, None, None), None)
+            .optional()
+            .repeat_star()
+            .repeat_star()
+            .concat(b.single_term(NfaTerm::element(B, None, None), None));
+        check_model(&fragment_to_table(nested), &[(A, None), (B, None)], None, 6);
+    }
+
+    #[test]
+    fn wildcard_priority_matches_reference_in_both_versions() {
+        // (a | any)* , b — element-over-wildcard priority only in XSD 1.1.
+        let b = FragmentBuilder::new();
+        let any = b.single_term(
+            NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax),
+            None,
+        );
+        let body = b
+            .single_term(NfaTerm::element(A, None, None), None)
+            .alternate(any)
+            .repeat_star()
+            .concat(b.single_term(NfaTerm::element(B, None, None), None));
+        let nfa = fragment_to_table(body);
+        check_model(&nfa, &[(A, None), (B, None), (C, Some(NS))], None, 5);
+    }
+
+    #[test]
+    fn substitution_group_members_match_reference() {
+        let mut schema_set = SchemaSet::new();
+        let head = schema_set.name_table.add("head");
+        let m1 = schema_set.name_table.add("m1");
+        let m2 = schema_set.name_table.add("m2");
+        let head_key = schema_set.arenas.alloc_element(element_data(head));
+        for m in [m1, m2] {
+            let key = schema_set.arenas.alloc_element(element_data(m));
+            schema_set
+                .arenas
+                .entries_mut()
+                .elements
+                .get_mut(key)
+                .unwrap()
+                .resolved_substitution_groups
+                .push(head_key);
+        }
+        let map = build_substitution_group_map(&schema_set);
+        assert!(map.contains_key(&head_key));
+        // (head? , b)* with the head substitutable by m1/m2.
+        let b = FragmentBuilder::new();
+        let body = b
+            .single_term(NfaTerm::element(head, None, Some(head_key)), None)
+            .optional()
+            .concat(b.single_term(NfaTerm::element(B, None, None), None))
+            .repeat_star();
+        let nfa = fragment_to_table(body);
+        check_model(
+            &nfa,
+            &[(head, None), (m1, None), (m2, None), (B, None)],
+            Some(&map),
+            5,
+        );
+    }
+
+    #[test]
+    fn union_with_promotes_and_ors_words() {
+        let mut a = StateSet::new();
+        a.insert(3);
+        let mut b = StateSet::new();
+        b.insert(70);
+        a.union_with(&b);
+        assert!(a.contains(3) && a.contains(70));
+        assert!(matches!(a, StateSet::Inline(_)));
+        let mut big = StateSet::new();
+        big.insert(300);
+        a.union_with(&big);
+        assert!(matches!(a, StateSet::Heap(_)));
+        assert!(a.contains(3) && a.contains(70) && a.contains(300));
+        // Empty operand: no promotion, no change.
+        let mut c = StateSet::new();
+        c.insert(1);
+        c.union_with(&StateSet::with_capacity_for(1000));
+        assert!(matches!(c, StateSet::Inline(_)) && c.contains(1));
+    }
+
+    #[test]
+    fn successor_closure_is_rebuilt_after_mutation() {
+        let b = FragmentBuilder::new();
+        let mut nfa = fragment_to_table(
+            b.single_term(NfaTerm::element(A, None, None), None)
+                .concat(b.single_term(NfaTerm::element(B, None, None), None)),
+        );
+        let a_state = nfa.states.iter().find(|s| s.term.is_some()).unwrap().id;
+        let before = nfa.successor_closure(a_state).clone();
+        assert!(!before.contains(nfa.accept_state));
+        // Add an epsilon edge from a's successor straight to accept.
+        let succ = nfa
+            .get_state(a_state)
+            .unwrap()
+            .consuming_transitions()
+            .next()
+            .unwrap();
+        let accept = nfa.accept_state;
+        nfa.get_state_mut(succ).unwrap().add_epsilon(accept);
+        let after = nfa.successor_closure(a_state);
+        assert!(
+            after.contains(accept),
+            "cache must be invalidated by get_state_mut"
+        );
     }
 }
