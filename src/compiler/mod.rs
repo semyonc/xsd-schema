@@ -86,12 +86,6 @@ pub enum ContentModelMatcher {
         mode: TypesOpenContentMode,
         wildcard: Option<WildcardRef>,
     },
-    /// All-group base + NFA extension (XSD 1.1 complex type extension).
-    #[cfg(feature = "xsd11")]
-    AllGroupExtension {
-        base_model: AllGroupModel,
-        extension_nfa: NfaTable,
-    },
 }
 
 #[cfg(feature = "xsd11")]

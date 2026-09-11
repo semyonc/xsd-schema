@@ -11,8 +11,76 @@ Phases P0 and P1 of `XSD_COMPILER_REWORK.md` (branch
 `perf/compiler-rework-p0-p1`): the exact-occurrence correction with its
 resource-failure contract, plus the two measurement-phase allocation gates.
 
+### Removed
+
+- **The never-constructed all-group-extension composite matcher.**
+  `ContentModelMatcher::AllGroupExtension`, `CompiledContentModel::AllGroupExtension`,
+  `ContentValidatorState::AllGroupExtension`, `validation::content::AllGroupExtPhase`
+  and `compiler::inspect::CompiledView::AllGroupExtension` modelled an
+  all-group base followed by an NFA extension. No compile path ever built one:
+  Structures §3.4.2.3.3 clause 4.2.3 gives an extension of an all-group base a
+  `{particle}` that is the base particle itself (4.2.3.1), one merged all group
+  — "a model group whose {compositor} is all and whose {particles} are the
+  {particles} of the {term} of the ·base particle· followed by the {particles}
+  of the {term} of the ·effective content·" (4.2.3.2) — or, in the "otherwise"
+  case 4.2.3.3, a sequence containing the base's all group, which All Group
+  Limited (§3.8.6.2) clause 1 forbids. The compiler already produced the merged
+  all group and rejected the third case, so the composite was unreachable in
+  every configuration. These are public enum variants, so this is a breaking
+  change for exhaustive `match`es on them (the unreleased set already carries
+  the `NfaTable` change). No validation verdict, diagnostic or W3C conformance
+  outcome changes. `ContentValidatorState::try_is_complete` now always returns
+  `Ok`, and `is_complete` no longer panics — the one execution limit it could
+  hit lived in the removed arm.
+
 ### Fixed
 
+- **A schema element's reported location is now its `<`, not the end of the
+  markup before it.** `SourceRef.span.start` was taken from quick-xml's
+  `buffer_position()` before the read, which is where the *previous* event
+  ended — the same read also consumes the whitespace in front of the tag. A
+  declaration was therefore reported on the line above itself and at the
+  column just past the preceding `>` (`examples/books.xsd`'s `BookForm` came
+  out as 14:21 instead of 16:3). The markup start is now recovered from the
+  tag's own length in `parser::reader::TrackedReader::read_event`, so every
+  span, every error location and every inspector row points at the `<`. Spans
+  stay stable per element, so `compiler::upa`'s `same_particle_origin`, which
+  compares `(doc_id, span)`, is unaffected.
+- **Epsilon states now carry a source location.** About half the rows of the
+  inspector's state table read `(no origin)`: branch and merge states are
+  invented by composition and `FragmentBuilder` left them without one. The new
+  `compiler::NfaFragment::fill_missing_origin` gives every origin-less epsilon
+  state the location of the construct that created it — applied after each
+  model group's composition and after each particle's occurrence wrapper, so
+  the innermost known construct wins. Term-bearing states are never touched,
+  keeping `same_particle_origin` exact. Diagnostics-only; no verdict moves.
+- **UPA compilation no longer compiles the base type uncapped.**
+  `compile_base_all_group` called the public, non-UPA
+  `compile_content_model_matcher`, so when an XSD 1.1 extension type was
+  compiled for schema-time UPA checking (`compile_content_model_for_upa`) the
+  base type's content model was built with exact occurrence bounds while the
+  rest of the same compilation was capped by `cap_for_upa`. The mode is now
+  threaded through, so both halves are capped (Sperberg-McQueen 2005: for
+  determinism testing `F{n,m}` can be replaced by `F{min(n,1), min(m,2)}`) and
+  the counted construction is not run for a model the UPA check discards. No
+  UPA verdict changes: an all-group model carries its member bounds in either
+  mode and `check_all_group_upa` does not read them.
+- **`xsi:nil` on a non-nillable element is now invalid at the start event.**
+  The pushed element state was `Invalid` and `cvc-elt.3.1` was reported, but
+  the `SchemaInfo` returned by `validate_element` / `validate_element_by_id`
+  for the *start* event still said `Valid`, so a streaming consumer reading
+  per-element `[validity]` saw the violation only at end-of-element. Element
+  Locally Valid (Element) (§3.3.4.2) clause 3.1 — "D . {nillable} = false, and
+  E has no xsi:nil attribute" — is a verdict on the element itself, so both now
+  report `Invalid`. Diagnostics, their order and every driver outcome are
+  unchanged.
+- **An unresolved `<xs:group ref="…"/>` now names the group.** The error read
+  `unresolved group reference: NameId(42):17` — the raw interned ids — instead
+  of the QName. Both group-reference resolution sites (`compile_group_ref` and
+  the XSD 1.1 `flatten_all_group_ref_into`) now format the name with
+  `schema::resolver::format_resolved_qname`, the helper every sibling error
+  site already uses, giving `unresolved group reference:
+  {http://example.com/tns}missing`.
 - **Finite `maxOccurs` above 10 000 is now enforced exactly.** The compiler
   treated any finite maximum larger than `MAX_COUNTED_OCCURS = 10_000` as
   `unbounded`, so `a{0,10001}` accepted 10 002 children. Structures §3.9.4.3

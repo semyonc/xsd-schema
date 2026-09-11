@@ -354,14 +354,6 @@ pub enum CompiledView {
     Nfa(NfaView),
     /// An all-group model (unordered particles).
     AllGroup(AllGroupView),
-    /// XSD 1.1: an all-group base with an NFA extension.
-    #[cfg(feature = "xsd11")]
-    AllGroupExtension {
-        /// The base type's all-group.
-        base: AllGroupView,
-        /// The extension's NFA. Boxed to keep [`CompiledView`] small.
-        extension: Box<NfaView>,
-    },
     /// The validator could not prepare a model for this type.
     Failed {
         /// The compiler error or execution-limit message.
@@ -377,8 +369,6 @@ impl CompiledView {
         match self {
             CompiledView::Nfa(view) => view.note = Some(note.to_string()),
             CompiledView::AllGroup(view) => view.note = Some(note.to_string()),
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { base, .. } => base.note = Some(note.to_string()),
             CompiledView::Failed { .. } => {}
         }
     }
@@ -388,8 +378,6 @@ impl CompiledView {
         match self {
             CompiledView::Nfa(view) => &view.matcher,
             CompiledView::AllGroup(view) => &view.matcher,
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { .. } => "all-group extension",
             CompiledView::Failed { .. } => "(preparation failed)",
         }
     }
@@ -722,8 +710,6 @@ fn source_view(
     let open_content = match compiled {
         CompiledView::Nfa(view) => view.open_content.clone(),
         CompiledView::AllGroup(view) => view.open_content.clone(),
-        #[cfg(feature = "xsd11")]
-        CompiledView::AllGroupExtension { base, .. } => base.open_content.clone(),
         CompiledView::Failed { .. } => None,
     };
     SourceView {
@@ -750,9 +736,6 @@ fn authored_view(
     compiled: &CompiledView,
 ) -> AuthoredView {
     let all_group_model = matches!(compiled, CompiledView::AllGroup(_));
-    #[cfg(feature = "xsd11")]
-    let all_group_model =
-        all_group_model || matches!(compiled, CompiledView::AllGroupExtension { .. });
 
     let mut sections = Vec::new();
     collect_sections(
@@ -1127,20 +1110,6 @@ fn compiled_view_from_matcher(
         ContentModelMatcher::AllGroup(model) => {
             CompiledView::AllGroup(all_group_view(schema_set, subst, model))
         }
-        #[cfg(feature = "xsd11")]
-        ContentModelMatcher::AllGroupExtension {
-            base_model,
-            extension_nfa,
-        } => CompiledView::AllGroupExtension {
-            base: all_group_view(schema_set, subst, base_model),
-            extension: Box::new(nfa_view(
-                schema_set,
-                subst,
-                extension_nfa,
-                None,
-                frontier_of(extension_nfa),
-            )),
-        },
     }
 }
 
@@ -1175,20 +1144,6 @@ fn compiled_view_from_prepared(
         CompiledContentModel::AllGroup(model) => {
             CompiledView::AllGroup(all_group_view(schema_set, subst, model))
         }
-        #[cfg(feature = "xsd11")]
-        CompiledContentModel::AllGroupExtension {
-            base_model,
-            extension_nfa,
-        } => CompiledView::AllGroupExtension {
-            base: all_group_view(schema_set, subst, base_model),
-            extension: Box::new(nfa_view(
-                schema_set,
-                subst,
-                extension_nfa,
-                None,
-                frontier_of(extension_nfa),
-            )),
-        },
     }
 }
 
@@ -1729,16 +1684,6 @@ impl fmt::Display for CompiledView {
         match self {
             CompiledView::Nfa(view) => view.fmt(f),
             CompiledView::AllGroup(view) => view.fmt(f),
-            #[cfg(feature = "xsd11")]
-            CompiledView::AllGroupExtension { base, extension } => {
-                kv(f, "matcher", "all-group extension (base all-group + NFA)")?;
-                writeln!(f)?;
-                writeln!(f, "  base all-group")?;
-                base.fmt(f)?;
-                writeln!(f)?;
-                writeln!(f, "  extension NFA")?;
-                extension.fmt(f)
-            }
             CompiledView::Failed { reason } => {
                 kv(f, "matcher", "(none — preparation failed)")?;
                 kv(f, "failure", reason)?;
@@ -2389,6 +2334,49 @@ mod tests {
         assert!(find_complex_type(&ss, None, "Nope").is_none());
         assert!(find_complex_type(&ss, Some("urn:nope"), "Pair").is_none());
         assert!(find_complex_type(&ss, None, "Pair").is_some());
+    }
+
+    /// Branch, merge and occurrence-wrapper states are invented by the
+    /// compiler rather than written by the schema author, but each still
+    /// belongs to the construct that caused it. Every state row must name a
+    /// location — the state table used to render about half its rows as
+    /// `(no origin)`.
+    #[test]
+    fn epsilon_states_carry_the_origin_of_their_construct() {
+        let ss = schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="Mixed">
+    <xs:sequence>
+      <xs:element name="a" type="xs:string"/>
+      <xs:choice minOccurs="0" maxOccurs="3">
+        <xs:element name="b" type="xs:string"/>
+        <xs:element name="c" type="xs:string"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>"#,
+        );
+        let key = find_complex_type(&ss, None, "Mixed").expect("named type");
+        let rep = inspect_content_model(&ss, key).expect("content model compiles");
+        let CompiledView::Nfa(view) = &rep.compiled else {
+            panic!("expected an NFA model, got {}", rep.compiled.matcher_kind());
+        };
+
+        let epsilons: Vec<&StateRow> = view.states.iter().filter(|s| s.term.is_none()).collect();
+        assert!(
+            !epsilons.is_empty(),
+            "this model is built by composition, so it has epsilon states"
+        );
+        for state in &epsilons {
+            assert!(
+                state.origin.is_some(),
+                "epsilon state #{} has no origin",
+                state.id
+            );
+        }
+
+        let text = rep.to_string();
+        assert!(!text.contains("(no origin)"), "{text}");
     }
 
     /// Report rendering must not depend on hash-map iteration order.

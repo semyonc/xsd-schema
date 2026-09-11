@@ -1036,3 +1036,97 @@ fn test_single_repeated_element_no_conflict() {
         "single repeated element should not violate UPA"
     );
 }
+
+// ========================================================================
+// Schema-level UPA compilation
+// ========================================================================
+
+/// The UPA path compiles every particle with capped occurrence bounds
+/// (`cap_for_upa`), so the model it produces is counter-free and the
+/// epsilon-closure analysis below can run on it. `compile_base_all_group`
+/// used to reach for the public, non-UPA entry point, compiling the base
+/// type of an extension with uncapped bounds while the rest of the same
+/// compilation was capped; both halves now run in the same mode.
+///
+/// `Derived` extends an all-group base (§3.4.2.3.3 clause 4.2.3.2: one merged
+/// all group, the base's particles followed by the extension's) and
+/// `DerivedSeq` extends a sequence base — the two shapes the UPA path can
+/// produce for an extension. Every particle carries `maxOccurs="1000"`, which
+/// outside UPA mode compiles to counted NFA transitions.
+#[cfg(feature = "xsd11")]
+#[test]
+fn test_upa_extension_of_all_group_base_is_counter_free() {
+    use crate::compiler::ContentModelMatcher;
+
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="Base">
+            <xs:all>
+                <xs:element name="a" type="xs:string" maxOccurs="1000"/>
+                <xs:element name="b" type="xs:string" maxOccurs="1000"/>
+            </xs:all>
+        </xs:complexType>
+        <xs:complexType name="Derived">
+            <xs:complexContent>
+                <xs:extension base="Base">
+                    <xs:all>
+                        <xs:element name="c" type="xs:string" maxOccurs="1000"/>
+                    </xs:all>
+                </xs:extension>
+            </xs:complexContent>
+        </xs:complexType>
+        <xs:complexType name="SeqBase">
+            <xs:sequence maxOccurs="1000">
+                <xs:element name="d" type="xs:string" maxOccurs="1000"/>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="DerivedSeq">
+            <xs:complexContent>
+                <xs:extension base="SeqBase">
+                    <xs:sequence maxOccurs="1000">
+                        <xs:element name="e" type="xs:string" maxOccurs="1000"/>
+                    </xs:sequence>
+                </xs:extension>
+            </xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+
+    let mut schema_set = SchemaSet::xsd11();
+    crate::pipeline::load_and_process_schema(xsd.as_bytes(), "upa.xsd", &mut schema_set, None)
+        .expect("schema should load and pass UPA checking");
+
+    let upa_matcher = |local: &str| {
+        let key = crate::compiler::inspect::find_complex_type(&schema_set, None, local)
+            .unwrap_or_else(|| panic!("complex type {local} not found"));
+        crate::compiler::compile_content_model_for_upa(
+            &schema_set,
+            &schema_set.arenas.complex_types[key],
+        )
+        .unwrap_or_else(|e| panic!("UPA compilation of {local} failed: {e}"))
+    };
+
+    // The all-group base merges with the extension's all group; an all-group
+    // model runs no automaton, so it carries no counters by construction.
+    match upa_matcher("Derived") {
+        ContentModelMatcher::AllGroup(model) => {
+            assert_eq!(
+                model.particles.len(),
+                3,
+                "base particles followed by the extension's"
+            );
+        }
+        other => panic!("expected a merged all-group UPA model, got {other:?}"),
+    }
+
+    // The sequence base goes through the NFA path; capping must leave it
+    // counter-free, which is what the closure-based UPA analysis requires.
+    match upa_matcher("DerivedSeq") {
+        ContentModelMatcher::Nfa(nfa) | ContentModelMatcher::WithOpenContent { nfa, .. } => {
+            assert!(
+                !nfa.has_counters(),
+                "UPA model must be counter-free, found {:?}",
+                nfa.counter_defs
+            );
+        }
+        other => panic!("expected an NFA UPA model, got {other:?}"),
+    }
+}

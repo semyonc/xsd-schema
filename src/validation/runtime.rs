@@ -410,27 +410,22 @@ fn init_declared_element_state(
 }
 
 impl DeclaredElementBinding {
-    /// Validity recorded on the pushed [`ElementValidationState`]: the
-    /// start-side verdicts, including `nillable_violation` (cvc-elt.3.1) —
-    /// which [`start_outcome_validity`](Self::start_outcome_validity) does not
-    /// fold in.
+    /// The start-side verdict, recorded both on the pushed
+    /// [`ElementValidationState`] and in the `SchemaInfo` the start event
+    /// returns — the two must agree.
+    ///
+    /// `nillable_violation` is one of them. Element Locally Valid (Element)
+    /// (§3.3.4.2) makes it a verdict on the element itself: "For an element
+    /// information item E to be locally ·valid· with respect to an element
+    /// declaration D all of the following must be true: … 3 One of the
+    /// following is true: 3.1 D . {nillable} = false, and E has no xsi:nil
+    /// attribute." An `xsi:nil` on a non-nillable declaration satisfies
+    /// neither clause 3.1 nor clause 3.2, so E is not locally valid and its
+    /// `[validity]` is `invalid` from the start event onward.
     fn state_validity(&self, edc_invalid: bool) -> SchemaValidity {
         if self.xsi_type_invalid
             || self.abstract_type_invalid
             || self.nillable_violation
-            || self.has_deferred_type_error
-            || edc_invalid
-        {
-            SchemaValidity::Invalid
-        } else {
-            SchemaValidity::Valid
-        }
-    }
-
-    /// Validity reported in the start-side `SchemaInfo`.
-    fn start_outcome_validity(&self, edc_invalid: bool) -> SchemaValidity {
-        if self.xsi_type_invalid
-            || self.abstract_type_invalid
             || self.has_deferred_type_error
             || edc_invalid
         {
@@ -1430,7 +1425,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ElementStartOutcome::Start {
             element_decl: Some(elem_key),
             schema_type: binding.type_key,
-            validity: binding.start_outcome_validity(edc_invalid),
+            validity: binding.state_validity(edc_invalid),
             is_nil: binding.is_nil,
             content_type: Some(content_type),
             type_source: Some(binding.type_source),
@@ -4005,64 +4000,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 local_name: *name,
                                 namespace: *namespace,
                                 element_key: *element_key,
-                            });
-                        }
-                    }
-                }
-                result
-            }
-            #[cfg(feature = "xsd11")]
-            ContentValidatorState::AllGroupExtension {
-                model,
-                state,
-                extension_nfa,
-                phase,
-            } => {
-                use super::content::AllGroupExtPhase;
-
-                let mut result = Vec::new();
-                match phase {
-                    AllGroupExtPhase::AllGroup => {
-                        // Include acceptable all-group particles
-                        for (i, particle) in model.particles.iter().enumerate() {
-                            if state.can_accept(model, i) {
-                                if let crate::compiler::NfaTerm::Element {
-                                    ref name,
-                                    ref namespace,
-                                    ref element_key,
-                                    ..
-                                } = particle.term
-                                {
-                                    result.push(ExpectedElement {
-                                        local_name: *name,
-                                        namespace: *namespace,
-                                        element_key: *element_key,
-                                    });
-                                }
-                            }
-                        }
-                        // If all-group is satisfied, also include extension NFA elements
-                        if state.is_satisfied(model) {
-                            let initial = crate::compiler::ActiveStates::from_nfa(extension_nfa);
-                            for (name, namespace, element_key) in
-                                initial.expected_element_terms(extension_nfa)
-                            {
-                                result.push(ExpectedElement {
-                                    local_name: name,
-                                    namespace,
-                                    element_key,
-                                });
-                            }
-                        }
-                    }
-                    AllGroupExtPhase::Nfa(active_states) => {
-                        for (name, namespace, element_key) in
-                            active_states.expected_element_terms(extension_nfa)
-                        {
-                            result.push(ExpectedElement {
-                                local_name: name,
-                                namespace,
-                                element_key,
                             });
                         }
                     }

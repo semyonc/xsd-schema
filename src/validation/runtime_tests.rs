@@ -375,6 +375,41 @@ fn test_xsi_nil_on_nillable_element() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
 
+/// cvc-elt.3.1 / Element Locally Valid (Element) (§3.3.4.2) clause 3.1:
+/// "D . {nillable} = false, and E has no xsi:nil attribute." An `xsi:nil` on a
+/// non-nillable declaration satisfies neither 3.1 nor 3.2, so the element is
+/// not locally valid — and the start event must say so, not just the end.
+#[test]
+fn test_xsi_nil_on_non_nillable_element_is_invalid_at_start() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="r" type="xs:string"/>
+        </xs:schema>"#,
+    );
+
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+
+    let info = v.validate_element("r", "", None, Some("true"), &ns);
+    assert_eq!(
+        info.validity,
+        SchemaValidity::Invalid,
+        "start event must report the cvc-elt.3.1 violation"
+    );
+
+    v.validate_end_of_attributes();
+    let end_info = v.validate_end_element();
+    assert_eq!(end_info.validity, SchemaValidity::Invalid);
+    v.end_validation().ok();
+
+    assert!(
+        v.sink.errors.iter().any(|e| e.constraint == "cvc-elt.3.1"),
+        "expected cvc-elt.3.1, got: {:?}",
+        v.sink.errors
+    );
+}
+
 #[test]
 fn test_end_validation_with_unclosed_elements() {
     let schema_set = load_schema(

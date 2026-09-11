@@ -87,9 +87,18 @@ impl<R: BufRead> TrackedReader<R> {
     }
 
     /// Read the next XML event with its source span
+    ///
+    /// For element events the span starts at the tag's `<`. quick-xml's
+    /// `buffer_position()` only reports where the *last* event ended, and the
+    /// read that produces an element also consumes the whitespace in front of
+    /// it (`trim_text`), so the position taken before the read is the end of
+    /// the previous event, not the start of this tag — it would place a
+    /// declaration on the line of whatever preceded it. The tag's own length
+    /// recovers the real start: `emit_start` hands back the tag with `<` and
+    /// `>` stripped, or `<` and `/>` for a self-closed one.
     pub fn read_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> SchemaResult<TrackedEvent<'b>> {
-        let start = self.reader.buffer_position() as usize;
-        self.last_position = start;
+        let prev_end = self.reader.buffer_position() as usize;
+        self.last_position = prev_end;
 
         let event = self.reader.read_event_into(buf).map_err(|e| {
             SchemaError::XmlError {
@@ -99,6 +108,20 @@ impl<R: BufRead> TrackedReader<R> {
         })?;
 
         let end = self.reader.buffer_position() as usize;
+        // `expand_empty_elements` would report `<a/>` as a Start whose length
+        // is three bytes short of the markup, so the adjustment is skipped
+        // when it is on; this reader never enables it.
+        let markup_start = match &event {
+            Event::Start(e) if !self.reader.config().expand_empty_elements => {
+                end.checked_sub(e.len() + 2)
+            }
+            Event::Empty(e) => end.checked_sub(e.len() + 3),
+            _ => None,
+        };
+        let start = match markup_start {
+            Some(s) if s >= prev_end => s,
+            _ => prev_end,
+        };
         let span = SourceSpan { start, end };
 
         Ok(TrackedEvent::new(event, span))
@@ -191,6 +214,35 @@ mod tests {
         let event = reader.read_event(&mut buf).unwrap();
         assert!(event.is_text());
         assert!(event.span.start > 0);
+    }
+
+    /// An element's span starts at its `<`, not at the end of whatever event
+    /// preceded it — the whitespace between the two is consumed by the same
+    /// read.
+    #[test]
+    fn test_element_span_starts_at_open_angle_bracket() {
+        let xml = b"<root>\n   <a x=\"1\"/>\n   <b>t</b>\n</root>";
+        let mut reader = TrackedReader::from_bytes(xml);
+        let mut buf = Vec::new();
+
+        let event = reader.read_event(&mut buf).unwrap();
+        assert!(event.is_start());
+        assert_eq!((event.span.start, event.span.end), (0, 6), "<root>");
+
+        buf.clear();
+        let event = reader.read_event(&mut buf).unwrap();
+        assert!(event.is_empty());
+        let start = xml.windows(2).position(|w| w == b"<a").unwrap();
+        assert_eq!(
+            event.span.start, start,
+            "empty element must start at its '<', not after </root>'s predecessor"
+        );
+        assert_eq!(&xml[event.span.start..event.span.end], b"<a x=\"1\"/>");
+
+        buf.clear();
+        let event = reader.read_event(&mut buf).unwrap();
+        assert!(event.is_start());
+        assert_eq!(&xml[event.span.start..event.span.end], b"<b>");
     }
 
     #[test]
