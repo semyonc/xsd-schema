@@ -6,12 +6,14 @@
 //! Callers create a per-run [`super::runtime::ValidationRuntime`] via
 //! [`SchemaValidator::start_run()`] to perform actual validation.
 
+use crate::compiler::inspect::{report_from_prepared, ContentModelReport};
 use crate::compiler::{build_substitution_group_map, SubstitutionGroupMap};
+use crate::ids::ComplexTypeKey;
 use crate::schema::SchemaSet;
 
 use super::errors::ValidationError;
 use super::info::ValidationFlags;
-use super::runtime::{build_content_models, ContentModelMap, ValidationRuntime};
+use super::runtime::{build_content_models, PreparedContentModels, ValidationRuntime};
 
 // ---------------------------------------------------------------------------
 // ValidationSink trait
@@ -120,7 +122,7 @@ pub struct SchemaValidator<'a> {
     /// Per-complex-type compiled content models, built once here and shared
     /// (borrowed) by every [`ValidationRuntime`]. Moves the content-model NFA
     /// compilation out of the per-element hot path. See `build_content_models`.
-    pub(crate) content_models: ContentModelMap,
+    pub(crate) content_models: PreparedContentModels,
     /// Validation flags controlling behaviour
     pub(crate) flags: ValidationFlags,
     /// Which assertion evaluation path is active (XSD 1.1 only)
@@ -153,6 +155,54 @@ impl<'a> SchemaValidator<'a> {
             #[cfg(feature = "xsd11")]
             assertion_source: AssertionSource::default(),
         }
+    }
+
+    /// Complex types whose content model could **not** be prepared at
+    /// construction, with the reason (an NFA compilation error, or an
+    /// execution limit hit while computing the model's initial state).
+    ///
+    /// Such a type is not silently treated as empty content: the first
+    /// element governed by it raises an operational failure
+    /// (`validation-preparation-failed`) that aborts the run and is returned
+    /// from `end_validation`. Callers that want to fail *before* validating
+    /// can check this list up front; it is empty for every schema the W3C
+    /// suites contain.
+    pub fn content_model_failures(&self) -> Vec<(ComplexTypeKey, &str)> {
+        self.content_models
+            .failures
+            .iter()
+            .map(|(k, reason)| (*k, reason.as_str()))
+            .collect()
+    }
+
+    /// A readable, source-attributed description of the content model this
+    /// validator holds for `ct_key` — see
+    /// [`ContentModelReport`](crate::compiler::inspect::ContentModelReport).
+    ///
+    /// Unlike
+    /// [`inspect_content_model`](crate::compiler::inspect::inspect_content_model),
+    /// which recompiles, this reads the model **already prepared** at
+    /// construction, so the compiled view is the exact object validation
+    /// executes. For a type listed in
+    /// [`content_model_failures`](Self::content_model_failures) the compiled
+    /// view states the preparation failure and its reason instead. For a type
+    /// whose content type is neither element-only nor mixed — no model is
+    /// prepared for those — the model is compiled on demand and the view says
+    /// so.
+    ///
+    /// Returns `None` when `ct_key` does not belong to this validator's schema
+    /// set.
+    pub fn describe_content_model(&self, ct_key: ComplexTypeKey) -> Option<ContentModelReport> {
+        report_from_prepared(
+            self.schema_set,
+            ct_key,
+            self.content_models.models.get(&ct_key),
+            self.content_models
+                .failures
+                .get(&ct_key)
+                .map(|reason| reason.as_str()),
+            self.subst_groups.as_ref(),
+        )
     }
 
     /// Create a new `SchemaValidator` with pre-built substitution groups.

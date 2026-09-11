@@ -229,9 +229,14 @@ pub fn parse_boolean(value: &str) -> Result<bool, String> {
 
 /// Parse an occurrence count (minOccurs/maxOccurs)
 ///
-/// XSD `nonNegativeInteger` has no upper bound, so values larger than `u32::MAX`
-/// are valid. We clamp them to `u32::MAX`; the compiler treats anything above
-/// `MAX_COUNTED_OCCURS` (10 000) as effectively unbounded.
+/// XSD `nonNegativeInteger` has no upper bound, so literals larger than
+/// `u32::MAX` are schema-valid (the W3C suite uses e.g.
+/// `maxOccurs="79228162514264337593543950335"`). Occurrence bounds are
+/// represented as `u32`, so such a literal **saturates to `u32::MAX`**
+/// (4 294 967 295) and is then enforced exactly at that value. This is a
+/// documented implementation limit — the bound is never widened to
+/// `unbounded` — and it is only observable on a document with more than
+/// `u32::MAX` sibling occurrences. Every literal that fits in `u32` is exact.
 pub fn parse_occurs(value: &str) -> Result<Option<u32>, String> {
     if value == "unbounded" {
         Ok(None)
@@ -239,7 +244,8 @@ pub fn parse_occurs(value: &str) -> Result<Option<u32>, String> {
         match value.parse::<u32>() {
             Ok(n) => Ok(Some(n)),
             Err(_) => {
-                // Accept valid non-negative integers that overflow u32
+                // Accept valid non-negative integers that overflow u32:
+                // saturate to the representable maximum (documented above).
                 if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
                     Ok(Some(u32::MAX))
                 } else {
@@ -297,6 +303,16 @@ mod tests {
         assert_eq!(parse_occurs("100"), Ok(Some(100)));
         assert_eq!(parse_occurs("unbounded"), Ok(None));
         assert!(parse_occurs("invalid").is_err());
+        // Documented implementation limit: literals beyond u32 saturate to
+        // u32::MAX (exact at that value) rather than becoming unbounded.
+        assert_eq!(parse_occurs("4294967295"), Ok(Some(u32::MAX)));
+        assert_eq!(parse_occurs("4294967296"), Ok(Some(u32::MAX)));
+        assert_eq!(
+            parse_occurs("79228162514264337593543950335"),
+            Ok(Some(u32::MAX))
+        );
+        assert!(parse_occurs("").is_err());
+        assert!(parse_occurs("-1").is_err());
     }
 
     #[test]

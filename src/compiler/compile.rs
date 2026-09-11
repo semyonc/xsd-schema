@@ -778,8 +778,8 @@ impl<'a> CompileContext<'a> {
 
     /// Apply occurrence constraints to a fragment
     ///
-    /// Small maxOccurs are unrolled; large values use counted NFA transitions;
-    /// very large values (> MAX_COUNTED_OCCURS) fall back to unbounded.
+    /// Small maxOccurs are unrolled; every larger finite value uses counted
+    /// NFA transitions and is enforced exactly (no finite bound is widened).
     ///
     /// When `upa_mode` is true, bounds are capped to small values first,
     /// producing a counter-free NFA suitable for UPA analysis.
@@ -1238,159 +1238,178 @@ pub fn compile_content_model_for_upa(
     compile_content_model_matcher_impl(schema_set, type_def, true)
 }
 
-fn compile_content_model_matcher_impl(
+/// Resolve a complex type's own open content (declared or default) and attach
+/// it to an already-built matcher.
+fn attach_own_open_content(
     schema_set: &SchemaSet,
     type_def: &ComplexTypeDefData,
-    upa_mode: bool,
-) -> NfaCompileResult<ContentModelMatcher> {
-    let target_namespace = type_def.target_namespace;
-    let mut ctx = if upa_mode {
-        CompileContext::new_for_upa(schema_set, target_namespace)
-    } else {
-        CompileContext::new(schema_set, target_namespace)
+    matcher: ContentModelMatcher,
+) -> ContentModelMatcher {
+    let open_content = resolve_open_content(
+        schema_set,
+        &type_def.content,
+        type_def.open_content.as_ref(),
+        type_def.source.as_ref(),
+    );
+    attach_open_content(schema_set, matcher, open_content)
+}
+
+/// Try the all-group path for a non-extension type whose top-level particle is
+/// an inline `xs:all`, or a named group reference resolving to one. Returns
+/// `None` when the shape doesn't apply, leaving the caller to fall through.
+fn compile_all_group_matcher(
+    ctx: &mut CompileContext<'_>,
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    is_extension: bool,
+) -> NfaCompileResult<Option<ContentModelMatcher>> {
+    if is_extension {
+        return Ok(None);
+    }
+    let ComplexContentResult::Complex(def) = &type_def.content else {
+        return Ok(None);
     };
-    let is_extension = matches!(
-        type_def.derivation_method,
-        Some(DerivationMethod::Extension)
+    let Some(particle) = def.particle.as_ref() else {
+        return Ok(None);
+    };
+
+    if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
+        validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
+        ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
+        ctx.resolved_particle_elements = type_def.resolved_content_particle_elements.to_vec();
+        ctx.content_flat_idx = Some(0);
+        let mut model = ctx.compile_all_group_model(all_particles, all_source)?;
+        if particle.min_occurs == 0 {
+            model.outer_optional = true;
+        }
+        let base_matcher = ContentModelMatcher::AllGroup(model);
+
+        return Ok(Some(attach_own_open_content(
+            schema_set,
+            type_def,
+            base_matcher,
+        )));
+    }
+
+    // Named group ref resolving to all-group
+    if let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) {
+        return Ok(Some(compile_top_level_all_group_ref_matcher(
+            ctx, schema_set, type_def, particle, group_data,
+        )?));
+    }
+
+    Ok(None)
+}
+
+/// XSD 1.1: Extension from an all-group base type — produce AllGroup or
+/// AllGroupExtension instead of the lossy NFA conversion. Returns `None` when
+/// the base type does not compile to an all-group, leaving the caller to fall
+/// through to the standard NFA path.
+#[cfg(feature = "xsd11")]
+fn compile_all_group_extension_matcher(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    is_extension: bool,
+    upa_mode: bool,
+) -> NfaCompileResult<Option<ContentModelMatcher>> {
+    if !is_extension || !schema_set.is_xsd11() {
+        return Ok(None);
+    }
+    let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? else {
+        return Ok(None);
+    };
+
+    let open_content = resolve_open_content(
+        schema_set,
+        &type_def.content,
+        type_def.open_content.as_ref(),
+        type_def.source.as_ref(),
     );
 
-    // Try the all-group path for non-extension types with an inline xs:all
-    if !is_extension {
-        if let ComplexContentResult::Complex(def) = &type_def.content {
-            if let Some(particle) = &def.particle {
-                if let Some((all_particles, all_source)) = is_top_level_all_group(particle) {
-                    validate_outer_all_group_occurs(particle, schema_set.xsd_version)?;
-                    ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
-                    ctx.resolved_particle_elements =
-                        type_def.resolved_content_particle_elements.to_vec();
-                    ctx.content_flat_idx = Some(0);
-                    let mut model = ctx.compile_all_group_model(all_particles, all_source)?;
-                    if particle.min_occurs == 0 {
-                        model.outer_optional = true;
-                    }
-                    let base_matcher = ContentModelMatcher::AllGroup(model);
+    // Determine what the extension adds
+    let own_particle = match &type_def.content {
+        ComplexContentResult::Complex(def) => def.particle.as_ref(),
+        _ => None,
+    };
 
-                    let open_content = resolve_open_content(
-                        schema_set,
-                        &type_def.content,
-                        type_def.open_content.as_ref(),
-                        type_def.source.as_ref(),
-                    );
-
-                    return Ok(attach_open_content(schema_set, base_matcher, open_content));
-                }
-
-                // Named group ref resolving to all-group
-                if let Some(group_data) = resolve_top_level_all_group_ref(particle, schema_set) {
-                    return compile_top_level_all_group_ref_matcher(
-                        &mut ctx, schema_set, type_def, particle, group_data,
-                    );
-                }
-            }
+    match own_particle {
+        None => {
+            // Extension adds only attributes — return base AllGroup directly
+            let matcher = ContentModelMatcher::AllGroup(base_all_model);
+            Ok(Some(attach_open_content(schema_set, matcher, open_content)))
         }
-    }
-
-    // XSD 1.0: empty-base xs:all extended via a top-level group reference to
-    // an xs:all. Without this branch the xsd11-feature path below would
-    // reject the schema even when the SchemaSet runs in XSD 1.0 mode
-    // (mgO007, mgZ003). Per §3.4.2.2 / §3.8 cos-all-limited, the empty base
-    // contributes nothing so the result is the extension's own all-group.
-    #[cfg(feature = "xsd11")]
-    if let Some(matcher) =
-        try_xsd10_empty_base_all_extension(&mut ctx, schema_set, type_def, is_extension)?
-    {
-        return Ok(matcher);
-    }
-
-    // XSD 1.1: Extension from an all-group base type — produce AllGroup or
-    // AllGroupExtension instead of the lossy NFA conversion.
-    #[cfg(feature = "xsd11")]
-    if is_extension && schema_set.is_xsd11() {
-        if let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? {
-            let open_content = resolve_open_content(
-                schema_set,
-                &type_def.content,
-                type_def.open_content.as_ref(),
-                type_def.source.as_ref(),
-            );
-
-            // Determine what the extension adds
-            let own_particle = match &type_def.content {
-                ComplexContentResult::Complex(def) => def.particle.as_ref(),
-                _ => None,
-            };
-
-            match own_particle {
-                None => {
-                    // Extension adds only attributes — return base AllGroup directly
-                    let matcher = ContentModelMatcher::AllGroup(base_all_model);
-                    return Ok(attach_open_content(schema_set, matcher, open_content));
-                }
-                Some(particle) => {
-                    // Check if extension's own particle is an inline all-group
-                    if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
-                        // §3.4.2.3 / cos-ct-extends: when both base and extension
-                        // are all-groups, their outer {min occurs} must match.
-                        let base_outer_optional = base_all_model.outer_optional;
-                        let ext_outer_optional = particle.min_occurs == 0;
-                        if base_outer_optional != ext_outer_optional {
-                            return Err(NfaCompileError::InvalidAllGroupOccurs {
-                                reason: format!(
-                                    "cos-ct-extends: when extending an xs:all base with an xs:all, \
-                                     the outer minOccurs must match (base minOccurs={}, \
-                                     extension minOccurs={})",
-                                    if base_outer_optional { 0 } else { 1 },
-                                    particle.min_occurs,
-                                ),
-                                location: particle.source.clone().or_else(|| ext_source.cloned()),
-                            });
-                        }
-
-                        // Reject extending an empty xs:all — there is no
-                        // base content to extend and the resulting type would
-                        // collapse to the extension's own all-group, which is
-                        // not a true extension. (W3C bug 6202; Saxon allows
-                        // this but conformance tests treat it as invalid.)
-                        if base_all_model.particles.is_empty() {
-                            return Err(NfaCompileError::InvalidAllGroupContent {
-                                location: particle.source.clone().or_else(|| ext_source.cloned()),
-                            });
-                        }
-
-                        let mut ctx = if upa_mode {
-                            CompileContext::new_for_upa(schema_set, type_def.target_namespace)
-                        } else {
-                            CompileContext::new(schema_set, type_def.target_namespace)
-                        };
-                        ctx.resolved_particle_types =
-                            type_def.resolved_content_particle_types.to_vec();
-                        ctx.resolved_particle_elements =
-                            type_def.resolved_content_particle_elements.to_vec();
-                        ctx.content_flat_idx = Some(0);
-                        let ext_model = ctx.compile_all_group_model(ext_particles, ext_source)?;
-
-                        let merged_outer_optional = base_outer_optional && ext_outer_optional;
-                        let mut merged_particles = base_all_model.particles;
-                        merged_particles.extend(ext_model.particles);
-                        let mut merged = AllGroupModel::new(merged_particles);
-                        merged.outer_optional = merged_outer_optional;
-                        let matcher = ContentModelMatcher::AllGroup(merged);
-                        return Ok(attach_open_content(schema_set, matcher, open_content));
-                    }
-
-                    // Extension is sequence/choice/group-ref — invalid per
-                    // cos-all-limited.1.2: an xs:all may only appear at the top
-                    // of a content model. Wrapping the base's all-group inside
-                    // a sequence(base, extension) violates that constraint.
-                    return Err(NfaCompileError::InvalidAllGroupContent {
-                        location: particle.source.clone(),
+        Some(particle) => {
+            // Check if extension's own particle is an inline all-group
+            if let Some((ext_particles, ext_source)) = is_top_level_all_group(particle) {
+                // §3.4.2.3 / cos-ct-extends: when both base and extension
+                // are all-groups, their outer {min occurs} must match.
+                let base_outer_optional = base_all_model.outer_optional;
+                let ext_outer_optional = particle.min_occurs == 0;
+                if base_outer_optional != ext_outer_optional {
+                    return Err(NfaCompileError::InvalidAllGroupOccurs {
+                        reason: format!(
+                            "cos-ct-extends: when extending an xs:all base with an xs:all, \
+                             the outer minOccurs must match (base minOccurs={}, \
+                             extension minOccurs={})",
+                            if base_outer_optional { 0 } else { 1 },
+                            particle.min_occurs,
+                        ),
+                        location: particle.source.clone().or_else(|| ext_source.cloned()),
                     });
                 }
+
+                // Reject extending an empty xs:all — there is no
+                // base content to extend and the resulting type would
+                // collapse to the extension's own all-group, which is
+                // not a true extension. (W3C bug 6202; Saxon allows
+                // this but conformance tests treat it as invalid.)
+                if base_all_model.particles.is_empty() {
+                    return Err(NfaCompileError::InvalidAllGroupContent {
+                        location: particle.source.clone().or_else(|| ext_source.cloned()),
+                    });
+                }
+
+                let mut ctx = if upa_mode {
+                    CompileContext::new_for_upa(schema_set, type_def.target_namespace)
+                } else {
+                    CompileContext::new(schema_set, type_def.target_namespace)
+                };
+                ctx.resolved_particle_types = type_def.resolved_content_particle_types.to_vec();
+                ctx.resolved_particle_elements =
+                    type_def.resolved_content_particle_elements.to_vec();
+                ctx.content_flat_idx = Some(0);
+                let ext_model = ctx.compile_all_group_model(ext_particles, ext_source)?;
+
+                let merged_outer_optional = base_outer_optional && ext_outer_optional;
+                let mut merged_particles = base_all_model.particles;
+                merged_particles.extend(ext_model.particles);
+                let mut merged = AllGroupModel::new(merged_particles);
+                merged.outer_optional = merged_outer_optional;
+                let matcher = ContentModelMatcher::AllGroup(merged);
+                return Ok(Some(attach_open_content(schema_set, matcher, open_content)));
             }
+
+            // Extension is sequence/choice/group-ref — invalid per
+            // cos-all-limited.1.2: an xs:all may only appear at the top
+            // of a content model. Wrapping the base's all-group inside
+            // a sequence(base, extension) violates that constraint.
+            Err(NfaCompileError::InvalidAllGroupContent {
+                location: particle.source.clone(),
+            })
         }
     }
+}
 
-    // Standard NFA path (sequences, choices, named group refs, extensions)
+/// Standard NFA path (sequences, choices, named group refs, extensions):
+/// compile the type's own particle, prepend the base type's content model for
+/// extensions, and attach the effective open content.
+fn compile_nfa_matcher(
+    ctx: &mut CompileContext<'_>,
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    is_extension: bool,
+    upa_mode: bool,
+) -> NfaCompileResult<ContentModelMatcher> {
     let own_nfa = match &type_def.content {
         ComplexContentResult::Complex(def) => match &def.particle {
             Some(particle) => {
@@ -1444,13 +1463,7 @@ fn compile_content_model_matcher_impl(
                     if own_nfa.is_none() {
                         // Extension adds only attributes — base AllGroup already carries its OC;
                         // attach_open_content(AllGroup, None) preserves it.
-                        let open_content = resolve_open_content(
-                            schema_set,
-                            &type_def.content,
-                            type_def.open_content.as_ref(),
-                            type_def.source.as_ref(),
-                        );
-                        return Ok(attach_open_content(schema_set, base_matcher, open_content));
+                        return Ok(attach_own_open_content(schema_set, type_def, base_matcher));
                     }
                     // Extension has own particles — convert AllGroup to NFA for concat
                     // (XSD 1.0 path; XSD 1.1 is handled above via compile_base_all_group)
@@ -1504,6 +1517,53 @@ fn compile_content_model_matcher_impl(
     );
 
     Ok(attach_open_content(schema_set, base_matcher, open_content))
+}
+
+fn compile_content_model_matcher_impl(
+    schema_set: &SchemaSet,
+    type_def: &ComplexTypeDefData,
+    upa_mode: bool,
+) -> NfaCompileResult<ContentModelMatcher> {
+    let target_namespace = type_def.target_namespace;
+    let mut ctx = if upa_mode {
+        CompileContext::new_for_upa(schema_set, target_namespace)
+    } else {
+        CompileContext::new(schema_set, target_namespace)
+    };
+    let is_extension = matches!(
+        type_def.derivation_method,
+        Some(DerivationMethod::Extension)
+    );
+
+    // Try the all-group path for non-extension types with an inline xs:all
+    if let Some(matcher) = compile_all_group_matcher(&mut ctx, schema_set, type_def, is_extension)?
+    {
+        return Ok(matcher);
+    }
+
+    // XSD 1.0: empty-base xs:all extended via a top-level group reference to
+    // an xs:all. Without this branch the xsd11-feature path below would
+    // reject the schema even when the SchemaSet runs in XSD 1.0 mode
+    // (mgO007, mgZ003). Per §3.4.2.2 / §3.8 cos-all-limited, the empty base
+    // contributes nothing so the result is the extension's own all-group.
+    #[cfg(feature = "xsd11")]
+    if let Some(matcher) =
+        try_xsd10_empty_base_all_extension(&mut ctx, schema_set, type_def, is_extension)?
+    {
+        return Ok(matcher);
+    }
+
+    // XSD 1.1: Extension from an all-group base type — produce AllGroup or
+    // AllGroupExtension instead of the lossy NFA conversion.
+    #[cfg(feature = "xsd11")]
+    if let Some(matcher) =
+        compile_all_group_extension_matcher(schema_set, type_def, is_extension, upa_mode)?
+    {
+        return Ok(matcher);
+    }
+
+    // Standard NFA path (sequences, choices, named group refs, extensions)
+    compile_nfa_matcher(&mut ctx, schema_set, type_def, is_extension, upa_mode)
 }
 
 /// §3.4.2.3 clauses 5–6: effective open content for an XSD 1.1 extension type.

@@ -725,6 +725,53 @@ The W3C XSD Test Suite is run exclusively in `Strict` mode. The
 not exercise the constructs unlocked by `LenientMs` — so wiring the
 flag into the harness would be dead code.
 
+## 7. Inspecting A Compiled Content Model
+
+When a document is rejected (or accepted) for a reason that is hard to see in
+the schema — a nested repetition, a substitution group, open content, a
+counted `maxOccurs` — the inspector shows what the validator actually compiled
+for a complex type. It is a diagnostic aid: nothing in it runs on the
+validation hot path.
+
+`compiler::inspect_content_model(&SchemaSet, ComplexTypeKey)` returns a
+`ContentModelReport` (also `Display`) with three labelled views:
+
+- **Source** — expanded type name, schema document and line/column, content
+  type (empty / simple / element-only / mixed), derivation, effective open
+  content, and the XSD version in force.
+- **Authored particles** — the resolved particle tree as the schema wrote it:
+  `sequence` / `choice` / `all` / group references (expanded inline but marked
+  as references) / elements with their declaration and type bindings /
+  wildcards with namespace constraint and `processContents`, each with its
+  `minOccurs..maxOccurs` and whether that range is *unrolled* (max ≤ 16) or
+  compiled to a *counter*, plus its source location.
+- **Compiled** — the matcher kind (NFA, all-group, NFA with open content, or
+  the XSD 1.1 all-group extension), state and transition counts, counters
+  (`c0: min..max`, nullable body or not), the initial frontier variant the
+  runtime will use, an *exposure* line for models that can reach the execution
+  limits, a per-state table (term, transitions including counter operations,
+  accept flag, origin) and the substitution-group expansions in play.
+
+The report compiles through the same entry point the validator uses, so the
+compiled view **is** the automaton validation executes. Two companions:
+
+- `SchemaValidator::describe_content_model(ct_key)` reads the model the
+  validator already prepared instead of recompiling, and — for a type listed by
+  `SchemaValidator::content_model_failures()` — names the reason the model
+  could not be prepared.
+- `compiler::find_complex_type(&SchemaSet, namespace, local)` looks a type up
+  by expanded name so callers can start from a QName.
+
+From the command line:
+
+```bash
+cargo run --example inspect_content_model -- examples/books.xsd BookForm urn:books
+```
+
+The example prints the report for the named type and, if the name is unknown,
+lists the named complex types of the schema. Anonymous local types are reported
+as `(anonymous)` and can be reached through the key of the declaring element.
+
 ## Recommended Reading Order
 
 If you are new to the crate, this sequence usually works well:

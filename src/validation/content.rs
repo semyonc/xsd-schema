@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use crate::compiler::{
     epsilon_closure, term_matches_with_substitution, ActiveStates, AllGroupModel, AllGroupState,
-    ContentModelMatcher, NfaTable, NfaTerm, OpenContentMode as AllGroupOpenContentMode, StateSet,
-    SubstitutionGroupMap, TermMatchResult,
+    ContentModelLimitExceeded, ContentModelMatcher, NfaTable, NfaTerm,
+    OpenContentMode as AllGroupOpenContentMode, StateSet, SubstitutionGroupMap, TermMatchResult,
 };
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::schema::model::XsdVersion;
@@ -93,10 +93,26 @@ pub enum CompiledContentModel {
 impl CompiledContentModel {
     /// Wrap a freshly compiled [`ContentModelMatcher`] into the shareable form,
     /// moving its automaton tables behind `Arc`s. Called once per complex type.
+    ///
+    /// # Panics
+    ///
+    /// If the model's initial configuration set exceeds an execution limit
+    /// (see [`ContentModelLimitExceeded`]). Use
+    /// [`try_from_matcher`](Self::try_from_matcher) to get that as an error;
+    /// the validator's load-time preparation does.
     pub fn from_matcher(matcher: ContentModelMatcher) -> Self {
-        match matcher {
+        Self::try_from_matcher(matcher).unwrap_or_else(|e| {
+            panic!("CompiledContentModel::from_matcher: {e}; use try_from_matcher")
+        })
+    }
+
+    /// Fallible form of [`from_matcher`](Self::from_matcher).
+    pub fn try_from_matcher(
+        matcher: ContentModelMatcher,
+    ) -> Result<Self, ContentModelLimitExceeded> {
+        Ok(match matcher {
             ContentModelMatcher::Nfa(nfa) => {
-                let initial = ActiveStates::from_nfa(&nfa);
+                let initial = ActiveStates::try_from_nfa(&nfa)?;
                 Self::Nfa {
                     nfa: Arc::new(nfa),
                     initial,
@@ -114,7 +130,7 @@ impl CompiledContentModel {
                     process_contents: w.process_contents,
                     not_qnames: w.not_qnames,
                 });
-                let initial = ActiveStates::from_nfa(&nfa);
+                let initial = ActiveStates::try_from_nfa(&nfa)?;
                 Self::NfaWithOpenContent {
                     nfa: Arc::new(nfa),
                     initial,
@@ -129,7 +145,7 @@ impl CompiledContentModel {
                 base_model: Arc::new(base_model),
                 extension_nfa: Arc::new(extension_nfa),
             },
-        }
+        })
     }
 }
 
@@ -255,6 +271,13 @@ impl ContentValidatorState {
     /// Returns `None` if the element was rejected.
     /// Returns `Some(ElementMatchInfo)` if accepted, containing the
     /// `ElementKey` and `resolved_type` from the matching NFA term (if any).
+    ///
+    /// # Panics
+    ///
+    /// If a counted model exceeds an execution limit
+    /// ([`ContentModelLimitExceeded`]). The validation runtime uses
+    /// [`try_advance_element`](Self::try_advance_element) instead and turns
+    /// the error into an operational failure.
     pub fn advance_element(
         &mut self,
         name: NameId,
@@ -262,6 +285,51 @@ impl ContentValidatorState {
         target_ns: Option<NameId>,
         xsd_version: XsdVersion,
         subst_groups: Option<&SubstitutionGroupMap>,
+    ) -> Option<ElementMatchInfo> {
+        self.try_advance_element(name, namespace, target_ns, xsd_version, subst_groups)
+            .unwrap_or_else(|e| {
+                panic!("ContentValidatorState::advance_element: {e}; use try_advance_element")
+            })
+    }
+
+    /// Fallible form of [`advance_element`](Self::advance_element).
+    ///
+    /// `Ok(Some(info))` — accepted; `Ok(None)` — rejected, state unchanged
+    /// (existing error-continuation behaviour); `Err(limit)` — a counted
+    /// model exceeded an execution limit, state unchanged, no verdict.
+    pub fn try_advance_element(
+        &mut self,
+        name: NameId,
+        namespace: Option<NameId>,
+        target_ns: Option<NameId>,
+        xsd_version: XsdVersion,
+        subst_groups: Option<&SubstitutionGroupMap>,
+    ) -> Result<Option<ElementMatchInfo>, ContentModelLimitExceeded> {
+        let mut limit: Option<ContentModelLimitExceeded> = None;
+        let matched = self.advance_element_impl(
+            name,
+            namespace,
+            target_ns,
+            xsd_version,
+            subst_groups,
+            &mut limit,
+        );
+        match limit {
+            Some(e) => Err(e),
+            None => Ok(matched),
+        }
+    }
+
+    /// Shared body of the two entry points above. A limit error is written to
+    /// `limit_out` and the function returns `None` without touching `self`.
+    fn advance_element_impl(
+        &mut self,
+        name: NameId,
+        namespace: Option<NameId>,
+        target_ns: Option<NameId>,
+        xsd_version: XsdVersion,
+        subst_groups: Option<&SubstitutionGroupMap>,
+        limit_out: &mut Option<ContentModelLimitExceeded>,
     ) -> Option<ElementMatchInfo> {
         match self {
             ContentValidatorState::Nfa {
@@ -272,14 +340,20 @@ impl ContentValidatorState {
                 // Fused single pass: capture the match info and compute the next
                 // frontier together (the open-content fallback below still reads
                 // the *old* `active_states`, so don't move `next` in until then).
-                let (mi, next) = active_states.advance_element_with_info(
+                let (mi, next) = match active_states.advance_element_with_info(
                     nfa,
                     name,
                     namespace,
                     target_ns,
                     subst_groups,
                     xsd_version,
-                );
+                ) {
+                    Ok(step) => step,
+                    Err(limit) => {
+                        *limit_out = Some(limit);
+                        return None;
+                    }
+                };
                 let match_info = ElementMatchInfo {
                     element_key: mi.element_key,
                     resolved_type: mi.resolved_type,
@@ -485,7 +559,13 @@ impl ContentValidatorState {
                         // No all-group particle matched — if all-group is satisfied,
                         // try transitioning to the extension NFA
                         if state.is_satisfied(model) {
-                            let initial = ActiveStates::from_nfa(extension_nfa);
+                            let initial = match ActiveStates::try_from_nfa(extension_nfa) {
+                                Ok(initial) => initial,
+                                Err(limit) => {
+                                    *limit_out = Some(limit);
+                                    return None;
+                                }
+                            };
                             let mi = initial.find_match_info(
                                 extension_nfa,
                                 name,
@@ -553,14 +633,20 @@ impl ContentValidatorState {
                             resolved_type: mi.resolved_type,
                             process_contents: mi.process_contents,
                         };
-                        let next = active_states.advance_with_priority_from(
+                        let next = match active_states.advance_with_priority_from(
                             extension_nfa,
                             name,
                             namespace,
                             target_ns,
                             subst_groups,
                             xsd_version,
-                        );
+                        ) {
+                            Ok(next) => next,
+                            Err(limit) => {
+                                *limit_out = Some(limit);
+                                return None;
+                            }
+                        };
                         if next.is_empty() {
                             // Try open content wildcard fallback
                             if let Some(oc) = &model.open_content {
@@ -605,7 +691,29 @@ impl ContentValidatorState {
     ///
     /// For NFA: any active state is the accept state.
     /// For AllGroup: all required particles have been satisfied.
+    ///
+    /// # Panics
+    ///
+    /// If computing the completion state of an XSD 1.1 all-group extension
+    /// exceeds an execution limit; see [`try_is_complete`](Self::try_is_complete).
     pub fn is_complete(&self) -> bool {
+        self.try_is_complete().unwrap_or_else(|e| {
+            panic!("ContentValidatorState::is_complete: {e}; use try_is_complete")
+        })
+    }
+
+    /// Fallible form of [`is_complete`](Self::is_complete).
+    pub fn try_is_complete(&self) -> Result<bool, ContentModelLimitExceeded> {
+        let mut limit: Option<ContentModelLimitExceeded> = None;
+        let complete = self.is_complete_impl(&mut limit);
+        match limit {
+            Some(e) => Err(e),
+            None => Ok(complete),
+        }
+    }
+
+    #[cfg_attr(not(feature = "xsd11"), allow(unused_variables))]
+    fn is_complete_impl(&self, limit_out: &mut Option<ContentModelLimitExceeded>) -> bool {
         match self {
             ContentValidatorState::Nfa {
                 nfa, active_states, ..
@@ -637,8 +745,13 @@ impl ContentValidatorState {
                 match phase {
                     AllGroupExtPhase::AllGroup => {
                         // Still in all-group phase — extension NFA must accept empty
-                        let initial = ActiveStates::from_nfa(extension_nfa);
-                        initial.contains_accept(extension_nfa)
+                        match ActiveStates::try_from_nfa(extension_nfa) {
+                            Ok(initial) => initial.contains_accept(extension_nfa),
+                            Err(limit) => {
+                                *limit_out = Some(limit);
+                                false
+                            }
+                        }
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
                         active_states.contains_accept(extension_nfa)
@@ -666,7 +779,10 @@ impl ContentValidatorState {
                 active_states,
                 open_content,
             } => {
-                let next = match xsd_version {
+                // Lookahead only: an execution-limit error here is reported as
+                // "not accepted"; the mutating advance that follows raises the
+                // operational failure.
+                let Ok(next) = (match xsd_version {
                     XsdVersion::V1_0 => active_states.advance_from(
                         nfa,
                         name,
@@ -683,6 +799,8 @@ impl ContentValidatorState {
                         subst_groups,
                         xsd_version,
                     ),
+                }) else {
+                    return false;
                 };
                 if !next.is_empty() {
                     return true;
@@ -780,15 +898,19 @@ impl ContentValidatorState {
                         }
                         // If all-group is satisfied, check extension NFA start
                         if state.is_satisfied(model) {
-                            let initial = ActiveStates::from_nfa(extension_nfa);
-                            let next = initial.advance_with_priority(
+                            let Ok(initial) = ActiveStates::try_from_nfa(extension_nfa) else {
+                                return false;
+                            };
+                            let Ok(next) = initial.try_advance_with_priority(
                                 extension_nfa,
                                 name,
                                 namespace,
                                 target_ns,
                                 subst_groups,
                                 xsd_version,
-                            );
+                            ) else {
+                                return false;
+                            };
                             if !next.is_empty() {
                                 return true;
                             }
@@ -816,14 +938,16 @@ impl ContentValidatorState {
                     }
                     AllGroupExtPhase::Nfa(active_states) => {
                         // Standard NFA lookahead
-                        let next = active_states.advance_with_priority_from(
+                        let Ok(next) = active_states.advance_with_priority_from(
                             extension_nfa,
                             name,
                             namespace,
                             target_ns,
                             subst_groups,
                             xsd_version,
-                        );
+                        ) else {
+                            return false;
+                        };
                         if !next.is_empty() {
                             return true;
                         }
