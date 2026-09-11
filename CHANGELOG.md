@@ -35,6 +35,15 @@ resource-failure contract, plus the two measurement-phase allocation gates.
 
 ### Fixed
 
+- **`xsi:nil` on a non-nillable element is now invalid at the start event.**
+  The pushed element state was `Invalid` and `cvc-elt.3.1` was reported, but
+  the `SchemaInfo` returned by `validate_element` / `validate_element_by_id`
+  for the *start* event still said `Valid`, so a streaming consumer reading
+  per-element `[validity]` saw the violation only at end-of-element. Element
+  Locally Valid (Element) (§3.3.4.2) clause 3.1 — "D . {nillable} = false, and
+  E has no xsi:nil attribute" — is a verdict on the element itself, so both now
+  report `Invalid`. Diagnostics, their order and every driver outcome are
+  unchanged.
 - **An unresolved `<xs:group ref="…"/>` now names the group.** The error read
   `unresolved group reference: NameId(42):17` — the raw interned ids — instead
   of the QName. Both group-reference resolution sites (`compile_group_ref` and
