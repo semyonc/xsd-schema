@@ -141,9 +141,16 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// instance of a type, so each element only clones cheap `Arc`s from here
     /// and allocates fresh active states, instead of recompiling the model per
     /// element. See `PERF_ANALYZE`.
-    content_models: &'a ContentModelMap,
+    content_models: &'a PreparedContentModels,
     /// Active constraint state instances
     active_constraints: Vec<ConstraintStruct>,
+    /// Terminal operational failure (execution limit, unprepared content
+    /// model). Once set, every push-API call short-circuits without
+    /// assessing and [`end_validation`](Self::end_validation) returns this
+    /// error, so no driver can report a successful completion. Distinct from
+    /// validity: the document is neither reported valid nor invalid.
+    /// See `XSD_COMPILER_REWORK.md` §8.4 / §13.3.
+    operational_failure: Option<ValidationError>,
     /// Collected ID values mapped to the owner element serial.
     /// XSD 1.1 §3.17.5.2: same ID on the same owner element is allowed.
     id_values: HashMap<String, u64>,
@@ -311,19 +318,44 @@ enum EndOfAttributesOutcome {
 /// Compilation failures are simply omitted from the map; the runtime then falls
 /// back to empty content (matching the previous per-element error path) and
 /// never retries the failed compile.
-pub(crate) fn build_content_models(schema_set: &SchemaSet) -> ContentModelMap {
-    let mut map = ContentModelMap::default();
+/// Load-time content-model preparation: the compiled models plus every
+/// complex type whose model could **not** be prepared, with the reason.
+///
+/// A failed type is deliberately not treated as empty content. The first
+/// element it governs raises an operational failure
+/// (`validation-preparation-failed`) that aborts the run — see
+/// [`ValidationRuntime::operational_failure`] — and
+/// `SchemaValidator::content_model_failures` exposes the list up front.
+pub(crate) struct PreparedContentModels {
+    pub(crate) models: ContentModelMap,
+    pub(crate) failures: HashMap<ComplexTypeKey, String, BuildHasherDefault<AHasher>>,
+}
+
+pub(crate) fn build_content_models(schema_set: &SchemaSet) -> PreparedContentModels {
+    let mut models = ContentModelMap::default();
+    let mut failures: HashMap<ComplexTypeKey, String, BuildHasherDefault<AHasher>> =
+        HashMap::default();
     for (ct_key, ct_data) in schema_set.arenas.complex_types.iter() {
         if matches!(
             determine_content_type(schema_set, ct_data),
             ContentType::ElementOnly | ContentType::Mixed
         ) {
-            if let Ok(matcher) = compile_content_model_matcher(schema_set, ct_data) {
-                map.insert(ct_key, CompiledContentModel::from_matcher(matcher));
+            match compile_content_model_matcher(schema_set, ct_data) {
+                Ok(matcher) => match CompiledContentModel::try_from_matcher(matcher) {
+                    Ok(model) => {
+                        models.insert(ct_key, model);
+                    }
+                    Err(limit) => {
+                        failures.insert(ct_key, limit.to_string());
+                    }
+                },
+                Err(err) => {
+                    failures.insert(ct_key, format!("{err}"));
+                }
             }
         }
     }
-    map
+    PreparedContentModels { models, failures }
 }
 
 /// Determine the [`ContentType`] of a complex type from its `ComplexTypeDefData`.
@@ -461,7 +493,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     pub(crate) fn new(
         schema_set: &'a SchemaSet,
         subst_groups: &'a Option<SubstitutionGroupMap>,
-        content_models: &'a ContentModelMap,
+        content_models: &'a PreparedContentModels,
         flags: ValidationFlags,
         sink: S,
         #[cfg(feature = "xsd11")] assertion_source: AssertionSource,
@@ -486,6 +518,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             element_path: String::new(),
             compiled_constraints: HashMap::new(),
             active_constraints: Vec::new(),
+            operational_failure: None,
             id_values: HashMap::new(),
             next_element_serial: 0,
             pending_idrefs: Vec::new(),
@@ -1120,6 +1153,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         xsi_nil: Option<&str>,
         ns_context: &NamespaceContextSnapshot,
     ) -> ElementStartOutcome {
+        if self.operational_failure.is_some() {
+            return ElementStartOutcome::Invalid;
+        }
         // 1. State machine check
         if !self.current_state.can_start_element() {
             self.report_error(
@@ -1150,6 +1186,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let mut content_model_accepted = false;
         let mut content_model_error = None;
         let mut nil_error: Option<String> = None;
+        let mut resource_failure: Option<(
+            crate::compiler::ContentModelLimitExceeded,
+            NameId,
+            Option<TypeKey>,
+        )> = None;
         if let Some(parent) = self.validation_stack.last_mut() {
             if parent.process_contents == ContentProcessing::Skip {
                 // Skipped element: don't validate content model, push as skip, return
@@ -1179,26 +1220,51 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     }
                     _ => parent.namespace,
                 };
-                match parent.content_state.advance_element(
+                match parent.content_state.try_advance_element(
                     local_name,
                     namespace,
                     wildcard_target_ns,
                     self.schema_set.xsd_version,
                     self.subst_groups.as_ref(),
                 ) {
-                    Some(info) => {
+                    Ok(Some(info)) => {
                         match_info = Some(info);
                         content_model_accepted = true;
                     }
-                    None => {
+                    Ok(None) => {
+                        // cvc-complex-type.2.4 is a constraint on the *parent*
+                        // (Structures §3.4.4, Element Locally Valid (Complex
+                        // Type)): a child that the content model rejects makes
+                        // the parent invalid, not merely error-annotated.
+                        parent.validity = SchemaValidity::Invalid;
                         let elem_name = self.schema_set.name_table.resolve(local_name);
                         content_model_error = Some(format!(
                             "Element '{}' is not allowed at this position in the content model",
                             elem_name,
                         ));
                     }
+                    Err(limit) => {
+                        resource_failure = Some((limit, parent.local_name, parent.schema_type));
+                    }
                 }
             }
+        }
+        if let Some((limit, parent_name, parent_type)) = resource_failure {
+            // Not a verdict: the counted content model could not be advanced
+            // within the execution limits. Abort the run (§8.4).
+            let parent_name = self.schema_set.name_table.resolve(parent_name).to_string();
+            let type_label = match parent_type {
+                Some(TypeKey::Complex(ct)) => self.complex_type_label(ct),
+                _ => "(no complex type)".to_string(),
+            };
+            self.fail_operational(
+                "validation-resource-limit",
+                format!(
+                    "Content model of element '{parent_name}' (type {type_label}) exceeded an \
+                     execution limit — {limit}; assessment aborted"
+                ),
+            );
+            return ElementStartOutcome::Invalid;
         }
         if let Some(msg) = nil_error {
             self.report_error("cvc-elt.3.2.1", msg);
@@ -1801,6 +1867,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         namespace: Option<NameId>,
         value: &str,
     ) -> SchemaInfo {
+        if self.operational_failure.is_some() {
+            return SchemaInfo::invalid();
+        }
         // 1. State machine check
         if !self.current_state.can_validate_attribute() {
             self.report_error(
@@ -2136,6 +2205,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// The end-of-attributes step shared by both entry points above:
     /// everything except assembling the returned `SchemaInfo`.
     fn end_of_attributes_inner(&mut self) -> EndOfAttributesOutcome {
+        if self.operational_failure.is_some() {
+            return EndOfAttributesOutcome::Invalid;
+        }
         if !self.current_state.can_end_attributes() {
             self.report_error(
                 "cvc-complex-type",
@@ -2438,6 +2510,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Validate a text content event
     pub fn validate_text(&mut self, text: &str) {
+        if self.operational_failure.is_some() {
+            return;
+        }
         if !self.current_state.can_validate_text() {
             self.report_error(
                 "cvc-complex-type",
@@ -2537,6 +2612,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// Whitespace is always allowed in element-only content (it is insignificant).
     pub fn validate_whitespace(&mut self, text: &str) {
+        if self.operational_failure.is_some() {
+            return;
+        }
         if !self.current_state.can_validate_text() {
             self.report_error(
                 "cvc-complex-type",
@@ -2627,6 +2705,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// call was out of sequence / the stack was empty (the caller then returns
     /// its own invalid sentinel, matching the previous inline behaviour).
     fn finish_top_element(&mut self) -> Option<FinishedElement> {
+        if self.operational_failure.is_some() {
+            return None;
+        }
         if !self.current_state.can_end_element() {
             self.report_error(
                 "cvc-complex-type",
@@ -2729,10 +2810,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn finish_content_model(&mut self, ev_state: &mut ElementValidationState) {
         // 1. Check content model completion
         if !ev_state.is_nil {
-            match ev_state.content_type {
+            let element_content = matches!(
+                ev_state.content_type,
                 Some(ContentType::ElementOnly) | Some(ContentType::Mixed)
-                    if !ev_state.content_state.is_complete() =>
-                {
+            );
+            let complete = if element_content {
+                match ev_state.content_state.try_is_complete() {
+                    Ok(complete) => complete,
+                    Err(limit) => {
+                        // Operational failure, not a verdict (§8.4).
+                        let elem_name = self
+                            .schema_set
+                            .name_table
+                            .resolve(ev_state.local_name)
+                            .to_string();
+                        self.fail_operational(
+                            "validation-resource-limit",
+                            format!(
+                                "Completion check of element '{elem_name}' exceeded an \
+                                 execution limit — {limit}; assessment aborted"
+                            ),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                true
+            };
+            match ev_state.content_type {
+                Some(ContentType::ElementOnly) | Some(ContentType::Mixed) if !complete => {
                     let elem_name = self.schema_set.name_table.resolve(ev_state.local_name);
                     let err = errors::error(
                         "cvc-complex-type.2.4",
@@ -3334,6 +3440,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// Checks that the validation stack is empty and performs IDREF validation.
     pub fn end_validation(&mut self) -> Result<(), ValidationError> {
+        // An operational failure is terminal: report it as the completion
+        // error regardless of the state machine (the run was abandoned where
+        // it happened, so the stack is not expected to be empty).
+        if let Some(err) = self.operational_failure.clone() {
+            self.current_state = ValidatorState::Finish;
+            return Err(err);
+        }
         if !self.current_state.can_finish() {
             return Err(errors::error(
                 "cvc-complex-type",
@@ -3783,6 +3896,65 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     }
 
     /// Report a validation error through the sink
+    /// Record a terminal operational failure. The first failure wins: it is
+    /// reported to the sink once (with the current location and element path)
+    /// and stored so that [`end_validation`](Self::end_validation) fails and
+    /// every later push call is inert.
+    fn fail_operational(&mut self, constraint: &'static str, message: String) {
+        if self.operational_failure.is_some() {
+            return;
+        }
+        let err = self.enrich(errors::error(constraint, message, None));
+        self.emit_error(err.clone());
+        self.operational_failure = Some(err);
+    }
+
+    /// The terminal operational failure recorded for this run, if any.
+    ///
+    /// Operational failures — a counted content model exceeding an execution
+    /// limit (`validation-resource-limit`, see
+    /// [`ContentModelLimitExceeded`](crate::compiler::ContentModelLimitExceeded))
+    /// or a content model that could not be prepared at load time
+    /// (`validation-preparation-failed`) — abort assessment. They are not
+    /// validity verdicts: the driver returns an error from completion instead
+    /// of a `DriveOutcome`, and direct push callers get `Err` from
+    /// [`end_validation`](Self::end_validation).
+    pub fn operational_failure(&self) -> Option<&ValidationError> {
+        self.operational_failure.as_ref()
+    }
+
+    /// Raise `validation-preparation-failed` for a complex type whose content
+    /// model is missing from the prepared map.
+    fn fail_content_model_unavailable(&mut self, ct_key: ComplexTypeKey) {
+        let reason = self
+            .content_models
+            .failures
+            .get(&ct_key)
+            .cloned()
+            .unwrap_or_else(|| "no content model was prepared for this type".to_string());
+        let type_label = self.complex_type_label(ct_key);
+        self.fail_operational(
+            "validation-preparation-failed",
+            format!(
+                "Content model of complex type {type_label} is unavailable: {reason}; \
+                 assessment aborted"
+            ),
+        );
+    }
+
+    /// `{ns}local` / `local` / `(anonymous)` label for diagnostics.
+    fn complex_type_label(&self, ct_key: ComplexTypeKey) -> String {
+        let ct = &self.schema_set.arenas.complex_types[ct_key];
+        let names = &self.schema_set.name_table;
+        match ct.name {
+            Some(local) => match ct.target_namespace {
+                Some(ns) => format!("{{{}}}{}", names.resolve(ns), names.resolve(local)),
+                None => names.resolve(local).to_string(),
+            },
+            None => "(anonymous)".to_string(),
+        }
+    }
+
     fn report_error(&mut self, constraint: &'static str, message: impl Into<String>) {
         let err = errors::error(constraint, message, self.current_location.clone());
         let err = if self.element_path.is_empty() {
@@ -4278,26 +4450,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         is_complex_content: bool,
         error_codes: &mut Vec<&'static str>,
     ) {
-        let name_table = &self.schema_set.name_table;
-        let element_path = self.element_path.clone();
-        let location = self.current_location.clone();
-
-        // 1. Advance all constraints (field value collection + key sequence finalization)
-        let mut ic_errors = Vec::new();
-        for cs in &mut self.active_constraints {
-            let errs = cs.end_element_with_text(
-                text_content,
-                typed_value,
-                is_nil,
-                is_complex_content,
-                name_table,
-                &element_path,
-                location.clone(),
-            );
-            ic_errors.extend(errs);
-        }
-        for err in ic_errors {
-            self.emit_error_to(err, error_codes);
+        // 1. Advance all constraints (field value collection + key sequence
+        //    finalization). Gated on a non-empty active list so the common
+        //    constraint-free element end neither clones the element path nor
+        //    the location (P0 allocation gate, XSD_COMPILER_REWORK §12.1).
+        //    Steps 2–3 below still run: they own the scope-stack teardown and
+        //    are already no-ops when nothing deactivated.
+        if !self.active_constraints.is_empty() {
+            let name_table = &self.schema_set.name_table;
+            let element_path: &str = &self.element_path;
+            let location = self.current_location.clone();
+            let mut ic_errors = Vec::new();
+            for cs in &mut self.active_constraints {
+                let errs = cs.end_element_with_text(
+                    text_content,
+                    typed_value,
+                    is_nil,
+                    is_complex_content,
+                    name_table,
+                    element_path,
+                    location.clone(),
+                );
+                ic_errors.extend(errs);
+            }
+            for err in ic_errors {
+                self.emit_error_to(err, error_codes);
+            }
         }
 
         // 2. Collect deactivated constraints (constraints whose scope element just closed)
@@ -4931,43 +5109,49 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ) {
         let ns = namespace.unwrap_or(NameId(0));
 
-        // Identity constraint: check field attribute matches
-        let ns_ctx = self
-            .validation_stack
-            .last()
-            .and_then(|ev| ev.ns_context.as_ref());
-        let ic_typed_value = Self::resolve_ic_qname_value(
-            &result.typed_value,
-            value,
-            ns_ctx,
-            &self.schema_set.name_table,
-        )
-        .or_else(|| result.typed_value.clone());
-        let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
-        for cs in &mut self.active_constraints {
-            let matches = cs.matching_fields(local_name, ns);
-            for field_idx in matches {
-                let already_matched =
-                    cs.set_field_value(field_idx, value.to_string(), ic_typed_value.clone());
-                if already_matched {
-                    multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+        // Identity constraint: check field attribute matches. The whole block
+        // — including the QName re-resolution and the typed-value clone it
+        // needs — is gated on an active constraint (P0 allocation gate,
+        // XSD_COMPILER_REWORK §12.1). The ID/IDREF/ENTITY/NOTATION checks
+        // below are independent and always run.
+        if !self.active_constraints.is_empty() {
+            let ns_ctx = self
+                .validation_stack
+                .last()
+                .and_then(|ev| ev.ns_context.as_ref());
+            let ic_typed_value = Self::resolve_ic_qname_value(
+                &result.typed_value,
+                value,
+                ns_ctx,
+                &self.schema_set.name_table,
+            )
+            .or_else(|| result.typed_value.clone());
+            let mut multi_node_ic: Vec<(NameId, usize)> = Vec::new();
+            for cs in &mut self.active_constraints {
+                let matches = cs.matching_fields(local_name, ns);
+                for field_idx in matches {
+                    let already_matched =
+                        cs.set_field_value(field_idx, value.to_string(), ic_typed_value.clone());
+                    if already_matched {
+                        multi_node_ic.push((cs.key_table.constraint_name, field_idx));
+                    }
                 }
             }
-        }
-        for (constraint_name, field_idx) in multi_node_ic {
-            let name = self
-                .schema_set
-                .name_table
-                .resolve(constraint_name)
-                .to_string();
-            self.report_error(
-                "cvc-identity-constraint.4.2.1",
-                format!(
-                    "Identity constraint '{}': field {} matches more than one node",
-                    name,
-                    field_idx + 1
-                ),
-            );
+            for (constraint_name, field_idx) in multi_node_ic {
+                let name = self
+                    .schema_set
+                    .name_table
+                    .resolve(constraint_name)
+                    .to_string();
+                self.report_error(
+                    "cvc-identity-constraint.4.2.1",
+                    format!(
+                        "Identity constraint '{}': field {} matches more than one node",
+                        name,
+                        field_idx + 1
+                    ),
+                );
+            }
         }
 
         // ID/IDREF/ENTITY collection — owner is current element (attribute binding)
@@ -5102,13 +5286,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Initialize content model and ContentType from a TypeKey
     fn init_content_model(
-        &self,
+        &mut self,
         type_key: Option<TypeKey>,
     ) -> (ContentValidatorState, ContentType) {
         match type_key {
             Some(TypeKey::Complex(ct_key)) => {
-                let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-                let content_type = determine_content_type(self.schema_set, ct_data);
+                let schema_set = self.schema_set;
+                let ct_data = &schema_set.arenas.complex_types[ct_key];
+                let content_type = determine_content_type(schema_set, ct_data);
 
                 let content_state = match content_type {
                     ContentType::Empty => ContentValidatorState::Empty,
@@ -5118,13 +5303,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // this complex type and was compiled once, at
                         // `SchemaValidator` construction (`build_content_models`).
                         // Per element we only clone the shared `Arc`s and build
-                        // fresh active states. A missing entry means compilation
-                        // failed at load time; fall back to empty content
-                        // (matching the previous per-element error path) without
-                        // retrying.
-                        match self.content_models.get(&ct_key) {
+                        // fresh active states. A missing entry means preparation
+                        // failed at load time: that is an operational failure
+                        // (assessment aborted), never silently empty content.
+                        match self.content_models.models.get(&ct_key) {
                             Some(cm) => ContentValidatorState::from_compiled(cm),
-                            None => ContentValidatorState::Empty,
+                            None => {
+                                self.fail_content_model_unavailable(ct_key);
+                                ContentValidatorState::Empty
+                            }
                         }
                     }
                 };
@@ -5253,7 +5440,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// The caller keeps `schema_type = None` (no governing type) — only the
     /// content model (Mixed + `(xs:any processContents=lax)*`) is used.
-    fn lax_assessment_content_model(&self) -> (ContentValidatorState, ContentType) {
+    fn lax_assessment_content_model(&mut self) -> (ContentValidatorState, ContentType) {
         let any_type_key = TypeKey::Complex(self.schema_set.any_type_key());
         self.init_content_model(Some(any_type_key))
     }

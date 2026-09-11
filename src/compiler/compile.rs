@@ -778,8 +778,8 @@ impl<'a> CompileContext<'a> {
 
     /// Apply occurrence constraints to a fragment
     ///
-    /// Small maxOccurs are unrolled; large values use counted NFA transitions;
-    /// very large values (> MAX_COUNTED_OCCURS) fall back to unbounded.
+    /// Small maxOccurs are unrolled; every larger finite value uses counted
+    /// NFA transitions and is enforced exactly (no finite bound is widened).
     ///
     /// When `upa_mode` is true, bounds are capped to small values first,
     /// producing a counter-free NFA suitable for UPA analysis.

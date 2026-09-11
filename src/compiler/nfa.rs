@@ -108,6 +108,158 @@ pub struct CounterDef {
     pub body_nullable: bool,
 }
 
+/// Upper bound on the number of live counter configurations one frontier may
+/// hold (`Counted` scalar configs, `Hybrid` keys, `RangedSingle` entries).
+///
+/// Finite occurrence bounds are enforced exactly (no `maxOccurs` is ever
+/// widened to unbounded), so a pathological model — nested nullable counted
+/// groups with very large bounds, e.g. `((a?){0,100000}){0,100000}` — can
+/// produce a configuration set proportional to the bound. This limit keeps
+/// peak memory and per-child work finite. Exceeding it is an **operational
+/// failure** ([`ContentModelLimitExceeded`]), never an acceptance decision:
+/// the runtime aborts assessment and reports `validation-resource-limit`.
+///
+/// Sized so that every model the former 10 000 cutoff admitted still fits
+/// (one nullable dimension × states ≈ 80 000 configurations at that bound).
+pub const MAX_ACTIVE_CONFIGS: usize = 1 << 18;
+
+/// Upper bound on the work (configurations popped from the worklist) a single
+/// epsilon closure may perform. Bounds CPU independently of the final
+/// configuration count. See [`MAX_ACTIVE_CONFIGS`].
+pub const MAX_CLOSURE_WORK: usize = 1 << 22;
+
+/// Which execution limit a counted content model exceeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContentModelLimit {
+    /// More than [`MAX_ACTIVE_CONFIGS`] live configurations in one frontier.
+    ActiveConfigurations,
+    /// More than [`MAX_CLOSURE_WORK`] configuration visits in one closure.
+    ClosureWork,
+}
+
+/// A counted content model exceeded an execution limit.
+///
+/// This is an operational failure of the validator, not a validity verdict:
+/// the document may or may not be valid, and the runtime must not report
+/// either. It is distinct from a schema error and from `cvc-*` violations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ContentModelLimitExceeded {
+    /// The limit that was exceeded.
+    pub limit: ContentModelLimit,
+    /// The value observed when the limit tripped.
+    pub observed: usize,
+    /// The configured maximum.
+    pub allowed: usize,
+}
+
+impl std::fmt::Display for ContentModelLimitExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match self.limit {
+            ContentModelLimit::ActiveConfigurations => "active counter configurations",
+            ContentModelLimit::ClosureWork => "epsilon-closure work units",
+        };
+        write!(
+            f,
+            "content-model execution limit exceeded: {} {} > {} allowed",
+            self.observed, what, self.allowed
+        )
+    }
+}
+
+impl std::error::Error for ContentModelLimitExceeded {}
+
+#[inline]
+fn check_config_limit(observed: usize) -> Result<(), ContentModelLimitExceeded> {
+    if observed > MAX_ACTIVE_CONFIGS {
+        Err(ContentModelLimitExceeded {
+            limit: ContentModelLimit::ActiveConfigurations,
+            observed,
+            allowed: MAX_ACTIVE_CONFIGS,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Exact dominance pruning for scalar counter configurations (`Counted`).
+///
+/// Two configurations at the same NFA state differ only in counter values.
+/// `x` dominates `y` when, for every counter `c`, either `x[c] == y[c]`, or
+/// `x[c] < y[c]` and `x[c] >= min_c`. Then every guard `y` can pass, `x` can
+/// pass too (`CounterMinGuard` needs `>= min`, `CounterMaxGuard` needs
+/// `< max`), and the relation is preserved by every transition (`+1` on both,
+/// reset or canonical exit to `0` on both). Hence every input accepted from
+/// `y` is accepted from `x`, through the same states — so dropping `y`
+/// changes neither acceptance, nor attribution (the term lives on the state),
+/// nor the expected-element diagnostics (the frontier's state set is
+/// unchanged).
+///
+/// Without this, nested non-nullable counted loops such as
+/// `choice{1,100000}(sequence{1,10^8}(a+), b)` (W3C `particlesZ036`) keep one
+/// configuration per way of partitioning the input into iterations —
+/// O(k²) after k children — although all but a bounded few are dominated.
+/// The former 10 000 cutoff hid this by turning such bounds into stars.
+fn prune_dominated(
+    configs: HashSet<ActiveConfig>,
+    defs: &[CounterDef],
+) -> HashSet<ActiveConfig> {
+    if configs.len() < 2 {
+        return configs;
+    }
+    let mut by_state: HashMap<StateId, Vec<ActiveConfig>> = HashMap::new();
+    for cfg in configs {
+        by_state.entry(cfg.state_id).or_default().push(cfg);
+    }
+    let mut out = HashSet::with_capacity(by_state.len());
+    for (_, group) in by_state {
+        if group.len() == 1 {
+            out.extend(group);
+            continue;
+        }
+        let mut keep: Vec<ActiveConfig> = Vec::with_capacity(group.len());
+        'next: for cfg in group {
+            for k in &keep {
+                if dominates(&k.counters, &cfg.counters, defs) {
+                    continue 'next;
+                }
+            }
+            keep.retain(|k| !dominates(&cfg.counters, &k.counters, defs));
+            keep.push(cfg);
+        }
+        out.extend(keep);
+    }
+    out
+}
+
+/// `x` dominates `y` — see [`prune_dominated`]. Equal vectors do not.
+fn dominates(x: &[u32], y: &[u32], defs: &[CounterDef]) -> bool {
+    let mut strictly = false;
+    for (c, (&xv, &yv)) in x.iter().zip(y).enumerate() {
+        if xv == yv {
+            continue;
+        }
+        if xv < yv && xv >= defs[c].min {
+            strictly = true;
+        } else {
+            return false;
+        }
+    }
+    strictly
+}
+
+#[inline]
+fn check_work_limit(observed: usize) -> Result<(), ContentModelLimitExceeded> {
+    if observed > MAX_CLOSURE_WORK {
+        Err(ContentModelLimitExceeded {
+            limit: ContentModelLimit::ClosureWork,
+            observed,
+            allowed: MAX_CLOSURE_WORK,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 /// Complete NFA table for a content model
 ///
 /// Represents a compiled content model as a state machine. The NFA can be used
@@ -908,11 +1060,14 @@ fn ranged_single_epsilon_closure(
     nfa: &NfaTable,
     seeds: HashMap<StateId, CounterRange>,
     counter_def: CounterDef,
-) -> ActiveStates {
+) -> Result<ActiveStates, ContentModelLimitExceeded> {
     let mut map: HashMap<StateId, CounterRange> = HashMap::new();
     let mut worklist: VecDeque<(StateId, CounterRange)> = seeds.into_iter().collect();
+    let mut work: usize = 0;
 
     while let Some((state_id, range)) = worklist.pop_front() {
+        work += 1;
+        check_work_limit(work)?;
         // Check subsumption: if existing range already covers this one, skip.
         if let Some(&existing) = map.get(&state_id) {
             if existing.subsumes(range) {
@@ -937,8 +1092,14 @@ fn ranged_single_epsilon_closure(
                     TransitionKind::CounterReset(_) => Some(CounterRange::single(0)),
                     TransitionKind::CounterIncrement(_) => {
                         // Fast-forward: body is nullable, so the counter can
-                        // reach max via repeated empty body traversals.
-                        Some(CounterRange::new(range.lo + 1, counter_def.max))
+                        // reach max via repeated empty body traversals. The
+                        // increment always follows a MaxGuard (`lo < max`), so
+                        // `lo + 1 <= max`; the checked form is defensive.
+                        range
+                            .lo
+                            .checked_add(1)
+                            .filter(|lo| *lo <= counter_def.max)
+                            .map(|lo| CounterRange::new(lo, counter_def.max))
                     }
                     TransitionKind::CounterMaxGuard(_) => {
                         let clamped = range.intersect_below(counter_def.max);
@@ -972,10 +1133,10 @@ fn ranged_single_epsilon_closure(
         }
     }
 
-    ActiveStates::RangedSingle {
+    Ok(ActiveStates::RangedSingle {
         state_ranges: map,
         counter_def,
-    }
+    })
 }
 
 /// Hybrid epsilon closure for multi-counter NFAs with one ranged counter.
@@ -992,14 +1153,17 @@ fn hybrid_epsilon_closure(
     seeds: HashMap<HybridKey, CounterRange>,
     ranged_counter_idx: usize,
     num_counters: usize,
-) -> ActiveStates {
+) -> Result<ActiveStates, ContentModelLimitExceeded> {
     let ranged_id = ranged_counter_idx as CounterId;
     let ranged_def = nfa.counter_defs[ranged_counter_idx];
 
     let mut map: HashMap<HybridKey, CounterRange> = HashMap::new();
     let mut worklist: VecDeque<(HybridKey, CounterRange)> = seeds.into_iter().collect();
+    let mut work: usize = 0;
 
     while let Some((key, range)) = worklist.pop_front() {
+        work += 1;
+        check_work_limit(work)?;
         // Subsumption check: if existing range already covers this one, skip.
         if let Some(&existing) = map.get(&key) {
             if existing.subsumes(range) {
@@ -1014,6 +1178,7 @@ fn hybrid_epsilon_closure(
             map.insert(key.clone(), merged);
         } else {
             map.insert(key.clone(), range);
+            check_config_limit(map.len())?;
         }
 
         if let Some(state) = nfa.get_state(key.state_id) {
@@ -1027,10 +1192,17 @@ fn hybrid_epsilon_closure(
                     }
                     TransitionKind::CounterIncrement(c) if c == ranged_id => {
                         // Fast-forward: body is nullable, so counter can reach max.
-                        Some((
-                            key.with_state(trans.target),
-                            CounterRange::new(range.lo + 1, ranged_def.max),
-                        ))
+                        // `lo < max` is guaranteed by the preceding MaxGuard.
+                        range
+                            .lo
+                            .checked_add(1)
+                            .filter(|lo| *lo <= ranged_def.max)
+                            .map(|lo| {
+                                (
+                                    key.with_state(trans.target),
+                                    CounterRange::new(lo, ranged_def.max),
+                                )
+                            })
                     }
                     TransitionKind::CounterMaxGuard(c) if c == ranged_id => {
                         let clamped = range.intersect_below(ranged_def.max);
@@ -1055,13 +1227,12 @@ fn hybrid_epsilon_closure(
                         key.with_scalar_counter(trans.target, c, 0, ranged_counter_idx),
                         range,
                     )),
-                    TransitionKind::CounterIncrement(c) => {
-                        let val = key.counter(c) + 1;
-                        Some((
+                    TransitionKind::CounterIncrement(c) => key.counter(c).checked_add(1).map(|val| {
+                        (
                             key.with_scalar_counter(trans.target, c, val, ranged_counter_idx),
                             range,
-                        ))
-                    }
+                        )
+                    }),
                     TransitionKind::CounterMaxGuard(c) => {
                         if key.counter(c) < nfa.counter_defs[c as usize].max {
                             Some((key.with_state(trans.target), range))
@@ -1099,7 +1270,7 @@ fn hybrid_epsilon_closure(
         ranged_counter_idx,
         num_counters,
     };
-    result.maybe_switch_ranged_counter(nfa)
+    Ok(result.maybe_switch_ranged_counter(nfa))
 }
 
 /// Quad-path active state set for NFA simulation.
@@ -1160,7 +1331,7 @@ impl ActiveStates {
         target_ns: Option<NameId>,
         subst_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
-    ) -> (MatchInfo, ActiveStates) {
+    ) -> Result<(MatchInfo, ActiveStates), ContentModelLimitExceeded> {
         let states = match self {
             ActiveStates::Simple(states) => states,
             // Counter-bearing variants keep the existing two-call behavior.
@@ -1190,8 +1361,8 @@ impl ActiveStates {
                         subst_groups,
                         xsd_version,
                     ),
-                };
-                return (info, next);
+                }?;
+                return Ok((info, next));
             }
         };
 
@@ -1279,7 +1450,7 @@ impl ActiveStates {
             }
         };
         let next = ActiveStates::Simple(epsilon_closure(nfa, chosen.iter()));
-        (match_info, next)
+        Ok((match_info, next))
     }
 
     /// Borrowed transition helper used by content validation hot paths to
@@ -1292,9 +1463,9 @@ impl ActiveStates {
         target_namespace: Option<NameId>,
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
-    ) -> Self {
+    ) -> Result<Self, ContentModelLimitExceeded> {
         match self {
-            ActiveStates::Simple(states) => ActiveStates::Simple(advance_states(
+            ActiveStates::Simple(states) => Ok(ActiveStates::Simple(advance_states(
                 nfa,
                 states.iter(),
                 element_name,
@@ -1302,7 +1473,7 @@ impl ActiveStates {
                 target_namespace,
                 substitution_groups,
                 xsd_version,
-            )),
+            ))),
             ActiveStates::Counted {
                 configs,
                 num_counters,
@@ -1332,7 +1503,7 @@ impl ActiveStates {
                     configs: next_configs,
                     num_counters: *num_counters,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
             ActiveStates::RangedSingle {
                 state_ranges,
@@ -1366,7 +1537,7 @@ impl ActiveStates {
                     state_ranges: next_seeds,
                     counter_def: *counter_def,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
             ActiveStates::Hybrid {
                 configs,
@@ -1403,7 +1574,7 @@ impl ActiveStates {
                     ranged_counter_idx: *ranged_counter_idx,
                     num_counters: *num_counters,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
         }
     }
@@ -1418,9 +1589,9 @@ impl ActiveStates {
         target_namespace: Option<NameId>,
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
-    ) -> Self {
+    ) -> Result<Self, ContentModelLimitExceeded> {
         match self {
-            ActiveStates::Simple(states) => ActiveStates::Simple(advance_with_priority(
+            ActiveStates::Simple(states) => Ok(ActiveStates::Simple(advance_with_priority(
                 nfa,
                 states.iter(),
                 element_name,
@@ -1428,7 +1599,7 @@ impl ActiveStates {
                 target_namespace,
                 substitution_groups,
                 xsd_version,
-            )),
+            ))),
             ActiveStates::Counted {
                 configs,
                 num_counters,
@@ -1471,7 +1642,7 @@ impl ActiveStates {
                     configs: next,
                     num_counters: *num_counters,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
             ActiveStates::RangedSingle {
                 state_ranges,
@@ -1518,7 +1689,7 @@ impl ActiveStates {
                     state_ranges: next,
                     counter_def: *counter_def,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
             ActiveStates::Hybrid {
                 configs,
@@ -1568,13 +1739,24 @@ impl ActiveStates {
                     ranged_counter_idx: *ranged_counter_idx,
                     num_counters: *num_counters,
                 };
-                result.epsilon_closure(nfa)
+                result.try_epsilon_closure(nfa)
             }
         }
     }
 
     /// Create initial active states from an NFA, picking the right variant.
     pub fn from_nfa(nfa: &NfaTable) -> Self {
+        Self::try_from_nfa(nfa)
+            .unwrap_or_else(|e| panic!("ActiveStates::from_nfa: {e}; use try_from_nfa"))
+    }
+
+    /// Fallible form of [`from_nfa`](Self::from_nfa).
+    ///
+    /// The initial closure of a counted model with nested nullable loops can
+    /// itself exceed [`MAX_ACTIVE_CONFIGS`] / [`MAX_CLOSURE_WORK`]; this
+    /// returns that as an error instead of panicking. The validation runtime
+    /// uses this form and turns the error into an operational failure.
+    pub fn try_from_nfa(nfa: &NfaTable) -> Result<Self, ContentModelLimitExceeded> {
         use super::particle::COUNTED_THRESHOLD;
 
         if nfa.has_counters() {
@@ -1586,7 +1768,7 @@ impl ActiveStates {
                     state_ranges,
                     counter_def: nfa.counter_defs[0],
                 };
-                return result.epsilon_closure(nfa);
+                return result.try_epsilon_closure(nfa);
             }
 
             // Multiple counters: check for a nullable counter worth ranging.
@@ -1614,7 +1796,7 @@ impl ActiveStates {
                             ranged_counter_idx: ranged_idx,
                             num_counters,
                         };
-                        return result.epsilon_closure(nfa);
+                        return result.try_epsilon_closure(nfa);
                     }
                 }
             }
@@ -1627,10 +1809,10 @@ impl ActiveStates {
                 configs,
                 num_counters: nfa.counter_defs.len(),
             };
-            result.epsilon_closure(nfa)
+            result.try_epsilon_closure(nfa)
         } else {
             let simple = epsilon_closure(nfa, std::iter::once(nfa.start_state));
-            ActiveStates::Simple(simple)
+            Ok(ActiveStates::Simple(simple))
         }
     }
 
@@ -1662,9 +1844,22 @@ impl ActiveStates {
 
     /// Compute epsilon closure (including counter transitions for Counted path).
     pub fn epsilon_closure(self, nfa: &NfaTable) -> Self {
+        self.try_epsilon_closure(nfa)
+            .unwrap_or_else(|e| panic!("ActiveStates::epsilon_closure: {e}; use try_epsilon_closure"))
+    }
+
+    /// Fallible form of [`epsilon_closure`](Self::epsilon_closure): enforces
+    /// [`MAX_ACTIVE_CONFIGS`] and [`MAX_CLOSURE_WORK`] on the counted paths
+    /// (the counter-free `Simple` path is bounded by the state count and
+    /// cannot fail). Limits are checked *while* the configuration set grows,
+    /// so peak memory is bounded, not just the final size.
+    pub fn try_epsilon_closure(
+        self,
+        nfa: &NfaTable,
+    ) -> Result<Self, ContentModelLimitExceeded> {
         match self {
             ActiveStates::Simple(states) => {
-                ActiveStates::Simple(epsilon_closure(nfa, states.iter()))
+                Ok(ActiveStates::Simple(epsilon_closure(nfa, states.iter())))
             }
             ActiveStates::Counted {
                 configs,
@@ -1672,11 +1867,15 @@ impl ActiveStates {
             } => {
                 let mut result: HashSet<ActiveConfig> = HashSet::new();
                 let mut stack: Vec<ActiveConfig> = configs.into_iter().collect();
+                let mut work: usize = 0;
 
                 while let Some(config) = stack.pop() {
+                    work += 1;
+                    check_work_limit(work)?;
                     if !result.insert(config.clone()) {
                         continue;
                     }
+                    check_config_limit(result.len())?;
                     if let Some(state) = nfa.get_state(config.state_id) {
                         for trans in &state.transitions {
                             let next = match trans.kind {
@@ -1684,10 +1883,10 @@ impl ActiveStates {
                                 TransitionKind::CounterReset(c) => {
                                     Some(config.with_counter_set(trans.target, c, 0))
                                 }
-                                TransitionKind::CounterIncrement(c) => {
-                                    let val = config.counters[c as usize] + 1;
-                                    Some(config.with_counter_set(trans.target, c, val))
-                                }
+                                TransitionKind::CounterIncrement(c) => config.counters
+                                    [c as usize]
+                                    .checked_add(1)
+                                    .map(|val| config.with_counter_set(trans.target, c, val)),
                                 TransitionKind::CounterMaxGuard(c) => {
                                     if config.counters[c as usize]
                                         < nfa.counter_defs[c as usize].max
@@ -1718,10 +1917,10 @@ impl ActiveStates {
                         }
                     }
                 }
-                ActiveStates::Counted {
-                    configs: result,
+                Ok(ActiveStates::Counted {
+                    configs: prune_dominated(result, &nfa.counter_defs),
                     num_counters,
-                }
+                })
             }
             ActiveStates::RangedSingle {
                 state_ranges,
@@ -1847,6 +2046,29 @@ impl ActiveStates {
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
     ) -> Self {
+        self.try_advance(
+            nfa,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+            xsd_version,
+        )
+        .unwrap_or_else(|e| panic!("ActiveStates::advance: {e}; use try_advance"))
+    }
+
+    /// Fallible form of [`advance`](Self::advance): returns
+    /// [`ContentModelLimitExceeded`] instead of panicking when a counted
+    /// model exceeds an execution limit.
+    pub fn try_advance(
+        self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
+    ) -> Result<Self, ContentModelLimitExceeded> {
         self.advance_from(
             nfa,
             element_name,
@@ -1867,6 +2089,29 @@ impl ActiveStates {
         substitution_groups: Option<&SubstitutionGroupMap>,
         xsd_version: XsdVersion,
     ) -> Self {
+        self.try_advance_with_priority(
+            nfa,
+            element_name,
+            element_namespace,
+            target_namespace,
+            substitution_groups,
+            xsd_version,
+        )
+        .unwrap_or_else(|e| {
+            panic!("ActiveStates::advance_with_priority: {e}; use try_advance_with_priority")
+        })
+    }
+
+    /// Fallible form of [`advance_with_priority`](Self::advance_with_priority).
+    pub fn try_advance_with_priority(
+        self,
+        nfa: &NfaTable,
+        element_name: NameId,
+        element_namespace: Option<NameId>,
+        target_namespace: Option<NameId>,
+        substitution_groups: Option<&SubstitutionGroupMap>,
+        xsd_version: XsdVersion,
+    ) -> Result<Self, ContentModelLimitExceeded> {
         self.advance_with_priority_from(
             nfa,
             element_name,
@@ -2315,7 +2560,7 @@ mod tests {
             simple.advance_from(&simple_nfa, NameId(1), None, None, None, XsdVersion::V1_0),
             simple
                 .clone()
-                .advance(&simple_nfa, NameId(1), None, None, None, XsdVersion::V1_0)
+                .try_advance(&simple_nfa, NameId(1), None, None, None, XsdVersion::V1_0)
         );
         assert_eq!(
             simple.advance_with_priority_from(
@@ -2326,7 +2571,7 @@ mod tests {
                 None,
                 XsdVersion::V1_1,
             ),
-            simple.clone().advance_with_priority(
+            simple.clone().try_advance_with_priority(
                 &simple_nfa,
                 NameId(1),
                 None,
@@ -2347,7 +2592,7 @@ mod tests {
                 None,
                 XsdVersion::V1_0,
             ),
-            counted.clone().advance(
+            counted.clone().try_advance(
                 &counted_nfa,
                 counted_name,
                 None,
@@ -3590,5 +3835,274 @@ mod tests {
         h = h.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         c = c.advance(&nfa, b, None, None, None, XsdVersion::V1_0);
         assert_eq!(h.contains_accept(&nfa), c.contains_accept(&nfa));
+    }
+}
+
+/// P1 (XSD_COMPILER_REWORK §8): exact finite bounds at and beyond the former
+/// 10 000 cutoff, boundary arithmetic at `u32::MAX`, and the execution limits.
+#[cfg(test)]
+mod exact_bounds_tests {
+    use super::*;
+    use crate::compiler::fragment::{fragment_to_table, FragmentBuilder};
+    use crate::schema::model::XsdVersion;
+
+    const A: NameId = NameId(100);
+
+    fn counted_a(min: u32, max: u32) -> NfaTable {
+        let builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(A, None, None), None);
+        fragment_to_table(frag.repeat_counted(min, max))
+    }
+
+    /// `((a?){0,n}){0,n}` — the nested nullable shape whose configuration set
+    /// grows with the bound.
+    fn nested_nullable(n: u32) -> NfaTable {
+        let builder = FragmentBuilder::new();
+        let frag = builder.single_term(NfaTerm::element(A, None, None), None);
+        let inner = frag.optional().repeat_counted(0, n);
+        fragment_to_table(inner.repeat_counted(0, n))
+    }
+
+    fn step(active: ActiveStates, nfa: &NfaTable) -> ActiveStates {
+        active
+            .try_advance(nfa, A, None, None, None, XsdVersion::V1_0)
+            .expect("no execution limit expected")
+    }
+
+    /// The reproduced defect: `a{0,10001}` must accept exactly 10 001 and
+    /// reject the 10 002nd child. Under the old cutoff the bound was widened
+    /// to unbounded and the extra child was accepted.
+    #[test]
+    fn bound_10001_is_exact() {
+        let nfa = counted_a(0, 10_001);
+        assert!(nfa.has_counters(), "bounds above the unroll threshold are counted");
+        let mut active = ActiveStates::try_from_nfa(&nfa).unwrap();
+        for _ in 0..10_001 {
+            active = step(active, &nfa);
+            assert!(!active.is_empty());
+        }
+        assert!(active.contains_accept(&nfa), "10 001 children satisfy a{{0,10001}}");
+        let over = step(active, &nfa);
+        assert!(over.is_empty(), "the 10 002nd child must be rejected");
+    }
+
+    /// Bounds around every threshold: below/at the minimum, at the maximum,
+    /// one past the maximum.
+    #[test]
+    fn boundary_matrix() {
+        for &(min, max) in &[
+            (0u32, 17u32),
+            (1, 17),
+            (17, 17),
+            (2, 9_999),
+            (0, 10_000),
+            (16, 10_000),
+            (17, 10_001),
+            (0, 100_000),
+        ] {
+            let nfa = counted_a(min, max);
+            let mut active = ActiveStates::try_from_nfa(&nfa).unwrap();
+            if min > 0 {
+                assert!(!active.contains_accept(&nfa), "{min}..{max}: empty content is invalid");
+            }
+            for i in 1..=max {
+                active = step(active, &nfa);
+                assert!(!active.is_empty(), "{min}..{max}: child {i} accepted");
+                assert_eq!(
+                    active.contains_accept(&nfa),
+                    i >= min,
+                    "{min}..{max}: completion after {i} children"
+                );
+            }
+            assert!(step(active, &nfa).is_empty(), "{min}..{max}: child {} rejected", max + 1);
+        }
+    }
+
+    /// The representable maximum is enforced exactly and the counter never
+    /// overflows: a configuration one below `u32::MAX` accepts one more child
+    /// and then rejects the next.
+    #[test]
+    fn bound_u32_max_arithmetic_is_exact() {
+        let nfa = counted_a(0, u32::MAX);
+        let term_state = nfa
+            .states
+            .iter()
+            .find(|s| s.term.is_some())
+            .map(|s| s.id)
+            .expect("term state");
+        let at = |count: u32| {
+            let mut configs = HashSet::new();
+            configs.insert(ActiveConfig {
+                state_id: term_state,
+                counters: vec![count].into_boxed_slice(),
+            });
+            ActiveStates::Counted {
+                configs,
+                num_counters: 1,
+            }
+        };
+
+        // One below the maximum: the next child completes the maximum, the one after is rejected.
+        let active = step(at(u32::MAX - 1), &nfa);
+        assert!(active.contains_accept(&nfa));
+        assert!(step(active, &nfa).is_empty(), "u32::MAX + 1 children must be rejected");
+
+        // Two below: two more children fit, the third does not.
+        let active = step(at(u32::MAX - 2), &nfa);
+        let active = step(active, &nfa);
+        assert!(active.contains_accept(&nfa));
+        assert!(step(active, &nfa).is_empty());
+    }
+
+    /// Every model the former cutoff admitted must still run within the limits.
+    #[test]
+    fn previously_capped_nested_nullable_shape_fits_limits() {
+        let nfa = nested_nullable(10_000);
+        let active = ActiveStates::try_from_nfa(&nfa).expect("10 000 nested nullable fits");
+        assert!(active.contains_accept(&nfa));
+        let active = step(active, &nfa);
+        assert!(!active.is_empty());
+        assert!(active.contains_accept(&nfa));
+    }
+
+    /// A pathological nested nullable model with huge bounds trips an
+    /// execution limit instead of hanging or exhausting memory — and the
+    /// error is an operational failure, not an acceptance decision.
+    #[test]
+    fn nested_nullable_huge_bounds_trip_a_limit() {
+        let nfa = nested_nullable(1_000_000);
+        let err = ActiveStates::try_from_nfa(&nfa).expect_err("must exceed a limit");
+        assert!(err.observed > err.allowed, "{err}");
+        assert!(
+            matches!(
+                err.limit,
+                ContentModelLimit::ActiveConfigurations | ContentModelLimit::ClosureWork
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("execution limit exceeded"));
+    }
+
+    /// The legacy infallible entry points panic (loudly) instead of returning
+    /// a wrong frontier when a limit is exceeded.
+    #[test]
+    #[should_panic(expected = "use try_from_nfa")]
+    fn legacy_from_nfa_panics_on_limit() {
+        let nfa = nested_nullable(1_000_000);
+        let _ = ActiveStates::from_nfa(&nfa);
+    }
+
+    const B: NameId = NameId(101);
+
+    /// `choice{cmin,cmax}( sequence{smin,smax}( a+ ), b )` — the W3C
+    /// `particlesZ036` shape. `counted` forces counter loops regardless of the
+    /// unroll threshold; otherwise the bounds are unrolled (counter-free).
+    fn choice_seq_model(cmin: u32, cmax: u32, smin: u32, smax: u32, counted: bool) -> NfaTable {
+        let builder = FragmentBuilder::new();
+        let a_plus = builder.single_term(NfaTerm::element(A, None, None), None).repeat_plus();
+        let seq = if counted {
+            a_plus.repeat_counted(smin, smax)
+        } else {
+            a_plus.repeat_range(smin, Some(smax))
+        };
+        let b = builder.single_term(NfaTerm::element(B, None, None), None);
+        let choice = seq.alternate(b);
+        let outer = if counted {
+            choice.repeat_counted(cmin, cmax)
+        } else {
+            choice.repeat_range(cmin, Some(cmax))
+        };
+        fragment_to_table(outer)
+    }
+
+    fn config_count(active: &ActiveStates) -> usize {
+        match active {
+            ActiveStates::Counted { configs, .. } => configs.len(),
+            ActiveStates::Hybrid { configs, .. } => configs.len(),
+            ActiveStates::RangedSingle { state_ranges, .. } => state_ranges.len(),
+            ActiveStates::Simple(_) => 0,
+        }
+    }
+
+    /// Dominance pruning keeps the nested non-nullable counted model bounded:
+    /// the W3C `particlesZ036_b` instance (16 660 `a` then `b`s) must run in a
+    /// constant-size frontier instead of O(k²) configurations.
+    #[test]
+    fn dominance_pruning_bounds_nested_nonnullable_counters() {
+        let nfa = choice_seq_model(1, 100_000, 1, 100_000_000, true);
+        assert_eq!(nfa.counter_defs.len(), 2);
+        let mut active = ActiveStates::try_from_nfa(&nfa).unwrap();
+        assert!(matches!(active, ActiveStates::Counted { .. }));
+        let mut peak = 0;
+        let mut at_1000 = 0;
+        for i in 0..20_000u32 {
+            active = active
+                .try_advance(&nfa, A, None, None, None, XsdVersion::V1_0)
+                .unwrap();
+            assert!(!active.is_empty(), "a #{i} accepted");
+            peak = peak.max(config_count(&active));
+            if i == 999 {
+                at_1000 = config_count(&active);
+            }
+        }
+        let at_20000 = config_count(&active);
+        for _ in 0..2 {
+            active = active
+                .try_advance(&nfa, B, None, None, None, XsdVersion::V1_0)
+                .unwrap();
+            assert!(!active.is_empty());
+            peak = peak.max(config_count(&active));
+        }
+        assert!(active.contains_accept(&nfa));
+        // Steady state: the frontier does not grow with the input (without
+        // pruning it would hold ~k²/2 configurations after k children).
+        assert_eq!(at_1000, at_20000, "frontier grew with input length");
+        assert!(peak <= 64, "frontier must stay bounded, peak was {peak}");
+    }
+
+    /// Differential test: the counted automaton (with dominance pruning) must
+    /// accept exactly the same prefixes as the unrolled, counter-free
+    /// automaton for the same bounds — for every string over {a, b} up to
+    /// length 8, including bounds whose minimum exceeds one (the `>= min`
+    /// side of the dominance rule) and both XSD versions' advance rules.
+    #[test]
+    fn counted_with_pruning_matches_unrolled() {
+        for &(cmin, cmax, smin, smax) in &[(1u32, 3u32, 1u32, 4u32), (2, 3, 2, 4), (0, 2, 1, 2), (1, 2, 0, 3)] {
+            let counted = choice_seq_model(cmin, cmax, smin, smax, true);
+            let unrolled = choice_seq_model(cmin, cmax, smin, smax, false);
+            assert!(counted.has_counters() && !unrolled.has_counters());
+            for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+                for len in 0..=8u32 {
+                    for bits in 0..(1u32 << len) {
+                        let mut c = ActiveStates::try_from_nfa(&counted).unwrap();
+                        let mut u = ActiveStates::try_from_nfa(&unrolled).unwrap();
+                        let tag = format!("{cmin},{cmax},{smin},{smax} {version:?} len={len} bits={bits:b}");
+                        assert_eq!(c.contains_accept(&counted), u.contains_accept(&unrolled), "{tag}: empty input");
+                        for i in 0..len {
+                            let sym = if bits & (1 << i) == 0 { A } else { B };
+                            c = match version {
+                                XsdVersion::V1_0 => c.try_advance(&counted, sym, None, None, None, version),
+                                XsdVersion::V1_1 => c.try_advance_with_priority(&counted, sym, None, None, None, version),
+                            }
+                            .unwrap();
+                            u = match version {
+                                XsdVersion::V1_0 => u.try_advance(&unrolled, sym, None, None, None, version),
+                                XsdVersion::V1_1 => u.try_advance_with_priority(&unrolled, sym, None, None, None, version),
+                            }
+                            .unwrap();
+                            assert_eq!(c.is_empty(), u.is_empty(), "{tag}: rejection at {i}");
+                            if c.is_empty() {
+                                break;
+                            }
+                            assert_eq!(
+                                c.contains_accept(&counted),
+                                u.contains_accept(&unrolled),
+                                "{tag}: completion at {i}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

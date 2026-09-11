@@ -7,11 +7,12 @@
 //! [`SchemaValidator::start_run()`] to perform actual validation.
 
 use crate::compiler::{build_substitution_group_map, SubstitutionGroupMap};
+use crate::ids::ComplexTypeKey;
 use crate::schema::SchemaSet;
 
 use super::errors::ValidationError;
 use super::info::ValidationFlags;
-use super::runtime::{build_content_models, ContentModelMap, ValidationRuntime};
+use super::runtime::{build_content_models, PreparedContentModels, ValidationRuntime};
 
 // ---------------------------------------------------------------------------
 // ValidationSink trait
@@ -120,7 +121,7 @@ pub struct SchemaValidator<'a> {
     /// Per-complex-type compiled content models, built once here and shared
     /// (borrowed) by every [`ValidationRuntime`]. Moves the content-model NFA
     /// compilation out of the per-element hot path. See `build_content_models`.
-    pub(crate) content_models: ContentModelMap,
+    pub(crate) content_models: PreparedContentModels,
     /// Validation flags controlling behaviour
     pub(crate) flags: ValidationFlags,
     /// Which assertion evaluation path is active (XSD 1.1 only)
@@ -153,6 +154,24 @@ impl<'a> SchemaValidator<'a> {
             #[cfg(feature = "xsd11")]
             assertion_source: AssertionSource::default(),
         }
+    }
+
+    /// Complex types whose content model could **not** be prepared at
+    /// construction, with the reason (an NFA compilation error, or an
+    /// execution limit hit while computing the model's initial state).
+    ///
+    /// Such a type is not silently treated as empty content: the first
+    /// element governed by it raises an operational failure
+    /// (`validation-preparation-failed`) that aborts the run and is returned
+    /// from `end_validation`. Callers that want to fail *before* validating
+    /// can check this list up front; it is empty for every schema the W3C
+    /// suites contain.
+    pub fn content_model_failures(&self) -> Vec<(ComplexTypeKey, &str)> {
+        self.content_models
+            .failures
+            .iter()
+            .map(|(k, reason)| (*k, reason.as_str()))
+            .collect()
     }
 
     /// Create a new `SchemaValidator` with pre-built substitution groups.

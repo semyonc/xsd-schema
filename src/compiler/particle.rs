@@ -4,9 +4,12 @@
 //! (minOccurs/maxOccurs) with optimization for large maxOccurs values.
 //!
 //! For small maxOccurs (≤ COUNTED_THRESHOLD), NFA fragments are unrolled
-//! (cloned). For larger values (up to MAX_COUNTED_OCCURS), counted NFA
-//! transitions are used for O(1) state overhead. Values above
-//! MAX_COUNTED_OCCURS are treated as unbounded.
+//! (cloned). Every larger finite bound uses counted NFA transitions with O(1)
+//! extra states and is enforced exactly, up to the representable maximum
+//! `u32::MAX` (XSD 1.1 §3.9.4.3 clause 2.2 requires the sequence length to be
+//! ≤ `{max occurs}` whenever it is a number; no finite bound is ever widened to
+//! unbounded). The former `MAX_COUNTED_OCCURS = 10_000` approximation was
+//! removed in 0.1.6 — see `XSD_COMPILER_REWORK.md` §8.1.
 
 use super::fragment::NfaFragment;
 
@@ -15,13 +18,6 @@ use super::fragment::NfaFragment;
 /// Values ≤ this threshold are unrolled (cloned fragments).
 /// Values above use counted transitions with O(1) extra states.
 pub const COUNTED_THRESHOLD: u32 = 16;
-
-/// Maximum maxOccurs value before treating as unbounded.
-///
-/// Values above this cap fall back to unbounded treatment to bound the
-/// O(maxOccurs) cost of epsilon closure for nullable loop bodies.
-/// Raises the correctness ceiling from the old limit of 100 to 10000.
-pub const MAX_COUNTED_OCCURS: u32 = 10_000;
 
 /// MaxOccurs value representation
 ///
@@ -52,19 +48,15 @@ impl MaxOccurs {
         }
     }
 
-    /// Check if this value is effectively unbounded.
-    ///
-    /// Returns true if:
-    /// - The value is explicitly Unbounded, or
-    /// - The bounded value exceeds MAX_COUNTED_OCCURS
-    ///
-    /// Values up to MAX_COUNTED_OCCURS are handled exactly by counted NFA.
-    /// Values above fall back to unbounded to bound runtime cost.
+    /// Formerly `true` for any finite bound above 10 000, which the compiler
+    /// then widened to unbounded. Every finite bound is now enforced exactly,
+    /// so this is identical to [`is_unbounded`](Self::is_unbounded).
+    #[deprecated(
+        since = "0.1.6",
+        note = "finite bounds are always exact now; use `is_unbounded`"
+    )]
     pub fn is_effectively_unbounded(&self) -> bool {
-        match self {
-            MaxOccurs::Unbounded => true,
-            MaxOccurs::Bounded(n) => *n > MAX_COUNTED_OCCURS,
-        }
+        self.is_unbounded()
     }
 
     /// Check if this is explicitly unbounded
@@ -82,16 +74,14 @@ impl Default for MaxOccurs {
 /// Apply occurrence constraints with threshold-based dispatch.
 ///
 /// - Small bounded (≤ COUNTED_THRESHOLD): unroll via repeat_range
-/// - Large bounded (≤ MAX_COUNTED_OCCURS): counted NFA via repeat_counted
-/// - Unbounded or > MAX_COUNTED_OCCURS: Kleene star via repeat_range
+/// - Larger bounded (any value up to `u32::MAX`): counted NFA via
+///   repeat_counted — exact, never approximated
+/// - Unbounded: Kleene star via repeat_range
+///
+/// `min > max` never reaches this function: the pipeline rejects it as
+/// `p-props-correct` clause 2.1 before compilation.
 pub fn apply_occurs(frag: NfaFragment, min: u32, max: MaxOccurs) -> NfaFragment {
-    let effective_max = if max.is_effectively_unbounded() {
-        None // Treat as unbounded
-    } else {
-        max.to_option()
-    };
-
-    match effective_max {
+    match max.to_option() {
         // Unbounded with large min → counted exact prefix + star tail
         None if min > COUNTED_THRESHOLD => frag
             .clone()
@@ -128,18 +118,36 @@ mod tests {
     }
 
     #[test]
-    fn test_max_occurs_effectively_unbounded() {
-        // Below MAX_COUNTED_OCCURS - NOT effectively unbounded
-        assert!(!MaxOccurs::Bounded(50).is_effectively_unbounded());
-        assert!(!MaxOccurs::Bounded(100).is_effectively_unbounded());
-        assert!(!MaxOccurs::Bounded(1000).is_effectively_unbounded());
-        assert!(!MaxOccurs::Bounded(MAX_COUNTED_OCCURS).is_effectively_unbounded());
-
-        // Above MAX_COUNTED_OCCURS - effectively unbounded
-        assert!(MaxOccurs::Bounded(MAX_COUNTED_OCCURS + 1).is_effectively_unbounded());
-
-        // Explicitly unbounded
+    #[allow(deprecated)]
+    fn test_max_occurs_effectively_unbounded_is_exact() {
+        // No finite bound is ever "effectively" unbounded any more — the
+        // former 10 000 cutoff was a spec violation (§3.9.4.3 clause 2.2).
+        for n in [50, 100, 1000, 10_000, 10_001, 1_000_000, u32::MAX] {
+            assert!(!MaxOccurs::Bounded(n).is_effectively_unbounded(), "{n}");
+        }
         assert!(MaxOccurs::Unbounded.is_effectively_unbounded());
+    }
+
+    /// Every finite bound above the unroll threshold must produce a counted
+    /// NFA (exact), including the values the old cutoff used to widen.
+    #[test]
+    fn test_apply_occurs_large_finite_bounds_are_counted() {
+        use crate::compiler::fragment::FragmentBuilder;
+        use crate::compiler::nfa::NfaTerm;
+        use crate::ids::NameId;
+        let builder = FragmentBuilder::new();
+        for max in [COUNTED_THRESHOLD + 1, 10_000, 10_001, 1_000_000, u32::MAX] {
+            let frag = builder.single_term(NfaTerm::element(NameId(1), None, None), None);
+            let out = apply_occurs(frag, 0, MaxOccurs::Bounded(max));
+            assert!(
+                !out.counter_defs.is_empty(),
+                "maxOccurs={max} must compile to a counted (exact) loop"
+            );
+            assert_eq!(out.counter_defs[0].max, max);
+        }
+        // Unbounded stays a star: no counter.
+        let frag = builder.single_term(NfaTerm::element(NameId(1), None, None), None);
+        assert!(apply_occurs(frag, 0, MaxOccurs::Unbounded).counter_defs.is_empty());
     }
 
     #[test]
