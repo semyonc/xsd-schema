@@ -6,6 +6,7 @@
 //! Callers create a per-run [`super::runtime::ValidationRuntime`] via
 //! [`SchemaValidator::start_run()`] to perform actual validation.
 
+use crate::compiler::inspect::{report_from_prepared, ContentModelReport};
 use crate::compiler::{build_substitution_group_map, SubstitutionGroupMap};
 use crate::ids::ComplexTypeKey;
 use crate::schema::SchemaSet;
@@ -172,6 +173,36 @@ impl<'a> SchemaValidator<'a> {
             .iter()
             .map(|(k, reason)| (*k, reason.as_str()))
             .collect()
+    }
+
+    /// A readable, source-attributed description of the content model this
+    /// validator holds for `ct_key` — see
+    /// [`ContentModelReport`](crate::compiler::inspect::ContentModelReport).
+    ///
+    /// Unlike
+    /// [`inspect_content_model`](crate::compiler::inspect::inspect_content_model),
+    /// which recompiles, this reads the model **already prepared** at
+    /// construction, so the compiled view is the exact object validation
+    /// executes. For a type listed in
+    /// [`content_model_failures`](Self::content_model_failures) the compiled
+    /// view states the preparation failure and its reason instead. For a type
+    /// whose content type is neither element-only nor mixed — no model is
+    /// prepared for those — the model is compiled on demand and the view says
+    /// so.
+    ///
+    /// Returns `None` when `ct_key` does not belong to this validator's schema
+    /// set.
+    pub fn describe_content_model(&self, ct_key: ComplexTypeKey) -> Option<ContentModelReport> {
+        report_from_prepared(
+            self.schema_set,
+            ct_key,
+            self.content_models.models.get(&ct_key),
+            self.content_models
+                .failures
+                .get(&ct_key)
+                .map(|reason| reason.as_str()),
+            self.subst_groups.as_ref(),
+        )
     }
 
     /// Create a new `SchemaValidator` with pre-built substitution groups.
