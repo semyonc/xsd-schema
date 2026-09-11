@@ -76,11 +76,42 @@ resource-failure contract, plus the two measurement-phase allocation gates.
   drivers) and `compiler::nfa::exact_bounds_tests` (counter arithmetic at
   `u32::MAX`, limit behaviour).
 
+- **Content-model inspector** (`compiler::inspect`): a readable,
+  source-attributed description of what the validator compiled for a complex
+  type, in three views — *Source* (type, document, location, content type,
+  open content), *Authored particles* (the resolved particle tree with
+  occurrence ranges, whether each range is unrolled or counted, declaration
+  and type bindings, source locations) and *Compiled* (matcher kind, states,
+  transitions including counter operations, counters, the initial frontier
+  variant, an exposure line for models that can hit the execution limits, and
+  substitution-group expansions). `inspect_content_model(&SchemaSet,
+  ComplexTypeKey)` compiles through the validator's own path so the report
+  is exactly what validation executes; `SchemaValidator::describe_content_model`
+  reuses the prepared model and names a preparation failure;
+  `find_complex_type` looks a type up by expanded name. Example:
+  `cargo run --example inspect_content_model -- schema.xsd TypeName [ns]`.
+
 ### Changed
 
 - `MaxOccurs::is_effectively_unbounded` is deprecated; it now equals
   `is_unbounded` because no finite bound is approximated any more.
 - Counter increments use checked arithmetic on every counted path.
+- Structural refactors, all behaviour-neutral (both W3C suites byte-identical,
+  no public signature changed):
+  - `src/schema/derivation.rs` (10,817 lines) is now the `schema::derivation`
+    module directory: `simple`, `complex`, `normalize`, `particle`,
+    `wildcard`, `attributes`, `constraints`, `type_table`, `redefine`,
+    `tests`, with the entry point and shared helpers in `mod.rs`. Every
+    previously reachable path is re-exported unchanged.
+  - The four oversized functions in `validation/runtime.rs` —
+    `start_element_by_id` (700 → 136 lines), `end_of_attributes_inner`
+    (305 → 110), `validate_attribute_by_id` (291 → 130) and
+    `validate_attribute_against_type` (293 → 45) — are entry-point sequences
+    over 25 single-responsibility helpers, with no new allocation on the
+    per-element path.
+  - `compile_content_model_matcher_impl` (267 → 46 lines) dispatches to
+    `compile_all_group_matcher`, `compile_all_group_extension_matcher`
+    (xsd11), `compile_nfa_matcher` and `attach_own_open_content`.
 
 ### Performance
 
