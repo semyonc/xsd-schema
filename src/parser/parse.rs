@@ -1224,6 +1224,42 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// A declaration's recorded location is its tag's `<`. quick-xml reports
+    /// positions after the event it just read, and the read that produces an
+    /// element also consumes the whitespace in front of it, so an unadjusted
+    /// position lands at the end of the preceding markup — on the line above.
+    #[test]
+    fn test_element_declaration_locates_at_open_angle_bracket() {
+        let mut schema_set = SchemaSet::new();
+        // Line 2 is four spaces then `<xs:element name="a" …/>`: column 5.
+        let xsd = concat!(
+            "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n",
+            "    <xs:element name=\"a\" type=\"xs:string\"/>\n",
+            "</xs:schema>",
+        );
+
+        parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set).expect("schema should parse");
+
+        let local = schema_set.name_table.get("a").expect("name interned");
+        let key = schema_set
+            .lookup_element(None, local)
+            .expect("element 'a' declared");
+        let source = schema_set.arenas.elements[key]
+            .source
+            .as_ref()
+            .expect("element carries a source ref");
+        let loc = schema_set
+            .source_maps
+            .locate(source)
+            .expect("source map resolves the span");
+
+        assert_eq!(
+            (loc.line, loc.column),
+            (2, 5),
+            "expected the '<' of <xs:element>, got {loc}"
+        );
+    }
+
     #[test]
     fn test_parse_schema_with_complex_type() {
         let mut schema_set = SchemaSet::new();

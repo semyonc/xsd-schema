@@ -35,6 +35,25 @@ resource-failure contract, plus the two measurement-phase allocation gates.
 
 ### Fixed
 
+- **A schema element's reported location is now its `<`, not the end of the
+  markup before it.** `SourceRef.span.start` was taken from quick-xml's
+  `buffer_position()` before the read, which is where the *previous* event
+  ended — the same read also consumes the whitespace in front of the tag. A
+  declaration was therefore reported on the line above itself and at the
+  column just past the preceding `>` (`examples/books.xsd`'s `BookForm` came
+  out as 14:21 instead of 16:3). The markup start is now recovered from the
+  tag's own length in `parser::reader::TrackedReader::read_event`, so every
+  span, every error location and every inspector row points at the `<`. Spans
+  stay stable per element, so `compiler::upa`'s `same_particle_origin`, which
+  compares `(doc_id, span)`, is unaffected.
+- **Epsilon states now carry a source location.** About half the rows of the
+  inspector's state table read `(no origin)`: branch and merge states are
+  invented by composition and `FragmentBuilder` left them without one. The new
+  `compiler::NfaFragment::fill_missing_origin` gives every origin-less epsilon
+  state the location of the construct that created it — applied after each
+  model group's composition and after each particle's occurrence wrapper, so
+  the innermost known construct wins. Term-bearing states are never touched,
+  keeping `same_particle_origin` exact. Diagnostics-only; no verdict moves.
 - **UPA compilation no longer compiles the base type uncapped.**
   `compile_base_all_group` called the public, non-UPA
   `compile_content_model_matcher`, so when an XSD 1.1 extension type was

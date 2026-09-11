@@ -93,6 +93,33 @@ impl NfaFragment {
         self.states.get_mut(index)
     }
 
+    /// Give every origin-less epsilon state in this fragment the location of
+    /// the construct that built it.
+    ///
+    /// Composition invents states that belong to no particle of their own —
+    /// the branch and merge states of [`alternate`](Self::alternate) and
+    /// [`concat`](Self::concat), the entry and exit of the occurrence
+    /// wrappers, the exit of a [`single_term`](FragmentBuilder::single_term)
+    /// fragment — so [`FragmentBuilder`] creates them with no origin and the
+    /// inspector renders them as `(no origin)`. Calling this right after a
+    /// composition attributes them to the model group or particle that caused
+    /// it; states already carrying an origin keep it, so the innermost known
+    /// construct always wins.
+    ///
+    /// Term-bearing states are never touched, whether or not they have an
+    /// origin. Their origin identifies the particle a term came from, and
+    /// `compiler::upa`'s `same_particle_origin` compares exactly those to
+    /// decide whether two reachable terms are two views of one particle;
+    /// handing two distinct terms one shared location would make a real UPA
+    /// conflict look like a particle meeting itself.
+    pub fn fill_missing_origin(&mut self, origin: &SourceRef) {
+        for state in &mut self.states {
+            if state.term.is_none() && state.origin.is_none() {
+                state.origin = Some(origin.clone());
+            }
+        }
+    }
+
     /// Concatenate two fragments: self followed by other
     ///
     /// Creates an epsilon transition from self's end state to other's start state.

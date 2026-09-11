@@ -144,8 +144,12 @@ impl<'a> CompileContext<'a> {
         let term_fragment = self.compile_term(&particle.term, particle.source.as_ref())?;
 
         // Apply occurrence constraints
-        let fragment =
+        let mut fragment =
             self.apply_occurrences(term_fragment, particle.min_occurs, particle.max_occurs);
+        // The occurrence wrapper's entry/exit epsilons belong to this particle.
+        if let Some(origin) = particle.source.as_ref() {
+            fragment.fill_missing_origin(origin);
+        }
 
         Ok(fragment)
     }
@@ -342,11 +346,17 @@ impl<'a> CompileContext<'a> {
         }
 
         // Compile based on compositor type
-        match compositor {
-            Compositor::Sequence => self.compile_sequence(&group.particles),
-            Compositor::Choice => self.compile_choice(&group.particles),
-            Compositor::All => self.compile_all(&group.particles, group.source.as_ref()),
+        let mut fragment = match compositor {
+            Compositor::Sequence => self.compile_sequence(&group.particles)?,
+            Compositor::Choice => self.compile_choice(&group.particles)?,
+            Compositor::All => self.compile_all(&group.particles, group.source.as_ref())?,
+        };
+        // The branch/merge epsilons this composition introduced belong to the
+        // model group that caused them.
+        if let Some(origin) = group.source.as_ref() {
+            fragment.fill_missing_origin(origin);
         }
+        Ok(fragment)
     }
 
     /// Compile a particle with a tracked index for resolved type lookup
@@ -755,11 +765,16 @@ impl<'a> CompileContext<'a> {
         // Enable flat indexing within the group
         self.content_flat_idx = Some(0);
 
-        let result = match compositor {
+        let mut result = match compositor {
             Compositor::Sequence => self.compile_sequence(&group.particles),
             Compositor::Choice => self.compile_choice(&group.particles),
             Compositor::All => self.compile_all(&group.particles, source),
         };
+        // As above: attribute the composition's epsilons to the named group,
+        // falling back to the reference site when the definition has no span.
+        if let (Ok(fragment), Some(origin)) = (&mut result, group.source.as_ref().or(source)) {
+            fragment.fill_missing_origin(origin);
+        }
 
         // Restore previous context
         self.redefine_redirect = saved_redirect;

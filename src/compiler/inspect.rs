@@ -2336,6 +2336,49 @@ mod tests {
         assert!(find_complex_type(&ss, None, "Pair").is_some());
     }
 
+    /// Branch, merge and occurrence-wrapper states are invented by the
+    /// compiler rather than written by the schema author, but each still
+    /// belongs to the construct that caused it. Every state row must name a
+    /// location — the state table used to render about half its rows as
+    /// `(no origin)`.
+    #[test]
+    fn epsilon_states_carry_the_origin_of_their_construct() {
+        let ss = schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:complexType name="Mixed">
+    <xs:sequence>
+      <xs:element name="a" type="xs:string"/>
+      <xs:choice minOccurs="0" maxOccurs="3">
+        <xs:element name="b" type="xs:string"/>
+        <xs:element name="c" type="xs:string"/>
+      </xs:choice>
+    </xs:sequence>
+  </xs:complexType>
+</xs:schema>"#,
+        );
+        let key = find_complex_type(&ss, None, "Mixed").expect("named type");
+        let rep = inspect_content_model(&ss, key).expect("content model compiles");
+        let CompiledView::Nfa(view) = &rep.compiled else {
+            panic!("expected an NFA model, got {}", rep.compiled.matcher_kind());
+        };
+
+        let epsilons: Vec<&StateRow> = view.states.iter().filter(|s| s.term.is_none()).collect();
+        assert!(
+            !epsilons.is_empty(),
+            "this model is built by composition, so it has epsilon states"
+        );
+        for state in &epsilons {
+            assert!(
+                state.origin.is_some(),
+                "epsilon state #{} has no origin",
+                state.id
+            );
+        }
+
+        let text = rep.to_string();
+        assert!(!text.contains("(no origin)"), "{text}");
+    }
+
     /// Report rendering must not depend on hash-map iteration order.
     #[test]
     fn rendering_is_deterministic() {
