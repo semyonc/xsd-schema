@@ -1097,17 +1097,27 @@ pub(crate) fn validate_outer_all_group_occurs(
 ///
 /// If the extension's resolved base type is a complex type whose content model
 /// compiles to an `AllGroup`, returns the `AllGroupModel`. Otherwise returns `None`.
+///
+/// `upa_mode` is the mode of the compilation that asked for the base, and must
+/// be passed through rather than defaulted: UPA analysis compiles the whole
+/// content model with bounds capped by [`cap_for_upa`] (Sperberg-McQueen 2005
+/// — for determinism testing `F{n,m}` can be replaced by `F{min(n,1),
+/// min(m,2)}`), which keeps the automaton counter-free so the closure-based
+/// analysis can run on it. Compiling one half of the same model uncapped
+/// breaks that uniformity, and does the expensive counted construction for a
+/// result the UPA check then discards.
 #[cfg(feature = "xsd11")]
 fn compile_base_all_group(
     schema_set: &SchemaSet,
     type_def: &ComplexTypeDefData,
+    upa_mode: bool,
 ) -> NfaCompileResult<Option<AllGroupModel>> {
     let base_ct_key = match type_def.resolved_base_type {
         Some(TypeKey::Complex(key)) => key,
         _ => return Ok(None),
     };
     let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
-    let base_matcher = compile_content_model_matcher(schema_set, base_type_def)?;
+    let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
     match base_matcher {
         ContentModelMatcher::AllGroup(model) => Ok(Some(model)),
         _ => Ok(None),
@@ -1127,7 +1137,7 @@ fn try_xsd10_empty_base_all_extension(
     if !is_extension || !schema_set.is_xsd10() {
         return Ok(None);
     }
-    let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? else {
+    let Some(base_all_model) = compile_base_all_group(schema_set, type_def, ctx.upa_mode)? else {
         return Ok(None);
     };
     if !base_all_model.particles.is_empty() {
@@ -1336,7 +1346,7 @@ fn compile_all_group_extension_matcher(
     if !is_extension || !schema_set.is_xsd11() {
         return Ok(None);
     }
-    let Some(base_all_model) = compile_base_all_group(schema_set, type_def)? else {
+    let Some(base_all_model) = compile_base_all_group(schema_set, type_def, upa_mode)? else {
         return Ok(None);
     };
 

@@ -35,6 +35,17 @@ resource-failure contract, plus the two measurement-phase allocation gates.
 
 ### Fixed
 
+- **UPA compilation no longer compiles the base type uncapped.**
+  `compile_base_all_group` called the public, non-UPA
+  `compile_content_model_matcher`, so when an XSD 1.1 extension type was
+  compiled for schema-time UPA checking (`compile_content_model_for_upa`) the
+  base type's content model was built with exact occurrence bounds while the
+  rest of the same compilation was capped by `cap_for_upa`. The mode is now
+  threaded through, so both halves are capped (Sperberg-McQueen 2005: for
+  determinism testing `F{n,m}` can be replaced by `F{min(n,1), min(m,2)}`) and
+  the counted construction is not run for a model the UPA check discards. No
+  UPA verdict changes: an all-group model carries its member bounds in either
+  mode and `check_all_group_upa` does not read them.
 - **`xsi:nil` on a non-nillable element is now invalid at the start event.**
   The pushed element state was `Invalid` and `cvc-elt.3.1` was reported, but
   the `SchemaInfo` returned by `validate_element` / `validate_element_by_id`
