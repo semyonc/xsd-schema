@@ -11,22 +11,10 @@
 | [Extensibility Guide](doc/EXTENSIBILITY.md) | Extension points for annotations/appinfo, schema loaders, DOM navigation, and custom XPath functions. |
 | [Unsafe Code](doc/UNSAFE.md) | Inventory of unsafe blocks, safety invariants, and Miri verification commands. |
 
-## Inspecting a compiled content model
-
-`compiler::inspect_content_model` explains what the validator compiled for a
-complex type, in three labelled views: **Source** (expanded name, schema
-document and line/column, content type, derivation, effective open content),
-**Authored particles** (the resolved particle tree with each
-`minOccurs..maxOccurs` marked as unrolled or counter-compiled), and **Compiled**
-(matcher kind, states, transitions, counters, the initial frontier variant, and
-a per-state table with origins). It compiles through the same entry point the
-validator uses, so the compiled view is the automaton validation executes;
-`SchemaValidator::describe_content_model` reads the already-prepared model
-instead, and names the reason when a type's model could not be prepared.
-
-```bash
-cargo run --example inspect_content_model -- examples/books.xsd BookForm urn:books
-```
+To see exactly what the validator compiled for a complex type — the authored
+particle tree, the automaton it became, counters, and where each state comes
+from in the schema — use the content-model inspector:
+[Inspecting a compiled content model](doc/INTRODUCTION.md#7-inspecting-a-compiled-content-model).
 
 ## Test Results
 
@@ -54,9 +42,14 @@ over 10 iterations, and the schema is compiled **once, off the clock**.
 
 | Strategy | Parser | Time | Throughput | RSS delta |
 | --- | --- | ---: | ---: | ---: | 
-| streaming | quick-xml | 353 ms | 44.1 MB/s | **608 KB** |
-| DOM (roxmltree) | roxmltree | 303 ms | 51.3 MB/s | 88.4 MB |
-| DOM (BufferDoc) | quick-xml | 377 ms | 41.3 MB/s | 61.5 MB |
+| streaming | quick-xml | 308 ms | 50.6 MB/s | **568 KB** |
+| DOM (roxmltree) | roxmltree | 265 ms | 58.8 MB/s | 88.4 MB |
+| DOM (BufferDoc) | quick-xml | 339 ms | 45.9 MB/s | 61.4 MB |
+
+Re-measured 2026-09-11 after the exact-occurrence, allocation-gate and
+precomputed-closure work (four runs per strategy, spread under 3 %); the
+previous table read 353 / 303 / 377 ms. Both W3C suites are unchanged by that
+work (failure lists byte-identical to v0.1.5).
 
 
 
