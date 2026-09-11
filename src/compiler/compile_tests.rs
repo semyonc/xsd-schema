@@ -1285,6 +1285,30 @@ fn make_group_ref_particle(
     }
 }
 
+/// An unresolvable `<xs:group ref="tns:missing"/>` must name the group the way
+/// every sibling error site does — the resolved `{namespace}local` QName, never
+/// the raw interned ids.
+#[test]
+fn test_unresolved_group_ref_error_uses_readable_qname() {
+    let schema_set = SchemaSet::new();
+    let ns = schema_set.name_table.add("http://example.com/tns");
+    let missing = schema_set.name_table.add("missing");
+    let particle = make_group_ref_particle(Some(ns), missing, 1, Some(1));
+
+    let err = compile_particle(&schema_set, &particle, Some(ns))
+        .expect_err("a reference to an undeclared group must not compile");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("{http://example.com/tns}missing"),
+        "expected the resolved QName, got {msg:?}"
+    );
+    assert!(
+        !msg.contains("NameId("),
+        "error message leaks raw interned ids: {msg:?}"
+    );
+}
+
 /// Helper: make an inline all-group particle with a group ref inside it,
 /// suitable for use as a complex type's top-level particle.
 #[cfg(feature = "xsd11")]

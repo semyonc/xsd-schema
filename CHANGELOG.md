@@ -35,6 +35,13 @@ resource-failure contract, plus the two measurement-phase allocation gates.
 
 ### Fixed
 
+- **An unresolved `<xs:group ref="…"/>` now names the group.** The error read
+  `unresolved group reference: NameId(42):17` — the raw interned ids — instead
+  of the QName. Both group-reference resolution sites (`compile_group_ref` and
+  the XSD 1.1 `flatten_all_group_ref_into`) now format the name with
+  `schema::resolver::format_resolved_qname`, the helper every sibling error
+  site already uses, giving `unresolved group reference:
+  {http://example.com/tns}missing`.
 - **Finite `maxOccurs` above 10 000 is now enforced exactly.** The compiler
   treated any finite maximum larger than `MAX_COUNTED_OCCURS = 10_000` as
   `unbounded`, so `a{0,10001}` accepted 10 002 children. Structures §3.9.4.3

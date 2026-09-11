@@ -559,13 +559,10 @@ impl<'a> CompileContext<'a> {
 
         // Resolve the group ref (redefine-aware)
         let group_key = self.resolve_model_group_key(ref_name).ok_or_else(|| {
-            let name = format!(
-                "{}:{}",
-                ref_name
-                    .namespace
-                    .map(|n| format!("{:?}", n))
-                    .unwrap_or_default(),
-                ref_name.local_name.0
+            let name = crate::schema::resolver::format_resolved_qname(
+                &self.schema_set.name_table,
+                ref_name.namespace,
+                ref_name.local_name,
             );
             NfaCompileError::unresolved_group(name, source.cloned())
         })?;
@@ -684,13 +681,10 @@ impl<'a> CompileContext<'a> {
 
         // Look up the referenced group (redefine-aware)
         let group_key = self.resolve_model_group_key(ref_name).ok_or_else(|| {
-            let name = format!(
-                "{}:{}",
-                ref_name
-                    .namespace
-                    .map(|n| format!("{:?}", n))
-                    .unwrap_or_default(),
-                ref_name.local_name.0
+            let name = crate::schema::resolver::format_resolved_qname(
+                &self.schema_set.name_table,
+                ref_name.namespace,
+                ref_name.local_name,
             );
             NfaCompileError::unresolved_group(name, source.cloned())
         })?;
