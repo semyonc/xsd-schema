@@ -15,8 +15,9 @@ use crate::document::{
     serialize, BufferDocument, BufferDocumentBuilder, BufferDocumentOptions, CopyOptions,
     SerializeOptions,
 };
-use crate::namespace::{NameTable, NamespaceContextSnapshot};
+use crate::namespace::{NameTable, NamespaceContextSnapshot, XSI_NAMESPACE, XS_NAMESPACE};
 use crate::navigator::{DomNavigator, DomNodeType};
+use crate::xpath::functions::FN_NAMESPACE;
 use crate::xpath::{XPathContext, XPathExpr, XPathValue};
 use crate::SchemaSet;
 
@@ -255,6 +256,20 @@ impl fmt::Debug for Doc<'_> {
     }
 }
 
+/// The prefixes a composer starts with bound, in declaration order.
+///
+/// An XQuery processor has `xs`, `xsi`, `fn`, `local` and `xml` in scope
+/// before the first character of a query is read, and an expression that casts
+/// — `xs:date('1999-01-31')` — is unwritable without at least the first of
+/// them. Three of the five are bound here: `local` names a namespace for
+/// user-declared functions, and there are none to declare, while `xml` is
+/// bound by XML itself and never needs a declaration.
+const PREDECLARED_NAMESPACES: [(&str, &str); 3] = [
+    ("xs", XS_NAMESPACE),
+    ("xsi", XSI_NAMESPACE),
+    ("fn", FN_NAMESPACE),
+];
+
 /// The home of a composition: one arena, one name table, one namespace
 /// context, one expression cache.
 ///
@@ -306,7 +321,8 @@ pub struct Composer<'a> {
     /// The table actually used for interning, evaluation and building.
     names: &'a NameTable,
     schema_set: Option<&'a SchemaSet>,
-    /// The prefix bindings, in the order they were added.
+    /// The prefix bindings, in the order they were added: the predeclared
+    /// ones first, then the caller's. A later binding for a prefix wins.
     namespaces: Vec<(String, String)>,
     default_element_ns: Option<String>,
     base_uri: Option<String>,
@@ -319,6 +335,28 @@ pub struct Composer<'a> {
 impl<'a> Composer<'a> {
     /// A composer over `arena` and `names`.
     ///
+    /// # Predeclared prefixes
+    ///
+    /// Three prefixes are bound before you bind anything:
+    ///
+    /// | Prefix | Namespace |
+    /// | --- | --- |
+    /// | `xs` | `http://www.w3.org/2001/XMLSchema` |
+    /// | `xsi` | `http://www.w3.org/2001/XMLSchema-instance` |
+    /// | `fn` | `http://www.w3.org/2005/xpath-functions` |
+    ///
+    /// They are the ones every processor of this expression language has in
+    /// scope from the start, and without `xs` no cast can be written at all:
+    /// `xs:date('1999-01-31')` would be `XPST0081 Prefix 'xs' cannot be
+    /// expanded`. The prefixes work everywhere a prefix works — in an
+    /// expression, and in a [`form!`](crate::form!) element or attribute name
+    /// — and a prefix a form actually uses is declared on the output like any
+    /// other. Two more prefixes are predeclared by XQuery 1.0 §4.12 and not
+    /// here: `local`, which names the namespace of user-declared functions
+    /// (there are none to declare), and `xml`, which XML binds itself and
+    /// which is never declared. Any of the three can be rebound with
+    /// [`with_namespace`](Self::with_namespace).
+    ///
     /// ```
     /// use bumpalo::Bump;
     /// use xsd_schema::compose::Composer;
@@ -328,6 +366,12 @@ impl<'a> Composer<'a> {
     /// let names = NameTable::new();
     /// let c = Composer::new(&arena, &names);
     /// assert_eq!(c.eval("1 + 1", &[], None, Vec::new())?.string()?, "2");
+    ///
+    /// // `xs` needs no declaration of your own.
+    /// assert_eq!(
+    ///     c.eval("month-from-date(xs:date('1999-01-31'))", &[], None, Vec::new())?.string()?,
+    ///     "1",
+    /// );
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn new(arena: &'a Bump, names: &'a NameTable) -> Self {
@@ -336,7 +380,10 @@ impl<'a> Composer<'a> {
             given_names: names,
             names,
             schema_set: None,
-            namespaces: Vec::new(),
+            namespaces: PREDECLARED_NAMESPACES
+                .iter()
+                .map(|(prefix, uri)| (prefix.to_string(), uri.to_string()))
+                .collect(),
             default_element_ns: None,
             base_uri: None,
             ctx: XPathContext::new(names),
@@ -384,6 +431,9 @@ impl<'a> Composer<'a> {
     }
 
     /// Binds a prefix, for `$p:x` in an expression and `p:x` in a form.
+    ///
+    /// `xs`, `xsi` and `fn` are bound already ([`new`](Self::new)); this
+    /// rebinds any of them, because the last declaration of a prefix wins.
     ///
     /// ```
     /// use bumpalo::Bump;
@@ -773,11 +823,17 @@ impl<'a> Composer<'a> {
             None => self.given_names,
         };
 
+        // A snapshot answers a lookup with the first binding it holds for the
+        // prefix, so the bindings go in newest first: a rebinding of a prefix
+        // — one of the predeclared ones included — wins over what it rebinds,
+        // which is how the emitter reads the same list (innermost last).
         let mut snapshot = NamespaceContextSnapshot::default();
-        for (prefix, uri) in &self.namespaces {
-            snapshot
-                .bindings
-                .push((self.names.add(prefix), self.names.add(uri)));
+        for (prefix, uri) in self.namespaces.iter().rev() {
+            let prefix = self.names.add(prefix);
+            if snapshot.bindings.iter().any(|(p, _)| *p == prefix) {
+                continue;
+            }
+            snapshot.bindings.push((prefix, self.names.add(uri)));
         }
 
         let mut ctx = XPathContext::new(self.names).with_namespaces(snapshot);
@@ -826,7 +882,7 @@ impl fmt::Debug for Composer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compose::form::{Content, Name};
+    use crate::compose::form::{AttrValue, Content, Name};
     use crate::compose::IntoXPathValue;
 
     fn arena_and_names() -> (Bump, NameTable) {
@@ -1189,5 +1245,119 @@ mod tests {
         let text = format!("{c:?}");
         assert!(text.contains("Composer"), "{text}");
         assert!(text.contains("urn:x"), "{text}");
+    }
+
+    // ── Predeclared prefixes ──────────────────────────────────────────
+
+    #[test]
+    fn a_cast_needs_no_declaration_of_its_own() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+
+        let date = c
+            .eval(
+                "month-from-date(xs:date('1999-01-31'))",
+                &[],
+                None,
+                Vec::new(),
+            )
+            .expect("`xs` is bound");
+        assert_eq!(date.string().unwrap(), "1");
+
+        let integer = c
+            .eval("xs:integer('42') + 1", &[], None, Vec::new())
+            .expect("`xs` is bound");
+        assert_eq!(integer.string().unwrap(), "43");
+    }
+
+    #[test]
+    fn the_function_prefix_is_bound() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+
+        let counted = c
+            .eval("fn:count((1, 2, 3))", &[], None, Vec::new())
+            .expect("`fn` is bound");
+        assert_eq!(counted.string().unwrap(), "3");
+    }
+
+    #[test]
+    fn the_instance_prefix_is_bound() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+        let doc = c
+            .load_str(r#"<r xmlns:i="http://www.w3.org/2001/XMLSchema-instance" i:nil="true"/>"#)
+            .unwrap();
+
+        let found = c
+            .eval("count(//@xsi:nil)", &[], Some(doc.root()), Vec::new())
+            .expect("`xsi` is bound");
+        assert_eq!(found.string().unwrap(), "1");
+    }
+
+    #[test]
+    fn a_predeclared_prefix_reaches_a_form_and_its_output() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+
+        let mut form = Form::new(Name::prefixed("xs", "schema"));
+        form.attr(Name::prefixed("xsi", "type"), AttrValue::text("xs:string"));
+
+        let written = c
+            .build(form)
+            .unwrap()
+            .to_xml(&SerializeOptions::default())
+            .unwrap();
+        assert_eq!(
+            written,
+            concat!(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" "#,
+                r#"xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+                r#"xsi:type="xs:string"/>"#,
+            ),
+        );
+    }
+
+    #[test]
+    fn an_unused_predeclared_prefix_is_not_declared() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+
+        let written = c
+            .build(Form::new(Name::local("plain")))
+            .unwrap()
+            .to_xml(&SerializeOptions::default())
+            .unwrap();
+        assert_eq!(written, "<plain/>");
+    }
+
+    #[test]
+    fn a_rebinding_of_a_predeclared_prefix_wins() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names).with_namespace("xs", "urn:mine");
+        let doc = c.load_str(r#"<r xmlns:z="urn:mine"><z:a/></r>"#).unwrap();
+
+        let found = c
+            .eval("count(//xs:a)", &[], Some(doc.root()), Vec::new())
+            .expect("`xs` resolves to the new namespace");
+        assert_eq!(found.string().unwrap(), "1");
+
+        // And the last declaration is the only one: nothing resolves `xs` to
+        // the schema namespace any more, so the constructor is gone.
+        assert!(c
+            .eval("xs:date('1999-01-31')", &[], None, Vec::new())
+            .is_err());
+    }
+
+    #[test]
+    fn predeclaring_leaves_the_cache_empty() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+        assert_eq!(c.cached_expressions(), 0, "nothing is compiled up front");
+
+        for _ in 0..3 {
+            c.eval("xs:integer('1')", &[], None, Vec::new()).unwrap();
+        }
+        assert_eq!(c.cached_expressions(), 1, "one call site, one compilation");
     }
 }

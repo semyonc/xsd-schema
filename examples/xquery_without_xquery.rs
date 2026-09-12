@@ -35,7 +35,7 @@ use bumpalo::Bump;
 use xsd_schema::compose::order::{Direction, EmptyOrder};
 use xsd_schema::compose::{pipe, ComposeError, Composer, Doc};
 use xsd_schema::document::SerializeOptions;
-use xsd_schema::namespace::{NameTable, XS_NAMESPACE};
+use xsd_schema::namespace::NameTable;
 use xsd_schema::{form, xpath};
 
 fn main() -> ExitCode {
@@ -77,9 +77,9 @@ fn report(root: &Path) -> Result<(), ComposeError> {
     // every node and value shares that one lifetime.
     let arena = Bump::new();
     let names = NameTable::new();
-    // `xs` is not a prefix the static context knows on its own, and RQ9
-    // constructs an `xs:date`, so declare it here.
-    let c = Composer::new(&arena, &names).with_namespace("xs", XS_NAMESPACE);
+    // RQ9 constructs an `xs:date`, and `xs` is one of the prefixes a composer
+    // starts with bound, so there is nothing to declare here.
+    let c = Composer::new(&arena, &names);
 
     let items = c.load_file(root.join("TestSources/items.xml"))?;
     let bids = c.load_file(root.join("TestSources/bids.xml"))?;

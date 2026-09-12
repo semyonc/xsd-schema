@@ -32,6 +32,11 @@
 //! `form!((p::title "One"))` — because one colon after the element name is
 //! always the start of an attribute: `form!((book :id "b1"))`.
 //!
+//! A composer starts with `xs`, `xsi` and `fn` bound, so a cast —
+//! `xs:date('1999-01-31')` — and a form name like `(xs::schema …)` need no
+//! declaration of their own; [`Composer::new`] carries the table and the
+//! reasoning.
+//!
 //! # Lifetimes
 //!
 //! A [`Composer<'a>`] borrows an arena and a name table. Every document it
@@ -349,9 +354,8 @@
 //! # use xsd_schema::{form, xpath};
 //! # let arena = Bump::new();
 //! # let names = NameTable::new();
-//! // `xs` is not a prefix the static context knows on its own.
-//! let c = Composer::new(&arena, &names)
-//!     .with_namespace("xs", "http://www.w3.org/2001/XMLSchema");
+//! // `xs` is bound from the start, so the casts below need no declaration.
+//! let c = Composer::new(&arena, &names);
 //! # let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
 //!
 //! // let $end_dates := ...

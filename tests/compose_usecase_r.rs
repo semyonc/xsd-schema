@@ -33,7 +33,7 @@ use bumpalo::Bump;
 use xsd_schema::compose::order::{Direction, EmptyOrder};
 use xsd_schema::compose::{pipe, ComposeError, Composer, Doc};
 use xsd_schema::document::SerializeOptions;
-use xsd_schema::namespace::{NameTable, XS_NAMESPACE};
+use xsd_schema::namespace::NameTable;
 use xsd_schema::{form, xpath};
 
 // ── The suite ─────────────────────────────────────────────────────────
@@ -111,9 +111,9 @@ const QUERIES: [(u32, Query); 18] = [
 fn run(root: &Path, query: Query) -> Result<String, ComposeError> {
     let arena = Bump::new();
     let names = NameTable::new();
-    // `xs` is not a prefix the static context knows on its own, and four of
-    // these queries construct an `xs:date`, so the composer declares it.
-    let c = Composer::new(&arena, &names).with_namespace("xs", XS_NAMESPACE);
+    // Four of these queries construct an `xs:date`, and `xs` is one of the
+    // prefixes a composer starts with bound, so nothing is declared here.
+    let c = Composer::new(&arena, &names);
     let inputs = Inputs::load(&c, root)?;
     query(&c, &inputs)?.to_xml(&SerializeOptions::default())
 }

@@ -88,15 +88,10 @@ options and a cache of compiled expressions. Its builder methods are:
 Each setter rebuilds the static context and clears the expression cache, so
 call them before evaluating anything.
 
-**`xs` is not declared for you.** The static context starts with no prefix
-bindings at all, so `xs:date("1999-01-31")` in an expression is
-`XPST0081 Prefix 'xs' cannot be expanded` until you say so:
-
-```rust
-use xsd_schema::namespace::XS_NAMESPACE;
-
-let c = Composer::new(&arena, &names).with_namespace("xs", XS_NAMESPACE);
-```
+Three prefixes are bound before you bind anything — `xs`, `xsi` and `fn` — so
+`xs:date("1999-01-31")` in an expression and `(xs::schema …)` in a form work
+with no declaration of your own, and `with_namespace` rebinds any of them
+because the last declaration of a prefix wins.
 
 ### The lifetime model
 
@@ -367,7 +362,9 @@ A name that is not a Rust identifier is a string literal: `("bid-count" "7")`.
 
 Prefixes are resolved **when the document is built**, not when the macro
 expands: a form's own `:xmlns` declarations first, innermost out, then the
-composer's `with_namespace` table. `xml` is always bound and never declared. An
+composer's table — the three predeclared prefixes of §2 included, so
+`(xs::schema …)` and `:xsi:type "…"` resolve and are declared on the output
+like any other. `xml` is always bound and never declared. An
 unprefixed element name takes the default element namespace; an unprefixed
 attribute is always in no namespace. A prefix nothing binds is
 `UnboundPrefix { prefix, at }`, and a literal name that is not an `NCName` or
