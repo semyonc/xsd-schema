@@ -20,7 +20,7 @@ use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
 use crate::xml_entity::resolve_general_ref;
 
-use super::buffer::BufferDocument;
+use super::buffer::{next_document_serial, BufferDocument};
 use super::error::BufferDocumentError;
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
@@ -105,6 +105,7 @@ impl<'a> BufferDocumentBuilder<'a> {
 
         let doc = BufferDocument {
             arena,
+            serial: next_document_serial(),
             kind: options.kind,
             names: effective_names,
             nodes,
