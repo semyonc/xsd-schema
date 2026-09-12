@@ -338,7 +338,7 @@ queries of the XQuery test suite's relational use case.
 - **`xpath!` and `form!`** (`compose` feature): the composition written as
   macros. `xpath!(c, "expr", node, name = value)` evaluates a cached
   expression with an optional context node and named bindings;
-  `form!((result :id "b1" ^{ value } ..?^{ rows }))` describes a result
+  `form! { (result :id "b1" ^{ value } ..?^{ rows }) }` describes a result
   element — attributes, namespace declarations, literal and `Display` text,
   copied content, spliced sequences, and fallible splices whose first failure
   propagates with `?`. Both are exported at the crate root
@@ -346,6 +346,13 @@ queries of the XQuery test suite's relational use case.
   `p::local`: one colon after the element name is always the attribute
   marker, so nothing is ever reinterpreted silently. Element and attribute
   names are checked when the document is built (`ComposeError::InvalidName`).
+  Braces are the documented spelling of a form invocation because a form's
+  tokens also parse as a Rust expression, which rustfmt would reflow; all
+  three delimiters expand identically. `Composer::new` predeclares the `xs`,
+  `xsi` and `fn` prefixes, as every XQuery processor does, so `xs:date(…)` in
+  an expression and `:xsi:type "…"` in a form need no declaration of their
+  own; `with_namespace` rebinds any of them, the last declaration winning, and
+  a predeclared prefix a form does not use is not written to the output.
   The eighteen queries of the XQTS "relational" use case, rewritten in this
   style, reproduce their expected results (`tests/compose_usecase_r.rs`);
   `examples/xquery_without_xquery.rs` runs three of them end to end, and
