@@ -135,6 +135,286 @@
 //! );
 //! # Ok::<(), ComposeError>(())
 //! ```
+//!
+//! # Walkthroughs
+//!
+//! Three queries from the relational use case of the XQuery 1.0 test suite,
+//! over its own `items.xml`, `bids.xml` and `users.xml`. Every one of the
+//! eighteen queries in that use case is rewritten this way in
+//! `tests/compose_usecase_r.rs` and compared with the suite's expected
+//! result; these three are the ones worth reading. They are `no_run` here
+//! because they need the suite checked out — the test is what runs them.
+//!
+//! The shared setup, and the canonical import list:
+//!
+//! ```no_run
+//! use bumpalo::Bump;
+//! use xsd_schema::compose::order::{Direction, EmptyOrder};
+//! use xsd_schema::compose::{pipe, ComposeError, Composer};
+//! use xsd_schema::document::SerializeOptions;
+//! use xsd_schema::namespace::NameTable;
+//! use xsd_schema::{form, xpath};
+//!
+//! let arena = Bump::new();
+//! let names = NameTable::new();
+//! let c = Composer::new(&arena, &names);
+//! let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
+//! let bids = c.load_file("XQTS_1_0_2/TestSources/bids.xml")?;
+//! let users = c.load_file("XQTS_1_0_2/TestSources/users.xml")?;
+//! # Ok::<(), ComposeError>(())
+//! ```
+//!
+//! ## RQ2 — the highest bid for every bicycle
+//!
+//! ```xquery
+//! <result>{
+//!   for $i in $input-context1//item_tuple
+//!   let $b := $input-context2//bid_tuple[itemno = $i/itemno]
+//!   where contains($i/description, "Bicycle")
+//!   order by $i/itemno
+//!   return <item_tuple>{ $i/itemno }{ $i/description }
+//!          <high_bid>{ max($b/bid) }</high_bid></item_tuple>
+//! }</result>
+//! ```
+//!
+//! The XPath2.Net README rewrites this query into LINQ, and its version is
+//! where the shape of this module comes from — an expression with a host
+//! value bound to `$i`, and a constructor taking the result:
+//!
+//! ```csharp
+//! // the XPath2.Net README, abridged
+//! var bid = bids.XPath2Select<XElement>(
+//!     "//bid_tuple[itemno = $i/itemno]", new { i = item });
+//! new XElement("item_tuple", item.Element("itemno"), item.Element("description"),
+//!     !bid.Any() ? null
+//!                : new XElement("high_bid", bid.AsQueryable().Max(/* … */)));
+//! ```
+//!
+//! `new { i = item }` is `i = &i` below. The `!bid.Any() ? null : …` is the
+//! part that does not carry over, and deliberately: the query says
+//! `<high_bid>{ max($b/bid) }</high_bid>` with no conditional in it, and the
+//! broken bicycle's empty `high_bid` element is what the content rules
+//! produce from an empty sequence. There is no Rust test for "no bids"
+//! anywhere in the version below.
+//!
+//! ```no_run
+//! # use bumpalo::Bump;
+//! # use xsd_schema::compose::order::{Direction, EmptyOrder};
+//! # use xsd_schema::compose::{pipe, ComposeError, Composer};
+//! # use xsd_schema::document::SerializeOptions;
+//! # use xsd_schema::namespace::NameTable;
+//! # use xsd_schema::{form, xpath};
+//! # let arena = Bump::new();
+//! # let names = NameTable::new();
+//! # let c = Composer::new(&arena, &names);
+//! # let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
+//! # let bids = c.load_file("XQTS_1_0_2/TestSources/bids.xml")?;
+//! // for $i in ...
+//! let rows = pipe::nodes(xpath!(c, "//item_tuple", items)?)
+//!     // let $b := ...
+//!     .try_map(|i| {
+//!         let b = xpath!(c, "//bid_tuple[itemno = $i/itemno]", bids, i = &i)?;
+//!         Ok((i, b))
+//!     })
+//!     // where ...
+//!     .try_filter(|(i, _)| xpath!(c, "contains(description, 'Bicycle')", i)?.boolean())
+//!     // order by ...
+//!     .order_by(Direction::Ascending, EmptyOrder::Least, |(i, _)| {
+//!         xpath!(c, "itemno", i)?.key()
+//!     })?
+//!     // return ...
+//!     .try_map(|(i, b)| {
+//!         Ok(form!((item_tuple
+//!             ^{ xpath!(c, "itemno", &i)? }
+//!             ^{ xpath!(c, "description", &i)? }
+//!             (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))))
+//!     });
+//!
+//! let doc = c.build(form!((result ..?^{ rows })))?;
+//! assert_eq!(
+//!     doc.to_xml(&SerializeOptions::default())?,
+//!     concat!(
+//!         "<result>",
+//!         "<item_tuple><itemno>1001</itemno><description>Red Bicycle</description>",
+//!         "<high_bid>55</high_bid></item_tuple>",
+//!         "<item_tuple><itemno>1003</itemno><description>Old Bicycle</description>",
+//!         "<high_bid>20</high_bid></item_tuple>",
+//!         "<item_tuple><itemno>1007</itemno><description>Racing Bicycle</description>",
+//!         "<high_bid>225</high_bid></item_tuple>",
+//!         "<item_tuple><itemno>1008</itemno><description>Broken Bicycle</description>",
+//!         "<high_bid/></item_tuple>",
+//!         "</result>",
+//!     ),
+//! );
+//! # Ok::<(), ComposeError>(())
+//! ```
+//!
+//! Every closure is one FLWOR clause. The `let` is a projection that carries
+//! the bid sequence beside its item as `(i, b)`; the filter and the key
+//! selector borrow that row; the last projection consumes it. Relative
+//! expressions take the node as their context item rather than rebinding it
+//! as a variable, and no result element is built before the sort — `order_by`
+//! owns the buffer, and computes each key once.
+//!
+//! ## RQ3 — users rated worse than "C" offering items over 1000
+//!
+//! ```xquery
+//! <result>{
+//!   for $u in $input-context2//user_tuple
+//!   for $i in $input-context1//item_tuple
+//!   where $u/rating > "C" and $i/reserve_price > 1000
+//!     and $i/offered_by = $u/userid
+//!   return <warning>{ $u/name }{ $u/rating }
+//!          { $i/description }{ $i/reserve_price }</warning>
+//! }</result>
+//! ```
+//!
+//! ```no_run
+//! # use bumpalo::Bump;
+//! # use xsd_schema::compose::{pipe, ComposeError, Composer};
+//! # use xsd_schema::document::SerializeOptions;
+//! # use xsd_schema::namespace::NameTable;
+//! # use xsd_schema::{form, xpath};
+//! # let arena = Bump::new();
+//! # let names = NameTable::new();
+//! # let c = Composer::new(&arena, &names);
+//! # let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
+//! # let users = c.load_file("XQTS_1_0_2/TestSources/users.xml")?;
+//! // for $u in ..., for $i in ...
+//! let warnings = pipe::nodes(xpath!(c, "//user_tuple", users)?)
+//!     .try_flat_map(|u| {
+//!         Ok(pipe::nodes(xpath!(c, "//item_tuple", items)?)
+//!             .try_map(move |i| Ok((u.clone(), i))))
+//!     })
+//!     // where ...
+//!     .try_filter(|(u, i)| {
+//!         xpath!(
+//!             c,
+//!             "$u/rating > 'C' and $i/reserve_price > 1000 \
+//!              and $i/offered_by = $u/userid",
+//!             u = u,
+//!             i = i
+//!         )?
+//!         .boolean()
+//!     })
+//!     // return ...
+//!     .try_map(|(u, i)| {
+//!         Ok(form!((warning
+//!             ^{ xpath!(c, "name", &u)? }
+//!             ^{ xpath!(c, "rating", &u)? }
+//!             ^{ xpath!(c, "description", &i)? }
+//!             ^{ xpath!(c, "reserve_price", &i)? })))
+//!     });
+//!
+//! let doc = c.build(form!((result ..?^{ warnings })))?;
+//! assert_eq!(
+//!     doc.to_xml(&SerializeOptions::default())?,
+//!     concat!(
+//!         "<result><warning><name>Dee Linquent</name><rating>D</rating>",
+//!         "<description>Helicopter</description>",
+//!         "<reserve_price>50000</reserve_price></warning></result>",
+//!     ),
+//! );
+//! # Ok::<(), ComposeError>(())
+//! ```
+//!
+//! The nested `for` is `try_flat_map`: the item source is created for each
+//! user and exhausted before the next user, which is the query's own order.
+//! The inner `move` closure owns `u` and clones the handle into each pair —
+//! a navigator handle, not a copied subtree; the copying happens later, when
+//! the form is built. The three-part `where` stays one expression with two
+//! nodes bound to it, which is the shape the C# version has too.
+//!
+//! ## RQ9 — how many auctions ended in each month
+//!
+//! ```xquery
+//! <result>{
+//!   let $end_dates := $input-context//item_tuple/end_date
+//!   for $m in distinct-values(for $e in $end_dates
+//!                             return month-from-date($e))
+//!   let $item := $input-context//item_tuple
+//!       [year-from-date(end_date) = 1999 and month-from-date(end_date) = $m]
+//!   order by $m
+//!   return <monthly_result><month>{ $m }</month>
+//!          <item_count>{ count($item) }</item_count></monthly_result>
+//! }</result>
+//! ```
+//!
+//! ```no_run
+//! # use bumpalo::Bump;
+//! # use xsd_schema::compose::order::{Direction, EmptyOrder};
+//! # use xsd_schema::compose::{pipe, ComposeError, Composer};
+//! # use xsd_schema::document::SerializeOptions;
+//! # use xsd_schema::namespace::NameTable;
+//! # use xsd_schema::{form, xpath};
+//! # let arena = Bump::new();
+//! # let names = NameTable::new();
+//! // `xs` is not a prefix the static context knows on its own.
+//! let c = Composer::new(&arena, &names)
+//!     .with_namespace("xs", "http://www.w3.org/2001/XMLSchema");
+//! # let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
+//!
+//! // let $end_dates := ...
+//! let end_dates = xpath!(c, "//item_tuple/end_date", items)?;
+//! // for $m in distinct-values(...)
+//! let months = xpath!(
+//!     c,
+//!     "distinct-values(for $e in $end_dates return month-from-date(xs:date($e)))",
+//!     end_dates = &end_dates
+//! )?
+//! .atomics()?;
+//!
+//! let rows = pipe::from(months)
+//!     // let $item := ...
+//!     .try_map(|m| {
+//!         let item = xpath!(
+//!             c,
+//!             "//item_tuple[year-from-date(xs:date(end_date)) = 1999 \
+//!              and month-from-date(xs:date(end_date)) = $m]",
+//!             items,
+//!             m = &m
+//!         )?;
+//!         Ok((m, item))
+//!     })
+//!     // order by $m
+//!     .order_by(Direction::Ascending, EmptyOrder::Least, |(m, _)| Ok(Some(m.clone())))?
+//!     // return ...
+//!     .try_map(|(m, item)| {
+//!         Ok(form!((monthly_result
+//!             (month ^{ m })
+//!             (item_count ^{ xpath!(c, "count($item)", item = &item)? }))))
+//!     });
+//!
+//! let doc = c.build(form!((result ..?^{ rows })))?;
+//! assert_eq!(
+//!     doc.to_xml(&SerializeOptions::default())?,
+//!     concat!(
+//!         "<result>",
+//!         "<monthly_result><month>1</month><item_count>1</item_count></monthly_result>",
+//!         "<monthly_result><month>2</month><item_count>2</item_count></monthly_result>",
+//!         "<monthly_result><month>3</month><item_count>3</item_count></monthly_result>",
+//!         "<monthly_result><month>4</month><item_count>1</item_count></monthly_result>",
+//!         "<monthly_result><month>5</month><item_count>1</item_count></monthly_result>",
+//!         "</result>",
+//!     ),
+//! );
+//! # Ok::<(), ComposeError>(())
+//! ```
+//!
+//! Here the rows are atomic values rather than nodes: `pipe::from` adapts the
+//! atomized months, the key closure hands the month straight back, and the
+//! sort is numeric because a month is an `xs:integer` whose string value is
+//! `1` and not `1.0`. `atomics()` materializes its conversion — the pipeline
+//! makes the structure declarative, it does not make XPath evaluation lazy.
+//!
+//! Two details this query settles. The distinct months come from *all* end
+//! dates while the year restriction sits in the per-month lookup, so a month
+//! with end dates but no matching 1999 items would still return a count of
+//! zero. And the `xs:date(...)` constructors are written out: these documents
+//! have no schema, so their dates are `xs:untypedAtomic`, and
+//! `month-from-date` reports XPTY0004 rather than applying the function
+//! conversion rule that would cast it. A general comparison — RQ1's
+//! `$i/end_date >= xs:date("1999-01-31")` — does perform that cast.
 
 pub mod composer;
 pub mod emit;
