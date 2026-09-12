@@ -4,14 +4,16 @@
 //! the implementations in `xpath::string_ops`.
 
 use crate::types::value::XmlValue;
+use crate::types::XmlTypeCode;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::XmlItem;
 use crate::xpath::string_ops;
 use crate::xpath::DomNavigator;
 
 use super::{
-    atomize_to_double, atomize_to_string, atomize_to_string_opt, atomize_to_string_required,
-    atomize_to_string_strict, atomize_to_string_strict_opt, XPathValue,
+    atomize_sequence, atomize_to_double, atomize_to_string, atomize_to_string_opt,
+    atomize_to_string_required, atomize_to_string_strict, atomize_to_string_strict_opt, convert,
+    XPathValue,
 };
 use crate::xpath::context::DynamicContext;
 
@@ -541,27 +543,18 @@ pub fn codepoints_to_string<N: DomNavigator>(
         ));
     }
 
-    let sequence = args.remove(0);
-    let items = sequence.into_vec();
+    // Function conversion rules, XPath 2.0 §3.1.5: atomize the argument, then
+    // cast every xs:untypedAtomic item to the expected type, xs:integer.
+    let values = atomize_sequence(args.remove(0))?;
 
-    if items.is_empty() {
+    if values.is_empty() {
         return Ok(XPathValue::string(""));
     }
 
-    let mut codepoints = Vec::with_capacity(items.len());
-    for item in items {
-        match item {
-            XmlItem::Atomic(v) => {
-                let cp = atomize_to_codepoint(&v)?;
-                codepoints.push(cp);
-            }
-            XmlItem::Node(_) => {
-                return Err(XPathError::XPTY0004 {
-                    expected: "xs:integer".to_string(),
-                    found: "node()".to_string(),
-                });
-            }
-        }
+    let mut codepoints = Vec::with_capacity(values.len());
+    for value in values {
+        let value = convert::cast_untyped_as(value, XmlTypeCode::Integer, "codepoints-to-string")?;
+        codepoints.push(atomize_to_codepoint(&value)?);
     }
 
     match string_ops::codepoints_to_string(&codepoints) {

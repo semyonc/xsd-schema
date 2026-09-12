@@ -17,7 +17,7 @@ use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
 
-use super::{atomize_to_single_opt, XPathValue};
+use super::{atomize_to_single_opt, convert, XPathValue};
 
 /// Check if a type code is an integer-derived type.
 fn is_integer_type(code: XmlTypeCode) -> bool {
@@ -67,6 +67,9 @@ pub fn abs<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(v) => v,
     };
+    // Function conversion rules, XPath 2.0 §3.1.5: an xs:untypedAtomic
+    // argument of a `numeric` parameter is cast to xs:double.
+    let value = convert::promote_untyped_to_double(value, "abs")?;
 
     let result = numeric_abs(&value)?;
     Ok(XPathValue::from_atomic(result))
@@ -139,6 +142,9 @@ pub fn ceiling<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(v) => v,
     };
+    // Function conversion rules, XPath 2.0 §3.1.5: an xs:untypedAtomic
+    // argument of a `numeric` parameter is cast to xs:double.
+    let value = convert::promote_untyped_to_double(value, "ceiling")?;
 
     let result = numeric_ceiling(&value)?;
     Ok(XPathValue::from_atomic(result))
@@ -209,6 +215,9 @@ pub fn floor<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(v) => v,
     };
+    // Function conversion rules, XPath 2.0 §3.1.5: an xs:untypedAtomic
+    // argument of a `numeric` parameter is cast to xs:double.
+    let value = convert::promote_untyped_to_double(value, "floor")?;
 
     let result = numeric_floor(&value)?;
     Ok(XPathValue::from_atomic(result))
@@ -280,6 +289,9 @@ pub fn round<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(v) => v,
     };
+    // Function conversion rules, XPath 2.0 §3.1.5: an xs:untypedAtomic
+    // argument of a `numeric` parameter is cast to xs:double.
+    let value = convert::promote_untyped_to_double(value, "round")?;
 
     let result = numeric_round(&value)?;
     Ok(XPathValue::from_atomic(result))
@@ -391,6 +403,7 @@ pub fn round_half_to_even<N: DomNavigator>(
         match atomize_to_single_opt(prec_arg)? {
             None => return Ok(XPathValue::Empty),
             Some(v) => {
+                let v = convert::expect_atomic_as(v, XmlTypeCode::Integer, "round-half-to-even")?;
                 v.as_integer()
                     .and_then(|i| i.to_i32())
                     .ok_or_else(|| XPathError::XPTY0004 {
@@ -408,6 +421,9 @@ pub fn round_half_to_even<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(v) => v,
     };
+    // Function conversion rules, XPath 2.0 §3.1.5: an xs:untypedAtomic
+    // argument of a `numeric` parameter is cast to xs:double.
+    let value = convert::promote_untyped_to_double(value, "round-half-to-even")?;
 
     let result = numeric_round_half_to_even(&value, precision)?;
     Ok(XPathValue::from_atomic(result))

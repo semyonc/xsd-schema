@@ -23,7 +23,7 @@ use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::DomNavigator;
 
-use super::{atomize_to_single_opt, XPathValue};
+use super::{atomize_to_single_opt, convert, XPathValue};
 
 // ============================================================================
 // Helper Functions
@@ -173,12 +173,43 @@ fn as_day_time_duration(value: &XmlValue) -> Option<&DayTimeDurationValue> {
     }
 }
 
-/// Check if value is a duration type (duration, yearMonthDuration, or dayTimeDuration).
-fn is_duration_type(code: XmlTypeCode) -> bool {
-    matches!(
-        code,
-        XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
-    )
+/// Apply the function conversion rules (XPath 2.0 §3.1.5) for an `xs:dateTime`
+/// parameter and hand back the value's dateTime payload.
+fn require_datetime(value: XmlValue, function: &str) -> Result<DateTimeValue, XPathError> {
+    let value = convert::expect_atomic_as(value, XmlTypeCode::DateTime, function)?;
+    as_datetime(&value)
+        .cloned()
+        .ok_or_else(|| XPathError::internal("xs:dateTime without a dateTime payload"))
+}
+
+/// Apply the function conversion rules (XPath 2.0 §3.1.5) for an `xs:date`
+/// parameter and hand back the value's date payload.
+fn require_date(value: XmlValue, function: &str) -> Result<DateValue, XPathError> {
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Date, function)?;
+    as_date(&value)
+        .cloned()
+        .ok_or_else(|| XPathError::internal("xs:date without a date payload"))
+}
+
+/// Apply the function conversion rules (XPath 2.0 §3.1.5) for an `xs:time`
+/// parameter and hand back the value's time payload.
+fn require_time(value: XmlValue, function: &str) -> Result<TimeValue, XPathError> {
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Time, function)?;
+    as_time(&value)
+        .cloned()
+        .ok_or_else(|| XPathError::internal("xs:time without a time payload"))
+}
+
+/// Apply the function conversion rules (XPath 2.0 §3.1.5) for an
+/// `xs:dayTimeDuration` parameter and hand back the value's duration payload.
+fn require_day_time_duration(
+    value: XmlValue,
+    function: &str,
+) -> Result<DayTimeDurationValue, XPathError> {
+    let value = convert::expect_atomic_as(value, XmlTypeCode::DayTimeDuration, function)?;
+    as_day_time_duration(&value)
+        .cloned()
+        .ok_or_else(|| XPathError::internal("xs:dayTimeDuration without a duration payload"))
 }
 
 /// Create an XmlValue containing an integer.
@@ -529,12 +560,7 @@ pub fn years_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "years-from-duration")?;
 
     // Extract years component with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -571,12 +597,7 @@ pub fn months_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "months-from-duration")?;
 
     // Extract months component (0-11) with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -612,12 +633,7 @@ pub fn days_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "days-from-duration")?;
 
     // Extract days component from day-time portion with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -653,12 +669,7 @@ pub fn hours_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "hours-from-duration")?;
 
     // Extract hours component (0-23) with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -694,12 +705,7 @@ pub fn minutes_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "minutes-from-duration")?;
 
     // Extract minutes component (0-59) with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -735,12 +741,7 @@ pub fn seconds_from_duration<N: DomNavigator>(
         Some(v) => v,
     };
 
-    if !is_duration_type(value.type_code) {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:duration".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Duration, "seconds-from-duration")?;
 
     // Extract seconds component (0-59.xxx) with normalization
     let result = if let Some(dur) = as_duration(&value) {
@@ -780,10 +781,7 @@ pub fn year_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "year-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_integer(dt.year as i64)))
 }
@@ -807,10 +805,7 @@ pub fn month_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "month-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_integer(dt.month as i64)))
 }
@@ -834,10 +829,7 @@ pub fn day_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "day-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_integer(dt.day as i64)))
 }
@@ -861,10 +853,7 @@ pub fn hours_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "hours-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_integer(dt.hour as i64)))
 }
@@ -888,10 +877,7 @@ pub fn minutes_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "minutes-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_integer(dt.minute as i64)))
 }
@@ -915,10 +901,7 @@ pub fn seconds_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "seconds-from-dateTime")?;
 
     Ok(XPathValue::from_atomic(xml_decimal(dt.second)))
 }
@@ -942,10 +925,7 @@ pub fn timezone_from_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let dt = require_datetime(value, "timezone-from-dateTime")?;
 
     match dt.timezone {
         Some(tz) => {
@@ -979,10 +959,7 @@ pub fn year_from_date<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let date = require_date(value, "year-from-date")?;
 
     Ok(XPathValue::from_atomic(xml_integer(date.year as i64)))
 }
@@ -1006,10 +983,7 @@ pub fn month_from_date<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let date = require_date(value, "month-from-date")?;
 
     Ok(XPathValue::from_atomic(xml_integer(date.month as i64)))
 }
@@ -1033,10 +1007,7 @@ pub fn day_from_date<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let date = require_date(value, "day-from-date")?;
 
     Ok(XPathValue::from_atomic(xml_integer(date.day as i64)))
 }
@@ -1060,10 +1031,7 @@ pub fn timezone_from_date<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let date = require_date(value, "timezone-from-date")?;
 
     match date.timezone {
         Some(tz) => {
@@ -1097,10 +1065,7 @@ pub fn hours_from_time<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let time = as_time(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let time = require_time(value, "hours-from-time")?;
 
     Ok(XPathValue::from_atomic(xml_integer(time.hour as i64)))
 }
@@ -1124,10 +1089,7 @@ pub fn minutes_from_time<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let time = as_time(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let time = require_time(value, "minutes-from-time")?;
 
     Ok(XPathValue::from_atomic(xml_integer(time.minute as i64)))
 }
@@ -1151,10 +1113,7 @@ pub fn seconds_from_time<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let time = as_time(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let time = require_time(value, "seconds-from-time")?;
 
     Ok(XPathValue::from_atomic(xml_decimal(time.second)))
 }
@@ -1178,10 +1137,7 @@ pub fn timezone_from_time<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let time = as_time(&value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", value.type_code),
-    })?;
+    let time = require_time(value, "timezone-from-time")?;
 
     match time.timezone {
         Some(tz) => {
@@ -1226,15 +1182,9 @@ pub fn create_datetime<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&date_value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", date_value.type_code),
-    })?;
+    let date = require_date(date_value, "dateTime")?;
 
-    let time = as_time(&time_value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", time_value.type_code),
-    })?;
+    let time = require_time(time_value, "dateTime")?;
 
     // Check timezone compatibility
     let timezone = match (date.timezone, time.timezone) {
@@ -1296,10 +1246,7 @@ pub fn adjust_datetime_to_timezone<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let dt = as_datetime(&dt_value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:dateTime".to_string(),
-        found: format!("{:?}", dt_value.type_code),
-    })?;
+    let dt = require_datetime(dt_value, "adjust-dateTime-to-timezone")?;
 
     // Determine target timezone
     let target_tz = if let Some(tz_val) = tz_arg {
@@ -1318,11 +1265,8 @@ pub fn adjust_datetime_to_timezone<N: DomNavigator>(
                 return Ok(XPathValue::from_atomic(xml_datetime(result)));
             }
             Some(v) => {
-                let duration = as_day_time_duration(&v).ok_or_else(|| XPathError::XPTY0004 {
-                    expected: "xs:dayTimeDuration".to_string(),
-                    found: format!("{:?}", v.type_code),
-                })?;
-                day_time_duration_to_timezone(duration)?
+                let duration = require_day_time_duration(v, "adjust-dateTime-to-timezone")?;
+                day_time_duration_to_timezone(&duration)?
             }
         }
     } else {
@@ -1351,7 +1295,7 @@ pub fn adjust_datetime_to_timezone<N: DomNavigator>(
         Some(source_tz) => {
             // Convert from source timezone to target timezone
             let offset_diff = target_tz.0 - source_tz.0;
-            adjust_datetime_by_minutes(dt, offset_diff, target_tz)?
+            adjust_datetime_by_minutes(&dt, offset_diff, target_tz)?
         }
     };
 
@@ -1384,10 +1328,7 @@ pub fn adjust_date_to_timezone<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let date = as_date(&date_value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:date".to_string(),
-        found: format!("{:?}", date_value.type_code),
-    })?;
+    let date = require_date(date_value, "adjust-date-to-timezone")?;
 
     // Determine target timezone
     let target_tz = if let Some(tz_val) = tz_arg {
@@ -1403,11 +1344,8 @@ pub fn adjust_date_to_timezone<N: DomNavigator>(
                 return Ok(XPathValue::from_atomic(xml_date(result)));
             }
             Some(v) => {
-                let duration = as_day_time_duration(&v).ok_or_else(|| XPathError::XPTY0004 {
-                    expected: "xs:dayTimeDuration".to_string(),
-                    found: format!("{:?}", v.type_code),
-                })?;
-                day_time_duration_to_timezone(duration)?
+                let duration = require_day_time_duration(v, "adjust-date-to-timezone")?;
+                day_time_duration_to_timezone(&duration)?
             }
         }
     } else {
@@ -1434,7 +1372,7 @@ pub fn adjust_date_to_timezone<N: DomNavigator>(
             // Convert from source timezone to target timezone
             // For dates, we need to convert via dateTime at midnight
             let offset_diff = target_tz.0 - source_tz.0;
-            adjust_date_by_minutes(date, offset_diff, target_tz)?
+            adjust_date_by_minutes(&date, offset_diff, target_tz)?
         }
     };
 
@@ -1467,10 +1405,7 @@ pub fn adjust_time_to_timezone<N: DomNavigator>(
         Some(v) => v,
     };
 
-    let time = as_time(&time_value).ok_or_else(|| XPathError::XPTY0004 {
-        expected: "xs:time".to_string(),
-        found: format!("{:?}", time_value.type_code),
-    })?;
+    let time = require_time(time_value, "adjust-time-to-timezone")?;
 
     // Determine target timezone
     let target_tz = if let Some(tz_val) = tz_arg {
@@ -1486,11 +1421,8 @@ pub fn adjust_time_to_timezone<N: DomNavigator>(
                 return Ok(XPathValue::from_atomic(xml_time(result)));
             }
             Some(v) => {
-                let duration = as_day_time_duration(&v).ok_or_else(|| XPathError::XPTY0004 {
-                    expected: "xs:dayTimeDuration".to_string(),
-                    found: format!("{:?}", v.type_code),
-                })?;
-                day_time_duration_to_timezone(duration)?
+                let duration = require_day_time_duration(v, "adjust-time-to-timezone")?;
+                day_time_duration_to_timezone(&duration)?
             }
         }
     } else {
@@ -1516,7 +1448,7 @@ pub fn adjust_time_to_timezone<N: DomNavigator>(
         Some(source_tz) => {
             // Convert from source timezone to target timezone
             let offset_diff = target_tz.0 - source_tz.0;
-            adjust_time_by_minutes(time, offset_diff, target_tz)?
+            adjust_time_by_minutes(&time, offset_diff, target_tz)?
         }
     };
 
