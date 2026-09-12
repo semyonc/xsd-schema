@@ -1,6 +1,7 @@
 //! Top-level `BufferDocument` struct assembling all storage primitives.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bumpalo::Bump;
 
@@ -12,6 +13,19 @@ use super::{
     Node, NodePages, NodeSourceSpans, NsRef, QNameTable, StringStore, NULL,
 };
 
+/// Monotonic source of [`BufferDocument::serial`] values.
+///
+/// Starts at 1 so that `0` can be used by callers as a "no document" sentinel.
+static NEXT_DOCUMENT_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// Hands out the next document creation ordinal.
+///
+/// Called once per [`BufferDocument`] construction; see
+/// [`BufferDocument::serial`] for the guarantees this provides.
+pub(crate) fn next_document_serial() -> u64 {
+    NEXT_DOCUMENT_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Compact, cache-friendly XML document representation.
 ///
 /// Built on a flat array of 16-byte [`Node`] structs with power-of-2
@@ -20,6 +34,8 @@ use super::{
 #[allow(dead_code)] // fields used by builder/navigator in later steps
 pub struct BufferDocument<'a> {
     pub(crate) arena: &'a Bump,
+    /// Creation ordinal, unique within the process — see [`Self::serial`].
+    pub(crate) serial: u64,
     pub(crate) kind: DocumentKind,
     pub(crate) names: &'a NameTable,
     pub(crate) nodes: NodePages<'a>,
@@ -63,6 +79,30 @@ impl<'a> BufferDocument<'a> {
     #[inline]
     pub fn root(&self) -> u32 {
         self.root
+    }
+
+    /// Returns this document's **creation ordinal**.
+    ///
+    /// The serial is assigned once, when the document is constructed, from a
+    /// process-wide counter. It is therefore:
+    ///
+    /// * **unique within the process** — no two live or dead
+    ///   `BufferDocument`s of this process share a serial;
+    /// * **strictly increasing in creation order** — if `a` was created
+    ///   before `b`, then `a.serial() < b.serial()`;
+    /// * **not** stable across processes, and **not** derived from the
+    ///   document's content.
+    ///
+    /// It is intended for reproducible cross-document ordering (see
+    /// [`BufferDocNavigator::compare_position`], which orders nodes from
+    /// distinct trees by serial rather than by heap address) and for
+    /// `generate-id()`-style identifiers, where a caller can combine the
+    /// serial with a node reference to obtain a cheap unique node name.
+    ///
+    /// [`BufferDocNavigator::compare_position`]: super::navigator::BufferDocNavigator
+    #[inline]
+    pub fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// Returns the associated schema set, if any.
@@ -208,6 +248,7 @@ mod tests {
     fn make_doc<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocument<'a> {
         BufferDocument {
             arena,
+            serial: next_document_serial(),
             kind: DocumentKind::default(),
             names,
             nodes: NodePages::new(arena),

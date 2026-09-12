@@ -21,7 +21,7 @@ pub use self::roxmltree::RoXmlNavigator;
 
 use std::borrow::Cow;
 
-use crate::ids::SimpleTypeKey;
+use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::types::value::XmlValue;
 
 /// Error type for navigator operations
@@ -231,6 +231,38 @@ pub trait DomNavigator: Clone {
 
     /// Get the schema type of the current node (if known)
     fn schema_type(&self) -> Option<SimpleTypeKey>;
+
+    /// The **type annotation** of the current node, as a full [`TypeKey`].
+    ///
+    /// This is the node's XDM *type-name* property: the type the node was
+    /// annotated with by schema validation. Unlike
+    /// [`schema_type`](Self::schema_type) it is not restricted to simple
+    /// types — an element validated against a complex type reports
+    /// [`TypeKey::Complex`], which is what `element(*, T)` and
+    /// `schema-element(x)` matching need in order to accept complex `T`.
+    ///
+    /// Returns:
+    ///
+    /// * `Some(TypeKey::Complex(_))` or `Some(TypeKey::Simple(_))` for an
+    ///   **element** or **attribute** node carrying a type annotation;
+    /// * `None` for an untyped node (no schema binding — e.g. any node of a
+    ///   document that was never validated, or a lax-validated node that was
+    ///   skipped);
+    /// * `None` for every other node kind (root, text, comment,
+    ///   processing-instruction, namespace), which have no type annotation in
+    ///   the XDM sense.
+    ///
+    /// [`schema_type`](Self::schema_type) remains the *simple-type
+    /// projection* of this value: where `type_annotation()` returns
+    /// `Some(TypeKey::Simple(k))`, `schema_type()` returns `Some(k)`; where it
+    /// returns `Some(TypeKey::Complex(_))`, `schema_type()` returns `None`.
+    ///
+    /// The default implementation returns `None`, which is correct for any
+    /// schema-unaware backend (for example [`RoXmlNavigator`]); schema-aware
+    /// navigators override it.
+    fn type_annotation(&self) -> Option<TypeKey> {
+        None
+    }
 
     /// Get the typed value of the current node.
     ///

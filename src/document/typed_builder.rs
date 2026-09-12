@@ -316,7 +316,7 @@ pub fn build_typed_document<'a, R: BufRead>(
 mod tests {
     use super::*;
     use crate::ids::TypeKey;
-    use crate::navigator::{DomNavigator, TypedValue};
+    use crate::navigator::{DomNavigator, DomNodeType, NamespaceAxisScope, TypedValue};
     use crate::pipeline::load_and_process_schema;
     use crate::validation::info::ContentType;
 
@@ -484,6 +484,115 @@ mod tests {
         assert!(nav.move_to_first_child()); // root element
                                             // Unknown element should still build, just no type binding
         assert_eq!(nav.typed_value(), TypedValue::Untyped);
+    }
+
+    // ── Test 6b: type_annotation() — the full TypeKey ────────────────
+
+    /// `type_annotation()` is the XDM *type-name* property, so unlike
+    /// `schema_type()` it must also report complex types — that is what
+    /// `element(*, T)` matching with a complex `T` needs.
+    #[test]
+    fn type_annotation_reports_complex_simple_and_attribute_types() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="leaf" type="xs:integer"/>
+                        </xs:sequence>
+                        <xs:attribute name="count" type="xs:integer"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_doc(
+            r#"<root count="7"><leaf>42</leaf></root>"#,
+            &arena,
+            &schema_set,
+        );
+
+        // Document root: not an element or attribute → no annotation.
+        let mut nav = doc.create_navigator();
+        assert_eq!(nav.node_type(), DomNodeType::Root);
+        assert_eq!(nav.type_annotation(), None);
+
+        // <root>: annotated with a complex type, which `schema_type()`
+        // cannot express.
+        assert!(nav.move_to_first_child());
+        assert!(
+            matches!(nav.type_annotation(), Some(TypeKey::Complex(_))),
+            "complex-typed element should report TypeKey::Complex, got {:?}",
+            nav.type_annotation()
+        );
+        assert_eq!(
+            nav.schema_type(),
+            None,
+            "a complex annotation has no simple-type projection"
+        );
+
+        // @count: a typed attribute; the annotation agrees with
+        // `schema_type()`.
+        let mut attr = nav.clone();
+        assert!(attr.move_to_first_attribute());
+        assert_eq!(attr.local_name(), "count");
+        match attr.type_annotation() {
+            Some(TypeKey::Simple(k)) => assert_eq!(Some(k), attr.schema_type()),
+            other => panic!("expected a simple annotation on @count, got {:?}", other),
+        }
+
+        // <leaf>: a simple-typed element; same agreement.
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.local_name(), "leaf");
+        match nav.type_annotation() {
+            Some(TypeKey::Simple(k)) => assert_eq!(Some(k), nav.schema_type()),
+            other => panic!("expected a simple annotation on <leaf>, got {:?}", other),
+        }
+
+        // The text child of <leaf> is not an element or attribute.
+        let mut text = nav.clone();
+        assert!(text.move_to_first_child());
+        assert_eq!(text.node_type(), DomNodeType::Text);
+        assert_eq!(text.type_annotation(), None);
+
+        // The namespace cursor keeps `current` on its owning element, but is
+        // not itself an annotated node.
+        let mut ns = nav.clone();
+        assert!(ns.move_to_first_namespace(NamespaceAxisScope::All));
+        assert_eq!(ns.node_type(), DomNodeType::Namespace);
+        assert_eq!(ns.type_annotation(), None);
+    }
+
+    /// A document whose content the schema does not declare carries no
+    /// bindings, so every node is untyped.
+    #[test]
+    fn type_annotation_is_none_for_untyped_document() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="other" type="xs:string"/>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_doc(r#"<root count="7">hello</root>"#, &arena, &schema_set);
+
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child()); // undeclared <root>
+        assert_eq!(nav.type_annotation(), None);
+        assert_eq!(nav.typed_value(), TypedValue::Untyped);
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.type_annotation(), None);
+    }
+
+    /// `RoXmlNavigator` is schema-unaware and keeps the trait's default body.
+    #[test]
+    fn type_annotation_is_none_for_roxml_navigator() {
+        let parsed = roxmltree::Document::parse(r#"<root count="7">hello</root>"#).unwrap();
+        let mut nav = crate::navigator::RoXmlNavigator::new(&parsed);
+        assert_eq!(nav.type_annotation(), None);
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.type_annotation(), None);
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.type_annotation(), None);
     }
 
     // ── Test 7: xsi:type override ─────────────────────────────────────

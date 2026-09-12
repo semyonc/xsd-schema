@@ -498,18 +498,53 @@ impl<'a> BufferDocNavigator<'a> {
 // ── DomNavigator impl ─────────────────────────────────────────────────
 
 impl<'a> DomNavigator for BufferDocNavigator<'a> {
+    /// Node identity, as required by the XPath 2.0 `is` operator.
+    ///
+    /// XPath 2.0 §3.5.3 *Node Comparisons*: "A comparison with the `is`
+    /// operator is true if the two operand nodes have the same identity, and
+    /// are thus the same node; otherwise it is `false`."
+    ///
+    /// Every cursor field of this navigator (`current`, `virtual_parent`,
+    /// `current_ns`, `attr_index`) is an index **into one
+    /// [`BufferDocument`]** and carries no meaning outside it, so identity
+    /// must include the document itself: two navigators sitting on the same
+    /// node index of two *different* documents are two different nodes. The
+    /// document is compared by address, which is exactly document identity —
+    /// a `BufferDocument` cannot move while a navigator borrows it.
     fn is_same_position(&self, other: &Self) -> bool {
-        self.current == other.current
+        std::ptr::eq(self.doc, other.doc)
+            && self.current == other.current
             && self.virtual_parent == other.virtual_parent
             && self.current_ns == other.current_ns
             && self.attr_index == other.attr_index
     }
 
+    /// Document order, including across trees.
+    ///
+    /// Within one document the flat node layout *is* document order, so the
+    /// comparison is on the cursor's `order_key`.
+    ///
+    /// Across documents, XPath 2.0 §2.4.1 *Document Order* leaves the choice
+    /// to the implementation but constrains it: "The relative order of nodes
+    /// in distinct trees is stable but implementation-dependent, subject to
+    /// the following constraint: If any node in a given tree T1 is before any
+    /// node in a different tree T2, then all nodes in tree T1 are before all
+    /// nodes in tree T2" — and "Document order is stable, which means that
+    /// the relative order of two nodes will not change during the processing
+    /// of a given expression".
+    ///
+    /// Trees are therefore ordered as whole blocks, by
+    /// [`BufferDocument::serial`] — the document creation ordinal. A serial
+    /// satisfies the constraint (it depends only on the document, not on the
+    /// node) and, unlike the heap address used previously, it is
+    /// *reproducible*: repeating the same sequence of document constructions
+    /// yields the same order, which makes cross-document results
+    /// diffable in tests and stable for `generate-id()`-style identifiers.
+    /// Serials are unique per process, so `Same` can only be returned for
+    /// two cursors on the same document.
     fn compare_position(&self, other: &Self) -> XmlNodeOrder {
         if !std::ptr::eq(self.doc, other.doc) {
-            let self_ptr = self.doc as *const _ as usize;
-            let other_ptr = other.doc as *const _ as usize;
-            return if self_ptr < other_ptr {
+            return if self.doc.serial() < other.doc.serial() {
                 XmlNodeOrder::Before
             } else {
                 XmlNodeOrder::After
@@ -522,7 +557,11 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         }
     }
 
+    /// Moves this cursor onto `other`'s position — including `other`'s
+    /// document, so that moving onto a node of another tree lands on that
+    /// node rather than on this tree's node of the same index.
     fn move_to(&mut self, other: &Self) -> bool {
+        self.doc = other.doc;
         self.current = other.current;
         self.assertion_absolute_root = other.assertion_absolute_root;
         self.assertion_fragment_root = other.assertion_fragment_root;
@@ -892,6 +931,30 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             TypeKey::Simple(k) => Some(k),
             TypeKey::Complex(_) => None,
         }
+    }
+
+    /// The node's type annotation, complex types included.
+    ///
+    /// Reads the [`NodeSchemaBinding`] the typed builder attached to the
+    /// node. Bindings exist only on element and attribute nodes — an
+    /// attribute's binding lives on the `Attribute` node of its
+    /// name+value pair, which is exactly where the attribute cursor sits, so
+    /// no extra indexing is needed — and the unbound sentinel of the remap
+    /// table makes every other node kind (and any node of an unvalidated
+    /// document) report `None`. The namespace cursor keeps `current` on the
+    /// owning element, so it is rejected explicitly.
+    fn type_annotation(&self) -> Option<TypeKey> {
+        if self.is_on_namespace() {
+            return None;
+        }
+        if !matches!(
+            self.node().node_type(),
+            NodeType::Element | NodeType::Attribute
+        ) {
+            return None;
+        }
+        let idx = self.node().binding_index();
+        Some(self.doc.binding_remap.get(idx)?.type_key)
     }
 
     fn typed_value(&self) -> TypedValue {
@@ -1702,5 +1765,136 @@ mod tests {
         let nav2 = doc.create_navigator_at(child_ref);
         assert_eq!(nav2.local_name(), "child");
         assert!(nav.is_same_position(&nav2));
+    }
+
+    // ── 12. Cross-document identity, order and serials ───────────────
+
+    /// XPath 2.0 §3.5.3 *Node Comparisons*: "A comparison with the `is`
+    /// operator is true if the two operand nodes have the same identity, and
+    /// are thus the same node; otherwise it is `false`."
+    ///
+    /// Two documents with byte-identical content produce byte-identical node
+    /// indices, so a cursor comparison that ignored the document would report
+    /// two distinct nodes as the same node.
+    #[test]
+    fn is_same_position_is_false_across_documents() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc_a = build_doc(r#"<root x="1"><a/><b/></root>"#, &arena, &names);
+        let doc_b = build_doc(r#"<root x="1"><a/><b/></root>"#, &arena, &names);
+
+        // Element cursors: same flat index in both documents.
+        let mut nav_a = doc_a.create_navigator();
+        let mut nav_b = doc_b.create_navigator();
+        assert!(nav_a.move_to_first_child());
+        assert!(nav_b.move_to_first_child());
+        assert_eq!(nav_a.current_ref(), nav_b.current_ref());
+        assert!(!nav_a.is_same_position(&nav_b));
+        assert!(!nav_b.is_same_position(&nav_a));
+
+        // Root cursors.
+        assert!(!doc_a
+            .create_navigator()
+            .is_same_position(&doc_b.create_navigator()));
+
+        // Attribute cursors.
+        let mut attr_a = nav_a.clone();
+        let mut attr_b = nav_b.clone();
+        assert!(attr_a.move_to_first_attribute());
+        assert!(attr_b.move_to_first_attribute());
+        assert!(!attr_a.is_same_position(&attr_b));
+
+        // Within one document nothing changes.
+        let other_a = doc_a.create_navigator_at(nav_a.current_ref());
+        assert!(nav_a.is_same_position(&other_a));
+        assert!(nav_a.is_same_position(&nav_a.clone()));
+        assert!(!nav_a.is_same_position(&attr_a));
+    }
+
+    #[test]
+    fn move_to_carries_the_document() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc_a = build_doc("<root><a/></root>", &arena, &names);
+        let doc_b = build_doc("<root><b/></root>", &arena, &names);
+
+        let mut nav_a = doc_a.create_navigator();
+        let mut nav_b = doc_b.create_navigator();
+        assert!(nav_b.move_to_first_child());
+        assert!(nav_b.move_to_first_child()); // <b/>
+
+        assert!(nav_a.move_to(&nav_b));
+        assert_eq!(nav_a.local_name(), "b");
+        assert!(nav_a.is_same_position(&nav_b));
+        assert_eq!(nav_a.compare_position(&nav_b), XmlNodeOrder::Same);
+    }
+
+    #[test]
+    fn document_serials_are_unique_and_increasing() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc_a = build_doc("<root/>", &arena, &names);
+        let doc_b = build_doc("<root/>", &arena, &names);
+        let doc_c = build_doc("<root/>", &arena, &names);
+
+        assert!(doc_a.serial() < doc_b.serial());
+        assert!(doc_b.serial() < doc_c.serial());
+        assert_eq!(doc_a.serial(), doc_a.serial());
+    }
+
+    /// XPath 2.0 §2.4.1 *Document Order*: "If any node in a given tree T1 is
+    /// before any node in a different tree T2, then all nodes in tree T1 are
+    /// before all nodes in tree T2." The serial order decides which tree
+    /// comes first, and every node of that tree follows it.
+    #[test]
+    fn compare_position_orders_documents_by_serial() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc_a = build_doc("<root><a/><b/></root>", &arena, &names);
+        let doc_b = build_doc("<root><a/><b/></root>", &arena, &names);
+        assert!(doc_a.serial() < doc_b.serial());
+
+        // Every node of the earlier document precedes every node of the
+        // later one, in both comparison directions.
+        let mut cursor_a = doc_a.create_navigator();
+        loop {
+            let mut cursor_b = doc_b.create_navigator();
+            loop {
+                assert_eq!(cursor_a.compare_position(&cursor_b), XmlNodeOrder::Before);
+                assert_eq!(cursor_b.compare_position(&cursor_a), XmlNodeOrder::After);
+                if !move_to_next_in_subtree(&mut cursor_b) {
+                    break;
+                }
+            }
+            if !move_to_next_in_subtree(&mut cursor_a) {
+                break;
+            }
+        }
+
+        // `Same` is reachable only within one document.
+        let root_a = doc_a.create_navigator();
+        assert_eq!(root_a.compare_position(&root_a), XmlNodeOrder::Same);
+        assert_ne!(
+            doc_a
+                .create_navigator()
+                .compare_position(&doc_b.create_navigator()),
+            XmlNodeOrder::Same
+        );
+    }
+
+    /// Depth-first walk used by [`compare_position_orders_documents_by_serial`]
+    /// to visit every node of a small document.
+    fn move_to_next_in_subtree(nav: &mut BufferDocNavigator<'_>) -> bool {
+        if nav.move_to_first_child() {
+            return true;
+        }
+        loop {
+            if nav.move_to_next_sibling() {
+                return true;
+            }
+            if !nav.move_to_parent() {
+                return false;
+            }
+        }
     }
 }
