@@ -47,6 +47,21 @@ queries of the XQuery test suite's relational use case.
 
 ### Fixed
 
+- **`fn:round` takes a half towards positive infinity, not away from zero.**
+  F&O §6.4.4: "Returns the number with no fractional part that is closest to the
+  argument. If there are two such numbers, then the one that is closest to
+  positive infinity is returned", with the example "round(-2.5) returns -2 (not
+  the possible alternative, -3)". Halves of a negative argument were rounded
+  away from zero, so `round(-2.5)` answered -3 and `round(-3.5)` answered -4.
+  All four numeric types now round the same way, and the floating-point special
+  cases of §6.4.4 are explicit: NaN, both infinities and both zeroes come back
+  unchanged, and an `xs:double` or `xs:float` argument "less than zero, but
+  greater than or equal to -0.5" returns negative zero (`round(-0.3)` is `-0`,
+  while the `xs:decimal` `-0.3` rounds to plain `0`). The rounding is computed
+  from `floor(x)` and an exact fractional part instead of `(x + 0.5).floor()`,
+  which for the largest `xs:double` below a half would have answered 1.
+  `fn:round-half-to-even` is a different function and is unchanged; so are all
+  W3C XSD and XQTS results.
 - **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
   arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
   type xs:untypedAtomic is cast to the expected atomic type. For built-in
