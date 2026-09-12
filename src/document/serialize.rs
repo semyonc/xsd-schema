@@ -28,9 +28,9 @@
 //!
 //! # What the output looks like
 //!
-//! Output is UTF-8 bytes with no added whitespace: the serializer writes exactly
-//! the nodes of the tree, so `parse → serialize → parse` yields the same tree
-//! again. Empty elements are always collapsed to `<a/>`.
+//! Output is UTF-8 bytes. By default nothing is added: the serializer writes
+//! exactly the nodes of the tree, so `parse → serialize → parse` yields the same
+//! tree again. Empty elements are always collapsed to `<a/>`.
 //!
 //! Escaping follows the rules of *Canonical XML 1.0* §2.3 ("Processing Model",
 //! its *Text Nodes* and *Attribute Nodes* items), because those are the rules
@@ -66,8 +66,82 @@
 //! * an element or attribute whose prefix is not bound to its namespace URI in
 //!   the scope the output creates ([`SerializeError::UnboundName`]).
 //!
-//! Out of scope for this module: other encodings, CDATA sections, a doctype
-//! declaration, and indentation.
+//! Out of scope for this module: other encodings, CDATA sections and a doctype
+//! declaration.
+//!
+//! # Compact and formatted output
+//!
+//! [`SerializeOptions::indent`] chooses between the two modes. `None`, the
+//! default, is *compact*: no layout whitespace is added — and none is removed,
+//! so it is the mode for an exact text round trip. `Some(n)` is *formatted*: a
+//! line break plus `n` spaces per level wherever the contract below permits one
+//! (`Some(0)` gives the breaks without the spaces).
+//!
+//! ```
+//! use bumpalo::Bump;
+//! use xsd_schema::document::{serialize, BufferDocument, SerializeOptions};
+//! use xsd_schema::namespace::NameTable;
+//!
+//! let arena = Bump::new();
+//! let names = NameTable::new();
+//! let doc = BufferDocument::from_reader_default(
+//!     "<catalog><book id=\"b1\"><title>One</title></book></catalog>".as_bytes(),
+//!     &arena,
+//!     &names,
+//! )?;
+//! let nav = doc.create_navigator();
+//!
+//! let formatted = SerializeOptions { indent: Some(2), ..Default::default() };
+//! assert_eq!(
+//!     serialize::to_string(&nav, &formatted)?,
+//!     "<catalog>\n  <book id=\"b1\">\n    <title>One</title>\n  </book>\n</catalog>",
+//! );
+//!
+//! // The same tree, no layout added, nothing rebuilt.
+//! assert_eq!(
+//!     serialize::to_string(&nav, &Default::default())?,
+//!     "<catalog><book id=\"b1\"><title>One</title></book></catalog>",
+//! );
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! Line breaks are LF on every platform, the outermost element sits at depth 0
+//! (a subtree written on its own included), attributes stay on the start-tag
+//! line, an empty element stays `<a/>`, and no trailing newline is written.
+//! Whether a declaration is written is independent of the mode.
+//!
+//! ## Whitespace contract
+//!
+//! Formatted output must not change what the document says, so layout is added
+//! conservatively:
+//!
+//! 1. **Every existing text character survives, in both modes**, whitespace-only
+//!    text included. Before formatting a container, *all* of its direct children
+//!    are inspected: any text child suppresses added layout throughout that
+//!    container's subtree. So `<p>Hello <b>world</b>!</p>` and
+//!    `<p><b>world</b>!</p>` both stay on one line, and existing indentation is
+//!    kept rather than rewritten.
+//! 2. **A break goes only at a child boundary next to an element**: before an
+//!    element child at the child's depth, before the closing tag at the
+//!    container's depth when the last child is an element, and between siblings
+//!    when either one is an element. A run of comments and processing
+//!    instructions is never split internally, and nothing is ever added inside
+//!    text, a comment, PI data, an attribute value or an empty element.
+//! 3. **`xml:space` is honoured** (XML 1.0 §2.10, read by its expanded
+//!    XML-namespace name): `preserve` turns added layout off for that element and
+//!    is inherited; a descendant `default` turns it back on for its own content,
+//!    unless rule 1 still suppresses it. A subtree serialized on its own consults
+//!    its ancestors for the inherited value without inventing an attribute.
+//! 4. **At document level** the same rules apply at depth 0. A declaration
+//!    immediately followed by the document element gets a break between them; a
+//!    declaration followed by a comment or PI does not. No leading blank line and
+//!    no final newline are invented, and a standalone text, comment or PI node
+//!    gets no layout at all.
+//!
+//! Formatted output therefore adds whitespace *text nodes* to a reparsed
+//! document, which can change string values and text-node counts: compact mode
+//! is the contract for exact round trips, formatted mode is a presentation
+//! choice. Tabs, other line endings and line wrapping are out of scope.
 //!
 //! # Namespace declarations
 //!
@@ -99,6 +173,7 @@ use crate::navigator::{DomNavigator, DomNodeType, NamespaceAxisScope};
 /// let file = SerializeOptions {
 ///     xml_declaration: true,
 ///     standalone: Some(true),
+///     indent: Some(2),
 /// };
 /// assert_eq!(file.standalone, Some(true));
 /// ```
@@ -114,6 +189,16 @@ pub struct SerializeOptions {
     ///
     /// Ignored when `xml_declaration` is `false`.
     pub standalone: Option<bool>,
+    /// `None` — the default — writes no layout whitespace. `Some(n)` writes a
+    /// line break plus `n` spaces per level where the whitespace contract
+    /// allows one; `Some(0)` writes the line breaks alone.
+    ///
+    /// `None` is not a minifier: it adds no whitespace and removes none, which
+    /// is what makes it the mode for an exact text round trip. Breaks are LF on
+    /// every platform, the outermost element sits at depth 0 (a subtree
+    /// included), and no trailing newline is written. See the module docs for
+    /// the rules on where a break may go.
+    pub indent: Option<usize>,
 }
 
 /// Why a tree could not be written as XML.
@@ -213,6 +298,15 @@ pub enum SerializeError {
 ///     String::from_utf8(out)?,
 ///     r#"<?xml version="1.0" encoding="UTF-8"?><?work now?><a/><!--after-->"#,
 /// );
+///
+/// // Formatted: a break lands next to the element and nowhere else.
+/// let mut out = Vec::new();
+/// let opts = SerializeOptions { xml_declaration: true, indent: Some(2), ..Default::default() };
+/// serialize::serialize_document(&doc.create_navigator(), &mut out, &opts)?;
+/// assert_eq!(
+///     String::from_utf8(out)?,
+///     "<?xml version=\"1.0\" encoding=\"UTF-8\"?><?work now?>\n<a/>\n<!--after-->",
+/// );
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 pub fn serialize_document<N: DomNavigator, W: Write>(
@@ -222,7 +316,9 @@ pub fn serialize_document<N: DomNavigator, W: Write>(
 ) -> Result<(), SerializeError> {
     let mut nav = root.clone();
     nav.move_to_root();
-    Serializer::new(out, opts).write_document(&nav)
+    Serializer::new(out, opts)
+        .with_ancestor_layout(&nav)
+        .write_document(&nav)
 }
 
 /// Writes the node at the cursor.
@@ -231,7 +327,8 @@ pub fn serialize_document<N: DomNavigator, W: Write>(
 /// * On an element it writes that subtree. The element receives the namespace
 ///   declarations it needs, inherited ones included, so the fragment stands on
 ///   its own.
-/// * On a text, comment or processing-instruction node it writes that one node.
+/// * On a text, comment or processing-instruction node it writes that one node,
+///   with no layout around it even in formatted mode.
 /// * On an attribute or namespace node it is
 ///   [`SerializeError::NotSerializable`].
 ///
@@ -265,7 +362,7 @@ pub fn serialize_node<N: DomNavigator, W: Write>(
     opts: &SerializeOptions,
 ) -> Result<(), SerializeError> {
     let kind = node.node_type();
-    let mut ser = Serializer::new(out, opts);
+    let mut ser = Serializer::new(out, opts).with_ancestor_layout(node);
     match kind {
         DomNodeType::Root => ser.write_document(node),
         DomNodeType::Attribute | DomNodeType::Namespace | DomNodeType::All => {
@@ -320,7 +417,34 @@ fn is_forbidden_char(ch: char) -> bool {
     }
 }
 
-/// The single in-scope namespace stack plus the writer.
+/// Spaces to write an indent from, so a break costs no allocation.
+const SPACES: [u8; 64] = [b' '; 64];
+
+/// What a container's content is allowed to receive in the way of layout, and
+/// what its children inherit.
+#[derive(Clone, Copy, Debug, Default)]
+struct Layout {
+    /// Add breaks at this container's child boundaries.
+    enabled: bool,
+    /// A text child of this container or of an ancestor. Rule 1 of the
+    /// whitespace contract: it suppresses layout for the whole subtree and
+    /// cannot be switched back on.
+    suppressed: bool,
+    /// The effective `xml:space="preserve"`, inherited until a descendant says
+    /// `default` (XML 1.0 §2.10).
+    preserve: bool,
+}
+
+/// One open element: what to unwind when its end tag is written.
+struct Frame {
+    ns_watermark: usize,
+    layout: Layout,
+    /// The kind of the last child written in this container; `None` before the
+    /// first one, which is what distinguishes the opening boundary.
+    prev_child: Option<DomNodeType>,
+}
+
+/// The in-scope namespace stack, the layout state and the writer.
 struct Serializer<'o, W: Write> {
     out: W,
     opts: &'o SerializeOptions,
@@ -328,6 +452,9 @@ struct Serializer<'o, W: Write> {
     /// empty prefix *and* an empty URI is an undeclared default namespace.
     /// This is the serializer's only per-node allocation.
     ns_stack: Vec<(String, String)>,
+    /// The layout state the requested node inherits from its ancestors. Only
+    /// `suppressed` and `preserve` are read; `enabled` is always recomputed.
+    seed: Layout,
 }
 
 impl<'o, W: Write> Serializer<'o, W> {
@@ -336,7 +463,61 @@ impl<'o, W: Write> Serializer<'o, W> {
             out,
             opts,
             ns_stack: Vec::new(),
+            seed: Layout::default(),
         }
+    }
+
+    /// Seeds the inherited `xml:space` from the node's ancestors, so an
+    /// attached subtree honours a `preserve` it sits inside without the
+    /// serializer inventing an attribute for it (XML 1.0 §2.10).
+    fn with_ancestor_layout<N: DomNavigator>(mut self, node: &N) -> Self {
+        if self.opts.indent.is_none() {
+            return self;
+        }
+        let mut ancestor = node.clone();
+        while ancestor.move_to_parent() {
+            if ancestor.node_type() == DomNodeType::Element {
+                if let Some(preserve) = xml_space(&ancestor) {
+                    self.seed.preserve = preserve;
+                    break;
+                }
+            }
+        }
+        self
+    }
+
+    // ── Layout ───────────────────────────────────────────────────────
+
+    /// The layout state for an element's content: rule 1's child scan (skipped
+    /// when a break could not be written anyway) over rule 3's `xml:space`.
+    fn content_layout<N: DomNavigator>(
+        &self,
+        nav: &N,
+        inherited: Layout,
+        space: Option<bool>,
+    ) -> Layout {
+        let indented = self.opts.indent.is_some();
+        let preserve = space.unwrap_or(inherited.preserve);
+        // `||` short-circuits: an already-suppressed subtree is never scanned,
+        // and neither is anything in compact mode.
+        let suppressed = inherited.suppressed || (indented && has_text_child(nav));
+        Layout {
+            enabled: indented && !suppressed && !preserve,
+            suppressed,
+            preserve,
+        }
+    }
+
+    /// A line break plus `depth` levels of indentation.
+    fn write_break(&mut self, depth: usize) -> Result<(), SerializeError> {
+        self.out.write_all(b"\n")?;
+        let mut remaining = self.opts.indent.unwrap_or(0) * depth;
+        while remaining > 0 {
+            let take = remaining.min(SPACES.len());
+            self.out.write_all(&SPACES[..take])?;
+            remaining -= take;
+        }
+        Ok(())
     }
 
     // ── Namespace scope ──────────────────────────────────────────────
@@ -383,7 +564,8 @@ impl<'o, W: Write> Serializer<'o, W> {
     // ── Node dispatch ────────────────────────────────────────────────
 
     fn write_document<N: DomNavigator>(&mut self, node: &N) -> Result<(), SerializeError> {
-        if self.opts.xml_declaration {
+        let declaration = self.opts.xml_declaration;
+        if declaration {
             self.out
                 .write_all(br#"<?xml version="1.0" encoding="UTF-8""#)?;
             match self.opts.standalone {
@@ -396,41 +578,86 @@ impl<'o, W: Write> Serializer<'o, W> {
         if node.node_type() != DomNodeType::Root {
             // A fragment tree whose visible root is an element (an assertion
             // fragment, say) has no document node to walk into.
+            if declaration && self.opts.indent.is_some() {
+                self.write_break(0)?;
+            }
             return self.write_subtree(node);
         }
+        // The document node is a container too, at depth 0, under the same
+        // rules; a declaration stands in for its opening boundary.
+        let layout = self.content_layout(node, self.seed, None);
+        let mut prev_child: Option<DomNodeType> = None;
         let mut child = node.clone();
         if child.move_to_first_child() {
             loop {
+                let kind = child.node_type();
+                let boundary = match prev_child {
+                    // No leading break is invented; a declaration is what
+                    // there is to separate the document element from.
+                    None => declaration && kind == DomNodeType::Element,
+                    Some(prev) => is_element(prev) || is_element(kind),
+                };
+                if layout.enabled && boundary {
+                    self.write_break(0)?;
+                }
+                prev_child = Some(kind);
                 self.write_subtree(&child)?;
                 if !child.move_to_next_sibling() {
                     break;
                 }
             }
         }
+        // No final newline either.
         Ok(())
     }
 
-    /// Writes the subtree at the cursor, iteratively: `frames` holds one
-    /// `ns_stack` watermark per open element, so descending never recurses and
-    /// a deep document cannot overflow the Rust stack.
+    /// Writes the subtree at the cursor, iteratively: `frames` holds one entry
+    /// per open element — its `ns_stack` watermark and its layout state — so
+    /// descending never recurses and a deep document cannot overflow the Rust
+    /// stack. `frames.len()` is the depth of the node at the cursor, which is
+    /// also its indentation level; the node the caller asked for is at depth 0.
     fn write_subtree<N: DomNavigator>(&mut self, start: &N) -> Result<(), SerializeError> {
         let mut nav = start.clone();
-        let mut frames: Vec<usize> = Vec::new();
+        let mut frames: Vec<Frame> = Vec::new();
         loop {
+            let kind = nav.node_type();
+            // The boundary before this child, inside its container. A standalone
+            // node has no container, hence no layout around it.
+            let boundary = frames.last().is_some_and(|frame| {
+                frame.layout.enabled
+                    && match frame.prev_child {
+                        None => is_element(kind),
+                        Some(prev) => is_element(prev) || is_element(kind),
+                    }
+            });
+            if boundary {
+                self.write_break(frames.len())?;
+            }
+            if let Some(frame) = frames.last_mut() {
+                frame.prev_child = Some(kind);
+            }
+
             let mut descended = false;
-            match nav.node_type() {
+            match kind {
                 DomNodeType::Element => {
-                    let watermark = self.ns_stack.len();
-                    self.write_start_tag(&nav)?;
+                    let ns_watermark = self.ns_stack.len();
+                    let space = self.write_start_tag(&nav)?;
                     let mut child = nav.clone();
                     if child.move_to_first_child() {
                         self.out.write_all(b">")?;
-                        frames.push(watermark);
+                        let inherited = frames.last().map_or(self.seed, |frame| frame.layout);
+                        let layout = self.content_layout(&nav, inherited, space);
+                        frames.push(Frame {
+                            ns_watermark,
+                            layout,
+                            prev_child: None,
+                        });
                         nav = child;
                         descended = true;
                     } else {
+                        // An empty element stays `<a/>`; nothing goes inside it.
                         self.out.write_all(b"/>")?;
-                        self.ns_stack.truncate(watermark);
+                        self.ns_stack.truncate(ns_watermark);
                     }
                 }
                 kind => self.write_leaf(&nav, kind)?,
@@ -447,9 +674,13 @@ impl<'o, W: Write> Serializer<'o, W> {
                     break;
                 }
                 nav.move_to_parent();
-                let watermark = frames.pop().expect("checked non-empty");
+                let frame = frames.pop().expect("checked non-empty");
+                // The closing boundary, at the container's own depth.
+                if frame.layout.enabled && frame.prev_child.is_some_and(is_element) {
+                    self.write_break(frames.len())?;
+                }
                 self.write_end_tag(&nav)?;
-                self.ns_stack.truncate(watermark);
+                self.ns_stack.truncate(frame.ns_watermark);
             }
         }
     }
@@ -508,7 +739,13 @@ impl<'o, W: Write> Serializer<'o, W> {
 
     /// Writes `<qname` plus the declarations this element introduces and all of
     /// its attributes, leaving the caller to add `>` or `/>`.
-    fn write_start_tag<N: DomNavigator>(&mut self, nav: &N) -> Result<(), SerializeError> {
+    ///
+    /// Returns the element's `xml:space` if it carries one, read off the
+    /// attributes as they are written rather than in a second walk.
+    fn write_start_tag<N: DomNavigator>(
+        &mut self,
+        nav: &N,
+    ) -> Result<Option<bool>, SerializeError> {
         self.out.write_all(b"<")?;
         self.write_qname(nav.prefix(), nav.local_name())?;
         self.write_namespace_declarations(nav)?;
@@ -522,10 +759,15 @@ impl<'o, W: Write> Serializer<'o, W> {
             });
         }
 
+        let watch_space = self.opts.indent.is_some();
+        let mut space = None;
         let mut attr = nav.clone();
         if attr.move_to_first_attribute() {
             loop {
                 let (prefix, uri) = (attr.prefix(), attr.namespace_uri());
+                if watch_space && uri == XML_NAMESPACE && attr.local_name() == "space" {
+                    space = xml_space_value(&attr.value_ref());
+                }
                 // An unprefixed attribute is in no namespace: the default
                 // namespace does not apply to it (Namespaces in XML §6.2).
                 let bound = if prefix.is_empty() {
@@ -549,7 +791,7 @@ impl<'o, W: Write> Serializer<'o, W> {
                 }
             }
         }
-        Ok(())
+        Ok(space)
     }
 
     /// Emits exactly the declarations that change the scope: the element's
@@ -628,6 +870,56 @@ impl<'o, W: Write> Serializer<'o, W> {
 
     fn write_attribute_value(&mut self, value: &str) -> Result<(), SerializeError> {
         write_attribute_value(&mut self.out, value)
+    }
+}
+
+// ── Layout helpers, independent of the writer ────────────────────────────
+
+fn is_element(kind: DomNodeType) -> bool {
+    kind == DomNodeType::Element
+}
+
+/// Whether any direct child of this element is a text node — rule 1 of the
+/// whitespace contract, which looks at *all* the children: text after an
+/// element suppresses layout just as text before one does.
+fn has_text_child<N: DomNavigator>(nav: &N) -> bool {
+    let mut child = nav.clone();
+    if !child.move_to_first_child() {
+        return false;
+    }
+    loop {
+        if child.node_type().is_text_like() {
+            return true;
+        }
+        if !child.move_to_next_sibling() {
+            return false;
+        }
+    }
+}
+
+/// `xml:space` on this element, by its expanded XML-namespace name.
+fn xml_space<N: DomNavigator>(nav: &N) -> Option<bool> {
+    let mut attr = nav.clone();
+    if attr.move_to_first_attribute() {
+        loop {
+            if attr.namespace_uri() == XML_NAMESPACE && attr.local_name() == "space" {
+                return xml_space_value(&attr.value_ref());
+            }
+            if !attr.move_to_next_attribute() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// `Some(true)` for `preserve`, `Some(false)` for `default`; any other value is
+/// not one XML 1.0 §2.10 defines, so it changes nothing.
+fn xml_space_value(value: &str) -> Option<bool> {
+    match value {
+        "preserve" => Some(true),
+        "default" => Some(false),
+        _ => None,
     }
 }
 
@@ -748,6 +1040,43 @@ mod tests {
     fn round_roxml(xml: &str) -> String {
         let doc = roxmltree::Document::parse(xml).expect("the fixture parses");
         to_string(&RoXmlNavigator::new(&doc), &SerializeOptions::default()).expect("serializes")
+    }
+
+    /// Just the indentation width, everything else default.
+    fn indented(width: usize) -> SerializeOptions {
+        SerializeOptions {
+            indent: Some(width),
+            ..SerializeOptions::default()
+        }
+    }
+
+    /// Parses `xml` and serializes it with the given options.
+    fn round_with(xml: &str, opts: &SerializeOptions) -> String {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(xml.as_bytes(), &arena, &names)
+            .expect("the fixture parses");
+        to_string(&doc.create_navigator(), opts).expect("serializes")
+    }
+
+    /// The same through the roxmltree backend.
+    fn round_roxml_with(xml: &str, opts: &SerializeOptions) -> String {
+        let doc = roxmltree::Document::parse(xml).expect("the fixture parses");
+        to_string(&RoXmlNavigator::new(&doc), opts).expect("serializes")
+    }
+
+    /// Serializes the element reached by `descend` steps of `move_to_first_child`
+    /// from the document root — a subtree, still attached to its tree.
+    fn round_subtree(xml: &str, descend: usize, opts: &SerializeOptions) -> String {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(xml.as_bytes(), &arena, &names)
+            .expect("the fixture parses");
+        let mut nav = doc.create_navigator();
+        for _ in 0..descend {
+            assert!(nav.move_to_first_child(), "not that deep");
+        }
+        to_string(&nav, opts).expect("serializes")
     }
 
     /// Builds a tree by hand, so that content XML cannot express can be tested.
@@ -1186,6 +1515,7 @@ mod tests {
         let opts = SerializeOptions {
             xml_declaration: true,
             standalone: None,
+            indent: None,
         };
         serialize_document(&nav, &mut out, &opts).expect("serializes");
         assert_eq!(
@@ -1198,6 +1528,7 @@ mod tests {
             let opts = SerializeOptions {
                 xml_declaration: true,
                 standalone: Some(standalone),
+                indent: None,
             };
             serialize_document(&nav, &mut out, &opts).expect("serializes");
             assert_eq!(
@@ -1288,5 +1619,342 @@ mod tests {
         // Trailing whitespace is part of the data (XML 1.0 §2.6).
         assert_eq!(round("<a><?pi d ?></a>"), "<a><?pi d ?></a>");
         assert_eq!(round_roxml("<a><?pi d ?></a>"), "<a><?pi d ?></a>");
+    }
+
+    // ── Formatted output (§4.7) ──────────────────────────────────────
+
+    #[test]
+    fn compact_is_the_default_and_adds_nothing() {
+        assert_eq!(SerializeOptions::default().indent, None);
+        assert_eq!(round("<a><b><c/></b></a>"), "<a><b><c/></b></a>");
+    }
+
+    #[test]
+    fn compact_mode_is_not_a_minifier() {
+        // It adds no whitespace and removes none.
+        assert_eq!(round("<a>  <b/>  </a>"), "<a>  <b/>  </a>");
+        assert_eq!(round("<a>\n  <b/>\n</a>"), "<a>\n  <b/>\n</a>");
+    }
+
+    #[test]
+    fn the_catalog_example_writes_both_ways() {
+        // §4.7's example, built through the builder API.
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder =
+            BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())
+                .expect("builder");
+        builder.start_element("catalog", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        for (id, title) in [("b1", "One"), ("b2", "Two")] {
+            builder.start_element("book", "", "", &[]).unwrap();
+            builder.attribute("id", "", "", id).unwrap();
+            builder.end_of_attributes();
+            builder.start_element("title", "", "", &[]).unwrap();
+            builder.end_of_attributes();
+            builder.text(title);
+            builder.end_element().unwrap();
+            builder.end_element().unwrap();
+        }
+        builder.end_element().unwrap();
+        let doc = builder.finalize().expect("finalize");
+        let nav = doc.create_navigator();
+
+        assert_eq!(
+            to_string(&nav, &SerializeOptions::default()).expect("serializes"),
+            "<catalog><book id=\"b1\"><title>One</title></book>\
+             <book id=\"b2\"><title>Two</title></book></catalog>"
+        );
+        assert_eq!(
+            to_string(&nav, &indented(2)).expect("serializes"),
+            "<catalog>\n  \
+               <book id=\"b1\">\n    \
+                 <title>One</title>\n  \
+               </book>\n  \
+               <book id=\"b2\">\n    \
+                 <title>Two</title>\n  \
+               </book>\n\
+             </catalog>"
+        );
+    }
+
+    #[test]
+    fn indentation_width_zero_writes_breaks_only() {
+        assert_eq!(
+            round_with("<a><b><c/></b></a>", &indented(0)),
+            "<a>\n<b>\n<c/>\n</b>\n</a>"
+        );
+    }
+
+    #[test]
+    fn indentation_width_two_and_four_nest_per_depth() {
+        assert_eq!(
+            round_with("<a><b><c/></b></a>", &indented(2)),
+            "<a>\n  <b>\n    <c/>\n  </b>\n</a>"
+        );
+        assert_eq!(
+            round_with("<a><b><c/></b></a>", &indented(4)),
+            "<a>\n    <b>\n        <c/>\n    </b>\n</a>"
+        );
+    }
+
+    #[test]
+    fn empty_elements_stay_collapsed_when_formatted() {
+        assert_eq!(
+            round_with("<a><b/><c></c></a>", &indented(2)),
+            "<a>\n  <b/>\n  <c/>\n</a>"
+        );
+        assert_eq!(round_with("<a/>", &indented(2)), "<a/>");
+    }
+
+    #[test]
+    fn formatted_output_with_and_without_the_declaration() {
+        let with_declaration = SerializeOptions {
+            xml_declaration: true,
+            standalone: None,
+            indent: Some(2),
+        };
+        // A declaration in front of the document element gets a break.
+        assert_eq!(
+            round_with("<a><b/></a>", &with_declaration),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>\n  <b/>\n</a>"
+        );
+        // In front of a comment it gets none.
+        assert_eq!(
+            round_with("<!--c--><a/>", &with_declaration),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!--c-->\n<a/>"
+        );
+        // And no leading break is invented without a declaration.
+        assert_eq!(round_with("<a><b/></a>", &indented(2)), "<a>\n  <b/>\n</a>");
+    }
+
+    #[test]
+    fn document_level_comments_and_pis_when_formatted() {
+        // Layout only lands next to an element; a run of comments and PIs is
+        // never split internally. No final newline.
+        assert_eq!(
+            round_with("<!--before--><?go?><a/><?stop?><!--after-->", &indented(2)),
+            "<!--before--><?go?>\n<a/>\n<?stop?><!--after-->"
+        );
+    }
+
+    #[test]
+    fn comments_and_pis_inside_an_element_when_formatted() {
+        assert_eq!(
+            round_with("<a><!--c--><b/><?pi d?></a>", &indented(2)),
+            "<a><!--c-->\n  <b/>\n  <?pi d?></a>"
+        );
+        // A container of comments alone gets no layout at all.
+        assert_eq!(
+            round_with("<a><!--c--><!--d--></a>", &indented(2)),
+            "<a><!--c--><!--d--></a>"
+        );
+    }
+
+    #[test]
+    fn standalone_nodes_get_no_layout() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            "<a>text<!--c--><?go d?></a>".as_bytes(),
+            &arena,
+            &names,
+        )
+        .expect("parses");
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child());
+        assert!(nav.move_to_first_child());
+        for expected in ["text", "<!--c-->", "<?go d?>"] {
+            assert_eq!(to_string(&nav, &indented(2)).expect("serializes"), expected);
+            nav.move_to_next_sibling();
+        }
+    }
+
+    #[test]
+    fn a_subtree_is_formatted_from_depth_zero() {
+        assert_eq!(
+            round_subtree("<r><box><a/></box></r>", 2, &indented(2)),
+            "<box>\n  <a/>\n</box>"
+        );
+    }
+
+    #[test]
+    fn text_anywhere_in_a_container_suppresses_layout() {
+        // Both of these stay on one line; inspecting only the first child would
+        // get the second one wrong.
+        for xml in [
+            "<p>Hello <b>world</b>!</p>",
+            "<p><b>world</b>!</p>",
+            "<p><b/>tail</p>",
+        ] {
+            assert_eq!(round_with(xml, &indented(2)), xml, "{xml}");
+        }
+        // Suppression reaches the whole subtree, not just the mixed container.
+        assert_eq!(
+            round_with("<p>t<b><c/></b></p>", &indented(2)),
+            "<p>t<b><c/></b></p>"
+        );
+        // A sibling with text does not suppress its neighbours.
+        assert_eq!(
+            round_with("<r><p>t</p><q><c/></q></r>", &indented(2)),
+            "<r>\n  <p>t</p>\n  <q>\n    <c/>\n  </q>\n</r>"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_is_preserved_and_suppresses_layout() {
+        assert_eq!(round_with("<p> <b/> </p>", &indented(2)), "<p> <b/> </p>");
+    }
+
+    #[test]
+    fn formatting_does_not_reindent_existing_layout() {
+        // An already-indented document has whitespace text children, so its
+        // layout is kept exactly as it is rather than rewritten.
+        let xml = "<a>\n    <b/>\n</a>";
+        assert_eq!(round_with(xml, &indented(2)), xml);
+    }
+
+    #[test]
+    fn xml_space_preserve_disables_added_layout() {
+        let xml = "<pre xml:space=\"preserve\"><a/><b/></pre>";
+        assert_eq!(round_with(xml, &indented(2)), xml);
+        // And it is inherited by descendants.
+        let xml = "<pre xml:space=\"preserve\"><a><b/></a></pre>";
+        assert_eq!(round_with(xml, &indented(2)), xml);
+    }
+
+    #[test]
+    fn a_descendant_xml_space_default_restores_layout() {
+        assert_eq!(
+            round_with(
+                "<r xml:space=\"preserve\"><a><b xml:space=\"default\"><c/></b></a></r>",
+                &indented(2)
+            ),
+            "<r xml:space=\"preserve\"><a><b xml:space=\"default\">\n      <c/>\n    </b></a></r>"
+        );
+    }
+
+    #[test]
+    fn an_attached_subtree_inherits_xml_space_from_its_ancestors() {
+        // The ancestors are consulted for the inherited value; no attribute is
+        // invented on the subtree's top element.
+        assert_eq!(
+            round_subtree(
+                "<r xml:space=\"preserve\"><box><a/><b/></box></r>",
+                2,
+                &indented(2)
+            ),
+            "<box><a/><b/></box>"
+        );
+        // The nearest ancestor wins, so a `default` in between restores layout.
+        assert_eq!(
+            round_subtree(
+                "<r xml:space=\"preserve\"><m xml:space=\"default\"><box><a/></box></m></r>",
+                3,
+                &indented(2)
+            ),
+            "<box>\n  <a/>\n</box>"
+        );
+        // Without an ancestor setting, the same subtree is formatted.
+        assert_eq!(
+            round_subtree("<r><box><a/><b/></box></r>", 2, &indented(2)),
+            "<box>\n  <a/>\n  <b/>\n</box>"
+        );
+    }
+
+    #[test]
+    fn string_and_writer_output_are_the_same_bytes() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            "<a><b k=\"v\"><c/></b><!--x--></a>".as_bytes(),
+            &arena,
+            &names,
+        )
+        .expect("parses");
+        let nav = doc.create_navigator();
+        for opts in [SerializeOptions::default(), indented(0), indented(3)] {
+            let string = to_string(&nav, &opts).expect("serializes");
+            let mut bytes = Vec::new();
+            serialize_node(&nav, &mut bytes, &opts).expect("serializes");
+            assert_eq!(string.as_bytes(), bytes.as_slice());
+            let mut document_bytes = Vec::new();
+            serialize_document(&nav, &mut document_bytes, &opts).expect("serializes");
+            assert_eq!(string.as_bytes(), document_bytes.as_slice());
+        }
+    }
+
+    #[test]
+    fn serializing_leaves_the_source_tree_unchanged() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc =
+            BufferDocument::from_reader_default("<a><b>t</b><c/></a>".as_bytes(), &arena, &names)
+                .expect("parses");
+        let nav = doc.create_navigator();
+        let before = to_string(&nav, &SerializeOptions::default()).expect("serializes");
+        let _ = to_string(&nav, &indented(4)).expect("serializes");
+        let after = to_string(&nav, &SerializeOptions::default()).expect("serializes");
+        assert_eq!(before, after);
+        assert_eq!(after, "<a><b>t</b><c/></a>");
+    }
+
+    #[test]
+    fn formatted_output_reparses_with_its_content_intact() {
+        let formatted = round_with(
+            "<catalog><book id=\"b1\"><title>One</title></book></catalog>",
+            &indented(2),
+        );
+        let doc = roxmltree::Document::parse(&formatted).expect("output parses");
+        let catalog = doc.root_element();
+        assert_eq!(catalog.tag_name().name(), "catalog");
+
+        // The added whitespace is exactly one break plus one level, and one
+        // break before the closing tag.
+        let catalog_text: Vec<&str> = catalog
+            .children()
+            .filter(|n| n.is_text())
+            .map(|n| n.text().unwrap_or(""))
+            .collect();
+        assert_eq!(catalog_text, vec!["\n  ", "\n"]);
+
+        let book = catalog
+            .children()
+            .find(|n| n.is_element())
+            .expect("the book survived");
+        assert_eq!(book.tag_name().name(), "book");
+        assert_eq!(book.attribute("id"), Some("b1"));
+        let book_text: Vec<&str> = book
+            .children()
+            .filter(|n| n.is_text())
+            .map(|n| n.text().unwrap_or(""))
+            .collect();
+        assert_eq!(book_text, vec!["\n    ", "\n  "]);
+
+        // Existing text is untouched: no break went inside <title>.
+        let title = book
+            .children()
+            .find(|n| n.is_element())
+            .expect("the title survived");
+        assert_eq!(title.text(), Some("One"));
+        assert_eq!(title.children().count(), 1);
+    }
+
+    #[test]
+    fn both_backends_format_identically() {
+        for xml in [
+            "<a><b><c/></b></a>",
+            "<a><!--c--><b/><?pi d?></a>",
+            "<p>Hello <b>world</b>!</p>",
+            "<pre xml:space=\"preserve\"><a/><b/></pre>",
+            "<r xml:space=\"preserve\"><a><b xml:space=\"default\"><c/></b></a></r>",
+            "<!--before--><a><b/></a><!--after-->",
+        ] {
+            assert_eq!(
+                round_with(xml, &indented(2)),
+                round_roxml_with(xml, &indented(2)),
+                "backends differ on {xml}"
+            );
+        }
     }
 }

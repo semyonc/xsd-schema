@@ -29,6 +29,8 @@
 //! declaration (the canonical form ignores it), a `<!DOCTYPE>` with its entity
 //! declarations (those files are skipped outright), and CDATA section markers
 //! (the canonical form compares text content, not how it was written).
+//! Everything else — processing-instruction data included, trailing whitespace
+//! and all — is compared exactly.
 //!
 //! The suite lives at `$XSDTESTS_DIR`, or `../../xsdtests` relative to the
 //! crate. When it is not there the test prints a message and passes, the same
@@ -147,16 +149,11 @@ fn render_node(node: roxmltree::Node<'_, '_>, depth: usize, out: &mut String) {
         }
         roxmltree::NodeType::PI => {
             let pi = node.pi().expect("a PI node has PI data");
-            // Trailing whitespace in PI data is part of the data (XML 1.0 §2.6
-            // `PI ::= '<?' PITarget (S (Char* - (Char* '?>')))? '?>'`), but
-            // `parse_pi_content` in `src/document/builder.rs` trims the raw
-            // content, so it is already gone when the serializer is handed the
-            // tree. Compared without it on both sides.
             out.push_str(&format!(
                 "{:pad$}P {} {:?}\n",
                 "",
                 pi.target,
-                pi.value.unwrap_or("").trim_end(),
+                pi.value.unwrap_or(""),
             ));
         }
         // Text is merged by the caller; the root cannot appear as a child.
@@ -322,20 +319,25 @@ fn serialize_round_trips_the_conformance_corpus() {
             continue;
         };
 
-        let output =
-            match serialize::to_string(&doc.create_navigator(), &SerializeOptions::default()) {
-                Ok(output) => output,
-                Err(serialize::SerializeError::InvalidChar { .. }) if declares_xml_11(&bytes) => {
-                    counts.xml11_char_skipped += 1;
-                    continue;
-                }
-                Err(e) => {
-                    counts
-                        .serialize_errors
-                        .push(format!("{}: {e}", path.display()));
-                    continue;
-                }
-            };
+        // Compact output: an exact text round trip is the contract of this mode,
+        // where formatted output would add layout whitespace text (§4.7).
+        let compact = SerializeOptions {
+            indent: None,
+            ..SerializeOptions::default()
+        };
+        let output = match serialize::to_string(&doc.create_navigator(), &compact) {
+            Ok(output) => output,
+            Err(serialize::SerializeError::InvalidChar { .. }) if declares_xml_11(&bytes) => {
+                counts.xml11_char_skipped += 1;
+                continue;
+            }
+            Err(e) => {
+                counts
+                    .serialize_errors
+                    .push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
 
         // An independent parser judges both sides; if it will not take the
         // original, it has nothing to say about the output either.

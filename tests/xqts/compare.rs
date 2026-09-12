@@ -108,11 +108,16 @@ fn serialize_xpath_result<N: DomNavigator>(
                     }
                     // When wrapping, attributes were already added to the wrapper element above
                 } else {
-                    // The crate's serializer: compact output, declarations only
-                    // where they are introduced. Namespace declarations are not
-                    // part of `deep_equal`, so what changes here is whitespace
-                    // between attributes and nothing a comparison can see.
-                    out.push_str(&serialize::to_string(nav, &SerializeOptions::default())?);
+                    // The crate's serializer, explicitly in compact mode:
+                    // added layout whitespace would show up as text nodes in
+                    // the comparison. Declarations land only where they are
+                    // introduced, which `deep_equal` does not look at, so what
+                    // changes here is nothing a comparison can see.
+                    let compact = SerializeOptions {
+                        indent: None,
+                        ..SerializeOptions::default()
+                    };
+                    out.push_str(&serialize::to_string(nav, &compact)?);
                 }
                 string_flag = false;
             }

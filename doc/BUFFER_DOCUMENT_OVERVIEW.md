@@ -198,7 +198,9 @@ over `DomNavigator`, not over `BufferDocument`, so the same code serializes a
 engine brings of its own; it touches no `pub(crate)` node pages.
 
 ```rust
-let xml = serialize::to_string(&doc.create_navigator(), &SerializeOptions::default())?;
+let compact = serialize::to_string(&doc.create_navigator(), &SerializeOptions::default())?;
+let formatted = SerializeOptions { indent: Some(2), ..SerializeOptions::default() };
+serialize::serialize_document(&doc.create_navigator(), &mut out, &formatted)?;
 ```
 
 Three entry points — `serialize_document` (a whole document, optionally with an
@@ -206,8 +208,8 @@ XML declaration), `serialize_node` (one node: a `Root` behaves as a document, an
 element writes its subtree, an attribute or namespace node is refused) and
 `to_string` — plus `SerializeOptions` and `SerializeError`.
 
-**What is written.** Compact UTF-8 with no added whitespace, empty elements
-collapsed to `<a/>`, attributes in stored document order. Escaping follows
+**What is written.** UTF-8, empty elements collapsed to `<a/>`, attributes in
+stored document order. Escaping follows
 *Canonical XML 1.0* §2.3: in text `&`, `<`, `>` and U+000D; in attribute values
 (always `"`-quoted) `&`, `<`, `"` and the three whitespace characters as
 references, so XML 1.0's end-of-line handling (§2.11) and attribute-value
@@ -215,6 +217,41 @@ normalization (§3.3.3) cannot change the value on a re-parse. Content that XML
 cannot express — a character outside the `Char` production, a comment with `--`,
 a PI target `xml`, a name whose prefix is not in scope — is an error, never
 dropped or repaired.
+
+**Two modes, one traversal.** `SerializeOptions::indent` is `None` by default —
+*compact*: no layout whitespace is added, and none is removed, which is what
+makes it the mode for an exact text round trip. `Some(n)` is *formatted*: a line
+break (LF everywhere) plus `n` spaces per level, `Some(0)` being the breaks
+alone. The outermost element sits at depth 0, a subtree written on its own
+included; attributes stay on the start-tag line; no trailing newline is written;
+the declaration is controlled separately. Formatting happens inside the same
+iterative walk — per-depth layout state and a direct-child scan with cloned
+navigators — so there is no second tree, no intermediate string and no textual
+pretty-print pass, and compact mode skips the scans entirely.
+
+The whitespace contract is deliberately conservative, because added layout
+becomes text nodes when the output is parsed again:
+
+1. Every existing text character survives in both modes. Before formatting a
+   container, *all* of its direct children are inspected: any text child
+   suppresses added layout throughout that container's subtree — so
+   `<p>Hello <b>world</b>!</p>` and `<p><b>world</b>!</p>` alike stay on one
+   line, and existing indentation is kept rather than reindented.
+2. A break goes only at a child boundary next to an element: before an element
+   child at the child's depth, before the closing tag at the container's depth
+   when the last child is an element, and between siblings when either is an
+   element. A run of comments and PIs is never split internally; nothing is ever
+   inserted inside text, a comment, PI data, an attribute value or an empty
+   element.
+3. `xml:space` (XML 1.0 §2.10, by its expanded XML-namespace name) is honoured:
+   `preserve` disables added layout for that element and is inherited, a
+   descendant `default` restores it for its own content unless rule 1 still
+   suppresses, and a subtree serialized on its own consults its ancestors for the
+   inherited value without inventing an attribute.
+4. At document level the same rules apply at depth 0. A declaration immediately
+   followed by the document element gets a break; a declaration followed by a
+   comment or PI does not. No leading blank line, no final newline, and no layout
+   around a standalone text/comment/PI node.
 
 **Namespace declarations** are written where they are *introduced*. The
 serializer keeps its own in-scope stack while descending and diffs each
@@ -230,12 +267,10 @@ axis has no order of its own to preserve.
 
 **What `from_reader` cannot give it back.** The parse keeps no XML declaration
 (version, encoding, `standalone`), no `<!DOCTYPE` or internal entity
-declarations, no CDATA section markers (the content is kept, as text), no text
-outside the document element, and no trailing whitespace in processing-
-instruction data (`parse_pi_content` trims the raw content). A round trip is
-therefore an identity on the *tree*, not on the bytes;
-`tests/serialize_roundtrip.rs` holds the whole XSD conformance corpus to that
-standard.
+declarations, no CDATA section markers (the content is kept, as text), and no
+text outside the document element. A round trip is therefore an identity on the
+*tree*, not on the bytes; `tests/serialize_roundtrip.rs` holds the whole XSD
+conformance corpus to that standard, in compact mode.
 
 ---
 
