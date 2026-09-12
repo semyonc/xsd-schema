@@ -640,25 +640,35 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
     ///     })
     ///     .unwrap();
     /// ```
+    ///
+    /// # Callback lifetimes
+    ///
+    /// Only the `&mut` borrow of the [`TypedEvaluator`] is higher-ranked; the expression
+    /// and static-context lifetimes are this evaluator's own `'expr` and `'ctx`. That is
+    /// what lets the callback install borrowed state that lives in the caller's frame —
+    /// e.g. [`DynamicContext::set_extension`] or
+    /// [`DynamicContext::set_function_evaluator`] with a local — instead of only
+    /// `'static` data.
     pub fn run_with<N, F>(self, setup: F) -> Result<XPathValue<N>, XPathError>
     where
-        N: DomNavigator,
-        F: for<'a> FnOnce(&mut TypedEvaluator<'_, '_, 'a, N>),
+        N: DomNavigator + 'ctx,
+        F: for<'d> FnOnce(&mut TypedEvaluator<'expr, 'ctx, 'd, N>),
     {
         self.run_with_node_and_setup(None, setup)
     }
 
     /// Evaluate with a context node and setup callback for advanced variable binding.
     ///
-    /// Combines `run_with_node` and `run_with` functionality.
+    /// Combines `run_with_node` and `run_with` functionality. See
+    /// [`run_with`](Self::run_with) for the callback's lifetimes.
     pub fn run_with_node_and_setup<N, F>(
         self,
         context_node: Option<N>,
         setup: F,
     ) -> Result<XPathValue<N>, XPathError>
     where
-        N: DomNavigator,
-        F: for<'a> FnOnce(&mut TypedEvaluator<'_, '_, 'a, N>),
+        N: DomNavigator + 'ctx,
+        F: for<'d> FnOnce(&mut TypedEvaluator<'expr, 'ctx, 'd, N>),
     {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);
