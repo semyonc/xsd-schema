@@ -806,10 +806,13 @@ pub(crate) fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
 
 /// Parses PI content into `(target, data)`.
 pub(crate) fn parse_pi_content(raw: &str) -> (&str, &str) {
-    let trimmed = raw.trim();
-    match trimmed.find(|c: char| c.is_ascii_whitespace()) {
-        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim_start()),
-        None => (trimmed, ""),
+    // `PI ::= '<?' PITarget (S (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6):
+    // only the `S` separating the target from the data is not data. Whatever
+    // follows it — trailing whitespace included — is the data verbatim.
+    let raw = raw.trim_start();
+    match raw.find(|c: char| c.is_ascii_whitespace()) {
+        Some(pos) => (&raw[..pos], raw[pos..].trim_start()),
+        None => (raw, ""),
     }
 }
 
@@ -827,6 +830,17 @@ mod tests {
     use super::*;
     use crate::ids::TypeKey;
     use crate::navigator::DomNavigator;
+
+    #[test]
+    fn parse_pi_content_keeps_the_data_verbatim() {
+        // XML 1.0 §2.6: only the `S` between target and data is a separator;
+        // everything after it, trailing whitespace included, is the data.
+        assert_eq!(parse_pi_content("go now "), ("go", "now "));
+        assert_eq!(parse_pi_content("go   now\t"), ("go", "now\t"));
+        assert_eq!(parse_pi_content("go"), ("go", ""));
+        assert_eq!(parse_pi_content("go "), ("go", ""));
+        assert_eq!(parse_pi_content("go a?b "), ("go", "a?b "));
+    }
 
     fn make_builder<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocumentBuilder<'a> {
         BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default()).unwrap()
