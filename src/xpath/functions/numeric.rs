@@ -342,6 +342,9 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
 
 /// Round half toward positive infinity for `f64` (`fn:round` semantics).
 ///
+/// Shared with `fn:subsequence`, whose positions F&O §15.1.10 defines through
+/// `fn:round`, so that the two cannot drift apart.
+///
 /// F&O §6.4.4 lists the special values of the floating-point types explicitly:
 /// NaN, positive and negative infinity and positive and negative zero are
 /// returned unchanged, and an argument "less than zero, but greater than or
@@ -355,7 +358,7 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
 /// fractional part is 0. Writing it this way also needs no magnitude guard: at
 /// 2^52 and above every `f64` is already integral, so `floor(x)` is `x` and the
 /// fractional part is zero.
-fn round_half_toward_positive_infinity_f64(d: f64) -> f64 {
+pub(crate) fn round_half_toward_positive_infinity_f64(d: f64) -> f64 {
     // `d == 0.0` matches negative zero too, and returning `d` keeps its sign.
     if d.is_nan() || d.is_infinite() || d == 0.0 {
         return d;

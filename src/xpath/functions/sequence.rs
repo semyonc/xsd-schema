@@ -19,6 +19,7 @@ use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 use crate::xpath::tree_comparer::TreeComparer;
 use crate::xpath::DomNavigator;
 
+use super::numeric::round_half_toward_positive_infinity_f64;
 use super::{
     atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt,
     atomize_to_string_opt, convert, materialize, XPathValue,
@@ -496,8 +497,13 @@ pub fn insert_before<N: DomNavigator>(
 /// Returns items from $sourceSeq starting at position $startingLoc
 /// and continuing for $length items (or to the end if $length is omitted).
 ///
-/// Uses XPath 2.0 rounding rules:
-/// - Positions are doubles, rounded to integers
+/// F&O §15.1.10 defines the result as the items whose position `p` satisfies
+/// `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
+/// fn:round($length)`, so both arguments are rounded by `fn:round` — half
+/// towards positive infinity, the same helper `fn:round` itself uses. A
+/// fractional `$startingLoc` of -1.5 therefore begins at -1, not -2.
+///
+/// The remaining rules on the arguments, which are `xs:double`:
 /// - NaN startingLoc or length -> empty
 /// - +Infinity startingLoc -> empty
 /// - -Infinity length -> empty
@@ -553,13 +559,15 @@ pub fn subsequence<N: DomNavigator>(
     // Materialize source sequence
     let items = materialize(source);
 
-    // Round starting location (XPath uses round-half-to-even, but round() is close enough)
-    let start_rounded = round_half_away_from_zero(starting_loc);
+    // F&O §15.1.10 selects the items whose position p satisfies
+    // `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
+    // fn:round($length)`, so both arguments go through fn:round's own rounding.
+    let start_rounded = round_half_toward_positive_infinity_f64(starting_loc);
 
     // Calculate effective start and end positions
     let (start_idx, end_idx) = match length {
         Some(len) => {
-            let len_rounded = round_half_away_from_zero(len);
+            let len_rounded = round_half_toward_positive_infinity_f64(len);
             // Per spec: items where round(startingLoc) <= position < round(startingLoc) + round(length)
             // Note: position is 1-based, so item at position p has index p-1
 
@@ -610,18 +618,6 @@ pub fn subsequence<N: DomNavigator>(
         .collect();
 
     Ok(XPathValue::from_sequence(result))
-}
-
-/// Round half away from zero (XPath round semantics).
-fn round_half_away_from_zero(d: f64) -> f64 {
-    if d.is_nan() || d.is_infinite() {
-        return d;
-    }
-    if d >= 0.0 {
-        (d + 0.5).floor()
-    } else {
-        (d - 0.5).ceil()
-    }
 }
 
 // ============================================================================
@@ -915,6 +911,77 @@ mod tests {
         let args = vec![seq, start, len];
         let result = subsequence(&mut ctx, args).unwrap();
         assert_eq!(extract_integers(result), vec![2, 3, 4]);
+    }
+
+    /// Evaluate `fn:subsequence` over `(1, 2, 3, 4, 5)`.
+    fn subsequence_of_five(start: f64, length: Option<f64>) -> Vec<i64> {
+        let mut ctx = make_context();
+        let mut args = vec![
+            integer_seq::<RoXmlNavigator>(&[1, 2, 3, 4, 5]),
+            XPathValue::double(start),
+        ];
+        if let Some(length) = length {
+            args.push(XPathValue::double(length));
+        }
+        extract_integers(subsequence(&mut ctx, args).expect("numeric arguments"))
+    }
+
+    /// A half `$startingLoc` or `$length` rounds towards positive infinity,
+    /// because F&O §15.1.10 rounds both through `fn:round`.
+    ///
+    /// The spec's own arithmetic for `subsequence((1,2,3,4,5), -1.5, 4.5)`:
+    /// `fn:round(-1.5)` is -1 and `fn:round(4.5)` is 5, so the result is the
+    /// items whose position satisfies `p >= -1` and `p < 4` — items 1, 2 and 3.
+    #[test]
+    fn test_subsequence_takes_halves_toward_positive_infinity() {
+        assert_eq!(subsequence_of_five(-1.5, Some(4.5)), vec![1, 2, 3]);
+        // round(2.5) = 3: positions 3 to the end.
+        assert_eq!(subsequence_of_five(2.5, None), vec![3, 4, 5]);
+        // round(1.5) = 2 and round(2.5) = 3: 2 <= p < 5.
+        assert_eq!(subsequence_of_five(1.5, Some(2.5)), vec![2, 3, 4]);
+        // round(-2.5) = -2 and round(4.5) = 5: -2 <= p < 3.
+        assert_eq!(subsequence_of_five(-2.5, Some(4.5)), vec![1, 2]);
+    }
+
+    /// The integral cases are unchanged, and stay exactly on the §15.1.10
+    /// arithmetic.
+    #[test]
+    fn test_subsequence_integral_positions_are_unchanged() {
+        assert_eq!(subsequence_of_five(2.0, Some(3.0)), vec![2, 3, 4]);
+        assert_eq!(subsequence_of_five(3.0, None), vec![3, 4, 5]);
+        assert_eq!(subsequence_of_five(1.0, None), vec![1, 2, 3, 4, 5]);
+        assert_eq!(subsequence_of_five(-1.0, Some(4.0)), vec![1, 2]);
+        assert_eq!(subsequence_of_five(6.0, None), Vec::<i64>::new());
+        assert_eq!(subsequence_of_five(2.0, Some(0.0)), Vec::<i64>::new());
+    }
+
+    /// NaN and the infinities behave as they did: `fn:round` returns them
+    /// unchanged, so the argument guards still decide the result.
+    #[test]
+    fn test_subsequence_nan_and_infinite_arguments() {
+        assert_eq!(subsequence_of_five(f64::NAN, None), Vec::<i64>::new());
+        assert_eq!(subsequence_of_five(f64::NAN, Some(2.0)), Vec::<i64>::new());
+        assert_eq!(subsequence_of_five(2.0, Some(f64::NAN)), Vec::<i64>::new());
+        assert_eq!(subsequence_of_five(f64::INFINITY, None), Vec::<i64>::new());
+        assert_eq!(
+            subsequence_of_five(2.0, Some(f64::NEG_INFINITY)),
+            Vec::<i64>::new()
+        );
+        // -Infinity start with a finite length leaves no room for any position.
+        assert_eq!(
+            subsequence_of_five(f64::NEG_INFINITY, Some(4.0)),
+            Vec::<i64>::new()
+        );
+        // -Infinity start without a length keeps the whole sequence, and an
+        // infinite length runs to the end.
+        assert_eq!(
+            subsequence_of_five(f64::NEG_INFINITY, None),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(
+            subsequence_of_five(2.0, Some(f64::INFINITY)),
+            vec![2, 3, 4, 5]
+        );
     }
 
     // ========== unordered tests ==========

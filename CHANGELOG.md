@@ -62,6 +62,14 @@ queries of the XQuery test suite's relational use case.
   which for the largest `xs:double` below a half would have answered 1.
   `fn:round-half-to-even` is a different function and is unchanged; so are all
   W3C XSD and XQTS results.
+  `fn:subsequence` rounds `$startingLoc` and `$length` through the same helper:
+  F&O §15.1.10 defines its result as the items whose position `p` satisfies
+  `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
+  fn:round($length)`, and it kept a second, half-away-from-zero copy of the
+  rounding (whose comment claimed `fn:round-half-to-even`), so
+  `subsequence((1,2,3,4,5), -1.5, 4.5)` started at -2 and yielded `(1, 2)`
+  instead of the specified `(1, 2, 3)`. Integral positions, NaN and the
+  infinities are unaffected.
 - **`fn:codepoints-to-string` rejects a non-integer numeric argument.** Its
   declared parameter type is `xs:integer*`, and the function conversion rules of
   XPath 2.0 §3.1.5 cast only an `xs:untypedAtomic` item to it: numeric promotion
