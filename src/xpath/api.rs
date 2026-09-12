@@ -397,11 +397,12 @@ impl XPathExpr {
     /// inside predicates, `for` bodies and other nested foci.
     ///
     /// One [`FunctionCallRef`] per distinct `(namespace, local_name, arity)`
-    /// triple, in the order the calls were first seen. Namespaces are the URIs
-    /// the binder resolved for lookup (empty for unprefixed calls in XPath 1.0
-    /// mode). Constructor functions (`xs:integer(…)`) are rewritten into
-    /// `cast as` expressions during binding and are therefore not function
-    /// calls here.
+    /// triple, in the order the calls were first seen. The namespace is the one
+    /// the call actually **bound** to (the resolved function's own namespace),
+    /// so an unprefixed `count(...)` is reported in the `fn:` namespace in
+    /// XPath 1.0 mode as well. Constructor functions (`xs:integer(…)`) are
+    /// rewritten into `cast as` expressions during binding and are therefore
+    /// not function calls here.
     ///
     /// This is the hook for deciding impurity yourself: look for `fn:doc`,
     /// `fn:collection`, `fn:unparsed-text`, a host language's `document()` or

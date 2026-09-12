@@ -8,7 +8,7 @@
 use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::table::{NameTable, XS_NAMESPACE};
 use crate::xpath::api::XPathExpr;
-use crate::xpath::functions::{XPath10Catalog, FN_NAMESPACE};
+use crate::xpath::functions::{XPath10Catalog, FN_2010_NAMESPACE, FN_NAMESPACE};
 use crate::xpath::{XPathContext, XPathMode};
 
 /// Compile in XPath 2.0 mode with the given external variable names.
@@ -329,21 +329,25 @@ fn function_calls_are_distinct_and_nested_foci_included() {
 }
 
 #[test]
-fn function_calls_in_xpath10_mode_use_the_bound_namespace() {
-    // XPath 1.0 core functions are looked up without a namespace
-    // (XPathContext::default_function_namespace), which is what gets reported.
+fn function_calls_in_xpath10_mode_report_the_bound_namespace() {
+    // XPath 1.0 core functions are *looked up* without a namespace (the static
+    // context's default function namespace is empty in 1.0 mode) but they
+    // *bind* to the fn: entries via XPath10Catalog, and the bound namespace is
+    // what gets reported — so `namespace == FN_NAMESPACE` tests written by a
+    // caller work in both modes.
     let names = NameTable::new();
     let catalog = XPath10Catalog;
     let ctx = XPathContext::new(&names)
         .with_mode(XPathMode::XPath10)
         .with_function_catalog(&catalog);
-    let expr = XPathExpr::compile_with_vars("count(//a) + string-length(.)", &ctx, &[]).unwrap();
+    assert_eq!(ctx.default_function_namespace(), "");
 
+    let expr = XPathExpr::compile_with_vars("count(//a) + string-length(.)", &ctx, &[]).unwrap();
     assert_eq!(
         calls(&expr),
         vec![
-            (String::new(), "count".to_string(), 1),
-            (String::new(), "string-length".to_string(), 1),
+            (FN_NAMESPACE.to_string(), "count".to_string(), 1),
+            (FN_NAMESPACE.to_string(), "string-length".to_string(), 1),
         ]
     );
     // Focus analysis is mode-independent: `//a` reads the context node.
@@ -356,8 +360,34 @@ fn function_calls_in_xpath10_mode_use_the_bound_namespace() {
     assert_eq!(
         calls(&expr),
         vec![
-            (String::new(), "position".to_string(), 0),
-            (String::new(), "last".to_string(), 0),
+            (FN_NAMESPACE.to_string(), "position".to_string(), 0),
+            (FN_NAMESPACE.to_string(), "last".to_string(), 0),
         ]
+    );
+
+    // Identical triples in XPath 2.0 mode, where the same calls are looked up
+    // in fn: directly.
+    let expr20 = compile("position() = last()", &[]);
+    assert_eq!(calls(&expr20), calls(&expr));
+}
+
+#[test]
+fn function_calls_normalize_the_fn_namespace_alias() {
+    // A call written against the XPath 2010 fn: alias binds to the same
+    // registry entry, so it is reported under the canonical fn: namespace.
+    let names = NameTable::new();
+    let mut namespaces = NamespaceContextSnapshot::default();
+    namespaces
+        .bindings
+        .push((names.add("fn2010"), names.add(FN_2010_NAMESPACE)));
+    let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+    let expr = XPathExpr::compile("fn2010:count((1, 2))", &ctx).unwrap();
+
+    assert_eq!(
+        expr.function_calls()
+            .iter()
+            .map(|c| (c.namespace.clone(), c.local_name.clone(), c.arity))
+            .collect::<Vec<_>>(),
+        vec![(FN_NAMESPACE.to_string(), "count".to_string(), 1)]
     );
 }

@@ -49,7 +49,7 @@ use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{AstNode, FunctionCallNode};
 use crate::xpath::context::{VarSlotId, XPathContext};
 use crate::xpath::functions::extensible::handle_to_function_id;
-use crate::xpath::functions::FunctionId;
+use crate::xpath::functions::{FunctionId, FUNCTION_REGISTRY};
 
 // ============================================================================
 // FunctionCallRef
@@ -65,12 +65,20 @@ use crate::xpath::functions::FunctionId;
 /// `fn:unparsed-text`, an XSLT `key()` …) without this crate having to take a
 /// position on what "impure" means.
 ///
-/// `namespace` is the URI the binder used for function lookup: the resolution
-/// of the call's prefix, or the static context's default function namespace
-/// when the call is unprefixed. In XPath 1.0 mode that default is the empty
-/// string (core 1.0 functions are looked up without a namespace), so an
-/// unprefixed `count(...)` is reported with an empty `namespace` even though it
-/// binds to `fn:count`.
+/// `namespace` is the namespace the call actually **bound** to — the namespace
+/// of the resolved function's signature, not the way the call was spelled. So
+/// `count(...)` is reported in `http://www.w3.org/2005/xpath-functions` in both
+/// XPath 2.0 and XPath 1.0 mode, even though 1.0 mode looks core functions up
+/// without a namespace (`XPath10Catalog` resolves them through `FN_NAMESPACE`),
+/// and a call written against the `FN_2010_NAMESPACE` alias is reported under
+/// the canonical `fn:` namespace it resolves to. A test like
+/// `namespace == FN_NAMESPACE && local_name == "doc"` is therefore mode
+/// independent.
+///
+/// Only when no signature is reachable for the call — an unbound tree, or a
+/// catalog that does not describe its own handle — does this fall back to the
+/// lexical resolution of the prefix (or the static context's default function
+/// namespace for an unprefixed call).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FunctionCallRef {
     /// Namespace URI the call was bound in (may be empty).
@@ -361,17 +369,8 @@ impl Analyzer<'_, '_> {
 
     /// Add a distinct `(namespace, local name, arity)` entry for a call site.
     fn record_call(&mut self, call: &FunctionCallNode) {
-        // Mirror the namespace resolution of `bind_node` (src/xpath/bind.rs:146-154):
-        // an empty prefix means the default function namespace, otherwise the
-        // prefix is resolved in the static context. Binding has already
-        // succeeded here, so an unresolvable prefix cannot occur.
-        let namespace = if call.prefix.is_empty() {
-            self.ctx.default_function_namespace().to_string()
-        } else {
-            self.ctx.resolve_prefix(&call.prefix).unwrap_or_default()
-        };
         let entry = FunctionCallRef {
-            namespace,
+            namespace: self.bound_namespace(call),
             local_name: call.local_name.clone(),
             arity: call.args.len(),
         };
@@ -379,6 +378,42 @@ impl Analyzer<'_, '_> {
         // hash set here and keeps the reported order stable (source order).
         if !self.deps.function_calls.contains(&entry) {
             self.deps.function_calls.push(entry);
+        }
+    }
+
+    /// The namespace the call actually **bound** to.
+    ///
+    /// Taken from the signature of the resolved function, so the reported
+    /// namespace is the one the function is declared in rather than the way
+    /// the call happened to be spelled. That matters in XPath 1.0 mode, where
+    /// `XPath10Catalog` resolves an unprefixed core function through
+    /// `FN_NAMESPACE` while the static context's default function namespace is
+    /// the empty string (`functions/extensible.rs:577-590`,
+    /// `context.rs:167-175`), and for the `FN_2010_NAMESPACE` alias, which the
+    /// registry maps onto the same entries (`functions/registry.rs:110-140`).
+    ///
+    /// Falls back to the lexical resolution — the same one `bind_node` uses
+    /// (`bind.rs:146-154`) — only when no signature is reachable, i.e. when the
+    /// node carries no handle (an unbound tree) or the catalog does not know
+    /// the handle.
+    fn bound_namespace(&self, call: &FunctionCallNode) -> String {
+        if let Some(handle) = call.function_handle {
+            // Ask the catalog that bound the call; it knows custom functions too.
+            if let Some(signature) = self.ctx.function_catalog().get_signature(handle) {
+                return signature.namespace.to_string();
+            }
+            // Defensive: a catalog that cannot describe its own built-in
+            // handles still resolves through the built-in registry.
+            if let Ok(id) = handle_to_function_id(handle) {
+                if let Some(entry) = FUNCTION_REGISTRY.by_id(id) {
+                    return entry.signature.namespace.to_string();
+                }
+            }
+        }
+        if call.prefix.is_empty() {
+            self.ctx.default_function_namespace().to_string()
+        } else {
+            self.ctx.resolve_prefix(&call.prefix).unwrap_or_default()
         }
     }
 }
