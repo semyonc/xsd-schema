@@ -150,3 +150,137 @@ pub use value::{IntoContextNode, IntoXPathValue, Value};
 /// mechanical extension, and is not needed until a host wants to splice nodes
 /// from another tree implementation.
 pub type Nav<'a> = crate::document::BufferDocNavigator<'a>;
+
+#[cfg(test)]
+mod use_case_tests {
+    use std::path::{Path, PathBuf};
+
+    use bumpalo::Bump;
+
+    use super::order::{Direction, EmptyOrder};
+    use super::{pipe, ComposeError, Composer, Content, Form, IntoContent, IntoXPathValue, Name};
+    use crate::document::SerializeOptions;
+    use crate::namespace::NameTable;
+
+    /// The XQuery 1.0 test-suite root, or `None` when it is not around.
+    ///
+    /// Same convention as the conformance drivers: an environment variable
+    /// first, then the checkout next to this crate, and a printed message
+    /// rather than a failure when neither is there.
+    fn suite_root() -> Option<PathBuf> {
+        let candidate = match std::env::var_os("XQTS_DIR") {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from("../../XQTS_1_0_2"),
+        };
+        if candidate.join("TestSources/items.xml").is_file() {
+            Some(candidate)
+        } else {
+            println!(
+                "skipping: no XQuery test suite at {} (set XQTS_DIR)",
+                candidate.display()
+            );
+            None
+        }
+    }
+
+    /// The highest bid for every bicycle, in item-number order.
+    ///
+    /// The query this rewrites, from the test suite's relational use case:
+    ///
+    /// ```xquery
+    /// <result>{
+    ///   for $i in $input-context1//item_tuple
+    ///   let $b := $input-context2//bid_tuple[itemno = $i/itemno]
+    ///   where contains($i/description, "Bicycle")
+    ///   order by $i/itemno
+    ///   return <item_tuple>{ $i/itemno }{ $i/description }
+    ///          <high_bid>{ max($b/bid) }</high_bid></item_tuple>
+    /// }</result>
+    /// ```
+    ///
+    /// Written with [`Composer::eval`] and the [`Form`] API directly, since
+    /// the macros are a later step.
+    fn highest_bid_per_bicycle(root: &Path) -> Result<String, ComposeError> {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let c = Composer::new(&arena, &names);
+
+        let items = c.load_file(root.join("TestSources/items.xml"))?;
+        let bids = c.load_file(root.join("TestSources/bids.xml"))?;
+
+        // for $i in //item_tuple
+        let rows = pipe::nodes(c.eval("//item_tuple", &[], Some(items.root()), Vec::new())?)
+            // let $b := //bid_tuple[itemno = $i/itemno]
+            .try_map(|i| {
+                let b = c.eval(
+                    "//bid_tuple[itemno = $i/itemno]",
+                    &["i"],
+                    Some(bids.root()),
+                    vec![("i", (&i).into_xpath_value())],
+                )?;
+                Ok((i, b))
+            })
+            // where contains($i/description, "Bicycle")
+            .try_filter(|(i, _)| {
+                c.eval(
+                    "contains(description, 'Bicycle')",
+                    &[],
+                    Some(i.clone()),
+                    Vec::new(),
+                )?
+                .boolean()
+            })
+            // order by $i/itemno
+            .order_by(Direction::Ascending, EmptyOrder::Least, |(i, _)| {
+                c.eval("itemno", &[], Some(i.clone()), Vec::new())?.key()
+            })?
+            // return <item_tuple>…</item_tuple>
+            .try_map(|(i, b)| {
+                let mut high_bid = Form::new(Name::local("high_bid"));
+                high_bid.push(
+                    c.eval(
+                        "max($b/bid)",
+                        &["b"],
+                        None,
+                        vec![("b", (&b).into_xpath_value())],
+                    )?
+                    .into_content(),
+                );
+
+                let mut item = Form::new(Name::local("item_tuple"));
+                item.push(
+                    c.eval("itemno", &[], Some(i.clone()), Vec::new())?
+                        .into_content(),
+                )
+                .push(
+                    c.eval("description", &[], Some(i.clone()), Vec::new())?
+                        .into_content(),
+                )
+                .push(Content::Element(high_bid));
+                Ok(item)
+            });
+
+        let mut result = Form::new(Name::local("result"));
+        for row in rows {
+            result.push(Content::Element(row?));
+        }
+
+        c.build(result)?.to_xml(&SerializeOptions::default())
+    }
+
+    #[test]
+    fn the_relational_use_case_matches_its_oracle() {
+        let Some(root) = suite_root() else { return };
+
+        let written = highest_bid_per_bicycle(&root).expect("the composition succeeds");
+
+        // The expected result of the use case, byte for byte.
+        assert_eq!(
+            written,
+            "<result><item_tuple><itemno>1001</itemno><description>Red Bicycle</description><high_bid>55</high_bid></item_tuple>\
+             <item_tuple><itemno>1003</itemno><description>Old Bicycle</description><high_bid>20</high_bid></item_tuple>\
+             <item_tuple><itemno>1007</itemno><description>Racing Bicycle</description><high_bid>225</high_bid></item_tuple>\
+             <item_tuple><itemno>1008</itemno><description>Broken Bicycle</description><high_bid/></item_tuple></result>",
+        );
+    }
+}
