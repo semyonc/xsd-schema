@@ -43,6 +43,7 @@ use crate::namespace::qname::QualifiedName;
 use super::arena::{AstArena, AstNodeId, SourceSpan};
 use super::bind::bind_node;
 use super::context::{DynamicContext, NameBinder, VarSlotId, XPathContext};
+use super::deps::{analyze, ExprDependencies, FunctionCallRef};
 use super::error::XPathError;
 use super::eval::eval_node;
 use super::functions::{effective_boolean_value, XPathValue};
@@ -114,6 +115,9 @@ pub struct XPathExpr {
     var_slots: usize,
     /// External variables declared at compile time
     external_vars: Vec<ExternalVar>,
+    /// Compile-time dependency metadata (referenced externals, focus use,
+    /// function calls). Computed once after binding; see [`super::deps`].
+    deps: ExprDependencies,
 }
 
 impl XPathExpr {
@@ -215,6 +219,18 @@ impl XPathExpr {
 
         let var_slots = binder.len();
 
+        // External slots are allocated first, so they occupy 0..count and no
+        // expression-internal (for/some/every) variable can collide with them.
+        let external_slot_count = external_vars.len();
+        debug_assert!(external_vars
+            .iter()
+            .enumerate()
+            .all(|(i, v)| v.slot as usize == i));
+
+        // Compile-time only: collect referenced externals, focus use and the
+        // function-call inventory in a single post-bind walk.
+        let deps = analyze(&arena, root, ctx, external_slot_count);
+
         Ok(Self {
             source: expr.to_string(),
             arena,
@@ -222,6 +238,7 @@ impl XPathExpr {
             span,
             var_slots,
             external_vars,
+            deps,
         })
     }
 
@@ -238,6 +255,188 @@ impl XPathExpr {
     /// Get the external variables declared for this expression.
     pub fn external_vars(&self) -> &[ExternalVar] {
         &self.external_vars
+    }
+
+    /// The external variables this expression actually **references**.
+    ///
+    /// A subset of [`external_vars()`](Self::external_vars), which keeps
+    /// listing every name *supplied* to
+    /// [`compile_with_vars`](Self::compile_with_vars). Variables the
+    /// expression introduces itself (`for $i in …`, `some $i in …`) are never
+    /// reported, and a binding that shadows a declared external does not mark
+    /// that external as referenced.
+    ///
+    /// Callers that bind variable values per evaluation can use this to do
+    /// O(referenced) work instead of O(in-scope).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use xsd_schema::xpath::api::XPathExpr;
+    /// # use xsd_schema::xpath::XPathContext;
+    /// # use xsd_schema::namespace::table::NameTable;
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let expr = XPathExpr::compile_with_vars("$a + 1", &ctx, &["a", "b", "c"]).unwrap();
+    ///
+    /// // All three stay declared …
+    /// assert_eq!(expr.external_vars().len(), 3);
+    /// // … but only $a is referenced.
+    /// assert_eq!(expr.referenced_external_vars().count(), 1);
+    /// let slot_of_a = expr.external_vars()[0].slot;
+    /// let slot_of_b = expr.external_vars()[1].slot;
+    /// assert!(expr.references_external_var(slot_of_a));
+    /// assert!(!expr.references_external_var(slot_of_b));
+    /// ```
+    pub fn referenced_external_vars(&self) -> impl Iterator<Item = &ExternalVar> + '_ {
+        self.external_vars
+            .iter()
+            .filter(|var| self.deps.references_var(var.slot))
+    }
+
+    /// Whether the external variable in `slot` is referenced by this
+    /// expression. O(1) — backed by a bitset over the external slots.
+    ///
+    /// Returns `false` for any slot that is not an external variable of this
+    /// expression (including slots of its own `for`/`some`/`every` variables).
+    /// See [`referenced_external_vars()`](Self::referenced_external_vars) for
+    /// an example.
+    pub fn references_external_var(&self, slot: VarSlotId) -> bool {
+        self.deps.references_var(slot)
+    }
+
+    /// Whether evaluation reads the **initial** context item — the focus in
+    /// effect when the expression is entered (XPath 2.0 §2.1.2).
+    ///
+    /// Foci created *inside* the expression do not count: a predicate is
+    /// evaluated with the item being tested as its context item (§3.2.2), and
+    /// every path step after the first is evaluated against the items of the
+    /// previous step (§3.2). `for`, `some`/`every`, `if`, function arguments,
+    /// operators and comma sequences keep the enclosing focus.
+    ///
+    /// `false` means an evaluator may skip setting up a context item
+    /// altogether. A call to a custom (catalog-registered) function is
+    /// conservatively treated as reading the context item, since this crate
+    /// cannot inspect its body.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use xsd_schema::xpath::api::XPathExpr;
+    /// # use xsd_schema::xpath::XPathContext;
+    /// # use xsd_schema::namespace::table::NameTable;
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    ///
+    /// // A relative first step reads the context node …
+    /// let expr = XPathExpr::compile_with_vars("a[position() = 1]", &ctx, &[]).unwrap();
+    /// assert!(expr.uses_focus());
+    /// // … but the predicate runs in an inner focus.
+    /// assert!(!expr.uses_position());
+    ///
+    /// // Filtering a variable needs no focus at all.
+    /// let expr = XPathExpr::compile_with_vars("$x[position() = 1]", &ctx, &["x"]).unwrap();
+    /// assert!(!expr.uses_focus());
+    /// assert!(!expr.uses_position());
+    /// ```
+    pub fn uses_focus(&self) -> bool {
+        self.deps.uses_focus()
+    }
+
+    /// Whether `fn:position()` is evaluated against the **initial** focus.
+    ///
+    /// `position()` inside a predicate or a non-first path step refers to that
+    /// inner focus and is not reported. Implies
+    /// [`uses_focus()`](Self::uses_focus), since the context position is part
+    /// of the focus (§2.1.2).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use xsd_schema::xpath::api::XPathExpr;
+    /// # use xsd_schema::xpath::XPathContext;
+    /// # use xsd_schema::namespace::table::NameTable;
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let expr = XPathExpr::compile_with_vars("position() = 1", &ctx, &[]).unwrap();
+    /// assert!(expr.uses_position());
+    /// assert!(expr.uses_focus());
+    /// ```
+    pub fn uses_position(&self) -> bool {
+        self.deps.uses_position()
+    }
+
+    /// Whether `fn:last()` is evaluated against the **initial** focus.
+    ///
+    /// As with [`uses_position()`](Self::uses_position), a `last()` inside a
+    /// predicate or a later path step belongs to that inner focus:
+    /// `count(//a[last()])` reports `uses_last() == false` (and
+    /// `uses_focus() == true`, because `//` starts from the root of the context
+    /// node).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use xsd_schema::xpath::api::XPathExpr;
+    /// # use xsd_schema::xpath::XPathContext;
+    /// # use xsd_schema::namespace::table::NameTable;
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let expr = XPathExpr::compile_with_vars("last()", &ctx, &[]).unwrap();
+    /// assert!(expr.uses_last());
+    ///
+    /// let expr = XPathExpr::compile_with_vars("count(//a[last()])", &ctx, &[]).unwrap();
+    /// assert!(!expr.uses_last());
+    /// assert!(expr.uses_focus());
+    /// ```
+    pub fn uses_last(&self) -> bool {
+        self.deps.uses_last()
+    }
+
+    /// The distinct functions called anywhere in this expression, including
+    /// inside predicates, `for` bodies and other nested foci.
+    ///
+    /// One [`FunctionCallRef`] per distinct `(namespace, local_name, arity)`
+    /// triple, in the order the calls were first seen. The namespace is the one
+    /// the call actually **bound** to (the resolved function's own namespace),
+    /// so an unprefixed `count(...)` is reported in the `fn:` namespace in
+    /// XPath 1.0 mode as well. Constructor functions (`xs:integer(…)`) are
+    /// rewritten into `cast as` expressions during binding and are therefore
+    /// not function calls here.
+    ///
+    /// This is the hook for deciding impurity yourself: look for `fn:doc`,
+    /// `fn:collection`, `fn:unparsed-text`, a host language's `document()` or
+    /// `key()`, and so on.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use xsd_schema::xpath::api::XPathExpr;
+    /// # use xsd_schema::xpath::XPathContext;
+    /// # use xsd_schema::namespace::table::NameTable;
+    /// const FN: &str = "http://www.w3.org/2005/xpath-functions";
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let expr =
+    ///     XPathExpr::compile_with_vars("count(distinct-values($s)) + string-length()", &ctx, &["s"])
+    ///         .unwrap();
+    ///
+    /// let calls: Vec<(&str, &str, usize)> = expr
+    ///     .function_calls()
+    ///     .iter()
+    ///     .map(|c| (c.namespace.as_str(), c.local_name.as_str(), c.arity))
+    ///     .collect();
+    /// assert_eq!(
+    ///     calls,
+    ///     vec![
+    ///         (FN, "count", 1),
+    ///         (FN, "distinct-values", 1),
+    ///         (FN, "string-length", 0),
+    ///     ]
+    /// );
+    /// ```
+    pub fn function_calls(&self) -> &[FunctionCallRef] {
+        self.deps.function_calls()
     }
 
     /// Borrow the bound AST arena of this expression.
@@ -640,25 +839,35 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
     ///     })
     ///     .unwrap();
     /// ```
+    ///
+    /// # Callback lifetimes
+    ///
+    /// Only the `&mut` borrow of the [`TypedEvaluator`] is higher-ranked; the expression
+    /// and static-context lifetimes are this evaluator's own `'expr` and `'ctx`. That is
+    /// what lets the callback install borrowed state that lives in the caller's frame —
+    /// e.g. [`DynamicContext::set_extension`] or
+    /// [`DynamicContext::set_function_evaluator`] with a local — instead of only
+    /// `'static` data.
     pub fn run_with<N, F>(self, setup: F) -> Result<XPathValue<N>, XPathError>
     where
-        N: DomNavigator,
-        F: for<'a> FnOnce(&mut TypedEvaluator<'_, '_, 'a, N>),
+        N: DomNavigator + 'ctx,
+        F: for<'d> FnOnce(&mut TypedEvaluator<'expr, 'ctx, 'd, N>),
     {
         self.run_with_node_and_setup(None, setup)
     }
 
     /// Evaluate with a context node and setup callback for advanced variable binding.
     ///
-    /// Combines `run_with_node` and `run_with` functionality.
+    /// Combines `run_with_node` and `run_with` functionality. See
+    /// [`run_with`](Self::run_with) for the callback's lifetimes.
     pub fn run_with_node_and_setup<N, F>(
         self,
         context_node: Option<N>,
         setup: F,
     ) -> Result<XPathValue<N>, XPathError>
     where
-        N: DomNavigator,
-        F: for<'a> FnOnce(&mut TypedEvaluator<'_, '_, 'a, N>),
+        N: DomNavigator + 'ctx,
+        F: for<'d> FnOnce(&mut TypedEvaluator<'expr, 'ctx, 'd, N>),
     {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);

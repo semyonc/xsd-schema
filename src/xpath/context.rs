@@ -52,6 +52,12 @@ pub struct XPathContext<'a> {
     pub trace_enabled: bool,
     /// Function catalog for bind-time lookup (None = use builtins).
     function_catalog: Option<&'a dyn FunctionCatalog>,
+    /// Owned default function namespace, set by
+    /// [`with_default_function_ns_owned`](Self::with_default_function_ns_owned).
+    ///
+    /// Takes precedence over the `default_function_ns` field when set; see
+    /// [`default_function_namespace`](Self::default_function_namespace).
+    default_function_ns_owned: Option<String>,
 }
 
 impl<'a> XPathContext<'a> {
@@ -68,6 +74,7 @@ impl<'a> XPathContext<'a> {
             mode: XPathMode::XPath20,
             trace_enabled: false,
             function_catalog: None,
+            default_function_ns_owned: None,
         }
     }
 
@@ -92,6 +99,45 @@ impl<'a> XPathContext<'a> {
     /// Set the default function namespace
     pub fn with_default_function_ns(mut self, ns: &'static str) -> Self {
         self.default_function_ns = Some(ns);
+        self
+    }
+
+    /// Set the default function namespace from an owned string.
+    ///
+    /// This is the counterpart of [`with_default_function_ns`](Self::with_default_function_ns)
+    /// for namespaces that are only known at runtime — for example one read from a
+    /// configuration file or a host document — and that therefore
+    /// cannot be a `&'static str` without leaking. The string is stored in a private field,
+    /// so the public `default_function_ns` field and its `&'static str` setter keep working
+    /// unchanged.
+    ///
+    /// # Precedence
+    ///
+    /// [`default_function_namespace`](Self::default_function_namespace) resolves, in order:
+    ///
+    /// 1. in [`XPathMode::XPath10`] the empty namespace
+    ///    (unchanged: XPath 1.0 core functions live in no namespace, and neither setter
+    ///    overrides that);
+    /// 2. the value set here, if any;
+    /// 3. the public `default_function_ns` field, if `Some`;
+    /// 4. the `fn:` namespace.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::xpath::XPathContext;
+    ///
+    /// // A namespace computed at runtime, not a literal.
+    /// let host_ns = format!("http://example.com/fn/v{}", 2);
+    ///
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names).with_default_function_ns_owned(host_ns);
+    ///
+    /// assert_eq!(ctx.default_function_namespace(), "http://example.com/fn/v2");
+    /// ```
+    pub fn with_default_function_ns_owned(mut self, ns: impl Into<String>) -> Self {
+        self.default_function_ns_owned = Some(ns.into());
         self
     }
 
@@ -164,12 +210,26 @@ impl<'a> XPathContext<'a> {
     ///
     /// In XPath 1.0 mode, core functions live in no namespace (empty string).
     /// In XPath 2.0 mode, the default is the fn: namespace.
+    ///
+    /// # Precedence
+    ///
+    /// 1. [`XPathMode::XPath10`] always yields `""` — XPath
+    ///    1.0 core functions live in no namespace, and neither of the two setters overrides
+    ///    that.
+    /// 2. Otherwise the owned namespace set by
+    ///    [`with_default_function_ns_owned`](Self::with_default_function_ns_owned), if any.
+    /// 3. Otherwise the public `default_function_ns` field (set by
+    ///    [`with_default_function_ns`](Self::with_default_function_ns)), if `Some`.
+    /// 4. Otherwise the `fn:` namespace.
     pub fn default_function_namespace(&self) -> &str {
         match self.mode {
             XPathMode::XPath10 => "",
-            XPathMode::XPath20 => self
-                .default_function_ns
-                .unwrap_or(super::functions::FN_NAMESPACE),
+            XPathMode::XPath20 => match self.default_function_ns_owned.as_deref() {
+                Some(ns) => ns,
+                None => self
+                    .default_function_ns
+                    .unwrap_or(super::functions::FN_NAMESPACE),
+            },
         }
     }
 
@@ -423,6 +483,10 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     pub variables: VarStore<super::functions::XPathValue<N>>,
     /// Function evaluator for eval-time dispatch (None = use builtins).
     function_evaluator: Option<&'a dyn FunctionEvaluator<N>>,
+    /// Host/engine state for extension functions (None = no state).
+    ///
+    /// See [`with_extension`](Self::with_extension).
+    extension: Option<&'a dyn std::any::Any>,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -440,6 +504,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             base_uri: static_context.base_uri.clone(),
             variables: VarStore::new(var_count),
             function_evaluator: None,
+            extension: None,
         }
     }
 
@@ -513,6 +578,31 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         self
     }
 
+    /// Set or clear the function evaluator on an existing dynamic context.
+    ///
+    /// The mutable-reference counterpart of
+    /// [`with_function_evaluator`](Self::with_function_evaluator), for contexts that are
+    /// already built. This is what makes custom functions reachable through the high-level
+    /// API: [`XPathEvaluator::run_with`](crate::xpath::XPathEvaluator::run_with) and
+    /// [`run_with_node_and_setup`](crate::xpath::XPathEvaluator::run_with_node_and_setup)
+    /// create the dynamic context themselves and hand it to the setup callback through
+    /// [`TypedEvaluator::context`](crate::xpath::TypedEvaluator::context), where only a
+    /// `&mut DynamicContext` is available. Passing `None` restores built-in dispatch.
+    ///
+    /// The evaluator must be the one whose
+    /// [`FunctionCatalog`] was used to compile the
+    /// expression — handles from one catalog are meaningless to another. With
+    /// [`FunctionSet`](crate::xpath::functions::FunctionSet) the same value is both, so pass
+    /// it to [`XPathContext::with_function_catalog`] and to this method.
+    ///
+    /// # Example
+    ///
+    /// See [`set_extension`](Self::set_extension) for a complete `run_with` example that
+    /// installs a `FunctionSet` and the state its function reads.
+    pub fn set_function_evaluator(&mut self, evaluator: Option<&'a dyn FunctionEvaluator<N>>) {
+        self.function_evaluator = evaluator;
+    }
+
     /// Get the function evaluator, using built-in functions as default.
     ///
     /// Returns a reference to the configured evaluator, or `BuiltinEvaluator` if none set.
@@ -524,6 +614,183 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     /// Check if a custom function evaluator is configured.
     pub fn has_custom_evaluator(&self) -> bool {
         self.function_evaluator.is_some()
+    }
+
+    /// Attach host state for extension functions (builder form).
+    ///
+    /// [`FunctionEvaluator::eval`] takes
+    /// `&self`, so a custom function cannot keep mutable state on the evaluator itself. The
+    /// extension slot is the supported way to give it per-run engine or host state without
+    /// changing that contract: the host stores a `&dyn Any` on the dynamic context, and the
+    /// function reads it back with [`extension`](Self::extension), using interior mutability
+    /// (`Cell`, `RefCell`, atomics) for whatever it needs to update.
+    ///
+    /// The slot holds a single value. Hosts that need several pieces of state put them in one
+    /// struct — that also keeps the downcast target unambiguous.
+    ///
+    /// This is the builder form, for code that constructs its own `DynamicContext`. Through
+    /// the high-level API the dynamic context is created for you, so use
+    /// [`set_extension`](Self::set_extension) inside the
+    /// [`run_with`](crate::xpath::XPathEvaluator::run_with) setup callback instead — its
+    /// example shows the complete public-API flow.
+    ///
+    /// # Lifetime
+    ///
+    /// The reference is `&'a`, the same lifetime parameter as the borrowed
+    /// [`XPathContext`], so the state lives *alongside* the static context: it has to
+    /// outlive this `DynamicContext`, which means an enclosing scope (or a leak, for
+    /// `&'static`) — not a temporary created in the evaluating call. The whole expression
+    /// evaluates against one dynamic context — sub-expressions (predicates, path steps,
+    /// `for` and quantified bodies, nested calls) reuse it and only save/restore the focus —
+    /// so a value set here is visible to every `eval` call the expression makes.
+    ///
+    /// # Example
+    ///
+    /// A custom function that counts its own calls through the extension slot, driven from
+    /// the low-level `parse`/`bind_node`/`eval_node` path; the expression body runs the
+    /// function once per `for` iteration:
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    /// use xsd_schema::namespace::context::NamespaceContextSnapshot;
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::types::sequence::SequenceType;
+    /// use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+    /// use xsd_schema::xpath::{
+    ///     bind_node, eval_node, parse, DynamicContext, NameBinder, RoXmlNavigator, XPathContext,
+    /// };
+    ///
+    /// /// Host state: how many times the extension function ran.
+    /// struct CallCounter {
+    ///     calls: Cell<u32>,
+    /// }
+    ///
+    /// let mut functions: FunctionSet<RoXmlNavigator<'static>> = FunctionSet::with_builtins();
+    /// functions.register(
+    ///     DynamicFunctionSignature::new(
+    ///         "http://example.com/ext",
+    ///         "tick",
+    ///         vec![],
+    ///         SequenceType::integer(),
+    ///     ),
+    ///     |ctx, _args| {
+    ///         // Read the host state back out of the dynamic context.
+    ///         let counter = ctx.extension::<CallCounter>().expect("counter installed");
+    ///         counter.calls.set(counter.calls.get() + 1);
+    ///         Ok(XPathValue::integer(counter.calls.get() as i64))
+    ///     },
+    /// );
+    ///
+    /// let names = NameTable::new();
+    /// let mut namespaces = NamespaceContextSnapshot::default();
+    /// namespaces
+    ///     .bindings
+    ///     .push((names.add("ext"), names.add("http://example.com/ext")));
+    /// let ctx = XPathContext::new(&names)
+    ///     .with_namespaces(namespaces)
+    ///     .with_function_catalog(&functions);
+    ///
+    /// // The state lives alongside the context it is attached to.
+    /// let counter = CallCounter { calls: Cell::new(0) };
+    ///
+    /// let mut parsed = parse("for $i in (1, 2, 3) return ext:tick()").unwrap();
+    /// let mut binder = NameBinder::new();
+    /// bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder).unwrap();
+    ///
+    /// let mut dyn_ctx: DynamicContext<'_, RoXmlNavigator<'static>> =
+    ///     DynamicContext::new(&ctx, binder.len())
+    ///         .with_function_evaluator(&functions)
+    ///         .with_extension(&counter);
+    /// eval_node(&parsed.arena, parsed.root, &mut dyn_ctx).unwrap();
+    ///
+    /// assert_eq!(counter.calls.get(), 3);
+    /// ```
+    pub fn with_extension(mut self, ext: &'a dyn std::any::Any) -> Self {
+        self.extension = Some(ext);
+        self
+    }
+
+    /// Set or clear the extension slot on an existing dynamic context.
+    ///
+    /// The mutable-reference counterpart of [`with_extension`](Self::with_extension), for
+    /// contexts that are already built — for example inside a
+    /// [`run_with`](crate::xpath::XPathEvaluator::run_with) setup callback, which hands out
+    /// `&mut DynamicContext` through
+    /// [`TypedEvaluator::context`](crate::xpath::TypedEvaluator::context). Passing `None`
+    /// clears the slot.
+    ///
+    /// # Example
+    ///
+    /// The whole flow through the high-level API: one
+    /// [`FunctionSet`](crate::xpath::functions::FunctionSet) serves as the compile-time
+    /// catalog and the eval-time evaluator, and the state it reads is a plain local — the
+    /// setup callback borrows the caller's frame, no `'static` and no leak.
+    ///
+    /// ```
+    /// use std::cell::Cell;
+    /// use xsd_schema::namespace::context::NamespaceContextSnapshot;
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::types::sequence::SequenceType;
+    /// use xsd_schema::xpath::api::XPathExpr;
+    /// use xsd_schema::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+    /// use xsd_schema::xpath::{RoXmlNavigator, XPathContext};
+    ///
+    /// /// Host state: how many times the extension function ran.
+    /// struct CallCounter {
+    ///     calls: Cell<u32>,
+    /// }
+    ///
+    /// let mut functions: FunctionSet<RoXmlNavigator<'static>> = FunctionSet::with_builtins();
+    /// functions.register(
+    ///     DynamicFunctionSignature::new(
+    ///         "http://example.com/ext",
+    ///         "tick",
+    ///         vec![],
+    ///         SequenceType::integer(),
+    ///     ),
+    ///     |ctx, _args| {
+    ///         let counter = ctx.extension::<CallCounter>().expect("counter installed");
+    ///         counter.calls.set(counter.calls.get() + 1);
+    ///         Ok(XPathValue::integer(counter.calls.get() as i64))
+    ///     },
+    /// );
+    ///
+    /// let names = NameTable::new();
+    /// let mut namespaces = NamespaceContextSnapshot::default();
+    /// namespaces
+    ///     .bindings
+    ///     .push((names.add("ext"), names.add("http://example.com/ext")));
+    /// let ctx = XPathContext::new(&names)
+    ///     .with_namespaces(namespaces)
+    ///     .with_function_catalog(&functions);
+    ///
+    /// let expr = XPathExpr::compile("for $i in (1, 2, 3) return ext:tick()", &ctx).unwrap();
+    ///
+    /// // A local on the stack — not leaked, not `'static`.
+    /// let counter = CallCounter { calls: Cell::new(0) };
+    ///
+    /// let result = expr
+    ///     .evaluator(&ctx)
+    ///     .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+    ///         let dyn_ctx = eval.context();
+    ///         dyn_ctx.set_function_evaluator(Some(&functions));
+    ///         dyn_ctx.set_extension(Some(&counter));
+    ///     })
+    ///     .unwrap();
+    ///
+    /// assert_eq!(result.into_vec().len(), 3);
+    /// assert_eq!(counter.calls.get(), 3);
+    /// ```
+    pub fn set_extension(&mut self, ext: Option<&'a dyn std::any::Any>) {
+        self.extension = ext;
+    }
+
+    /// Read the extension slot, downcast to `T`.
+    ///
+    /// Returns `None` if no extension is set or if the stored value is not a `T`; see
+    /// [`with_extension`](Self::with_extension) for the intended use and lifetime.
+    pub fn extension<T: std::any::Any>(&self) -> Option<&'a T> {
+        self.extension.and_then(|ext| ext.downcast_ref::<T>())
     }
 
     /// Evaluate a function using the configured evaluator.
@@ -669,5 +936,337 @@ mod tests {
             result,
             Err(super::super::error::XPathError::XPST0008 { .. })
         ));
+    }
+}
+
+// ============================================================================
+// Tests: DynamicContext extension slot, owned default function namespace
+// ============================================================================
+
+#[cfg(test)]
+mod extension_slot_tests {
+    use super::{DynamicContext, NameBinder, XPathContext};
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::namespace::table::NameTable;
+    use crate::types::sequence::SequenceType;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::bind::bind_node;
+    use crate::xpath::eval::eval_node;
+    use crate::xpath::functions::{DynamicFunctionSignature, FunctionSet, XPathValue};
+    use crate::xpath::parser::parse;
+    use crate::xpath::{DomNavigator, RoXmlNavigator, XPathMode};
+    use std::cell::Cell;
+
+    type Nav = RoXmlNavigator<'static>;
+
+    const EXT_NS: &str = "http://example.com/ext";
+
+    /// Host state reached through the extension slot: `FunctionEvaluator::eval` takes
+    /// `&self`, so the mutable state lives in a `Cell` behind the shared reference.
+    #[derive(Default)]
+    struct CallCounter {
+        calls: Cell<u32>,
+    }
+
+    /// A second `Any` type, to check that `extension::<T>()` is type-checked.
+    struct OtherState;
+
+    /// A function set with `my:tick()`: increments the counter found in the extension
+    /// slot and returns its new value (0 when no counter is installed).
+    fn tick_functions<N: DomNavigator>() -> FunctionSet<N> {
+        let mut functions: FunctionSet<N> = FunctionSet::with_builtins();
+        functions.register(
+            DynamicFunctionSignature::new(EXT_NS, "tick", vec![], SequenceType::integer()),
+            |ctx, _args| match ctx.extension::<CallCounter>() {
+                Some(counter) => {
+                    counter.calls.set(counter.calls.get() + 1);
+                    Ok(XPathValue::integer(i64::from(counter.calls.get())))
+                }
+                None => Ok(XPathValue::integer(0)),
+            },
+        );
+        functions
+    }
+
+    /// Bind the `my` prefix for `EXT_NS` in a fresh snapshot.
+    fn ext_namespaces(names: &NameTable) -> NamespaceContextSnapshot {
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces
+            .bindings
+            .push((names.add("my"), names.add(EXT_NS)));
+        namespaces
+    }
+
+    /// Compile and evaluate `expr` with `my:tick()` available and `counter` in the
+    /// extension slot.
+    fn eval_with_counter(expr: &str, counter: &CallCounter) -> XPathValue<Nav> {
+        let names = NameTable::new();
+        let functions: FunctionSet<Nav> = tick_functions();
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(ext_namespaces(&names))
+            .with_function_catalog(&functions);
+
+        let mut parsed = parse(expr).unwrap();
+        let mut binder = NameBinder::new();
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx: DynamicContext<'_, Nav> = DynamicContext::new(&ctx, binder.len())
+            .with_function_evaluator(&functions)
+            .with_extension(counter);
+
+        eval_node(&parsed.arena, parsed.root, &mut dyn_ctx).unwrap()
+    }
+
+    #[test]
+    fn test_extension_visible_in_for_body() {
+        let counter = CallCounter::default();
+        let result = eval_with_counter("for $i in (1, 2, 3) return my:tick()", &counter);
+        assert_eq!(counter.calls.get(), 3);
+        // The slot is the *same* state across iterations, so the values increase.
+        let values: Vec<String> = result
+            .into_vec()
+            .into_iter()
+            .map(|item| {
+                XPathValue::<Nav>::from_item(item)
+                    .as_integer()
+                    .expect("integer result")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(values, vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn test_extension_visible_in_predicate() {
+        let counter = CallCounter::default();
+        let result = eval_with_counter("(1, 2, 3)[my:tick() > 0]", &counter);
+        // One predicate evaluation per input item.
+        assert_eq!(counter.calls.get(), 3);
+        assert_eq!(result.into_vec().len(), 3);
+    }
+
+    #[test]
+    fn test_extension_visible_in_quantified_body() {
+        let counter = CallCounter::default();
+        let result = eval_with_counter("some $i in (1, 2) satisfies my:tick() > 0", &counter);
+        assert_eq!(result.as_bool(), Some(true));
+        // `some` short-circuits on the first true item, so exactly one call happened.
+        assert_eq!(counter.calls.get(), 1);
+
+        // `every` has to visit both items.
+        let counter = CallCounter::default();
+        let result = eval_with_counter("every $i in (1, 2) satisfies my:tick() > 0", &counter);
+        assert_eq!(result.as_bool(), Some(true));
+        assert_eq!(counter.calls.get(), 2);
+    }
+
+    #[test]
+    fn test_extension_visible_in_nested_calls() {
+        let counter = CallCounter::default();
+        let result = eval_with_counter("my:tick() + my:tick()", &counter);
+        assert_eq!(counter.calls.get(), 2);
+        // 1 + 2 — both calls saw the same counter.
+        assert_eq!(result.as_integer().map(|i| i.to_string()), Some("3".into()));
+    }
+
+    #[test]
+    fn test_extension_without_counter_installed() {
+        // The same function set, but no extension in the context: the function sees None.
+        let names = NameTable::new();
+        let functions: FunctionSet<Nav> = tick_functions();
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(ext_namespaces(&names))
+            .with_function_catalog(&functions);
+
+        let mut parsed = parse("my:tick()").unwrap();
+        let mut binder = NameBinder::new();
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx: DynamicContext<'_, Nav> =
+            DynamicContext::new(&ctx, binder.len()).with_function_evaluator(&functions);
+        assert!(dyn_ctx.extension::<CallCounter>().is_none());
+
+        let result = eval_node(&parsed.arena, parsed.root, &mut dyn_ctx).unwrap();
+        assert_eq!(result.as_integer().map(|i| i.to_string()), Some("0".into()));
+    }
+
+    #[test]
+    fn test_extension_downcast_is_type_checked() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let counter = CallCounter::default();
+
+        let dyn_ctx: DynamicContext<'_, Nav> =
+            DynamicContext::new(&ctx, 0).with_extension(&counter);
+
+        assert!(dyn_ctx.extension::<CallCounter>().is_some());
+        assert!(dyn_ctx.extension::<OtherState>().is_none());
+    }
+
+    #[test]
+    fn test_set_extension_installs_and_clears() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let counter = CallCounter::default();
+
+        let mut dyn_ctx: DynamicContext<'_, Nav> = DynamicContext::new(&ctx, 0);
+        assert!(dyn_ctx.extension::<CallCounter>().is_none());
+
+        dyn_ctx.set_extension(Some(&counter));
+        assert!(dyn_ctx.extension::<CallCounter>().is_some());
+
+        dyn_ctx.set_extension(None);
+        assert!(dyn_ctx.extension::<CallCounter>().is_none());
+    }
+
+    #[test]
+    fn test_default_function_ns_owned_binds_unprefixed_call() {
+        // A namespace that only exists at runtime — no `&'static str` available.
+        let runtime_ns = format!("http://example.com/{}/ext", "runtime");
+
+        let mut functions: FunctionSet<Nav> = FunctionSet::with_builtins();
+        functions.register(
+            DynamicFunctionSignature::new(
+                runtime_ns.as_str(),
+                "answer",
+                vec![],
+                SequenceType::integer(),
+            ),
+            |_ctx, _args| Ok(XPathValue::integer(42)),
+        );
+
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names)
+            .with_default_function_ns_owned(runtime_ns.clone())
+            .with_function_catalog(&functions);
+        assert_eq!(ctx.default_function_namespace(), runtime_ns);
+
+        // Unprefixed call binds against the owned default function namespace.
+        let mut parsed = parse("answer()").unwrap();
+        let mut binder = NameBinder::new();
+        bind_node(&mut parsed.arena, parsed.root, &ctx, &mut binder).unwrap();
+
+        let mut dyn_ctx: DynamicContext<'_, Nav> =
+            DynamicContext::new(&ctx, binder.len()).with_function_evaluator(&functions);
+        let result = eval_node(&parsed.arena, parsed.root, &mut dyn_ctx).unwrap();
+        assert_eq!(
+            result.as_integer().map(|i| i.to_string()),
+            Some("42".into())
+        );
+    }
+
+    #[test]
+    fn test_default_function_ns_owned_wins_over_static_field() {
+        let names = NameTable::new();
+
+        let ctx = XPathContext::new(&names)
+            .with_default_function_ns("http://example.com/static")
+            .with_default_function_ns_owned(format!("http://example.com/{}", "owned"));
+        assert_eq!(ctx.default_function_namespace(), "http://example.com/owned");
+        // The public field keeps the value it was given.
+        assert_eq!(ctx.default_function_ns, Some("http://example.com/static"));
+
+        // Order of the two setters does not matter.
+        let ctx = XPathContext::new(&names)
+            .with_default_function_ns_owned("http://example.com/owned")
+            .with_default_function_ns("http://example.com/static");
+        assert_eq!(ctx.default_function_namespace(), "http://example.com/owned");
+
+        // Without the owned value the static field still wins over fn:.
+        let ctx = XPathContext::new(&names).with_default_function_ns("http://example.com/static");
+        assert_eq!(
+            ctx.default_function_namespace(),
+            "http://example.com/static"
+        );
+
+        // XPath 1.0 mode still yields the empty namespace (neither setter overrides it).
+        let ctx = XPathContext::new(&names)
+            .with_mode(XPathMode::XPath10)
+            .with_default_function_ns_owned("http://example.com/owned");
+        assert_eq!(ctx.default_function_namespace(), "");
+    }
+
+    #[test]
+    fn test_public_api_run_with_evaluator_and_extension() {
+        // Everything through the public API: one FunctionSet is both the compile-time
+        // catalog and the eval-time evaluator, installed from the setup callback.
+        let names = NameTable::new();
+        let functions: FunctionSet<Nav> = tick_functions();
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(ext_namespaces(&names))
+            .with_function_catalog(&functions);
+
+        let expr = XPathExpr::compile("for $i in (1, 2, 3) return my:tick()", &ctx).unwrap();
+
+        // Non-`'static` local state: lives on this stack frame, never leaked.
+        let counter = CallCounter::default();
+
+        let result = expr
+            .evaluator(&ctx)
+            .run_with::<Nav, _>(|te| {
+                let dyn_ctx = te.context();
+                dyn_ctx.set_function_evaluator(Some(&functions));
+                dyn_ctx.set_extension(Some(&counter));
+            })
+            .unwrap();
+
+        assert_eq!(counter.calls.get(), 3);
+        assert_eq!(result.into_vec().len(), 3);
+    }
+
+    #[test]
+    fn test_public_api_run_with_node_and_setup_extension() {
+        // Same, through `run_with_node_and_setup`, with a context node and a predicate:
+        // the borrowed state also reaches per-item predicate evaluation.
+        let doc = roxmltree::Document::parse("<root><item/><item/></root>").unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // <root>
+
+        let names = NameTable::new();
+        let functions: FunctionSet<RoXmlNavigator<'_>> = tick_functions();
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(ext_namespaces(&names))
+            .with_function_catalog(&functions);
+
+        let expr = XPathExpr::compile("item[my:tick() > 0]", &ctx).unwrap();
+
+        let counter = CallCounter::default();
+
+        let result = expr
+            .evaluator(&ctx)
+            .run_with_node_and_setup(Some(nav), |te| {
+                let dyn_ctx = te.context();
+                dyn_ctx.set_function_evaluator(Some(&functions));
+                dyn_ctx.set_extension(Some(&counter));
+            })
+            .unwrap();
+
+        assert_eq!(counter.calls.get(), 2);
+        assert_eq!(result.into_vec().len(), 2);
+    }
+
+    #[test]
+    fn test_set_function_evaluator_installs_and_clears() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let functions: FunctionSet<Nav> = tick_functions();
+
+        let mut dyn_ctx: DynamicContext<'_, Nav> = DynamicContext::new(&ctx, 0);
+        assert!(!dyn_ctx.has_custom_evaluator());
+
+        dyn_ctx.set_function_evaluator(Some(&functions));
+        assert!(dyn_ctx.has_custom_evaluator());
+
+        dyn_ctx.set_function_evaluator(None);
+        assert!(!dyn_ctx.has_custom_evaluator());
+    }
+
+    #[test]
+    fn test_xpath_expr_send_sync() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<crate::xpath::api::XPathExpr>();
+        assert_sync::<crate::xpath::api::XPathExpr>();
     }
 }

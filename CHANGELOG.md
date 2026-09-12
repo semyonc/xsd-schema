@@ -11,6 +11,12 @@ Phases P0 and P1 of `XSD_COMPILER_REWORK.md` (branch
 `perf/compiler-rework-p0-p1`): the exact-occurrence correction with its
 resource-failure contract, plus the two measurement-phase allocation gates.
 
+Also a set of additive extensions for hosts that embed the XPath engine
+and work with more than one document: multi-document node identity,
+`DomNavigator::type_annotation`, `XPathExpr` dependency metadata, the
+`DynamicContext` extension slot and `set_function_evaluator`, an owned
+default function namespace, and `BufferDocument::serial()`.
+
 ### Removed
 
 - **The never-constructed all-group-extension composite matcher.**
@@ -102,6 +108,26 @@ resource-failure contract, plus the two measurement-phase allocation gates.
   validated as if the type were empty. The failure is now recorded
   (`SchemaValidator::content_model_failures`) and raised as an operational
   failure (`validation-preparation-failed`) when such a type is first used.
+- **Node identity now includes the document.**
+  `BufferDocNavigator::is_same_position` compared `current`, `virtual_parent`,
+  `current_ns` and `attr_index` — each an index into *one* `BufferDocument` —
+  but not the document itself, and `RoXmlNavigator::is_same_position` compared
+  roxmltree `NodeId`s, which are per `Document`. Two navigators on the same
+  node index of two different documents therefore compared equal. XPath 2.0
+  §3.5.3: "A comparison with the `is` operator is true if the two operand
+  nodes have the same identity, and are thus the same node; otherwise it is
+  `false`." `is`, `<<` and `>>` were unaffected (they go through
+  `compare_position`, which already compared the document); the reachable
+  consequence was in `union`, `intersect` and `except`, which "eliminate
+  duplicate nodes from their result sequences based on node identity"
+  (§3.3.3) — `$a/root/x | $b/root/x` over two same-shaped documents yielded 2
+  nodes instead of 4 — and in the adjacent-duplicate check of
+  `DocumentOrderNodeIterator` at a tree boundary. Both navigators' `move_to`
+  also copied the cursor but not the document, so moving onto a node of
+  another tree landed on this tree's node of the same index; `RoXmlNavigator`
+  now carries the document's base URI over as well. New integration test
+  `tests/multi_document.rs` pins identity, `is`, the three set operators and
+  block order across two documents for both navigators.
 
 ### Added
 
@@ -158,6 +184,62 @@ resource-failure contract, plus the two measurement-phase allocation gates.
   reuses the prepared model and names a preparation failure;
   `find_complex_type` looks a type up by expanded name. Example:
   `cargo run --example inspect_content_model -- schema.xsd TypeName [ns]`.
+- **`DomNavigator::type_annotation() -> Option<TypeKey>`**, with a default body
+  returning `None`. The node's XDM type-name property: complex or simple for
+  element and attribute nodes, `None` for untyped nodes and for every other
+  node kind. `schema_type()` is unchanged and remains its simple-type
+  projection. This is the half of `element(*, T)` / `schema-element(x)`
+  matching with a complex `T` that can be added without breaking the public
+  `ItemType`; `BufferDocNavigator` overrides it, `RoXmlNavigator` keeps the
+  default.
+- **`BufferDocument::serial()`** — the document's creation ordinal from a
+  process-wide counter: unique within the process, strictly increasing in
+  creation order. Intended for reproducible cross-document ordering and
+  `generate-id()`-style identifiers.
+- **`XPathExpr` dependency metadata**, computed once in a post-bind walk
+  (nothing on the evaluation path changes):
+  `referenced_external_vars()` — the declared externals the expression
+  actually references, a subset of the unchanged `external_vars()`, which
+  still lists every name supplied to `compile_with_vars`;
+  `references_external_var(slot)`, O(1) and bitset-backed;
+  `uses_focus()`, `uses_position()`, `uses_last()` — whether evaluation reads
+  the *initial* focus (context item, `fn:position()`, `fn:last()`). Foci
+  created inside the expression do not count: "Certain language constructs,
+  notably the path expression `E1/E2` and the predicate `E1[E2]`, create a new
+  focus for the evaluation of a sub-expression" (XPath 2.0 §2.1.2), so
+  `$x[position() = 1]` uses neither the focus nor the position, while
+  `a[position() = 1]` uses the focus (its first step is relative) but not the
+  position; `for`, quantified and `if` expressions keep the enclosing focus.
+  Functions that default to the context item (`string()`, `number()`,
+  `name()`, `local-name()`, `namespace-uri()`, `base-uri()`, `root()`,
+  `string-length()`, `normalize-space()`, `lang($l)`, `id($x)`) count as
+  focus uses at the arity that reads it; calls this crate cannot inspect are
+  conservatively counted.
+  `function_calls() -> &[FunctionCallRef]` — the distinct (namespace, local
+  name, arity) triples of every function called anywhere in the expression,
+  nested foci included, so a host language can detect its impure calls
+  (`doc`, `document`, `key`, `unparsed-text`, `collection`) itself. The
+  namespace is the one the call *bound* to, so `fn:` names are reported
+  identically in XPath 1.0 and 2.0 mode and the `FN_2010_NAMESPACE` alias is
+  normalized. `FunctionCallRef` is re-exported at the crate root and from
+  `xpath` under the `xsd11` feature.
+- **`DynamicContext::with_extension` / `set_extension` / `extension::<T>()`** — a
+  `&dyn Any` slot for host or engine state that extension functions can read
+  during evaluation without changing the `FunctionEvaluator::eval(&self, …)`
+  contract. One `DynamicContext` serves a whole expression (sub-expressions
+  only save and restore the focus in place), so the slot is visible from every
+  function call: predicates, path steps, `for` and quantified bodies, nested
+  calls.
+- **`DynamicContext::set_function_evaluator`** — the mutable counterpart of
+  `with_function_evaluator`, so a custom `FunctionEvaluator` can be installed
+  from an `XPathEvaluator::run_with` setup callback. Custom functions were
+  reachable only through `parse` / `bind_node` / `eval_node` before; they now
+  work through the high-level API.
+- **`XPathContext::with_default_function_ns_owned(impl Into<String>)`** — the
+  default function namespace from a runtime-built `String`, with no
+  `&'static str` to leak per host context. `default_function_namespace()`
+  prefers it over the public `default_function_ns` field; XPath 1.0 mode still
+  yields `""`.
 
 ### Changed
 
@@ -180,6 +262,25 @@ resource-failure contract, plus the two measurement-phase allocation gates.
   - `compile_content_model_matcher_impl` (267 → 46 lines) dispatches to
     `compile_all_group_matcher`, `compile_all_group_extension_matcher`
     (xsd11), `compile_nfa_matcher` and `attach_own_open_content`.
+- **Cross-document document order is reproducible.**
+  `BufferDocNavigator::compare_position` orders nodes of distinct trees by
+  `BufferDocument::serial()` instead of the document's heap address, which
+  XPath 2.0 §2.4.1 permits and constrains: "The relative order of nodes in
+  distinct trees is stable but implementation-dependent, subject to the
+  following constraint: If any node in a given tree T1 is before any node in
+  a different tree T2, then all nodes in tree T1 are before all nodes in tree
+  T2." `RoXmlNavigator` keeps address ordering (there is no serial to attach
+  to a foreign `roxmltree::Document`), which stays stable for the duration of
+  an expression.
+- **`XPathEvaluator::run_with` / `run_with_node_and_setup` accept callbacks over
+  caller-frame state.** The callback bound is now
+  `for<'d> FnOnce(&mut TypedEvaluator<'expr, 'ctx, 'd, N>)`: only the borrow
+  of the evaluator stays higher-ranked, and the expression and static-context
+  lifetimes are the evaluator's own. A setup callback can therefore install a
+  reference to a local (`set_extension`, `set_function_evaluator`) instead of
+  `'static` data only. The bound is strictly wider than before; the one new
+  requirement is `N: 'ctx` (the navigator outlives the static-context borrow),
+  which every existing call site satisfies through variance without change.
 
 ### Performance
 

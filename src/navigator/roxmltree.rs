@@ -264,7 +264,22 @@ impl<'a> RoXmlNavigator<'a> {
 }
 
 impl<'a> DomNavigator for RoXmlNavigator<'a> {
+    /// Node identity, as required by the XPath 2.0 `is` operator.
+    ///
+    /// XPath 2.0 §3.5.3 *Node Comparisons*: "A comparison with the `is`
+    /// operator is true if the two operand nodes have the same identity, and
+    /// are thus the same node; otherwise it is `false`."
+    ///
+    /// roxmltree's `NodeId` is an index into *one* `Document`'s node vector,
+    /// and an attribute/namespace index is relative to its owner, so none of
+    /// the cursor fields identifies a node on their own. Identity therefore
+    /// starts with the document, compared by address (a `Document` cannot
+    /// move while a navigator borrows it): cursors on two different documents
+    /// are never at the same position, however their ids line up.
     fn is_same_position(&self, other: &Self) -> bool {
+        if !std::ptr::eq(self.doc, other.doc) {
+            return false;
+        }
         match (&self.cursor, &other.cursor) {
             (RoCursor::Node(a), RoCursor::Node(b)) => a.id() == b.id(),
             (
@@ -283,9 +298,20 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         }
     }
 
+    /// Document order, including across trees.
+    ///
+    /// Cross-document ordering uses the documents' heap addresses. XPath 2.0
+    /// §2.4.1 *Document Order* allows this: "The relative order of nodes in
+    /// distinct trees is stable but implementation-dependent, subject to the
+    /// following constraint: If any node in a given tree T1 is before any
+    /// node in a different tree T2, then all nodes in tree T1 are before all
+    /// nodes in tree T2." Ordering whole trees by an address that cannot
+    /// change while the navigators borrow them satisfies both the constraint
+    /// and the stability requirement for the duration of an expression. It is
+    /// not reproducible across runs; the schema-aware
+    /// [`BufferDocNavigator`](crate::document::navigator::BufferDocNavigator)
+    /// uses a document serial instead, for callers that need that.
     fn compare_position(&self, other: &Self) -> XmlNodeOrder {
-        // Cross-document ordering: use stable pointer-based ordering
-        // Per XPath 2.0, cross-document order is implementation-defined but must be consistent
         if !std::ptr::eq(self.doc, other.doc) {
             let self_ptr = self.doc as *const _ as usize;
             let other_ptr = other.doc as *const _ as usize;
@@ -306,7 +332,16 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         }
     }
 
+    /// Moves this cursor onto `other`'s position — including `other`'s
+    /// document, so that moving onto a node of another tree lands on that
+    /// node rather than on this tree's node of the same id. The base URI
+    /// follows the document, since it describes the document and not the
+    /// cursor.
     fn move_to(&mut self, other: &Self) -> bool {
+        if !std::ptr::eq(self.doc, other.doc) {
+            self.doc = other.doc;
+            self.base_uri.clone_from(&other.base_uri);
+        }
         self.cursor = other.cursor.clone();
         self.name_cache.clear();
         true
@@ -1088,5 +1123,111 @@ mod tests {
             !local_uris.contains("http://example.com"),
             "Should NOT see inherited namespace in Local scope"
         );
+    }
+    // ── Cross-document node identity ─────────────────────────────────
+
+    /// XPath 2.0 §3.5.3 *Node Comparisons*: "A comparison with the `is`
+    /// operator is true if the two operand nodes have the same identity, and
+    /// are thus the same node; otherwise it is `false`."
+    ///
+    /// roxmltree hands out `NodeId`s per `Document`, so two documents with
+    /// identical content give their corresponding nodes identical ids — the
+    /// document has to take part in the identity test.
+    #[test]
+    fn is_same_position_is_false_across_documents() {
+        let doc_a = parse(r#"<root x="1" y="2" xmlns:n="http://example.com/"><a/><b/></root>"#);
+        let doc_b = parse(r#"<root x="1" y="2" xmlns:n="http://example.com/"><a/><b/></root>"#);
+
+        // Root cursors.
+        let nav_a = RoXmlNavigator::new(&doc_a);
+        let nav_b = RoXmlNavigator::new(&doc_b);
+        assert!(!nav_a.is_same_position(&nav_b));
+        assert!(!nav_b.is_same_position(&nav_a));
+
+        // Element cursors — same NodeId in both documents.
+        let mut elem_a = RoXmlNavigator::new(&doc_a);
+        let mut elem_b = RoXmlNavigator::new(&doc_b);
+        assert!(elem_a.move_to_first_child());
+        assert!(elem_b.move_to_first_child());
+        assert_eq!(
+            elem_a.as_node().unwrap().id(),
+            elem_b.as_node().unwrap().id()
+        );
+        assert!(!elem_a.is_same_position(&elem_b));
+
+        // Attribute cursors — same owner id, same index.
+        let mut attr_a = elem_a.clone();
+        let mut attr_b = elem_b.clone();
+        assert!(attr_a.move_to_first_attribute());
+        assert!(attr_b.move_to_first_attribute());
+        assert!(!attr_a.is_same_position(&attr_b));
+        assert!(attr_a.move_to_next_attribute());
+        assert!(attr_b.move_to_next_attribute());
+        assert!(!attr_a.is_same_position(&attr_b));
+
+        // Namespace cursors — same owner id, same index.
+        let mut ns_a = elem_a.clone();
+        let mut ns_b = elem_b.clone();
+        assert!(ns_a.move_to_first_namespace(NamespaceAxisScope::All));
+        assert!(ns_b.move_to_first_namespace(NamespaceAxisScope::All));
+        assert!(!ns_a.is_same_position(&ns_b));
+
+        // Within one document nothing changes.
+        assert!(elem_a.is_same_position(&elem_a.clone()));
+        assert!(attr_a.is_same_position(&attr_a.clone()));
+        assert!(ns_a.is_same_position(&ns_a.clone()));
+        assert!(!elem_a.is_same_position(&attr_a));
+        assert!(RoXmlNavigator::new(&doc_a).is_same_position(&RoXmlNavigator::new(&doc_a)));
+    }
+
+    #[test]
+    fn move_to_carries_the_document() {
+        let doc_a = parse("<root><a/></root>");
+        let doc_b = parse("<root><b/></root>");
+
+        let mut nav_a = RoXmlNavigator::with_base_uri(&doc_a, "http://example.com/a.xml");
+        let mut nav_b = RoXmlNavigator::with_base_uri(&doc_b, "http://example.com/b.xml");
+        assert!(nav_b.move_to_first_child());
+        assert!(nav_b.move_to_first_child()); // <b/>
+
+        assert!(nav_a.move_to(&nav_b));
+        assert_eq!(nav_a.local_name(), "b");
+        assert!(nav_a.is_same_position(&nav_b));
+        assert_eq!(nav_a.compare_position(&nav_b), XmlNodeOrder::Same);
+        assert_eq!(nav_a.base_uri(), "http://example.com/b.xml");
+    }
+
+    /// XPath 2.0 §2.4.1 *Document Order*: "If any node in a given tree T1 is
+    /// before any node in a different tree T2, then all nodes in tree T1 are
+    /// before all nodes in tree T2."
+    #[test]
+    fn compare_position_across_documents_is_a_consistent_block_order() {
+        let doc_a = parse("<root><a/><b/></root>");
+        let doc_b = parse("<root><a/><b/></root>");
+
+        let root_a = RoXmlNavigator::new(&doc_a);
+        let root_b = RoXmlNavigator::new(&doc_b);
+        let first = root_a.compare_position(&root_b);
+        assert_ne!(first, XmlNodeOrder::Same);
+        assert_eq!(
+            root_b.compare_position(&root_a),
+            if first == XmlNodeOrder::Before {
+                XmlNodeOrder::After
+            } else {
+                XmlNodeOrder::Before
+            }
+        );
+
+        // Whichever tree wins, every one of its nodes wins too.
+        let mut cursor_a = RoXmlNavigator::new(&doc_a);
+        while cursor_a.move_to_first_child() {
+            let mut cursor_b = RoXmlNavigator::new(&doc_b);
+            loop {
+                assert_eq!(cursor_a.compare_position(&cursor_b), first);
+                if !cursor_b.move_to_first_child() {
+                    break;
+                }
+            }
+        }
     }
 }

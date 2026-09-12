@@ -172,9 +172,9 @@ pub use navigator::{
 // Re-export XPath types (only with xsd11 feature)
 #[cfg(feature = "xsd11")]
 pub use xpath::{
-    BufferedNodeIterator, EmptyIterator, EvalValue, ExternalVar, RangeIterator, TreeComparer,
-    TypedEvaluator, VecNodeIterator, XPathContext, XPathEvaluator, XPathExpr, XmlItem, XmlItemRef,
-    XmlNodeIterator,
+    BufferedNodeIterator, EmptyIterator, EvalValue, ExternalVar, FunctionCallRef, RangeIterator,
+    TreeComparer, TypedEvaluator, VecNodeIterator, XPathContext, XPathEvaluator, XPathExpr,
+    XmlItem, XmlItemRef, XmlNodeIterator,
 };
 
 // Re-export pipeline functions
