@@ -39,6 +39,26 @@ struct ElementBuildState {
     has_attrs: bool,
 }
 
+// ── ContentState ──────────────────────────────────────────────────────
+
+/// What has already been appended to one open container.
+///
+/// The constructor content rules (XQuery 1.0 §3.7.1.3) need two facts about
+/// the container that is currently being filled: whether it already has a
+/// child (an attribute may not follow one) and whether the item appended last
+/// was an atomic value (two adjacent atomic values are separated by a single
+/// space). Both are per-container, so the builder keeps one of these for every
+/// open element plus one for the document level.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContentState {
+    /// A text, element, comment, processing-instruction or atomic item has
+    /// been appended to this container.
+    pub(crate) children_started: bool,
+    /// The item appended last was an atomic value, so the next atomic value
+    /// needs a separating space.
+    pub(crate) last_atomic: bool,
+}
+
 // ── hash_name ─────────────────────────────────────────────────────────
 
 /// Compute a `u32` hash of a local name string (same hasher as `QNameTable`).
@@ -61,6 +81,8 @@ pub struct BufferDocumentBuilder<'a> {
     text_type: Option<NodeType>,
     current_namespace: NsRef,
     element_stack: Vec<ElementBuildState>,
+    /// One entry per open container, the document level first. Never empty.
+    content_states: Vec<ContentState>,
     pending_spans: Vec<(u32, usize)>,
     #[allow(dead_code)]
     options: BufferDocumentOptions,
@@ -134,6 +156,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             text_type: None,
             current_namespace: NsRef::NULL,
             element_stack: Vec::new(),
+            content_states: vec![ContentState::default()],
             pending_spans: Vec::new(),
             options,
         })
@@ -153,6 +176,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         ns_declarations: &[(&str, &str)],
     ) -> Result<u32, BufferDocumentError> {
         self.flush_text()?;
+        self.note_child_appended();
 
         // Save previous namespace head
         let prev_namespace = self.current_namespace;
@@ -237,6 +261,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             node_ref: elem_ref,
             has_attrs: false,
         });
+        self.content_states.push(ContentState::default());
         self.parent = elem_ref;
         self.last_sibling = NULL;
         self.last_attr = NULL;
@@ -333,11 +358,13 @@ impl<'a> BufferDocumentBuilder<'a> {
         if self.text_type.is_none() {
             self.text_type = Some(NodeType::Text);
         }
+        self.note_child_appended();
     }
 
     /// Adds a comment node.
     pub fn comment(&mut self, value: &str) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
+        self.note_child_appended();
         self.add_content_node(NodeType::Comment, value)?;
         Ok(())
     }
@@ -349,6 +376,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         data: &str,
     ) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
+        self.note_child_appended();
 
         let target_idx = self.doc.strings.store(target);
         let pi_ref = self.doc.nodes.alloc()?;
@@ -392,6 +420,11 @@ impl<'a> BufferDocumentBuilder<'a> {
             .element_stack
             .pop()
             .ok_or(BufferDocumentError::UnmatchedEndElement)?;
+        // The document-level state is never popped, so the vector stays
+        // non-empty for `content_state{,_mut}`.
+        if self.content_states.len() > 1 {
+            self.content_states.pop();
+        }
 
         // If element has namespace declarations, restore previous scope
         let elem_node = self.doc.nodes.get(self.parent);
@@ -477,6 +510,186 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// Records a completed source span for a node.
     pub fn set_source_span(&mut self, node_ref: u32, span: SourceSpan) {
         self.doc.source_spans.set(node_ref, span);
+    }
+
+    // ── Services for `super::copy` ────────────────────────────────────
+    //
+    // The copy helpers live in `super::copy` but need a few facts about the
+    // half-built document that the push API alone does not expose. They are
+    // `pub(crate)` on purpose: none of them is part of the builder's contract.
+
+    /// The content state of the container currently being filled.
+    #[inline]
+    pub(crate) fn content_state(&self) -> ContentState {
+        *self
+            .content_states
+            .last()
+            .expect("the document-level state is never popped")
+    }
+
+    /// The content state of the container currently being filled, mutably.
+    #[inline]
+    pub(crate) fn content_state_mut(&mut self) -> &mut ContentState {
+        self.content_states
+            .last_mut()
+            .expect("the document-level state is never popped")
+    }
+
+    /// Records that a child has been appended to the current container: an
+    /// attribute may no longer follow, and an atomic run is broken.
+    #[inline]
+    fn note_child_appended(&mut self) {
+        let state = self.content_state_mut();
+        state.children_started = true;
+        state.last_atomic = false;
+    }
+
+    /// Whether an element is open, i.e. whether content is being added to an
+    /// element rather than at document level.
+    #[inline]
+    pub(crate) fn has_open_element(&self) -> bool {
+        !self.element_stack.is_empty()
+    }
+
+    /// The schema set the document under construction is bound to, if any.
+    #[inline]
+    pub(crate) fn schema_set(&self) -> Option<&'a SchemaSet> {
+        self.doc.schema_set
+    }
+
+    /// The `(prefix, namespace_uri)` bindings in scope at the insertion point,
+    /// one entry per prefix (the innermost declaration wins).
+    ///
+    /// An entry whose URI is empty is an undeclared default namespace. The
+    /// implicit `xml` binding is not included: it needs no declaration.
+    pub(crate) fn in_scope_bindings(&self) -> Vec<(String, String)> {
+        let mut bindings: Vec<(String, String)> = Vec::new();
+        let mut ns_ref = self.current_namespace;
+        while !ns_ref.is_null() {
+            let ns_node = self.doc.namespace_pages.get(ns_ref);
+            let prefix = self.doc.names.resolve_ref(ns_node.prefix);
+            if !bindings.iter().any(|(p, _)| p == prefix) {
+                bindings.push((
+                    prefix.to_string(),
+                    self.doc
+                        .names
+                        .resolve_ref(ns_node.namespace_uri)
+                        .to_string(),
+                ));
+            }
+            ns_ref = ns_node.next;
+        }
+        bindings
+    }
+
+    /// Declares a namespace on the element that is currently open, after
+    /// [`start_element`](Self::start_element) has returned.
+    ///
+    /// Only sound while the element is still in its attribute phase — no child
+    /// has been added yet — because a child that was already created captured
+    /// the chain head as it was then. Attributes are the one thing that can
+    /// need a declaration after the start tag was opened (the builder takes an
+    /// element's own declarations up front), and they can only be added before
+    /// any child, so that restriction costs nothing.
+    pub(crate) fn declare_namespace_on_open_element(
+        &mut self,
+        prefix: &str,
+        uri: &str,
+    ) -> Result<(), BufferDocumentError> {
+        debug_assert!(self.has_open_element(), "no element is open");
+        debug_assert!(
+            !self.content_state().children_started,
+            "a child was already added to this element"
+        );
+        let elem_ref = self.parent;
+        let previously_declared = self.doc.nodes.get(elem_ref).has_flag(Node::HAS_NMSP_DECLS);
+        let prev_namespace = self.current_namespace;
+        self.handle_namespace_decl(prefix, uri)?;
+        if !previously_declared {
+            // First declaration on this element: it now owns a scope, which
+            // `end_element` has to restore.
+            self.namespace_stack.push((elem_ref, prev_namespace));
+            self.doc.nodes.update(elem_ref, |n| {
+                n.set_flag(Node::HAS_NMSP_DECLS);
+            });
+        }
+        self.doc
+            .element_namespaces
+            .insert(elem_ref, self.current_namespace);
+        Ok(())
+    }
+
+    /// Points `last_attr` at the last attribute of the open element, so that a
+    /// further [`attribute`](Self::attribute) chains onto it.
+    ///
+    /// [`end_of_attributes`](Self::end_of_attributes) clears that cursor; a
+    /// host that appends an attribute item after it (perfectly legal as long as
+    /// the element has no children yet) would otherwise orphan the new node.
+    pub(crate) fn sync_last_attribute(&mut self) {
+        if self.last_attr != NULL || !self.has_open_element() {
+            return;
+        }
+        if !self
+            .doc
+            .nodes
+            .get(self.parent)
+            .has_flag(Node::HAS_ATTRIBUTE)
+        {
+            return;
+        }
+        let mut cursor = self.doc.first_child_of(self.parent);
+        loop {
+            let next = self.doc.nodes.get(cursor).next_sibling;
+            if next == NULL || self.doc.nodes.get(next).node_type() != NodeType::Attribute {
+                break;
+            }
+            cursor = next;
+        }
+        self.last_attr = cursor;
+    }
+
+    /// The open element's attribute with this expanded name, if it has one.
+    pub(crate) fn find_attribute(&self, local_name: &str, ns_uri: &str) -> Option<u32> {
+        if !self.has_open_element()
+            || !self
+                .doc
+                .nodes
+                .get(self.parent)
+                .has_flag(Node::HAS_ATTRIBUTE)
+        {
+            return None;
+        }
+        let local_id = self.doc.names.add(local_name);
+        let uri_id = self.doc.names.add(ns_uri);
+        let mut cursor = self.doc.first_child_of(self.parent);
+        while self.doc.nodes.get(cursor).node_type() == NodeType::Attribute {
+            let atom = self.doc.qname_table.get(self.doc.nodes.get(cursor).value);
+            if atom.local_name == local_id && atom.namespace_uri == uri_id {
+                return Some(cursor);
+            }
+            let next = self.doc.nodes.get(cursor).next_sibling;
+            if next == NULL {
+                break;
+            }
+            cursor = next;
+        }
+        None
+    }
+
+    /// Replaces the value of an existing attribute node.
+    ///
+    /// The previous value stays interned in the string store; duplicate
+    /// attribute names are rare enough that reclaiming it is not worth a
+    /// back-reference.
+    pub(crate) fn set_attribute_value(&mut self, attr_ref: u32, value: &str) {
+        debug_assert_eq!(
+            self.doc.nodes.get(attr_ref).node_type(),
+            NodeType::Attribute
+        );
+        let val_idx = self.doc.strings.store(value);
+        self.doc.nodes.update(attr_ref + 1, |n| {
+            n.value = val_idx;
+        });
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -806,10 +1019,13 @@ pub(crate) fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
 
 /// Parses PI content into `(target, data)`.
 pub(crate) fn parse_pi_content(raw: &str) -> (&str, &str) {
-    let trimmed = raw.trim();
-    match trimmed.find(|c: char| c.is_ascii_whitespace()) {
-        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim_start()),
-        None => (trimmed, ""),
+    // `PI ::= '<?' PITarget (S (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6):
+    // only the `S` separating the target from the data is not data. Whatever
+    // follows it — trailing whitespace included — is the data verbatim.
+    let raw = raw.trim_start();
+    match raw.find(|c: char| c.is_ascii_whitespace()) {
+        Some(pos) => (&raw[..pos], raw[pos..].trim_start()),
+        None => (raw, ""),
     }
 }
 
@@ -827,6 +1043,17 @@ mod tests {
     use super::*;
     use crate::ids::TypeKey;
     use crate::navigator::DomNavigator;
+
+    #[test]
+    fn parse_pi_content_keeps_the_data_verbatim() {
+        // XML 1.0 §2.6: only the `S` between target and data is a separator;
+        // everything after it, trailing whitespace included, is the data.
+        assert_eq!(parse_pi_content("go now "), ("go", "now "));
+        assert_eq!(parse_pi_content("go   now\t"), ("go", "now\t"));
+        assert_eq!(parse_pi_content("go"), ("go", ""));
+        assert_eq!(parse_pi_content("go "), ("go", ""));
+        assert_eq!(parse_pi_content("go a?b "), ("go", "a?b "));
+    }
 
     fn make_builder<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocumentBuilder<'a> {
         BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default()).unwrap()

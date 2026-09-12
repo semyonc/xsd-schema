@@ -832,10 +832,13 @@ fn split_prefix_local(name: &[u8]) -> (&[u8], &[u8]) {
 }
 
 fn parse_pi_content(raw: &str) -> (&str, &str) {
-    let trimmed = raw.trim();
-    match trimmed.find(|c: char| c.is_ascii_whitespace()) {
-        Some(pos) => (&trimmed[..pos], trimmed[pos..].trim_start()),
-        None => (trimmed, ""),
+    // `PI ::= '<?' PITarget (S (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6):
+    // only the `S` separating the target from the data is not data. Whatever
+    // follows it — trailing whitespace included — is the data verbatim.
+    let raw = raw.trim_start();
+    match raw.find(|c: char| c.is_ascii_whitespace()) {
+        Some(pos) => (&raw[..pos], raw[pos..].trim_start()),
+        None => (raw, ""),
     }
 }
 

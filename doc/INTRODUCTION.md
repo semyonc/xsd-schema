@@ -15,6 +15,7 @@ The public surface changes mainly through the `xsd11` and `async` features.
 | XSD 1.0 + async | `default-features = false, features = ["async"]` | Same XSD 1.0-only surface, plus async schema-loading/directive-resolution APIs. |
 | XSD 1.1 | `features = ["xsd11"]` | Full XSD 1.1 mode: XSD 1.1 processing, XPath 2.0 engine, `regexml`, Unicode normalization, and `BufferDocument` / typed document support. |
 | XSD 1.1 + async | `features = ["xsd11", "async"]` | Full XSD 1.1 surface plus async schema-loading/directive-resolution APIs. |
+| XSD 1.1 + composition | `features = ["compose"]` | Full XSD 1.1 mode plus the `compose` module: the `xpath!` and `form!` macros, iterator pipelines and the composition layer of section 9. `compose` implies `xsd11`. |
 
 Notes:
 
@@ -778,6 +779,133 @@ The example prints the report for the named type and, if the name is unknown,
 lists the named complex types of the schema. Anonymous local types are reported
 as `(anonymous)` and can be reached through the key of the declaring element.
 
+## 8. Writing Documents Out And Copying Subtrees
+
+Everything so far reads XML. Two modules in `document` write it (both need the
+`xsd11` feature, like the rest of `document`):
+
+- `document::serialize` turns any `DomNavigator` position back into XML text —
+  `to_string`, `serialize_node` (one node or one subtree), `serialize_document`
+  (the whole document, optionally with an XML declaration). `SerializeOptions`
+  chooses compact output (`indent: None`, the default — nothing is added and
+  nothing removed, so a parse/serialize round trip is an identity on the tree)
+  or formatted output (`indent: Some(n)`).
+- `document::copy` adds four methods to `BufferDocumentBuilder` for building a
+  new document out of nodes that already exist: `copy_subtree`,
+  `copy_attribute`, `append_content` (a sequence of nodes and atomic values,
+  with the constructor content rules of XQuery 1.0 §3.7.1.3) and
+  `append_atomic`. The copy is a new subtree with new node identities, and it
+  carries the namespace declarations its names need — including ones the source
+  inherited from ancestors the copy does not have.
+
+Load a document, copy one subtree out of it, write the result both ways:
+
+```rust
+use bumpalo::Bump;
+use xsd_schema::document::{serialize, BufferDocument, BufferDocumentBuilder};
+use xsd_schema::document::{BufferDocumentOptions, CopyOptions, SerializeOptions};
+use xsd_schema::namespace::NameTable;
+use xsd_schema::navigator::DomNavigator;
+
+let arena = Bump::new();
+let names = NameTable::new();
+
+// 1. Load.
+let source = BufferDocument::from_reader_default(
+    r#"<catalog xmlns:m="urn:meta"><book m:id="b1"><title>One</title></book><book m:id="b2"><title>Two</title></book></catalog>"#.as_bytes(),
+    &arena,
+    &names,
+)?;
+
+// 2. Copy the first <book> into a document of its own.
+let mut book = source.create_navigator();
+book.move_to_first_child(); // <catalog>
+book.move_to_first_child(); // the first <book>
+
+let mut builder =
+    BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())?;
+builder.start_element("selection", "", "", &[])?;
+builder.end_of_attributes();
+builder.copy_subtree(&book, CopyOptions::default())?;
+builder.end_element()?;
+let selection = builder.finalize()?;
+
+// 3. Write it out. `m` was declared on <catalog> in the source; the copy
+//    carries the declaration itself, so the name still resolves.
+let nav = selection.create_navigator();
+assert_eq!(
+    serialize::to_string(&nav, &SerializeOptions::default())?,
+    r#"<selection><book xmlns:m="urn:meta" m:id="b1"><title>One</title></book></selection>"#,
+);
+
+let formatted = SerializeOptions { indent: Some(2), ..SerializeOptions::default() };
+assert_eq!(
+    serialize::to_string(&nav, &formatted)?,
+    "<selection>\n  <book xmlns:m=\"urn:meta\" m:id=\"b1\">\n    <title>One</title>\n  </book>\n</selection>",
+);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`CopyOptions` has three knobs: `namespaces` (whether an element keeps
+declarations it does not need), `inherit` (whether the copy leans on the
+namespaces in scope where it lands, or re-declares what it needs on its own top
+element) and `annotations` (whether schema type annotations are carried over —
+only possible within one `SchemaSet`). See
+[`BUFFER_DOCUMENT_OVERVIEW.md`](BUFFER_DOCUMENT_OVERVIEW.md) for the
+serialization and copying rules in full.
+
+## 9. Composing XML With `xpath!` And `form!`
+
+Sections 1 to 8 read XML, validate it, query it and write it back out. The
+`compose` module (feature `compose`, which implies `xsd11`) adds the last
+piece: building *new* XML out of query results, in the shape an XQuery FLWOR
+expression would — without an XQuery processor anywhere in the crate.
+
+The idea is that a FLWOR expression is three things at once, and two of them
+already exist. The XPath 2.0 engine evaluates every expression such a query
+needs; Rust iterates, binds and branches; so what was missing was a way to
+bind a Rust value to an XPath `$variable`, a way to describe a result element,
+and the data-model rules that turn a description into a tree. Those are what
+the module supplies: a `Composer` holding the arena, the name table and a cache
+of compiled expressions; `xpath!` for evaluation; `pipe` adapters for the
+FLWOR clauses (`try_map` is `let`, `try_filter` is `where`, `try_flat_map` is
+a nested `for`, `order_by` is `order by`); and a Lisp-style `form!`
+constructor whose splices follow the constructor content rules, so an empty
+sequence spliced into an element leaves an empty element rather than needing a
+host-side conditional.
+
+```rust
+use bumpalo::Bump;
+use xsd_schema::compose::{pipe, ComposeError, Composer};
+use xsd_schema::document::SerializeOptions;
+use xsd_schema::namespace::NameTable;
+use xsd_schema::{form, xpath};
+
+let arena = Bump::new();
+let names = NameTable::new();
+let c = Composer::new(&arena, &names);
+let stock = c.load_str("<stock><part qty='7'>bolt</part><part qty='0'>nut</part></stock>")?;
+
+// for $p in //part where $p/@qty > 0 return <part>{ string($p) }</part>
+let rows = pipe::nodes(xpath!(c, "//part", stock)?)
+    .try_filter(|p| xpath!(c, "@qty > 0", p)?.boolean())
+    .try_map(|p| Ok(form! { (part ^{ xpath!(c, "string()", &p)? }) }));
+
+assert_eq!(
+    c.build(form! { (in_stock ..?^{ rows }) })?.to_xml(&SerializeOptions::default())?,
+    "<in_stock><part>bolt</part></in_stock>",
+);
+# Ok::<(), ComposeError>(())
+```
+
+Everything the layer offers — the four `xpath!` call forms and every value that
+can be bound, the whole `form!` grammar, the pipeline contract and what is not
+lazy, the `order by` rules, `build` versus `build_sequence`, serialization,
+the error variants and the v1 limits — is in its own guide:
+[Composing XML from Rust](COMPOSE.md). The relational use case of the XQuery
+1.0 test suite is rewritten query by query in `tests/compose_usecase_r.rs`,
+and `examples/xquery_without_xquery.rs` runs three of them end to end.
+
 ## Recommended Reading Order
 
 If you are new to the crate, this sequence usually works well:
@@ -787,3 +915,5 @@ If you are new to the crate, this sequence usually works well:
 3. Add `XPathExpr` and `XPathContext` if you need XPath/XSD 1.1 features.
 4. Move down to `SchemaResolver`, `ReferenceResolver`, and the raw schema model
    only when you need custom loading or custom analysis.
+5. Add `Composer`, `xpath!` and `form!` if you need to build XML out of query
+   results (section 9).

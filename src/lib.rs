@@ -113,6 +113,10 @@ pub mod xpath;
 #[cfg(feature = "xsd11")]
 pub mod document;
 
+// XQuery-style XML composition from Rust (only with the compose feature)
+#[cfg(feature = "compose")]
+pub mod compose;
+
 // Pipeline orchestration
 pub mod pipeline;
 

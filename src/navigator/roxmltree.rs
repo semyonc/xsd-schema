@@ -13,6 +13,14 @@ use crate::ids::SimpleTypeKey;
 
 use super::{DomNavigator, DomNodeType, NamespaceAxisScope, TypedValue, XmlNodeOrder};
 
+/// The data of a processing instruction, which is its XDM string value.
+///
+/// `Node::text()` returns `None` for a PI — roxmltree keeps the data in
+/// `Node::pi()` instead — so a PI's value has to be read from there.
+fn pi_data<'a>(node: Node<'a, 'a>) -> &'a str {
+    node.pi().and_then(|pi| pi.value).unwrap_or("")
+}
+
 /// Internal cursor state for RoXmlNavigator
 #[derive(Clone)]
 enum RoCursor<'a> {
@@ -637,8 +645,9 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
             RoCursor::Node(n) => match n.node_type() {
                 NodeType::Text | NodeType::Comment => n.text().unwrap_or("").to_string(),
                 NodeType::PI => {
-                    // PI value is the content after the target
-                    n.text().unwrap_or("").to_string()
+                    // The string value of a processing instruction is its data
+                    // (XDM). `Node::text()` does not report it; `pi()` does.
+                    pi_data(*n).to_string()
                 }
                 NodeType::Element | NodeType::Root => {
                     // String value is concatenation of all text descendants
@@ -673,9 +682,9 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         // element/root descendant concatenation must allocate.
         match &self.cursor {
             RoCursor::Node(n) => match n.node_type() {
-                NodeType::Text | NodeType::Comment | NodeType::PI => {
-                    Cow::Borrowed(n.text().unwrap_or(""))
-                }
+                NodeType::Text | NodeType::Comment => Cow::Borrowed(n.text().unwrap_or("")),
+                // A PI's string value is its data, which `text()` never reports.
+                NodeType::PI => Cow::Borrowed(pi_data(*n)),
                 NodeType::Element | NodeType::Root => Cow::Owned(self.value()),
             },
             RoCursor::Attribute { owner, index } => Cow::Borrowed(
@@ -723,6 +732,26 @@ mod tests {
 
     fn parse(xml: &str) -> Document<'_> {
         Document::parse(xml).unwrap()
+    }
+
+    #[test]
+    fn pi_value_is_the_data() {
+        // XDM: the string value of a processing instruction is its data.
+        let doc = parse("<root><?go now ?></root>");
+        let mut nav = RoXmlNavigator::new(&doc);
+        assert!(nav.move_to_first_child());
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.node_type(), DomNodeType::ProcessingInstruction);
+        assert_eq!(nav.local_name(), "go");
+        assert_eq!(nav.value(), "now ");
+        assert_eq!(nav.value_ref(), "now ");
+
+        let doc = parse("<root><?go?></root>");
+        let mut nav = RoXmlNavigator::new(&doc);
+        assert!(nav.move_to_first_child());
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.value(), "");
+        assert_eq!(nav.value_ref(), "");
     }
 
     #[test]

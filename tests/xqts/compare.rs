@@ -1,3 +1,4 @@
+use xsd_schema::document::{serialize, SerializeError, SerializeOptions};
 use xsd_schema::xpath::functions::XPathValue;
 use xsd_schema::xpath::iterator::XmlItem;
 use xsd_schema::xpath::tree_comparer::TreeComparer;
@@ -20,141 +21,6 @@ const IS_EXCEPTION: &[&str] = &[
     "fn-union-node-args-011",
 ];
 
-/// Serialize a DomNavigator node to XML string.
-fn serialize_node_to_xml<N: DomNavigator>(nav: &N, out: &mut String) {
-    match nav.node_type() {
-        DomNodeType::Element => {
-            let prefix = nav.prefix();
-            let local = nav.local_name();
-
-            // Opening tag
-            if prefix.is_empty() {
-                out.push('<');
-                out.push_str(local);
-            } else {
-                out.push('<');
-                out.push_str(prefix);
-                out.push(':');
-                out.push_str(local);
-            }
-
-            // Namespace declarations (serialize from namespace axis)
-            // Use ExcludeXml to include inherited namespaces (needed for standalone node serialization)
-            // but exclude the always-implicit xml namespace.
-            let mut ns_nav = nav.clone();
-            if ns_nav.move_to_first_namespace(xsd_schema::xpath::NamespaceAxisScope::ExcludeXml) {
-                loop {
-                    let ns_prefix = ns_nav.local_name().to_string();
-                    let ns_uri = ns_nav.value();
-                    if ns_prefix.is_empty() {
-                        out.push_str(&format!(" xmlns=\"{}\"", escape_xml_attr(&ns_uri)));
-                    } else {
-                        out.push_str(&format!(
-                            " xmlns:{}=\"{}\"",
-                            ns_prefix,
-                            escape_xml_attr(&ns_uri)
-                        ));
-                    }
-                    if !ns_nav
-                        .move_to_next_namespace(xsd_schema::xpath::NamespaceAxisScope::ExcludeXml)
-                    {
-                        break;
-                    }
-                }
-            }
-
-            // Attributes
-            let mut attr_nav = nav.clone();
-            if attr_nav.move_to_first_attribute() {
-                loop {
-                    let attr_prefix = attr_nav.prefix().to_string();
-                    let attr_local = attr_nav.local_name().to_string();
-                    let attr_value = attr_nav.value();
-                    if attr_prefix.is_empty() {
-                        out.push_str(&format!(
-                            " {}=\"{}\"",
-                            attr_local,
-                            escape_xml_attr(&attr_value)
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            " {}:{}=\"{}\"",
-                            attr_prefix,
-                            attr_local,
-                            escape_xml_attr(&attr_value)
-                        ));
-                    }
-                    if !attr_nav.move_to_next_attribute() {
-                        break;
-                    }
-                }
-            }
-
-            // Children
-            let mut child_nav = nav.clone();
-            if child_nav.move_to_first_child() {
-                out.push('>');
-                loop {
-                    serialize_node_to_xml(&child_nav, out);
-                    if !child_nav.move_to_next_sibling() {
-                        break;
-                    }
-                }
-                // Closing tag
-                if prefix.is_empty() {
-                    out.push_str(&format!("</{}>", local));
-                } else {
-                    out.push_str(&format!("</{}:{}>", prefix, local));
-                }
-            } else {
-                out.push_str("/>");
-            }
-        }
-        DomNodeType::Text | DomNodeType::Whitespace | DomNodeType::SignificantWhitespace => {
-            out.push_str(&escape_xml_text(&nav.value()));
-        }
-        DomNodeType::Comment => {
-            out.push_str(&format!("<!--{}-->", nav.value()));
-        }
-        DomNodeType::ProcessingInstruction => {
-            let value = nav.value();
-            if value.is_empty() {
-                out.push_str(&format!("<?{}?>", nav.local_name()));
-            } else {
-                out.push_str(&format!("<?{} {}?>", nav.local_name(), value));
-            }
-        }
-        DomNodeType::Attribute => {
-            let prefix = nav.prefix();
-            let local = nav.local_name();
-            let value = nav.value();
-            if prefix.is_empty() {
-                out.push_str(&format!("{}=\"{}\"", local, escape_xml_attr(&value)));
-            } else {
-                out.push_str(&format!(
-                    "{}:{}=\"{}\"",
-                    prefix,
-                    local,
-                    escape_xml_attr(&value)
-                ));
-            }
-        }
-        DomNodeType::Root => {
-            // Serialize children of document root
-            let mut child_nav = nav.clone();
-            if child_nav.move_to_first_child() {
-                loop {
-                    serialize_node_to_xml(&child_nav, out);
-                    if !child_nav.move_to_next_sibling() {
-                        break;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Serialize XPath result items to an XML string.
 ///
 /// `wrap_element` is the element name to wrap in (from expected output root element).
@@ -166,7 +32,7 @@ fn serialize_xpath_result<N: DomNavigator>(
     is_excpt: bool,
     wrap_element: &str,
     wrap_namespaces: &[(Option<String>, String)],
-) -> String {
+) -> Result<String, SerializeError> {
     let mut out = String::new();
     let wrap = !((xml_compare && is_single) || is_excpt);
 
@@ -216,7 +82,7 @@ fn serialize_xpath_result<N: DomNavigator>(
         out.push('>');
     } else if wrap && !has_non_attr {
         out.push_str("/>");
-        return out;
+        return Ok(out);
     }
 
     let mut string_flag = false;
@@ -242,7 +108,16 @@ fn serialize_xpath_result<N: DomNavigator>(
                     }
                     // When wrapping, attributes were already added to the wrapper element above
                 } else {
-                    serialize_node_to_xml(nav, &mut out);
+                    // The crate's serializer, explicitly in compact mode:
+                    // added layout whitespace would show up as text nodes in
+                    // the comparison. Declarations land only where they are
+                    // introduced, which `deep_equal` does not look at, so what
+                    // changes here is nothing a comparison can see.
+                    let compact = SerializeOptions {
+                        indent: None,
+                        ..SerializeOptions::default()
+                    };
+                    out.push_str(&serialize::to_string(nav, &compact)?);
                 }
                 string_flag = false;
             }
@@ -266,7 +141,7 @@ fn serialize_xpath_result<N: DomNavigator>(
         out.push('>');
     }
 
-    out
+    Ok(out)
 }
 
 /// Compare XPath result against an expected output file.
@@ -360,7 +235,8 @@ fn compare_result_inner<'a>(
         is_excpt,
         &wrap_element,
         &wrap_namespaces,
-    );
+    )
+    .map_err(|e| format!("Failed to serialize result: {e}"))?;
 
     // Compare with TreeComparer.
     // When xml_compare is true and the result is a bare atomic value (not valid XML),

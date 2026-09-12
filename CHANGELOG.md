@@ -17,6 +17,12 @@ and work with more than one document: multi-document node identity,
 `DynamicContext` extension slot and `set_function_evaluator`, an owned
 default function namespace, and `BufferDocument::serial()`.
 
+And "XQuery without XQuery": an XML serializer for any `DomNavigator`
+(`document::serialize`, compact or indented), a subtree copy with constructor
+semantics (`document::copy`), and a `compose` feature with `xpath!` and `form!`
+for building XML from query results in Rust — proven against the eighteen
+queries of the XQuery test suite's relational use case.
+
 ### Removed
 
 - **The never-constructed all-group-extension composite matcher.**
@@ -128,6 +134,18 @@ default function namespace, and `BufferDocument::serial()`.
   now carries the document's base URI over as well. New integration test
   `tests/multi_document.rs` pins identity, `is`, the three set operators and
   block order across two documents for both navigators.
+- **Processing-instruction data is kept verbatim.** `PI ::= '<?' PITarget (S
+  (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6) makes only the `S` between
+  target and data a separator, but both quick-xml adapters — the
+  `BufferDocument` builder's and the streaming validator's — trimmed the raw
+  content first, so a PI ending in whitespace (Microsoft InfoPath writes
+  `<?mso-application progid="…" ?>`) reached the tree, and any host hook, a
+  character short.
+- **A processing instruction's string value through `RoXmlNavigator` is its
+  data.** `value()` / `value_ref()` asked roxmltree's `Node::text()`, which
+  answers only for text and comments — a PI's data lives in `Node::pi()` — so
+  they returned an empty string where `BufferDocNavigator` returned the data,
+  and XDM asks for the data.
 
 ### Added
 
@@ -240,6 +258,105 @@ default function namespace, and `BufferDocument::serial()`.
   `&'static str` to leak per host context. `default_function_namespace()`
   prefers it over the public `default_function_ns` field; XPath 1.0 mode still
   yields `""`.
+- **`document::serialize` — a `BufferDocument` can be written back out.** Three
+  entry points, `serialize_document`, `serialize_node` and `to_string`, plus
+  `SerializeOptions` (an optional XML declaration with `standalone`, and
+  `indent`) and `SerializeError`. Generic over `DomNavigator` rather than over
+  `BufferDocument`, so the same code writes a `BufferDocNavigator`, a
+  `RoXmlNavigator` and whatever navigator a host embedding the engine brings,
+  using only navigation, names and `value_ref()`. Escaping follows Canonical
+  XML 1.0 §2.3 — the rules under which a re-parse cannot change the value back,
+  since XML 1.0's end-of-line handling (§2.11) and attribute-value
+  normalization (§3.3.3) would otherwise rewrite literal carriage returns and
+  attribute whitespace. Namespace declarations are written where they are
+  introduced, diffed against an in-scope stack: redundant re-declarations are
+  dropped, an element leaving an inherited default namespace gets `xmlns=""`,
+  the `xml` prefix and prefixed undeclarations are never written, and a
+  subtree written on its own gains the declarations it inherits. Content XML
+  cannot express is refused, never dropped: a character outside the XML 1.0
+  `Char` production, a comment containing `--`, a PI target `xml` or data
+  containing `?>`, and a name whose prefix is not bound to its namespace URI
+  in the output scope. Output is compact by default — no layout whitespace
+  added and none removed, which is what makes it an exact text round trip —
+  while `indent: Some(n)` opts into formatted output (a line break plus `n`
+  spaces per level, `Some(0)` the breaks alone) from the same traversal with
+  no second tree and no pretty-print pass. Layout is added conservatively
+  because it becomes text nodes when parsed again: every existing text
+  character survives, any text child of a container suppresses added layout
+  throughout that container's subtree (so mixed content such as
+  `<p>Hello <b>world</b>!</p>` stays on one line and existing indentation is
+  never reindented), a break lands only at a child boundary next to an
+  element, `xml:space` is honoured per XML 1.0 §2.10 including for a subtree
+  that reads its ancestors for the inherited value, and no leading blank line
+  or final newline is invented. All 26,307 comparable instance documents of
+  the W3C XSD test suite round-trip (`tests/serialize_roundtrip.rs`); the
+  XQTS driver's private comparison serializer is gone in favour of this one,
+  with its pass count unchanged. Other encodings, CDATA sections and a
+  doctype are out of scope.
+- **`document::copy` — copying existing nodes into a document under
+  construction, with constructor semantics.** Four additive methods on
+  `BufferDocumentBuilder`: `copy_subtree` (element, text, comment, PI,
+  document node, attribute — new node identities, nothing shared with the
+  source), `copy_attribute`, `append_content` and `append_atomic`; plus
+  `CopyOptions` (`CopyNamespaces::{Preserve, NoPreserve}`, `inherit`,
+  `Annotations::{Strip, Preserve}`), `CopyError`, the `CopySource` trait
+  (every `DomNavigator` is one with nothing to preserve; `BufferDocNavigator`
+  reports its schema bindings) and `NamespaceFixup`. Content sequences follow
+  the constructor content rules (XQuery 1.0 §3.7.1.3): consecutive atomic
+  values joined with a single space, document nodes flattened, zero-length
+  text dropped, an attribute after a child refused (XQTY0024) — a duplicate
+  attribute name keeps the later value. A copied element carries the
+  namespace declarations its names need (XQuery 1.0 §3.7.4), with generated
+  `ns0`, `ns1`, … prefixes on a conflict and `xmlns=""` where an inherited
+  default namespace would otherwise apply, which is the invariant that lets
+  `document::serialize` refuse an unbound name. Type annotations are stripped
+  by default and can be preserved within one `SchemaSet`.
+- **XQuery-style composition from Rust** (`compose` feature, implies `xsd11`):
+  a `compose` module for hosts that build XML from query results without a
+  query processor. `Composer` owns one arena, one name table, one namespace
+  context and a cache of compiled expressions keyed by expression text plus
+  external variable names, so an expression inside a loop is parsed once;
+  every method takes `&self`, so it works inside iterator closures. `Doc` is a
+  `Copy` handle on a document in that arena — loaded with
+  `load_str`/`load_reader`/`load_file` or built with `build`/`build_sequence`
+  — and every navigator, `Value` and `Form` shares its lifetime, so a node of
+  one document splices into another with no lifetime work. `Value` exposes a
+  result as the XDM sequence it is, with `nodes`/`atomics`/`boolean`/`string`/
+  `number`/`key` on top, each refusing rather than guessing.
+  `Form`/`Content`/`AttrValue`/`Name` describe a result element as an owned,
+  closure-free tree; the emitter resolves prefixes, computes the namespace
+  declarations each element must carry, atomizes and space-joins attribute
+  sequences, and splices nodes with the constructor content rules, so an
+  empty sequence leaves an empty element. `compose::order` implements
+  `order by` with XDM comparison, stable sorting and one key evaluation per
+  row; `compose::pipe` turns the FLWOR clauses into fallible iterator
+  adapters (`try_filter`, `try_map`, `try_flat_map`, `order_by`) that keep the
+  `Result` and fuse after the first error. `IntoXPathValue` and `IntoContent`
+  convert Rust values, navigators, documents and sequences into bindings and
+  content. The module uses only the crate's public API and adds no
+  dependencies.
+- **`xpath!` and `form!`** (`compose` feature): the composition written as
+  macros. `xpath!(c, "expr", node, name = value)` evaluates a cached
+  expression with an optional context node and named bindings;
+  `form! { (result :id "b1" ^{ value } ..?^{ rows }) }` describes a result
+  element — attributes, namespace declarations, literal and `Display` text,
+  copied content, spliced sequences, and fallible splices whose first failure
+  propagates with `?`. Both are exported at the crate root
+  (`use xsd_schema::{form, xpath};`). A prefixed element name is written
+  `p::local`: one colon after the element name is always the attribute
+  marker, so nothing is ever reinterpreted silently. Element and attribute
+  names are checked when the document is built (`ComposeError::InvalidName`).
+  Braces are the documented spelling of a form invocation because a form's
+  tokens also parse as a Rust expression, which rustfmt would reflow; all
+  three delimiters expand identically. `Composer::new` predeclares the `xs`,
+  `xsi` and `fn` prefixes, as every XQuery processor does, so `xs:date(…)` in
+  an expression and `:xsi:type "…"` in a form need no declaration of their
+  own; `with_namespace` rebinds any of them, the last declaration winning, and
+  a predeclared prefix a form does not use is not written to the output.
+  The eighteen queries of the XQTS "relational" use case, rewritten in this
+  style, reproduce their expected results (`tests/compose_usecase_r.rs`);
+  `examples/xquery_without_xquery.rs` runs three of them end to end, and
+  `doc/COMPOSE.md` is the guide.
 
 ### Changed
 
