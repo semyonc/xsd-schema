@@ -49,6 +49,11 @@ pub mod functions;
 pub mod bind;
 pub mod eval;
 
+// Compile-time dependency analysis (focus use, referenced variables, calls).
+// Internal: the public surface is `FunctionCallRef` plus the accessors on
+// `XPathExpr` (re-exported below).
+pub(crate) mod deps;
+
 // High-level public API
 pub mod api;
 
@@ -72,6 +77,7 @@ pub use self::axis_iterators::{
 };
 pub use self::bind::bind_node;
 pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
+pub use self::deps::FunctionCallRef;
 pub use self::error::XPathError;
 pub use self::eval::eval_node;
 pub use self::functions::{
