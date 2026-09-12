@@ -585,19 +585,11 @@ fn q8<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// The rows are atomic values, not nodes: `pipe::from` adapts the atomized
 /// months, the key closure hands back the month itself, and the sort is
 /// numeric because the month is an `xs:integer` and not its string.
-///
-/// One difference from the query as written: the dates are cast with
-/// `xs:date(...)` before `year-from-date` and `month-from-date` see them.
-/// These documents have no schema, so their content is `xs:untypedAtomic`,
-/// and this engine does not apply the function conversion rule that would
-/// cast it to the declared `xs:date` parameter — it reports XPTY0004
-/// instead. The general comparisons in Q1 and Q8 do perform that cast, which
-/// is why those two need no explicit constructor.
 fn q9<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let end_dates = xpath!(c, "//item_tuple/end_date", inputs.items)?;
     let months = xpath!(
         c,
-        "distinct-values(for $e in $end_dates return month-from-date(xs:date($e)))",
+        "distinct-values(for $e in $end_dates return month-from-date($e))",
         end_dates = &end_dates
     )?
     .atomics()?;
@@ -606,8 +598,8 @@ fn q9<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
         .try_map(|m| {
             let item = xpath!(
                 c,
-                "//item_tuple[year-from-date(xs:date(end_date)) = 1999 \
-                 and month-from-date(xs:date(end_date)) = $m]",
+                "//item_tuple[year-from-date(end_date) = 1999 \
+                 and month-from-date(end_date) = $m]",
                 inputs.items,
                 m = &m
             )?;

@@ -358,7 +358,6 @@
 //! # use xsd_schema::{form, xpath};
 //! # let arena = Bump::new();
 //! # let names = NameTable::new();
-//! // `xs` is bound from the start, so the casts below need no declaration.
 //! let c = Composer::new(&arena, &names);
 //! # let items = c.load_file("XQTS_1_0_2/TestSources/items.xml")?;
 //!
@@ -367,7 +366,7 @@
 //! // for $m in distinct-values(...)
 //! let months = xpath!(
 //!     c,
-//!     "distinct-values(for $e in $end_dates return month-from-date(xs:date($e)))",
+//!     "distinct-values(for $e in $end_dates return month-from-date($e))",
 //!     end_dates = &end_dates
 //! )?
 //! .atomics()?;
@@ -377,8 +376,8 @@
 //!     .try_map(|m| {
 //!         let item = xpath!(
 //!             c,
-//!             "//item_tuple[year-from-date(xs:date(end_date)) = 1999 \
-//!              and month-from-date(xs:date(end_date)) = $m]",
+//!             "//item_tuple[year-from-date(end_date) = 1999 \
+//!              and month-from-date(end_date) = $m]",
 //!             items,
 //!             m = &m
 //!         )?;
@@ -417,14 +416,13 @@
 //! `1` and not `1.0`. `atomics()` materializes its conversion — the pipeline
 //! makes the structure declarative, it does not make XPath evaluation lazy.
 //!
-//! Two details this query settles. The distinct months come from *all* end
+//! One detail this query settles: the distinct months come from *all* end
 //! dates while the year restriction sits in the per-month lookup, so a month
 //! with end dates but no matching 1999 items would still return a count of
-//! zero. And the `xs:date(...)` constructors are written out: these documents
-//! have no schema, so their dates are `xs:untypedAtomic`, and
-//! `month-from-date` reports XPTY0004 rather than applying the function
-//! conversion rule that would cast it. A general comparison — RQ1's
-//! `$i/end_date >= xs:date("1999-01-31")` — does perform that cast.
+//! zero. Note also that `month-from-date(end_date)` is written exactly as the
+//! query has it, with no constructor: these documents carry no schema, so
+//! their dates are `xs:untypedAtomic`, and the function conversion rules of
+//! XPath 2.0 §3.1.5 cast such an argument to the declared `xs:date` parameter.
 
 pub mod composer;
 pub mod emit;
