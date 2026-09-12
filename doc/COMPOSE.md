@@ -25,7 +25,7 @@ So there are three ingredients:
 | --- | --- | --- |
 | `for` / `let` / `where` / `order by` / `return` | LINQ `from` / `let` / `where` / `orderby` / `select` | `pipe::nodes` / `try_map` / `try_filter` / `order_by` / `try_map` (§7) |
 | an XPath expression with variables bound to host values | `node.XPath2Select("//bid_tuple[itemno = $i/itemno]", new { i = item })` | `xpath!(c, "//bid_tuple[itemno = $i/itemno]", bids, i = &i)?` (§5) |
-| element constructors with `{ expr }` splices | `new XElement("item_tuple", item.Element("itemno"), …)` | `form!((item_tuple ^{ … } ^{ … }))` (§6) |
+| element constructors with `{ expr }` splices | `new XElement("item_tuple", item.Element("itemno"), …)` | `form! { (item_tuple ^{ … } ^{ … }) }` (§6) |
 | `doc("items.xml")` | `XDocument.Load("items.xml")` | `c.load_file("items.xml")?` (§3) |
 | the serialized result | `XNode` printed by .NET | `doc.to_xml(&opts)?` (§10) |
 
@@ -41,7 +41,7 @@ new XElement("item_tuple", item.Element("itemno"),
     !bid.Any() ? null : new XElement("high_bid", /* … */));
 ```
 
-Here, `form!((high_bid ^{ max_bid }))` with an empty `max_bid` *is*
+Here, `form! { (high_bid ^{ max_bid }) }` with an empty `max_bid` *is*
 `<high_bid/>`, because that is what the data model says an empty sequence
 spliced into an element produces. No conditional, no `null`, nothing for the
 host to remember.
@@ -183,13 +183,15 @@ let rows = pipe::nodes(xpath!(c, "//item_tuple", items)?)
     })?
     // return ...
     .try_map(|(i, b)| {
-        Ok(form!((item_tuple
-            ^{ xpath!(c, "itemno", &i)? }
-            ^{ xpath!(c, "description", &i)? }
-            (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))))
+        Ok(form! {
+            (item_tuple
+                ^{ xpath!(c, "itemno", &i)? }
+                ^{ xpath!(c, "description", &i)? }
+                (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))
+        })
     });
 
-let doc = c.build(form!((result ..?^{ rows })))?;
+let doc = c.build(form! { (result ..?^{ rows }) })?;
 println!("{}", doc.to_xml(&SerializeOptions::default())?);
 ```
 
@@ -326,6 +328,16 @@ The shape is a Lisp form: a name, then items. Attributes are named operands
 (`:id "b1"`), which leaves `@{…}` with exactly one meaning — evaluate a Rust
 expression now and capture the text.
 
+**Write the invocation with braces: `form! { ( … ) }`.** All three delimiters
+expand identically, but a form's tokens also parse as a Rust expression —
+`(a ^{ x } (b))` is a bit-xor and a call — so rustfmt reads a *parenthesized*
+invocation as arguments and reflows it into that shape: `form!((a ^{ x } (b)))`
+comes back as `form!((a ^ { x }(b)))`, and the element structure is gone. A
+brace-delimited invocation is left alone, so the form keeps the layout you gave
+it and no `#[rustfmt::skip]` is needed anywhere. `xpath!(…)` stays
+parenthesized: its arguments *are* Rust expressions, and rustfmt formats them
+correctly.
+
 ### The escapes
 
 | Written | Means |
@@ -376,9 +388,11 @@ attribute is always in no namespace. A prefix nothing binds is
 ```rust
 let c = Composer::new(&arena, &names).with_namespace("q", "urn:q");
 
-let doc = c.build(form!((e::root :xmlns::e "urn:e" :xml::lang "en"
-    (q::child :xmlns "urn:d" (leaf "text"))
-)))?;
+let doc = c.build(form! {
+    (e::root :xmlns::e "urn:e" :xml::lang "en"
+        (q::child :xmlns "urn:d" (leaf "text"))
+    )
+})?;
 // <e:root xmlns:e="urn:e" xml:lang="en">
 //   <q:child xmlns="urn:d" xmlns:q="urn:q"><leaf>text</leaf></q:child>
 // </e:root>
@@ -401,7 +415,7 @@ which is the constructor rule for attribute content:
 
 ```rust
 let tags = xpath!(c, "//part/@name", stock)?;
-let summary = form!((parts :count @{ tags.len() } :names ^{ &tags }));
+let summary = form! { (parts :count @{ tags.len() } :names ^{ &tags }) };
 // <parts count="3" names="bolt nut washer"/>
 ```
 
@@ -411,11 +425,11 @@ is the sixteenth use-case query, whose XQuery reads
 
 ```rust
 let status = if b.is_empty() {
-    form!((status "inactive"))
+    form! { (status "inactive") }
 } else {
-    form!((status "active"))
+    form! { (status "active") }
 };
-let user = form!((user ^{ xpath!(c, "userid", &u)? } ^{ status }));
+let user = form! { (user ^{ xpath!(c, "userid", &u)? } ^{ status }) };
 ```
 
 An `Option<Form>` works the same way, with `None` contributing nothing.
@@ -537,9 +551,11 @@ fn bid_summary<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Doc<'a>, ComposeEr
     let rows = pipe::from(xpath!(c, "distinct-values(//itemno)", bids)?.atomics()?)
         .try_map(|i| {
             let b = xpath!(c, "//bid_tuple[itemno = $i]", bids, i = &i)?;
-            Ok(form!((bid_count
-                (itemno ^{ i })
-                (nbids ^{ xpath!(c, "count($b)", b = &b)? }))))
+            Ok(form! {
+                (bid_count
+                    (itemno ^{ i })
+                    (nbids ^{ xpath!(c, "count($b)", b = &b)? }))
+            })
         })
         .collect::<Result<Vec<_>, ComposeError>>()?;
     c.build_sequence(rows)

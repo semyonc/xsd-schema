@@ -889,10 +889,10 @@ let stock = c.load_str("<stock><part qty='7'>bolt</part><part qty='0'>nut</part>
 // for $p in //part where $p/@qty > 0 return <part>{ string($p) }</part>
 let rows = pipe::nodes(xpath!(c, "//part", stock)?)
     .try_filter(|p| xpath!(c, "@qty > 0", p)?.boolean())
-    .try_map(|p| Ok(form!((part ^{ xpath!(c, "string()", &p)? }))));
+    .try_map(|p| Ok(form! { (part ^{ xpath!(c, "string()", &p)? }) }));
 
 assert_eq!(
-    c.build(form!((in_stock ..?^{ rows })))?.to_xml(&SerializeOptions::default())?,
+    c.build(form! { (in_stock ..?^{ rows }) })?.to_xml(&SerializeOptions::default())?,
     "<in_stock><part>bolt</part></in_stock>",
 );
 # Ok::<(), ComposeError>(())

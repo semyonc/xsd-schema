@@ -29,8 +29,8 @@
 //! The macros are exported at the crate root, so the canonical import is
 //! `use xsd_schema::{form, xpath};` — see [`macros`] for the grammar they
 //! accept. In a form, a prefixed name is written with two colons —
-//! `form!((p::title "One"))` — because one colon after the element name is
-//! always the start of an attribute: `form!((book :id "b1"))`.
+//! `form! { (p::title "One") }` — because one colon after the element name is
+//! always the start of an attribute: `form! { (book :id "b1") }`.
 //!
 //! A composer starts with `xs`, `xsi` and `fn` bound, so a cast —
 //! `xs:date('1999-01-31')` — and a form name like `(xs::schema …)` need no
@@ -229,13 +229,15 @@
 //!     })?
 //!     // return ...
 //!     .try_map(|(i, b)| {
-//!         Ok(form!((item_tuple
-//!             ^{ xpath!(c, "itemno", &i)? }
-//!             ^{ xpath!(c, "description", &i)? }
-//!             (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))))
+//!         Ok(form! {
+//!             (item_tuple
+//!                 ^{ xpath!(c, "itemno", &i)? }
+//!                 ^{ xpath!(c, "description", &i)? }
+//!                 (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))
+//!         })
 //!     });
 //!
-//! let doc = c.build(form!((result ..?^{ rows })))?;
+//! let doc = c.build(form! { (result ..?^{ rows }) })?;
 //! assert_eq!(
 //!     doc.to_xml(&SerializeOptions::default())?,
 //!     concat!(
@@ -304,14 +306,16 @@
 //!     })
 //!     // return ...
 //!     .try_map(|(u, i)| {
-//!         Ok(form!((warning
-//!             ^{ xpath!(c, "name", &u)? }
-//!             ^{ xpath!(c, "rating", &u)? }
-//!             ^{ xpath!(c, "description", &i)? }
-//!             ^{ xpath!(c, "reserve_price", &i)? })))
+//!         Ok(form! {
+//!             (warning
+//!                 ^{ xpath!(c, "name", &u)? }
+//!                 ^{ xpath!(c, "rating", &u)? }
+//!                 ^{ xpath!(c, "description", &i)? }
+//!                 ^{ xpath!(c, "reserve_price", &i)? })
+//!         })
 //!     });
 //!
-//! let doc = c.build(form!((result ..?^{ warnings })))?;
+//! let doc = c.build(form! { (result ..?^{ warnings }) })?;
 //! assert_eq!(
 //!     doc.to_xml(&SerializeOptions::default())?,
 //!     concat!(
@@ -384,12 +388,14 @@
 //!     .order_by(Direction::Ascending, EmptyOrder::Least, |(m, _)| Ok(Some(m.clone())))?
 //!     // return ...
 //!     .try_map(|(m, item)| {
-//!         Ok(form!((monthly_result
-//!             (month ^{ m })
-//!             (item_count ^{ xpath!(c, "count($item)", item = &item)? }))))
+//!         Ok(form! {
+//!             (monthly_result
+//!                 (month ^{ m })
+//!                 (item_count ^{ xpath!(c, "count($item)", item = &item)? }))
+//!         })
 //!     });
 //!
-//! let doc = c.build(form!((result ..?^{ rows })))?;
+//! let doc = c.build(form! { (result ..?^{ rows }) })?;
 //! assert_eq!(
 //!     doc.to_xml(&SerializeOptions::default())?,
 //!     concat!(

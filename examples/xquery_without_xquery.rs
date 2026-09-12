@@ -22,11 +22,6 @@
 //!   `order_by` for `order by`;
 //! * `form!` describes the result elements, and `Composer::build` turns the
 //!   description into a document.
-//!
-//! The query functions carry `#[rustfmt::skip]`. A form's tokens also parse
-//! as a Rust expression — `(a ^{ x } (b))` is a bit-xor and a call — so
-//! rustfmt reflows them into that shape and the element structure stops being
-//! visible. The layout below is the form grammar's own.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -130,7 +125,6 @@ fn show(title: &str, doc: Doc<'_>) -> Result<(), ComposeError> {
 /// One stage per clause. The last bicycle has no bids, so `max` returns the
 /// empty sequence and its `high_bid` element comes out empty — no Rust test
 /// for "no bids" anywhere, because the data model already says it.
-#[rustfmt::skip]
 fn highest_bid_per_bicycle<'a>(
     c: &Composer<'a>,
     items: Doc<'a>,
@@ -151,13 +145,15 @@ fn highest_bid_per_bicycle<'a>(
         })?
         // return ...
         .try_map(|(i, b)| {
-            Ok(form!((item_tuple
-                ^{ xpath!(c, "itemno", &i)? }
-                ^{ xpath!(c, "description", &i)? }
-                (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))))
+            Ok(form! {
+                (item_tuple
+                    ^{ xpath!(c, "itemno", &i)? }
+                    ^{ xpath!(c, "description", &i)? }
+                    (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// RQ3, users rated worse than "C" who offer items over 1000.
@@ -176,7 +172,6 @@ fn highest_bid_per_bicycle<'a>(
 /// The nested `for` is `try_flat_map`: the item source is created for each
 /// user and exhausted before the next user, which is the query's own order.
 /// The three-part `where` stays one expression with two nodes bound to it.
-#[rustfmt::skip]
 fn risky_sellers<'a>(
     c: &Composer<'a>,
     items: Doc<'a>,
@@ -200,14 +195,16 @@ fn risky_sellers<'a>(
         })
         // return ...
         .try_map(|(u, i)| {
-            Ok(form!((warning
-                ^{ xpath!(c, "name", &u)? }
-                ^{ xpath!(c, "rating", &u)? }
-                ^{ xpath!(c, "description", &i)? }
-                ^{ xpath!(c, "reserve_price", &i)? })))
+            Ok(form! {
+                (warning
+                    ^{ xpath!(c, "name", &u)? }
+                    ^{ xpath!(c, "rating", &u)? }
+                    ^{ xpath!(c, "description", &i)? }
+                    ^{ xpath!(c, "reserve_price", &i)? })
+            })
         });
 
-    c.build(form!((result ..?^{ warnings })))
+    c.build(form! { (result ..?^{ warnings }) })
 }
 
 /// RQ9, how many auctions ended in each month of 1999.
@@ -230,7 +227,6 @@ fn risky_sellers<'a>(
 /// documents have no schema, so their dates are untyped and the `xs:date(...)`
 /// constructors are written out; the query relies on a function conversion
 /// this engine does not apply.
-#[rustfmt::skip]
 fn auctions_per_month<'a>(c: &Composer<'a>, items: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     // let $end_dates := ...
     let end_dates = xpath!(c, "//item_tuple/end_date", items)?;
@@ -260,10 +256,12 @@ fn auctions_per_month<'a>(c: &Composer<'a>, items: Doc<'a>) -> Result<Doc<'a>, C
         })?
         // return ...
         .try_map(|(m, item)| {
-            Ok(form!((monthly_result
-                (month ^{ m })
-                (item_count ^{ xpath!(c, "count($item)", item = &item)? }))))
+            Ok(form! {
+                (monthly_result
+                    (month ^{ m })
+                    (item_count ^{ xpath!(c, "count($item)", item = &item)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }

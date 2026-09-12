@@ -159,10 +159,10 @@
 ///
 /// let rows = pipe::nodes(xpath!(c, "//part", stock)?)
 ///     .try_filter(|p| xpath!(c, "@qty > 0", p)?.boolean())
-///     .try_map(|p| Ok(form!((part ^{ xpath!(c, "string()", &p)? }))));
+///     .try_map(|p| Ok(form! { (part ^{ xpath!(c, "string()", &p)? }) }));
 ///
 /// assert_eq!(
-///     c.build(form!((in_stock ..?^{ rows })))?.to_xml(&SerializeOptions::default())?,
+///     c.build(form! { (in_stock ..?^{ rows }) })?.to_xml(&SerializeOptions::default())?,
 ///     "<in_stock><part>bolt</part></in_stock>",
 /// );
 /// # Ok::<(), ComposeError>(())
@@ -316,6 +316,18 @@ macro_rules! xpath {
 /// implementation, so `..^{}` cannot quietly turn a failure into missing
 /// content; `..?^{}` is the spelling that propagates it.
 ///
+/// # Write the invocation with braces
+///
+/// **`form! { ( … ) }` is the spelling to use**, and it is what every example
+/// here and in the guide uses. All three delimiters expand identically —
+/// `macro_rules!` does not care which one an invocation carries — but a form's
+/// tokens also happen to parse as a Rust expression: `(a ^{ x } (b))` is a
+/// bit-xor and a call. rustfmt reads a parenthesized invocation as arguments
+/// and reflows them into that shape, so `form!((a ^{ x } (b)))` comes back as
+/// `form!((a ^ { x }(b)))` and the element structure stops being visible. A
+/// brace-delimited invocation is left alone, which is all it takes: the form
+/// keeps the layout you gave it, with no `#[rustfmt::skip]` anywhere.
+///
 /// # Names
 ///
 /// Prefixes are resolved when the document is built — against the form's own
@@ -388,18 +400,20 @@ macro_rules! xpath {
 /// let parts = xpath!(c, "//part", stock)?;
 /// let extra = ["washer", "screw"];
 ///
-/// let doc = c.build(form!((inventory
-///     :kind "hardware"                                      // a literal attribute
-///     :count @{ count }                                     // an attribute from a Rust value
-///     :first ^{ xpath!(c, "//part[1]", stock)? }            // an attribute from a query
-///     "in stock: "                                          // literal text
-///     @{ count }                                            // text from a Rust value
-///     ^{ parts }                                            // two copied elements
-///     ..^{ extra.iter().map(|n| form!((part ^{ *n }))) }     // a spliced sequence
-///     (note :kind "generated" "written by form!")           // a child element
-///     #comment " counted "                                  // a comment
-///     #pi "sort" "by name"                                  // a processing instruction
-/// )))?;
+/// let doc = c.build(form! {
+///     (inventory
+///         :kind "hardware"                                       // a literal attribute
+///         :count @{ count }                                      // an attribute from a Rust value
+///         :first ^{ xpath!(c, "//part[1]", stock)? }             // an attribute from a query
+///         "in stock: "                                           // literal text
+///         @{ count }                                             // text from a Rust value
+///         ^{ parts }                                             // two copied elements
+///         ..^{ extra.iter().map(|n| form! { (part ^{ *n }) }) }   // a spliced sequence
+///         (note :kind "generated" "written by form!")            // a child element
+///         #comment " counted "                                   // a comment
+///         #pi "sort" "by name"                                   // a processing instruction
+///     )
+/// })?;
 ///
 /// assert_eq!(
 ///     doc.to_xml(&SerializeOptions::default())?,
@@ -427,9 +441,11 @@ macro_rules! xpath {
 /// let names = NameTable::new();
 /// let c = Composer::new(&arena, &names).with_namespace("q", "urn:q");
 ///
-/// let doc = c.build(form!((e::root :xmlns::e "urn:e" :xml::lang "en"
-///     (q::child :xmlns "urn:d" (leaf "text"))
-/// )))?;
+/// let doc = c.build(form! {
+///     (e::root :xmlns::e "urn:e" :xml::lang "en"
+///         (q::child :xmlns "urn:d" (leaf "text"))
+///     )
+/// })?;
 ///
 /// assert_eq!(
 ///     doc.to_xml(&SerializeOptions::default())?,
@@ -453,10 +469,10 @@ macro_rules! xpath {
 ///
 /// fn loud<'a>(c: &Composer<'a>, stock: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
 ///     let rows = pipe::nodes(xpath!(c, "//part", stock)?)
-///         .try_map(|p| Ok(form!((part ^{ xpath!(c, "upper-case(string())", &p)? }))));
+///         .try_map(|p| Ok(form! { (part ^{ xpath!(c, "upper-case(string())", &p)? }) }));
 ///     // A failure anywhere in `rows` leaves this function instead of
 ///     // becoming missing content, and `build` is never reached.
-///     c.build(form!((parts ..?^{ rows })))
+///     c.build(form! { (parts ..?^{ rows }) })
 /// }
 ///
 /// let arena = Bump::new();
@@ -485,8 +501,8 @@ macro_rules! xpath {
 /// let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
 ///
 /// // `:root` starts an attribute, and `(child)` is not an attribute value.
-/// // Write form!((p::root (child))) for the element `p:root`.
-/// let refused = form!((p:root (child)));
+/// // Write form! { (p::root (child)) } for the element `p:root`.
+/// let refused = form! { (p:root (child)) };
 /// # Ok::<(), ComposeError>(())
 /// ```
 ///
@@ -504,7 +520,7 @@ macro_rules! xpath {
 ///
 /// let rows: Vec<Result<&str, ComposeError>> = vec![Ok("a")];
 /// // `Result` is not content: write `..?^{ rows }` to propagate the failure.
-/// let refused = form!((result ..^{ rows }));
+/// let refused = form! { (result ..^{ rows }) };
 /// # Ok::<(), ComposeError>(())
 /// ```
 ///
@@ -517,7 +533,7 @@ macro_rules! xpath {
 /// fn how_many() -> usize {
 ///     let rows: Vec<Result<&'static str, ComposeError>> = vec![Ok("a")];
 ///     // There is nothing here for the `?` to return to.
-///     let refused = form!((result ..?^{ rows }));
+///     let refused = form! { (result ..?^{ rows }) };
 ///     refused.content().len()
 /// }
 /// ```
@@ -620,8 +636,8 @@ macro_rules! form {
 
     ($($rest:tt)*) => {
         ::core::compile_error!(
-            "form!: expected one parenthesized form — form!((name item…)), whose name is \
-             `local`, `prefix::local` or a string literal"
+            "form!: expected one parenthesized form — form! { (name item…) }, whose name \
+             is `local`, `prefix::local` or a string literal"
         )
     };
 }
@@ -786,8 +802,8 @@ macro_rules! __form_attr {
         ::core::compile_error!(
             "form!: an attribute needs a value — a string literal, @{ e } for a Display \
              value, or ^{ e } for a sequence. A single colon always starts an attribute, so \
-             a prefixed element name is written with two — form!((p::local …)) — or as a \
-             string literal — form!((\"p:local\" …))"
+             a prefixed element name is written with two — form! { (p::local …) } — or as \
+             a string literal — form! { (\"p:local\" …) }"
         )
     };
 }
@@ -952,6 +968,25 @@ mod tests {
         }
     }
 
+    // ── form!: the invocation itself ──────────────────────────────────
+
+    #[test]
+    fn every_invocation_delimiter_expands_the_same() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let c = Composer::new(&arena, &names);
+
+        // `form! { ( … ) }` is the documented spelling because rustfmt leaves
+        // it alone; the other two must keep working all the same.
+        let braces = xml(&c, form! { (part :qty "7" "bolt" (tag "new")) });
+        let parens = xml(&c, form!((part :qty "7" "bolt" (tag "new"))));
+        let brackets = xml(&c, form![(part :qty "7" "bolt" (tag "new"))]);
+
+        assert_eq!(braces, r#"<part qty="7">bolt<tag>new</tag></part>"#);
+        assert_eq!(parens, braces);
+        assert_eq!(brackets, braces);
+    }
+
     // ── form!: names ──────────────────────────────────────────────────
 
     #[test]
@@ -960,18 +995,18 @@ mod tests {
         let names = NameTable::new();
         let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
 
-        assert_eq!(xml(&c, form!((item_tuple))), "<item_tuple/>");
+        assert_eq!(xml(&c, form! { (item_tuple) }), "<item_tuple/>");
         assert_eq!(
-            xml(&c, form!((p::bid "55"))),
+            xml(&c, form! { (p::bid "55") }),
             r#"<p:bid xmlns:p="urn:p">55</p:bid>"#
         );
         // A name that is not a Rust identifier, and a prefixed one.
         assert_eq!(
-            xml(&c, form!(("bid-count" :"low-bid" "3" "7"))),
+            xml(&c, form! { ("bid-count" :"low-bid" "3" "7") }),
             r#"<bid-count low-bid="3">7</bid-count>"#
         );
         assert_eq!(
-            xml(&c, form!(("p:bid" "55"))),
+            xml(&c, form! { ("p:bid" "55") }),
             r#"<p:bid xmlns:p="urn:p">55</p:bid>"#
         );
         Ok(())
@@ -986,8 +1021,8 @@ mod tests {
         // `(p:title "One")` and `(book :id "b1")` are the same token shape —
         // whitespace is not in the token stream — so one colon after the
         // element name is the attribute marker in both, and in either spacing.
-        assert_eq!(xml(&c, form!((p:title "One"))), r#"<p title="One"/>"#);
-        assert_eq!(xml(&c, form!((p :title "One"))), r#"<p title="One"/>"#);
+        assert_eq!(xml(&c, form! { (p:title "One") }), r#"<p title="One"/>"#);
+        assert_eq!(xml(&c, form! { (p :title "One") }), r#"<p title="One"/>"#);
         // A prefixed element name written with one colon does not compile at
         // all; the doc tests pin that. Nothing here is reinterpreted.
     }
@@ -999,20 +1034,20 @@ mod tests {
         let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
 
         assert_eq!(
-            xml(&c, form!((p::title "One"))),
+            xml(&c, form! { (p::title "One") }),
             r#"<p:title xmlns:p="urn:p">One</p:title>"#
         );
         assert_eq!(
-            xml(&c, form!(("p:title" "One"))),
+            xml(&c, form! { ("p:title" "One") }),
             r#"<p:title xmlns:p="urn:p">One</p:title>"#
         );
         // An attribute after either spelling is unambiguous.
         assert_eq!(
-            xml(&c, form!((p::title :id "b1" "One"))),
+            xml(&c, form! { (p::title :id "b1" "One") }),
             r#"<p:title xmlns:p="urn:p" id="b1">One</p:title>"#
         );
         assert_eq!(
-            xml(&c, form!((p::title(leaf)))),
+            xml(&c, form! { (p::title (leaf)) }),
             r#"<p:title xmlns:p="urn:p"><leaf/></p:title>"#
         );
     }
@@ -1023,7 +1058,7 @@ mod tests {
         let names = NameTable::new();
         let c = Composer::new(&arena, &names);
 
-        match c.build(form!((p::x))) {
+        match c.build(form! { (p::x) }) {
             Err(ComposeError::UnboundPrefix { prefix, at }) => {
                 assert_eq!(prefix, "p");
                 assert_eq!(at, "p:x");
@@ -1038,11 +1073,11 @@ mod tests {
         let names = NameTable::new();
         let c = Composer::new(&arena, &names);
 
-        match c.build(form!(("not a name"))) {
+        match c.build(form! { ("not a name") }) {
             Err(ComposeError::InvalidName(name)) => assert_eq!(name, "not a name"),
             other => panic!("expected an invalid name, got {other:?}"),
         }
-        match c.build(form!((e :"not a name" "v"))) {
+        match c.build(form! { (e :"not a name" "v") }) {
             Err(ComposeError::InvalidName(name)) => assert_eq!(name, "not a name"),
             other => panic!("expected an invalid name, got {other:?}"),
         }
@@ -1060,7 +1095,7 @@ mod tests {
         assert_eq!(
             xml(
                 &c,
-                form!((item :kind "bike" :count @{ 7 } :what @{ Bicycle } :ids ^{ ids }))
+                form! { (item :kind "bike" :count @{ 7 } :what @{ Bicycle } :ids ^{ ids }) }
             ),
             r#"<item kind="bike" count="7" what="Red Bicycle" ids="1 2 3"/>"#
         );
@@ -1074,11 +1109,11 @@ mod tests {
         let c = Composer::new(&arena, &names);
 
         assert_eq!(
-            xml(&c, form!((p :xml::lang "en" "text"))),
+            xml(&c, form! { (p :xml::lang "en" "text") }),
             r#"<p xml:lang="en">text</p>"#
         );
         assert_eq!(
-            xml(&c, form!((p :xml:space "preserve" "text"))),
+            xml(&c, form! { (p :xml:space "preserve" "text") }),
             r#"<p xml:space="preserve">text</p>"#
         );
     }
@@ -1092,9 +1127,11 @@ mod tests {
         assert_eq!(
             xml(
                 &c,
-                form!((outer :xmlns "urn:one"
-                    (inner :xmlns "urn:two" (leaf))
-                    (sibling)))
+                form! {
+                    (outer :xmlns "urn:one"
+                        (inner :xmlns "urn:two" (leaf))
+                        (sibling))
+                }
             ),
             concat!(
                 r#"<outer xmlns="urn:one">"#,
@@ -1105,7 +1142,7 @@ mod tests {
         assert_eq!(
             xml(
                 &c,
-                form!((e::root :xmlns::e "urn:e" (e::child :xmlns:e "urn:f" (e::leaf))))
+                form! { (e::root :xmlns::e "urn:e" (e::child :xmlns:e "urn:f" (e::leaf))) }
             ),
             concat!(
                 r#"<e:root xmlns:e="urn:e">"#,
@@ -1128,7 +1165,7 @@ mod tests {
         let source = c.load_str(r#"<s xmlns:p="urn:b" p:k="v"/>"#)?;
         let attr = xpath!(c, "//@q:k", source)?;
 
-        let written = xml(&c, form!((p::out ^ { attr })));
+        let written = xml(&c, form! { (p::out ^{ attr }) });
         assert!(written.contains(r#"ns0:k="v""#), "{written}");
         assert!(written.contains(r#"xmlns:ns0="urn:b""#), "{written}");
         assert!(written.contains(r#"xmlns:p="urn:a""#), "{written}");
@@ -1144,7 +1181,7 @@ mod tests {
         let source = c.load_str(r#"<s k="v"/>"#)?;
         let attr = xpath!(c, "//@k", source)?;
 
-        match c.build(form!((result (item "text first" ^{ attr })))) {
+        match c.build(form! { (result (item "text first" ^{ attr })) }) {
             Err(ComposeError::Copy { source, at }) => {
                 assert_eq!(at, "result/item");
                 assert!(source.to_string().contains("content"), "{source}");
@@ -1164,7 +1201,7 @@ mod tests {
 
         // Two adjacent texts concatenate with nothing between them.
         assert_eq!(
-            xml(&c, form!((p "in stock: " @{ 4 } " of " @{ Bicycle }))),
+            xml(&c, form! { (p "in stock: " @{ 4 } " of " @{ Bicycle }) }),
             "<p>in stock: 4 of Red Bicycle</p>"
         );
     }
@@ -1178,7 +1215,7 @@ mod tests {
         let b = xpath!(c, "//b", source)?;
 
         assert_eq!(
-            xml(&c, form!((out ^ { b } ^ { form!((child "x")) }))),
+            xml(&c, form! { (out ^{ b } ^{ form! { (child "x") } }) }),
             r#"<out><b k="v">text</b><child>x</child></out>"#
         );
         Ok(())
@@ -1189,11 +1226,11 @@ mod tests {
         let arena = Bump::new();
         let names = NameTable::new();
         let c = Composer::new(&arena, &names);
-        let present: Option<Form<'_>> = Some(form!((here)));
+        let present: Option<Form<'_>> = Some(form! { (here) });
         let absent: Option<Form<'_>> = None;
 
         assert_eq!(
-            xml(&c, form!((root ^ { present } ^ { absent }))),
+            xml(&c, form! { (root ^{ present } ^{ absent }) }),
             "<root><here/></root>"
         );
     }
@@ -1205,7 +1242,7 @@ mod tests {
         let c = Composer::new(&arena, &names);
         let empty: Vec<&str> = Vec::new();
 
-        assert_eq!(xml(&c, form!((e "a" ..^{ empty } "b"))), "<e>ab</e>");
+        assert_eq!(xml(&c, form! { (e "a" ..^{ empty } "b") }), "<e>ab</e>");
     }
 
     #[test]
@@ -1220,10 +1257,12 @@ mod tests {
         assert_eq!(
             xml(
                 &c,
-                form!((e
-                    ..^{ [XmlValue::string("a")] }
-                    ..^{ empty }
-                    ..^{ [XmlValue::string("b")] }))
+                form! {
+                    (e
+                        ..^{ [XmlValue::string("a")] }
+                        ..^{ empty }
+                        ..^{ [XmlValue::string("b")] })
+                }
             ),
             "<e>a b</e>"
         );
@@ -1239,7 +1278,7 @@ mod tests {
         assert_eq!(
             xml(
                 &c,
-                form!((parts ..^{ extra.iter().map(|n| form!((part ^{ *n }))) }))
+                form! { (parts ..^{ extra.iter().map(|n| form! { (part ^{ *n }) }) }) }
             ),
             "<parts><part>washer</part><part>screw</part></parts>"
         );
@@ -1252,7 +1291,7 @@ mod tests {
         let c = Composer::new(&arena, &names);
 
         assert_eq!(
-            xml(&c, form!((root #comment " note " #pi "work" "now"))),
+            xml(&c, form! { (root #comment " note " #pi "work" "now") }),
             "<root><!-- note --><?work now?></root>"
         );
     }
@@ -1264,7 +1303,7 @@ mod tests {
         let c = Composer::new(&arena, &names);
 
         assert_eq!(
-            xml(&c, form!((a (b (c "deep")) (b)))),
+            xml(&c, form! { (a (b (c "deep")) (b)) }),
             "<a><b><c>deep</c></b><b/></a>"
         );
     }
@@ -1276,12 +1315,14 @@ mod tests {
         let c = Composer::new(&arena, &names);
         let log = RefCell::new(Vec::new());
 
-        let form = form!((e
-            :first @{ note(&log, "attribute", 1) }
-            @{ note(&log, "text", 2) }
-            ^{ note(&log, "value", "three") }
-            ..^{ note(&log, "splice", vec!["four"]) }
-        ));
+        let form = form! {
+            (e
+                :first @{ note(&log, "attribute", 1) }
+                @{ note(&log, "text", 2) }
+                ^{ note(&log, "value", "three") }
+                ..^{ note(&log, "splice", vec!["four"]) }
+            )
+        };
 
         assert_eq!(*log.borrow(), ["attribute", "text", "value", "splice"]);
         assert_eq!(xml(&c, form), r#"<e first="1">2threefour</e>"#);
@@ -1296,7 +1337,7 @@ mod tests {
         let c = Composer::new(&arena, &names);
         let rows: Vec<Result<&str, ComposeError>> = vec![Ok("a"), Ok("b")];
 
-        assert_eq!(xml(&c, form!((e ..?^{ rows }))), "<e>ab</e>");
+        assert_eq!(xml(&c, form! { (e ..?^{ rows }) }), "<e>ab</e>");
         Ok(())
     }
 
@@ -1318,10 +1359,12 @@ mod tests {
         ];
 
         let outcome = (|| -> Result<String, ComposeError> {
-            let form = form!((result
-                ..?^{ rows.into_iter().inspect(|_| pulled.set(pulled.get() + 1)) }
-                ^{ { later.set(later.get() + 1); "after" } }
-            ));
+            let form = form! {
+                (result
+                    ..?^{ rows.into_iter().inspect(|_| pulled.set(pulled.get() + 1)) }
+                    ^{ { later.set(later.get() + 1); "after" } }
+                )
+            };
             built.set(built.get() + 1);
             c.build(form)?.to_xml(&SerializeOptions::default())
         })();
@@ -1343,10 +1386,12 @@ mod tests {
         let names = NameTable::new();
         let c = Composer::new(&arena, &names);
 
-        let doc = c.build(form!((catalog
-            (book :id "b1" (title "One"))
-            (book :id "b2" (title "Two"))
-        )))?;
+        let doc = c.build(form! {
+            (catalog
+                (book :id "b1" (title "One"))
+                (book :id "b2" (title "Two"))
+            )
+        })?;
 
         assert_eq!(
             doc.to_xml(&SerializeOptions::default())?,

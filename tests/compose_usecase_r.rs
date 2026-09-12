@@ -20,11 +20,6 @@
 //! Each query's own documentation carries the XQuery it rewrites and the
 //! catalog's input bindings, since which of `items`, `bids` and `users` an
 //! `$input-context` names changes from query to query.
-//!
-//! The query functions carry `#[rustfmt::skip]`. A form's tokens also parse
-//! as a Rust expression — `(a ^{ x } (b))` is a bit-xor and a call — so
-//! rustfmt reflows them into that shape and the element structure stops being
-//! visible. The layout below is the form grammar's own.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -249,7 +244,6 @@ fn render_node(node: roxmltree::Node<'_, '_>, depth: usize, out: &mut String) {
 /// context item. The dates in these documents are untyped, and a general
 /// comparison casts an untyped operand to the type of the other one, so the
 /// comparison is a date comparison and nothing about dates reaches Rust.
-#[rustfmt::skip]
 fn q1<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//item_tuple", inputs.items)?)
         .try_filter(|i| {
@@ -266,12 +260,14 @@ fn q1<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             xpath!(c, "itemno", i)?.key()
         })?
         .try_map(|i| {
-            Ok(form!((item_tuple
-                ^{ xpath!(c, "itemno", &i)? }
-                ^{ xpath!(c, "description", &i)? })))
+            Ok(form! {
+                (item_tuple
+                    ^{ xpath!(c, "itemno", &i)? }
+                    ^{ xpath!(c, "description", &i)? })
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q2 — the highest bid for every bicycle, in item-number order.
@@ -293,7 +289,6 @@ fn q1<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// the bid sequence beside its item. The broken bicycle has no bids at all,
 /// so `max` returns the empty sequence and `high_bid` comes out empty — the
 /// data model's answer, with nothing in Rust testing for it.
-#[rustfmt::skip]
 fn q2<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//item_tuple", inputs.items)?)
         .try_map(|i| {
@@ -305,13 +300,15 @@ fn q2<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             xpath!(c, "itemno", i)?.key()
         })?
         .try_map(|(i, b)| {
-            Ok(form!((item_tuple
-                ^{ xpath!(c, "itemno", &i)? }
-                ^{ xpath!(c, "description", &i)? }
-                (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))))
+            Ok(form! {
+                (item_tuple
+                    ^{ xpath!(c, "itemno", &i)? }
+                    ^{ xpath!(c, "description", &i)? }
+                    (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q3 — users rated worse than "C" offering items over 1000.
@@ -332,7 +329,6 @@ fn q2<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// The nested `for` is a `try_flat_map`: the item source is created for each
 /// user and exhausted before the next one, which is the query's own order.
 /// The `where` stays one expression with two bound nodes.
-#[rustfmt::skip]
 fn q3<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .try_flat_map(|u| {
@@ -350,14 +346,16 @@ fn q3<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             .boolean()
         })
         .try_map(|(u, i)| {
-            Ok(form!((warning
-                ^{ xpath!(c, "name", &u)? }
-                ^{ xpath!(c, "rating", &u)? }
-                ^{ xpath!(c, "description", &i)? }
-                ^{ xpath!(c, "reserve_price", &i)? })))
+            Ok(form! {
+                (warning
+                    ^{ xpath!(c, "name", &u)? }
+                    ^{ xpath!(c, "rating", &u)? }
+                    ^{ xpath!(c, "description", &i)? }
+                    ^{ xpath!(c, "reserve_price", &i)? })
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q4 — items nobody bid on.
@@ -373,7 +371,6 @@ fn q3<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// ```
 ///
 /// No `order by`, so the rows keep the source's document order.
-#[rustfmt::skip]
 fn q4<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//item_tuple", inputs.items)?)
         .try_filter(|i| {
@@ -386,12 +383,14 @@ fn q4<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             .boolean()
         })
         .try_map(|i| {
-            Ok(form!((no_bid_item
-                ^{ xpath!(c, "itemno", &i)? }
-                ^{ xpath!(c, "description", &i)? })))
+            Ok(form! {
+                (no_bid_item
+                    ^{ xpath!(c, "itemno", &i)? }
+                    ^{ xpath!(c, "description", &i)? })
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q5 — the bicycle Tom Jones sold, its winning bid, and who made it.
@@ -424,7 +423,6 @@ fn q4<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// applied to that source instead, which is an author's choice and not
 /// something the pipeline does on its own. `unordered` asks for no particular
 /// order, and one row satisfies the join.
-#[rustfmt::skip]
 fn q5<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .try_filter(|seller| xpath!(c, "name = 'Tom Jones'", seller)?.boolean())
@@ -457,14 +455,16 @@ fn q5<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             .boolean()
         })
         .try_map(|(_seller, buyer, item, highbid)| {
-            Ok(form!((jones_bike
-                ^{ xpath!(c, "itemno", &item)? }
-                ^{ xpath!(c, "description", &item)? }
-                (high_bid ^{ xpath!(c, "bid", &highbid)? })
-                (high_bidder ^{ xpath!(c, "name", &buyer)? }))))
+            Ok(form! {
+                (jones_bike
+                    ^{ xpath!(c, "itemno", &item)? }
+                    ^{ xpath!(c, "description", &item)? }
+                    (high_bid ^{ xpath!(c, "bid", &highbid)? })
+                    (high_bidder ^{ xpath!(c, "name", &buyer)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q6 — items whose highest bid beats twice the reserve price.
@@ -486,7 +486,6 @@ fn q5<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// into the `where` as `$z` and spliced into the result as content. An item
 /// with no bids gives an empty `$z`, the comparison is then the empty
 /// sequence, and its effective boolean value rejects the row.
-#[rustfmt::skip]
 fn q6<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//item_tuple", inputs.items)?)
         .try_map(|item| {
@@ -503,14 +502,16 @@ fn q6<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             xpath!(c, "$item/reserve_price * 2 < $z", item = item, z = z)?.boolean()
         })
         .try_map(|(item, z)| {
-            Ok(form!((successful_item
-                ^{ xpath!(c, "itemno", &item)? }
-                ^{ xpath!(c, "description", &item)? }
-                ^{ xpath!(c, "reserve_price", &item)? }
-                (high_bid ^{ z }))))
+            Ok(form! {
+                (successful_item
+                    ^{ xpath!(c, "itemno", &item)? }
+                    ^{ xpath!(c, "description", &item)? }
+                    ^{ xpath!(c, "reserve_price", &item)? }
+                    (high_bid ^{ z }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q7 — the highest bid on anything with two or three wheels.
@@ -527,7 +528,6 @@ fn q6<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 ///
 /// No `for`, so no pipeline: two Rust locals holding node sequences, each
 /// bound into the next expression as a variable, and one result element.
-#[rustfmt::skip]
 fn q7<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let allbikes = xpath!(
         c,
@@ -542,7 +542,7 @@ fn q7<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
         allbikes = &allbikes
     )?;
 
-    c.build(form!((high_bid ^{ xpath!(c, "max($bikebids/bid)", bikebids = &bikebids)? })))
+    c.build(form! { (high_bid ^{ xpath!(c, "max($bikebids/bid)", bikebids = &bikebids)? }) })
 }
 
 /// Q8 — how many auctions ended in March 1999.
@@ -554,7 +554,6 @@ fn q7<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 ///   [end_date >= xs:date("1999-03-01") and end_date <= xs:date("1999-03-31")]
 /// return <item_count>{ count($item) }</item_count>
 /// ```
-#[rustfmt::skip]
 fn q8<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let item = xpath!(
         c,
@@ -563,7 +562,7 @@ fn q8<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
         inputs.items
     )?;
 
-    c.build(form!((item_count ^{ xpath!(c, "count($item)", item = &item)? })))
+    c.build(form! { (item_count ^{ xpath!(c, "count($item)", item = &item)? }) })
 }
 
 /// Q9 — how many auctions ended in each month.
@@ -594,7 +593,6 @@ fn q8<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 /// cast it to the declared `xs:date` parameter — it reports XPTY0004
 /// instead. The general comparisons in Q1 and Q8 do perform that cast, which
 /// is why those two need no explicit constructor.
-#[rustfmt::skip]
 fn q9<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let end_dates = xpath!(c, "//item_tuple/end_date", inputs.items)?;
     let months = xpath!(
@@ -619,12 +617,14 @@ fn q9<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
             Ok(Some(m.clone()))
         })?
         .try_map(|(m, item)| {
-            Ok(form!((monthly_result
-                (month ^{ m })
-                (item_count ^{ xpath!(c, "count($item)", item = &item)? }))))
+            Ok(form! {
+                (monthly_result
+                    (month ^{ m })
+                    (item_count ^{ xpath!(c, "count($item)", item = &item)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q10 — the winning bid on every item, with the bidder's name.
@@ -646,7 +646,6 @@ fn q9<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError
 ///
 /// `$user/name/text()` splices a *text* node, so the bidder's name arrives as
 /// characters rather than as a copied `name` element.
-#[rustfmt::skip]
 fn q10<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//bid_tuple", inputs.bids)?)
         .try_flat_map(|highbid| {
@@ -668,13 +667,15 @@ fn q10<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             xpath!(c, "itemno", highbid)?.key()
         })?
         .try_map(|(highbid, user)| {
-            Ok(form!((high_bid
-                ^{ xpath!(c, "itemno", &highbid)? }
-                ^{ xpath!(c, "bid", &highbid)? }
-                (bidder ^{ xpath!(c, "name/text()", &user)? }))))
+            Ok(form! {
+                (high_bid
+                    ^{ xpath!(c, "itemno", &highbid)? }
+                    ^{ xpath!(c, "bid", &highbid)? }
+                    (bidder ^{ xpath!(c, "name/text()", &user)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q11 — the item that attracted the highest bid of all.
@@ -695,7 +696,6 @@ fn q10<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// The outer `let` is an ordinary Rust local, evaluated once before the
 /// pipeline: it is bound into the `where` as `$highbid` and spliced into the
 /// content of every result element.
-#[rustfmt::skip]
 fn q11<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let highbid = xpath!(c, "max(//bid_tuple/bid)", inputs.bids)?;
 
@@ -711,13 +711,15 @@ fn q11<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
         })
         .try_filter(|(_, b)| xpath!(c, "$b/bid = $highbid", b = b, highbid = &highbid)?.boolean())
         .try_map(|(item, _)| {
-            Ok(form!((expensive_item
-                ^{ xpath!(c, "itemno", &item)? }
-                ^{ xpath!(c, "description", &item)? }
-                (high_bid ^{ &highbid }))))
+            Ok(form! {
+                (expensive_item
+                    ^{ xpath!(c, "itemno", &item)? }
+                    ^{ xpath!(c, "description", &item)? }
+                    (high_bid ^{ &highbid }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// The bid count of every item that was bid on, as a sequence of elements.
@@ -736,14 +738,15 @@ fn q11<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// top-level elements, and [`Doc::children`] hands them back as nodes that
 /// [`q12`] queries with XPath — which is exactly what the query does with
 /// `$bid_counts/nbids`.
-#[rustfmt::skip]
 fn bid_summary<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::from(xpath!(c, "distinct-values(//itemno)", bids)?.atomics()?)
         .try_map(|i| {
             let b = xpath!(c, "//bid_tuple[itemno = $i]", bids, i = &i)?;
-            Ok(form!((bid_count
-                (itemno ^{ i })
-                (nbids ^{ xpath!(c, "count($b)", b = &b)? }))))
+            Ok(form! {
+                (bid_count
+                    (itemno ^{ i })
+                    (nbids ^{ xpath!(c, "count($b)", b = &b)? }))
+            })
         })
         .collect::<Result<Vec<_>, ComposeError>>()?;
 
@@ -769,7 +772,6 @@ fn bid_summary<'a>(c: &Composer<'a>, bids: Doc<'a>) -> Result<Doc<'a>, ComposeEr
 /// The constructed summary is re-queried: its children are bound as
 /// `$bid_counts`, `max` runs over them, and their text nodes are spliced into
 /// the result. The query's unused `$maxitemnos` binding is left out.
-#[rustfmt::skip]
 fn q12<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let summary = bid_summary(c, inputs.bids)?;
     let bid_counts = summary.children();
@@ -794,13 +796,15 @@ fn q12<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             .boolean()
         })
         .try_map(|(item, bc)| {
-            Ok(form!((popular_item
-                ^{ xpath!(c, "itemno", &item)? }
-                ^{ xpath!(c, "description", &item)? }
-                (bid_count ^{ xpath!(c, "nbids/text()", &bc)? }))))
+            Ok(form! {
+                (popular_item
+                    ^{ xpath!(c, "itemno", &item)? }
+                    ^{ xpath!(c, "description", &item)? }
+                    (bid_count ^{ xpath!(c, "nbids/text()", &bc)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q13 — every bidder, with how much they bid and how often.
@@ -822,7 +826,6 @@ fn q12<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// The outer source is atomic and the inner one is a node lookup that uses
 /// it, so the row starts as a user id, grows a user, and then grows that
 /// user's bids.
-#[rustfmt::skip]
 fn q13<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::from(xpath!(c, "distinct-values(//userid)", inputs.bids)?.atomics()?)
         .try_flat_map(|uid| {
@@ -837,14 +840,16 @@ fn q13<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             xpath!(c, "userid", u)?.key()
         })?
         .try_map(|(u, b)| {
-            Ok(form!((bidder
-                ^{ xpath!(c, "userid", &u)? }
-                ^{ xpath!(c, "name", &u)? }
-                (bidcount ^{ xpath!(c, "count($b)", b = &b)? })
-                (avgbid ^{ xpath!(c, "avg($b/bid)", b = &b)? }))))
+            Ok(form! {
+                (bidder
+                    ^{ xpath!(c, "userid", &u)? }
+                    ^{ xpath!(c, "name", &u)? }
+                    (bidcount ^{ xpath!(c, "count($b)", b = &b)? })
+                    (avgbid ^{ xpath!(c, "avg($b/bid)", b = &b)? }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q14 — the items with at least three bids, dearest first.
@@ -865,7 +870,6 @@ fn q13<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 ///
 /// The only descending sort in the use case. The key is the average itself —
 /// an `xs:double` the engine computed — so the comparison is numeric.
-#[rustfmt::skip]
 fn q14<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::from(xpath!(c, "distinct-values(//itemno)", inputs.bids)?.atomics()?)
         .try_map(|i| {
@@ -880,12 +884,14 @@ fn q14<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             |(_, _, avgbid)| avgbid.key(),
         )?
         .try_map(|(i, _, avgbid)| {
-            Ok(form!((popular_item
-                (itemno ^{ i })
-                (avgbid ^{ avgbid }))))
+            Ok(form! {
+                (popular_item
+                    (itemno ^{ i })
+                    (avgbid ^{ avgbid }))
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q15 — users who bid 100 or more on more than one item.
@@ -900,7 +906,6 @@ fn q14<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 ///   return <big_spender>{ $u/name/text() }</big_spender>
 /// }</result>
 /// ```
-#[rustfmt::skip]
 fn q15<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .try_map(|u| {
@@ -913,9 +918,9 @@ fn q15<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             Ok((u, b))
         })
         .try_filter(|(_, b)| xpath!(c, "count($b) > 1", b = b)?.boolean())
-        .try_map(|(u, _)| Ok(form!((big_spender ^{ xpath!(c, "name/text()", &u)? }))));
+        .try_map(|(u, _)| Ok(form! { (big_spender ^{ xpath!(c, "name/text()", &u)? }) }));
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q16 — every user, marked active or inactive.
@@ -936,7 +941,6 @@ fn q15<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// The conditional constructor is a Rust `if` choosing between two forms. It
 /// needs no XPath at all: the bid sequence is a value in hand, so `empty($b)`
 /// is [`Value::is_empty`](xsd_schema::compose::Value::is_empty).
-#[rustfmt::skip]
 fn q16<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .try_map(|u| {
@@ -948,17 +952,19 @@ fn q16<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
         })?
         .try_map(|(u, b)| {
             let status = if b.is_empty() {
-                form!((status "inactive"))
+                form! { (status "inactive") }
             } else {
-                form!((status "active"))
+                form! { (status "active") }
             };
-            Ok(form!((user
-                ^{ xpath!(c, "userid", &u)? }
-                ^{ xpath!(c, "name", &u)? }
-                ^{ status })))
+            Ok(form! {
+                (user
+                    ^{ xpath!(c, "userid", &u)? }
+                    ^{ xpath!(c, "name", &u)? }
+                    ^{ status })
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 /// Q17 — users who bid on every single item.
@@ -980,7 +986,6 @@ fn q16<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// three documents bound as variables; Rust only iterates the users. Nobody
 /// qualifies, so the splice contributes nothing and the result is an empty
 /// element.
-#[rustfmt::skip]
 fn q17<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .try_filter(|u| {
@@ -997,7 +1002,7 @@ fn q17<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
         })
         .try_map(|u| xpath!(c, "name", &u)?.nodes());
 
-    c.build(form!((frequent_bidder ..?^{ rows })))
+    c.build(form! { (frequent_bidder ..?^{ rows }) })
 }
 
 /// Q18 — every user and what they bid on, both lists sorted.
@@ -1024,7 +1029,6 @@ fn q17<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
 /// `order_by` runs once per user and its failures are that user's failures.
 /// A user who bid on nothing gets an empty `user` element rather than a
 /// special case.
-#[rustfmt::skip]
 fn q18<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeError> {
     let rows = pipe::nodes(xpath!(c, "//user_tuple", inputs.users)?)
         .order_by(Direction::Ascending, EmptyOrder::Least, |u| {
@@ -1050,14 +1054,16 @@ fn q18<'a>(c: &Composer<'a>, inputs: &Inputs<'a>) -> Result<Doc<'a>, ComposeErro
             })
             .try_map(|i| xpath!(c, "description/text()", &i))
             .order_by(Direction::Ascending, EmptyOrder::Least, |descr| descr.key())?
-            .try_map(|descr| Ok(form!((bid_on_item ^{ descr }))));
+            .try_map(|descr| Ok(form! { (bid_on_item ^{ descr }) }));
 
-            Ok(form!((user
-                ^{ xpath!(c, "name", &u)? }
-                ..?^{ bid_on })))
+            Ok(form! {
+                (user
+                    ^{ xpath!(c, "name", &u)? }
+                    ..?^{ bid_on })
+            })
         });
 
-    c.build(form!((result ..?^{ rows })))
+    c.build(form! { (result ..?^{ rows }) })
 }
 
 // ── The tests ─────────────────────────────────────────────────────────

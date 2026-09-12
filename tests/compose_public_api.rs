@@ -81,14 +81,15 @@ fn highest_bid_per_bicycle(root: &Path) -> Result<String, ComposeError> {
         })?
         // return ...
         .try_map(|(i, b)| {
-            Ok(form!(
-                (item_tuple ^ { xpath!(c, "itemno", &i)? } ^ { xpath!(c, "description", &i)? }(
-                    high_bid ^ { xpath!(c, "max($b/bid)", b = &b)? }
-                ))
-            ))
+            Ok(form! {
+                (item_tuple
+                    ^{ xpath!(c, "itemno", &i)? }
+                    ^{ xpath!(c, "description", &i)? }
+                    (high_bid ^{ xpath!(c, "max($b/bid)", b = &b)? }))
+            })
         });
 
-    let doc = c.build(form!((result ..?^{ rows })))?;
+    let doc = c.build(form! { (result ..?^{ rows }) })?;
     doc.to_xml(&SerializeOptions::default())
 }
 
@@ -112,15 +113,17 @@ fn the_relational_use_case_matches_its_oracle() {
 fn grouped<'a>(c: &Composer<'a>, doc: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     let groups = pipe::nodes(xpath!(c, "//group", doc)?).try_map(|g| {
         let members = pipe::nodes(xpath!(c, "member", &g)?)
-            .try_map(|m| Ok(form!((member :name ^{ xpath!(c, "@name", &m)? }))))
+            .try_map(|m| Ok(form! { (member :name ^{ xpath!(c, "@name", &m)? }) }))
             .collect::<Result<Vec<_>, ComposeError>>()?;
-        Ok(form!((group
-            :id ^{ xpath!(c, "@id", &g)? }
-            :size @{ members.len() }
-            ..^{ members })))
+        Ok(form! {
+            (group
+                :id ^{ xpath!(c, "@id", &g)? }
+                :size @{ members.len() }
+                ..^{ members })
+        })
     });
 
-    c.build(form!((groups ..?^{ groups })))
+    c.build(form! { (groups ..?^{ groups }) })
 }
 
 /// The same shape, but insisting every group has exactly one member.
@@ -132,10 +135,10 @@ fn grouped<'a>(c: &Composer<'a>, doc: Doc<'a>) -> Result<Doc<'a>, ComposeError> 
 fn only_children<'a>(c: &Composer<'a>, doc: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     let groups = pipe::nodes(xpath!(c, "//group", doc)?).try_map(|g| {
         let only = xpath!(c, "member/@name", &g)?.string()?;
-        Ok(form!((group ^ { only })))
+        Ok(form! { (group ^{ only }) })
     });
 
-    c.build(form!((groups ..?^{ groups })))
+    c.build(form! { (groups ..?^{ groups }) })
 }
 
 #[test]
