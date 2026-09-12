@@ -530,7 +530,19 @@ pub fn string_to_codepoints<N: DomNavigator>(
 /// fn:codepoints-to-string($arg as xs:integer*) as xs:string
 ///
 /// Converts a sequence of codepoints to a string.
-/// Accepts any numeric type that can be converted to an integer codepoint.
+///
+/// The declared parameter type is `xs:integer*`, so the function conversion
+/// rules of XPath 2.0 §3.1.5 accept an `xs:integer`, any type derived from it,
+/// and an `xs:untypedAtomic` item — which step 2 casts to `xs:integer` — and
+/// nothing else. In particular no other numeric type is admitted: step 3
+/// promotes `xs:decimal` and `xs:float` *to* `xs:double` and never a numeric
+/// item down to `xs:integer` (§B.1 Type Promotion), so a whole-valued
+/// `xs:decimal` or `xs:double` reaches the closing rule — "If, after the above
+/// conversions, the resulting value does not match the expected type according
+/// to the rules for SequenceType Matching, a type error is raised
+/// \[err:XPTY0004\]" — and is rejected. `codepoints-to-string(65.0)`, whose
+/// argument is an `xs:decimal` literal, and `codepoints-to-string(xs:double(65))`
+/// are both `XPTY0004`.
 pub fn codepoints_to_string<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -543,8 +555,9 @@ pub fn codepoints_to_string<N: DomNavigator>(
         ));
     }
 
-    // Function conversion rules, XPath 2.0 §3.1.5: atomize the argument, then
-    // cast every xs:untypedAtomic item to the expected type, xs:integer.
+    // Function conversion rules, XPath 2.0 §3.1.5: atomize the argument, cast
+    // every xs:untypedAtomic item to the expected type, xs:integer, and raise
+    // XPTY0004 for an item that is not an xs:integer afterwards.
     let values = atomize_sequence(args.remove(0))?;
 
     if values.is_empty() {
@@ -553,7 +566,7 @@ pub fn codepoints_to_string<N: DomNavigator>(
 
     let mut codepoints = Vec::with_capacity(values.len());
     for value in values {
-        let value = convert::cast_untyped_as(value, XmlTypeCode::Integer, "codepoints-to-string")?;
+        let value = convert::expect_atomic_as(value, XmlTypeCode::Integer, "codepoints-to-string")?;
         codepoints.push(atomize_to_codepoint(&value)?);
     }
 
@@ -577,53 +590,25 @@ fn is_valid_xml_char(cp: u32) -> bool {
     )
 }
 
-/// Convert an atomic value to a codepoint (u32).
-/// Handles integer types directly and numeric types that are whole numbers.
-/// Validates the codepoint is a valid XML character (FOCH0001 if not).
+/// Convert one already-converted `xs:integer` argument item to a codepoint.
+///
+/// The caller has applied the function conversion rules, so the value is an
+/// `xs:integer` or a type derived from it. A value outside the range of a valid
+/// XML character — negative, past `#x10FFFF`, or one of the excluded ranges of
+/// the `Char` production — is `FOCH0001`.
 fn atomize_to_codepoint(value: &XmlValue) -> Result<u32, XPathError> {
-    let cp;
-
-    // Try integer first (most common case)
-    if let Some(i) = value.as_integer() {
-        cp = i.try_into().map_err(|_| XPathError::FOCH0001 {
-            codepoint: i.to_string(),
-        })?;
-    } else if value.type_code.is_numeric() {
-        if let Some(d) = value.as_double() {
-            // Check it's a whole number
-            if d.is_nan() || d.is_infinite() || d.fract() != 0.0 {
-                return Err(XPathError::FORG0001 {
-                    value: d.to_string(),
-                    target_type: "xs:integer".to_string(),
-                });
-            }
-            // Check it's in valid u32 range
-            if d < 0.0 || d > u32::MAX as f64 {
-                return Err(XPathError::FOCH0001 {
-                    codepoint: d.to_string(),
-                });
-            }
-            cp = d as u32;
-        } else {
-            return Err(XPathError::XPTY0004 {
-                expected: "xs:integer".to_string(),
-                found: format!("{:?}", value.type_code),
-            });
-        }
-    } else {
-        return Err(XPathError::XPTY0004 {
-            expected: "xs:integer".to_string(),
-            found: format!("{:?}", value.type_code),
-        });
-    }
-
-    // Validate the codepoint is a valid XML character
+    let i = value.as_integer().ok_or_else(|| XPathError::XPTY0004 {
+        expected: "xs:integer".to_string(),
+        found: format!("{:?}", value.type_code),
+    })?;
+    let cp: u32 = i.try_into().map_err(|_| XPathError::FOCH0001 {
+        codepoint: i.to_string(),
+    })?;
     if !is_valid_xml_char(cp) {
         return Err(XPathError::FOCH0001 {
             codepoint: cp.to_string(),
         });
     }
-
     Ok(cp)
 }
 
@@ -872,21 +857,64 @@ mod tests {
         }
     }
 
+    /// A whole-valued `xs:double` is *not* an `xs:integer`.
+    ///
+    /// The declared parameter type is `xs:integer*`. XPath 2.0 §3.1.5 casts only
+    /// `xs:untypedAtomic` items to it, and its numeric promotion goes the other
+    /// way — `xs:decimal` and `xs:float` are promoted *to* `xs:double`, never a
+    /// numeric item down to `xs:integer` — so the closing rule applies: "If,
+    /// after the above conversions, the resulting value does not match the
+    /// expected type according to the rules for SequenceType Matching, a type
+    /// error is raised [err:XPTY0004]."
     #[test]
-    fn test_codepoints_to_string_from_doubles() {
+    fn test_codepoints_to_string_from_doubles_is_a_type_error() {
         let (_, mut ctx) = make_context();
-        // Use doubles that are whole numbers
         let seq = XPathValue::from_sequence(vec![
             XmlItem::Atomic(XmlValue::double(65.0)),
             XmlItem::Atomic(XmlValue::double(66.0)),
             XmlItem::Atomic(XmlValue::double(67.0)),
         ]);
-        let args = vec![seq];
-        let result = codepoints_to_string(&mut ctx, args).unwrap();
+        let err = match codepoints_to_string(&mut ctx, vec![seq]) {
+            Err(err) => err,
+            Ok(_) => panic!("an xs:double is not an xs:integer"),
+        };
+        assert_eq!(err.error_code(), Some("XPTY0004"));
+        assert_eq!(
+            err.to_string(),
+            "[XPTY0004] Type mismatch: expected 'xs:integer', found 'Double'"
+        );
+    }
+
+    /// The same rule rejects an `xs:decimal`, which is what the literal `65.0`
+    /// is, and an `xs:float`.
+    #[test]
+    fn test_codepoints_to_string_from_decimal_or_float_is_a_type_error() {
+        let (_, mut ctx) = make_context();
+        for arg in [
+            XmlValue::decimal(rust_decimal::Decimal::from(65)),
+            XmlValue::float(65.0),
+        ] {
+            let found = format!("{:?}", arg.type_code);
+            let seq = XPathValue::from_sequence(vec![XmlItem::Atomic(arg)]);
+            let err = match codepoints_to_string(&mut ctx, vec![seq]) {
+                Err(err) => err,
+                Ok(_) => panic!("only xs:integer and its subtypes are accepted: {found}"),
+            };
+            assert_eq!(err.error_code(), Some("XPTY0004"), "{found}");
+        }
+    }
+
+    /// An `xs:integer` subtype is accepted: SequenceType matching "permit[s] a
+    /// value of a derived type to be substituted for a value of its base type".
+    #[test]
+    fn test_codepoints_to_string_from_an_integer_subtype() {
+        let (_, mut ctx) = make_context();
+        let mut short = XmlValue::integer(65.into());
+        short.type_code = XmlTypeCode::Short;
+        let seq = XPathValue::from_sequence(vec![XmlItem::Atomic(short)]);
+        let result = codepoints_to_string(&mut ctx, vec![seq]).unwrap();
         match result {
-            XPathValue::Item(XmlItem::Atomic(v)) => {
-                assert_eq!(v.as_string().unwrap(), "ABC");
-            }
+            XPathValue::Item(XmlItem::Atomic(v)) => assert_eq!(v.as_string().unwrap(), "A"),
             _ => panic!("Expected string"),
         }
     }

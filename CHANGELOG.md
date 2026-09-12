@@ -62,6 +62,18 @@ queries of the XQuery test suite's relational use case.
   which for the largest `xs:double` below a half would have answered 1.
   `fn:round-half-to-even` is a different function and is unchanged; so are all
   W3C XSD and XQTS results.
+- **`fn:codepoints-to-string` rejects a non-integer numeric argument.** Its
+  declared parameter type is `xs:integer*`, and the function conversion rules of
+  XPath 2.0 §3.1.5 cast only an `xs:untypedAtomic` item to it: numeric promotion
+  goes the other way, promoting `xs:decimal` and `xs:float` *to* `xs:double`
+  (§B.1), never a numeric item down to `xs:integer`. A whole-valued
+  `xs:decimal`, `xs:float` or `xs:double` therefore reaches the closing rule —
+  "If, after the above conversions, the resulting value does not match the
+  expected type according to the rules for SequenceType Matching, a type error
+  is raised [err:XPTY0004]" — where it used to be accepted as a codepoint. So
+  `codepoints-to-string(65.0)` and `codepoints-to-string(xs:double(65))` are now
+  `XPTY0004`, while `xs:integer`, every type derived from it and an untyped node
+  still work.
 - **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
   arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
   type xs:untypedAtomic is cast to the expected atomic type. For built-in
