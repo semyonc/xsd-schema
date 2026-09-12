@@ -274,6 +274,76 @@ conformance corpus to that standard, in compact mode.
 
 ---
 
+## Copying
+
+`src/document/copy.rs` is the step between parsing and writing: taking nodes
+that already exist — in another `BufferDocument`, in a `roxmltree` document, in
+any navigator a host supplies — and appending them to the document being built,
+as new nodes with new identities. Four additive methods on the builder, plus
+`CopyOptions`, `CopyError`, the `CopySource` trait and `NamespaceFixup`:
+
+```rust
+builder.copy_subtree(&node, CopyOptions::default())?;     // element/text/comment/PI/document
+builder.copy_attribute(&attr, CopyOptions::default())?;   // onto the open element
+builder.append_content(&items, CopyOptions::default())?;  // a whole XPathValue sequence
+builder.append_atomic(&value)?;                           // one atomic value as text
+```
+
+**Constructor semantics.** `append_content` applies the rules an XQuery element
+constructor applies to its content sequence — the constructor content rules
+(XQuery 1.0 §3.7.1.3): an atomic value becomes text, separated from a
+*preceding atomic value* by a single space and from a node by nothing; a
+document node contributes its children; zero-length text disappears and
+adjacent text merges (which the builder's text coalescing already does). An
+attribute after a child is `CopyError::AttributeAfterContent` (XQuery XQTY0024)
+and one with no element open is `CopyError::AttributeOutsideElement`. Two
+attributes with the same expanded name cannot both survive: XQuery raises
+XQDY0025, this builder keeps the later value, which needs no lookahead.
+
+The "has a child" and "last item was atomic" facts belong to the container, not
+to the call, so the builder carries one `ContentState` per open element (plus
+one for document level), pushed at `start_element`, popped at `end_element`.
+Splitting a sequence across two `append_content` calls therefore changes
+nothing about the output, and an explicit `text()` call breaks an atomic run.
+
+**Namespace fixup.** A copied element's names must keep resolving where the
+ancestors are different ones. `NamespaceFixup` mirrors the open elements as a
+scope stack and answers, per element, which declarations it has to carry
+(XQuery 1.0 §3.7.4): the element's own binding first, then the declarations
+carried over from the source (`CopyNamespaces::Preserve`, the source element's
+*local* namespace axis — `NoPreserve` carries none), then the attributes. An
+attribute whose prefix is empty (a namespaced attribute cannot use the default
+namespace, Namespaces in XML 1.0 §6.2) or already bound to another URI gets a
+generated prefix, `ns0`, `ns1`, … An unprefixed element in no namespace under
+an inherited default namespace gets `xmlns=""`. The declarations are computed
+*before* `start_element`, which is where the builder takes them; the one
+exception is `copy_attribute`, which may declare on an element that is already
+open — sound because an attribute can only be added before any child exists.
+`CopyOptions::inherit = false` starts the copy from an empty scope, so its top
+element re-declares everything its names need; an inherited *default* namespace
+stays visible there, because XML 1.0 cannot undeclare a prefix but an
+unprefixed name still needs `xmlns=""` under one.
+
+This is the counterpart of the serializer's strictness: fixup is what
+guarantees the invariant the serializer only *checks* (`UnboundName`), so every
+tree built through this module can be written out.
+
+**Annotations.** A copy is untyped by default: no binding, no nil flag, so it
+atomizes as `xs:untypedAtomic` whatever the source was.
+`Annotations::Preserve` replays `set_node_binding` and `set_nil` from the
+source — but only when the source document is bound to the *same* `SchemaSet`
+as the target, compared by address, since a `TypeKey` means nothing in another
+set. A typed source bound to a different set is `CopyError::SchemaMismatch`; a
+source with no schema set at all has nothing to preserve and copies as `Strip`
+would.
+
+`tests/copy_roundtrip.rs` copies subtrees out of a spread of corpus documents,
+writes source and copy out, re-parses both with `roxmltree` and compares
+canonical forms — so a copy that lost content, or that is not
+namespace-well-formed, fails the test.
+
+---
+
 ## Fragment Mode And Assertions
 
 When `ValidationRuntime` opens an element whose governing complex type has
@@ -306,3 +376,4 @@ path described in [`OVERVIEW.md`](OVERVIEW.md) under *XSD 1.1 Assertion Bufferin
 | Element index / source spans | `src/document/element_index.rs`, `source_spans.rs` |
 | Document, navigator, builder | `src/document/document.rs`, `navigator.rs`, `builder.rs` |
 | XML output | `src/document/serialize.rs` |
+| Subtree copy, content rules, namespace fixup | `src/document/copy.rs` |

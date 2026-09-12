@@ -778,6 +778,81 @@ The example prints the report for the named type and, if the name is unknown,
 lists the named complex types of the schema. Anonymous local types are reported
 as `(anonymous)` and can be reached through the key of the declaring element.
 
+## 8. Writing Documents Out And Copying Subtrees
+
+Everything so far reads XML. Two modules in `document` write it (both need the
+`xsd11` feature, like the rest of `document`):
+
+- `document::serialize` turns any `DomNavigator` position back into XML text —
+  `to_string`, `serialize_node` (one node or one subtree), `serialize_document`
+  (the whole document, optionally with an XML declaration). `SerializeOptions`
+  chooses compact output (`indent: None`, the default — nothing is added and
+  nothing removed, so a parse/serialize round trip is an identity on the tree)
+  or formatted output (`indent: Some(n)`).
+- `document::copy` adds four methods to `BufferDocumentBuilder` for building a
+  new document out of nodes that already exist: `copy_subtree`,
+  `copy_attribute`, `append_content` (a sequence of nodes and atomic values,
+  with the constructor content rules of XQuery 1.0 §3.7.1.3) and
+  `append_atomic`. The copy is a new subtree with new node identities, and it
+  carries the namespace declarations its names need — including ones the source
+  inherited from ancestors the copy does not have.
+
+Load a document, copy one subtree out of it, write the result both ways:
+
+```rust
+use bumpalo::Bump;
+use xsd_schema::document::{serialize, BufferDocument, BufferDocumentBuilder};
+use xsd_schema::document::{BufferDocumentOptions, CopyOptions, SerializeOptions};
+use xsd_schema::namespace::NameTable;
+use xsd_schema::navigator::DomNavigator;
+
+let arena = Bump::new();
+let names = NameTable::new();
+
+// 1. Load.
+let source = BufferDocument::from_reader_default(
+    r#"<catalog xmlns:m="urn:meta"><book m:id="b1"><title>One</title></book><book m:id="b2"><title>Two</title></book></catalog>"#.as_bytes(),
+    &arena,
+    &names,
+)?;
+
+// 2. Copy the first <book> into a document of its own.
+let mut book = source.create_navigator();
+book.move_to_first_child(); // <catalog>
+book.move_to_first_child(); // the first <book>
+
+let mut builder =
+    BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())?;
+builder.start_element("selection", "", "", &[])?;
+builder.end_of_attributes();
+builder.copy_subtree(&book, CopyOptions::default())?;
+builder.end_element()?;
+let selection = builder.finalize()?;
+
+// 3. Write it out. `m` was declared on <catalog> in the source; the copy
+//    carries the declaration itself, so the name still resolves.
+let nav = selection.create_navigator();
+assert_eq!(
+    serialize::to_string(&nav, &SerializeOptions::default())?,
+    r#"<selection><book xmlns:m="urn:meta" m:id="b1"><title>One</title></book></selection>"#,
+);
+
+let formatted = SerializeOptions { indent: Some(2), ..SerializeOptions::default() };
+assert_eq!(
+    serialize::to_string(&nav, &formatted)?,
+    "<selection>\n  <book xmlns:m=\"urn:meta\" m:id=\"b1\">\n    <title>One</title>\n  </book>\n</selection>",
+);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`CopyOptions` has three knobs: `namespaces` (whether an element keeps
+declarations it does not need), `inherit` (whether the copy leans on the
+namespaces in scope where it lands, or re-declares what it needs on its own top
+element) and `annotations` (whether schema type annotations are carried over —
+only possible within one `SchemaSet`). See
+[`BUFFER_DOCUMENT_OVERVIEW.md`](BUFFER_DOCUMENT_OVERVIEW.md) for the
+serialization and copying rules in full.
+
 ## Recommended Reading Order
 
 If you are new to the crate, this sequence usually works well:
