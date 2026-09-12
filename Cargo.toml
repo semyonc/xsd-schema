@@ -87,6 +87,11 @@ path = "tests/xpath_integration.rs"
 required-features = ["xsd11"]
 
 [[test]]
+name = "serialize_roundtrip"
+path = "tests/serialize_roundtrip.rs"
+required-features = ["xsd11"]
+
+[[test]]
 name = "multi_document"
 path = "tests/multi_document.rs"
 required-features = ["xsd11"]
