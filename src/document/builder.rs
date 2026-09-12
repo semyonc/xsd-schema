@@ -1566,4 +1566,63 @@ mod tests {
             );
         }
     }
+    // ── DocumentKind::Full with several document-element children ─────
+
+    /// `DocumentKind::Full` does not restrict the root to a single element
+    /// child: the builder accepts two document elements, the navigator sees
+    /// both as children of the root, and XPath counts both.
+    ///
+    /// This is what a temporary tree holding a sequence of elements needs;
+    /// the XDM root node's `children` property is a sequence, and nothing in
+    /// the builder's full-document bookkeeping (element index, `xml:id`
+    /// registration) assumes it has length one.
+    #[test]
+    fn full_document_accepts_two_document_elements() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_full(&arena, &names);
+        assert_eq!(builder.doc.kind(), DocumentKind::Full);
+
+        builder.start_element("a", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.text("first");
+        builder.end_element().unwrap();
+
+        builder.start_element("b", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.text("second");
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.kind(), DocumentKind::Full);
+
+        // The navigator sees both as children of the root.
+        let mut nav = doc.create_navigator();
+        assert_eq!(nav.node_type(), crate::navigator::DomNodeType::Root);
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.local_name(), "a");
+        assert_eq!(nav.value(), "first");
+        assert!(nav.move_to_next_sibling());
+        assert_eq!(nav.local_name(), "b");
+        assert_eq!(nav.value(), "second");
+        assert!(!nav.move_to_next_sibling());
+        assert!(nav.move_to_parent());
+        assert_eq!(nav.node_type(), crate::navigator::DomNodeType::Root);
+
+        // And so does XPath, with the root as the context node.
+        let ctx = crate::xpath::context::XPathContext::new(&names);
+        let expr = crate::xpath::XPathExpr::compile("count(/*)", &ctx).unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_with_node(doc.create_navigator())
+            .unwrap();
+        assert_eq!(result.as_f64(), Some(2.0));
+
+        let expr = crate::xpath::XPathExpr::compile("string-join(/*/name(), '|')", &ctx).unwrap();
+        let result = expr
+            .evaluator(&ctx)
+            .run_with_node(doc.create_navigator())
+            .unwrap();
+        assert_eq!(result.as_str().as_deref(), Some("a|b"));
+    }
 }
