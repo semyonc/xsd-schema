@@ -17,6 +17,7 @@ pub mod navigator;
 pub mod node;
 pub mod page;
 pub mod qname;
+pub mod serialize;
 pub mod source_spans;
 pub mod strings;
 pub mod type_remap;
@@ -36,6 +37,7 @@ pub use node::{
 };
 pub use page::NodePages;
 pub use qname::{QNameAtom, QNameTable, EMPTY_QNAME};
+pub use serialize::{SerializeError, SerializeOptions};
 pub use source_spans::NodeSourceSpans;
 pub use strings::StringStore;
 pub use type_remap::{BindingRemapTable, NodeSchemaBinding};
