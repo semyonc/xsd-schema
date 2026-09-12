@@ -92,6 +92,11 @@ path = "tests/serialize_roundtrip.rs"
 required-features = ["xsd11"]
 
 [[test]]
+name = "copy_roundtrip"
+path = "tests/copy_roundtrip.rs"
+required-features = ["xsd11"]
+
+[[test]]
 name = "multi_document"
 path = "tests/multi_document.rs"
 required-features = ["xsd11"]
