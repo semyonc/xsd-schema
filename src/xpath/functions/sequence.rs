@@ -21,7 +21,7 @@ use crate::xpath::DomNavigator;
 
 use super::{
     atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt,
-    atomize_to_string_opt, materialize, XPathValue,
+    atomize_to_string_opt, convert, materialize, XPathValue,
 };
 
 /// Default collation URI (codepoint collation).
@@ -35,6 +35,19 @@ fn validate_collation(collation: Option<&str>) -> Result<(), XPathError> {
         Some(c) if c.is_empty() || c == DEFAULT_COLLATION => Ok(()),
         Some(c) => Err(XPathError::unknown_collation(c)),
     }
+}
+
+/// Apply the function conversion rules (XPath 2.0 §3.1.5) for an `xs:integer`
+/// parameter and hand back the value as an `i64` position.
+fn require_integer(value: XmlValue, function: &str) -> Result<i64, XPathError> {
+    let value = convert::expect_atomic_as(value, XmlTypeCode::Integer, function)?;
+    value
+        .as_integer()
+        .and_then(|i| i.to_i64())
+        .ok_or_else(|| XPathError::XPTY0004 {
+            expected: "xs:integer".to_string(),
+            found: format!("{:?}", value.type_code),
+        })
 }
 
 // ============================================================================
@@ -391,15 +404,8 @@ pub fn remove<N: DomNavigator>(
     let target = args.remove(0);
     let position_arg = args.remove(0);
 
-    // Get position as integer
-    let position_value = atomize_to_single(position_arg)?;
-    let position = position_value
-        .as_integer()
-        .and_then(|i| i.to_i64())
-        .ok_or_else(|| XPathError::XPTY0004 {
-            expected: "xs:integer".to_string(),
-            found: format!("{:?}", position_value.type_code),
-        })?;
+    // Get position as integer (function conversion rules, XPath 2.0 §3.1.5)
+    let position = require_integer(atomize_to_single(position_arg)?, "remove")?;
 
     // Materialize target sequence
     let mut items = materialize(target);
@@ -441,15 +447,8 @@ pub fn insert_before<N: DomNavigator>(
     let position_arg = args.remove(0);
     let inserts = args.remove(0);
 
-    // Get position as integer
-    let position_value = atomize_to_single(position_arg)?;
-    let position = position_value
-        .as_integer()
-        .and_then(|i| i.to_i64())
-        .ok_or_else(|| XPathError::XPTY0004 {
-            expected: "xs:integer".to_string(),
-            found: format!("{:?}", position_value.type_code),
-        })?;
+    // Get position as integer (function conversion rules, XPath 2.0 §3.1.5)
+    let position = require_integer(atomize_to_single(position_arg)?, "insert-before")?;
 
     // Materialize both sequences
     let mut target_items = materialize(target);

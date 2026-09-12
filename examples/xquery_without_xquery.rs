@@ -224,16 +224,16 @@ fn risky_sellers<'a>(
 ///
 /// The rows here are atomic values rather than nodes: `pipe::from` adapts the
 /// atomized months, and the sort compares `xs:integer`s numerically. These
-/// documents have no schema, so their dates are untyped and the `xs:date(...)`
-/// constructors are written out; the query relies on a function conversion
-/// this engine does not apply.
+/// documents have no schema, so their dates are `xs:untypedAtomic`; the
+/// function conversion rules of XPath 2.0 §3.1.5 cast them to the declared
+/// `xs:date` parameter, so the expressions read exactly as the query does.
 fn auctions_per_month<'a>(c: &Composer<'a>, items: Doc<'a>) -> Result<Doc<'a>, ComposeError> {
     // let $end_dates := ...
     let end_dates = xpath!(c, "//item_tuple/end_date", items)?;
     // for $m in distinct-values(...)
     let months = xpath!(
         c,
-        "distinct-values(for $e in $end_dates return month-from-date(xs:date($e)))",
+        "distinct-values(for $e in $end_dates return month-from-date($e))",
         end_dates = &end_dates
     )?
     .atomics()?;
@@ -243,8 +243,8 @@ fn auctions_per_month<'a>(c: &Composer<'a>, items: Doc<'a>) -> Result<Doc<'a>, C
         .try_map(|m| {
             let item = xpath!(
                 c,
-                "//item_tuple[year-from-date(xs:date(end_date)) = 1999 \
-                 and month-from-date(xs:date(end_date)) = $m]",
+                "//item_tuple[year-from-date(end_date) = 1999 \
+                 and month-from-date(end_date) = $m]",
                 items,
                 m = &m
             )?;

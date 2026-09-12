@@ -648,13 +648,6 @@ v1 is deliberately small. These are the boundaries, with what to do instead:
 | **Deep form nesting** | `form!` is a token-tree muncher, so nesting depth *and* item count cost macro expansion steps, which `recursion_limit` (128 by default) bounds. About thirty levels deep or a hundred items in one form needs `#![recursion_limit = "256"]` in the crate that writes it |
 | **XQuery semantics in full** | duplicate attribute names in spliced content keep the last one rather than raising XQDY0025; `xml:base` is stored but not interpreted; dynamic-error *timing* is not promised, since materialization separates row production from projection |
 
-One more, which is not a limit of this module but shows up through it: the
-function conversion rule that casts `xs:untypedAtomic` to a function's declared
-parameter type is not applied by the engine for the date component functions,
-so `month-from-date(end_date)` over an unschema'd document is `XPTY0004`. Write
-the constructor: `month-from-date(xs:date(end_date))`. General comparisons
-*do* perform that cast, so `end_date >= xs:date("1999-03-01")` needs nothing.
-
 ## 13. Where The Code Lives
 
 | File | What is in it |

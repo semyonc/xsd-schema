@@ -47,6 +47,26 @@ queries of the XQuery test suite's relational use case.
 
 ### Fixed
 
+- **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
+  arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
+  type xs:untypedAtomic is cast to the expected atomic type. For built-in
+  functions where the expected type is specified as numeric, arguments of type
+  xs:untypedAtomic are cast to xs:double." Functions whose parameter is a
+  specific atomic type checked the exact variant instead, so
+  `month-from-date(end_date)` over a document with no schema raised `XPTY0004`
+  where a general comparison on the same node cast and compared. The whole
+  `*-from-date` / `*-from-dateTime` / `*-from-time` / `*-from-duration` /
+  `timezone-from-*` / `adjust-*-to-timezone` family, `fn:dateTime`, the
+  `xs:integer` parameters of `fn:remove`, `fn:insert-before` and
+  `fn:round-half-to-even`, `fn:codepoints-to-string` (which also now atomizes
+  its argument) and the `numeric` parameters of `fn:abs`, `fn:ceiling`,
+  `fn:floor` and `fn:round` now cast through one shared helper
+  (`functions::convert`). An untyped value whose lexical form is invalid for
+  the expected type is the dynamic error `FORG0001`; a type that
+  `xs:untypedAtomic` cannot be cast to at all still raises `XPTY0004`, so
+  `fn:prefix-from-QName` keeps rejecting an untyped node (casting to
+  `xs:QName` requires a string literal, §2.3.4). No central signature-driven
+  conversion was introduced. W3C XSD and XQTS results are unchanged.
 - **A schema element's reported location is now its `<`, not the end of the
   markup before it.** `SourceRef.span.start` was taken from quick-xml's
   `buffer_position()` before the read, which is where the *previous* event

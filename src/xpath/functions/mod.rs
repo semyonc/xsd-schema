@@ -11,8 +11,14 @@
 //! Functions are identified by `FunctionId` which allows non-generic registry
 //! lookup at bind time. Function dispatch uses a match on `FunctionId` to call
 //! the appropriate implementation.
+//!
+//! Each built-in converts its own arguments; `eval_function` does not consult
+//! the registry's `param_types`. The crate-internal `convert` module holds the
+//! shared function conversion rules of XPath 2.0 §3.1.5 that a built-in with a
+//! specific atomic parameter type applies to an `xs:untypedAtomic` argument.
 
 pub mod aggregate;
+pub(crate) mod convert;
 pub mod datetime;
 pub mod extensible;
 pub mod node;
