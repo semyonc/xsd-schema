@@ -190,6 +190,55 @@ the document module stays free of validation logic.
 
 ---
 
+## Serialization
+
+`src/document/serialize.rs` writes a tree back out as XML text. It is generic
+over `DomNavigator`, not over `BufferDocument`, so the same code serializes a
+`BufferDocNavigator`, a `RoXmlNavigator` and any navigator a host embedding the
+engine brings of its own; it touches no `pub(crate)` node pages.
+
+```rust
+let xml = serialize::to_string(&doc.create_navigator(), &SerializeOptions::default())?;
+```
+
+Three entry points — `serialize_document` (a whole document, optionally with an
+XML declaration), `serialize_node` (one node: a `Root` behaves as a document, an
+element writes its subtree, an attribute or namespace node is refused) and
+`to_string` — plus `SerializeOptions` and `SerializeError`.
+
+**What is written.** Compact UTF-8 with no added whitespace, empty elements
+collapsed to `<a/>`, attributes in stored document order. Escaping follows
+*Canonical XML 1.0* §2.3: in text `&`, `<`, `>` and U+000D; in attribute values
+(always `"`-quoted) `&`, `<`, `"` and the three whitespace characters as
+references, so XML 1.0's end-of-line handling (§2.11) and attribute-value
+normalization (§3.3.3) cannot change the value on a re-parse. Content that XML
+cannot express — a character outside the `Char` production, a comment with `--`,
+a PI target `xml`, a name whose prefix is not in scope — is an error, never
+dropped or repaired.
+
+**Namespace declarations** are written where they are *introduced*. The
+serializer keeps its own in-scope stack while descending and diffs each
+element's `namespace::ExcludeXml` axis against it: a binding that is not already
+in scope is declared, one that merely repeats an inherited declaration is
+dropped, and an element that leaves an inherited default namespace gets
+`xmlns=""`. The `xml` prefix is never declared, prefixed undeclarations (XML 1.1
+only) are never written. A name that does not resolve through that stack is
+`SerializeError::UnboundName` — the serializer refuses to write a tree whose
+names would not read back the same, and leaves repairing them to whoever built
+it. Declarations on one element come out in prefix order, since the namespace
+axis has no order of its own to preserve.
+
+**What `from_reader` cannot give it back.** The parse keeps no XML declaration
+(version, encoding, `standalone`), no `<!DOCTYPE` or internal entity
+declarations, no CDATA section markers (the content is kept, as text), no text
+outside the document element, and no trailing whitespace in processing-
+instruction data (`parse_pi_content` trims the raw content). A round trip is
+therefore an identity on the *tree*, not on the bytes;
+`tests/serialize_roundtrip.rs` holds the whole XSD conformance corpus to that
+standard.
+
+---
+
 ## Fragment Mode And Assertions
 
 When `ValidationRuntime` opens an element whose governing complex type has
@@ -221,3 +270,4 @@ path described in [`OVERVIEW.md`](OVERVIEW.md) under *XSD 1.1 Assertion Bufferin
 | Namespaces | `src/document/namespace.rs` |
 | Element index / source spans | `src/document/element_index.rs`, `source_spans.rs` |
 | Document, navigator, builder | `src/document/document.rs`, `navigator.rs`, `builder.rs` |
+| XML output | `src/document/serialize.rs` |
