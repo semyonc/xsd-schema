@@ -528,7 +528,13 @@ restricts syntax and adjusts operator semantics.
 - `XPathContext::with_schema_set(...)` for schema-aware evaluation
 - `XPathExpr::compile_with_vars(...)` plus `with_variable(...)` for external variables
 - `run_bool`, `run_string`, `run_number`, `run_nodes` for convenient result coercion
-- `run_with(...)` / `run_with_node_and_setup(...)` when variables need full `XPathValue` binding
+- `run_with(...)` / `run_with_node_and_setup(...)` when variables need full `XPathValue` binding,
+  or to install a custom `FunctionEvaluator` and host state
+  (`te.context().set_function_evaluator(..)`, `set_extension(..)`) — see
+  [`EXTENSIBILITY.md`](EXTENSIBILITY.md) §4.5
+- `XPathExpr::referenced_external_vars()`, `uses_focus()`, `uses_position()`, `uses_last()`,
+  `function_calls()` — compile-time dependency metadata for hosts that bind many variables
+  or need to know whether an expression reads the focus
 
 ## 4. Schema Resolving
 

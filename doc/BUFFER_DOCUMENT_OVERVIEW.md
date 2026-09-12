@@ -35,8 +35,10 @@ of XPath with it — is `xsd11`-gated at the crate root, so per-variant
 `#[cfg(feature = "xsd11")]` would be redundant. Earlier draft designs showed
 `Fragment` gated; the shipping code does not.
 
-`Full` is what callers use when they own the document. `Fragment` is what
-`ValidationRuntime` builds on the fly during streaming validation so that
+`Full` is what callers use when they own the document. It does not insist on
+a single document element: the builder accepts several top-level elements
+under the root, which is what a constructed node sequence or a temporary
+tree needs. `Fragment` is what `ValidationRuntime` builds on the fly during streaming validation so that
 XSD 1.1 assertions can run XPath against the asserted element's subtree
 without preloading the instance into a DOM. Side tables (element index,
 source spans, ID map) are skipped in `Fragment` mode.
@@ -92,6 +94,19 @@ all three cases.
 
 Capacity (~4 billion nodes, ~64 GB) is well past any practical document.
 
+### Identity and order across documents
+
+A `NodeRef` is only meaningful inside its own document, so a navigator's
+identity is the pair (document, cursor): `is_same_position` compares the
+document pointer before the node index, the virtual attribute/namespace
+cursor and the namespace chain position. Every `BufferDocument` also gets a
+`serial()` — a creation ordinal from a process-wide counter, unique within
+the process and strictly increasing — and `compare_position` orders nodes of
+different documents by it. XPath 2.0 §2.4.1 leaves the order of distinct
+trees implementation-dependent but requires it to be stable and to keep each
+tree contiguous; the serial gives a reproducible order where the heap address
+would not.
+
 ---
 
 ## Schema Binding
@@ -124,6 +139,11 @@ Two flags optimize hot paths off this design:
 - `IS_COMPLEX_TYPE` (bit 6) records simple-vs-complex without a table lookup.
 - `IS_NIL` is kept *out* of the binding so dedup works — nil state is
   per-instance, not per-declaration.
+
+The binding's `type_key` is what `DomNavigator::type_annotation()` returns
+for element and attribute nodes — complex or simple — while `schema_type()`
+is its simple-type projection (`None` for a complex type). Both are `None`
+on unbound nodes.
 
 `typed_value()` uses `element_decl` directly: when an element is empty and
 its declaration carries `ValueConstraint::Default` or `Fixed`, the declared
@@ -160,7 +180,7 @@ without allocating per-element arenas, and what makes the second
 ```rust
 let arena = Bump::new();
 let names = NameTable::new();
-let doc = BufferDocument::from_reader_default(&arena, &names, reader)?;
+let doc = BufferDocument::from_reader_default(reader, &arena, &names)?;
 let nav = doc.create_navigator();
 ```
 

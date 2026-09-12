@@ -885,7 +885,10 @@ pub enum FunctionArity {
 Custom functions need to be connected at two points:
 
 1. **Bind-time** -- via `XPathContext::with_function_catalog()`
-2. **Eval-time** -- via `DynamicContext::with_function_evaluator()`
+2. **Eval-time** -- via `DynamicContext::set_function_evaluator()` from a
+   `run_with` / `run_with_node_and_setup` setup callback (the high-level API
+   creates the dynamic context itself), or `DynamicContext::with_function_evaluator()`
+   when you build the context by hand for `eval_node`
 
 Since `FunctionSet` implements both traits, a single object serves both:
 
@@ -929,11 +932,43 @@ let doc = roxmltree::Document::parse("<root/>")?;
 let nav = RoXmlNavigator::new(&doc);
 
 let result = expr.evaluator(&ctx)
-    .run_with_node_and_setup(nav, |dyn_ctx| {
-        dyn_ctx.with_function_evaluator(&functions)  // eval-time dispatch
+    .run_with_node_and_setup(Some(nav), |te| {
+        te.context().set_function_evaluator(Some(&functions));  // eval-time dispatch
     })?;
 // result contains XPathValue::string("Hello, World!")
 ```
+
+The setup callback borrows the evaluator's own lifetimes, so the function set
+and any state it needs can live on the caller's stack.
+
+### 4.5.1 Host State for Custom Functions
+
+`FunctionEvaluator::eval` takes `&self`, so a function that needs mutable or
+per-run engine state reads it from the dynamic context's extension slot
+instead. Install any `&dyn Any` next to the evaluator and downcast it inside
+the function; one `DynamicContext` serves the whole expression, so the slot is
+visible from predicates, path steps, `for` bodies and nested calls alike:
+
+```rust
+struct CallCounter { calls: std::cell::Cell<u32> }
+
+functions.register(sig, |ctx, _args| {
+    if let Some(counter) = ctx.extension::<CallCounter>() {
+        counter.calls.set(counter.calls.get() + 1);
+    }
+    Ok(XPathValue::integer(1))
+});
+
+let counter = CallCounter { calls: std::cell::Cell::new(0) };
+let result = expr.evaluator(&ctx)
+    .run_with(|te| {
+        te.context().set_function_evaluator(Some(&functions));
+        te.context().set_extension(Some(&counter));
+    })?;
+```
+
+`extension::<T>()` returns `None` when nothing is installed or the type does
+not match, so a function can degrade gracefully outside its host.
 
 ### 4.6 The CustomFn Type
 
@@ -1037,7 +1072,8 @@ functions.register(sig, |_ctx, mut args| {
 |-----------|------|-------|
 | `FunctionSet::register()` | Register custom function | -- |
 | `XPathContext::with_function_catalog()` | Wire catalog for binding | `FunctionCatalog` |
-| `DynamicContext::with_function_evaluator()` | Wire evaluator for execution | `FunctionEvaluator<N>` |
+| `DynamicContext::set_function_evaluator()` / `with_function_evaluator()` | Wire evaluator for execution (from a `run_with` callback / on a hand-built context) | `FunctionEvaluator<N>` |
+| `DynamicContext::set_extension()` / `extension::<T>()` | Host state readable by custom functions | `Any` |
 
 ### 4.9 Built-in Function Registry
 
