@@ -105,8 +105,8 @@ impl<'a> XPathContext<'a> {
     /// Set the default function namespace from an owned string.
     ///
     /// This is the counterpart of [`with_default_function_ns`](Self::with_default_function_ns)
-    /// for namespaces that are only known at runtime — for example the
-    /// `xpath-default-function-namespace` of a stylesheet read from disk — and that therefore
+    /// for namespaces that are only known at runtime — for example one read from a
+    /// configuration file or a host document — and that therefore
     /// cannot be a `&'static str` without leaking. The string is stored in a private field,
     /// so the public `default_function_ns` field and its `&'static str` setter keep working
     /// unchanged.
@@ -129,10 +129,10 @@ impl<'a> XPathContext<'a> {
     /// use xsd_schema::xpath::XPathContext;
     ///
     /// // A namespace computed at runtime, not a literal.
-    /// let stylesheet_ns = format!("http://example.com/fn/v{}", 2);
+    /// let host_ns = format!("http://example.com/fn/v{}", 2);
     ///
     /// let names = NameTable::new();
-    /// let ctx = XPathContext::new(&names).with_default_function_ns_owned(stylesheet_ns);
+    /// let ctx = XPathContext::new(&names).with_default_function_ns_owned(host_ns);
     ///
     /// assert_eq!(ctx.default_function_namespace(), "http://example.com/fn/v2");
     /// ```

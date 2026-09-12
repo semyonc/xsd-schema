@@ -11,12 +11,11 @@ Phases P0 and P1 of `XSD_COMPILER_REWORK.md` (branch
 `perf/compiler-rework-p0-p1`): the exact-occurrence correction with its
 resource-failure contract, plus the two measurement-phase allocation gates.
 
-Also the additive `xsd-schema` prerequisites of the XSLT 2.0 crate
-(`XSLT2_DESIGN_SKETCH.md` §5, the rows labelled 0.1.6 there — they ship in
-this release): multi-document node identity, `DomNavigator::type_annotation`,
-`XPathExpr` dependency metadata, the `DynamicContext` extension slot and
-`set_function_evaluator`, an owned default function namespace, and
-`BufferDocument::serial()`.
+Also a set of additive extensions for hosts that embed the XPath engine
+and work with more than one document: multi-document node identity,
+`DomNavigator::type_annotation`, `XPathExpr` dependency metadata, the
+`DynamicContext` extension slot and `set_function_evaluator`, an owned
+default function namespace, and `BufferDocument::serial()`.
 
 ### Removed
 
@@ -238,7 +237,7 @@ this release): multi-document node identity, `DomNavigator::type_annotation`,
   work through the high-level API.
 - **`XPathContext::with_default_function_ns_owned(impl Into<String>)`** — the
   default function namespace from a runtime-built `String`, with no
-  `&'static str` to leak per stylesheet. `default_function_namespace()`
+  `&'static str` to leak per host context. `default_function_namespace()`
   prefers it over the public `default_function_ns` field; XPath 1.0 mode still
   yields `""`.
 

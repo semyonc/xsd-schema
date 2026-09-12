@@ -62,7 +62,7 @@ use crate::xpath::functions::{FunctionId, FUNCTION_REGISTRY};
 /// — including calls that appear inside predicates, `for` bodies and other
 /// nested foci. Callers use it to detect functions whose results are not a
 /// function of the focus and the arguments alone (`fn:doc`, `fn:collection`,
-/// `fn:unparsed-text`, an XSLT `key()` …) without this crate having to take a
+/// `fn:unparsed-text`, a host language's `key()` …) without this crate having to take a
 /// position on what "impure" means.
 ///
 /// `namespace` is the namespace the call actually **bound** to — the namespace
