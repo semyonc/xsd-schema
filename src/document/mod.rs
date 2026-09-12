@@ -10,6 +10,7 @@
 
 pub mod buffer;
 pub mod builder;
+pub mod copy;
 pub mod element_index;
 pub mod error;
 pub mod namespace;
@@ -25,6 +26,7 @@ pub mod typed_builder;
 
 pub use buffer::BufferDocument;
 pub use builder::BufferDocumentBuilder;
+pub use copy::{Annotations, CopyError, CopyNamespaces, CopyOptions, CopySource, NamespaceFixup};
 pub use element_index::ElementIndex;
 pub use error::BufferDocumentError;
 pub use namespace::{
