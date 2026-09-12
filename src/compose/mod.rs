@@ -182,12 +182,12 @@
 //! }</result>
 //! ```
 //!
-//! The XPath2.Net README rewrites this query into LINQ, and its version is
-//! where the shape of this module comes from — an expression with a host
-//! value bound to `$i`, and a constructor taking the result:
+//! In C# with LINQ the same query reads as an expression with a host value
+//! bound to `$i` and a constructor taking the result — the shape this module
+//! follows:
 //!
 //! ```csharp
-//! // the XPath2.Net README, abridged
+//! // C# with LINQ, abridged
 //! var bid = bids.XPath2Select<XElement>(
 //!     "//bid_tuple[itemno = $i/itemno]", new { i = item });
 //! new XElement("item_tuple", item.Element("itemno"), item.Element("description"),

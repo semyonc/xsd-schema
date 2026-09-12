@@ -21,7 +21,7 @@ that turn a description into a tree.
 
 So there are three ingredients:
 
-| XQuery construct | XPath2.Net (C#) | This module (Rust) |
+| XQuery construct | C# with LINQ | This module (Rust) |
 | --- | --- | --- |
 | `for` / `let` / `where` / `order by` / `return` | LINQ `from` / `let` / `where` / `orderby` / `select` | `pipe::nodes` / `try_map` / `try_filter` / `order_by` / `try_map` (§7) |
 | an XPath expression with variables bound to host values | `node.XPath2Select("//bid_tuple[itemno = $i/itemno]", new { i = item })` | `xpath!(c, "//bid_tuple[itemno = $i/itemno]", bids, i = &i)?` (§5) |
@@ -29,14 +29,13 @@ So there are three ingredients:
 | `doc("items.xml")` | `XDocument.Load("items.xml")` | `c.load_file("items.xml")?` (§3) |
 | the serialized result | `XNode` printed by .NET | `doc.to_xml(&opts)?` (§10) |
 
-The C# column is the pattern this module follows, from the XPath2.Net README
-(StefH/XPath2.Net, a descendant of the author's own earlier XPath 2.0 work).
-The difference worth naming up front is what the Rust column does *not* need.
+The C# column shows the same three ingredients in another host language. The
+difference worth naming up front is what the Rust column does *not* need.
 In C#, an empty result has to be special-cased so an empty element is not
 constructed:
 
 ```csharp
-// the XPath2.Net README, abridged
+// C# with LINQ, abridged
 new XElement("item_tuple", item.Element("itemno"),
     !bid.Any() ? null : new XElement("high_bid", /* … */));
 ```
