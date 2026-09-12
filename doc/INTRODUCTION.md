@@ -15,6 +15,7 @@ The public surface changes mainly through the `xsd11` and `async` features.
 | XSD 1.0 + async | `default-features = false, features = ["async"]` | Same XSD 1.0-only surface, plus async schema-loading/directive-resolution APIs. |
 | XSD 1.1 | `features = ["xsd11"]` | Full XSD 1.1 mode: XSD 1.1 processing, XPath 2.0 engine, `regexml`, Unicode normalization, and `BufferDocument` / typed document support. |
 | XSD 1.1 + async | `features = ["xsd11", "async"]` | Full XSD 1.1 surface plus async schema-loading/directive-resolution APIs. |
+| XSD 1.1 + composition | `features = ["compose"]` | Full XSD 1.1 mode plus the `compose` module: the `xpath!` and `form!` macros, iterator pipelines and the composition layer of section 9. `compose` implies `xsd11`. |
 
 Notes:
 
@@ -853,6 +854,58 @@ only possible within one `SchemaSet`). See
 [`BUFFER_DOCUMENT_OVERVIEW.md`](BUFFER_DOCUMENT_OVERVIEW.md) for the
 serialization and copying rules in full.
 
+## 9. Composing XML With `xpath!` And `form!`
+
+Sections 1 to 8 read XML, validate it, query it and write it back out. The
+`compose` module (feature `compose`, which implies `xsd11`) adds the last
+piece: building *new* XML out of query results, in the shape an XQuery FLWOR
+expression would — without an XQuery processor anywhere in the crate.
+
+The idea is that a FLWOR expression is three things at once, and two of them
+already exist. The XPath 2.0 engine evaluates every expression such a query
+needs; Rust iterates, binds and branches; so what was missing was a way to
+bind a Rust value to an XPath `$variable`, a way to describe a result element,
+and the data-model rules that turn a description into a tree. Those are what
+the module supplies: a `Composer` holding the arena, the name table and a cache
+of compiled expressions; `xpath!` for evaluation; `pipe` adapters for the
+FLWOR clauses (`try_map` is `let`, `try_filter` is `where`, `try_flat_map` is
+a nested `for`, `order_by` is `order by`); and a Lisp-style `form!`
+constructor whose splices follow the constructor content rules, so an empty
+sequence spliced into an element leaves an empty element rather than needing a
+host-side conditional.
+
+```rust
+use bumpalo::Bump;
+use xsd_schema::compose::{pipe, ComposeError, Composer};
+use xsd_schema::document::SerializeOptions;
+use xsd_schema::namespace::NameTable;
+use xsd_schema::{form, xpath};
+
+let arena = Bump::new();
+let names = NameTable::new();
+let c = Composer::new(&arena, &names);
+let stock = c.load_str("<stock><part qty='7'>bolt</part><part qty='0'>nut</part></stock>")?;
+
+// for $p in //part where $p/@qty > 0 return <part>{ string($p) }</part>
+let rows = pipe::nodes(xpath!(c, "//part", stock)?)
+    .try_filter(|p| xpath!(c, "@qty > 0", p)?.boolean())
+    .try_map(|p| Ok(form!((part ^{ xpath!(c, "string()", &p)? }))));
+
+assert_eq!(
+    c.build(form!((in_stock ..?^{ rows })))?.to_xml(&SerializeOptions::default())?,
+    "<in_stock><part>bolt</part></in_stock>",
+);
+# Ok::<(), ComposeError>(())
+```
+
+Everything the layer offers — the four `xpath!` call forms and every value that
+can be bound, the whole `form!` grammar, the pipeline contract and what is not
+lazy, the `order by` rules, `build` versus `build_sequence`, serialization,
+the error variants and the v1 limits — is in its own guide:
+[Composing XML from Rust](COMPOSE.md). The relational use case of the XQuery
+1.0 test suite is rewritten query by query in `tests/compose_usecase_r.rs`,
+and `examples/xquery_without_xquery.rs` runs three of them end to end.
+
 ## Recommended Reading Order
 
 If you are new to the crate, this sequence usually works well:
@@ -862,3 +915,5 @@ If you are new to the crate, this sequence usually works well:
 3. Add `XPathExpr` and `XPathContext` if you need XPath/XSD 1.1 features.
 4. Move down to `SchemaResolver`, `ReferenceResolver`, and the raw schema model
    only when you need custom loading or custom analysis.
+5. Add `Composer`, `xpath!` and `form!` if you need to build XML out of query
+   results (section 9).
