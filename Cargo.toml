@@ -11,8 +11,9 @@ keywords = ["xsd", "xml", "schema", "validation", "xpath"]
 categories = ["parser-implementations", "data-structures"]
 
 [package.metadata.docs.rs]
-# Build docs with the full feature set so XPath and XSD 1.1 APIs are documented.
-features = ["xsd11"]
+# Build docs with the full feature set so XPath, XSD 1.1 and composition APIs
+# are documented (`compose` implies `xsd11`).
+features = ["compose"]
 
 [dependencies]
 # XML parsing
@@ -69,6 +70,9 @@ criterion = "0.5"            # Benchmarking (optional)
 [features]
 default = ["unicode-normalization"]
 xsd11 = ["dep:lalrpop-util", "dep:lalrpop", "dep:bumpalo", "dep:regexml"]
+# XQuery-style XML composition from Rust (src/compose): needs the XPath engine
+# and the document buffer, so it implies xsd11.
+compose = ["xsd11"]
 unicode-normalization = ["dep:unicode-normalization"]
 async = ["dep:futures"]
 
