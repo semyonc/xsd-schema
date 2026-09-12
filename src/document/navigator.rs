@@ -933,6 +933,30 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         }
     }
 
+    /// The node's type annotation, complex types included.
+    ///
+    /// Reads the [`NodeSchemaBinding`] the typed builder attached to the
+    /// node. Bindings exist only on element and attribute nodes — an
+    /// attribute's binding lives on the `Attribute` node of its
+    /// name+value pair, which is exactly where the attribute cursor sits, so
+    /// no extra indexing is needed — and the unbound sentinel of the remap
+    /// table makes every other node kind (and any node of an unvalidated
+    /// document) report `None`. The namespace cursor keeps `current` on the
+    /// owning element, so it is rejected explicitly.
+    fn type_annotation(&self) -> Option<TypeKey> {
+        if self.is_on_namespace() {
+            return None;
+        }
+        if !matches!(
+            self.node().node_type(),
+            NodeType::Element | NodeType::Attribute
+        ) {
+            return None;
+        }
+        let idx = self.node().binding_index();
+        Some(self.doc.binding_remap.get(idx)?.type_key)
+    }
+
     fn typed_value(&self) -> TypedValue {
         if self.is_on_namespace() {
             return TypedValue::Untyped;
