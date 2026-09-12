@@ -111,7 +111,17 @@ path = "tests/compose_public_api.rs"
 required-features = ["compose"]
 
 [[test]]
+name = "compose_usecase_r"
+path = "tests/compose_usecase_r.rs"
+required-features = ["compose"]
+
+[[test]]
 name = "xqts_xpath"
 path = "tests/xqts/driver.rs"
 harness = false
 required-features = ["xsd11"]
+
+[[example]]
+name = "xquery_without_xquery"
+path = "examples/xquery_without_xquery.rs"
+required-features = ["compose"]
