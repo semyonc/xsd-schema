@@ -24,6 +24,11 @@
 //! | [`order`] | `order by`, with XDM comparison and stable sorting |
 //! | [`pipe`] | fallible iterator pipelines: the FLWOR clauses as adapters |
 //! | [`ComposeError`] | every way a composition can fail |
+//! | [`xpath!`](crate::xpath!) / [`form!`](crate::form!) | the two macros: one evaluation, one result element |
+//!
+//! The macros are exported at the crate root, so the canonical import is
+//! `use xsd_schema::{form, xpath};` — see [`macros`] for the grammar they
+//! accept.
 //!
 //! # Lifetimes
 //!
@@ -133,6 +138,7 @@ pub mod composer;
 pub mod emit;
 pub mod error;
 pub mod form;
+pub mod macros;
 pub mod order;
 pub mod pipe;
 pub mod value;
@@ -142,6 +148,13 @@ pub use emit::Emitter;
 pub use error::ComposeError;
 pub use form::{AttrValue, Content, Form, IntoContent, Name};
 pub use value::{IntoContextNode, IntoXPathValue, Value};
+
+// What `form!` calls, and nothing a host writes by hand. The macros are
+// exported at the crate root (`xsd_schema::form!`, `xsd_schema::xpath!`) and
+// expand to `$crate::compose::…` paths only, so these have to be reachable
+// from outside the crate even though they are not part of the surface.
+#[doc(hidden)]
+pub use form::{__display_text, __name_from_literal};
 
 /// The navigator every composed value and form uses.
 ///
