@@ -268,9 +268,16 @@ fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
 // fn:round($arg as numeric?) as numeric?
 // ============================================================================
 
-/// Implements fn:round - returns the nearest integer to the argument.
+/// Implements fn:round - returns the number with no fractional part that is
+/// closest to the argument.
 ///
-/// Rounds half values away from zero (e.g., 0.5 -> 1, -0.5 -> -1).
+/// F&O §6.4.4 `fn:round`: "Returns the number with no fractional part that is
+/// closest to the argument. If there are two such numbers, then the one that is
+/// closest to positive infinity is returned." A half value therefore rounds
+/// *towards positive infinity* in both directions — `round(2.5)` is 3 and
+/// `round(-2.5)` is -2, not -3 — and the spec's own examples spell the negative
+/// case out: "round(-2.5) returns -2 (not the possible alternative, -3)".
+///
 /// The function preserves the numeric type of the input.
 pub fn round<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
@@ -304,22 +311,23 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
                 expected: "xs:double".to_string(),
                 found: format!("{:?}", value.type_code),
             })?;
-            // XPath round() rounds half away from zero
-            Ok(XmlValue::double(round_half_away_from_zero_f64(d)))
+            Ok(XmlValue::double(round_half_toward_positive_infinity_f64(d)))
         }
         XmlTypeCode::Float => {
             let f = get_float(value).ok_or_else(|| XPathError::XPTY0004 {
                 expected: "xs:float".to_string(),
                 found: format!("{:?}", value.type_code),
             })?;
-            Ok(XmlValue::float(round_half_away_from_zero_f32(f)))
+            Ok(XmlValue::float(round_half_toward_positive_infinity_f32(f)))
         }
         XmlTypeCode::Decimal => {
             let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
                 expected: "xs:decimal".to_string(),
                 found: format!("{:?}", value.type_code),
             })?;
-            Ok(XmlValue::decimal(round_half_away_from_zero_decimal(d)))
+            Ok(XmlValue::decimal(
+                round_half_toward_positive_infinity_decimal(d),
+            ))
         }
         _ if is_integer_type(value.type_code) => {
             // For integers, round is identity
@@ -332,48 +340,77 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
     }
 }
 
-/// Round half away from zero for f64 (XPath round semantics).
-fn round_half_away_from_zero_f64(d: f64) -> f64 {
-    if d.is_nan() || d.is_infinite() {
+/// Round half toward positive infinity for `f64` (`fn:round` semantics).
+///
+/// Shared with `fn:subsequence`, whose positions F&O §15.1.10 defines through
+/// `fn:round`, so that the two cannot drift apart.
+///
+/// F&O §6.4.4 lists the special values of the floating-point types explicitly:
+/// NaN, positive and negative infinity and positive and negative zero are
+/// returned unchanged, and an argument "less than zero, but greater than or
+/// equal to -0.5" returns *negative* zero.
+///
+/// The rounding itself is `floor(x) + 1` when the fractional part is at least
+/// a half, rather than the more compact `(x + 0.5).floor()`: the fractional
+/// part `x - floor(x)` is always exact — it is a multiple of `ulp(x)` smaller
+/// than one — whereas `x + 0.5` is not, and for the largest `f64` below a half
+/// it rounds up to `1.0` and would answer 1 where the nearest number with no
+/// fractional part is 0. Writing it this way also needs no magnitude guard: at
+/// 2^52 and above every `f64` is already integral, so `floor(x)` is `x` and the
+/// fractional part is zero.
+pub(crate) fn round_half_toward_positive_infinity_f64(d: f64) -> f64 {
+    // `d == 0.0` matches negative zero too, and returning `d` keeps its sign.
+    if d.is_nan() || d.is_infinite() || d == 0.0 {
         return d;
     }
-    // For positive numbers: floor(x + 0.5)
-    // For negative numbers: ceil(x - 0.5)
-    if d >= 0.0 {
-        (d + 0.5).floor()
+    let floored = d.floor();
+    let rounded = if d - floored >= 0.5 {
+        floored + 1.0
     } else {
-        (d - 0.5).ceil()
+        floored
+    };
+    if rounded == 0.0 && d < 0.0 {
+        // -0.5 <= d < 0: the result is negative zero, not positive zero.
+        -0.0
+    } else {
+        rounded
     }
 }
 
-/// Round half away from zero for f32.
-fn round_half_away_from_zero_f32(f: f32) -> f32 {
-    if f.is_nan() || f.is_infinite() {
+/// Round half toward positive infinity for `f32`.
+///
+/// Identical to [`round_half_toward_positive_infinity_f64`], including the
+/// negative-zero rule of F&O §6.4.4; the exactness argument holds at 2^23,
+/// where every `f32` is already integral.
+fn round_half_toward_positive_infinity_f32(f: f32) -> f32 {
+    if f.is_nan() || f.is_infinite() || f == 0.0 {
         return f;
     }
-    if f >= 0.0 {
-        (f + 0.5).floor()
+    let floored = f.floor();
+    let rounded = if f - floored >= 0.5 {
+        floored + 1.0
     } else {
-        (f - 0.5).ceil()
+        floored
+    };
+    if rounded == 0.0 && f < 0.0 {
+        -0.0
+    } else {
+        rounded
     }
 }
 
-/// Round half away from zero for Decimal.
-fn round_half_away_from_zero_decimal(d: Decimal) -> Decimal {
-    let half = Decimal::new(5, 1); // 0.5
-    let truncated = d.trunc();
-    let frac = d - truncated;
-
-    if d >= Decimal::ZERO {
-        if frac >= half {
-            truncated + Decimal::ONE
-        } else {
-            truncated
-        }
-    } else if frac <= -half {
-        truncated - Decimal::ONE
+/// Round half toward positive infinity for `Decimal`, in exact decimal
+/// arithmetic.
+///
+/// `xs:decimal` has no NaN, no infinities and no negative zero (Datatypes
+/// §3.3.4), so the floating-point special cases do not arise and `round(-0.5)`
+/// is plain `0`.
+fn round_half_toward_positive_infinity_decimal(d: Decimal) -> Decimal {
+    let floored = d.floor();
+    if d - floored >= Decimal::new(5, 1) {
+        floored + Decimal::ONE
     } else {
-        truncated
+        floored
     }
 }
 
@@ -679,36 +716,155 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_round_double() {
+    /// Evaluate `fn:round` on one atomic argument and hand back the result.
+    fn round_one(arg: XPathValue<RoXmlNavigator<'static>>) -> XmlValue {
         let mut ctx = make_context();
-
-        // Test 2.5 -> 3 (round half away from zero)
-        let args = vec![XPathValue::double(2.5)];
-        let result = round(&mut ctx, args).unwrap();
-        match result {
-            XPathValue::Item(item) => {
-                if let crate::xpath::iterator::XmlItem::Atomic(v) = item {
-                    assert_eq!(v.as_double().unwrap(), 3.0);
-                } else {
-                    panic!("Expected atomic value");
-                }
-            }
-            _ => panic!("Expected single item"),
+        match round(&mut ctx, vec![arg]).expect("fn:round of a numeric argument") {
+            XPathValue::Item(crate::xpath::iterator::XmlItem::Atomic(v)) => v,
+            _ => panic!("Expected a single atomic item"),
         }
+    }
 
-        // Test -2.5 -> -3 (round half away from zero)
-        let args = vec![XPathValue::double(-2.5)];
-        let result = round(&mut ctx, args).unwrap();
-        match result {
-            XPathValue::Item(item) => {
-                if let crate::xpath::iterator::XmlItem::Atomic(v) = item {
-                    assert_eq!(v.as_double().unwrap(), -3.0);
-                } else {
-                    panic!("Expected atomic value");
-                }
-            }
-            _ => panic!("Expected single item"),
+    fn round_double(d: f64) -> f64 {
+        let value = round_one(XPathValue::double(d));
+        assert_eq!(value.type_code, XmlTypeCode::Double);
+        value.as_double().expect("xs:double result")
+    }
+
+    fn round_float(f: f32) -> f32 {
+        let value = round_one(XPathValue::from_atomic(XmlValue::float(f)));
+        assert_eq!(value.type_code, XmlTypeCode::Float);
+        get_float(&value).expect("xs:float result")
+    }
+
+    fn round_decimal(literal: &str) -> Decimal {
+        let d: Decimal = literal.parse().expect("decimal literal");
+        let value = round_one(XPathValue::decimal(d));
+        assert_eq!(value.type_code, XmlTypeCode::Decimal);
+        value.as_decimal().expect("xs:decimal result")
+    }
+
+    /// F&O §6.4.4: "If there are two such numbers, then the one that is closest
+    /// to positive infinity is returned", with the example `round(-2.5)` = -2.
+    #[test]
+    fn round_double_takes_halves_toward_positive_infinity() {
+        assert_eq!(round_double(2.5), 3.0);
+        assert_eq!(round_double(-2.5), -2.0);
+        assert_eq!(round_double(3.5), 4.0);
+        assert_eq!(round_double(-3.5), -3.0);
+        assert_eq!(round_double(2.4999), 2.0);
+        assert_eq!(round_double(-2.4999), -2.0);
+        assert_eq!(round_double(0.5), 1.0);
+    }
+
+    /// F&O §6.4.4: "If the argument is less than zero, but greater than or equal
+    /// to -0.5, then negative zero is returned."
+    #[test]
+    fn round_double_returns_negative_zero_just_below_zero() {
+        for arg in [-0.3, -0.5, -f64::MIN_POSITIVE] {
+            let rounded = round_double(arg);
+            assert_eq!(rounded, 0.0, "round({arg})");
+            assert!(
+                rounded.is_sign_negative(),
+                "round({arg}) is not negative zero"
+            );
+        }
+    }
+
+    /// F&O §6.4.4 returns NaN, both infinities and both zeroes unchanged.
+    #[test]
+    fn round_double_returns_special_values_unchanged() {
+        assert!(round_double(f64::NAN).is_nan());
+        assert_eq!(round_double(f64::INFINITY), f64::INFINITY);
+        assert_eq!(round_double(f64::NEG_INFINITY), f64::NEG_INFINITY);
+
+        let positive_zero = round_double(0.0);
+        assert_eq!(positive_zero, 0.0);
+        assert!(positive_zero.is_sign_positive(), "round(0) lost its sign");
+
+        let negative_zero = round_double(-0.0);
+        assert_eq!(negative_zero, 0.0);
+        assert!(negative_zero.is_sign_negative(), "round(-0) lost its sign");
+    }
+
+    /// At 2^52 and above every `f64` is already integral and `x + 0.5` is no
+    /// longer exact, so such an argument must come back untouched.
+    #[test]
+    fn round_double_leaves_large_integral_values_alone() {
+        for arg in [
+            4_503_599_627_370_496.0_f64,  // 2^52
+            4_503_599_627_370_497.0_f64,  // 2^52 + 1, an odd integer
+            -4_503_599_627_370_497.0_f64, // and its negation
+            1.797_693_134_862_315_7e308,  // xs:double's largest finite value
+        ] {
+            assert_eq!(round_double(arg), arg, "round({arg})");
+        }
+    }
+
+    /// The largest `f64` strictly below a half: the nearest number with no
+    /// fractional part is 0, even though `x + 0.5` rounds up to `1.0`.
+    #[test]
+    fn round_double_does_not_round_up_the_largest_value_below_a_half() {
+        assert_eq!(round_double(0.499_999_999_999_999_94), 0.0);
+    }
+
+    #[test]
+    fn round_float_takes_halves_toward_positive_infinity() {
+        assert_eq!(round_float(2.5), 3.0);
+        assert_eq!(round_float(-2.5), -2.0);
+        assert_eq!(round_float(3.5), 4.0);
+        assert_eq!(round_float(-3.5), -3.0);
+        assert_eq!(round_float(2.4999), 2.0);
+        assert_eq!(round_float(-2.4999), -2.0);
+        assert_eq!(round_float(0.5), 1.0);
+    }
+
+    #[test]
+    fn round_float_handles_zeroes_infinities_and_large_values() {
+        for arg in [-0.3_f32, -0.5_f32] {
+            let rounded = round_float(arg);
+            assert_eq!(rounded, 0.0);
+            assert!(
+                rounded.is_sign_negative(),
+                "round({arg}) is not negative zero"
+            );
+        }
+        assert!(round_float(f32::NAN).is_nan());
+        assert_eq!(round_float(f32::INFINITY), f32::INFINITY);
+        assert_eq!(round_float(f32::NEG_INFINITY), f32::NEG_INFINITY);
+        assert!(round_float(-0.0).is_sign_negative());
+        assert!(round_float(0.0).is_sign_positive());
+        // 2^23: every f32 at or above this magnitude is already integral.
+        assert_eq!(round_float(8_388_609.0), 8_388_609.0);
+        assert_eq!(round_float(0.499_999_97), 0.0);
+    }
+
+    /// `xs:decimal` has no negative zero, so `round(-0.5)` is plain `0`.
+    #[test]
+    fn round_decimal_takes_halves_toward_positive_infinity() {
+        assert_eq!(round_decimal("2.5"), Decimal::from(3));
+        assert_eq!(round_decimal("-2.5"), Decimal::from(-2));
+        assert_eq!(round_decimal("3.5"), Decimal::from(4));
+        assert_eq!(round_decimal("-3.5"), Decimal::from(-3));
+        assert_eq!(round_decimal("2.4999"), Decimal::from(2));
+        assert_eq!(round_decimal("-2.4999"), Decimal::from(-2));
+        assert_eq!(round_decimal("0.5"), Decimal::from(1));
+        assert_eq!(round_decimal("-0.5"), Decimal::ZERO);
+        assert_eq!(round_decimal("-0.3"), Decimal::ZERO);
+        assert_eq!(round_decimal("0"), Decimal::ZERO);
+        assert_eq!(
+            round_decimal("999999999999999999"),
+            Decimal::from(999_999_999_999_999_999_i64)
+        );
+    }
+
+    /// `fn:round` of an `xs:integer` is the identity, and keeps its type.
+    #[test]
+    fn round_integer_is_the_identity() {
+        for literal in [0_i64, 1, -1, 2, -3, 999_999_999_999_999_999] {
+            let value = round_one(XPathValue::integer(literal));
+            assert!(is_integer_type(value.type_code), "{:?}", value.type_code);
+            assert_eq!(value.as_integer(), Some(&BigInt::from(literal)));
         }
     }
 

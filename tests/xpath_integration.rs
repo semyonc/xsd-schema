@@ -191,6 +191,7 @@ const UNTYPED_DOC: &str = concat!(
     "<precision>1</precision>",
     "<amount>-3.5</amount>",
     "<ratio>2.4</ratio>",
+    "<letter>b</letter>",
     "<text>not-a-date</text>",
     "</record>"
 );
@@ -383,4 +384,30 @@ fn test_untyped_argument_to_qname_function_is_xpty0004() {
     let err =
         eval_untyped("prefix-from-QName(/record/text)").expect_err("xs:QName is not castable");
     assert!(err.starts_with("[XPTY0004]"), "{err}");
+}
+
+/// `fn:index-of` does *not* cast its search value to the type of the sequence.
+///
+/// Its items are compared with `$srchParam` under the rules of the `eq`
+/// operator, and F&O §15.1.5 adds: "Values that cannot be compared, i.e. the eq
+/// operator is not defined for their types, are considered to be distinct."
+/// Under `eq` an `xs:untypedAtomic` operand is cast to `xs:string` (XPath 2.0
+/// §3.5.1: "If the atomized operand is of type xs:untypedAtomic, it is cast to
+/// xs:string"), and `xs:integer eq xs:string` is not a valid combination in
+/// §B.2 Operator Mapping. So an untyped `2` is distinct from every `xs:integer`
+/// in the sequence: the result is the empty sequence, and no error.
+#[test]
+fn test_index_of_untyped_search_value_is_compared_as_a_string() {
+    assert_eq!(
+        eval_untyped("index-of((1, 2, 3), /record/position)").unwrap(),
+        Vec::<String>::new(),
+        "an untyped search value is a string, so it matches no xs:integer"
+    );
+    // The same cast makes the comparison succeed against a sequence of strings.
+    assert_eq!(
+        eval_untyped("index-of(('a', 'b'), /record/letter)").unwrap(),
+        vec!["2"]
+    );
+    // And a typed xs:integer search value still matches.
+    assert_eq!(eval_untyped("index-of((1, 2, 3), 2)").unwrap(), vec!["2"]);
 }

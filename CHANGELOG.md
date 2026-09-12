@@ -47,6 +47,41 @@ queries of the XQuery test suite's relational use case.
 
 ### Fixed
 
+- **`fn:round` takes a half towards positive infinity, not away from zero.**
+  F&O §6.4.4: "Returns the number with no fractional part that is closest to the
+  argument. If there are two such numbers, then the one that is closest to
+  positive infinity is returned", with the example "round(-2.5) returns -2 (not
+  the possible alternative, -3)". Halves of a negative argument were rounded
+  away from zero, so `round(-2.5)` answered -3 and `round(-3.5)` answered -4.
+  All four numeric types now round the same way, and the floating-point special
+  cases of §6.4.4 are explicit: NaN, both infinities and both zeroes come back
+  unchanged, and an `xs:double` or `xs:float` argument "less than zero, but
+  greater than or equal to -0.5" returns negative zero (`round(-0.3)` is `-0`,
+  while the `xs:decimal` `-0.3` rounds to plain `0`). The rounding is computed
+  from `floor(x)` and an exact fractional part instead of `(x + 0.5).floor()`,
+  which for the largest `xs:double` below a half would have answered 1.
+  `fn:round-half-to-even` is a different function and is unchanged; so are all
+  W3C XSD and XQTS results.
+  `fn:subsequence` rounds `$startingLoc` and `$length` through the same helper:
+  F&O §15.1.10 defines its result as the items whose position `p` satisfies
+  `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
+  fn:round($length)`, and it kept a second, half-away-from-zero copy of the
+  rounding (whose comment claimed `fn:round-half-to-even`), so
+  `subsequence((1,2,3,4,5), -1.5, 4.5)` started at -2 and yielded `(1, 2)`
+  instead of the specified `(1, 2, 3)`. Integral positions, NaN and the
+  infinities are unaffected.
+- **`fn:codepoints-to-string` rejects a non-integer numeric argument.** Its
+  declared parameter type is `xs:integer*`, and the function conversion rules of
+  XPath 2.0 §3.1.5 cast only an `xs:untypedAtomic` item to it: numeric promotion
+  goes the other way, promoting `xs:decimal` and `xs:float` *to* `xs:double`
+  (§B.1), never a numeric item down to `xs:integer`. A whole-valued
+  `xs:decimal`, `xs:float` or `xs:double` therefore reaches the closing rule —
+  "If, after the above conversions, the resulting value does not match the
+  expected type according to the rules for SequenceType Matching, a type error
+  is raised [err:XPTY0004]" — where it used to be accepted as a codepoint. So
+  `codepoints-to-string(65.0)` and `codepoints-to-string(xs:double(65))` are now
+  `XPTY0004`, while `xs:integer`, every type derived from it and an untyped node
+  still work.
 - **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
   arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
   type xs:untypedAtomic is cast to the expected atomic type. For built-in
