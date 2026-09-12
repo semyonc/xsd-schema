@@ -58,7 +58,15 @@ fn require_integer(value: XmlValue, function: &str) -> Result<i64, XPathError> {
 /// Implements fn:index-of - returns positions of matching items in a sequence.
 ///
 /// Returns a sequence of positive integers giving the positions of items in $seq
-/// that are equal to $search.
+/// that are equal to $search. F&O §15.1.5 compares them under the rules of the
+/// `eq` operator and adds that "Values that cannot be compared, i.e. the eq
+/// operator is not defined for their types, are considered to be distinct" — so
+/// an incomparable pair is a non-match, never an error. `$search` is *not*
+/// converted to the type of the sequence: it is an `xs:anyAtomicType`
+/// parameter, and under `eq` an `xs:untypedAtomic` operand is cast to
+/// `xs:string` (XPath 2.0 §3.5.1), which is what `values_equal` does. An
+/// untyped `2` therefore matches no `xs:integer` and `index-of((1, 2, 3), $u)`
+/// is the empty sequence.
 pub fn index_of<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -95,8 +103,13 @@ pub fn index_of<N: DomNavigator>(
 }
 
 /// Compare two atomic values for equality (used by index-of and distinct-values).
-/// Normalizes UntypedAtomic and AnyUri to string for comparison.
-/// Applies numeric type promotion for comparing different numeric types.
+///
+/// Normalizes UntypedAtomic and AnyUri to string, which is the `eq` rule of
+/// XPath 2.0 §3.5.1 ("If the atomized operand is of type xs:untypedAtomic, it
+/// is cast to xs:string"), and applies numeric type promotion for comparing
+/// different numeric types. A pair whose types `eq` is not defined for — an
+/// `xs:integer` against an `xs:string`, say — compares unequal rather than
+/// raising, which is F&O §15.1.5's "considered to be distinct".
 fn values_equal(left: &XmlValue, right: &XmlValue) -> bool {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
