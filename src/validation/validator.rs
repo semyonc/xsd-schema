@@ -177,7 +177,7 @@ impl<'a> SchemaValidator<'a> {
 
     /// A readable, source-attributed description of the content model this
     /// validator holds for `ct_key` — see
-    /// [`ContentModelReport`](crate::compiler::inspect::ContentModelReport).
+    /// [`ContentModelReport`].
     ///
     /// Unlike
     /// [`inspect_content_model`](crate::compiler::inspect::inspect_content_model),

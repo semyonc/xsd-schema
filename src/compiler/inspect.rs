@@ -19,7 +19,7 @@
 //!   (expanded inline but labelled as references), element particles with their
 //!   resolved declaration and type, and wildcards with their namespace
 //!   constraint. Every node carries `minOccurs..maxOccurs` and says whether
-//!   that range will be **unrolled** (`maxOccurs` ≤ [`COUNTED_THRESHOLD`]) or
+//!   that range will be **unrolled** (`maxOccurs` ≤ `COUNTED_THRESHOLD`) or
 //!   compiled to a **counter**. For an extension, the base type's contribution
 //!   is shown first, in the order the compiler concatenates it.
 //! * **Compiled** — the matcher the validator actually runs: the matcher kind,
@@ -76,8 +76,6 @@
 //! assert!(text.contains("element a"));
 //! assert!(text.contains("[unrolled]"));
 //! ```
-//!
-//! [`COUNTED_THRESHOLD`]: super::particle::COUNTED_THRESHOLD
 
 use std::fmt;
 
@@ -325,7 +323,7 @@ pub struct GroupRefView {
 pub enum OccurrenceCompilation {
     /// `1..1`: nothing to repeat.
     Single,
-    /// `maxOccurs` ≤ [`COUNTED_THRESHOLD`] (or unbounded with a small
+    /// `maxOccurs` ≤ `COUNTED_THRESHOLD` (or unbounded with a small
     /// `minOccurs`): the fragment is cloned into the automaton.
     Unrolled,
     /// Above the threshold: counter transitions enforce the bound exactly.
