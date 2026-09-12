@@ -635,9 +635,48 @@ impl<'a> IntoContent<'a> for Vec<&XmlValue> {
     }
 }
 
+// ── Macro support ─────────────────────────────────────────────────────
+//
+// The two functions below exist so the macros stay `macro_rules!` and expand
+// to ordinary calls. They are not part of the documented surface.
+
+/// The name a string literal in `form!` stands for.
+///
+/// The literal is split at its first colon, and the halves are *not* checked
+/// here: the emitter checks every name it writes, so a literal that is not an
+/// `NCName` or `prefix:NCName` is [`ComposeError::InvalidName`] at build time,
+/// where every other name rule is decided too.
+#[doc(hidden)]
+pub fn __name_from_literal(text: &str) -> Name {
+    match text.split_once(':') {
+        Some((prefix, local)) => Name::prefixed(prefix, local),
+        None => Name::local(text),
+    }
+}
+
+/// The content `form!`'s `@{…}` makes: a Rust value formatted with `Display`.
+#[doc(hidden)]
+pub fn __display_text<'a>(value: impl fmt::Display) -> Content<'a> {
+    Content::Text(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_literal_name_splits_at_its_first_colon() {
+        assert_eq!(__name_from_literal("bid-count"), Name::local("bid-count"));
+        assert_eq!(__name_from_literal("p:bid"), Name::prefixed("p", "bid"));
+        // Unchecked here; the emitter refuses it.
+        assert_eq!(__name_from_literal("a:b:c"), Name::prefixed("a", "b:c"));
+    }
+
+    #[test]
+    fn a_display_value_becomes_text() {
+        let content: Content<'_> = __display_text(1.5f64);
+        assert!(matches!(content, Content::Text(ref t) if t == "1.5"));
+    }
 
     #[test]
     fn parse_accepts_local_and_prefixed_names() {

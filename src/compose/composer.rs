@@ -796,8 +796,11 @@ impl<'a> Composer<'a> {
     }
 
     /// How many distinct expressions have been compiled.
+    ///
+    /// Visible to the crate's own tests because the macro tests assert that
+    /// one call site compiles one expression however often it runs.
     #[cfg(test)]
-    fn cached_expressions(&self) -> usize {
+    pub(crate) fn cached_expressions(&self) -> usize {
         self.exprs.borrow().len()
     }
 

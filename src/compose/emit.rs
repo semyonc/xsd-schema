@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use crate::document::{BufferDocument, BufferDocumentBuilder, CopyOptions, NamespaceFixup};
-use crate::namespace::XML_NAMESPACE;
+use crate::namespace::{is_ncname, XML_NAMESPACE};
 use crate::types::value::XmlValue;
 use crate::xpath::atomize::atomize_node;
 use crate::xpath::XmlItem;
@@ -270,12 +270,14 @@ impl<'a> Emitter<'a> {
         content: Vec<Content<'a>>,
     ) -> Result<(), ComposeError> {
         let at = self.path.join("/");
+        check_name(name)?;
         let elem_uri = self.element_namespace(name.prefix(), &at)?;
 
         // Attribute names and values, resolved before the element opens: the
         // fixup needs every name at once to generate prefixes deterministically.
         let mut resolved: Vec<(Name, String, String)> = Vec::with_capacity(attrs.len());
         for (attr_name, value) in attrs {
+            check_name(&attr_name)?;
             let uri = self.attribute_namespace(attr_name.prefix(), &at)?;
             let text = self.attribute_text(value, &at)?;
             resolved.push((attr_name, uri, text));
@@ -447,6 +449,23 @@ impl<'a> Emitter<'a> {
             format!("{key}[{seen}]")
         }
     }
+}
+
+/// Refuses a name whose parts are not `NCName`s.
+///
+/// [`Name::parse`](crate::compose::Name::parse) checks what it parses, but
+/// [`Name::local`](crate::compose::Name::local) and
+/// [`Name::prefixed`](crate::compose::Name::prefixed) take the author's word,
+/// and so does the string-literal name spelling of `form!`. Every name that
+/// reaches the document is therefore checked here, at build time, where the
+/// rest of the name rules are decided: an element or attribute name that no
+/// well-formed document could carry is
+/// [`ComposeError::InvalidName`](crate::compose::ComposeError::InvalidName).
+fn check_name(name: &Name) -> Result<(), ComposeError> {
+    if is_ncname(name.local_name()) && (name.prefix().is_empty() || is_ncname(name.prefix())) {
+        return Ok(());
+    }
+    Err(ComposeError::InvalidName(name.to_string()))
 }
 
 #[cfg(test)]
