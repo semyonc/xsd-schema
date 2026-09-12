@@ -1245,7 +1245,7 @@ mod tests {
         // cannot change the bytes.
         for xml in [
             "<a/>",
-            "<a>t1<b/>t2<!--c--><?pi?></a>",
+            "<a>t1<b/>t2<!--c--><?pi d?></a>",
             r#"<a z="1" m="2"/>"#,
             r#"<p:a xmlns:p="urn:x" xmlns="urn:d"><p:b p:k="v"><c/></p:b></a>"#
                 .replace("</a>", "</p:a>")
@@ -1280,12 +1280,13 @@ mod tests {
     }
 
     #[test]
-    fn roxmltree_pi_data_is_not_surfaced_by_the_navigator() {
-        // A known gap in the roxmltree adapter, not in the serializer: its
-        // `value()` reports nothing for a processing instruction, so the data
-        // is already gone when the serializer asks for it. Pinned here so the
-        // divergence between the two backends stays visible.
-        assert_eq!(round_roxml("<a><?pi d?></a>"), "<a><?pi?></a>");
+    fn both_backends_report_pi_data() {
+        // Both navigators report a PI's data as its string value, so the data
+        // survives on either backend.
         assert_eq!(round("<a><?pi d?></a>"), "<a><?pi d?></a>");
+        assert_eq!(round_roxml("<a><?pi d?></a>"), "<a><?pi d?></a>");
+        // Trailing whitespace is part of the data (XML 1.0 §2.6).
+        assert_eq!(round("<a><?pi d ?></a>"), "<a><?pi d ?></a>");
+        assert_eq!(round_roxml("<a><?pi d ?></a>"), "<a><?pi d ?></a>");
     }
 }
