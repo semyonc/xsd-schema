@@ -35,6 +35,11 @@
 //! escape returns from the enclosing function and why the finished form can
 //! be stored, returned and spliced later.
 //!
+//! In a form, a prefixed name is written `p::local`: one colon after the
+//! element name is always the attribute marker, so `(p:title "One")` is the
+//! element `p` with `title="One"`, and `(p::title "One")` is the element
+//! `p:title`.
+//!
 //! # Expansion depth
 //!
 //! Both the nesting depth of a form and the number of items in one form cost
@@ -278,8 +283,9 @@ macro_rules! xpath {
 ///
 /// ```text
 /// form      ::= '(' name item* ')'
-/// name      ::= ident | ident '::' ident | ident ':' ident | string-literal
-/// item      ::= ':' name attr-value                 -- an attribute
+/// name      ::= ident | ident '::' ident | string-literal
+///                                                   -- one colon after the name is an attribute
+/// item      ::= ':' attr-name attr-value            -- an attribute
 ///             | ':' 'xmlns' string-literal          -- a default namespace declaration
 ///             | ':' 'xmlns' '::' ident string-literal
 ///             | ':' 'xmlns' ':' ident string-literal
@@ -291,6 +297,7 @@ macro_rules! xpath {
 ///             | '#' 'comment' string-literal
 ///             | '#' 'pi' string-literal string-literal
 ///             | form                                -- a child element
+/// attr-name ::= ident | ident '::' ident | ident ':' ident | string-literal
 /// attr-value::= string-literal | '@' '{' rust-expr '}' | '^' '{' rust-expr '}'
 /// ```
 ///
@@ -317,16 +324,23 @@ macro_rules! xpath {
 /// An unprefixed element name takes the default element namespace; an
 /// unprefixed attribute is in no namespace. `xml` is always bound.
 ///
-/// **A prefixed name is written with `::`** — `(p::title …)`, `:xml::lang
-/// "en"`. Rust's tokens carry no whitespace, so `(p:title "One")` and
-/// `(book :id "b1")` are the same shape, and the attribute reading wins: a
-/// `:` item is an attribute whenever what follows it can be an attribute
-/// value. The single-colon name spelling of the design grammar is still
-/// accepted where nothing attribute-shaped follows it — `(p:root (child))`,
-/// `(p:root ..^{ rows })`, `(p:root)` — but `(p:title "One")` builds
-/// `<p title="One"/>`. Write `(p::title "One")`, or the name as a string
-/// literal `("p:title" "One")`, which is also how a name that is not a Rust
-/// identifier is written: `("bid-count" "7")`.
+/// **A prefixed element name is written with two colons** — `(p::title
+/// "One")` — or as a string literal — `("p:title" "One")`, which is also how
+/// a name that is not a Rust identifier is written: `("bid-count" "7")`.
+///
+/// One colon is the attribute marker, always. Rust's tokens carry no
+/// whitespace, so `(book :id "b1")` and `(p:title "One")` are the same shape,
+/// and rather than guess, the macro reads a single colon after the element
+/// name as the start of an attribute in every case: `(p:title "One")` and
+/// `(p :title "One")` are both the element `p` with `title="One"`, and
+/// `(p:root (child))` — where no attribute value follows — does not compile,
+/// with a message naming the `p::root` spelling. Nothing is ever reinterpreted
+/// silently.
+///
+/// After that marker the ambiguity is gone, so an attribute name and a
+/// declaration take either spelling: `:xml::lang "en"` and `:xml:lang "en"`
+/// are the same attribute, `:xmlns::p "urn:x"` and `:xmlns:p "urn:x"` the same
+/// declaration.
 ///
 /// A literal name that is not an `NCName` or `prefix:NCName` is
 /// [`ComposeError::InvalidName`](crate::compose::ComposeError::InvalidName)
@@ -457,6 +471,25 @@ macro_rules! xpath {
 /// # Ok::<(), ComposeError>(())
 /// ```
 ///
+/// A single colon after the element name is an attribute, so a prefixed
+/// element name written with one does not compile:
+///
+/// ```compile_fail
+/// use bumpalo::Bump;
+/// use xsd_schema::compose::{ComposeError, Composer};
+/// use xsd_schema::form;
+/// use xsd_schema::namespace::NameTable;
+///
+/// let arena = Bump::new();
+/// let names = NameTable::new();
+/// let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
+///
+/// // `:root` starts an attribute, and `(child)` is not an attribute value.
+/// // Write form!((p::root (child))) for the element `p:root`.
+/// let refused = form!((p:root (child)));
+/// # Ok::<(), ComposeError>(())
+/// ```
+///
 /// `..^{}` refuses an iterator of results:
 ///
 /// ```compile_fail
@@ -492,11 +525,12 @@ macro_rules! xpath {
 macro_rules! form {
     // ── The element name ──────────────────────────────────────────────
     //
-    // `p::local` is unambiguous, so it is decided first. A single colon is
-    // not: `(book :id "b1")` and `(p:title "One")` are the same token shape,
-    // and the arms below give the attribute reading priority by looking ahead
-    // for a complete attribute — a name and a value — before accepting
-    // `ident : ident` as a prefixed element name.
+    // `p::local` is the prefixed spelling, and it is decided first. A single
+    // colon is always the attribute marker: `(book :id "b1")` and
+    // `(p:title "One")` are the same token shape, so the arms below look ahead
+    // for a complete attribute — a name and a value — and hand everything
+    // else to the plain-name arm, where an attribute without a value is
+    // refused by name.
 
     (($prefix:ident :: $local:ident $($items:tt)*)) => {
         $crate::__form_build!(
@@ -566,16 +600,10 @@ macro_rules! form {
         )
     };
 
-    // Nothing attribute-shaped follows, so `ident : ident` is the name.
-    (($prefix:ident : $local:ident $($items:tt)*)) => {
-        $crate::__form_build!(
-            $crate::compose::Name::prefixed(
-                ::core::stringify!($prefix),
-                ::core::stringify!($local),
-            ),
-            $($items)*
-        )
-    };
+    // There is deliberately no `ident : ident` element-name arm: a single
+    // colon after the name always starts an attribute, so `(p:root (child))`
+    // reaches the attribute arms and is refused there by name, rather than
+    // quietly meaning something else than `(p::root (child))`.
 
     // A name that is not a Rust identifier.
     (($name:literal $($items:tt)*)) => {
@@ -757,7 +785,9 @@ macro_rules! __form_attr {
     ($f:ident, $name:expr, $($rest:tt)*) => {
         ::core::compile_error!(
             "form!: an attribute needs a value — a string literal, @{ e } for a Display \
-             value, or ^{ e } for a sequence"
+             value, or ^{ e } for a sequence. A single colon always starts an attribute, so \
+             a prefixed element name is written with two — form!((p::local …)) — or as a \
+             string literal — form!((\"p:local\" …))"
         )
     };
 }
@@ -948,28 +978,42 @@ mod tests {
     }
 
     #[test]
-    fn a_single_colon_name_yields_to_the_attribute_reading() {
+    fn a_single_colon_after_the_name_starts_an_attribute() {
         let arena = Bump::new();
         let names = NameTable::new();
         let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
 
-        // `(p:title "One")` and `(book :id "b1")` are the same token shape, so
-        // the attribute reading wins: whitespace is not in the token stream.
+        // `(p:title "One")` and `(book :id "b1")` are the same token shape —
+        // whitespace is not in the token stream — so one colon after the
+        // element name is the attribute marker in both, and in either spacing.
         assert_eq!(xml(&c, form!((p:title "One"))), r#"<p title="One"/>"#);
-        // The `::` spelling says what was meant …
+        assert_eq!(xml(&c, form!((p :title "One"))), r#"<p title="One"/>"#);
+        // A prefixed element name written with one colon does not compile at
+        // all; the doc tests pin that. Nothing here is reinterpreted.
+    }
+
+    #[test]
+    fn a_prefixed_element_name_is_written_with_two_colons_or_a_literal() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let c = Composer::new(&arena, &names).with_namespace("p", "urn:p");
+
         assert_eq!(
             xml(&c, form!((p::title "One"))),
             r#"<p:title xmlns:p="urn:p">One</p:title>"#
         );
-        // … with nothing attribute-shaped after it, one colon is the name …
         assert_eq!(
-            xml(&c, form!((p:title (leaf)))),
-            r#"<p:title xmlns:p="urn:p"><leaf/></p:title>"#
+            xml(&c, form!(("p:title" "One"))),
+            r#"<p:title xmlns:p="urn:p">One</p:title>"#
         );
-        // … and an attribute after a `::` name is unambiguous.
+        // An attribute after either spelling is unambiguous.
         assert_eq!(
             xml(&c, form!((p::title :id "b1" "One"))),
             r#"<p:title xmlns:p="urn:p" id="b1">One</p:title>"#
+        );
+        assert_eq!(
+            xml(&c, form!((p::title(leaf)))),
+            r#"<p:title xmlns:p="urn:p"><leaf/></p:title>"#
         );
     }
 

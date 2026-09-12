@@ -28,7 +28,9 @@
 //!
 //! The macros are exported at the crate root, so the canonical import is
 //! `use xsd_schema::{form, xpath};` — see [`macros`] for the grammar they
-//! accept.
+//! accept. In a form, a prefixed name is written with two colons —
+//! `form!((p::title "One"))` — because one colon after the element name is
+//! always the start of an attribute: `form!((book :id "b1"))`.
 //!
 //! # Lifetimes
 //!
