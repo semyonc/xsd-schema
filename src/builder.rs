@@ -26,14 +26,15 @@ use crate::error::{SchemaError, SchemaResult};
 use crate::ids::DocumentId;
 use crate::parser::parse::parse_schema_with_config;
 use crate::parser::resolver::{
-    fixup_composition_edges, resolve_all_directives, ResolverConfig, SchemaLoader, SchemaResolver,
+    fixup_composition_edges, normalize_path, resolve_all_directives, ResolverConfig, SchemaLoader,
+    SchemaResolver,
 };
 #[cfg(feature = "async")]
 use crate::parser::resolver::{resolve_all_directives_async, AsyncSchemaLoader};
 use crate::pipeline::process_loaded_schemas;
 use crate::schema::model::{RegexCompat, XsdVersion};
 use crate::schema::SchemaSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Builder for creating compiled schema sets.
 ///
@@ -503,22 +504,6 @@ fn is_absolute_location(location: &str) -> bool {
         || (location.len() >= 2 && location.as_bytes().get(1) == Some(&b':'))
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            _ => result.push(component),
-        }
-    }
-
-    result
-}
-
 impl Default for SchemaSetBuilder {
     fn default() -> Self {
         Self::new()
@@ -703,6 +688,30 @@ mod tests {
             .expect("Should compile");
 
         assert_eq!(compiled.stats.documents_loaded, 2);
+    }
+
+    #[test]
+    fn test_normalize_loaded_location_keeps_leading_parent_dir() {
+        // Missing files are not canonicalized, so the result is purely lexical.
+        let resolver = SchemaResolver::new();
+        let cwd = std::env::current_dir().unwrap();
+        let parent = cwd.parent().unwrap();
+
+        let location = normalize_loaded_location(&resolver, "../no-such-dir/x.xsd", "");
+        assert_eq!(
+            Path::new(&location),
+            parent.join("no-such-dir").join("x.xsd")
+        );
+
+        let location = normalize_loaded_location(&resolver, "./../no-such-dir/x.xsd", "");
+        assert_eq!(
+            Path::new(&location),
+            parent.join("no-such-dir").join("x.xsd")
+        );
+
+        let location =
+            normalize_loaded_location(&resolver, "../../no-such.xsd", "no-such-dir/a.xsd");
+        assert_eq!(Path::new(&location), parent.join("no-such.xsd"));
     }
 
     #[test]

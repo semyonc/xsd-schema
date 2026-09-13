@@ -5,6 +5,20 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Relative schema locations keep a leading `..`. Path normalization let every
+  `..` remove the component before it, and on a relative path with nothing
+  left to remove the `..` was silently dropped, so
+  `SchemaSetBuilder::add("", "../xsd/a.xsd")` read `xsd/a.xsd` below the
+  current directory, and an `include`, `import`, `redefine` or `override` with
+  `schemaLocation="../../common.xsd"` resolved against the relative base URI
+  `schemas/a.xsd` read `common.xsd` instead of `../common.xsd`. A `..` now
+  cancels only a preceding directory name; it is kept at the start of a
+  relative path and, as before, dropped at the root of an absolute one.
+
 ## [0.2.0] - 2026-09-13
 
 A breaking release, in three parts:
@@ -750,6 +764,7 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/semyonc/xsd-schema/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/semyonc/xsd-schema/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/semyonc/xsd-schema/compare/v0.1.3...v0.1.4
