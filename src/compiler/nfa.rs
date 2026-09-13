@@ -331,8 +331,7 @@ impl NfaTable {
     /// Because the epsilon closure of a union is the union of the closures,
     /// one child step on a counter-free model is the OR of these precomputed
     /// bitsets over the matching frontier states — no per-child depth-first
-    /// search (XSD_COMPILER_REWORK.md §6.7, "precomputed epsilon-closed NFA
-    /// successors"). Built lazily, once per table, and shared by every
+    /// search. Built lazily, once per table, and shared by every
     /// element instance through the `Arc<NfaTable>`. Counter-free tables
     /// only; counted models keep their configuration-based closures.
     #[inline]

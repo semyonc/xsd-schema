@@ -9,7 +9,7 @@
 //! `u32::MAX` (XSD 1.1 §3.9.4.3 clause 2.2 requires the sequence length to be
 //! ≤ `{max occurs}` whenever it is a number; no finite bound is ever widened to
 //! unbounded). The former `MAX_COUNTED_OCCURS = 10_000` approximation was
-//! removed in 0.1.6 — see `XSD_COMPILER_REWORK.md` §8.1.
+//! removed in 0.2.0.
 
 use super::fragment::NfaFragment;
 
@@ -52,7 +52,7 @@ impl MaxOccurs {
     /// then widened to unbounded. Every finite bound is now enforced exactly,
     /// so this is identical to [`is_unbounded`](Self::is_unbounded).
     #[deprecated(
-        since = "0.1.6",
+        since = "0.2.0",
         note = "finite bounds are always exact now; use `is_unbounded`"
     )]
     pub fn is_effectively_unbounded(&self) -> bool {

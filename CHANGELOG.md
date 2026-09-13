@@ -5,202 +5,73 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-09-13
 
-Phases P0 and P1 of `XSD_COMPILER_REWORK.md` (branch
-`perf/compiler-rework-p0-p1`): the exact-occurrence correction with its
-resource-failure contract, plus the two measurement-phase allocation gates.
+A breaking release, in three parts:
 
-Also a set of additive extensions for hosts that embed the XPath engine
-and work with more than one document: multi-document node identity,
-`DomNavigator::type_annotation`, `XPathExpr` dependency metadata, the
-`DynamicContext` extension slot and `set_function_evaluator`, an owned
-default function namespace, and `BufferDocument::serial()`.
+- **Exact occurrence bounds.** Every finite `maxOccurs` is enforced exactly.
+  Execution limits keep pathological counted models finite, and hitting one
+  is an operational failure, never a validity verdict. The release also adds
+  a content-model inspector and precomputed successor closures on the
+  validation hot path.
+- **Hosts working with more than one document.** Additive extensions for
+  hosts that embed the XPath engine: node identity that includes the
+  document, `DomNavigator::type_annotation`, `XPathExpr` dependency
+  metadata, the `DynamicContext` extension slot and `set_function_evaluator`,
+  an owned default function namespace, and `BufferDocument::serial()`.
+- **"XQuery without XQuery".** An XML serializer for any `DomNavigator`
+  (`document::serialize`, compact or indented), a subtree copy with
+  constructor semantics (`document::copy`), and a `compose` feature with
+  `xpath!` and `form!` for building XML from query results in Rust — proven
+  against the eighteen queries of the XQuery test suite's relational use
+  case.
 
-And "XQuery without XQuery": an XML serializer for any `DomNavigator`
-(`document::serialize`, compact or indented), a subtree copy with constructor
-semantics (`document::copy`), and a `compose` feature with `xpath!` and `form!`
-for building XML from query results in Rust — proven against the eighteen
-queries of the XQuery test suite's relational use case.
+XPath built-in functions now apply the function conversion rules to
+`xs:untypedAtomic` arguments, and `fn:round`, `fn:subsequence` and
+`fn:codepoints-to-string` follow F&O to the letter.
 
-### Removed
+Both W3C XSD suites fail exactly the tests 0.1.5 failed (XSD 1.0
+39458/39510, XSD 1.1 2313/2319), the XQTS XPath 2.0 selection passes
+8047/8047, and the GAEB DA XML 3.3 corpus loads as it did in 0.1.5 (all 32
+schemas under XSD 1.1, 23 under XSD 1.0). The crate still builds and tests on
+rustc 1.85.0.
 
-- **The never-constructed all-group-extension composite matcher.**
-  `ContentModelMatcher::AllGroupExtension`, `CompiledContentModel::AllGroupExtension`,
-  `ContentValidatorState::AllGroupExtension`, `validation::content::AllGroupExtPhase`
-  and `compiler::inspect::CompiledView::AllGroupExtension` modelled an
-  all-group base followed by an NFA extension. No compile path ever built one:
-  Structures §3.4.2.3.3 clause 4.2.3 gives an extension of an all-group base a
-  `{particle}` that is the base particle itself (4.2.3.1), one merged all group
-  — "a model group whose {compositor} is all and whose {particles} are the
-  {particles} of the {term} of the ·base particle· followed by the {particles}
-  of the {term} of the ·effective content·" (4.2.3.2) — or, in the "otherwise"
-  case 4.2.3.3, a sequence containing the base's all group, which All Group
-  Limited (§3.8.6.2) clause 1 forbids. The compiler already produced the merged
-  all group and rejected the third case, so the composite was unreachable in
-  every configuration. These are public enum variants, so this is a breaking
-  change for exhaustive `match`es on them (the unreleased set already carries
-  the `NfaTable` change). No validation verdict, diagnostic or W3C conformance
-  outcome changes. `ContentValidatorState::try_is_complete` now always returns
-  `Ok`, and `is_complete` no longer panics — the one execution limit it could
-  hit lived in the removed arm.
+### Upgrading from 0.1.x
 
-### Fixed
+Source changes, only where you use the item:
 
-- **`fn:round` takes a half towards positive infinity, not away from zero.**
-  F&O §6.4.4: "Returns the number with no fractional part that is closest to the
-  argument. If there are two such numbers, then the one that is closest to
-  positive infinity is returned", with the example "round(-2.5) returns -2 (not
-  the possible alternative, -3)". Halves of a negative argument were rounded
-  away from zero, so `round(-2.5)` answered -3 and `round(-3.5)` answered -4.
-  All four numeric types now round the same way, and the floating-point special
-  cases of §6.4.4 are explicit: NaN, both infinities and both zeroes come back
-  unchanged, and an `xs:double` or `xs:float` argument "less than zero, but
-  greater than or equal to -0.5" returns negative zero (`round(-0.3)` is `-0`,
-  while the `xs:decimal` `-0.3` rounds to plain `0`). The rounding is computed
-  from `floor(x)` and an exact fractional part instead of `(x + 0.5).floor()`,
-  which for the largest `xs:double` below a half would have answered 1.
-  `fn:round-half-to-even` is a different function and is unchanged; so are all
-  W3C XSD and XQTS results.
-  `fn:subsequence` rounds `$startingLoc` and `$length` through the same helper:
-  F&O §15.1.10 defines its result as the items whose position `p` satisfies
-  `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
-  fn:round($length)`, and it kept a second, half-away-from-zero copy of the
-  rounding (whose comment claimed `fn:round-half-to-even`), so
-  `subsequence((1,2,3,4,5), -1.5, 4.5)` started at -2 and yielded `(1, 2)`
-  instead of the specified `(1, 2, 3)`. Integral positions, NaN and the
-  infinities are unaffected.
-- **`fn:codepoints-to-string` rejects a non-integer numeric argument.** Its
-  declared parameter type is `xs:integer*`, and the function conversion rules of
-  XPath 2.0 §3.1.5 cast only an `xs:untypedAtomic` item to it: numeric promotion
-  goes the other way, promoting `xs:decimal` and `xs:float` *to* `xs:double`
-  (§B.1), never a numeric item down to `xs:integer`. A whole-valued
-  `xs:decimal`, `xs:float` or `xs:double` therefore reaches the closing rule —
-  "If, after the above conversions, the resulting value does not match the
-  expected type according to the rules for SequenceType Matching, a type error
-  is raised [err:XPTY0004]" — where it used to be accepted as a codepoint. So
-  `codepoints-to-string(65.0)` and `codepoints-to-string(xs:double(65))` are now
-  `XPTY0004`, while `xs:integer`, every type derived from it and an untyped node
-  still work.
-- **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
-  arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
-  type xs:untypedAtomic is cast to the expected atomic type. For built-in
-  functions where the expected type is specified as numeric, arguments of type
-  xs:untypedAtomic are cast to xs:double." Functions whose parameter is a
-  specific atomic type checked the exact variant instead, so
-  `month-from-date(end_date)` over a document with no schema raised `XPTY0004`
-  where a general comparison on the same node cast and compared. The whole
-  `*-from-date` / `*-from-dateTime` / `*-from-time` / `*-from-duration` /
-  `timezone-from-*` / `adjust-*-to-timezone` family, `fn:dateTime`, the
-  `xs:integer` parameters of `fn:remove`, `fn:insert-before` and
-  `fn:round-half-to-even`, `fn:codepoints-to-string` (which also now atomizes
-  its argument) and the `numeric` parameters of `fn:abs`, `fn:ceiling`,
-  `fn:floor` and `fn:round` now cast through one shared helper
-  (`functions::convert`). An untyped value whose lexical form is invalid for
-  the expected type is the dynamic error `FORG0001`; a type that
-  `xs:untypedAtomic` cannot be cast to at all still raises `XPTY0004`, so
-  `fn:prefix-from-QName` keeps rejecting an untyped node (casting to
-  `xs:QName` requires a string literal, §2.3.4). No central signature-driven
-  conversion was introduced. W3C XSD and XQTS results are unchanged.
-- **A schema element's reported location is now its `<`, not the end of the
-  markup before it.** `SourceRef.span.start` was taken from quick-xml's
-  `buffer_position()` before the read, which is where the *previous* event
-  ended — the same read also consumes the whitespace in front of the tag. A
-  declaration was therefore reported on the line above itself and at the
-  column just past the preceding `>` (`examples/books.xsd`'s `BookForm` came
-  out as 14:21 instead of 16:3). The markup start is now recovered from the
-  tag's own length in `parser::reader::TrackedReader::read_event`, so every
-  span, every error location and every inspector row points at the `<`. Spans
-  stay stable per element, so `compiler::upa`'s `same_particle_origin`, which
-  compares `(doc_id, span)`, is unaffected.
-- **Epsilon states now carry a source location.** About half the rows of the
-  inspector's state table read `(no origin)`: branch and merge states are
-  invented by composition and `FragmentBuilder` left them without one. The new
-  `compiler::NfaFragment::fill_missing_origin` gives every origin-less epsilon
-  state the location of the construct that created it — applied after each
-  model group's composition and after each particle's occurrence wrapper, so
-  the innermost known construct wins. Term-bearing states are never touched,
-  keeping `same_particle_origin` exact. Diagnostics-only; no verdict moves.
-- **UPA compilation no longer compiles the base type uncapped.**
-  `compile_base_all_group` called the public, non-UPA
-  `compile_content_model_matcher`, so when an XSD 1.1 extension type was
-  compiled for schema-time UPA checking (`compile_content_model_for_upa`) the
-  base type's content model was built with exact occurrence bounds while the
-  rest of the same compilation was capped by `cap_for_upa`. The mode is now
-  threaded through, so both halves are capped (Sperberg-McQueen 2005: for
-  determinism testing `F{n,m}` can be replaced by `F{min(n,1), min(m,2)}`) and
-  the counted construction is not run for a model the UPA check discards. No
-  UPA verdict changes: an all-group model carries its member bounds in either
-  mode and `check_all_group_upa` does not read them.
-- **`xsi:nil` on a non-nillable element is now invalid at the start event.**
-  The pushed element state was `Invalid` and `cvc-elt.3.1` was reported, but
-  the `SchemaInfo` returned by `validate_element` / `validate_element_by_id`
-  for the *start* event still said `Valid`, so a streaming consumer reading
-  per-element `[validity]` saw the violation only at end-of-element. Element
-  Locally Valid (Element) (§3.3.4.2) clause 3.1 — "D . {nillable} = false, and
-  E has no xsi:nil attribute" — is a verdict on the element itself, so both now
-  report `Invalid`. Diagnostics, their order and every driver outcome are
-  unchanged.
-- **An unresolved `<xs:group ref="…"/>` now names the group.** The error read
-  `unresolved group reference: NameId(42):17` — the raw interned ids — instead
-  of the QName. Both group-reference resolution sites (`compile_group_ref` and
-  the XSD 1.1 `flatten_all_group_ref_into`) now format the name with
-  `schema::resolver::format_resolved_qname`, the helper every sibling error
-  site already uses, giving `unresolved group reference:
-  {http://example.com/tns}missing`.
-- **Finite `maxOccurs` above 10 000 is now enforced exactly.** The compiler
-  treated any finite maximum larger than `MAX_COUNTED_OCCURS = 10_000` as
-  `unbounded`, so `a{0,10001}` accepted 10 002 children. Structures §3.9.4.3
-  clause 2.2 requires the sequence length to be "less than or equal to the
-  {max occurs}" whenever it is a number. Every finite bound now compiles to an
-  exact counted loop up to the representable maximum `u32::MAX`. Occurrence
-  literals beyond `u32` (schema-valid — `nonNegativeInteger` has no bound)
-  saturate to `u32::MAX` and stay finite; this is documented on
-  `parse_occurs` and only observable past 4 294 967 295 sibling occurrences.
-- **A child rejected by the content model now makes its parent invalid.**
-  `cvc-complex-type.2.4` was reported to the sink, but the parent's PSVI
-  `[validity]` — and therefore `DriveOutcome::root_validity` — stayed
-  `Valid`. Clause 2.4 of Element Locally Valid (Complex Type) (§3.4.4) is a
-  constraint on the parent, so it is now `Invalid`. Sink diagnostics are
-  unchanged; only the validity field moves.
-- **A content model that cannot be prepared is no longer treated as empty
-  content.** `SchemaValidator::new` silently dropped any complex type whose
-  content model failed to compile, and the first element it governed was then
-  validated as if the type were empty. The failure is now recorded
-  (`SchemaValidator::content_model_failures`) and raised as an operational
-  failure (`validation-preparation-failed`) when such a type is first used.
-- **Node identity now includes the document.**
-  `BufferDocNavigator::is_same_position` compared `current`, `virtual_parent`,
-  `current_ns` and `attr_index` — each an index into *one* `BufferDocument` —
-  but not the document itself, and `RoXmlNavigator::is_same_position` compared
-  roxmltree `NodeId`s, which are per `Document`. Two navigators on the same
-  node index of two different documents therefore compared equal. XPath 2.0
-  §3.5.3: "A comparison with the `is` operator is true if the two operand
-  nodes have the same identity, and are thus the same node; otherwise it is
-  `false`." `is`, `<<` and `>>` were unaffected (they go through
-  `compare_position`, which already compared the document); the reachable
-  consequence was in `union`, `intersect` and `except`, which "eliminate
-  duplicate nodes from their result sequences based on node identity"
-  (§3.3.3) — `$a/root/x | $b/root/x` over two same-shaped documents yielded 2
-  nodes instead of 4 — and in the adjacent-duplicate check of
-  `DocumentOrderNodeIterator` at a tree boundary. Both navigators' `move_to`
-  also copied the cursor but not the document, so moving onto a node of
-  another tree landed on this tree's node of the same index; `RoXmlNavigator`
-  now carries the document's base URI over as well. New integration test
-  `tests/multi_document.rs` pins identity, `is`, the three set operators and
-  block order across two documents for both navigators.
-- **Processing-instruction data is kept verbatim.** `PI ::= '<?' PITarget (S
-  (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6) makes only the `S` between
-  target and data a separator, but both quick-xml adapters — the
-  `BufferDocument` builder's and the streaming validator's — trimmed the raw
-  content first, so a PI ending in whitespace (Microsoft InfoPath writes
-  `<?mso-application progid="…" ?>`) reached the tree, and any host hook, a
-  character short.
-- **A processing instruction's string value through `RoXmlNavigator` is its
-  data.** `value()` / `value_ref()` asked roxmltree's `Node::text()`, which
-  answers only for text and comments — a PI's data lives in `Node::pi()` — so
-  they returned an empty string where `BufferDocNavigator` returned the data,
-  and XDM asks for the data.
+- Exhaustive `match`es on `compiler::ContentModelMatcher`,
+  `validation::CompiledContentModel` or `validation::ContentValidatorState`
+  lose their `AllGroupExtension` arm, and `validation::content::AllGroupExtPhase`
+  is gone. No compile path ever constructed them (see *Removed*).
+- `compiler::NfaTable` has a private field: build one with `NfaTable::new` or
+  `NfaTable::with_counters` instead of a struct literal, and after a table has
+  been executed mutate its states through `get_state_mut`.
+- `XPathEvaluator::run_with` and `run_with_node_and_setup` require `N: 'ctx`;
+  existing call sites satisfy it without change.
+- `MaxOccurs::is_effectively_unbounded` is deprecated in favour of
+  `is_unbounded`.
+
+Behaviour you may observe without changing code:
+
+- A finite `maxOccurs` above 10 000 is no longer treated as `unbounded`, so an
+  instance with more occurrences than the bound is now invalid.
+- The drivers (`drive_quick_xml`, `drive_navigator`, `drive_buffer_document`)
+  return `Err` when validation cannot complete — an execution limit, or a
+  complex type whose content model failed to prepare, which used to be
+  validated silently as empty content.
+- PSVI `[validity]` is `Invalid` on a parent whose child the content model
+  rejected, and on the start event of an element with `xsi:nil` that is not
+  nillable. Sink diagnostics are unchanged.
+- Schema error locations point at the element's `<`, so line and column
+  numbers in messages move.
+- XPath: `round(-2.5)` is `-2`; `codepoints-to-string` raises `XPTY0004` for
+  an `xs:decimal`, `xs:float` or `xs:double` argument, even a whole-valued
+  one; an untyped argument now casts to the expected type, and one whose value
+  is not in that type's lexical space raises `FORG0001` where it used to raise
+  `XPTY0004`.
+- Processing-instruction data is kept verbatim instead of trimmed, and
+  `RoXmlNavigator` returns a PI's data as its string value.
 
 ### Added
 
@@ -242,7 +113,6 @@ queries of the XQuery test suite's relational use case.
   matrix around 16 and 10 000, huge literals, both failure contracts on both
   drivers) and `compiler::nfa::exact_bounds_tests` (counter arithmetic at
   `u32::MAX`, limit behaviour).
-
 - **Content-model inspector** (`compiler::inspect`): a readable,
   source-attributed description of what the validator compiled for a complex
   type, in three views — *Source* (type, document, location, content type,
@@ -415,8 +285,6 @@ queries of the XQuery test suite's relational use case.
 
 ### Changed
 
-- `MaxOccurs::is_effectively_unbounded` is deprecated; it now equals
-  `is_unbounded` because no finite bound is approximated any more.
 - Counter increments use checked arithmetic on every counted path.
 - Structural refactors, all behaviour-neutral (both W3C suites byte-identical,
   no public signature changed):
@@ -454,6 +322,190 @@ queries of the XQuery test suite's relational use case.
   requirement is `N: 'ctx` (the navigator outlives the static-context borrow),
   which every existing call site satisfies through variance without change.
 
+### Deprecated
+
+- `MaxOccurs::is_effectively_unbounded` is deprecated; it now equals
+  `is_unbounded` because no finite bound is approximated any more.
+
+### Removed
+
+- **The never-constructed all-group-extension composite matcher.**
+  `ContentModelMatcher::AllGroupExtension`, `CompiledContentModel::AllGroupExtension`,
+  `ContentValidatorState::AllGroupExtension` and
+  `validation::content::AllGroupExtPhase` modelled an all-group base followed
+  by an NFA extension. No compile path ever built one:
+  Structures §3.4.2.3.3 clause 4.2.3 gives an extension of an all-group base a
+  `{particle}` that is the base particle itself (4.2.3.1), one merged all group
+  — "a model group whose {compositor} is all and whose {particles} are the
+  {particles} of the {term} of the ·base particle· followed by the {particles}
+  of the {term} of the ·effective content·" (4.2.3.2) — or, in the "otherwise"
+  case 4.2.3.3, a sequence containing the base's all group, which All Group
+  Limited (§3.8.6.2) clause 1 forbids. The compiler already produced the merged
+  all group and rejected the third case, so the composite was unreachable in
+  every configuration. These are public enum variants, so this is a breaking
+  change for exhaustive `match`es on them. No validation verdict, diagnostic
+  or W3C conformance outcome changes. With the arm gone,
+  `ContentValidatorState::try_is_complete` always returns `Ok` and
+  `is_complete` never panics: the one execution limit completion could hit
+  lived there.
+
+### Fixed
+
+- **`fn:round` takes a half towards positive infinity, not away from zero.**
+  F&O §6.4.4: "Returns the number with no fractional part that is closest to the
+  argument. If there are two such numbers, then the one that is closest to
+  positive infinity is returned", with the example "round(-2.5) returns -2 (not
+  the possible alternative, -3)". Halves of a negative argument were rounded
+  away from zero, so `round(-2.5)` answered -3 and `round(-3.5)` answered -4.
+  All four numeric types now round the same way, and the floating-point special
+  cases of §6.4.4 are explicit: NaN, both infinities and both zeroes come back
+  unchanged, and an `xs:double` or `xs:float` argument "less than zero, but
+  greater than or equal to -0.5" returns negative zero (`round(-0.3)` is `-0`,
+  while the `xs:decimal` `-0.3` rounds to plain `0`). The rounding is computed
+  from `floor(x)` and an exact fractional part instead of `(x + 0.5).floor()`,
+  which for the largest `xs:double` below a half would have answered 1.
+  `fn:round-half-to-even` is a different function and is unchanged; so are all
+  W3C XSD and XQTS results.
+  `fn:subsequence` rounds `$startingLoc` and `$length` through the same helper:
+  F&O §15.1.10 defines its result as the items whose position `p` satisfies
+  `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
+  fn:round($length)`, and it kept a second, half-away-from-zero copy of the
+  rounding (whose comment claimed `fn:round-half-to-even`), so
+  `subsequence((1,2,3,4,5), -1.5, 4.5)` started at -2 and yielded `(1, 2)`
+  instead of the specified `(1, 2, 3)`. Integral positions, NaN and the
+  infinities are unaffected.
+- **`fn:codepoints-to-string` rejects a non-integer numeric argument.** Its
+  declared parameter type is `xs:integer*`, and the function conversion rules of
+  XPath 2.0 §3.1.5 cast only an `xs:untypedAtomic` item to it: numeric promotion
+  goes the other way, promoting `xs:decimal` and `xs:float` *to* `xs:double`
+  (§B.1), never a numeric item down to `xs:integer`. A whole-valued
+  `xs:decimal`, `xs:float` or `xs:double` therefore reaches the closing rule —
+  "If, after the above conversions, the resulting value does not match the
+  expected type according to the rules for SequenceType Matching, a type error
+  is raised [err:XPTY0004]" — where it used to be accepted as a codepoint. So
+  `codepoints-to-string(65.0)` and `codepoints-to-string(xs:double(65))` are now
+  `XPTY0004`, while `xs:integer`, every type derived from it and an untyped node
+  still work.
+- **Built-in functions apply the function conversion rules to `xs:untypedAtomic`
+  arguments.** XPath 2.0 §3.1.5: "Each item in the atomic sequence that is of
+  type xs:untypedAtomic is cast to the expected atomic type. For built-in
+  functions where the expected type is specified as numeric, arguments of type
+  xs:untypedAtomic are cast to xs:double." Functions whose parameter is a
+  specific atomic type checked the exact variant instead, so
+  `month-from-date(end_date)` over a document with no schema raised `XPTY0004`
+  where a general comparison on the same node cast and compared. The whole
+  `*-from-date` / `*-from-dateTime` / `*-from-time` / `*-from-duration` /
+  `timezone-from-*` / `adjust-*-to-timezone` family, `fn:dateTime`, the
+  `xs:integer` parameters of `fn:remove`, `fn:insert-before` and
+  `fn:round-half-to-even`, `fn:codepoints-to-string` (which also now atomizes
+  its argument) and the `numeric` parameters of `fn:abs`, `fn:ceiling`,
+  `fn:floor` and `fn:round` now cast through one shared helper
+  (`functions::convert`). An untyped value whose lexical form is invalid for
+  the expected type is the dynamic error `FORG0001`; a type that
+  `xs:untypedAtomic` cannot be cast to at all still raises `XPTY0004`, so
+  `fn:prefix-from-QName` keeps rejecting an untyped node (casting to
+  `xs:QName` requires a string literal, §2.3.4). No central signature-driven
+  conversion was introduced. W3C XSD and XQTS results are unchanged.
+- **A schema element's reported location is now its `<`, not the end of the
+  markup before it.** `SourceRef.span.start` was taken from quick-xml's
+  `buffer_position()` before the read, which is where the *previous* event
+  ended — the same read also consumes the whitespace in front of the tag. A
+  declaration was therefore reported on the line above itself and at the
+  column just past the preceding `>` (`examples/books.xsd`'s `BookForm` came
+  out as 14:21 instead of 16:3). The markup start is now recovered from the
+  tag's own length in `parser::reader::TrackedReader::read_event`, so every
+  span, every error location and every inspector row points at the `<`. Spans
+  stay stable per element, so `compiler::upa`'s `same_particle_origin`, which
+  compares `(doc_id, span)`, is unaffected.
+- **Epsilon states now carry a source location.** About half the rows of the
+  inspector's state table read `(no origin)`: branch and merge states are
+  invented by composition and `FragmentBuilder` left them without one. The new
+  `compiler::NfaFragment::fill_missing_origin` gives every origin-less epsilon
+  state the location of the construct that created it — applied after each
+  model group's composition and after each particle's occurrence wrapper, so
+  the innermost known construct wins. Term-bearing states are never touched,
+  keeping `same_particle_origin` exact. Diagnostics-only; no verdict moves.
+- **UPA compilation no longer compiles the base type uncapped.**
+  `compile_base_all_group` called the public, non-UPA
+  `compile_content_model_matcher`, so when an XSD 1.1 extension type was
+  compiled for schema-time UPA checking (`compile_content_model_for_upa`) the
+  base type's content model was built with exact occurrence bounds while the
+  rest of the same compilation was capped by `cap_for_upa`. The mode is now
+  threaded through, so both halves are capped (Sperberg-McQueen 2005: for
+  determinism testing `F{n,m}` can be replaced by `F{min(n,1), min(m,2)}`) and
+  the counted construction is not run for a model the UPA check discards. No
+  UPA verdict changes: an all-group model carries its member bounds in either
+  mode and `check_all_group_upa` does not read them.
+- **`xsi:nil` on a non-nillable element is now invalid at the start event.**
+  The pushed element state was `Invalid` and `cvc-elt.3.1` was reported, but
+  the `SchemaInfo` returned by `validate_element` / `validate_element_by_id`
+  for the *start* event still said `Valid`, so a streaming consumer reading
+  per-element `[validity]` saw the violation only at end-of-element. Element
+  Locally Valid (Element) (§3.3.4.2) clause 3.1 — "D . {nillable} = false, and
+  E has no xsi:nil attribute" — is a verdict on the element itself, so both now
+  report `Invalid`. Diagnostics, their order and every driver outcome are
+  unchanged.
+- **An unresolved `<xs:group ref="…"/>` now names the group.** The error read
+  `unresolved group reference: NameId(42):17` — the raw interned ids — instead
+  of the QName. Both group-reference resolution sites (`compile_group_ref` and
+  the XSD 1.1 `flatten_all_group_ref_into`) now format the name with
+  `schema::resolver::format_resolved_qname`, the helper every sibling error
+  site already uses, giving `unresolved group reference:
+  {http://example.com/tns}missing`.
+- **Finite `maxOccurs` above 10 000 is now enforced exactly.** The compiler
+  treated any finite maximum larger than `MAX_COUNTED_OCCURS = 10_000` as
+  `unbounded`, so `a{0,10001}` accepted 10 002 children. Structures §3.9.4.3
+  clause 2.2 requires the sequence length to be "less than or equal to the
+  {max occurs}" whenever it is a number. Every finite bound now compiles to an
+  exact counted loop up to the representable maximum `u32::MAX`. Occurrence
+  literals beyond `u32` (schema-valid — `nonNegativeInteger` has no bound)
+  saturate to `u32::MAX` and stay finite; this is documented on
+  `parse_occurs` and only observable past 4 294 967 295 sibling occurrences.
+- **A child rejected by the content model now makes its parent invalid.**
+  `cvc-complex-type.2.4` was reported to the sink, but the parent's PSVI
+  `[validity]` — and therefore `DriveOutcome::root_validity` — stayed
+  `Valid`. Clause 2.4 of Element Locally Valid (Complex Type) (§3.4.4) is a
+  constraint on the parent, so it is now `Invalid`. Sink diagnostics are
+  unchanged; only the validity field moves.
+- **A content model that cannot be prepared is no longer treated as empty
+  content.** `SchemaValidator::new` silently dropped any complex type whose
+  content model failed to compile, and the first element it governed was then
+  validated as if the type were empty. The failure is now recorded
+  (`SchemaValidator::content_model_failures`) and raised as an operational
+  failure (`validation-preparation-failed`) when such a type is first used.
+- **Node identity now includes the document.**
+  `BufferDocNavigator::is_same_position` compared `current`, `virtual_parent`,
+  `current_ns` and `attr_index` — each an index into *one* `BufferDocument` —
+  but not the document itself, and `RoXmlNavigator::is_same_position` compared
+  roxmltree `NodeId`s, which are per `Document`. Two navigators on the same
+  node index of two different documents therefore compared equal. XPath 2.0
+  §3.5.3: "A comparison with the `is` operator is true if the two operand
+  nodes have the same identity, and are thus the same node; otherwise it is
+  `false`." `is`, `<<` and `>>` were unaffected (they go through
+  `compare_position`, which already compared the document); the reachable
+  consequence was in `union`, `intersect` and `except`, which "eliminate
+  duplicate nodes from their result sequences based on node identity"
+  (§3.3.3) — `$a/root/x | $b/root/x` over two same-shaped documents yielded 2
+  nodes instead of 4 — and in the adjacent-duplicate check of
+  `DocumentOrderNodeIterator` at a tree boundary. Both navigators' `move_to`
+  also copied the cursor but not the document, so moving onto a node of
+  another tree landed on this tree's node of the same index; `RoXmlNavigator`
+  now carries the document's base URI over as well. New integration test
+  `tests/multi_document.rs` pins identity, `is`, the three set operators and
+  block order across two documents for both navigators.
+- **Processing-instruction data is kept verbatim.** `PI ::= '<?' PITarget (S
+  (Char* - (Char* '?>')))? '?>'` (XML 1.0 §2.6) makes only the `S` between
+  target and data a separator, but both quick-xml adapters — the
+  `BufferDocument` builder's and the streaming validator's — trimmed the raw
+  content first, so a PI ending in whitespace (Microsoft InfoPath writes
+  `<?mso-application progid="…" ?>`) reached the tree, and any host hook, a
+  character short.
+- **A processing instruction's string value through `RoXmlNavigator` is its
+  data.** `value()` / `value_ref()` asked roxmltree's `Node::text()`, which
+  answers only for text and comments — a PI's data lives in `Node::pi()` — so
+  they returned an empty string where `BufferDocNavigator` returned the data,
+  and XDM asks for the data.
+
 ### Performance
 
 - **Precomputed successor closures for counter-free content models**
@@ -461,10 +513,9 @@ queries of the XQuery test suite's relational use case.
   epsilon closure of its consuming successors is computed once per table
   (lazily, shared through the `Arc`), so one child step is the OR of a few
   4-word bitsets over the matching frontier states instead of a depth-first
-  epsilon search per child — the "precomputed epsilon-closed NFA successors"
-  option of `XSD_COMPILER_REWORK.md` §6.7, exact by distributivity of the
-  closure over unions. Paired A/B on the 47 MiB catalog against the
-  integrated refactor branch: validate-only 67.4 → 72.4 MiB/s (roxmltree),
+  epsilon search per child, exact because the epsilon closure distributes
+  over unions. Paired A/B on a 47 MiB synthetic catalog against the preceding
+  revision: validate-only 67.4 → 72.4 MiB/s (roxmltree),
   64.1 → 68.6 (BufferDoc), streaming 47.2 → 50.0, streaming without PSVI
   52.4 → 55.5; libxml2 control flat. A differential test compares the step
   with the previous algorithm on every string up to length 5–7 over unrolled,
@@ -476,8 +527,7 @@ queries of the XQuery test suite's relational use case.
 - Two per-element allocation gates in the validation runtime: the element
   path and location are no longer cloned at every element end, and the
   attribute typed value is no longer cloned at every attribute, unless an
-  identity constraint is actually active (`XSD_COMPILER_REWORK.md` §12.1).
-  Both W3C suites are unchanged.
+  identity constraint is actually active. Both W3C suites are unchanged.
 
 ## [0.1.5] - 2026-08-31
 
@@ -700,6 +750,7 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
+[0.2.0]: https://github.com/semyonc/xsd-schema/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/semyonc/xsd-schema/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/semyonc/xsd-schema/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/semyonc/xsd-schema/compare/v0.1.2...v0.1.3

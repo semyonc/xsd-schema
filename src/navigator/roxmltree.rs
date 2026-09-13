@@ -316,9 +316,9 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
     /// nodes in tree T2." Ordering whole trees by an address that cannot
     /// change while the navigators borrow them satisfies both the constraint
     /// and the stability requirement for the duration of an expression. It is
-    /// not reproducible across runs; the schema-aware
-    /// [`BufferDocNavigator`](crate::document::navigator::BufferDocNavigator)
-    /// uses a document serial instead, for callers that need that.
+    /// not reproducible across runs; the schema-aware `BufferDocNavigator`
+    /// (`xsd11` feature) uses a document serial instead, for callers that
+    /// need that.
     fn compare_position(&self, other: &Self) -> XmlNodeOrder {
         if !std::ptr::eq(self.doc, other.doc) {
             let self_ptr = self.doc as *const _ as usize;
