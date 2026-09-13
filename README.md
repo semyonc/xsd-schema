@@ -11,6 +11,7 @@
 | [Extensibility Guide](doc/EXTENSIBILITY.md) | Extension points for annotations/appinfo, schema loaders, DOM navigation, and custom XPath functions. |
 | [Unsafe Code](doc/UNSAFE.md) | Inventory of unsafe blocks, safety invariants, and Miri verification commands. |
 | [Composing XML from Rust](doc/COMPOSE.md) | XPath 2.0 with Rust values bound as `$variables`, the Lisp-style `form!` constructor, iterator pipelines for the FLWOR clauses, and serialization. |
+| [Changelog](CHANGELOG.md) | Release notes for every version, with upgrade notes for breaking releases. |
 
 To see exactly what the validator compiled for a complex type — the authored
 particle tree, the automaton it became, counters, and where each state comes
