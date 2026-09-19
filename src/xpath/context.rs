@@ -58,6 +58,9 @@ pub struct XPathContext<'a> {
     /// Takes precedence over the `default_function_ns` field when set; see
     /// [`default_function_namespace`](Self::default_function_namespace).
     default_function_ns_owned: Option<String>,
+    /// XPath 1.0 compatibility mode, set by
+    /// [`with_xpath10_compatibility`](Self::with_xpath10_compatibility).
+    xpath10_compatibility: bool,
 }
 
 impl<'a> XPathContext<'a> {
@@ -75,6 +78,7 @@ impl<'a> XPathContext<'a> {
             trace_enabled: false,
             function_catalog: None,
             default_function_ns_owned: None,
+            xpath10_compatibility: false,
         }
     }
 
@@ -163,6 +167,62 @@ impl<'a> XPathContext<'a> {
     pub fn with_trace_enabled(mut self, enabled: bool) -> Self {
         self.trace_enabled = enabled;
         self
+    }
+
+    /// Turn *XPath 1.0 compatibility mode* on or off.
+    ///
+    /// This is the static-context property XPath 2.0 calls "XPath 1.0
+    /// compatibility mode", and it is **not** the same thing as
+    /// [`XPathMode::XPath10`]. The mode selects the *language*: its lexer and
+    /// parser reject XPath 2.0 syntax outright (sequence expressions, `for`,
+    /// `instance of`, double literals, …). The flag set here keeps the full
+    /// XPath 2.0 syntax and changes only the *semantics* that XPath 2.0 itself
+    /// defines differently when the flag is true:
+    ///
+    /// * the effective boolean value of a sequence of more than one item
+    ///   follows the 1.0 rules instead of raising `FORG0006` — this covers
+    ///   `and`, `or` and predicates;
+    /// * the operands of `+`, `-`, `*`, `div` and `mod` are converted with the
+    ///   1.0 number rules;
+    /// * general comparisons (`=`, `!=`, `<`, …) use the 1.0 node-set rules,
+    ///   including the node-set-versus-boolean case.
+    ///
+    /// Hosts embedding the XPath engine need this when they must run
+    /// expressions written for a 1.0-era host language while still accepting
+    /// 2.0 syntax in the same document. Setting
+    /// [`with_mode`](Self::with_mode) to [`XPathMode::XPath10`] implies these
+    /// semantics as well, so the flag is only meaningful in
+    /// [`XPathMode::XPath20`].
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+    ///
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names).with_xpath10_compatibility(true);
+    ///
+    /// // 2.0 syntax still parses …
+    /// let expr = XPathExpr::compile("(1, 2, 3)[1]", &ctx).unwrap();
+    /// // … while `1 div 0` follows the 1.0 rule of yielding INF, not an error.
+    /// let inf = XPathExpr::compile("1 div 0", &ctx).unwrap();
+    /// let value = inf.evaluator(&ctx).run_number::<RoXmlNavigator<'static>>().unwrap();
+    /// assert!(value.is_infinite());
+    /// let _ = expr;
+    /// ```
+    pub fn with_xpath10_compatibility(mut self, enabled: bool) -> Self {
+        self.xpath10_compatibility = enabled;
+        self
+    }
+
+    /// Whether *XPath 1.0 compatibility mode* is on — either because
+    /// [`with_xpath10_compatibility`](Self::with_xpath10_compatibility) set it
+    /// or because the language mode is [`XPathMode::XPath10`], which implies
+    /// it.
+    #[inline]
+    pub fn xpath10_compatibility(&self) -> bool {
+        self.xpath10_compatibility || self.mode == XPathMode::XPath10
     }
 
     /// Get the XPath language mode.
@@ -1268,5 +1328,109 @@ mod extension_slot_tests {
 
         assert_send::<crate::xpath::api::XPathExpr>();
         assert_sync::<crate::xpath::api::XPathExpr>();
+    }
+}
+
+/// XPath 1.0 *compatibility mode*: a static-context flag, not a language mode.
+#[cfg(test)]
+mod xpath10_compatibility_tests {
+    use super::*;
+
+    // ── XPath 1.0 compatibility mode (a static-context flag, not a language mode)
+
+    /// The flag is off by default and `XPathMode::XPath10` implies it.
+    #[test]
+    fn xpath10_compatibility_defaults_to_off_and_the_mode_implies_it() {
+        let names = NameTable::new();
+        assert!(!XPathContext::new(&names).xpath10_compatibility());
+        assert!(XPathContext::new(&names)
+            .with_xpath10_compatibility(true)
+            .xpath10_compatibility());
+        assert!(XPathContext::new(&names)
+            .with_mode(XPathMode::XPath10)
+            .xpath10_compatibility());
+        // The flag does not change the language mode.
+        assert_eq!(
+            XPathContext::new(&names)
+                .with_xpath10_compatibility(true)
+                .mode(),
+            XPathMode::XPath20
+        );
+    }
+
+    /// The flag keeps XPath 2.0 syntax, which `XPathMode::XPath10` rejects.
+    #[test]
+    fn xpath10_compatibility_keeps_xpath20_syntax() {
+        use crate::xpath::api::XPathExpr;
+        use crate::xpath::RoXmlNavigator;
+        let names = NameTable::new();
+
+        let compat = XPathContext::new(&names).with_xpath10_compatibility(true);
+        assert!(XPathExpr::compile("(1, 2, 3)", &compat).is_ok());
+        assert!(XPathExpr::compile("for $i in 1 to 3 return $i", &compat).is_ok());
+
+        // `XPathMode::XPath10` refuses the same expression.
+        let mode10 = XPathContext::new(&names).with_mode(XPathMode::XPath10);
+        let rejected = XPathExpr::compile("(1, 2, 3)", &mode10)
+            .and_then(|e| e.evaluator(&mode10).run::<RoXmlNavigator<'static>>())
+            .err()
+            .expect("XPath 1.0 has no sequence expressions");
+        assert_eq!(rejected.error_code(), Some("XPST0003"));
+    }
+
+    /// The semantics the flag switches: 1.0 arithmetic, 1.0 effective boolean
+    /// value for a multi-item sequence, and the 1.0 first-item conversion of
+    /// `fn:string`/`fn:number`.
+    #[test]
+    fn xpath10_compatibility_switches_the_semantics() {
+        use crate::xpath::api::XPathExpr;
+        use crate::xpath::RoXmlNavigator;
+        let names = NameTable::new();
+        let plain = XPathContext::new(&names);
+        let compat = XPathContext::new(&names).with_xpath10_compatibility(true);
+
+        let run = |src: &str, ctx: &XPathContext<'_>| {
+            XPathExpr::compile(src, ctx)
+                .unwrap()
+                .evaluator(ctx)
+                .run::<RoXmlNavigator<'static>>()
+        };
+
+        // Arithmetic: 1.0 divides by zero to infinity, 2.0 raises FOAR0001
+        // for integers.
+        assert!(run("1 div 0", &plain).is_err());
+        assert!(run("1 div 0", &compat)
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            .is_infinite());
+
+        // Effective boolean value of a multi-item non-node sequence: an error
+        // in 2.0 (FORG0006), the 1.0 rule under the flag.
+        assert!(run("if (('a', 'b')) then 1 else 2", &plain).is_err());
+        assert_eq!(
+            run("('a', 'b') and true()", &compat).unwrap().as_bool(),
+            Some(true)
+        );
+
+        // fn:string / fn:number take the first item of a sequence.
+        assert!(run("string(('a', 'b'))", &plain).is_err());
+        assert_eq!(
+            run("string(('a', 'b'))", &compat)
+                .unwrap()
+                .as_str()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            run("number(('7', 'x'))", &compat).unwrap().as_f64(),
+            Some(7.0)
+        );
+        // A non-numeric string is NaN in 1.0 rather than an error.
+        assert!(run("number('x')", &compat)
+            .unwrap()
+            .as_f64()
+            .unwrap()
+            .is_nan());
     }
 }

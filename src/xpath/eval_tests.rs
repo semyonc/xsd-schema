@@ -3325,3 +3325,33 @@ mod xpath10_eval_tests {
         }
     }
 }
+
+/// XPath 2.0 §3.3.1: the operands of `to` are `xs:integer?`, so an
+/// `xs:untypedAtomic` operand is cast rather than rejected.
+#[test]
+fn range_operands_follow_the_function_conversion_rules() {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::RoXmlNavigator;
+
+    use crate::namespace::context::NamespaceContextSnapshot;
+    let names = NameTable::new();
+    let mut namespaces = NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        names.add("xs"),
+        names.add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+    let count = |expr: &str| {
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run::<RoXmlNavigator<'static>>()
+            .map(|v| v.len())
+    };
+    assert_eq!(count("xs:untypedAtomic('5') to 7").unwrap(), 3);
+    assert_eq!(count("1 to xs:untypedAtomic('3')").unwrap(), 3);
+    // A value that is not an integer is still an error.
+    assert!(count("xs:untypedAtomic('x') to 3").is_err());
+    assert!(count("1.5 to 3").is_err());
+}

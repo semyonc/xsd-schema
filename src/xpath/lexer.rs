@@ -960,8 +960,11 @@ impl<'input> Lexer<'input> {
             return Ok(());
         }
 
-        // for $ — XPath 2.0 only; in 1.0 mode, "for" is a plain NCName
-        if !self.is_xpath10() && self.try_match_identifier(&["for"]) {
+        // `for $` — XPath 2.0 only, and only when a variable really follows.
+        // `for`, `some` and `every` are not reserved words in XPath 2.0, so
+        // `@for`, `some:a` and an element named `every` are ordinary names;
+        // in 1.0 mode they are plain NCNames in every position.
+        if !self.is_xpath10() && self.try_match_identifier(&["for", "$"]) {
             self.match_identifier(&["for"]);
             self.enqueue(Token::For, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -975,7 +978,7 @@ impl<'input> Lexer<'input> {
         }
 
         // some $ — XPath 2.0 only
-        if !self.is_xpath10() && self.try_match_identifier(&["some"]) {
+        if !self.is_xpath10() && self.try_match_identifier(&["some", "$"]) {
             self.match_identifier(&["some"]);
             self.enqueue(Token::Some, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -989,7 +992,7 @@ impl<'input> Lexer<'input> {
         }
 
         // every $ — XPath 2.0 only
-        if !self.is_xpath10() && self.try_match_identifier(&["every"]) {
+        if !self.is_xpath10() && self.try_match_identifier(&["every", "$"]) {
             self.match_identifier(&["every"]);
             self.enqueue(Token::Every, start, self.pos);
             self.skip_whitespace_and_comments();
@@ -1128,10 +1131,18 @@ impl<'input> Lexer<'input> {
         let name = self.consume_qname();
         let end = self.pos;
 
-        // Check for prefix:* wildcard
-        if name.contains(':') && self.current() == Some('*') {
-            // Actually this case is NCName:* which should be handled differently
-            // The name already consumed the prefix:local, so this won't hit
+        // `NCName ":" "*"` — the second alternative of the Wildcard production
+        // (XPath 2.0 §3.2.1). `consume_qname` stops before the colon, because
+        // what follows is not an NCName character, so the three tokens the
+        // grammar expects are emitted here.
+        if !name.contains(':') && self.current() == Some(':') && self.peek(1) == Some('*') {
+            let colon_start = self.pos;
+            self.advance(2);
+            self.enqueue(Token::NCName(name), start, end);
+            self.enqueue(Token::Colon, colon_start, colon_start + 1);
+            self.enqueue(Token::Star, colon_start + 1, self.pos);
+            self.state = LexerState::Operator;
+            return Ok(());
         }
 
         self.skip_whitespace_and_comments();
@@ -2400,5 +2411,45 @@ mod tests {
     fn test_xpath20_double_greater_still_works() {
         let tokens = tokenize("a>>b");
         assert!(tokens.contains(&Token::DoubleGreater));
+    }
+    /// `for`, `some` and `every` are not reserved words: they are only
+    /// keywords when a variable follows.
+    #[test]
+    fn the_quantifier_keywords_are_also_ordinary_names() {
+        assert_eq!(
+            tokenize("@for"),
+            vec![Token::At, Token::QName("for".to_string())]
+        );
+        assert_eq!(tokenize("some:a"), vec![Token::QName("some:a".to_string())]);
+        assert_eq!(tokenize("every"), vec![Token::QName("every".to_string())]);
+        // With a variable they are still keywords.
+        assert_eq!(tokenize("for $i in 1 return $i")[0], Token::For);
+        assert_eq!(tokenize("some $i in 1 satisfies $i")[0], Token::Some);
+        assert_eq!(tokenize("every $i in 1 satisfies $i")[0], Token::Every);
+    }
+
+    /// `NCName ":" "*"` is the second alternative of the Wildcard production.
+    #[test]
+    fn prefix_wildcard_lexes_as_three_tokens() {
+        let tokens = tokenize("bar:*");
+        assert_eq!(
+            tokens,
+            vec![Token::NCName("bar".to_string()), Token::Colon, Token::Star]
+        );
+        // It is still a wildcard after an axis and inside a path.
+        assert_eq!(
+            tokenize("child::bar:*"),
+            vec![
+                Token::AxisChild,
+                Token::NCName("bar".to_string()),
+                Token::Colon,
+                Token::Star
+            ]
+        );
+        // A plain QName is unaffected.
+        assert_eq!(
+            tokenize("bar:baz"),
+            vec![Token::QName("bar:baz".to_string())]
+        );
     }
 }

@@ -5,6 +5,78 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A name test on the `namespace::` axis now selects namespace nodes. The
+  principal node kind of that axis is namespace, and a namespace node's name is
+  its prefix, in no namespace — but the name-test matcher rejected every node
+  that was not an element or an attribute, so `namespace::*` and
+  `namespace::p` always returned the empty sequence.
+- The lexer now accepts `NCName ":" "*"`, the second alternative of the
+  Wildcard production. `*:NCName` already lexed and the grammar already had the
+  production, but `p:*` failed with a lexer error in every position.
+- `TimSort::merge_hi` no longer panics in a debug build. The algorithm walks
+  its cursors backwards and deliberately lets two of them step one position
+  past the front of the array, which is the reference implementation's `-1`
+  sentinel; with `usize` indices that is wrapping arithmetic, and a plain
+  subtraction panicked under `cargo test` without `--release` while the
+  release build was already correct. Sorting a node sequence in a debug build
+  could hit it.
+- `for`, `some` and `every` are no longer treated as reserved words. They are
+  keywords only when a variable follows, so `@for`, `some:a` and an element
+  named `every` now lex as ordinary names instead of failing to parse.
+- The operands of the `to` operator now follow the function conversion rules
+  (XPath 2.0 §3.3.1): an `xs:untypedAtomic` operand is cast to `xs:integer`
+  instead of raising `XPTY0004`, which matters for a range whose bound comes
+  from an untyped node.
+
+### Added
+
+- `XPathContext::with_xpath10_compatibility(bool)` and
+  `XPathContext::xpath10_compatibility()`. This is the static-context property
+  XPath 2.0 calls *XPath 1.0 compatibility mode*, and it is distinct from
+  `XPathMode::XPath10`, which is a *language* mode whose lexer and parser
+  reject XPath 2.0 syntax. The flag keeps the full 2.0 syntax and switches
+  only the semantics 2.0 itself defines differently when the property is
+  true: the 1.0 effective boolean value of a multi-item sequence (`and`,
+  `or`, predicates), the 1.0 conversions in arithmetic, the 1.0 node-set
+  rules in general comparisons, and the first-item conversion of the argument
+  of `fn:string` and `fn:number`. Hosts embedding the XPath engine need this
+  when they run expressions written for a 1.0-era host language while still
+  accepting 2.0 syntax in the same document. `XPathMode::XPath10` implies the
+  property, so those four semantics now also apply in that mode when no
+  `XPath10Evaluator` is installed.
+- `BufferDocNavigator::new_orphan(doc, node)` — a navigator under which `node`
+  has **no parent**: `move_to_parent` returns `false` there, `move_to_root`
+  and `move_to_visible_root` land on it, and it has no siblings; its
+  descendants are unaffected. A `BufferDocument` always has a document node at
+  the root of its tree, but the XDM allows a parentless element, attribute,
+  comment, processing instruction or text node, and a host that constructs
+  such nodes has to build them somewhere. The existing `new_assertion` only
+  hides the synthetic root from `/` and `//`, so `parent::node()` and
+  `fn:root()` still reached it; the new constructor cuts the upward links as
+  well, and leaves `new_assertion` and XSD 1.1 assertion evaluation untouched.
+  The cut applies to the node itself only: its attribute and namespace nodes
+  keep it as their parent, and the parentless view travels with `move_to`.
+- `BufferDocument::set_document_base_uri(uri)` and
+  `BufferDocument::document_base_uri()` — the **document-level base URI**, the
+  base URI a node reports once the walk up its `xml:base` ancestors reaches
+  the document node without finding one. A parser is handed bytes and cannot
+  know the URI a document was retrieved from, so a document built by
+  `from_reader` or by a `BufferDocumentBuilder` still starts with none and
+  `fn:base-uri` still falls back to the static base URI of the expression; a
+  host that does know records it here, and `fn:base-uri` and
+  `fn:document-uri` then report it, with any `xml:base` attribute on the node
+  or an ancestor still taking precedence and being resolved against it.
+- `BufferDocument::source_span(node_ref)` and
+  `BufferDocument::has_source_spans()`. The per-node byte ranges a document
+  records under `BufferDocumentOptions::track_source_locations` were only
+  reachable from inside the crate; a host that parses a document and wants to
+  report an error at a line and column of its own copy of the source text can
+  now read them.
+
 ## [0.2.0] - 2026-09-13
 
 A breaking release, in three parts:

@@ -43,6 +43,9 @@ pub struct BufferDocNavigator<'a> {
     virtual_parent: u32,
     /// Non-NULL when positioned on a namespace node.
     current_ns: NsRef,
+    /// The node this navigator presents as having no parent, or `NULL`.
+    /// See [`BufferDocNavigator::new_orphan`].
+    orphan_root: u32,
     /// Sub-index for document-order comparison of virtual nodes.
     attr_index: u16,
     /// Collected namespaces for All/ExcludeXml traversal.
@@ -57,6 +60,7 @@ impl<'a> BufferDocNavigator<'a> {
             current: node,
             assertion_absolute_root: false,
             assertion_fragment_root: NULL,
+            orphan_root: NULL,
             virtual_parent: NULL,
             current_ns: NsRef::NULL,
             attr_index: 0,
@@ -73,6 +77,30 @@ impl<'a> BufferDocNavigator<'a> {
         Self {
             assertion_absolute_root: true,
             assertion_fragment_root: node,
+            ..Self::new(doc, node)
+        }
+    }
+
+    /// Creates a navigator for a node that must appear to have **no parent**.
+    ///
+    /// `BufferDocument` always has a document node at the root of the tree,
+    /// but the XDM allows a parentless element, attribute, comment,
+    /// processing-instruction or text node, and a host that constructs such
+    /// nodes has to build them somewhere. Under this constructor `node` is
+    /// that parentless node: `move_to_parent` returns `false` there,
+    /// `move_to_root` and `move_to_visible_root` land on it rather than on the
+    /// document node that physically holds it, and it has no siblings. Its
+    /// descendants behave normally and reach it with `move_to_parent`.
+    ///
+    /// Unlike [`new_assertion`](Self::new_assertion), which only hides the
+    /// synthetic root from `/` and `//`, this also cuts the upward links —
+    /// which is what makes `fn:root()`, `parent::node()` and `..` agree that
+    /// the node is the root of its own tree.
+    pub fn new_orphan(doc: &'a BufferDocument<'a>, node: u32) -> Self {
+        Self {
+            assertion_absolute_root: true,
+            assertion_fragment_root: node,
+            orphan_root: node,
             ..Self::new(doc, node)
         }
     }
@@ -99,6 +127,18 @@ impl<'a> BufferDocNavigator<'a> {
     #[inline]
     fn is_on_attribute(&self) -> bool {
         self.virtual_parent != NULL && self.current_ns.is_null()
+    }
+
+    /// Whether this cursor sits on the node that was declared parentless.
+    ///
+    /// An attribute or namespace cursor keeps `current` on its **owning
+    /// element**, so `current == orphan_root` is true for the orphan's
+    /// attribute and namespace nodes as well as for the orphan itself. They
+    /// are different nodes, and the parent of such a node *is* the orphan —
+    /// the cut applies only to the orphan's own upward links.
+    #[inline]
+    fn is_orphan_root(&self) -> bool {
+        self.orphan_root != NULL && self.current == self.orphan_root && self.virtual_parent == NULL
     }
 
     #[inline]
@@ -565,6 +605,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         self.current = other.current;
         self.assertion_absolute_root = other.assertion_absolute_root;
         self.assertion_fragment_root = other.assertion_fragment_root;
+        // The parentless view travels with the cursor: landing on a node of a
+        // tree whose root is an orphan must not restore its hidden ancestors.
+        self.orphan_root = other.orphan_root;
         self.virtual_parent = other.virtual_parent;
         self.current_ns = other.current_ns;
         self.attr_index = other.attr_index;
@@ -573,6 +616,11 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn move_to_root(&mut self) {
+        if self.orphan_root != NULL {
+            self.current = self.orphan_root;
+            self.clear_virtual();
+            return;
+        }
         self.current = self.doc.root;
         self.clear_virtual();
     }
@@ -587,6 +635,13 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn move_to_parent(&mut self) -> bool {
+        // The orphan's own upward link is cut, but an attribute or namespace
+        // node *of* the orphan still has it as its parent, and such a cursor
+        // also sits on `orphan_root` — so the virtual parent is resolved
+        // first.
+        if self.is_orphan_root() {
+            return false;
+        }
         if self.virtual_parent != NULL {
             self.current = self.virtual_parent;
             self.clear_virtual();
@@ -619,6 +674,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         if self.virtual_parent != NULL {
             return false;
         }
+        if self.is_orphan_root() {
+            return false;
+        }
         let sib = self.node().next_sibling;
         if sib == NULL {
             return false;
@@ -629,6 +687,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 
     fn move_to_prev_sibling(&mut self) -> bool {
         if self.virtual_parent != NULL {
+            return false;
+        }
+        if self.is_orphan_root() {
             return false;
         }
         let parent_ref = self.node().parent;
@@ -1021,6 +1082,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             let mut nav = BufferDocNavigator::new(self.doc, r);
             nav.assertion_absolute_root = self.assertion_absolute_root;
             nav.assertion_fragment_root = self.assertion_fragment_root;
+            nav.orphan_root = self.orphan_root;
             nav
         }))
     }
@@ -1896,5 +1958,135 @@ mod tests {
                 return false;
             }
         }
+    }
+    /// `new_orphan` presents a node as the root of its own tree.
+    #[test]
+    fn an_orphan_node_has_no_parent_and_is_its_own_root() {
+        use crate::navigator::DomNavigator;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            b"<holder><kid><deep/></kid></holder>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        // The element the host wants to hand out as parentless.
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        let mut nav = BufferDocNavigator::new_orphan(doc_ref(&arena, doc), kid);
+        assert_eq!(nav.local_name(), "kid");
+        assert!(!nav.move_to_parent(), "an orphan has no parent");
+        assert!(!nav.move_to_next_sibling());
+        assert!(!nav.move_to_prev_sibling());
+
+        // Its descendants are unaffected and reach it again.
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.local_name(), "deep");
+        assert!(nav.move_to_parent());
+        assert_eq!(nav.local_name(), "kid");
+
+        // fn:root() lands on the orphan, not on the document node.
+        nav.move_to_root();
+        assert_eq!(nav.local_name(), "kid");
+
+        // An ordinary navigator on the same node still sees the whole tree.
+        let mut plain = BufferDocNavigator::new(doc_ref(&arena, doc2(&arena, &names)), 0);
+        plain.move_to_root();
+        assert_eq!(plain.node_type(), DomNodeType::Root);
+    }
+
+    fn doc_ref<'a>(arena: &'a Bump, doc: BufferDocument<'a>) -> &'a BufferDocument<'a> {
+        arena.alloc(doc)
+    }
+
+    fn doc2<'a>(arena: &'a Bump, names: &'a NameTable) -> BufferDocument<'a> {
+        BufferDocument::from_reader_default(b"<a/>".as_slice(), arena, names).unwrap()
+    }
+
+    /// An orphan's *attributes and namespace nodes* keep it as their parent.
+    ///
+    /// An attribute or namespace cursor keeps `current` on the owning element,
+    /// so the naive "current == orphan_root" test also swallowed the virtual
+    /// nodes' parent link.
+    #[test]
+    fn the_virtual_nodes_of_an_orphan_still_have_it_as_their_parent() {
+        use crate::navigator::{DomNavigator, NamespaceAxisScope};
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            br#"<holder><kid xmlns:p="urn:p" a="1"/></holder>"#.as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let doc = doc_ref(&arena, doc);
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        // The attribute axis.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.local_name(), "a");
+        assert!(
+            nav.move_to_parent(),
+            "an attribute of an orphan has a parent"
+        );
+        assert_eq!(nav.local_name(), "kid");
+        assert!(!nav.move_to_parent(), "and above it the tree still ends");
+
+        // The namespace axis. `local_name()` of a namespace node is its prefix.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        assert_eq!(nav.local_name(), "p");
+        assert_eq!(nav.node_type(), DomNodeType::Namespace);
+        assert!(
+            nav.move_to_parent(),
+            "a namespace node of an orphan has a parent"
+        );
+        assert_eq!(nav.local_name(), "kid");
+
+        // The ancestor axis of a namespace node is exactly the orphan.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        let mut ancestors = Vec::new();
+        while nav.move_to_parent() {
+            ancestors.push(nav.local_name().to_string());
+        }
+        assert_eq!(ancestors, vec!["kid".to_string()]);
+
+        // root() of a namespace node of an orphan is the orphan, not the
+        // document node that physically holds it.
+        let mut nav = BufferDocNavigator::new_orphan(doc, kid);
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        nav.move_to_root();
+        assert_eq!(nav.node_type(), DomNodeType::Element);
+        assert_eq!(nav.local_name(), "kid");
+    }
+
+    /// The parentless view travels with `move_to`.
+    #[test]
+    fn move_to_carries_the_orphan_view() {
+        use crate::navigator::DomNavigator;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            b"<holder><kid><deep/></kid></holder>".as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+        let doc = doc_ref(&arena, doc);
+        let holder = doc.root() + 1;
+        let kid = doc.first_content_child_of(holder).unwrap();
+
+        let orphan = BufferDocNavigator::new_orphan(doc, kid);
+        let mut cursor = doc.create_navigator();
+        assert!(cursor.move_to(&orphan));
+        assert!(
+            !cursor.move_to_parent(),
+            "move_to must carry the cut upward link"
+        );
     }
 }

@@ -56,7 +56,9 @@ pub struct BufferDocument<'a> {
     /// when no `xml:base` is found and the cursor reaches the document root.
     /// Used by CTA fragment evaluation to expose the instance file URI to
     /// `fn:base-uri(.)` while leaving the static base URI in
-    /// `XPathContext::base_uri` free to carry the schema document URI.
+    /// `XPathContext::base_uri` free to carry the schema document URI, and by
+    /// [`BufferDocument::set_document_base_uri`] for a host that knows where
+    /// the document came from.
     pub(crate) fragment_base_uri: Option<&'a str>,
 }
 
@@ -103,6 +105,79 @@ impl<'a> BufferDocument<'a> {
     #[inline]
     pub fn serial(&self) -> u64 {
         self.serial
+    }
+
+    /// Returns the byte range of `node_ref` in the original XML source.
+    ///
+    /// Spans are only recorded when the document was built with
+    /// [`BufferDocumentOptions::track_source_locations`] enabled; otherwise
+    /// this always returns `None`, and only element nodes carry one. The span
+    /// *starts* at the element's `<`; it ends after the end tag for an element
+    /// written with one, and after the tag itself for an empty-element tag. A
+    /// host embedding the parser uses `span.start` to report an error at a line
+    /// and column of its own copy of the source text.
+    ///
+    /// ```no_run
+    /// # use xsd_schema::document::{BufferDocument, BufferDocumentOptions};
+    /// # use xsd_schema::namespace::NameTable;
+    /// # let arena = bumpalo::Bump::new();
+    /// # let names = NameTable::new();
+    /// let options = BufferDocumentOptions { track_source_locations: true, ..Default::default() };
+    /// let doc = BufferDocument::from_reader(b"<a/>".as_slice(), &arena, &names, options, None)?;
+    /// let span = doc.source_span(doc.root() + 1);
+    /// # Ok::<(), xsd_schema::document::BufferDocumentError>(())
+    /// ```
+    #[inline]
+    pub fn source_span(&self, node_ref: u32) -> Option<crate::parser::location::SourceSpan> {
+        self.source_spans.get(node_ref)
+    }
+
+    /// Whether this document recorded source spans at all
+    /// ([`BufferDocumentOptions::track_source_locations`]).
+    #[inline]
+    pub fn has_source_spans(&self) -> bool {
+        !self.source_spans.is_empty()
+    }
+
+    /// Sets the **document-level base URI**: the base URI a node of this
+    /// document reports once the walk up its `xml:base` ancestors reaches the
+    /// document node without finding one.
+    ///
+    /// A parser has no way to know the URI a document was retrieved from — it
+    /// is handed bytes — so a document built by [`BufferDocument::from_reader`]
+    /// or by a [`BufferDocumentBuilder`] starts with none, and `fn:base-uri`
+    /// on its nodes falls back to the static base URI of the expression. A
+    /// host that *does* know where the document came from records it here, and
+    /// `fn:base-uri` then reports that URI (still overridden by any `xml:base`
+    /// attribute on the node or an ancestor, which is resolved against it).
+    ///
+    /// The URI must live at least as long as the document; allocate it in the
+    /// same arena when it is computed at run time.
+    ///
+    /// [`BufferDocumentBuilder`]: super::builder::BufferDocumentBuilder
+    ///
+    /// ```
+    /// # use xsd_schema::document::BufferDocument;
+    /// # use xsd_schema::namespace::NameTable;
+    /// # use xsd_schema::navigator::DomNavigator;
+    /// # let arena = bumpalo::Bump::new();
+    /// # let names = NameTable::new();
+    /// let mut doc = BufferDocument::from_reader_default(b"<a/>".as_slice(), &arena, &names)?;
+    /// doc.set_document_base_uri(Some("file:///tmp/a.xml"));
+    /// assert_eq!(doc.create_navigator().base_uri(), "file:///tmp/a.xml");
+    /// # Ok::<(), xsd_schema::document::BufferDocumentError>(())
+    /// ```
+    #[inline]
+    pub fn set_document_base_uri(&mut self, uri: Option<&'a str>) {
+        self.fragment_base_uri = uri;
+    }
+
+    /// The document-level base URI, if one was recorded.
+    ///
+    /// See [`set_document_base_uri`](Self::set_document_base_uri).
+    #[inline]
+    pub fn document_base_uri(&self) -> Option<&'a str> {
+        self.fragment_base_uri
     }
 
     /// Returns the associated schema set, if any.
@@ -451,5 +526,87 @@ mod tests {
         let doc = make_doc(&arena, &names);
 
         assert_eq!(doc.get_element_by_id("nonexistent"), None);
+    }
+
+    #[test]
+    fn source_span_is_readable_when_tracking_is_on() {
+        let xml = "<a>\n  <b/>\n</a>";
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let options = BufferDocumentOptions {
+            track_source_locations: true,
+            ..Default::default()
+        };
+        let doc =
+            BufferDocument::from_reader(xml.as_bytes(), &arena, &names, options, None).unwrap();
+
+        assert!(doc.has_source_spans());
+        // The document element is the node right after the root. Its span runs
+        // from its `<` to the end of its end tag.
+        let a = doc.root() + 1;
+        let span_a = doc.source_span(a).expect("the root element has a span");
+        assert_eq!(&xml[span_a.start..span_a.end], xml);
+        assert!(xml[span_a.start..].starts_with("<a>"));
+
+        // An empty-element tag's span is exactly that tag.
+        use crate::navigator::{DomNavigator, DomNodeType};
+        let mut nav = doc.create_navigator_at(a);
+        assert!(nav.move_to_first_child());
+        while nav.node_type() != DomNodeType::Element {
+            assert!(nav.move_to_next_sibling());
+        }
+        let span_b = doc
+            .source_span(nav.current_ref())
+            .expect("the child element has a span");
+        assert!(span_b.start > span_a.start);
+        assert_eq!(&xml[span_b.start..span_b.end], "<b/>");
+    }
+
+    #[test]
+    fn a_document_level_base_uri_is_reported_and_xml_base_still_wins() {
+        use crate::navigator::DomNavigator;
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut doc = BufferDocument::from_reader_default(
+            br#"<a><plain/><based xml:base="sub/"/></a>"#.as_slice(),
+            &arena,
+            &names,
+        )
+        .unwrap();
+
+        // Nothing is recorded by default, which is what every document built
+        // before this accessor existed reports.
+        assert_eq!(doc.document_base_uri(), None);
+        assert_eq!(doc.create_navigator().base_uri(), "");
+
+        doc.set_document_base_uri(Some("file:///tmp/a.xml"));
+        assert_eq!(doc.document_base_uri(), Some("file:///tmp/a.xml"));
+
+        // The document node and any node without an `xml:base` ancestor
+        // report it.
+        let mut nav = doc.create_navigator();
+        assert_eq!(nav.base_uri(), "file:///tmp/a.xml");
+        assert!(nav.move_to_first_child());
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.local_name(), "plain");
+        assert_eq!(nav.base_uri(), "file:///tmp/a.xml");
+
+        // An `xml:base` attribute still takes precedence at the node itself.
+        assert!(nav.move_to_next_sibling());
+        assert_eq!(nav.local_name(), "based");
+        assert_eq!(nav.base_uri(), "sub/");
+
+        doc.set_document_base_uri(None);
+        assert_eq!(doc.create_navigator().base_uri(), "");
+    }
+
+    #[test]
+    fn source_span_is_absent_without_tracking() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = BufferDocument::from_reader_default(b"<a/>".as_slice(), &arena, &names).unwrap();
+
+        assert!(!doc.has_source_spans());
+        assert_eq!(doc.source_span(doc.root() + 1), None);
     }
 }

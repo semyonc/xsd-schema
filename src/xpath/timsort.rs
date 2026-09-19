@@ -539,6 +539,15 @@ where
     /// Like merge_lo, except that this method should be called only if
     /// len1 >= len2; merge_lo should be called if len1 <= len2. (Either method
     /// may be called if len1 == len2.)
+    ///
+    /// The cursors walk **backwards**. When run 1 starts at index 0 and is
+    /// exhausted before run 2, `cursor1` (and, in the `len2 == 1` tails,
+    /// `dest`) step one position past the front of the array — the `-1` the
+    /// reference implementation reaches with a signed `int`. The value is
+    /// never used as an index afterwards: either the loop exits on
+    /// `len1 == 0`, or `+ 1` is added back first. With `usize` that needs
+    /// wrapping arithmetic; an ordinary subtraction panics in a debug build
+    /// and wraps silently in a release build.
     fn merge_hi(&mut self, base1: usize, mut len1: usize, base2: usize, mut len2: usize) {
         debug_assert!(len1 > 0 && len2 > 0 && base1 + len1 == base2);
 
@@ -554,8 +563,8 @@ where
 
         // Move last element of first run and deal with degenerate cases
         self.a[dest] = self.a[cursor1].clone();
-        dest -= 1;
-        cursor1 -= 1;
+        dest = dest.wrapping_sub(1);
+        cursor1 = cursor1.wrapping_sub(1);
         len1 -= 1;
         if len1 == 0 {
             let start = dest - (len2 - 1);
@@ -565,10 +574,11 @@ where
             return;
         }
         if len2 == 1 {
-            dest -= len1;
-            cursor1 -= len1;
+            dest = dest.wrapping_sub(len1);
+            cursor1 = cursor1.wrapping_sub(len1);
             for i in (0..len1).rev() {
-                self.a[dest + 1 + i] = self.a[cursor1 + 1 + i].clone();
+                self.a[dest.wrapping_add(1).wrapping_add(i)] =
+                    self.a[cursor1.wrapping_add(1).wrapping_add(i)].clone();
             }
             self.a[dest] = self.tmp[cursor2].clone();
             return;
@@ -586,8 +596,8 @@ where
                 debug_assert!(len1 > 0 && len2 > 1);
                 if (self.c)(&self.tmp[cursor2], &self.a[cursor1]) == Ordering::Less {
                     self.a[dest] = self.a[cursor1].clone();
-                    dest -= 1;
-                    cursor1 -= 1;
+                    dest = dest.wrapping_sub(1);
+                    cursor1 = cursor1.wrapping_sub(1);
                     count1 += 1;
                     count2 = 0;
                     len1 -= 1;
@@ -596,7 +606,7 @@ where
                     }
                 } else {
                     self.a[dest] = self.tmp[cursor2].clone();
-                    dest -= 1;
+                    dest = dest.wrapping_sub(1);
                     cursor2 = cursor2.wrapping_sub(1);
                     count2 += 1;
                     count1 = 0;
@@ -625,18 +635,19 @@ where
                         &mut self.c,
                     );
                 if count1 != 0 {
-                    dest -= count1;
-                    cursor1 -= count1;
+                    dest = dest.wrapping_sub(count1);
+                    cursor1 = cursor1.wrapping_sub(count1);
                     len1 -= count1;
                     for i in (0..count1).rev() {
-                        self.a[dest + 1 + i] = self.a[cursor1 + 1 + i].clone();
+                        self.a[dest.wrapping_add(1).wrapping_add(i)] =
+                            self.a[cursor1.wrapping_add(1).wrapping_add(i)].clone();
                     }
                     if len1 == 0 {
                         break 'outer;
                     }
                 }
                 self.a[dest] = self.tmp[cursor2].clone();
-                dest -= 1;
+                dest = dest.wrapping_sub(1);
                 cursor2 = cursor2.wrapping_sub(1);
                 len2 -= 1;
                 if len2 == 1 {
@@ -646,7 +657,7 @@ where
                 count2 =
                     len2 - gallop_left(&self.a[cursor1], &self.tmp, 0, len2, len2 - 1, &mut self.c);
                 if count2 != 0 {
-                    dest -= count2;
+                    dest = dest.wrapping_sub(count2);
                     cursor2 = cursor2.wrapping_sub(count2);
                     len2 -= count2;
                     for i in 0..count2 {
@@ -657,8 +668,10 @@ where
                     }
                 }
                 self.a[dest] = self.a[cursor1].clone();
+                // `len2 > 1` here, so `dest` stays inside the array; `cursor1`
+                // may be the first element of a run at index 0.
                 dest -= 1;
-                cursor1 -= 1;
+                cursor1 = cursor1.wrapping_sub(1);
                 len1 -= 1;
                 if len1 == 0 {
                     break 'outer;
@@ -675,10 +688,11 @@ where
 
         if len2 == 1 {
             debug_assert!(len1 > 0);
-            dest -= len1;
-            cursor1 -= len1;
+            dest = dest.wrapping_sub(len1);
+            cursor1 = cursor1.wrapping_sub(len1);
             for i in (0..len1).rev() {
-                self.a[dest + 1 + i] = self.a[cursor1 + 1 + i].clone();
+                self.a[dest.wrapping_add(1).wrapping_add(i)] =
+                    self.a[cursor1.wrapping_add(1).wrapping_add(i)].clone();
             }
             self.a[dest] = self.tmp[cursor2].clone();
         } else if len2 == 0 {
@@ -1172,5 +1186,91 @@ mod tests {
         let comparer = OrdComparer::<i32>::new();
         timsort_slice_with_comparer(&mut arr, &comparer);
         assert_eq!(arr, [1, 2, 5, 8, 9]);
+    }
+    /// `merge_hi` walks its cursors backwards and lets them run one past the
+    /// front of the array, which used to panic in a debug build. This input
+    /// reaches that path: a long descending prefix (one run) followed by a
+    /// shorter ascending tail, merged from base 0.
+    #[test]
+    fn merge_hi_does_not_overflow_at_the_front_of_the_array() {
+        // A long descending prefix becomes run 1 at base 0; a shorter
+        // ascending tail whose values are all *larger* becomes run 2. Merging
+        // them backwards copies run 2 first and then walks run 1 down to its
+        // first element, so `cursor1` and `dest` reach the `-1` sentinel.
+        for (long, short) in [(100usize, 16usize), (257, 40), (1000, 100)] {
+            let mut data: Vec<i64> = (1..=long as i64).rev().collect();
+            data.extend((0..short as i64).map(|x| 10_000 + x));
+            let mut expected = data.clone();
+            expected.sort();
+
+            let sorted = timsort(data);
+            assert_eq!(sorted, expected, "{long} + {short}");
+        }
+
+        // The galloping branch: run 1 sits at base 0 and every one of its
+        // values is *above* run 2's, so after seven straight wins the gallop
+        // claims all of run 1 at once and `cursor1 -= count1` steps off the
+        // front of the array.
+        for (long, short) in [(60usize, 30usize), (200, 90), (1000, 400)] {
+            let mut data: Vec<i64> = (0..long as i64).map(|i| 10_000 - i).collect();
+            data.extend((0..short as i64).map(|i| 100 - i));
+            let mut expected = data.clone();
+            expected.sort();
+            assert_eq!(timsort(data), expected, "gallop {long} + {short}");
+        }
+
+        // The last statement of the gallop loop: run 1 sits at base 0, its
+        // first element is below most of run 2 but above a few of it. The
+        // gallop first claims all of run 1 except that element, then claims
+        // the part of run 2 above it, and finally moves the element itself —
+        // stepping `cursor1` off the front while run 2 still has items left.
+        for (high, low, mid) in [(100i64, 4i64, 40i64), (300, 2, 120), (1000, 9, 500)] {
+            let mut data: Vec<i64> = vec![5];
+            data.extend(1000..1000 + high);
+            data.extend(0..low.min(5));
+            data.extend(500..500 + mid);
+            let mut expected = data.clone();
+            expected.sort();
+            assert_eq!(
+                timsort(data),
+                expected,
+                "gallop tail {high} + {low} + {mid}"
+            );
+        }
+
+        // A deterministic sweep of run shapes, which is what actually walks
+        // every branch of `merge_hi` and `merge_lo`: a cheap LCG decides how
+        // long each run is and whether it ascends or descends.
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let mut data: Vec<i64> = Vec::new();
+            let mut value: i64 = 0;
+            while data.len() < 300 {
+                let run = 1 + (next() % 70) as usize;
+                let descending = next() % 2 == 0;
+                let start = value;
+                if descending {
+                    data.extend((0..run as i64).map(|i| start + run as i64 - i));
+                } else {
+                    data.extend((0..run as i64).map(|i| start + i));
+                }
+                // Sometimes the next run is entirely above the previous one,
+                // which is what exhausts run 1 before run 2 in `merge_hi`.
+                value = if next() % 3 == 0 {
+                    start + 10_000
+                } else {
+                    start
+                };
+            }
+            let mut expected = data.clone();
+            expected.sort();
+            assert_eq!(timsort(data), expected, "round {round}");
+        }
     }
 }

@@ -38,6 +38,13 @@ pub fn matches_name_test<N: DomNavigator>(
     nav: &N,
     ctx: &XPathContext<'_>,
 ) -> bool {
+    // A namespace node has a name too: its prefix, in no namespace (XDM §6.4).
+    // A name test on the `namespace::` axis therefore selects by prefix, and
+    // `*` selects every namespace node — the principal node kind of that axis
+    // is namespace, not element.
+    if nav.node_type() == DomNodeType::Namespace {
+        return matches_namespace_name_test(test, nav, ctx);
+    }
     if nav.node_type() != DomNodeType::Element && nav.node_type() != DomNodeType::Attribute {
         return false;
     }
@@ -59,6 +66,31 @@ pub fn matches_name_test<N: DomNavigator>(
             }
         }
         NameTest::QName(qname) => qname_matches(qname, nav, ctx),
+    }
+}
+
+/// A name test applied to a namespace node, whose name is its prefix.
+fn matches_namespace_name_test<N: DomNavigator>(
+    test: &NameTest,
+    nav: &N,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    match test {
+        NameTest::Wildcard => true,
+        // `*:local` — a namespace node is in no namespace, so this is just the
+        // prefix test.
+        NameTest::NamespaceWildcard(local_id) => match ctx.resolve_name(*local_id) {
+            Some(local) => nav.local_name() == local,
+            None => false,
+        },
+        // `prefix:*` — no namespace node is in a namespace.
+        NameTest::LocalWildcard(_) => false,
+        // A QName selects the namespace node whose prefix it is; a prefixed
+        // name never matches, because the name is in no namespace.
+        NameTest::QName(qname) => match ctx.resolve_name(qname.local_name) {
+            Some(local) => qname.namespace_uri.is_none() && nav.local_name() == local,
+            None => false,
+        },
     }
 }
 

@@ -193,6 +193,11 @@ pub fn eval_node<N: DomNavigator>(
             match (start_opt, end_opt) {
                 (None, _) | (_, None) => Ok(XPathValue::empty()),
                 (Some(start), Some(end)) => {
+                    // XPath 2.0 §3.3.1: the operands of `to` are `xs:integer?`,
+                    // so the function conversion rules apply and an
+                    // `xs:untypedAtomic` operand is cast to `xs:integer`.
+                    let start = to_integer_operand(start)?;
+                    let end = to_integer_operand(end)?;
                     let values = eval_range(&start, &end)?;
                     let items: Vec<XmlItem<N>> = values.into_iter().map(XmlItem::Atomic).collect();
                     Ok(XPathValue::from_sequence(items))
@@ -218,7 +223,7 @@ pub fn eval_node<N: DomNavigator>(
                 // Logical operators - short-circuit evaluation
                 BinaryOpKind::And => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                    let left_bool = if ctx.static_context.xpath10_compatibility() {
                         effective_boolean_value_10(&left_val)?
                     } else {
                         effective_boolean_value(&left_val)?
@@ -227,7 +232,7 @@ pub fn eval_node<N: DomNavigator>(
                         return Ok(XPathValue::boolean(false));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                    let right_bool = if ctx.static_context.xpath10_compatibility() {
                         effective_boolean_value_10(&right_val)?
                     } else {
                         effective_boolean_value(&right_val)?
@@ -236,7 +241,7 @@ pub fn eval_node<N: DomNavigator>(
                 }
                 BinaryOpKind::Or => {
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
-                    let left_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                    let left_bool = if ctx.static_context.xpath10_compatibility() {
                         effective_boolean_value_10(&left_val)?
                     } else {
                         effective_boolean_value(&left_val)?
@@ -245,7 +250,7 @@ pub fn eval_node<N: DomNavigator>(
                         return Ok(XPathValue::boolean(true));
                     }
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
-                    let right_bool = if ctx.static_context.mode() == XPathMode::XPath10 {
+                    let right_bool = if ctx.static_context.xpath10_compatibility() {
                         effective_boolean_value_10(&right_val)?
                     } else {
                         effective_boolean_value(&right_val)?
@@ -283,13 +288,12 @@ pub fn eval_node<N: DomNavigator>(
                                     | BinaryOpKind::Div
                                     | BinaryOpKind::Mod
                             );
-                            let result = if is_arithmetic
-                                && ctx.static_context.mode() == XPathMode::XPath10
-                            {
-                                eval_numeric_binary_10(bin_op.kind, &left, &right)?
-                            } else {
-                                eval_binary(bin_op.kind, &left, &right)?
-                            };
+                            let result =
+                                if is_arithmetic && ctx.static_context.xpath10_compatibility() {
+                                    eval_numeric_binary_10(bin_op.kind, &left, &right)?
+                                } else {
+                                    eval_binary(bin_op.kind, &left, &right)?
+                                };
                             Ok(XPathValue::from_atomic(result))
                         }
                     }
@@ -306,7 +310,7 @@ pub fn eval_node<N: DomNavigator>(
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
                     // XPath 1.0 §3.4: node-set vs boolean → convert node-set to boolean as a whole
-                    if ctx.static_context.mode() == XPathMode::XPath10 {
+                    if ctx.static_context.xpath10_compatibility() {
                         let left_is_bool = is_boolean_value(&left_val);
                         let right_is_bool = is_boolean_value(&right_val);
                         let left_has_nodes = has_nodes_or_empty(&left_val);
@@ -341,7 +345,7 @@ pub fn eval_node<N: DomNavigator>(
                     let left_iter = VecNodeIterator::new(left_val.into_vec());
                     let right_iter = VecNodeIterator::new(right_val.into_vec());
 
-                    let result = if ctx.static_context.mode() == XPathMode::XPath10 {
+                    let result = if ctx.static_context.xpath10_compatibility() {
                         match bin_op.kind {
                             BinaryOpKind::GeneralEq => general_eq_iter_10(&left_iter, &right_iter)?,
                             BinaryOpKind::GeneralNe => general_ne_iter_10(&left_iter, &right_iter)?,
@@ -661,6 +665,14 @@ fn eval_castable_as<N: DomNavigator>(
             Ok(XPathValue::boolean(is_castable))
         }
     }
+}
+
+/// Applies the function conversion rules to an operand of the `to` operator.
+fn to_integer_operand(value: crate::types::XmlValue) -> Result<crate::types::XmlValue, XPathError> {
+    if value.type_code == XmlTypeCode::UntypedAtomic {
+        return crate::xpath::cast::cast_to(&value, XmlTypeCode::Integer);
+    }
+    Ok(value)
 }
 
 /// Format a sequence type for error messages.
@@ -1252,7 +1264,7 @@ fn eval_predicates<N: DomNavigator>(
             ctx.context_size = saved_size;
 
             // Check if item should be included
-            let is_10 = ctx.static_context.mode() == XPathMode::XPath10;
+            let is_10 = ctx.static_context.xpath10_compatibility();
             let include = match &pred_result {
                 XPathValue::Item(XmlItem::Atomic(value)) if value.type_code.is_numeric() => {
                     // XPath 1.0 §2.4 and 2.0: exact comparison, no rounding

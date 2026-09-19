@@ -950,7 +950,15 @@ fn eval_fn_string<N: DomNavigator>(
         }
         1 => {
             let arg = args.remove(0);
-            let s = atomize_to_string(arg)?;
+            // XPath 1.0 compatibility mode: the argument of a function whose
+            // parameter is a singleton is replaced by its first item, so
+            // `string(//a)` is the string value of the first `a` instead of a
+            // type error.
+            let s = if context.static_context.xpath10_compatibility() {
+                atomize::to_string_10(&arg)
+            } else {
+                atomize_to_string(arg)?
+            };
             Ok(XPathValue::string(s))
         }
         _ => Err(XPathError::wrong_number_of_arguments(
@@ -980,7 +988,14 @@ fn eval_fn_number<N: DomNavigator>(
         }
         1 => {
             let arg = args.remove(0);
-            let d = atomize_to_double(arg)?;
+            // XPath 1.0 compatibility mode: first item, then the 1.0 number
+            // rules (a value that is not a number becomes NaN rather than an
+            // error).
+            let d = if context.static_context.xpath10_compatibility() {
+                atomize::to_number_10(&arg)
+            } else {
+                atomize_to_double(arg)?
+            };
             Ok(XPathValue::double(d))
         }
         _ => Err(XPathError::wrong_number_of_arguments(

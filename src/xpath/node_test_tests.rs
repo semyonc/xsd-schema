@@ -914,3 +914,34 @@ fn test_kind_test_schema_attribute_unresolved_prefix() {
     // Should not match - prefix cannot be resolved
     assert!(!matches_kind_test(&nav, &kind_test, &ctx));
 }
+
+/// A name test on the `namespace::` axis selects by prefix, and `*` selects
+/// every namespace node: the principal node kind of that axis is namespace.
+#[test]
+fn name_tests_select_namespace_nodes_by_prefix() {
+    use crate::xpath::XPathExpr;
+
+    let doc =
+        roxmltree::Document::parse(r#"<out xmlns:four="http://four.com"/>"#).expect("parse xml");
+    let table = NameTable::new();
+    let ctx = XPathContext::new(&table);
+
+    let count = |expr: &str| {
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run_with_node::<RoXmlNavigator<'_>>(RoXmlNavigator::new(&doc))
+            .expect("evaluate")
+            .first()
+            .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+            .unwrap_or_default()
+    };
+
+    // `xmlns:four` plus the implicit `xml` binding.
+    assert_eq!(count("count(/out/namespace::*)"), "2");
+    assert_eq!(count("count(/out/namespace::four)"), "1");
+    assert_eq!(count("count(/out/namespace::nope)"), "0");
+    assert_eq!(count("string(/out/namespace::four)"), "http://four.com");
+    // A prefixed name test never matches: the name is in no namespace.
+    assert_eq!(count("count(/out/namespace::*[name() = 'four'])"), "1");
+}
