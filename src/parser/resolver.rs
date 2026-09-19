@@ -43,7 +43,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Debug;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[cfg(feature = "async")]
 use std::pin::Pin;
 
@@ -1224,21 +1224,29 @@ pub(crate) fn canonicalize_file_location(resolved: String) -> String {
     }
 }
 
-/// Normalize a path by resolving . and .. components
-fn normalize_path(path: &Path) -> PathBuf {
+/// Lexically normalize a path: drop `.` components and let each `..` cancel
+/// the normal segment before it.
+///
+/// A `..` with no normal segment to cancel is kept when the path is relative
+/// (`../a` stays `../a`, `a/../..` becomes `..`), because it refers to a
+/// directory outside the part of the path that is spelled out. Above a root it
+/// is dropped (`/..` is `/`). The filesystem is not consulted, so symlinks are
+/// not taken into account.
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
     let mut result = PathBuf::new();
 
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {
-                // Skip current dir
-            }
-            _ => {
-                result.push(component);
-            }
+            Component::CurDir => {}
+            Component::ParentDir => match result.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    result.pop();
+                }
+                Some(Component::RootDir) => {}
+                // Empty, `..`, or a drive-relative prefix such as `C:`.
+                _ => result.push(component),
+            },
+            _ => result.push(component),
         }
     }
 
@@ -1648,9 +1656,34 @@ mod tests {
     fn test_resolve_relative_path_parent() {
         let resolved =
             resolve_relative_path("../common/types.xsd", "/home/user/schemas/main.xsd").unwrap();
-        // Should resolve to something like /home/user/common/types.xsd
-        assert!(resolved.contains("common"));
-        assert!(resolved.contains("types.xsd"));
+        assert_eq!(
+            Path::new(&resolved),
+            Path::new("/home/user/common/types.xsd")
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_path_parent_without_base() {
+        let resolved = resolve_relative_path("../xsd/X.xsd", "").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("../xsd/X.xsd"));
+        let resolved = resolve_relative_path("../../xsd/X.xsd", "").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("../../xsd/X.xsd"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_parent_of_relative_base() {
+        let resolved = resolve_relative_path("../../common.xsd", "schemas/a.xsd").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("../common.xsd"));
+        let resolved = resolve_relative_path("../common.xsd", "../schemas/a.xsd").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("../common.xsd"));
+        let resolved = resolve_relative_path("../common.xsd", "schemas/a.xsd").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("common.xsd"));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_parent_above_root() {
+        let resolved = resolve_relative_path("../../../x.xsd", "/a/b.xsd").unwrap();
+        assert_eq!(Path::new(&resolved), Path::new("/x.xsd"));
     }
 
     #[test]
@@ -1685,12 +1718,65 @@ mod tests {
         assert!(resolver.resolving.is_empty());
     }
 
+    fn normalized(path: &str) -> PathBuf {
+        normalize_path(Path::new(path))
+    }
+
     #[test]
     fn test_normalize_path() {
-        let path = Path::new("/home/user/../other/./schema.xsd");
-        let normalized = normalize_path(path);
-        assert!(!normalized.to_string_lossy().contains(".."));
-        assert!(!normalized.to_string_lossy().contains("./"));
+        assert_eq!(
+            normalized("/home/user/../other/./schema.xsd"),
+            Path::new("/home/other/schema.xsd")
+        );
+        assert_eq!(normalized("a/./b/../c.xsd"), Path::new("a/c.xsd"));
+        assert_eq!(normalized("./a.xsd"), Path::new("a.xsd"));
+        assert_eq!(normalized("a/.."), Path::new(""));
+    }
+
+    #[test]
+    fn test_normalize_path_keeps_leading_parent_dir() {
+        assert_eq!(normalized("../xsd/X.xsd"), Path::new("../xsd/X.xsd"));
+        assert_eq!(normalized("./../xsd/X.xsd"), Path::new("../xsd/X.xsd"));
+        assert_eq!(
+            normalized("../../common.xsd"),
+            Path::new("../../common.xsd")
+        );
+        assert_eq!(normalized(".."), Path::new(".."));
+    }
+
+    #[test]
+    fn test_normalize_path_parent_dir_beyond_relative_start() {
+        assert_eq!(normalized("a/../.."), Path::new(".."));
+        assert_eq!(normalized("a/../../b.xsd"), Path::new("../b.xsd"));
+        assert_eq!(
+            normalized("schemas/../../common.xsd"),
+            Path::new("../common.xsd")
+        );
+        assert_eq!(normalized("../a/../b.xsd"), Path::new("../b.xsd"));
+        assert_eq!(normalized("a/b/../../../c/d.xsd"), Path::new("../c/d.xsd"));
+    }
+
+    #[test]
+    fn test_normalize_path_parent_dir_at_root() {
+        assert_eq!(normalized("/.."), Path::new("/"));
+        assert_eq!(normalized("/../a.xsd"), Path::new("/a.xsd"));
+        assert_eq!(normalized("/a/../../b/c.xsd"), Path::new("/b/c.xsd"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_normalize_path_windows_prefix() {
+        assert_eq!(
+            normalized(r"C:\schemas\..\..\common.xsd"),
+            Path::new(r"C:\common.xsd")
+        );
+        assert_eq!(
+            normalized(r"\\server\share\..\a.xsd"),
+            Path::new(r"\\server\share\a.xsd")
+        );
+        // Drive-relative: `..` is relative to the drive's current directory.
+        assert_eq!(normalized(r"C:..\a.xsd"), Path::new(r"C:..\a.xsd"));
+        assert_eq!(normalized(r"C:a\..\..\b.xsd"), Path::new(r"C:..\b.xsd"));
     }
 
     #[test]
