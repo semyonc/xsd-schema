@@ -16,7 +16,7 @@ use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::{VecNodeIterator, XmlItem};
-use crate::xpath::tree_comparer::TreeComparer;
+use crate::xpath::tree_comparer::NodeComparer;
 use crate::xpath::DomNavigator;
 
 use super::numeric::round_half_toward_positive_infinity_f64;
@@ -611,7 +611,7 @@ pub fn unordered<N: DomNavigator>(
 /// Two sequences are deep-equal if they have the same length and each pair
 /// of corresponding items are deep-equal.
 pub fn deep_equal<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -640,8 +640,15 @@ pub fn deep_equal<N: DomNavigator>(
     let iter1: VecNodeIterator<N> = VecNodeIterator::new(items1);
     let iter2: VecNodeIterator<N> = VecNodeIterator::new(items2);
 
-    // Use TreeComparer for deep equality
-    let comparer = TreeComparer::default();
+    // The `fn:deep-equal` content model (F&O §15.3.1), not the stricter
+    // comparison the published `TreeComparer` performs: comment and
+    // processing-instruction *children* play no part, and an element is
+    // compared according to its content — typed value for simple content,
+    // child elements only for element-only content, `(*|text())` for mixed.
+    // The static context's schema set is what makes the content kind of a
+    // complex type readable; with none, every element is `xs:untyped`, hence
+    // mixed, which is the unvalidated behaviour.
+    let comparer = NodeComparer::deep_equal_function(context.static_context.schema_set);
     let result = comparer.deep_equal_iter(&iter1, &iter2)?;
 
     Ok(XPathValue::boolean(result))
@@ -1233,5 +1240,75 @@ mod tests {
         let args = vec![seq1, seq2];
         let result = deep_equal(&mut ctx, args).unwrap();
         assert!(!extract_bool(result));
+    }
+
+    /// The document element of `doc`, as a one-item argument sequence.
+    fn document_element<'d>(doc: &'d roxmltree::Document<'d>) -> XPathValue<RoXmlNavigator<'d>> {
+        let mut nav = RoXmlNavigator::new(doc);
+        assert!(nav.move_to_first_child(), "a document element");
+        XPathValue::from_sequence(vec![XmlItem::Node(nav)])
+    }
+
+    /// F&O §15.3.1 compares an element's `(*|text())`, so comment and
+    /// processing-instruction children play no part. Checked through the
+    /// function itself, not through the comparer.
+    #[test]
+    fn deep_equal_ignores_comment_and_pi_children() {
+        let plain = roxmltree::Document::parse("<a>x</a>").expect("parse xml");
+
+        for xml in ["<a>x<!--c--></a>", "<a><!--c-->x</a>", "<a>x<?p d?></a>"] {
+            let with_noise = roxmltree::Document::parse(xml).expect("parse xml");
+            let mut ctx = make_context();
+            let args = vec![document_element(&with_noise), document_element(&plain)];
+            assert!(
+                extract_bool(deep_equal(&mut ctx, args).unwrap()),
+                "{xml} should be deep-equal to <a>x</a>",
+            );
+        }
+    }
+
+    /// …but such a child still splits the text around it, and text nodes are
+    /// never merged, so `<a>x<!--c-->y</a>` has two text children where
+    /// `<a>xy</a>` has one.
+    #[test]
+    fn deep_equal_does_not_merge_text_split_by_a_comment() {
+        let split = roxmltree::Document::parse("<a>x<!--c-->y</a>").expect("parse xml");
+        let joined = roxmltree::Document::parse("<a>xy</a>").expect("parse xml");
+
+        let mut ctx = make_context();
+        let args = vec![document_element(&split), document_element(&joined)];
+        assert!(!extract_bool(deep_equal(&mut ctx, args).unwrap()));
+    }
+
+    /// A comment or PI that is itself an item of the compared sequences is
+    /// compared — by string value, and for a PI by target as well.
+    #[test]
+    fn deep_equal_compares_comment_and_pi_items() {
+        let doc =
+            roxmltree::Document::parse("<a><!--c--><!--d--><?p v?><?q v?></a>").expect("parse xml");
+
+        let child = |index: usize| -> XPathValue<RoXmlNavigator<'_>> {
+            let mut nav = RoXmlNavigator::new(&doc);
+            assert!(nav.move_to_first_child(), "a document element");
+            assert!(nav.move_to_first_child(), "a child node");
+            for _ in 0..index {
+                assert!(nav.move_to_next_sibling(), "a child node");
+            }
+            XPathValue::from_sequence(vec![XmlItem::Node(nav)])
+        };
+
+        let mut ctx = make_context();
+        assert!(extract_bool(
+            deep_equal(&mut ctx, vec![child(0), child(0)]).unwrap()
+        ));
+        assert!(!extract_bool(
+            deep_equal(&mut ctx, vec![child(0), child(1)]).unwrap()
+        ));
+        assert!(extract_bool(
+            deep_equal(&mut ctx, vec![child(2), child(2)]).unwrap()
+        ));
+        assert!(!extract_bool(
+            deep_equal(&mut ctx, vec![child(2), child(3)]).unwrap()
+        ));
     }
 }

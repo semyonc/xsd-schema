@@ -334,6 +334,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing. `/` and `fn:root()` are unchanged: they still answer a document
   node whose children are hidden, so `//x` inside an assertion is empty, which
   is what the W3C test suite expects.
+- `fn:deep-equal` no longer looks at comment and processing-instruction
+  **children**. F&O §15.3.1 compares a document or element node's
+  `$i/(*|text())`, a sequence that holds neither kind, so
+  `deep-equal(<a>x<!--c--></a>, <a>x</a>)` is now true where it was false.
+  Such a child still *splits* the text around it and text nodes are never
+  merged, so `<a>x<!--c-->y</a>` has two text children and remains different
+  from `<a>xy</a>`; and a comment or PI that is itself an item of the two
+  compared sequences is still compared, by string value and, for a PI, by
+  target. `TreeComparer` is unchanged: its `deep_equal` and `deep_equal_iter`
+  keep comparing every child, which is what a serialization round-trip check
+  needs.
+- `fn:deep-equal` compares two elements according to their **content**, as
+  F&O §15.3.1 clauses (2) and (4) prescribe, instead of always comparing their
+  children. Two elements annotated as having simple content — a simple type,
+  or a complex type whose content is text-only — are compared by their typed
+  values, so a validated `<a>1</a>` and `<a>01</a>` of type `xs:integer` are
+  now deep-equal. With element-only content only the child elements are
+  compared, so whitespace between them no longer counts; with mixed content
+  the `(*|text())` sequences are compared, as before. An element annotated as
+  having simple content is never deep-equal to one with complex content.
+  Reading the content kind of a complex type needs the static context's schema
+  set: without one every element is `xs:untyped`, which is mixed complex
+  content, and the result is what it was.
+- `fn:deep-equal` compares two attributes' typed values with `eq` semantics,
+  the same rule it applies to a free-standing atomic item, instead of plain
+  value equality. The two answers could differ for schema-validated
+  attributes: an `xs:integer` `1` and an `xs:decimal` `1.0` were reported
+  different as attributes and equal as items. Untyped attributes are
+  `xs:untypedAtomic` and compare as strings either way, so nothing changes for
+  an unvalidated document.
 
 ### Added
 

@@ -3,8 +3,13 @@
 //! Port of `xpath2/XPath20Api/XPath20Api/TreeComparer.cs`.
 //! Aligns with `DOM_NAVIGATOR_DESIGN.md` and `XML_NODE_ITERATOR_DESIGN.md`.
 
+use crate::ids::{ComplexTypeKey, TypeKey};
+use crate::navigator::TypedValue;
+use crate::schema::SchemaSet;
 use crate::types::XmlTypeCode;
 use crate::types::{normalize_whitespace, WhitespaceMode, XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::validation::info::ContentType;
+use crate::validation::runtime::determine_content_type;
 
 use super::ast::BinaryOpKind;
 use super::error::XPathError;
@@ -26,6 +31,122 @@ impl TreeComparer {
 
     pub fn with_ignore_whitespace(ignore_whitespace: bool) -> Self {
         Self { ignore_whitespace }
+    }
+
+    /// Deep equality of the **children** of two navigator positions.
+    ///
+    /// This compares the two child sequences pairwise; it deliberately does
+    /// *not* look at the two positions themselves, so their names, attributes
+    /// and node kinds play no part. On two document nodes that is exactly
+    /// `fn:deep-equal`, whose content is its children; on two elements it is
+    /// a *content* comparison — `<a x="1">t</a>` and `<b y="2">t</b>` are
+    /// reported equal here, while `fn:deep-equal` reports them different.
+    ///
+    /// Every child is compared, comment and processing-instruction children
+    /// included — which is *stricter* than `fn:deep-equal`, whose content
+    /// model leaves those out. The strict reading is what a serialization
+    /// round-trip check wants, and it is the published behaviour of this type;
+    /// `fn:deep-equal` uses the crate-private comparer instead.
+    ///
+    /// To compare items the way `fn:deep-equal` does, including the node kind
+    /// and name, use [`deep_equal_iter`](Self::deep_equal_iter) over the two
+    /// sequences.
+    pub fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+        NodeComparer::legacy(self.ignore_whitespace).deep_equal(left, right)
+    }
+
+    /// Deep equality for two XPath item iterators.
+    ///
+    /// Node items are compared by kind, name and content; atomic items with
+    /// `eq` semantics, NaN equal to NaN, and a pair `eq` is not defined for
+    /// reported unequal rather than raising. Element content is compared the
+    /// same way [`deep_equal`](Self::deep_equal) compares it, comments and PIs
+    /// included.
+    pub fn deep_equal_iter<I>(&self, left: &I, right: &I) -> Result<bool, XPathError>
+    where
+        I: XmlNodeIterator,
+    {
+        NodeComparer::legacy(self.ignore_whitespace).deep_equal_iter(left, right)
+    }
+}
+
+/// Which of the four content cases of the element rule an element falls into.
+///
+/// The rule requires the two elements to be in the *same* case; the case then
+/// decides what is compared. `Simple` is "annotated as having simple content"
+/// and the other two are "annotated as having complex content", which is the
+/// distinction the rule's clause (2) turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementContent {
+    /// Clause 4(a): the element has a simple type annotation, or a complex
+    /// type whose content is text-only. Its *typed value* is compared.
+    Simple,
+    /// Clauses 4(b) and 4(d): complex content that is element-only, or empty.
+    /// Only the child **elements** are compared; text children are not looked
+    /// at. The two clauses are merged because they prescribe the same
+    /// comparison — an empty content type admits no child elements, so 4(d) is
+    /// 4(b) with both child-element sequences empty.
+    ElementOnly,
+    /// Clause 4(c): complex content that is mixed. The `(*|text())` sequences
+    /// are compared. An element with no type annotation is `xs:untyped`, which
+    /// is complex content and mixed, so every node of an unvalidated document
+    /// lands here.
+    Mixed,
+}
+
+/// The comparison engine behind [`TreeComparer`] and `fn:deep-equal`.
+///
+/// It is deliberately **crate-private**. [`TreeComparer`] is published with a
+/// single public field, so it can be built by struct literal out of crate and
+/// gaining a field would be a breaking change; the extra state the
+/// `fn:deep-equal` rules need lives here instead, and `TreeComparer`'s methods
+/// delegate with that state switched off. The published behaviour is therefore
+/// exactly what it was.
+///
+/// `function_rules` selects between the two:
+///
+/// * `false` — the historical comparison. Every child is compared, including
+///   comment and processing-instruction children, and an attribute's typed
+///   values are compared with plain value equality. This is what the XQTS
+///   judge and the copy round-trip check need, and what [`TreeComparer`] does.
+/// * `true` — the `fn:deep-equal` rules (F&O §15.3.1): comment and PI children
+///   play no part, an element is compared according to its content case, and
+///   typed values are compared with `eq` semantics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NodeComparer<'s> {
+    ignore_whitespace: bool,
+    function_rules: bool,
+    schema_set: Option<&'s SchemaSet>,
+}
+
+impl NodeComparer<'static> {
+    /// The comparison [`TreeComparer`] performs.
+    fn legacy(ignore_whitespace: bool) -> Self {
+        Self {
+            ignore_whitespace,
+            function_rules: false,
+            schema_set: None,
+        }
+    }
+}
+
+impl<'s> NodeComparer<'s> {
+    /// The comparison `fn:deep-equal` performs (F&O §15.3.1).
+    ///
+    /// `schema_set` is the static context's schema set, used to read a complex
+    /// type's content kind — element-only, mixed or empty — which decides
+    /// which of the rule's clause-4 cases applies. `None` (the usual case: no
+    /// schema was imported) makes every element untyped, i.e. `xs:untyped`,
+    /// i.e. mixed complex content, which is the unvalidated behaviour.
+    ///
+    /// `ignore_whitespace` is `false`: `fn:deep-equal` compares text nodes
+    /// exactly, and the option exists for test harnesses, not for the function.
+    pub(crate) fn deep_equal_function(schema_set: Option<&'s SchemaSet>) -> Self {
+        Self {
+            ignore_whitespace: false,
+            function_rules: true,
+            schema_set,
+        }
     }
 
     fn text_equal(&self, left: &str, right: &str) -> bool {
@@ -110,8 +231,126 @@ impl TreeComparer {
 
         let mut left_nav = left.clone();
         let mut right_nav = right.clone();
+        if !self.element_attributes_equal(&mut left_nav, &mut right_nav) {
+            return false;
+        }
 
-        self.element_attributes_equal(&mut left_nav, &mut right_nav) && self.deep_equal(left, right)
+        if !self.function_rules {
+            return self.deep_equal(left, right);
+        }
+
+        self.element_content_equal(left, right)
+    }
+
+    /// Clauses (2) and (4) of the element rule (F&O §15.3.1).
+    ///
+    /// Clause (2) demands that the two elements are *both* annotated as having
+    /// simple content or *both* as having complex content. Clause (4) then
+    /// demands one of four cases, each of which requires the *same* case on
+    /// both sides — so an element-only element and a mixed one are not
+    /// deep-equal even when their element children match, because no case of
+    /// clause (4) covers the pair.
+    fn element_content_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+        match (self.element_content(left), self.element_content(right)) {
+            // 4(a): compare the typed values.
+            (ElementContent::Simple, ElementContent::Simple) => {
+                self.typed_values_equal(left, right)
+            }
+            // 4(b) / 4(d): compare only the child elements.
+            (ElementContent::ElementOnly, ElementContent::ElementOnly) => {
+                self.child_elements_equal(left, right)
+            }
+            // 4(c): compare `(*|text())`, which is what `deep_equal` walks
+            // once comment and PI children are skipped.
+            (ElementContent::Mixed, ElementContent::Mixed) => self.deep_equal(left, right),
+            // A simple/complex mismatch fails clause (2); an element-only
+            // against a mixed element matches no case of clause (4).
+            _ => false,
+        }
+    }
+
+    /// The content case of an element, read from its type annotation.
+    ///
+    /// The type annotation alone separates the cases, given the schema:
+    /// a simple type, or a complex type whose content is text-only, is simple
+    /// content; the other complex content kinds are element-only, mixed or
+    /// empty; no annotation at all is `xs:untyped`, which is mixed.
+    ///
+    /// Without a schema set the content kind of a complex type cannot be read,
+    /// so the node's typed value decides simple-vs-complex on its own and
+    /// complex content is treated as mixed — the same answer an unvalidated
+    /// document gives.
+    fn element_content<N: DomNavigator>(&self, nav: &N) -> ElementContent {
+        match nav.type_annotation() {
+            None => ElementContent::Mixed,
+            Some(TypeKey::Simple(_)) => ElementContent::Simple,
+            Some(TypeKey::Complex(key)) => match self.complex_content_type(key) {
+                Some(ContentType::TextOnly) => ElementContent::Simple,
+                Some(ContentType::ElementOnly) | Some(ContentType::Empty) => {
+                    ElementContent::ElementOnly
+                }
+                Some(ContentType::Mixed) => ElementContent::Mixed,
+                None => match nav.typed_value() {
+                    TypedValue::Value(_) => ElementContent::Simple,
+                    _ => ElementContent::Mixed,
+                },
+            },
+        }
+    }
+
+    /// The content kind of a complex type, or `None` when there is no schema
+    /// set to ask.
+    ///
+    /// The key comes from the node's annotation and is looked up with `get`,
+    /// not indexing, so a key from some *other* schema set cannot panic. Like
+    /// the rest of schema-aware XPath — `schema-element()`, `element(*, T)` —
+    /// this assumes the static context's schema set is the one the document
+    /// was validated against.
+    fn complex_content_type(&self, key: ComplexTypeKey) -> Option<ContentType> {
+        let schema_set = self.schema_set?;
+        let ct_data = schema_set.arenas.complex_types.get(key)?;
+        Some(determine_content_type(schema_set, ct_data))
+    }
+
+    /// Clause 4(a): the two elements' typed values are deep-equal.
+    ///
+    /// A nilled element's typed value is the empty sequence, which is
+    /// deep-equal only to another empty sequence.
+    fn typed_values_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+        match (
+            crate::xpath::atomize::atomize_node(left),
+            crate::xpath::atomize::atomize_node(right),
+        ) {
+            (Ok(Some(left_value)), Ok(Some(right_value))) => {
+                self.item_equal(&left_value, &right_value)
+            }
+            (Ok(None), Ok(None)) => true,
+            _ => false,
+        }
+    }
+
+    /// Clause 4(b): each child element of one is deep-equal to the
+    /// corresponding child element of the other. Text children — which in
+    /// element-only content can only be whitespace — are not looked at, and
+    /// neither are comments and PIs.
+    fn child_elements_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+        let mut left_iter = ChildIter::new(left.clone());
+        let mut right_iter = ChildIter::new(right.clone());
+
+        loop {
+            match (
+                next_child_element(&mut left_iter),
+                next_child_element(&mut right_iter),
+            ) {
+                (None, None) => return true,
+                (Some(_), None) | (None, Some(_)) => return false,
+                (Some(left_child), Some(right_child)) => {
+                    if !self.node_equal(&left_child, &right_child) {
+                        return false;
+                    }
+                }
+            }
+        }
     }
 
     fn element_attributes_equal<N: DomNavigator>(&self, left: &mut N, right: &mut N) -> bool {
@@ -195,7 +434,20 @@ impl TreeComparer {
             .ok()
             .flatten()
             .unwrap_or_else(|| XmlValue::untyped(right.value()));
-        self.values_equal_or_nan(&left_value, &right_value)
+
+        if self.function_rules {
+            // F&O §15.3.1: two attributes are deep-equal when their names are
+            // equal and their *typed values* are deep-equal — the atomic rule,
+            // i.e. `eq` with NaN equal to NaN. `item_equal` is that rule; it is
+            // what the free-standing atomic arm of `deep_equal_iter` applies,
+            // so the same two values now get the same answer whether they
+            // arrived as an attribute's typed value or as a sequence item.
+            // An untyped attribute is `xs:untypedAtomic` and compares as a
+            // string either way, so nothing moves for unvalidated documents.
+            self.item_equal(&left_value, &right_value)
+        } else {
+            self.values_equal_or_nan(&left_value, &right_value)
+        }
     }
 
     /// Deep equality of the **children** of two navigator positions.
@@ -204,13 +456,8 @@ impl TreeComparer {
     /// *not* look at the two positions themselves, so their names, attributes
     /// and node kinds play no part. On two document nodes that is exactly
     /// `fn:deep-equal`, whose content is its children; on two elements it is
-    /// a *content* comparison — `<a x="1">t</a>` and `<b y="2">t</b>` are
-    /// reported equal here, while `fn:deep-equal` reports them different.
-    ///
-    /// To compare items the way `fn:deep-equal` does, including the node kind
-    /// and name, use [`deep_equal_iter`](Self::deep_equal_iter) over the two
-    /// sequences.
-    pub fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+    /// a *content* comparison.
+    fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
         let mut left_iter = ChildIter::new(left.clone());
         let mut right_iter = ChildIter::new(right.clone());
 
@@ -231,7 +478,7 @@ impl TreeComparer {
     }
 
     /// Deep equality for two XPath item iterators.
-    pub fn deep_equal_iter<I>(&self, left: &I, right: &I) -> Result<bool, XPathError>
+    pub(crate) fn deep_equal_iter<I>(&self, left: &I, right: &I) -> Result<bool, XPathError>
     where
         I: XmlNodeIterator,
     {
@@ -268,15 +515,46 @@ impl TreeComparer {
     }
 
     fn next_significant_child<N: DomNavigator>(&self, iter: &mut ChildIter<N>) -> Option<N> {
-        let mut current = iter.next();
-        while let Some(ref nav) = current {
-            if !self.is_whitespace_node(nav) {
-                return current;
+        while let Some(nav) = iter.next() {
+            if self.is_whitespace_node(&nav) {
+                continue;
             }
-            current = iter.next();
+            if self.function_rules && is_ignorable_child(&nav) {
+                continue;
+            }
+            return Some(nav);
         }
         None
     }
+}
+
+/// Whether a child node plays no part in `fn:deep-equal`.
+///
+/// F&O §15.3.1 compares a document or element node's `$i/(*|text())`, a
+/// sequence that holds neither comment nor processing-instruction children. As
+/// the spec's own note puts it, the content of a comment or PI matters only
+/// when it is itself an item of the two sequences being compared; as a
+/// *descendant* of a compared item it does not affect the result.
+///
+/// What such a child still does is **split text**: `<a>x<!--c-->y</a>` has two
+/// text children, `x` and `y`, and is therefore not deep-equal to `<a>xy</a>`,
+/// which has one. Skipping the comment here leaves both text nodes in place
+/// and does not merge them, so that distinction survives.
+fn is_ignorable_child<N: DomNavigator>(nav: &N) -> bool {
+    matches!(
+        nav.node_type(),
+        DomNodeType::Comment | DomNodeType::ProcessingInstruction
+    )
+}
+
+/// The next child **element**, skipping every other child kind.
+fn next_child_element<N: DomNavigator>(iter: &mut ChildIter<N>) -> Option<N> {
+    while let Some(nav) = iter.next() {
+        if nav.node_type() == DomNodeType::Element {
+            return Some(nav);
+        }
+    }
+    None
 }
 
 fn count_attributes<N: DomNavigator>(nav: &mut N) -> usize {
@@ -371,11 +649,41 @@ mod tests {
     /// `fn:deep-equal` over two one-item node sequences, through the same
     /// entry point the function itself uses.
     fn nodes_deep_equal<N: DomNavigator>(left: N, right: N) -> bool {
-        let left: VecNodeIterator<N> = VecNodeIterator::new(vec![XmlItem::Node(left)]);
-        let right: VecNodeIterator<N> = VecNodeIterator::new(vec![XmlItem::Node(right)]);
-        TreeComparer::new()
+        sequences_deep_equal(
+            &NodeComparer::deep_equal_function(None),
+            vec![XmlItem::Node(left)],
+            vec![XmlItem::Node(right)],
+        )
+    }
+
+    /// `fn:deep-equal` over two sequences, with an explicit comparer so that a
+    /// schema-aware one can be used.
+    fn sequences_deep_equal<N: DomNavigator>(
+        comparer: &NodeComparer<'_>,
+        left: Vec<XmlItem<N>>,
+        right: Vec<XmlItem<N>>,
+    ) -> bool {
+        let left: VecNodeIterator<N> = VecNodeIterator::new(left);
+        let right: VecNodeIterator<N> = VecNodeIterator::new(right);
+        comparer
             .deep_equal_iter(&left, &right)
             .expect("comparing two node sequences does not raise")
+    }
+
+    /// The document node of `doc`.
+    fn ro_root<'d>(doc: &'d roxmltree::Document<'d>) -> RoXmlNavigator<'d> {
+        RoXmlNavigator::new(doc)
+    }
+
+    /// The `index`-th child (0-based, every kind counted) of the document
+    /// element of `doc`.
+    fn ro_child<'d>(doc: &'d roxmltree::Document<'d>, index: usize) -> RoXmlNavigator<'d> {
+        let mut nav = ro_element(doc);
+        assert!(nav.move_to_first_child(), "a child node");
+        for _ in 0..index {
+            assert!(nav.move_to_next_sibling(), "a child node at index {index}");
+        }
+        nav
     }
 
     #[test]
@@ -618,5 +926,396 @@ mod tests {
             nodes_deep_equal(namespace(4), namespace(5)),
             "default binding, same URI"
         );
+    }
+
+    // ── Comments and PIs among children (F&O §15.3.1) ─────────────────
+    //
+    // A document or element node's content is `$i/(*|text())`, which holds
+    // neither comment nor processing-instruction children, so those children
+    // play no part in `fn:deep-equal`. They remain significant when they are
+    // themselves items of the two compared sequences.
+
+    #[test]
+    fn a_comment_child_of_an_element_is_ignored() {
+        let left = roxmltree::Document::parse("<a>x<!--c--></a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a>x</a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    #[test]
+    fn an_only_child_comment_leaves_an_element_empty() {
+        let left = roxmltree::Document::parse("<a><!--c--></a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a/>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    #[test]
+    fn a_processing_instruction_child_of_an_element_is_ignored() {
+        let left = roxmltree::Document::parse("<a>x<?p d?></a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a>x</a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    #[test]
+    fn comments_at_different_places_among_children_are_both_ignored() {
+        let left = roxmltree::Document::parse("<a><!--p-->x</a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a>x<!--q--></a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    #[test]
+    fn comments_and_pis_among_document_children_are_ignored() {
+        let left = roxmltree::Document::parse("<!--c--><?p d?><a/><!--e-->").expect("parse xml");
+        let right = roxmltree::Document::parse("<a/>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_root(&left), ro_root(&right)));
+    }
+
+    #[test]
+    fn comments_deeper_in_the_tree_are_ignored_too() {
+        let left = roxmltree::Document::parse("<a><b>t<!--c--></b></a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a><b>t</b></a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    /// The spec's own note: a comment among the children does not affect the
+    /// result, but it still *splits* the text around it, and text nodes are
+    /// not merged. `<a>x<!--c-->y</a>` has two text children where `<a>xy</a>`
+    /// has one, so the two are not deep-equal.
+    #[test]
+    fn a_comment_between_two_texts_does_not_merge_them() {
+        let left = roxmltree::Document::parse("<a>x<!--c-->y</a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a>xy</a>").expect("parse xml");
+
+        assert!(!nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    #[test]
+    fn a_comment_item_is_compared_by_string_value() {
+        let doc = roxmltree::Document::parse("<a><!--c--><!--c--><!--d--></a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_child(&doc, 0), ro_child(&doc, 1)));
+        assert!(!nodes_deep_equal(ro_child(&doc, 0), ro_child(&doc, 2)));
+    }
+
+    #[test]
+    fn a_processing_instruction_item_is_compared_by_target_and_value() {
+        let doc =
+            roxmltree::Document::parse("<a><?p d?><?p d?><?q d?><?p e?></a>").expect("parse xml");
+
+        assert!(nodes_deep_equal(ro_child(&doc, 0), ro_child(&doc, 1)));
+        assert!(
+            !nodes_deep_equal(ro_child(&doc, 0), ro_child(&doc, 2)),
+            "different target"
+        );
+        assert!(
+            !nodes_deep_equal(ro_child(&doc, 0), ro_child(&doc, 3)),
+            "different value"
+        );
+    }
+
+    /// The published [`TreeComparer`] keeps the stricter comparison: it is
+    /// what the XQTS judge and the copy round-trip check use, and both need a
+    /// comment or PI child to count. `with_ignore_whitespace(true)` is the
+    /// judge's own setting.
+    #[test]
+    fn the_public_tree_comparer_still_compares_comments_and_pis() {
+        let left = roxmltree::Document::parse("<a><!--x--></a>").expect("parse xml");
+        let right = roxmltree::Document::parse("<a/>").expect("parse xml");
+        let pi = roxmltree::Document::parse("<a><?p d?></a>").expect("parse xml");
+
+        for comparer in [
+            TreeComparer::new(),
+            TreeComparer::with_ignore_whitespace(true),
+        ] {
+            assert!(
+                !comparer.deep_equal(&ro_element(&left), &ro_element(&right)),
+                "a comment child must still count"
+            );
+            assert!(
+                !comparer.deep_equal(&ro_element(&pi), &ro_element(&right)),
+                "a PI child must still count"
+            );
+            // The XQTS judge compares two *document roots* with exactly this
+            // comparer (`tests/xqts/compare.rs`), so check that shape too.
+            assert!(
+                !comparer.deep_equal(&ro_root(&left), &ro_root(&right)),
+                "the judge must still see the comment"
+            );
+        }
+
+        // …and through the item entry point as well.
+        let left_iter = VecNodeIterator::new(vec![XmlItem::Node(ro_element(&left))]);
+        let right_iter = VecNodeIterator::new(vec![XmlItem::Node(ro_element(&right))]);
+        assert!(!TreeComparer::new()
+            .deep_equal_iter(&left_iter, &right_iter)
+            .expect("no error"));
+    }
+
+    // ── Typed comparison (F&O §15.3.1 clauses 2, 3 and 4) ─────────────
+
+    mod typed {
+        use super::*;
+
+        use bumpalo::Bump;
+
+        use crate::document::{
+            build_typed_document, BufferDocNavigator, BufferDocument, BufferDocumentOptions,
+        };
+        use crate::pipeline::load_and_process_schema;
+        use crate::schema::SchemaSet;
+
+        fn load_schema(xsd: &str) -> SchemaSet {
+            let mut schema_set = SchemaSet::xsd11();
+            load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
+                .expect("the fixture schema loads");
+            schema_set
+        }
+
+        /// A schema-validated document, whose element and attribute nodes
+        /// carry type annotations.
+        fn typed_doc<'a>(
+            xml: &str,
+            arena: &'a Bump,
+            schema_set: &'a SchemaSet,
+        ) -> BufferDocument<'a> {
+            build_typed_document(
+                xml.as_bytes(),
+                arena,
+                schema_set,
+                BufferDocumentOptions::default(),
+            )
+            .expect("the fixture document is built")
+        }
+
+        /// The document element.
+        fn element<'a>(doc: &'a BufferDocument<'a>) -> BufferDocNavigator<'a> {
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child(), "a document element");
+            nav
+        }
+
+        /// The first attribute of the document element.
+        fn attribute<'a>(doc: &'a BufferDocument<'a>) -> BufferDocNavigator<'a> {
+            let mut nav = element(doc);
+            assert!(nav.move_to_first_attribute(), "an attribute");
+            nav
+        }
+
+        fn deep_equal(
+            schema_set: Option<&SchemaSet>,
+            left: BufferDocNavigator<'_>,
+            right: BufferDocNavigator<'_>,
+        ) -> bool {
+            sequences_deep_equal(
+                &NodeComparer::deep_equal_function(schema_set),
+                vec![XmlItem::Node(left)],
+                vec![XmlItem::Node(right)],
+            )
+        }
+
+        const INTEGER_ATTRIBUTE: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="e">
+                    <xs:complexType>
+                        <xs:attribute name="n" type="xs:integer"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#;
+
+        /// Clause (3): an attribute's *typed values* are compared, so the two
+        /// lexical forms `1` and `01` of the same `xs:integer` are equal.
+        #[test]
+        fn a_typed_attribute_is_compared_by_its_typed_value() {
+            let schema_set = load_schema(INTEGER_ATTRIBUTE);
+            let arena = Bump::new();
+            let left = typed_doc(r#"<e n="1"/>"#, &arena, &schema_set);
+            let right = typed_doc(r#"<e n="01"/>"#, &arena, &schema_set);
+
+            assert!(deep_equal(
+                Some(&schema_set),
+                attribute(&left),
+                attribute(&right),
+            ));
+        }
+
+        /// The same two attributes without a schema are `xs:untypedAtomic`,
+        /// which compares as a string — `1` and `01` are different strings.
+        #[test]
+        fn an_untyped_attribute_is_compared_as_a_string() {
+            let arena = Bump::new();
+            let names = crate::namespace::NameTable::new();
+            let left =
+                BufferDocument::from_reader_default(r#"<e n="1"/>"#.as_bytes(), &arena, &names)
+                    .expect("the fixture parses");
+            let right =
+                BufferDocument::from_reader_default(r#"<e n="01"/>"#.as_bytes(), &arena, &names)
+                    .expect("the fixture parses");
+
+            assert!(!deep_equal(None, attribute(&left), attribute(&right)));
+        }
+
+        /// The A-7 audit's §5.5: an attribute's typed values went through
+        /// plain value equality while a free-standing atomic item went through
+        /// `eq`, so the same pair got two answers. `fn:deep-equal` now applies
+        /// `eq` to both; the published `TreeComparer` keeps plain equality.
+        #[test]
+        fn typed_attributes_of_different_types_compare_with_eq() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e">
+                        <xs:complexType>
+                            <xs:attribute name="n" type="xs:integer"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let decimal_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e">
+                        <xs:complexType>
+                            <xs:attribute name="n" type="xs:decimal"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let arena = Bump::new();
+            let integer = typed_doc(r#"<e n="1"/>"#, &arena, &schema_set);
+            let decimal = typed_doc(r#"<e n="1.0"/>"#, &arena, &decimal_set);
+
+            assert!(
+                deep_equal(Some(&schema_set), attribute(&integer), attribute(&decimal)),
+                "xs:integer 1 eq xs:decimal 1.0"
+            );
+            assert!(
+                !TreeComparer::new()
+                    .deep_equal_iter(
+                        &VecNodeIterator::new(vec![XmlItem::Node(attribute(&integer))]),
+                        &VecNodeIterator::new(vec![XmlItem::Node(attribute(&decimal))]),
+                    )
+                    .expect("no error"),
+                "the published comparer keeps plain value equality",
+            );
+        }
+
+        /// Clause 4(a): two elements with simple content are compared by
+        /// their typed values.
+        #[test]
+        fn simple_content_elements_are_compared_by_typed_value() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e" type="xs:integer"/>
+                </xs:schema>"#,
+            );
+            let arena = Bump::new();
+            let left = typed_doc("<e>1</e>", &arena, &schema_set);
+            let right = typed_doc("<e>01</e>", &arena, &schema_set);
+
+            assert!(deep_equal(
+                Some(&schema_set),
+                element(&left),
+                element(&right),
+            ));
+        }
+
+        /// …and the same two elements with no schema are untyped, hence mixed
+        /// complex content, hence compared by their text children.
+        #[test]
+        fn untyped_elements_are_compared_by_their_text() {
+            let arena = Bump::new();
+            let names = crate::namespace::NameTable::new();
+            let left = BufferDocument::from_reader_default("<e>1</e>".as_bytes(), &arena, &names)
+                .expect("the fixture parses");
+            let right = BufferDocument::from_reader_default("<e>01</e>".as_bytes(), &arena, &names)
+                .expect("the fixture parses");
+
+            assert!(!deep_equal(None, element(&left), element(&right)));
+        }
+
+        /// Clause 4(b): with element-only content only the child *elements*
+        /// are compared, so the whitespace between them does not matter —
+        /// without `ignore_whitespace`, which `fn:deep-equal` never sets.
+        #[test]
+        fn element_only_content_ignores_text_children() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e">
+                        <xs:complexType>
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let arena = Bump::new();
+            let left = typed_doc("<e>\n  <c>x</c>\n</e>", &arena, &schema_set);
+            let right = typed_doc("<e><c>x</c></e>", &arena, &schema_set);
+            let other = typed_doc("<e><c>y</c></e>", &arena, &schema_set);
+
+            assert!(deep_equal(
+                Some(&schema_set),
+                element(&left),
+                element(&right),
+            ));
+            assert!(
+                !deep_equal(Some(&schema_set), element(&left), element(&other)),
+                "the child elements themselves still count"
+            );
+        }
+
+        /// Clause 4(c): with mixed content the `(*|text())` sequence is
+        /// compared, so the whitespace *does* matter.
+        #[test]
+        fn mixed_content_compares_text_children() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e">
+                        <xs:complexType mixed="true">
+                            <xs:sequence>
+                                <xs:element name="c" type="xs:string"/>
+                            </xs:sequence>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:schema>"#,
+            );
+            let arena = Bump::new();
+            let left = typed_doc("<e>\n  <c>x</c>\n</e>", &arena, &schema_set);
+            let right = typed_doc("<e><c>x</c></e>", &arena, &schema_set);
+
+            assert!(!deep_equal(
+                Some(&schema_set),
+                element(&left),
+                element(&right),
+            ));
+        }
+
+        /// Clause (2): both elements must be annotated as having simple
+        /// content or both as having complex content. An element with no
+        /// annotation is `xs:untyped`, which is complex content.
+        #[test]
+        fn simple_content_is_never_deep_equal_to_complex_content() {
+            let schema_set = load_schema(
+                r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                    <xs:element name="e" type="xs:string"/>
+                </xs:schema>"#,
+            );
+            let arena = Bump::new();
+            let names = crate::namespace::NameTable::new();
+            let typed = typed_doc("<e>x</e>", &arena, &schema_set);
+            let untyped =
+                BufferDocument::from_reader_default("<e>x</e>".as_bytes(), &arena, &names)
+                    .expect("the fixture parses");
+
+            assert!(!deep_equal(
+                Some(&schema_set),
+                element(&typed),
+                element(&untyped),
+            ));
+        }
     }
 }
