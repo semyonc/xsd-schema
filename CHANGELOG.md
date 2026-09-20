@@ -364,6 +364,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different as attributes and equal as items. Untyped attributes are
   `xs:untypedAtomic` and compare as strings either way, so nothing changes for
   an unvalidated document.
+- `fn:tokenize` reports an invalid `$pattern` (FORX0002), invalid `$flags`
+  (FORX0001) and a `$pattern` that matches the zero-length string (FORX0003)
+  when `$input` is the empty sequence or a zero-length string. It returned the
+  empty sequence for such an input before looking at the pattern at all, so
+  `tokenize("", "[")` and `tokenize((), "a*")` silently succeeded. F&O §7.6.4
+  states the three errors with no exemption for any input, and states the
+  empty-sequence result separately; that result is unchanged for a pattern
+  that raises nothing, so `tokenize("", "\s+")` is still the empty sequence.
+- `fn:replace` reports a malformed `$replacement` (FORX0004) even when nothing
+  is replaced — when `$input` is empty, or when `$pattern` matches nowhere in
+  it. The replacement string was only validated while the matches were walked,
+  so `replace("", "a", "$")` and `replace("abc", "z", "$")` returned a string
+  instead of raising. The two rules are unchanged: a `\` must be followed by a
+  `\` or a `$`, and a `$` that is not part of such a pair must be followed by
+  a digit.
 
 ### Added
 

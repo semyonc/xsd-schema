@@ -104,10 +104,22 @@ pub fn replace<N: DomNavigator>(
     // Get input (first argument)
     let input = atomize_to_string(args.pop().unwrap())?;
 
-    // Build the regex
+    // FORX0001 / FORX0002.
     let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
 
-    // regexml handles FORX0003 (zero-length match) and FORX0004 (invalid replacement) internally
+    // FORX0003, before anything is matched: the rule is about `$pattern`
+    // alone, so it applies whatever `$input` is — an empty one included.
+    if matches_zero_length_string(regex) {
+        return Err(XPathError::regex_matches_zero_length(&pattern));
+    }
+
+    // FORX0004. `$replacement` is a pure syntax rule, so it too applies
+    // whatever `$input` is. The backend only validates the replacement while
+    // it walks the matches, so a pattern that matches nothing — or an empty
+    // input, which it never walks at all — would otherwise let a malformed
+    // replacement string through.
+    check_replacement_string(&replacement)?;
+
     let result = regex
         .replace_all(&input, &replacement)
         .map_err(|e| match e {
@@ -153,15 +165,20 @@ pub fn tokenize<N: DomNavigator>(
     // Get input (first argument)
     let input = atomize_to_string(args.pop().unwrap())?;
 
-    // If input is empty, return empty sequence
+    // FORX0001 / FORX0002, then FORX0003, and only then the empty-input
+    // shortcut. F&O §7.6.4 states the three errors with no exemption for any
+    // input, and states separately that the result is the empty sequence when
+    // `$input` is the empty sequence or the zero-length string. Compiling
+    // first costs nothing: the program is cached per evaluation run.
+    let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
+    if matches_zero_length_string(regex) {
+        return Err(XPathError::regex_matches_zero_length(&pattern));
+    }
+
     if input.is_empty() {
         return Ok(XPathValue::Empty);
     }
 
-    // Build the regex
-    let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
-
-    // regexml handles FORX0003 (zero-length match) internally
     let token_iter = regex.tokenize(&input).map_err(|e| match e {
         regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
         _ => XPathError::invalid_regex_pattern(&pattern),
@@ -243,6 +260,54 @@ fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathEr
         i += 1;
     }
 
+    Ok(())
+}
+
+/// Whether a compiled pattern matches the zero-length string — the FORX0003
+/// condition of `fn:replace` (F&O §7.6.3) and `fn:tokenize` (F&O §7.6.4).
+///
+/// The specification states the condition as `matches("", $pattern, $flags)`
+/// being true, and that is literally what this is. The backend computes the
+/// same predicate once when it compiles the program, so asking it here does
+/// not re-run the matcher over anything but the empty string.
+///
+/// It is asked explicitly rather than left to the backend because the
+/// backend's own `tokenize` short-circuits on an empty haystack *before* it
+/// checks, so an empty `$input` would otherwise hide the error.
+fn matches_zero_length_string(regex: &Regex) -> bool {
+    regex.is_match("")
+}
+
+/// Validate a `fn:replace` `$replacement` string, raising FORX0004 (F&O
+/// §7.6.3) when it is malformed.
+///
+/// Two rules, applied left to right: a `\` must be followed by a `\` or a `$`,
+/// and a `$` that is not part of such a pair must be followed by a digit.
+///
+/// The backend applies the same two rules, but only while it walks the
+/// matches, so a `$replacement` is never looked at when the input is empty or
+/// when the pattern matches nothing. The rule is a property of `$replacement`
+/// alone, so it is checked here for every call.
+fn check_replacement_string(replacement: &str) -> Result<(), XPathError> {
+    let chars: Vec<char> = replacement.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                if !matches!(chars.get(i + 1), Some('\\' | '$')) {
+                    return Err(XPathError::invalid_replacement_string(replacement));
+                }
+                i += 2;
+            }
+            '$' => {
+                if !matches!(chars.get(i + 1), Some(c) if c.is_ascii_digit()) {
+                    return Err(XPathError::invalid_replacement_string(replacement));
+                }
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
     Ok(())
 }
 
@@ -1247,5 +1312,212 @@ mod tests {
             }
             _ => panic!("Expected sequence"),
         }
+    }
+    // ── Error order against an empty or non-matching input ────────────
+    //
+    // F&O states FORX0002 (invalid `$pattern`), FORX0001 (invalid `$flags`)
+    // and, for `replace` and `tokenize`, FORX0003 (the pattern matches the
+    // zero-length string) and FORX0004 (malformed `$replacement`) with no
+    // exemption for any input. `tokenize` returning the empty sequence for an
+    // empty `$input` is a separate statement about the *result*, so it comes
+    // after the errors, not before them.
+
+    #[test]
+    fn tokenize_reports_an_invalid_pattern_for_an_empty_string_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = tokenize(
+            &mut ctx,
+            vec![XPathValue::string(""), XPathValue::string("[")],
+        );
+
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+    }
+
+    #[test]
+    fn tokenize_reports_an_invalid_pattern_for_an_empty_sequence_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = tokenize(&mut ctx, vec![XPathValue::Empty, XPathValue::string("[")]);
+
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+    }
+
+    #[test]
+    fn tokenize_reports_invalid_flags_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = tokenize(
+            &mut ctx,
+            vec![
+                XPathValue::string(""),
+                XPathValue::string("a"),
+                XPathValue::string("z"),
+            ],
+        );
+
+        assert!(matches!(result, Err(XPathError::FORX0001 { .. })));
+    }
+
+    #[test]
+    fn tokenize_reports_a_zero_length_match_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for input in [XPathValue::string(""), XPathValue::Empty] {
+            let result = tokenize(&mut ctx, vec![input, XPathValue::string("a*")]);
+            assert!(matches!(result, Err(XPathError::FORX0003 { .. })));
+        }
+    }
+
+    /// The empty-sequence result survives for a pattern that raises nothing.
+    /// XQTS `fn-tokenize-8` is exactly this: `fn:count(fn:tokenize("", "\s+"))`
+    /// with the expected result `0`.
+    #[test]
+    fn tokenize_still_returns_the_empty_sequence_for_a_valid_pattern() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for input in [XPathValue::string(""), XPathValue::Empty] {
+            let result = tokenize(&mut ctx, vec![input, XPathValue::string("\\s+")]).unwrap();
+            assert!(matches!(result, XPathValue::Empty));
+        }
+    }
+
+    #[test]
+    fn replace_reports_a_malformed_replacement_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for replacement in ["$", "$ ", "\\", "\\ "] {
+            let result = replace(
+                &mut ctx,
+                vec![
+                    XPathValue::string(""),
+                    XPathValue::string("a"),
+                    XPathValue::string(replacement),
+                ],
+            );
+            assert!(
+                matches!(result, Err(XPathError::FORX0004 { .. })),
+                "expected FORX0004 for replacement {replacement:?}",
+            );
+        }
+    }
+
+    /// The same hole one step further out: the backend validates
+    /// `$replacement` only while it walks the matches, so a pattern that
+    /// matches nothing used to let a malformed replacement through as well.
+    #[test]
+    fn replace_reports_a_malformed_replacement_when_nothing_matches() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("abc"),
+                XPathValue::string("z"),
+                XPathValue::string("$"),
+            ],
+        );
+
+        assert!(matches!(result, Err(XPathError::FORX0004 { .. })));
+    }
+
+    /// A well-formed replacement is still accepted for those same inputs —
+    /// `\\`, `\$` and `$0` are the three legal shapes. XQTS `fn-replace-11`
+    /// is `fn:count(fn:replace((), "bra", "*"))` with the expected result `1`.
+    #[test]
+    fn replace_accepts_a_well_formed_replacement_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for replacement in ["*", "\\\\", "\\$", "$0", "a$1b"] {
+            let result = replace(
+                &mut ctx,
+                vec![
+                    XPathValue::string(""),
+                    XPathValue::string("(a)"),
+                    XPathValue::string(replacement),
+                ],
+            )
+            .unwrap_or_else(|e| panic!("replacement {replacement:?} must be accepted: {e}"));
+            assert!(
+                matches!(result, XPathValue::Item(XmlItem::Atomic(ref v)) if v.as_string() == Some("")),
+            );
+        }
+    }
+
+    #[test]
+    fn replace_reports_a_zero_length_match_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for input in [XPathValue::string(""), XPathValue::Empty] {
+            let result = replace(
+                &mut ctx,
+                vec![input, XPathValue::string("a*"), XPathValue::string("x")],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0003 { .. })));
+        }
+    }
+
+    #[test]
+    fn replace_reports_invalid_flags_and_patterns_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string(""),
+                XPathValue::string("a"),
+                XPathValue::string("x"),
+                XPathValue::string("z"),
+            ],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0001 { .. })));
+
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string(""),
+                XPathValue::string("["),
+                XPathValue::string("x"),
+            ],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+    }
+
+    /// `fn:matches` has no shortcut and no FORX0003 rule; it compiles before
+    /// it matches, so an empty input has always reported the pattern and flag
+    /// errors. A regression guard for the audit.
+    #[test]
+    fn matches_reports_pattern_and_flag_errors_for_an_empty_input() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for input in [XPathValue::string(""), XPathValue::Empty] {
+            let result = matches(&mut ctx, vec![input, XPathValue::string("[")]);
+            assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+        }
+
+        let result = matches(
+            &mut ctx,
+            vec![
+                XPathValue::Empty,
+                XPathValue::string("a"),
+                XPathValue::string("z"),
+            ],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0001 { .. })));
+
+        // A pattern that matches the zero-length string is fine for matches().
+        let result = matches(&mut ctx, vec![XPathValue::Empty, XPathValue::string("a*")]).unwrap();
+        assert!(boolean_of(result));
     }
 }
