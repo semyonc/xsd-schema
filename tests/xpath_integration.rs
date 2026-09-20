@@ -97,79 +97,70 @@ fn test_flwor_item_concat() {
     );
 }
 
-/// Test: //title[1] on books.xml
-/// Expected: "The First Book" (first title in document order)
-///
-/// Note: In XPath 2.0, `//title[1]` is equivalent to `(//title)[1]` and returns
-/// only the first title element in document order.
-#[test]
-fn test_positional_predicate() {
+/// Evaluate `expr` over `books.xml` and return the string value of each item.
+fn eval_books(expr: &str) -> Vec<String> {
     let xml_path = get_examples_dir().join("books.xml");
     let xml_content = fs::read_to_string(&xml_path).expect("Failed to read books.xml");
 
     let names = NameTable::new();
     let ctx = XPathContext::new(&names);
 
-    let expr = XPathExpr::compile("//title[1]", &ctx).expect("Failed to compile XPath expression");
+    let compiled = XPathExpr::compile(expr, &ctx).expect("Failed to compile XPath expression");
 
     let doc = roxmltree::Document::parse(&xml_content).expect("Failed to parse XML");
     let nav = RoXmlNavigator::new(&doc);
 
-    let result = expr
+    let result = compiled
         .evaluator(&ctx)
         .run_with_node(nav)
         .expect("Failed to evaluate XPath");
 
-    // //title[1] in XPath 2.0 returns only the first title element in document order
-    assert_eq!(
-        result.len(),
-        1,
-        "Expected one title element (the first in document order)"
-    );
+    result.into_vec().iter().map(item_to_string).collect()
+}
 
-    // The result should be "The First Book"
-    let items = result.into_vec();
-    let first_title = item_to_string(&items[0]);
+/// Test: `//title[1]` on books.xml.
+///
+/// A predicate belongs to the step it is written on, and the step is evaluated
+/// once per node of the sequence reaching it (XPath 2.0 §3.2 / §3.2.2). `//x[1]`
+/// therefore expands to `…/descendant-or-self::node()/child::x[1]` and selects
+/// the first `title` child **of every node that has one** — it is *not* the same
+/// expression as `(//title)[1]`, where the parentheses make the predicate apply
+/// to the whole node sequence.
+#[test]
+fn test_positional_predicate() {
     assert_eq!(
-        first_title, "The First Book",
-        "First title in document order should be 'The First Book'"
+        eval_books("//title[1]"),
+        [
+            "The First Book",
+            "Becoming Somebody",
+            "The Poet's First Poem"
+        ],
+        "`//title[1]` selects the first title child of each book"
+    );
+    assert_eq!(
+        eval_books("(//title)[1]"),
+        ["The First Book"],
+        "`(//title)[1]` selects the first title in document order"
     );
 }
 
-/// Test: //title[last()] on books.xml
-/// Expected: "The Poet's First Poem" (last title in document order)
+/// Test: `//title[last()]` on books.xml — the counterpart of
+/// [`test_positional_predicate`] for `fn:last()`.
 #[test]
 fn test_last_predicate() {
-    let xml_path = get_examples_dir().join("books.xml");
-    let xml_content = fs::read_to_string(&xml_path).expect("Failed to read books.xml");
-
-    let names = NameTable::new();
-    let ctx = XPathContext::new(&names);
-
-    let expr =
-        XPathExpr::compile("//title[last()]", &ctx).expect("Failed to compile XPath expression");
-
-    let doc = roxmltree::Document::parse(&xml_content).expect("Failed to parse XML");
-    let nav = RoXmlNavigator::new(&doc);
-
-    let result = expr
-        .evaluator(&ctx)
-        .run_with_node(nav)
-        .expect("Failed to evaluate XPath");
-
-    // //title[last()] returns only the last title element in document order
     assert_eq!(
-        result.len(),
-        1,
-        "Expected one title element (the last in document order)"
+        eval_books("//title[last()]"),
+        [
+            "The First Book",
+            "Becoming Somebody",
+            "The Poet's First Poem"
+        ],
+        "`//title[last()]` selects the last title child of each book"
     );
-
-    // The result should be "The Poet's First Poem" (third book)
-    let items = result.into_vec();
-    let last_title = item_to_string(&items[0]);
     assert_eq!(
-        last_title, "The Poet's First Poem",
-        "Last title in document order should be 'The Poet's First Poem'"
+        eval_books("(//title)[last()]"),
+        ["The Poet's First Poem"],
+        "`(//title)[last()]` selects the last title in document order"
     );
 }
 

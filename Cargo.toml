@@ -121,6 +121,12 @@ path = "tests/xqts/driver.rs"
 harness = false
 required-features = ["xsd11"]
 
+[[bench]]
+name = "general_compare"
+path = "benches/general_compare.rs"
+harness = false
+required-features = ["xsd11"]
+
 [[example]]
 name = "xquery_without_xquery"
 path = "examples/xquery_without_xquery.rs"

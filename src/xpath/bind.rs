@@ -236,6 +236,7 @@ pub fn bind_node(
             // Resolve atomic type QName if present
             if let Some(ItemTypeNode::Atomic(ref qname)) = type_expr.target_type.item_type {
                 let resolved = resolve_atomic_type_qname(qname, ctx)?;
+                check_atomic_type_name(&resolved, qname, ctx)?;
                 if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
                     node.resolved_atomic_type = Some(resolved);
                 }
@@ -395,6 +396,66 @@ fn resolve_atomic_type_qname(
             .resolve_prefix_id(prefix_id)
             .ok_or_else(|| XPathError::undefined_prefix(&qname.prefix))?;
         Ok(QualifiedName::new(Some(ns_id), local_id, Some(prefix_id)))
+    }
+}
+
+/// Check that a QName used as an `AtomicType` really names an atomic type.
+///
+/// XPath 2.0 §2.5.4.2: "An `ItemType` consisting simply of a QName is
+/// interpreted as an `AtomicType`. … If a QName that is used as an `AtomicType`
+/// is not defined as an atomic type in the in-scope schema types, a static error
+/// is raised [err:XPST0051]." §3.10.2 and §3.10.3 impose the same requirement on
+/// the target type of `cast as` and `castable as`. The spec's own note spells the
+/// consequence out: "The names of non-atomic types such as `xs:IDREFS` are not
+/// accepted."
+///
+/// The in-scope schema types are the built-in types of the XML Schema namespace
+/// plus, when a schema set is attached to the static context, its named types.
+///
+/// Note: `xs:NOTATION` and `xs:anyAtomicType` are atomic types and so pass this
+/// check, although §3.10.2 forbids them as the target of a `cast`; that separate
+/// rule has its own error code, which this crate's error type cannot yet carry.
+fn check_atomic_type_name(
+    resolved: &QualifiedName,
+    raw: &QName,
+    ctx: &XPathContext<'_>,
+) -> Result<(), XPathError> {
+    let unknown = || XPathError::XPST0051 {
+        type_name: if raw.prefix.is_empty() {
+            raw.local.clone()
+        } else {
+            format!("{}:{}", raw.prefix, raw.local)
+        },
+    };
+
+    let local = ctx
+        .names
+        .try_resolve(resolved.local_name)
+        .ok_or_else(unknown)?;
+
+    let is_xs = resolved
+        .namespace_uri
+        .and_then(|id| ctx.names.try_resolve(id))
+        .is_some_and(|ns| ns == XS_NAMESPACE);
+
+    if is_xs {
+        let code = XmlTypeCode::from_local_name(&local).ok_or_else(unknown)?;
+        // `xs:anyAtomicType` is the base of the atomic types and is itself a
+        // legal `AtomicType`; `is_atomic` groups it with the abstract types, so
+        // it is allowed here explicitly. Everything else that is not atomic —
+        // `xs:anyType`, `xs:anySimpleType`, the list types, `xs:error` — is not.
+        if code == XmlTypeCode::AnyAtomicType || code.is_atomic() {
+            return Ok(());
+        }
+        return Err(unknown());
+    }
+
+    // A name outside the XML Schema namespace can only be in the in-scope schema
+    // types when a schema set is attached, and must be a simple type there.
+    let schema_set = ctx.schema_set.ok_or_else(unknown)?;
+    match schema_set.lookup_type(resolved.namespace_uri, resolved.local_name) {
+        Some(crate::ids::TypeKey::Simple(_)) => Ok(()),
+        _ => Err(unknown()),
     }
 }
 

@@ -51,7 +51,14 @@ pub enum XPathError {
     #[error("[XPDY0002] {message}")]
     XPDY0002 { message: String },
 
-    /// XPDY0050: More than one item where singleton expected.
+    /// XPDY0050: a value does not match a required sequence type.
+    ///
+    /// The specification defines this code for the `treat as` expression — "It
+    /// is a dynamic error if the dynamic type of the operand of a treat
+    /// expression does not match the sequence type specified by the treat
+    /// expression" (XPath 2.0 §3.10.5, Appendix G) — and it is also what this
+    /// crate raises when a sequence of more than one item reaches a place that
+    /// requires a single item.
     #[error("[XPDY0050] More than one item in sequence where single item expected")]
     XPDY0050,
 
@@ -156,8 +163,9 @@ pub enum XPathError {
     // ========================================================================
     // Casting Errors (FOCA)
     // ========================================================================
-    /// FOCA0002: QName has null namespace but non-empty prefix.
-    #[error("[FOCA0002] QName '{qname}' has null namespace but non-empty prefix")]
+    /// FOCA0002: invalid lexical value where an `xs:QName` is required —
+    /// either the wrong lexical form, or a prefix with no namespace.
+    #[error("[FOCA0002] Invalid lexical value for xs:QName: '{qname}'")]
     FOCA0002 { qname: String },
 
     /// FOCA0003: Input value too large for integer.
@@ -227,7 +235,14 @@ pub enum XPathError {
     // Operator Errors
     // ========================================================================
     /// Binary operator not defined for argument types.
-    #[error("Operator '{operator}' is not defined for arguments of type '{left_type}' and '{right_type}'")]
+    ///
+    /// This is the XPath 2.0 §3.4 / §3.5.1 type error: "If the types of the
+    /// operands, after evaluation, are not a valid combination for the given
+    /// operator, according to the rules in B.2 Operator Mapping, a type error is
+    /// raised [err:XPTY0004]." The dedicated variant carries the operator and
+    /// the two type names for the message; its
+    /// [`error_code`](XPathError::error_code) is `XPTY0004`.
+    #[error("[XPTY0004] Operator '{operator}' is not defined for arguments of type '{left_type}' and '{right_type}'")]
     BinaryOperatorNotDefined {
         operator: String,
         left_type: String,
@@ -235,7 +250,11 @@ pub enum XPathError {
     },
 
     /// Unary operator not defined for argument type.
-    #[error("Operator '{operator}' is not defined for argument of type '{arg_type}'")]
+    ///
+    /// The unary counterpart of
+    /// [`BinaryOperatorNotDefined`](XPathError::BinaryOperatorNotDefined); its
+    /// [`error_code`](XPathError::error_code) is likewise `XPTY0004`.
+    #[error("[XPTY0004] Operator '{operator}' is not defined for argument of type '{arg_type}'")]
     UnaryOperatorNotDefined { operator: String, arg_type: String },
 
     // ========================================================================
@@ -458,7 +477,85 @@ impl XPathError {
         }
     }
 
+    /// Build a dynamic error identified by an error QName.
+    ///
+    /// `fn:error` may raise *any* error QName, so such an error cannot be one
+    /// of this enum's fixed, code-per-variant arms. It travels in
+    /// [`XPathError::Internal`] under a canonical encoding —
+    /// `Q{namespace}local: description` — which [`XPathError::raised_error`]
+    /// reads back. Callers should use those two entry points rather than the
+    /// message text, which is not part of the API contract.
+    ///
+    /// The same carrier serves the spec-defined codes that have no dedicated
+    /// variant yet, such as `FONS0004`; [`XPathError::error_code`] resolves
+    /// those back to their `'static` code string.
+    ///
+    /// `namespace_uri` is empty for an error QName in no namespace.
+    pub fn raised(namespace_uri: &str, local_name: &str, description: Option<&str>) -> Self {
+        let mut message = format!("Q{{{namespace_uri}}}{local_name}");
+        if let Some(description) = description {
+            message.push_str(": ");
+            message.push_str(description);
+        }
+        XPathError::Internal(message)
+    }
+
+    /// FORG0002: an argument that is not a valid URI reference.
+    ///
+    /// The code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`].
+    pub fn invalid_uri_argument(uri: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "FORG0002",
+            Some(&format!("'{uri}' is not a valid URI reference")),
+        )
+    }
+
+    /// FONS0004: no namespace binding for a prefix.
+    ///
+    /// The code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`].
+    pub fn no_namespace_for_prefix(prefix: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "FONS0004",
+            Some(&format!("No namespace binding for prefix '{prefix}'")),
+        )
+    }
+
+    /// The error QName and description of an error identified by a QName.
+    ///
+    /// Returns `None` for every error that has a variant of its own; see
+    /// [`XPathError::raised`].
+    pub fn raised_error(&self) -> Option<RaisedError<'_>> {
+        let XPathError::Internal(message) = self else {
+            return None;
+        };
+        let rest = message.strip_prefix("Q{")?;
+        // A namespace URI cannot contain "}", so the first one ends it.
+        let (namespace_uri, rest) = rest.split_once('}')?;
+        // A local name is an NCName, so the first ":" ends it.
+        let (local_name, description) = match rest.split_once(": ") {
+            Some((local_name, description)) => (local_name, Some(description)),
+            None => (rest, None),
+        };
+        if local_name.is_empty() {
+            return None;
+        }
+        Some(RaisedError {
+            namespace_uri,
+            local_name,
+            description,
+        })
+    }
+
     /// Get the error code (e.g., "XPTY0004") if this is a spec-defined error.
+    ///
+    /// An error identified by an error QName (see [`XPathError::raised`])
+    /// reports its code when that code is one of [`QNAMED_ERROR_CODES`].
+    /// Any other QName returns `None`, because the code is not a `'static`
+    /// string; read it from [`XPathError::raised_error`] instead.
     pub fn error_code(&self) -> Option<&'static str> {
         match self {
             XPathError::XPST0003 { .. } => Some("XPST0003"),
@@ -500,11 +597,48 @@ impl XPathError {
             XPathError::FORX0002 { .. } => Some("FORX0002"),
             XPathError::FORX0003 { .. } => Some("FORX0003"),
             XPathError::FORX0004 { .. } => Some("FORX0004"),
-            XPathError::BinaryOperatorNotDefined { .. } => None,
-            XPathError::UnaryOperatorNotDefined { .. } => None,
-            XPathError::Internal(_) => None,
+            // XPath 2.0 §3.4 and §3.5.1: an operand combination that no
+            // operator mapping covers is a type error.
+            XPathError::BinaryOperatorNotDefined { .. } => Some("XPTY0004"),
+            XPathError::UnaryOperatorNotDefined { .. } => Some("XPTY0004"),
+            XPathError::Internal(_) => self.raised_error().and_then(|raised| {
+                if raised.namespace_uri != XQT_ERRORS_NAMESPACE {
+                    return None;
+                }
+                QNAMED_ERROR_CODES
+                    .iter()
+                    .copied()
+                    .find(|code| *code == raised.local_name)
+            }),
         }
     }
+}
+
+/// The namespace of the error QNames the specifications define,
+/// `http://www.w3.org/2005/xqt-errors`. It is also the namespace of the
+/// default error QName of `fn:error`.
+pub const XQT_ERRORS_NAMESPACE: &str = "http://www.w3.org/2005/xqt-errors";
+
+/// The local name of the default error QName of `fn:error`.
+pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
+
+/// The spec-defined codes this crate reports through an error QName rather
+/// than through a variant of [`XPathError`], and which
+/// [`XPathError::error_code`] therefore resolves back to a `'static` string.
+pub const QNAMED_ERROR_CODES: &[&str] = &[DEFAULT_RAISED_ERROR, "FONS0004", "FORG0002"];
+
+/// The error QName and description of an error raised by `fn:error`.
+///
+/// Produced by [`XPathError::raised_error`]. `namespace_uri` is empty when the
+/// error QName is in no namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RaisedError<'a> {
+    /// Namespace URI of the error QName ("" for no namespace).
+    pub namespace_uri: &'a str,
+    /// Local name of the error QName.
+    pub local_name: &'a str,
+    /// The `$description` argument, if one was supplied.
+    pub description: Option<&'a str>,
 }
 
 #[cfg(test)]

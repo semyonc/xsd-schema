@@ -159,9 +159,10 @@ pub fn tokenize<N: DomNavigator>(
         _ => XPathError::invalid_regex_pattern(&pattern),
     })?;
 
-    // Convert to XPathValue sequence, filtering out empty tokens
+    // Every gap between two adjacent separators is a token, including the
+    // zero-length ones produced by a leading separator, a trailing separator
+    // and two adjacent separators.
     let items: Vec<XmlItem<N>> = token_iter
-        .filter(|s| !s.is_empty())
         .map(|s| XmlItem::Atomic(XmlValue::string(&s)))
         .collect();
 
@@ -172,6 +173,71 @@ pub fn tokenize<N: DomNavigator>(
 // Helper Functions
 // ============================================================================
 
+/// The regular-expression flags XPath 2.0 defines: `s`, `m`, `i` and `x`.
+const XPATH20_REGEX_FLAGS: &str = "smix";
+
+/// Reject regular-expression syntax that the XPath 2.0 dialect does not have.
+///
+/// The `regexml` backend implements the later XPath dialect, which added the
+/// non-capturing group `(?:…)` (and the other `(?…)` forms) together with the
+/// `q` flag. In the XPath 2.0 grammar a `(` always opens a capturing group and
+/// is followed by a branch; `?` is a quantifier and a quantifier needs an atom
+/// in front of it, so an unescaped `(` can never be followed by `?`. The only
+/// defined flags are `s`, `m`, `i` and `x`.
+///
+/// This is deliberately a pre-pass over the *source* pattern rather than a
+/// change to the backend: only the three XPath regular-expression functions go
+/// through here, so `xs:pattern` facets — which compile the same backend
+/// directly and wrap their own value in `^(?:…)$` — keep working unchanged.
+///
+/// Returns FORX0001 for an undefined flag and FORX0002 for a `(?` occurrence
+/// outside a character class.
+fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathError> {
+    for f in flags.chars() {
+        if !XPATH20_REGEX_FLAGS.contains(f) {
+            return Err(XPathError::invalid_regex_flags(flags));
+        }
+    }
+
+    // With the `x` flag the whitespace characters #x9, #xA, #xD and #x20 are
+    // removed from the pattern before it is parsed, so `( ?:a)` is `(?:a)`.
+    let ignore_whitespace = flags.contains('x');
+
+    let chars: Vec<char> = pattern.chars().collect();
+    // `[` opens a character class and, after `-`, a nested subtracted class;
+    // inside a class an unescaped `[` or `]` is not allowed otherwise, so a
+    // plain depth counter tracks `[a-z-[(?]]` correctly.
+    let mut class_depth: usize = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            // A backslash escapes the character that follows it, so `\(?` is a
+            // literal `(` with a `?` quantifier on it.
+            '\\' => {
+                i += 2;
+                continue;
+            }
+            '[' => class_depth += 1,
+            ']' => class_depth = class_depth.saturating_sub(1),
+            '(' if class_depth == 0 => {
+                let mut j = i + 1;
+                if ignore_whitespace {
+                    while matches!(chars.get(j), Some('\u{9}' | '\u{A}' | '\u{D}' | ' ')) {
+                        j += 1;
+                    }
+                }
+                if chars.get(j) == Some(&'?') {
+                    return Err(XPathError::invalid_regex_pattern(pattern));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    Ok(())
+}
+
 /// Build a Regex from an XPath pattern and flags using regexml.
 ///
 /// regexml natively handles XML Schema regex syntax including:
@@ -180,6 +246,8 @@ pub fn tokenize<N: DomNavigator>(
 /// - Unicode categories `\p{Lu}`, `\P{Lu}`
 /// - Flag handling (s, m, i, x)
 fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
+    check_xpath20_regex_dialect(pattern, flags)?;
+
     Regex::xpath(pattern, flags).map_err(|e| match e {
         regexml::Error::InvalidFlags(_) => XPathError::invalid_regex_flags(flags),
         regexml::Error::Syntax(_) => XPathError::invalid_regex_pattern(pattern),
@@ -564,56 +632,203 @@ mod tests {
         assert!(matches!(result, XPathValue::Empty));
     }
 
-    #[test]
-    fn test_tokenize_filters_empty_tokens() {
-        // Test that tokenize filters out empty tokens from leading/trailing delimiters
+    /// Collect a tokenize() result as plain strings.
+    fn token_strings(value: XPathValue<RoXmlNavigator<'_>>) -> Vec<String> {
+        match value {
+            XPathValue::Empty => Vec::new(),
+            XPathValue::Item(XmlItem::Atomic(v)) => vec![v.to_string_value()],
+            XPathValue::Sequence(items) => items
+                .iter()
+                .map(|item| {
+                    if let XmlItem::Atomic(v) = item {
+                        v.to_string_value()
+                    } else {
+                        panic!("Expected atomic")
+                    }
+                })
+                .collect(),
+            _ => panic!("Expected a sequence of atomic values"),
+        }
+    }
+
+    fn tokenize_strings(input: &str, pattern: &str) -> Vec<String> {
         let names = NameTable::new();
         let mut ctx = create_context(&names);
-
-        // Leading delimiter - should not produce empty token at start
         let result = tokenize(
             &mut ctx,
-            vec![XPathValue::string(",a,b"), XPathValue::string(",")],
+            vec![XPathValue::string(input), XPathValue::string(pattern)],
         )
         .unwrap();
+        token_strings(result)
+    }
 
-        match result {
-            XPathValue::Sequence(items) => {
-                assert_eq!(items.len(), 2); // "a" and "b" only, no leading empty
-                let strs: Vec<String> = items
-                    .iter()
-                    .map(|item| {
-                        if let XmlItem::Atomic(v) = item {
-                            v.to_string_value()
-                        } else {
-                            panic!("Expected atomic")
-                        }
-                    })
-                    .collect();
-                assert_eq!(strs, vec!["a", "b"]);
-            }
-            _ => panic!("Expected sequence"),
+    #[test]
+    fn test_tokenize_leading_separator_keeps_empty_token() {
+        // A separator at the start of the input yields a zero-length first token.
+        assert_eq!(tokenize_strings(",a,b", ","), vec!["", "a", "b"]);
+        assert_eq!(tokenize_strings("/a/b", "/"), vec!["", "a", "b"]);
+    }
+
+    #[test]
+    fn test_tokenize_trailing_separator_keeps_empty_token() {
+        // A separator at the end of the input yields a zero-length last token.
+        assert_eq!(tokenize_strings("a,b,", ","), vec!["a", "b", ""]);
+        assert_eq!(tokenize_strings("a/b/", "/"), vec!["a", "b", ""]);
+    }
+
+    #[test]
+    fn test_tokenize_adjacent_separators_keep_empty_token() {
+        // Two adjacent separators have a zero-length token between them.
+        assert_eq!(tokenize_strings("a,,b", ","), vec!["a", "", "b"]);
+        assert_eq!(tokenize_strings(",a,", ","), vec!["", "a", ""]);
+        assert_eq!(tokenize_strings(",", ","), vec!["", ""]);
+    }
+
+    #[test]
+    fn test_tokenize_all_gaps_are_tokens() {
+        // Every gap between matches is a token: "abracadabra" split on
+        // "(ab)|(a)" starts and ends with a zero-length token.
+        assert_eq!(
+            tokenize_strings("abracadabra", "(ab)|(a)"),
+            vec!["", "r", "c", "d", "r", ""]
+        );
+    }
+
+    // =========================================================================
+    // XPath 2.0 regular-expression dialect
+    // =========================================================================
+
+    fn matches_result(
+        input: &str,
+        pattern: &str,
+        flags: Option<&str>,
+    ) -> Result<XPathValue<RoXmlNavigator<'static>>, XPathError> {
+        let names = Box::leak(Box::new(NameTable::new()));
+        let mut ctx = create_context(names);
+        let mut args = vec![XPathValue::string(input), XPathValue::string(pattern)];
+        if let Some(f) = flags {
+            args.push(XPathValue::string(f));
+        }
+        matches(&mut ctx, args)
+    }
+
+    #[test]
+    fn test_group_with_question_mark_is_rejected() {
+        // `(?:` and the other `(?…)` forms belong to a later dialect; XPath 2.0
+        // has no atom that starts with `(?`.
+        for pattern in ["(?:a)", "a(?:b)c", "(?i)a", "(?=a)", "(?!a)", "((?:a))"] {
+            assert!(
+                matches!(
+                    matches_result("a", pattern, None),
+                    Err(XPathError::FORX0002 { .. })
+                ),
+                "expected FORX0002 for {pattern}"
+            );
         }
     }
 
     #[test]
-    fn test_tokenize_trailing_delimiter() {
-        // Trailing delimiter - should not produce empty token at end
+    fn test_escaped_paren_followed_by_quantifier_is_accepted() {
+        // `\(?` is an escaped `(` carrying a `?` quantifier, which is legal.
+        let result = matches_result("x", r"\(?x", None).unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
+
+        let result = matches_result("(x", r"\(?x", None).unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
+    }
+
+    #[test]
+    fn test_question_mark_in_character_class_is_accepted() {
+        // A `(` and a `?` are ordinary members of a character class.
+        let result = matches_result("?", "[(?]", None).unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
+
+        // …including inside a subtracted nested class.
+        let result = matches_result("b", "[a-z-[(?]]", None).unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(true))
+        );
+        let result = matches_result("?", "[a-z-[(?]]", None).unwrap();
+        assert!(
+            matches!(result, XPathValue::Item(XmlItem::Atomic(v)) if v.as_boolean() == Some(false))
+        );
+
+        // A class closed before the `(?` does not shield it.
+        assert!(matches!(
+            matches_result("a", "[ab](?:c)", None),
+            Err(XPathError::FORX0002 { .. })
+        ));
+    }
+
+    #[test]
+    fn test_group_with_question_mark_rejected_under_x_flag() {
+        // With `x`, whitespace is removed before the pattern is parsed, so
+        // `( ?:a)` is the same pattern as `(?:a)`.
+        assert!(matches!(
+            matches_result("a", "( ?:a)", Some("x")),
+            Err(XPathError::FORX0002 { .. })
+        ));
+        assert!(matches!(
+            matches_result("a", "(\t\n?:a)", Some("x")),
+            Err(XPathError::FORX0002 { .. })
+        ));
+        // Without `x` the space is a literal, so the pattern is a plain group.
+        assert!(matches_result("a", "( ?:a)", None).is_ok());
+    }
+
+    #[test]
+    fn test_q_flag_is_rejected() {
+        // The `q` (literal) flag was introduced after XPath 2.0.
+        assert!(matches!(
+            matches_result("a.b", "a.b", Some("q")),
+            Err(XPathError::FORX0001 { .. })
+        ));
+        for flag in ["q", "z", "smixq", " "] {
+            assert!(
+                matches!(
+                    matches_result("a", "a", Some(flag)),
+                    Err(XPathError::FORX0001 { .. })
+                ),
+                "expected FORX0001 for flags {flag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_defined_flags_are_accepted() {
+        for flag in ["", "s", "m", "i", "x", "smix", "ii"] {
+            assert!(
+                matches_result("a", "a", Some(flag)).is_ok(),
+                "expected flags {flag:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dialect_check_applies_to_replace_and_tokenize() {
         let names = NameTable::new();
         let mut ctx = create_context(&names);
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("abc"),
+                XPathValue::string("(?:b)"),
+                XPathValue::string("X"),
+            ],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
 
         let result = tokenize(
             &mut ctx,
-            vec![XPathValue::string("a,b,"), XPathValue::string(",")],
-        )
-        .unwrap();
-
-        match result {
-            XPathValue::Sequence(items) => {
-                assert_eq!(items.len(), 2); // "a" and "b" only, no trailing empty
-            }
-            _ => panic!("Expected sequence"),
-        }
+            vec![XPathValue::string("abc"), XPathValue::string("(?:b)")],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
     }
 
     // =========================================================================

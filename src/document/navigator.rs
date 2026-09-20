@@ -34,10 +34,11 @@ pub struct BufferDocNavigator<'a> {
     /// Hide the synthetic root's children for XSD assertion absolute paths.
     assertion_absolute_root: bool,
     /// In assertion scope, the asserter element (the visible "fragment root").
-    /// `NULL` outside assertion scope. Reverse axes that need a forward
-    /// document-order starting point (e.g. `preceding`) use this so they walk
-    /// inside the visible subtree instead of getting stuck at the synthetic
-    /// root, whose children `move_to_first_child` deliberately hides.
+    /// `NULL` outside assertion scope. Axis iterators that have to bound a
+    /// traversal at the top of the tree (e.g. `preceding`, which walks back
+    /// towards it) use this so they stay inside the visible subtree instead
+    /// of running into the synthetic root, whose children
+    /// `move_to_first_child` deliberately hides.
     assertion_fragment_root: u32,
     /// Non-NULL when positioned on an attribute or namespace (= owning element).
     virtual_parent: u32,
@@ -382,6 +383,31 @@ impl<'a> BufferDocNavigator<'a> {
                                             ns_ref = ns_node.next;
                                             continue;
                                         }
+                                    }
+                                    // A zero-length URI is a namespace
+                                    // *undeclaration* (`xmlns=""`). It cancels
+                                    // an outer binding — it must stay in
+                                    // `seen` so the outer one is shadowed —
+                                    // but it is the absence of a binding, so
+                                    // under `All` (the XDM
+                                    // `dm:namespace-nodes` accessor behind the
+                                    // `namespace::` axis and
+                                    // `fn:in-scope-prefixes`) no namespace
+                                    // node exists for it. `Local` and
+                                    // `ExcludeXml` are views of the
+                                    // *declarations* — serialization, shallow
+                                    // copy and the namespace context that
+                                    // resolves QNames during validation — and
+                                    // must keep it.
+                                    if scope == NamespaceAxisScope::All
+                                        && self
+                                            .doc
+                                            .names
+                                            .resolve_ref(ns_node.namespace_uri)
+                                            .is_empty()
+                                    {
+                                        ns_ref = ns_node.next;
+                                        continue;
                                     }
                                     result.push(ns_ref);
                                 }
@@ -1343,6 +1369,77 @@ mod tests {
             !local_uris.contains("http://example.com"),
             "inherited should not be in Local scope"
         );
+    }
+
+    #[test]
+    fn namespace_undeclaration_is_not_a_namespace_node() {
+        // `xmlns=""` is the absence of a binding for the default prefix, not a
+        // binding to the zero-length URI, so the XDM `dm:namespace-nodes`
+        // accessor (scope `All`) reports no namespace node for it — while it
+        // still shadows the outer default namespace.
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<chap xmlns="http://c/"><para xmlns=""><deep/></para></chap>"#,
+            &arena,
+            &names,
+        );
+
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::All));
+        let mut chap = vec![(nav.local_name().to_string(), nav.value())];
+        while nav.move_to_next_namespace(NamespaceAxisScope::All) {
+            chap.push((nav.local_name().to_string(), nav.value()));
+        }
+        chap.sort();
+        assert_eq!(
+            chap,
+            vec![
+                (String::new(), "http://c/".to_string()),
+                (
+                    "xml".to_string(),
+                    "http://www.w3.org/XML/1998/namespace".to_string()
+                ),
+            ]
+        );
+
+        for depth in 2..=3 {
+            let mut nav = doc.create_navigator();
+            for _ in 0..depth {
+                assert!(nav.move_to_first_child());
+            }
+            assert!(nav.move_to_first_namespace(NamespaceAxisScope::All));
+            let mut seen = vec![(nav.local_name().to_string(), nav.value())];
+            while nav.move_to_next_namespace(NamespaceAxisScope::All) {
+                seen.push((nav.local_name().to_string(), nav.value()));
+            }
+            assert_eq!(
+                seen,
+                vec![(
+                    "xml".to_string(),
+                    "http://www.w3.org/XML/1998/namespace".to_string()
+                )],
+                "the undeclaration must shadow http://c/ without becoming a node (depth {depth})"
+            );
+        }
+
+        // The declaration itself is still visible to the views that model
+        // declarations rather than namespace nodes: the serializer and the
+        // namespace context that resolves QNames while validating both need
+        // `xmlns=""` to stay.
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        nav.move_to_first_child(); // para
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::Local));
+        assert_eq!((nav.local_name(), nav.value()), ("", String::new()));
+        assert!(!nav.move_to_next_namespace(NamespaceAxisScope::Local));
+
+        let mut nav = doc.create_navigator();
+        nav.move_to_first_child(); // chap
+        nav.move_to_first_child(); // para
+        assert!(nav.move_to_first_namespace(NamespaceAxisScope::ExcludeXml));
+        assert_eq!((nav.local_name(), nav.value()), ("", String::new()));
     }
 
     // ── 4. Element value ─────────────────────────────────────────────

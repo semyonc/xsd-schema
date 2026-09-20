@@ -715,10 +715,11 @@ AbbrevForwardStep: AstNodeId = {
         let span = SourceSpan::new(l, r);
         arena.add(AstNode::PathStep(PathStepNode::new(Axis::Attribute, t, span)))
     },
-    // NodeTest alone => child axis
+    // NodeTest alone => child axis, except for an AttributeTest or a
+    // SchemaAttributeTest, which default to the attribute axis (§3.2.4).
     <l:@L> <t:NodeTest> <r:@R> => {
         let span = SourceSpan::new(l, r);
-        arena.add(AstNode::PathStep(PathStepNode::new(Axis::Child, t, span)))
+        arena.add(AstNode::PathStep(PathStepNode::abbrev_forward(t, span)))
     },
 };
 

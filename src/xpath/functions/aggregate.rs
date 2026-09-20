@@ -36,8 +36,10 @@ pub fn sum<N: DomNavigator>(
     }
 
     let seq = args.remove(0);
+    // `$zero` may itself be the empty sequence, which is different from not
+    // supplying it: `fn:sum((), ())` is the empty sequence, `fn:sum(())` is 0.
     let zero = if !args.is_empty() {
-        atomize_to_single_opt(args.remove(0))?
+        Some(atomize_to_single_opt(args.remove(0))?)
     } else {
         None
     };
@@ -46,9 +48,9 @@ pub fn sum<N: DomNavigator>(
     let values = atomize_sequence(seq)?;
 
     if values.is_empty() {
-        // Return $zero if provided, otherwise integer 0
         return Ok(match zero {
-            Some(z) => XPathValue::from_atomic(z),
+            Some(Some(z)) => XPathValue::from_atomic(z),
+            Some(None) => XPathValue::Empty,
             None => XPathValue::integer(0),
         });
     }
@@ -133,6 +135,7 @@ pub fn min<N: DomNavigator>(
         .map(promote_for_comparison)
         .collect::<Result<Vec<_>, _>>()?;
     promote_to_common_numeric_type(&mut promoted);
+    reject_mixed_comparison_families(&promoted, "min")?;
 
     // Per XPath 2.0: If sequence contains NaN, return NaN
     if contains_nan(&promoted) {
@@ -182,6 +185,7 @@ pub fn max<N: DomNavigator>(
         .map(promote_for_comparison)
         .collect::<Result<Vec<_>, _>>()?;
     promote_to_common_numeric_type(&mut promoted);
+    reject_mixed_comparison_families(&promoted, "max")?;
 
     // Per XPath 2.0: If sequence contains NaN, return NaN
     if contains_nan(&promoted) {
@@ -226,21 +230,21 @@ fn is_integer_type(code: XmlTypeCode) -> bool {
 
 /// Promote a value for sum/avg operations.
 ///
-/// Integers are promoted to decimal for accumulation.
-/// UntypedAtomic is promoted to double.
+/// UntypedAtomic is promoted to double; every other accepted type is left
+/// alone, because `fn:sum` accumulates with `op:numeric-add`, whose result
+/// type is the operands' own: a sum of `xs:integer`s is an `xs:integer`, not
+/// an `xs:decimal`. A subtype of `xs:integer` is widened to `xs:integer`,
+/// which is what `op:numeric-add` returns for it.
 fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double | XmlTypeCode::Float | XmlTypeCode::Decimal => Ok(value.clone()),
         XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration => Ok(value.clone()),
+        XmlTypeCode::Integer => Ok(value.clone()),
         code if is_integer_type(code) => {
-            // Promote integers to decimal for accumulation
             let i = value.as_integer().ok_or_else(|| XPathError::FORG0006 {
                 message: "Expected integer value".to_string(),
             })?;
-            let d: Decimal = i.to_string().parse().map_err(|_| XPathError::FORG0006 {
-                message: "Failed to convert integer to decimal".to_string(),
-            })?;
-            Ok(XmlValue::decimal(d))
+            Ok(XmlValue::integer(i.clone()))
         }
         XmlTypeCode::UntypedAtomic => {
             // Promote untyped to double - per XPath 2.0, throw FORG0001 for invalid values
@@ -258,6 +262,44 @@ fn promote_for_sum(value: &XmlValue) -> Result<XmlValue, XPathError> {
             ),
         }),
     }
+}
+
+/// The family of types a value can be ordered against: all the numeric types
+/// compare with one another, and so do all the string types with `xs:anyURI`,
+/// but nothing else crosses a primitive boundary.
+fn comparison_family(code: XmlTypeCode) -> XmlTypeCode {
+    if code.is_numeric() {
+        return XmlTypeCode::Decimal;
+    }
+    if code.is_string_derived() || code == XmlTypeCode::AnyUri {
+        return XmlTypeCode::String;
+    }
+    if code == XmlTypeCode::DateTimeStamp {
+        return XmlTypeCode::DateTime;
+    }
+    code
+}
+
+/// `fn:min` and `fn:max` raise FORG0006 when the converted sequence holds
+/// values of more than one primitive type, because `lt`/`gt` are not defined
+/// across primitives.
+fn reject_mixed_comparison_families(values: &[XmlValue], function: &str) -> Result<(), XPathError> {
+    let Some(first) = values.first() else {
+        return Ok(());
+    };
+    let family = comparison_family(first.type_code);
+    for value in values.iter().skip(1) {
+        if comparison_family(value.type_code) != family {
+            return Err(XPathError::FORG0006 {
+                message: format!(
+                    "fn:{function} requires a sequence of a single primitive type, \
+                     got {:?} and {:?}",
+                    first.type_code, value.type_code
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Promote all numeric values to the common numeric type.
@@ -288,14 +330,25 @@ fn promote_to_common_numeric_type(values: &mut [XmlValue]) {
 /// Promote a value for comparison (min/max).
 ///
 /// UntypedAtomic is promoted to double for numeric context, string otherwise.
+///
+/// `fn:min` and `fn:max` accept every type on which `lt`/`gt` are defined:
+/// the numeric types, the string types, `xs:boolean`, the two ordered
+/// duration types, and `xs:date`, `xs:time` and `xs:dateTime`. `xs:duration`
+/// itself and the `xs:gYear`-family types have no ordering, so they keep
+/// raising FORG0006.
 fn promote_for_comparison(value: &XmlValue) -> Result<XmlValue, XPathError> {
     match value.type_code {
         XmlTypeCode::Double
         | XmlTypeCode::Float
         | XmlTypeCode::Decimal
-        | XmlTypeCode::String
+        | XmlTypeCode::Boolean
         | XmlTypeCode::DayTimeDuration
-        | XmlTypeCode::YearMonthDuration => Ok(value.clone()),
+        | XmlTypeCode::YearMonthDuration
+        | XmlTypeCode::Date
+        | XmlTypeCode::Time
+        | XmlTypeCode::DateTime
+        | XmlTypeCode::DateTimeStamp => Ok(value.clone()),
+        code if code.is_string_derived() => Ok(value.clone()),
         code if is_integer_type(code) => Ok(value.clone()),
         XmlTypeCode::UntypedAtomic => {
             // Treat as double for min/max - throw FORG0001 for invalid values
@@ -339,6 +392,17 @@ fn numeric_divide(value: &XmlValue, count: usize) -> Result<XmlValue, XPathError
             let v = value.as_decimal().unwrap();
             let count_decimal = Decimal::from(count as u64);
             Ok(XmlValue::decimal(v / count_decimal))
+        }
+        // `fn:avg` divides the sum by the count with `op:numeric-divide`, and
+        // dividing two xs:integers yields an xs:decimal.
+        code if is_integer_type(code) => {
+            let v = value.as_integer().ok_or_else(|| XPathError::FORG0006 {
+                message: "Expected integer value".to_string(),
+            })?;
+            let d: Decimal = v.to_string().parse().map_err(|_| XPathError::FORG0006 {
+                message: "Failed to convert integer to decimal".to_string(),
+            })?;
+            Ok(XmlValue::decimal(d / Decimal::from(count as u64)))
         }
         XmlTypeCode::YearMonthDuration => {
             let dur = get_year_month_duration(value)?;

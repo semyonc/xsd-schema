@@ -37,3 +37,35 @@ fn test_value_node() {
         _ => panic!("Expected integer"),
     }
 }
+
+#[test]
+fn test_abbrev_forward_step_default_axis() {
+    // XPath 2.0 §3.2.4: the default axis of an abbreviated forward step is
+    // `child` unless the node test is an AttributeTest or a
+    // SchemaAttributeTest, in which case it is `attribute`.
+    let span = SourceSpan::new(0, 1);
+
+    let named = PathStepNode::abbrev_forward(NodeTest::Name(NameTest::any()), span);
+    assert_eq!(named.axis, Axis::Child);
+
+    let kind = PathStepNode::abbrev_forward(NodeTest::Kind(KindTest::AnyKind), span);
+    assert_eq!(kind.axis, Axis::Child);
+
+    let element = PathStepNode::abbrev_forward(
+        NodeTest::Kind(KindTest::Element(ElementTest::default())),
+        span,
+    );
+    assert_eq!(element.axis, Axis::Child);
+
+    let attribute = PathStepNode::abbrev_forward(
+        NodeTest::Kind(KindTest::Attribute(AttributeTest::default())),
+        span,
+    );
+    assert_eq!(attribute.axis, Axis::Attribute);
+
+    let schema_attribute = PathStepNode::abbrev_forward(
+        NodeTest::Kind(KindTest::SchemaAttribute("id".to_string())),
+        span,
+    );
+    assert_eq!(schema_attribute.axis, Axis::Attribute);
+}

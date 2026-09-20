@@ -2448,6 +2448,36 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_pattern_compiles_independently_of_xpath_dialect_gate() {
+        // Pattern facets compile through the regex backend directly and wrap
+        // their own value in `^(?:…)$`. The XPath function layer rejects a
+        // pattern containing `(?` (its grammar has no such atom), which must
+        // not leak into facet compilation. A facet whose own value contains a
+        // group with an alternation exercises exactly the wrapper that would
+        // be rejected there.
+        let pattern = PatternFacet::new(
+            "(abc|def)+".to_string(),
+            None,
+            XsdVersion::V1_1,
+            RegexCompat::Strict,
+        )
+        .unwrap();
+        assert!(pattern.matches("abcdef"));
+        assert!(!pattern.matches("abcx"));
+
+        // Same under XSD 1.0 and under the lenient grammar gate.
+        let pattern = PatternFacet::new(
+            "(a|b)*".to_string(),
+            None,
+            XsdVersion::V1_0,
+            RegexCompat::LenientMs,
+        )
+        .unwrap();
+        assert!(pattern.matches("abba"));
+        assert!(!pattern.matches("abc"));
+    }
+
     // =========================================================================
     // Whitespace normalization tests
     // =========================================================================

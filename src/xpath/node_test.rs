@@ -8,12 +8,47 @@ use crate::namespace::qname::QualifiedName;
 use crate::schema::model::DerivationSet;
 use crate::types::value::XmlValue;
 use crate::types::{ItemType, NameTest, SequenceType};
-use crate::xpath::ast::{ItemTypeNode, KindTest};
+use crate::xpath::ast::{Axis, ItemTypeNode, KindTest};
 use crate::xpath::cast::type_matches;
 use crate::xpath::iterator::XmlItem;
 
 use super::context::XPathContext;
 use super::{DomNavigator, DomNodeType};
+
+/// The principal node kind of `axis` (XPath 2.0 §3.2.1.1).
+///
+/// "If an axis can contain elements, then the principal node kind is element;
+/// otherwise, it is the kind of nodes that the axis can contain." Thus it is
+/// attribute for the `attribute::` axis, namespace for `namespace::`, and
+/// element for every other axis.
+pub fn principal_node_kind(axis: Axis) -> DomNodeType {
+    match axis {
+        Axis::Attribute => DomNodeType::Attribute,
+        Axis::Namespace => DomNodeType::Namespace,
+        _ => DomNodeType::Element,
+    }
+}
+
+/// Build the runtime node test for a **name test** used on an axis whose
+/// principal node kind is `principal`.
+///
+/// XPath 2.0 §3.2.1.2: "A name test is true if and only if the kind of the
+/// node is the principal node kind for the step axis and the expanded QName
+/// of the node is equal (as defined by the `eq` operator) to the expanded
+/// QName specified by the name test." Without this restriction `self::*` and
+/// `ancestor-or-self::*` would select attribute nodes, which are never of the
+/// principal node kind of those axes.
+pub fn name_test_for_principal_kind(test: NameTest, principal: DomNodeType) -> NodeTest {
+    match principal {
+        DomNodeType::Attribute => {
+            NodeTest::Type(SequenceType::one(ItemType::Attribute(Some(test), None)))
+        }
+        // A namespace node's name is its prefix, and it is the only kind the
+        // `namespace::` axis yields; `matches_name_test` applies that rule.
+        DomNodeType::Namespace => NodeTest::Name(test),
+        _ => NodeTest::Type(SequenceType::one(ItemType::Element(Some(test), None))),
+    }
+}
 
 /// Unified node test for axis iterators.
 #[derive(Debug, Clone)]
@@ -443,7 +478,19 @@ pub fn matches_kind_test<N: DomNavigator>(
                     return false;
                 }
             }
-            // TODO: Check type annotation if specified (elem_test.type_name)
+            if let Some(ref type_name) = elem_test.type_name {
+                if !matches_type_annotation(nav, type_name, true, ctx) {
+                    return false;
+                }
+                // §2.5.4.3: `element(N, T)` requires "the nilled property of
+                // the node is false"; only `element(N, T?)` accepts a nilled
+                // element.
+                if !elem_test.nillable
+                    && matches!(nav.typed_value(), crate::xpath::TypedValue::Nilled)
+                {
+                    return false;
+                }
+            }
             true
         }
         KindTest::Attribute(attr_test) => {
@@ -456,7 +503,11 @@ pub fn matches_kind_test<N: DomNavigator>(
                     return false;
                 }
             }
-            // TODO: Check type annotation if specified (attr_test.type_name)
+            if let Some(ref type_name) = attr_test.type_name {
+                if !matches_type_annotation(nav, type_name, false, ctx) {
+                    return false;
+                }
+            }
             true
         }
         KindTest::SchemaElement(name) => {
@@ -578,6 +629,84 @@ pub fn matches_kind_test<N: DomNavigator>(
             }
             // No schema context - name and namespace already verified
             true
+        }
+    }
+}
+
+/// Does the node's type annotation derive from the `TypeName` of an
+/// `element(N, T)` or `attribute(N, T)` test?
+///
+/// XPath 2.0 §2.5.4.3: "`element(ElementName, TypeName)` matches an element node
+/// whose name is `ElementName` if `derives-from(AT, TypeName)` is `true`, where
+/// `AT` is the type annotation of the element node". §2.5.4.5 states the same
+/// rule for `attribute(AttributeName, TypeName)`.
+///
+/// A node that carries no type annotation — any node of a document that was
+/// never validated, or one a lax assessment skipped — is annotated `xs:untyped`
+/// if it is an element and `xs:untypedAtomic` if it is an attribute. Those two
+/// types derive from none of the ordinary schema types, which is why
+/// `element(*, xs:integer)` must not match an untyped element; they do derive
+/// from `xs:anyType`, and `xs:untypedAtomic` additionally from
+/// `xs:anySimpleType` and `xs:anyAtomicType`. (That hierarchy is XDM, which is
+/// not available locally, so it is stated **from memory**; it is corroborated by
+/// this crate's own `types::builtin` base-type table, which gives
+/// `xs:untypedAtomic` the base `xs:anyAtomicType`, and by the W3C tests
+/// `saxonData/CTA/cta0018` and `cta0019`, which use `element(*, xs:untyped)` and
+/// `attribute(*, xs:untypedAtomic)` precisely to detect the untyped case.)
+fn matches_type_annotation<N: DomNavigator>(
+    nav: &N,
+    type_name: &crate::xpath::ast::QName,
+    is_element: bool,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    use crate::namespace::table::well_known;
+
+    // An unprefixed TypeName is in the default element/type namespace.
+    let ns_id = if type_name.prefix.is_empty() {
+        ctx.default_element_ns
+    } else {
+        match ctx.resolve_prefix(&type_name.prefix) {
+            Some(uri) => Some(ctx.names.add(&uri)),
+            None => return false,
+        }
+    };
+    let is_xs = ns_id == Some(well_known::XS_NAMESPACE);
+
+    match nav.type_annotation() {
+        None => {
+            // The node is untyped.
+            if !is_xs {
+                return false;
+            }
+            if is_element {
+                matches!(type_name.local.as_str(), "untyped" | "anyType")
+            } else {
+                matches!(
+                    type_name.local.as_str(),
+                    "untypedAtomic" | "anyAtomicType" | "anySimpleType" | "anyType"
+                )
+            }
+        }
+        Some(actual) => {
+            // The node is annotated, so the TypeName has to name a type of the
+            // schema the annotation came from.
+            let Some(schema_set) = ctx.schema_set else {
+                return false;
+            };
+            let local_id = ctx.names.add(&type_name.local);
+            let target = if is_xs {
+                schema_set.get_built_in_type_by_qname(ns_id, local_id)
+            } else {
+                schema_set.lookup_type(ns_id, local_id)
+            };
+            match target {
+                Some(target) => {
+                    schema_set.is_type_derived_from(actual, target, DerivationSet::empty())
+                }
+                // `xs:untyped` has no schema type of its own, and an annotated
+                // node is not untyped in any case.
+                None => false,
+            }
         }
     }
 }

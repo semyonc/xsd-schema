@@ -149,13 +149,14 @@ pub trait DomNavigator: Clone {
     /// Move to the document root
     fn move_to_root(&mut self);
 
-    /// Move to the appropriate starting position for forward document-order
-    /// traversal of the visible tree. In normal scope this is the document
-    /// root; in XSD 1.1 assertion scope it is the asserter element (the
-    /// "fragment root"), so reverse-axis iterators that need to walk forward
-    /// from the visible root stay inside the asserted subtree instead of
-    /// being blocked at the synthetic root, whose children are deliberately
-    /// hidden by `move_to_first_child`.
+    /// Move to the root of the **visible** tree. In normal scope this is the
+    /// document root; in XSD 1.1 assertion scope it is the asserter element
+    /// (the "fragment root"), whose ancestors are outside the tree the
+    /// assertion sees. Axis iterators that have to bound a traversal at the
+    /// top of the tree — `preceding`, which walks back towards it — use this
+    /// rather than `move_to_root`, so they stay inside the asserted subtree
+    /// instead of running into the synthetic root whose children are
+    /// deliberately hidden by `move_to_first_child`.
     ///
     /// Default implementation calls `move_to_root`. Implementations that
     /// support assertion scope should override.

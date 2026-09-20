@@ -536,79 +536,36 @@ pub fn subsequence<N: DomNavigator>(
         None => None,
     };
 
-    // Handle NaN cases
-    if starting_loc.is_nan() {
-        return Ok(XPathValue::Empty);
-    }
-    if let Some(len) = length {
-        if len.is_nan() {
-            return Ok(XPathValue::Empty);
-        }
-    }
-
-    // Handle infinity cases
-    if starting_loc.is_infinite() && starting_loc.is_sign_positive() {
-        return Ok(XPathValue::Empty);
-    }
-    if let Some(len) = length {
-        if len.is_infinite() && len.is_sign_negative() {
-            return Ok(XPathValue::Empty);
-        }
-    }
-
     // Materialize source sequence
     let items = materialize(source);
 
-    // F&O §15.1.10 selects the items whose position p satisfies
-    // `p >= fn:round($startingLoc)` and `p < fn:round($startingLoc) +
-    // fn:round($length)`, so both arguments go through fn:round's own rounding.
-    let start_rounded = round_half_toward_positive_infinity_f64(starting_loc);
+    // F&O §15.1.10 defines the result as the items whose position `p`
+    // satisfies `fn:round($startingLoc) <= p` and
+    // `p < fn:round($startingLoc) + fn:round($length)`, with both comparisons
+    // evaluated in xs:double arithmetic. Keeping the arithmetic in f64 makes
+    // the infinite and NaN arguments fall out of the same two comparisons:
+    // `-INF` to `+INF` sums to NaN, and every comparison with NaN is false, so
+    // the result is empty.
+    let start = round_half_toward_positive_infinity_f64(starting_loc);
+    let end_exclusive = length.map(|len| start + round_half_toward_positive_infinity_f64(len));
 
-    // Calculate effective start and end positions
-    let (start_idx, end_idx) = match length {
-        Some(len) => {
-            let len_rounded = round_half_toward_positive_infinity_f64(len);
-            // Per spec: items where round(startingLoc) <= position < round(startingLoc) + round(length)
-            // Note: position is 1-based, so item at position p has index p-1
-
-            // Handle negative start adjusting length
-            let effective_start = if start_rounded < 1.0 {
-                // If start is negative, we skip fewer items but the length is reduced
-                1.0
-            } else {
-                start_rounded
-            };
-
-            // Calculate length adjustment for negative start
-            let adjusted_len = if start_rounded < 1.0 {
-                len_rounded + start_rounded - 1.0
-            } else {
-                len_rounded
-            };
-
-            if adjusted_len <= 0.0 {
-                return Ok(XPathValue::Empty);
-            }
-
-            let start = (effective_start - 1.0).max(0.0) as usize;
-            let end = (effective_start - 1.0 + adjusted_len).min(items.len() as f64) as usize;
-            (start, end)
-        }
-        None => {
-            // No length specified - go to end
-            if start_rounded < 1.0 {
-                (0, items.len())
-            } else {
-                let start = (start_rounded - 1.0).max(0.0) as usize;
-                (start, items.len())
-            }
-        }
-    };
-
-    // Handle out of range
-    if start_idx >= items.len() {
+    if start.is_nan() || end_exclusive.is_some_and(f64::is_nan) {
         return Ok(XPathValue::Empty);
     }
+
+    let count = items.len() as f64;
+    // Both bounds are integer-valued (or infinite), so `p < end` is
+    // `p <= end - 1` over the integer positions.
+    let first_position = start.max(1.0);
+    let last_position = match end_exclusive {
+        Some(end) => (end - 1.0).min(count),
+        None => count,
+    };
+    if first_position > count || first_position > last_position {
+        return Ok(XPathValue::Empty);
+    }
+    let start_idx = (first_position - 1.0) as usize;
+    let end_idx = last_position as usize;
 
     // Extract subsequence
     let result: Vec<XmlItem<N>> = items

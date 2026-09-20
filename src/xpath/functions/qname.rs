@@ -43,18 +43,24 @@ pub fn resolve_qname<N: DomNavigator>(
     let qname_arg = args.remove(0);
     let qname_str = atomize_to_string_opt(qname_arg)?;
 
-    // If $qname is empty sequence, return empty
-    // If $qname is empty string, it's an invalid QName (FORG0001)
+    // If $qname is the empty sequence, return empty. A $qname that is not a
+    // lexical QName — including the zero-length string — is FOCA0002 here,
+    // not the FORG0001 of a failed `cast as xs:QName`.
     let qname_str = match qname_str {
         None => return Ok(XPathValue::Empty),
         Some(s) if s.is_empty() => {
-            return Err(XPathError::invalid_cast_value("", "xs:QName"));
+            return Err(XPathError::FOCA0002 {
+                qname: String::new(),
+            });
         }
         Some(s) => s,
     };
 
     // Parse the lexical QName
-    let (prefix, local_name) = parse_lexical_qname(&qname_str)?;
+    let (prefix, local_name) =
+        parse_lexical_qname(&qname_str).map_err(|_| XPathError::FOCA0002 {
+            qname: qname_str.clone(),
+        })?;
 
     // Lookup namespace for prefix using element's in-scope namespaces
     let namespace_uri = lookup_namespace_for_prefix(&element, prefix.as_deref())?;
@@ -420,9 +426,11 @@ fn lookup_namespace_for_prefix<N: DomNavigator>(
 ) -> Result<Option<String>, XPathError> {
     let result = lookup_namespace_for_prefix_opt(element, prefix);
 
-    // For resolve-QName, undefined prefix is an error
+    // For resolve-QName an undefined prefix is FONS0004: the element has no
+    // binding for it. (XPST0081 is the *static* error for a prefix that the
+    // expression's own static context cannot expand.)
     if prefix.is_some() && prefix != Some("") && result.is_none() {
-        return Err(XPathError::undefined_prefix(prefix.unwrap_or("")));
+        return Err(XPathError::no_namespace_for_prefix(prefix.unwrap_or("")));
     }
 
     Ok(result)

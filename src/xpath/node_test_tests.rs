@@ -945,3 +945,165 @@ fn name_tests_select_namespace_nodes_by_prefix() {
     // A prefixed name test never matches: the name is in no namespace.
     assert_eq!(count("count(/out/namespace::*[name() = 'four'])"), "1");
 }
+
+// ── §2.5.4.3 / §2.5.4.5: the TypeName of an element()/attribute() test ──────
+
+/// An untyped node is annotated `xs:untyped` (element) or `xs:untypedAtomic`
+/// (attribute), which derives from none of the ordinary schema types.
+#[test]
+fn element_and_attribute_type_names_reject_an_untyped_node() {
+    use crate::xpath::XPathExpr;
+
+    let doc = roxmltree::Document::parse(r#"<doc a="1"/>"#).expect("parse xml");
+    let table = NameTable::new();
+    let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        table.add("xs"),
+        table.add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    let ctx = XPathContext::new(&table).with_namespaces(namespaces);
+
+    let value = |expr: &str| {
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run_with_node::<RoXmlNavigator<'_>>(RoXmlNavigator::new(&doc))
+            .expect("evaluate")
+            .first()
+            .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+            .unwrap_or_default()
+    };
+
+    // A document that was never validated carries no type annotation.
+    assert_eq!(value("/doc instance of element(*, xs:integer)"), "false");
+    assert_eq!(value("/doc instance of element(doc, xs:integer)"), "false");
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:integer)"),
+        "false"
+    );
+    assert_eq!(
+        value("/doc/@a instance of attribute(a, xs:string)"),
+        "false"
+    );
+    // `xs:untyped` / `xs:untypedAtomic` and `xs:anyType` do match.
+    assert_eq!(value("/doc instance of element(*, xs:untyped)"), "true");
+    assert_eq!(value("/doc instance of element(*, xs:anyType)"), "true");
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:untypedAtomic)"),
+        "true"
+    );
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:anyAtomicType)"),
+        "true"
+    );
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:anySimpleType)"),
+        "true"
+    );
+    // …and the two untyped annotations are not interchangeable.
+    assert_eq!(
+        value("/doc instance of element(*, xs:untypedAtomic)"),
+        "false"
+    );
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:untyped)"),
+        "false"
+    );
+    // A test without a TypeName is unaffected.
+    assert_eq!(value("/doc instance of element()"), "true");
+    assert_eq!(value("/doc instance of element(doc)"), "true");
+    assert_eq!(value("/doc/@a instance of attribute()"), "true");
+    assert_eq!(value("/doc/@a instance of attribute(a)"), "true");
+    // The `T?` form only relaxes the nilled requirement, not the type match.
+    assert_eq!(value("/doc instance of element(*, xs:untyped?)"), "true");
+    assert_eq!(value("/doc instance of element(*, xs:integer?)"), "false");
+    // An unresolvable prefix in the TypeName matches nothing.
+    assert_eq!(value("/doc instance of element(*, nope:t)"), "false");
+}
+
+/// On a validated document the annotation is compared with `derives-from`.
+#[test]
+fn element_and_attribute_type_names_use_the_real_annotation() {
+    use crate::document::typed_builder::build_typed_document;
+    use crate::document::BufferDocumentOptions;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+    use crate::xpath::XPathExpr;
+    use bumpalo::Bump;
+
+    let mut schema_set = SchemaSet::xsd11();
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+             <xs:simpleType name="count">
+               <xs:restriction base="xs:integer"/>
+             </xs:simpleType>
+             <xs:element name="doc">
+               <xs:complexType>
+                 <xs:sequence>
+                   <xs:element name="n" type="count"/>
+                 </xs:sequence>
+                 <xs:attribute name="a" type="xs:date"/>
+               </xs:complexType>
+             </xs:element>
+           </xs:schema>"#
+            .as_bytes(),
+        "test.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("load schema");
+
+    let arena = Bump::new();
+    let doc = build_typed_document(
+        r#"<doc a="2024-01-01"><n>7</n></doc>"#.as_bytes(),
+        &arena,
+        &schema_set,
+        BufferDocumentOptions::default(),
+    )
+    .expect("build typed document");
+
+    let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        schema_set.name_table.add("xs"),
+        schema_set
+            .name_table
+            .add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    let ctx = XPathContext::new(&schema_set.name_table)
+        .with_namespaces(namespaces)
+        .with_schema_set(&schema_set);
+
+    let value = |expr: &str| {
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run_with_node(doc.create_navigator())
+            .expect("evaluate")
+            .first()
+            .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+            .unwrap_or_default()
+    };
+
+    // The attribute is annotated xs:date.
+    assert_eq!(value("/doc/@a instance of attribute(*, xs:date)"), "true");
+    assert_eq!(value("/doc/@a instance of attribute(a, xs:date)"), "true");
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:integer)"),
+        "false"
+    );
+    // An annotated node is no longer untyped.
+    assert_eq!(
+        value("/doc/@a instance of attribute(*, xs:untypedAtomic)"),
+        "false"
+    );
+    // `n` is annotated with the user-defined `count`, derived from xs:integer.
+    assert_eq!(value("/doc/n instance of element(*, count)"), "true");
+    assert_eq!(value("/doc/n instance of element(*, xs:integer)"), "true");
+    assert_eq!(value("/doc/n instance of element(*, xs:decimal)"), "true");
+    assert_eq!(value("/doc/n instance of element(*, xs:string)"), "false");
+    assert_eq!(value("/doc/n instance of element(*, xs:untyped)"), "false");
+    // The element itself has a complex type, so no atomic type matches it, but
+    // xs:anyType does.
+    assert_eq!(value("/doc instance of element(*, xs:anyType)"), "true");
+    assert_eq!(value("/doc instance of element(*, xs:string)"), "false");
+}

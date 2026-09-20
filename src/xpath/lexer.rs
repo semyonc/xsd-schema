@@ -382,19 +382,44 @@ impl<'input> Lexer<'input> {
     }
 
     /// Check if a character is an XML NCName start character.
+    ///
+    /// XML 1.0 §2.3 `NameStartChar`, minus `":"` (Namespaces in XML §3,
+    /// `NCName`). This is a fixed list of code-point ranges, not a Unicode
+    /// property: `Alphabetic` would also admit characters such as U+00B5
+    /// MICRO SIGN, which the production excludes because its ranges start at
+    /// #xC0.
     fn is_ncname_start(c: char) -> bool {
-        c.is_alphabetic() || c == '_'
+        matches!(c,
+            'A'..='Z'
+            | '_'
+            | 'a'..='z'
+            | '\u{C0}'..='\u{D6}'
+            | '\u{D8}'..='\u{F6}'
+            | '\u{F8}'..='\u{2FF}'
+            | '\u{370}'..='\u{37D}'
+            | '\u{37F}'..='\u{1FFF}'
+            | '\u{200C}'..='\u{200D}'
+            | '\u{2070}'..='\u{218F}'
+            | '\u{2C00}'..='\u{2FEF}'
+            | '\u{3001}'..='\u{D7FF}'
+            | '\u{F900}'..='\u{FDCF}'
+            | '\u{FDF0}'..='\u{FFFD}'
+            | '\u{10000}'..='\u{EFFFF}')
     }
 
     /// Check if a character is an XML NCName character.
+    ///
+    /// XML 1.0 §2.3 `NameChar`, minus `":"`. Note that only ASCII digits are
+    /// added here — the other decimal digits that `char::is_alphanumeric`
+    /// would accept are covered (or not) by the `NameStartChar` ranges.
     fn is_ncname_char(c: char) -> bool {
-        c.is_alphanumeric()
-            || c == '_'
-            || c == '-'
-            || c == '.'
-            || c == '\u{B7}'
-            || ('\u{0300}'..='\u{036F}').contains(&c)
-            || ('\u{203F}'..='\u{2040}').contains(&c)
+        Self::is_ncname_start(c)
+            || matches!(c,
+                '-' | '.'
+                | '0'..='9'
+                | '\u{B7}'
+                | '\u{300}'..='\u{36F}'
+                | '\u{203F}'..='\u{2040}')
     }
 
     /// Check if a character is a digit.
@@ -693,19 +718,14 @@ impl<'input> Lexer<'input> {
             }
         }
 
-        // Decimal part
-        if self.current() == Some('.') && self.peek(1).map(Self::is_digit).unwrap_or(false) {
-            is_decimal = true;
-            self.advance(1);
-            while let Some(c) = self.current() {
-                if Self::is_digit(c) {
-                    self.advance(1);
-                } else {
-                    break;
-                }
-            }
-        } else if self.current() == Some('.') && start == self.pos {
-            // Just a dot followed by digits
+        // Decimal part. XPath 2.0 §A.2.1:
+        //   DecimalLiteral ::= ("." Digits) | (Digits "." [0-9]*)
+        // The fractional digits are optional once at least one digit precedes
+        // the ".", so `5.` is a DecimalLiteral; with no leading digit the "."
+        // must be followed by at least one digit.
+        if self.current() == Some('.')
+            && (self.pos > start || self.peek(1).map(Self::is_digit).unwrap_or(false))
+        {
             is_decimal = true;
             self.advance(1);
             while let Some(c) = self.current() {
@@ -779,16 +799,6 @@ impl<'input> Lexer<'input> {
                 }
             }
         }
-
-        // Decode entity/character references (e.g., &amp; &#xHHHH;) in string literals,
-        // matching the C# Tokenizer's ConsumeLiteral() behavior.
-        let value =
-            crate::xpath::string_ops::normalize_string_value(&value, false, true).map_err(|e| {
-                LexerError {
-                    message: format!("{}", e),
-                    position: start,
-                }
-            })?;
 
         Ok((Token::StringLiteral(value), start, self.pos))
     }
@@ -2451,5 +2461,111 @@ mod tests {
             tokenize("bar:baz"),
             vec![Token::QName("bar:baz".to_string())]
         );
+    }
+
+    /// XPath 2.0 §3.1.1: the value of a string literal is the characters
+    /// between the delimiters, a doubled delimiter standing for one. XML
+    /// un-escaping is the host language's job and has already happened by the
+    /// time the expression text reaches the processor.
+    mod string_literals_are_not_re_decoded {
+        use super::*;
+
+        fn literal(input: &str) -> String {
+            match &tokenize(input)[0] {
+                Token::StringLiteral(s) => s.clone(),
+                other => panic!("expected a string literal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn entity_references_are_left_alone() {
+            assert_eq!(literal("'a&amp;b'"), "a&amp;b");
+            assert_eq!(literal("'&#13;'"), "&#13;");
+            assert_eq!(literal("'&lt;&gt;'"), "&lt;&gt;");
+        }
+
+        #[test]
+        fn a_bare_ampersand_is_an_ordinary_character() {
+            // Neither an unterminated nor an unknown reference is an error:
+            // there are no references in an XPath string literal at all.
+            assert_eq!(literal("'a&b'"), "a&b");
+            assert_eq!(literal("'a&foo;b'"), "a&foo;b");
+            assert_eq!(literal("'&'"), "&");
+        }
+
+        #[test]
+        fn carriage_returns_survive() {
+            assert_eq!(literal("'a\rb'"), "a\rb");
+            assert_eq!(literal("'a\r\nb'"), "a\r\nb");
+        }
+
+        #[test]
+        fn a_doubled_delimiter_still_stands_for_one() {
+            assert_eq!(literal("'it''s'"), "it's");
+            assert_eq!(literal("\"say \"\"hi\"\"\""), "say \"hi\"");
+        }
+    }
+
+    /// XPath 2.0 §A.2.1:
+    /// `DecimalLiteral ::= ("." Digits) | (Digits "." [0-9]*)`.
+    #[test]
+    fn decimal_literal_may_end_with_the_period() {
+        assert_eq!(
+            tokenize("5."),
+            vec![Token::DecimalLiteral("5.".to_string())]
+        );
+        assert_eq!(
+            tokenize("123."),
+            vec![Token::DecimalLiteral("123.".to_string())]
+        );
+        assert_eq!(
+            tokenize("5. + 1"),
+            vec![
+                Token::DecimalLiteral("5.".to_string()),
+                Token::Plus,
+                Token::IntegerLiteral("1".to_string())
+            ]
+        );
+        // The other two forms are unchanged.
+        assert_eq!(
+            tokenize(".5"),
+            vec![Token::DecimalLiteral(".5".to_string())]
+        );
+        assert_eq!(
+            tokenize("5.25"),
+            vec![Token::DecimalLiteral("5.25".to_string())]
+        );
+        // A lone "." is still the context item, and ".." the parent step.
+        assert_eq!(tokenize("."), vec![Token::Dot]);
+        assert_eq!(tokenize(".."), vec![Token::DoublePeriod]);
+    }
+
+    /// XML 1.0 §2.3 `NameStartChar` / `NameChar`, minus `":"`.
+    #[test]
+    fn ncname_uses_the_xml_name_productions() {
+        // U+00B5 MICRO SIGN is Unicode `Alphabetic` but is below the first
+        // NameStartChar range (#xC0), so it cannot start a name.
+        assert!(!Lexer::is_ncname_start('\u{B5}'));
+        assert!(!Lexer::is_ncname_char('\u{B5}'));
+        // …nor can U+00D7 MULTIPLICATION SIGN or U+00F7 DIVISION SIGN, the two
+        // holes in the #xC0-#xF6 / #xD8-#xF6 ranges.
+        assert!(!Lexer::is_ncname_start('\u{D7}'));
+        assert!(!Lexer::is_ncname_start('\u{F7}'));
+
+        for c in ['a', 'Z', '_', '\u{C0}', '\u{D8}', '\u{F8}', '\u{3001}'] {
+            assert!(Lexer::is_ncname_start(c), "{c:?} should start a name");
+        }
+        // ":" is excluded: an NCName is colon-free.
+        assert!(!Lexer::is_ncname_start(':'));
+        assert!(!Lexer::is_ncname_char(':'));
+
+        // NameChar adds the ASCII digits, "-", ".", and three combining ranges.
+        for c in ['0', '9', '-', '.', '\u{B7}', '\u{300}', '\u{203F}'] {
+            assert!(Lexer::is_ncname_char(c), "{c:?} should continue a name");
+            assert!(!Lexer::is_ncname_start(c), "{c:?} should not start a name");
+        }
+
+        // The lexer follows suit.
+        assert_eq!(tokenize("a-b.c0"), vec![Token::QName("a-b.c0".to_string())]);
     }
 }

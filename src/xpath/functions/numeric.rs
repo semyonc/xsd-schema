@@ -511,75 +511,114 @@ fn numeric_round_half_to_even(value: &XmlValue, precision: i32) -> Result<XmlVal
     }
 }
 
-/// Round half to even for f64 with given precision.
+/// Round half to even for f64 with a given precision.
+///
+/// F&O defines `fn:round-half-to-even($arg, $precision)` as the value nearest
+/// to `$arg` that is a multiple of 10^-precision, choosing the candidate whose
+/// digit at the rounding position is even when two are equally near.
+///
+/// Scaling first — `(d * 10^precision).round_ties_even() / 10^precision` —
+/// decides that tie on the *scaled product*, which is itself rounded: the
+/// double nearest `250.025` is above the midpoint, yet multiplying it by 100
+/// yields exactly `25002.5`, so a scaled implementation rounds it down. The
+/// digits below are taken from the double's own exact decimal expansion
+/// instead, which also lets a result of zero keep the sign of `$arg`.
 fn round_half_to_even_f64(d: f64, precision: i32) -> f64 {
-    if d.is_nan() || d.is_infinite() {
+    if !d.is_finite() || d == 0.0 {
         return d;
     }
-
-    if precision < 0 {
-        // Round to powers of 10 (e.g., precision -1 rounds to nearest 10)
-        let scale = 10_f64.powi(-precision);
-        let scaled = d / scale;
-        // Use round_ties_even
-        round_ties_even_f64(scaled) * scale
+    let magnitude = round_half_to_even_magnitude(d.abs(), precision);
+    if d.is_sign_negative() {
+        -magnitude
     } else {
-        let scale = 10_f64.powi(precision);
-        let scaled = d * scale;
-        round_ties_even_f64(scaled) / scale
+        magnitude
     }
 }
 
-/// Round ties to even for f64 (banker's rounding).
-fn round_ties_even_f64(d: f64) -> f64 {
-    let floored = d.floor();
-    let frac = d - floored;
+/// Round the exact decimal expansion of a positive finite double half-to-even
+/// at `precision` digits after the decimal point.
+fn round_half_to_even_magnitude(value: f64, precision: i32) -> f64 {
+    debug_assert!(value.is_finite() && value > 0.0);
 
-    if frac < 0.5 {
-        floored
-    } else if frac > 0.5 {
-        floored + 1.0
-    } else {
-        // Exactly 0.5 - round to even
-        if floored as i64 % 2 == 0 {
-            floored
-        } else {
-            floored + 1.0
+    // A finite double's exact decimal expansion has at most 1074 digits after
+    // the point, so this rendering is exact; the formatter pads with zeros
+    // beyond the last significant digit.
+    const EXACT_FRACTION_DIGITS: usize = 1080;
+    let exact = format!("{:.*}", EXACT_FRACTION_DIGITS, value);
+    let point = match exact.find('.') {
+        Some(p) => p,
+        None => return value,
+    };
+    let mut digits: Vec<u8> = Vec::with_capacity(exact.len() - 1);
+    digits.extend_from_slice(&exact.as_bytes()[..point]);
+    digits.extend_from_slice(&exact.as_bytes()[point + 1..]);
+    let int_digits = point as i64;
+
+    // How many leading digits survive; the rest are dropped.
+    let keep = int_digits + precision as i64;
+    if keep < 0 {
+        return 0.0;
+    }
+    let keep = keep as usize;
+    if keep >= digits.len() {
+        // Nothing to drop.
+        return value;
+    }
+
+    let round_up = match digits[keep] {
+        b'0'..=b'4' => false,
+        b'5' => {
+            if digits[keep + 1..].iter().any(|&d| d != b'0') {
+                // Above the midpoint, not on it.
+                true
+            } else {
+                // Exactly on the midpoint: keep the even candidate. With no
+                // digit kept the candidates are 0 and 1, and 0 is the even one.
+                keep > 0 && (digits[keep - 1] - b'0') % 2 == 1
+            }
+        }
+        _ => true,
+    };
+
+    let mut kept = digits[..keep].to_vec();
+    if round_up {
+        let mut i = keep;
+        loop {
+            if i == 0 {
+                kept.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if kept[i] == b'9' {
+                kept[i] = b'0';
+            } else {
+                kept[i] += 1;
+                break;
+            }
         }
     }
+
+    // The kept digits are the value scaled by 10^(keep - int_digits).
+    let mantissa = std::str::from_utf8(&kept).unwrap_or("");
+    if mantissa.is_empty() || mantissa.bytes().all(|b| b == b'0') {
+        return 0.0;
+    }
+    let exponent = int_digits - keep as i64;
+    format!("{mantissa}e{exponent}")
+        .parse::<f64>()
+        .unwrap_or(value)
 }
 
-/// Round half to even for f32 with given precision.
+/// Round half to even for f32 with a given precision.
+///
+/// The float widens to a double without loss, so the exact expansion used by
+/// [`round_half_to_even_f64`] is the float's own: `xs:float(150.0150e0)` is
+/// `150.014999…`, below the midpoint, and rounds down to `150.01`.
 fn round_half_to_even_f32(f: f32, precision: i32) -> f32 {
-    if f.is_nan() || f.is_infinite() {
+    if !f.is_finite() || f == 0.0 {
         return f;
     }
-
-    if precision < 0 {
-        let scale = 10_f32.powi(-precision);
-        let scaled = f / scale;
-        round_ties_even_f32(scaled) * scale
-    } else {
-        let scale = 10_f32.powi(precision);
-        let scaled = f * scale;
-        round_ties_even_f32(scaled) / scale
-    }
-}
-
-/// Round ties to even for f32.
-fn round_ties_even_f32(f: f32) -> f32 {
-    let floored = f.floor();
-    let frac = f - floored;
-
-    if frac < 0.5 {
-        floored
-    } else if frac > 0.5 {
-        floored + 1.0
-    } else if floored as i32 % 2 == 0 {
-        floored
-    } else {
-        floored + 1.0
-    }
+    round_half_to_even_f64(f as f64, precision) as f32
 }
 
 /// Round half to even for Decimal with given precision.

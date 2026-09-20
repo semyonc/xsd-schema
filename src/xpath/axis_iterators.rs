@@ -26,6 +26,46 @@ fn move_to_next_document_order<N: DomNavigator>(nav: &mut N) -> bool {
     false
 }
 
+/// Step back one node in document order: the previous sibling's deepest last
+/// descendant if there is a previous sibling, otherwise the parent.
+///
+/// Repeated from a node this enumerates, in reverse document order, exactly
+/// the nodes that precede it, interleaved with its ancestors.
+fn move_to_prev_document_order<N: DomNavigator>(nav: &mut N) -> bool {
+    if nav.move_to_prev_sibling() {
+        while nav.move_to_first_child() {
+            while nav.move_to_next_sibling() {}
+        }
+        return true;
+    }
+    nav.move_to_parent()
+}
+
+/// Move to the first node of the `following` axis of the current node.
+///
+/// XPath 2.0 §3.2.1.1: the axis holds the nodes that are "not descendants of
+/// the context node, and occur after the context node in document order", so
+/// the context node's own subtree is skipped **once** and everything from
+/// there on is on the axis. An attribute or namespace node has no descendants
+/// and precedes its owner's children in document order, so for such a context
+/// node the axis starts at the owner element's first child instead.
+fn move_to_first_following<N: DomNavigator>(nav: &mut N) -> bool {
+    if matches!(
+        nav.node_type(),
+        DomNodeType::Attribute | DomNodeType::Namespace
+    ) {
+        return nav.move_to_parent() && move_to_next_document_order(nav);
+    }
+    loop {
+        if nav.move_to_next_sibling() {
+            return true;
+        }
+        if !nav.move_to_parent() {
+            return false;
+        }
+    }
+}
+
 fn move_to_next_kind<N: DomNavigator>(nav: &mut N, kind: DomNodeType) -> bool {
     let mut cursor = nav.clone();
     while cursor.move_to_next_sibling() {
@@ -832,6 +872,7 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for ChildOverDescendantsNodeIterato
 pub struct FollowingNodeIterator<'a, I: XmlNodeIterator> {
     base: AxisNodeIteratorBase<'a, I>,
     kind: DomNodeType,
+    started: bool,
     index: Option<usize>,
 }
 
@@ -841,28 +882,51 @@ impl<'a, I: XmlNodeIterator> FollowingNodeIterator<'a, I> {
         Self {
             base: AxisNodeIteratorBase::new(context, node_test, false, iter),
             kind,
+            started: false,
             index: None,
         }
     }
 
     fn next_item(&mut self) -> Result<bool, XPathError> {
         loop {
-            if !self.base.accept && !self.base.move_next_iter()? {
-                return Ok(false);
+            if !self.base.accept {
+                if !self.base.move_next_iter()? {
+                    return Ok(false);
+                }
+                self.started = false;
             }
 
+            // The subtree escape happens once, when leaving the context node.
+            // From then on the axis is plain document order: the descendants
+            // of a node *on* the axis are on the axis too.
             let moved = match self.base.curr.as_mut() {
-                Some(nav) => nav.move_to_following(self.kind, None),
-                None => false,
-            };
-            self.base.accept = moved;
-            if moved {
-                if let Some(curr) = self.base.curr.as_ref() {
-                    if self.base.test_item(curr) {
-                        self.base.sequential_position += 1;
-                        return Ok(true);
+                Some(nav) => {
+                    if self.started {
+                        move_to_next_document_order(nav)
+                    } else {
+                        self.started = true;
+                        move_to_first_following(nav)
                     }
                 }
+                None => false,
+            };
+            if !moved {
+                self.base.accept = false;
+                continue;
+            }
+            let curr = match self.base.curr.as_ref() {
+                Some(curr) => curr,
+                None => {
+                    self.base.accept = false;
+                    continue;
+                }
+            };
+            if self.kind != DomNodeType::All && curr.node_type() != self.kind {
+                continue;
+            }
+            if self.base.test_item(curr) {
+                self.base.sequential_position += 1;
+                return Ok(true);
             }
         }
     }
@@ -908,9 +972,9 @@ impl<'a, I: XmlNodeIterator> XmlNodeIterator for FollowingNodeIterator<'a, I> {
 pub struct PrecedingNodeIterator<'a, I: XmlNodeIterator> {
     base: AxisNodeIteratorBase<'a, I>,
     kind: DomNodeType,
-    anchor: Option<I::Navigator>,
+    /// The node the reverse walk stops at — the root of the visible tree.
+    stop: Option<I::Navigator>,
     ancestors: Vec<I::Navigator>,
-    started: bool,
     index: Option<usize>,
 }
 
@@ -920,9 +984,8 @@ impl<'a, I: XmlNodeIterator> PrecedingNodeIterator<'a, I> {
         Self {
             base: AxisNodeIteratorBase::new(context, node_test, false, iter),
             kind,
-            anchor: None,
+            stop: None,
             ancestors: Vec::new(),
-            started: false,
             index: None,
         }
     }
@@ -941,6 +1004,15 @@ impl<'a, I: XmlNodeIterator> PrecedingNodeIterator<'a, I> {
             .any(|ancestor| nav.is_same_position(ancestor))
     }
 
+    /// Whether the cursor has reached the root of the visible tree, past which
+    /// nothing precedes the context node.
+    fn at_stop(&self) -> bool {
+        match (self.base.curr.as_ref(), self.stop.as_ref()) {
+            (Some(curr), Some(stop)) => curr.is_same_position(stop),
+            _ => true,
+        }
+    }
+
     fn next_item(&mut self) -> Result<bool, XPathError> {
         loop {
             if !self.base.accept {
@@ -951,35 +1023,40 @@ impl<'a, I: XmlNodeIterator> PrecedingNodeIterator<'a, I> {
                     Some(nav) => nav.clone(),
                     None => return Ok(false),
                 };
+                // An attribute or namespace node is preceded by exactly what
+                // precedes its owner element: the owner itself is one of its
+                // ancestors, and the reverse walk starts there without
+                // reporting it.
                 if matches!(
                     anchor.node_type(),
                     DomNodeType::Attribute | DomNodeType::Namespace
                 ) {
                     anchor.move_to_parent();
                 }
-                self.anchor = Some(anchor.clone());
                 self.collect_ancestors(&anchor);
+                // `move_to_visible_root` lands on the document root in
+                // ordinary scope, and on the asserter element when the
+                // navigator is in XSD 1.1 assertion scope. Stopping there
+                // keeps the reverse walk inside the visible subtree.
+                let mut stop = anchor.clone();
+                stop.move_to_visible_root();
+                self.stop = Some(stop);
                 if let Some(curr) = self.base.curr.as_mut() {
-                    // `move_to_visible_root` lands on the document root in
-                    // ordinary scope, and on the asserter element when the
-                    // navigator is in XSD 1.1 assertion scope. Using it here
-                    // keeps the forward walk inside the visible subtree
-                    // instead of being blocked by the synthetic-root child
-                    // gate that makes `//x` return empty under assertions.
-                    curr.move_to_visible_root();
+                    curr.move_to(&anchor);
                 }
-                self.started = false;
             }
 
+            // XPath 2.0 §3.2.1.1 / §3.2.2: `preceding` is a reverse axis, so
+            // it is delivered in reverse document order — the order a
+            // positional predicate's focus counts in. Walking backwards from
+            // the context node yields exactly the nodes before it; its own
+            // ancestors are stepped over and dropped.
+            if self.at_stop() {
+                self.base.accept = false;
+                continue;
+            }
             let moved = match self.base.curr.as_mut() {
-                Some(curr) => {
-                    if self.started {
-                        move_to_next_document_order(curr)
-                    } else {
-                        self.started = true;
-                        curr.move_to_first_child()
-                    }
-                }
+                Some(curr) => move_to_prev_document_order(curr),
                 None => false,
             };
             if !moved {
@@ -993,12 +1070,6 @@ impl<'a, I: XmlNodeIterator> PrecedingNodeIterator<'a, I> {
                     continue;
                 }
             };
-            if let Some(anchor) = self.anchor.as_ref() {
-                if curr.is_same_position(anchor) {
-                    self.base.accept = false;
-                    continue;
-                }
-            }
             if self.kind != DomNodeType::All && curr.node_type() != self.kind {
                 continue;
             }
@@ -1322,6 +1393,51 @@ mod tests {
     }
 
     #[test]
+    fn test_following_axis_includes_descendants_of_following_nodes() {
+        // XPath 2.0 §3.2.1.1: only the *context node's* descendants are off
+        // the axis. The subtree escape therefore happens once, at the start.
+        let doc = roxmltree::Document::parse("<root><a><b/></a><c><d><e/></d></c></root>")
+            .expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+        nav.move_to_first_child(); // b
+
+        let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+        let mut iter =
+            FollowingNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), base);
+
+        let names = collect_local_names(&mut iter);
+        assert_eq!(
+            names,
+            vec!["c".to_string(), "d".to_string(), "e".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_following_axis_from_attribute_starts_at_the_owners_children() {
+        // An attribute node has no descendants and precedes its owner's
+        // children in document order.
+        let doc =
+            roxmltree::Document::parse(r#"<root><a p="1"><b/></a><c/></root>"#).expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+        assert!(nav.move_to_first_attribute()); // @p
+
+        let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+        let mut iter =
+            FollowingNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), base);
+
+        let names = collect_local_names(&mut iter);
+        assert_eq!(names, vec!["b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
     fn test_preceding_axis() {
         let doc =
             roxmltree::Document::parse("<root><a><b/><c/></a><d/></root>").expect("parse xml");
@@ -1339,11 +1455,49 @@ mod tests {
         let mut iter =
             PrecedingNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), base);
 
+        // A reverse axis is delivered in reverse document order.
         let names = collect_local_names(&mut iter);
         assert_eq!(
             names,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            vec!["c".to_string(), "b".to_string(), "a".to_string()]
         );
+    }
+
+    #[test]
+    fn test_preceding_axis_from_tree_root_is_empty() {
+        // Every node of the tree is a descendant of the root and therefore
+        // *after* it in document order.
+        let doc = roxmltree::Document::parse("<root><a/><b/></root>").expect("parse xml");
+        let nav = RoXmlNavigator::new(&doc);
+
+        let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+        let mut iter =
+            PrecedingNodeIterator::new(ctx, Some(NodeTest::Type(SequenceType::node())), base);
+
+        assert!(!iter.move_next().unwrap());
+    }
+
+    #[test]
+    fn test_preceding_axis_skips_ancestors() {
+        let doc =
+            roxmltree::Document::parse("<root><a><b/></a><c><d/></c></root>").expect("parse xml");
+        let mut nav = RoXmlNavigator::new(&doc);
+        nav.move_to_first_child(); // root
+        nav.move_to_first_child(); // a
+        nav.move_to_next_sibling(); // c
+        nav.move_to_first_child(); // d
+
+        let base = VecNodeIterator::new(vec![XmlItem::Node(nav.clone())]);
+        let table = NameTable::new();
+        let ctx = XPathContext::new(&table);
+        let mut iter =
+            PrecedingNodeIterator::new(ctx, Some(NodeTest::Name(NameTest::Wildcard)), base);
+
+        // `c` and `root` are ancestors of `d`, so only `b` and `a` precede it.
+        let names = collect_local_names(&mut iter);
+        assert_eq!(names, vec!["b".to_string(), "a".to_string()]);
     }
 
     #[test]

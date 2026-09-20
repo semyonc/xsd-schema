@@ -24,12 +24,13 @@ use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
 use crate::xpath::cast::cast_to;
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
+use crate::xpath::general_compare;
 use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
 use crate::xpath::type_info::type_code_to_name;
 use crate::xpath::DomNavigator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumericClass {
+pub(super) enum NumericClass {
     Byte,
     UnsignedByte,
     Short,
@@ -727,8 +728,14 @@ fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
     } else {
         value
     };
-    let class = numeric_class(value.type_code)
-        .ok_or_else(|| XPathError::internal("Unary operator requires numeric operand"))?;
+    // XPath 2.0 §3.4: the unary operators are defined for numeric operands only;
+    // anything else is a type error [err:XPTY0004].
+    let class = numeric_class(value.type_code).ok_or_else(|| {
+        XPathError::unary_operator_not_defined(
+            "unary arithmetic operator",
+            type_code_to_name(value.type_code),
+        )
+    })?;
 
     let result_type = unary_result_type(class);
     let value = to_numeric_value(value, class)?;
@@ -934,10 +941,17 @@ fn promote_numeric(
         right
     };
 
-    let left_class = numeric_class(left_ref.type_code)
-        .ok_or_else(|| XPathError::internal("Left operand not numeric"))?;
-    let right_class = numeric_class(right_ref.type_code)
-        .ok_or_else(|| XPathError::internal("Right operand not numeric"))?;
+    // XPath 2.0 §3.4: an operand combination that is not valid for the operator
+    // is a type error [err:XPTY0004], not an internal failure.
+    let not_numeric = || {
+        XPathError::binary_operator_not_defined(
+            "arithmetic operator",
+            type_code_to_name(left_ref.type_code),
+            type_code_to_name(right_ref.type_code),
+        )
+    };
+    let left_class = numeric_class(left_ref.type_code).ok_or_else(not_numeric)?;
+    let right_class = numeric_class(right_ref.type_code).ok_or_else(not_numeric)?;
 
     let promotion = numeric_promotion(left_class, right_class);
     let target_class = match promotion {
@@ -952,7 +966,7 @@ fn promote_numeric(
     Ok((left_val, right_val, target_class))
 }
 
-fn numeric_class(code: XmlTypeCode) -> Option<NumericClass> {
+pub(super) fn numeric_class(code: XmlTypeCode) -> Option<NumericClass> {
     match code {
         XmlTypeCode::Byte => Some(NumericClass::Byte),
         XmlTypeCode::UnsignedByte => Some(NumericClass::UnsignedByte),
@@ -1200,7 +1214,7 @@ fn xml_day_time_duration_value(value: DayTimeDurationValue) -> XmlValue {
     }
 }
 
-fn is_temporal_type(code: XmlTypeCode) -> bool {
+pub(super) fn is_temporal_type(code: XmlTypeCode) -> bool {
     matches!(
         code,
         XmlTypeCode::DateTime
@@ -1213,11 +1227,11 @@ fn is_temporal_type(code: XmlTypeCode) -> bool {
     )
 }
 
-fn is_date_time_code(code: XmlTypeCode) -> bool {
+pub(super) fn is_date_time_code(code: XmlTypeCode) -> bool {
     matches!(code, XmlTypeCode::DateTime | XmlTypeCode::DateTimeStamp)
 }
 
-fn is_duration_code(code: XmlTypeCode) -> bool {
+pub(super) fn is_duration_code(code: XmlTypeCode) -> bool {
     matches!(
         code,
         XmlTypeCode::Duration | XmlTypeCode::YearMonthDuration | XmlTypeCode::DayTimeDuration
@@ -1280,6 +1294,36 @@ fn duration_parts(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError
         return Ok(Some((0, seconds)));
     }
     Ok(None)
+}
+
+// ----------------------------------------------------------------------------
+// Comparison keys for the indexed general comparison
+// ----------------------------------------------------------------------------
+//
+// Each of these exposes the *exact* normalization `compare_eq` performs on a
+// value of that family, so that `general_compare` can key a hash table on it
+// without inventing a second notion of equality. `None` means the value does
+// not hold the expected representation, which is the case in which the
+// comparison itself would raise.
+
+/// The instant `eq` compares an `xs:dateTime`/`xs:dateTimeStamp` value at.
+pub(super) fn datetime_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_datetime(value).map(datetime_instant_for_compare)
+}
+
+/// The instant `eq` compares an `xs:date` value at.
+pub(super) fn date_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_date(value).map(date_instant_for_compare)
+}
+
+/// The seconds-of-day `eq` compares an `xs:time` value at.
+pub(super) fn time_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
+    as_time(value).map(time_seconds_for_compare)
+}
+
+/// The (months, seconds) pair `eq` compares any duration value by.
+pub(super) fn duration_compare_key(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError> {
+    duration_parts(value)
 }
 
 fn numeric_to_f64(value: &XmlValue) -> Result<f64, XPathError> {
@@ -1888,7 +1932,7 @@ fn decimal_to_u8(value: Decimal, label: &str) -> Result<u8, XPathError> {
     u8::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
 }
 
-fn is_string_like(code: XmlTypeCode) -> bool {
+pub(super) fn is_string_like(code: XmlTypeCode) -> bool {
     code.is_string_derived() || matches!(code, XmlTypeCode::AnyUri | XmlTypeCode::UntypedAtomic)
 }
 
@@ -2222,7 +2266,9 @@ pub fn magnitude_relationship_ctx(
     Ok((left_result, right_result))
 }
 
-fn atomize_item<N: DomNavigator>(item: XmlItemRef<'_, N>) -> Result<Option<XmlValue>, XPathError> {
+pub(super) fn atomize_item<N: DomNavigator>(
+    item: XmlItemRef<'_, N>,
+) -> Result<Option<XmlValue>, XPathError> {
     match item {
         XmlItemRef::Atomic(value) => Ok(Some(value.clone())),
         XmlItemRef::Node(node) => crate::xpath::atomize::atomize_node(node),
@@ -2313,7 +2359,72 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+
+    // Walk a bounded prefix of the Cartesian product first. Every comparison
+    // whose product is no larger than the budget, and every comparison whose
+    // first true pair falls inside it, is decided at exactly the cost it had
+    // before — which is what the small comparisons in predicates need.
+    if let Some(result) = general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS)? {
+        return Ok(result);
+    }
+
+    // Only a genuinely large product gets here. A hash index answers the same
+    // question in O(|A| + |B|) for the operand shapes where that is provably
+    // the same answer, errors included; it declines everything else.
+    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf) {
+        return result;
+    }
+
+    general_eq_iter_pairwise(context, left, &right_buf)
+}
+
+/// How many pairs of the Cartesian product are compared before an index is
+/// considered.
+///
+/// The budget exists so that the indexed path can never cost more than the
+/// pairwise one on a comparison the pairwise one would have finished quickly:
+/// `(a, b, c) = (x, y)` is answered without ever atomizing an operand twice,
+/// and so is a large comparison whose very first pairs already match.
+const INDEX_AFTER_PAIRS: usize = 64;
+
+/// The Cartesian-product evaluation of `A = B`, and the definition of what the
+/// indexed path in [`general_compare`] must reproduce exactly.
+pub(super) fn general_eq_iter_pairwise<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    Ok(general_eq_scan(context, left, right_buf, usize::MAX)?.unwrap_or(false))
+}
+
+/// Walk at most `budget` pairs of the product in row-major order.
+///
+/// `Ok(None)` means the budget ran out before the product did, and nothing has
+/// been decided: no pair compared true and none raised a hard error, so the
+/// caller is free to answer the comparison any way it likes. With a budget of
+/// `usize::MAX` the result is never `None` and this is the original loop.
+fn general_eq_scan<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+    budget: usize,
+) -> Result<Option<bool>, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let mut left_iter = left.clone();
+    let mut remaining = budget;
+    // XPath 2.0 §3.5.2 lets a general comparison return true as soon as it finds
+    // a pair with the required magnitude relationship, so an incomparable pair
+    // found on the way there may be ignored. If no pair compares true, the
+    // comparison of the incomparable pair is what decides the result, and that
+    // comparison is a type error (§3.5.1).
+    let mut deferred: Option<XPathError> = None;
 
     while left_iter.move_next()? {
         let left_item = left_iter
@@ -2333,18 +2444,28 @@ where
                 Some(v) => v,
                 None => continue, // nilled → skip
             };
+            if remaining == 0 {
+                return Ok(None);
+            }
+            remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
-                Ok(true) => return Ok(true),
+                Ok(true) => return Ok(Some(true)),
                 Ok(false) => continue,
-                Err(err) if is_operator_not_defined(&err) => continue,
+                Err(err) if is_operator_not_defined(&err) => {
+                    deferred.get_or_insert(err);
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
     }
 
-    Ok(false)
+    match deferred {
+        Some(err) => Err(err),
+        None => Ok(Some(false)),
+    }
 }
 
 pub fn general_ne_iter<I1, I2>(
@@ -2357,7 +2478,52 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+
+    // `!=` already stops at the first unequal pair, so the bounded prefix
+    // decides it in practice; the index is only there for the degenerate
+    // all-equal product, and it declines everything else.
+    if let Some(result) = general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS)? {
+        return Ok(result);
+    }
+
+    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf) {
+        return result;
+    }
+
+    general_ne_iter_pairwise(context, left, &right_buf)
+}
+
+/// The Cartesian-product evaluation of `A != B`.
+pub(super) fn general_ne_iter_pairwise<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    Ok(general_ne_scan(context, left, right_buf, usize::MAX)?.unwrap_or(false))
+}
+
+/// The `!=` counterpart of [`general_eq_scan`]; see it for what `Ok(None)` means.
+fn general_ne_scan<I1, I2>(
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+    budget: usize,
+) -> Result<Option<bool>, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
     let mut left_iter = left.clone();
+    let mut remaining = budget;
+    // An incomparable pair is *not* an unequal pair: §3.5.2 defers to the `ne`
+    // value comparison, and §3.5.1 makes an incomparable `ne` a type error. The
+    // error is held back in case a genuinely unequal pair turns up, which §3.5.2
+    // allows to decide the comparison on its own.
+    let mut deferred: Option<XPathError> = None;
 
     while left_iter.move_next()? {
         let left_item = left_iter
@@ -2377,18 +2543,28 @@ where
                 Some(v) => v,
                 None => continue, // nilled → skip
             };
+            if remaining == 0 {
+                return Ok(None);
+            }
+            remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
             match value_eq(&l, &r) {
                 Ok(true) => continue,
-                Ok(false) => return Ok(true),
-                Err(err) if is_operator_not_defined(&err) => return Ok(true),
+                Ok(false) => return Ok(Some(true)),
+                Err(err) if is_operator_not_defined(&err) => {
+                    deferred.get_or_insert(err);
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }
     }
 
-    Ok(false)
+    match deferred {
+        Some(err) => Err(err),
+        None => Ok(Some(false)),
+    }
 }
 
 pub fn general_lt_iter<I1, I2>(
@@ -2940,11 +3116,21 @@ pub fn general_ge_seq(left: &[XmlValue], right: &[XmlValue]) -> Result<bool, XPa
     Ok(false)
 }
 
+/// The XPath 2.0 §3.4 type error for an operand combination that
+/// B.2 Operator Mapping does not cover.
+///
+/// It uses the dedicated `BinaryOperatorNotDefined` variant, whose error code is
+/// `XPTY0004`. The variant is also the "not comparable" signal that
+/// [`is_operator_not_defined`] tests, but that signal is only ever consulted on
+/// the result of a *comparison* (`compare_ge`/`compare_le` and the general
+/// comparisons), never on the result of an arithmetic operator, so the two uses
+/// do not interfere.
 fn unsupported_operator(op: BinaryOpKind, left: &XmlValue, right: &XmlValue) -> XPathError {
-    XPathError::internal(format!(
-        "Operator {:?} not defined for types {:?} and {:?}",
-        op, left.type_code, right.type_code
-    ))
+    XPathError::binary_operator_not_defined(
+        format!("{op:?}"),
+        type_code_to_name(left.type_code),
+        type_code_to_name(right.type_code),
+    )
 }
 
 #[cfg(test)]
@@ -3613,8 +3799,16 @@ mod tests {
         assert!(matches!(result, Err(XPathError::FORG0001 { .. })));
     }
 
+    /// A general comparison with no true pair reports the incomparable pair.
+    ///
+    /// XPath 2.0 §3.5.2 defers the comparison of a pair to the corresponding
+    /// value comparison, and §3.5.1 makes an operand combination that no
+    /// operator mapping covers a type error. `xs:boolean` against `xs:date` is
+    /// such a combination, so the comparison is an error rather than `false` —
+    /// the same outcome `test_general_gt_iter_type_mismatch_errors` asserts for
+    /// `gt`.
     #[test]
-    fn test_general_eq_iter_type_mismatch_is_false() {
+    fn test_general_eq_iter_type_mismatch_errors() {
         let names = NameTable::new();
         let context = XPathContext::new(&names);
         let left: VecNodeIterator<RoXmlNavigator<'static>> =
@@ -3622,7 +3816,44 @@ mod tests {
         let right: VecNodeIterator<RoXmlNavigator<'static>> =
             VecNodeIterator::new(vec![XmlItem::Atomic(date_value(2024, 1, 1))]);
 
-        assert!(!general_eq_iter(&context, &left, &right).unwrap());
+        let result = general_eq_iter(&context, &left, &right);
+        assert!(matches!(
+            result,
+            Err(XPathError::BinaryOperatorNotDefined { .. })
+        ));
+        assert_eq!(result.unwrap_err().error_code(), Some("XPTY0004"));
+    }
+
+    /// The same for `!=`: an incomparable pair is not an unequal pair.
+    #[test]
+    fn test_general_ne_iter_type_mismatch_errors() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::boolean(true))]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(date_value(2024, 1, 1))]);
+
+        let result = general_ne_iter(&context, &left, &right);
+        assert_eq!(result.unwrap_err().error_code(), Some("XPTY0004"));
+    }
+
+    /// A true pair still short-circuits past an incomparable one (§3.5.2:
+    /// "an implementation may return true as soon as it finds an item in the
+    /// first operand and an item in the second operand that have the required
+    /// magnitude relationship").
+    #[test]
+    fn test_general_eq_iter_true_pair_wins_over_incomparable_pair() {
+        let names = NameTable::new();
+        let context = XPathContext::new(&names);
+        let left: VecNodeIterator<RoXmlNavigator<'static>> = VecNodeIterator::new(vec![
+            XmlItem::Atomic(XmlValue::integer(BigInt::from(1))),
+            XmlItem::Atomic(date_value(2024, 1, 1)),
+        ]);
+        let right: VecNodeIterator<RoXmlNavigator<'static>> =
+            VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::integer(BigInt::from(1)))]);
+
+        assert!(general_eq_iter(&context, &left, &right).unwrap());
     }
 
     #[test]

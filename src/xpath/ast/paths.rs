@@ -213,6 +213,18 @@ impl PathStepNode {
         }
     }
 
+    /// Abbreviated forward step written as a bare `NodeTest` (no axis name).
+    ///
+    /// XPath 2.0 §3.2.4: "If the axis name is omitted from an axis step, the
+    /// default axis is `child` unless the axis step contains an
+    /// AttributeTest or SchemaAttributeTest; in that case, the default axis
+    /// is `attribute`." So `section/attribute(id)` abbreviates
+    /// `child::section/attribute::attribute(id)`, while `section/para`
+    /// abbreviates `child::section/child::para`.
+    pub fn abbrev_forward(test: NodeTest, span: SourceSpan) -> Self {
+        Self::new(default_forward_axis(&test), test, span)
+    }
+
     /// Abbreviated parent step (`..`).
     pub fn abbrev_parent(span: SourceSpan) -> Self {
         Self {
@@ -222,6 +234,19 @@ impl PathStepNode {
             span,
             resolved_test: None,
         }
+    }
+}
+
+/// The axis an abbreviated forward step (`NodeTest` with no axis name) runs on.
+///
+/// XPath 2.0 §3.2.4: `child` unless the node test is an AttributeTest or a
+/// SchemaAttributeTest, in which case it is `attribute`.
+pub fn default_forward_axis(test: &NodeTest) -> Axis {
+    match test {
+        NodeTest::Kind(KindTest::Attribute(_)) | NodeTest::Kind(KindTest::SchemaAttribute(_)) => {
+            Axis::Attribute
+        }
+        _ => Axis::Child,
     }
 }
 

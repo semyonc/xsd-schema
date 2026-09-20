@@ -2509,7 +2509,9 @@ mod type_expr_tests {
 
     #[test]
     fn test_treat_as_failure() {
-        // 42 treat as xs:string -> XPTY0004 error
+        // 42 treat as xs:string -> XPDY0050. XPath 2.0 §3.10.5: a value that
+        // does not match the sequence type of a `treat` expression raises a
+        // *dynamic* error, not a type error.
         let mut arena = AstArena::new();
         let val = arena.add(AstNode::Value(ValueNode::Integer("42".to_string())));
         let type_expr = make_type_expr(
@@ -2522,7 +2524,7 @@ mod type_expr_tests {
         let root = wrap_in_expr(&mut arena, type_expr);
 
         let result = bind_and_eval(&mut arena, root);
-        assert!(matches!(result, Err(XPathError::XPTY0004 { .. })));
+        assert!(matches!(result, Err(XPathError::XPDY0050)));
     }
 
     #[test]
@@ -3354,4 +3356,1236 @@ fn range_operands_follow_the_function_conversion_rules() {
     // A value that is not an integer is still an error.
     assert!(count("xs:untypedAtomic('x') to 3").is_err());
     assert!(count("1.5 to 3").is_err());
+}
+
+// ============================================================================
+// Axis Semantics (XPath 2.0 §3.2.1.1, §3.2.1.2, §3.2.4)
+// ============================================================================
+
+#[cfg(test)]
+mod axis_semantics_tests {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::{DomNavigator, DomNodeType, RoXmlNavigator, XPathContext};
+
+    /// One readable line per result item: `kind(detail)` for nodes, the
+    /// lexical form for atomic values.
+    fn describe<N: DomNavigator>(item: &XmlItem<N>) -> String {
+        match item {
+            XmlItem::Atomic(value) => value.to_string_value(),
+            XmlItem::Node(nav) => match nav.node_type() {
+                DomNodeType::Root => "document".to_string(),
+                DomNodeType::Element => format!("element({})", nav.local_name()),
+                DomNodeType::Attribute => {
+                    format!("attribute({}={})", nav.local_name(), nav.value())
+                }
+                DomNodeType::Namespace => {
+                    format!("namespace({}={})", nav.local_name(), nav.value())
+                }
+                DomNodeType::Comment => format!("comment({})", nav.value()),
+                DomNodeType::ProcessingInstruction => format!("pi({})", nav.local_name()),
+                other => format!("{other:?}({})", nav.value()),
+            },
+        }
+    }
+
+    /// Evaluate `expr` over `xml` with the document node as context item.
+    fn items(expr: &str, xml: &str) -> Vec<String> {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let compiled = XPathExpr::compile(expr, &ctx).expect("compile");
+        let doc = roxmltree::Document::parse(xml).expect("parse xml");
+        let value = compiled
+            .evaluator(&ctx)
+            .run_with_node(RoXmlNavigator::new(&doc))
+            .expect("evaluate");
+        value.into_vec().iter().map(describe).collect()
+    }
+
+    /// Evaluate an expression whose result is a single atomic value.
+    fn one(expr: &str, xml: &str) -> String {
+        let result = items(expr, xml);
+        assert_eq!(result.len(), 1, "{expr}: expected one item, got {result:?}");
+        result.into_iter().next().unwrap()
+    }
+
+    // ---- §3.2.4: the default axis of an abbreviated forward step ----------
+
+    #[test]
+    fn abbrev_step_with_attribute_test_uses_attribute_axis() {
+        // "If the axis name is omitted from an axis step, the default axis is
+        // child unless the axis step contains an AttributeTest or
+        // SchemaAttributeTest; in that case, the default axis is attribute."
+        let xml = r#"<doc a="1" b="2"><num>1</num></doc>"#;
+        assert_eq!(one("count(/doc/attribute())", xml), "2");
+        assert_eq!(one("count(/doc/attribute(a))", xml), "1");
+        assert_eq!(items("/doc/attribute(a)", xml), ["attribute(a=1)"]);
+        // The explicit axis keeps working, and yields the same nodes.
+        assert_eq!(one("count(/doc/attribute::attribute())", xml), "2");
+    }
+
+    #[test]
+    fn abbrev_step_attribute_test_in_every_position() {
+        let xml = r#"<doc a="1"><num b="2"/></doc>"#;
+        // `//` expansion: descendant-or-self::node()/attribute()
+        assert_eq!(one("count(//attribute())", xml), "2");
+        assert_eq!(
+            one("//attribute() instance of empty-sequence()", xml),
+            "false"
+        );
+        // Inside a predicate.
+        assert_eq!(one("count(/doc/num[attribute()])", xml), "1");
+        // Relative path with no leading `/`.
+        assert_eq!(one("count(doc/attribute())", xml), "1");
+    }
+
+    #[test]
+    fn abbrev_step_other_node_tests_keep_the_child_axis() {
+        let xml = r#"<doc a="1"><num>1</num></doc>"#;
+        assert_eq!(one("count(/doc/node())", xml), "1");
+        assert_eq!(one("count(/doc/element())", xml), "1");
+        assert_eq!(one("count(/doc/num)", xml), "1");
+        assert_eq!(one("count(/doc/*)", xml), "1");
+        // An explicit axis is never overridden by the node test.
+        assert_eq!(one("count(/doc/child::attribute())", xml), "0");
+    }
+
+    // ---- §3.2.1.1 / §3.2.1.2: principal node kind -------------------------
+
+    #[test]
+    fn name_test_matches_only_the_principal_node_kind() {
+        // "A name test is true if and only if the kind of the node is the
+        // principal node kind for the step axis and the expanded QName of the
+        // node is equal ... to the expanded QName specified by the name test."
+        // For every axis but attribute:: and namespace:: that kind is element.
+        let xml = r#"<doc><a x="1"/></doc>"#;
+        assert_eq!(one("count(/doc/a/@x/self::*)", xml), "0");
+        assert_eq!(one("count(/doc/a/@x/self::x)", xml), "0");
+        assert_eq!(one("count(/doc/a/@x/ancestor-or-self::*)", xml), "2");
+        assert_eq!(one("count(/doc/a/@x/descendant-or-self::*)", xml), "0");
+        // Kind tests are unaffected: they select on node kind, not on the
+        // axis's principal node kind.
+        assert_eq!(one("count(/doc/a/@x/self::node())", xml), "1");
+        assert_eq!(one("count(/doc/a/@x/ancestor-or-self::node())", xml), "4");
+        // An element context still matches.
+        assert_eq!(one("count(/doc/a/self::*)", xml), "1");
+        assert_eq!(one("count(/doc/a/ancestor-or-self::*)", xml), "2");
+    }
+
+    #[test]
+    fn name_test_on_attribute_and_namespace_axes() {
+        // The attribute axis's principal node kind is attribute...
+        let xml = r#"<doc xmlns:p="urn:x" a="1"><num/></doc>"#;
+        assert_eq!(one("count(/doc/@*)", xml), "1");
+        assert_eq!(items("/doc/@a", xml), ["attribute(a=1)"]);
+        // ... and the namespace axis's is namespace (a name test there
+        // selects by prefix).
+        assert_eq!(one("count(/doc/namespace::*)", xml), "2");
+        assert_eq!(items("/doc/namespace::p", xml), ["namespace(p=urn:x)"]);
+        assert_eq!(one("count(/doc/namespace::nosuch)", xml), "0");
+    }
+
+    // ---- §3.2.1.1: the `following` axis -----------------------------------
+
+    #[test]
+    fn following_axis_covers_the_whole_rest_of_the_document() {
+        // "all nodes that are descendants of the root of the tree ..., are not
+        // descendants of the context node, and occur after the context node in
+        // document order".
+        let xml = "<doc><a><x/>t1</a><b><y/>t2</b></doc>";
+        assert_eq!(one("count(/doc/a/following::node())", xml), "3");
+        assert_eq!(
+            items("/doc/a/following::node()", xml),
+            ["element(b)", "element(y)", "Text(t2)"]
+        );
+        // From a node inside the first subtree the axis also reaches the
+        // descendants of the following siblings.
+        assert_eq!(one("count(/doc/a/x/following::node())", xml), "4");
+        assert_eq!(one("count(/doc/a/x/following::*)", xml), "2");
+        // The context node's own descendants are excluded.
+        assert_eq!(one("count(/doc/following::node())", xml), "0");
+        assert_eq!(one("count(/following::node())", xml), "0");
+    }
+
+    #[test]
+    fn following_axis_from_attribute_and_namespace_nodes() {
+        // An attribute precedes its owner's children in document order and has
+        // no descendants, so the axis starts at the owner's first child.
+        let xml = r#"<doc><a p="1"><x/>t1</a><b/></doc>"#;
+        assert_eq!(one("count(/doc/a/@p/following::node())", xml), "3");
+        assert_eq!(
+            items("/doc/a/@p/following::node()", xml),
+            ["element(x)", "Text(t1)", "element(b)"]
+        );
+        let ns_xml = r#"<doc><a xmlns:p="urn:x"><x/></a><b/></doc>"#;
+        assert_eq!(
+            items("/doc/a/namespace::p/following::node()", ns_xml),
+            ["element(x)", "element(b)"]
+        );
+    }
+
+    // ---- §3.2.1.1: the `preceding` axis -----------------------------------
+
+    #[test]
+    fn preceding_axis_is_delivered_in_reverse_document_order() {
+        // A reverse axis presents its nodes in reverse document order, which
+        // is the order a positional predicate's focus counts in; the path
+        // expression as a whole still returns document order (§3.2).
+        let xml = "<doc><a><x/>t1</a><b/></doc>";
+        assert_eq!(one("count(/doc/b/preceding::node())", xml), "3");
+        assert_eq!(
+            items("/doc/b/preceding::node()", xml),
+            ["element(a)", "element(x)", "Text(t1)"]
+        );
+        assert_eq!(items("/doc/b/preceding::node()[1]", xml), ["Text(t1)"]);
+        assert_eq!(items("/doc/b/preceding::*[1]", xml), ["element(x)"]);
+        assert_eq!(items("/doc/b/preceding::*[last()]", xml), ["element(a)"]);
+        assert_eq!(
+            items("/doc/b/preceding::node()[position() > 1]", xml),
+            ["element(a)", "element(x)"]
+        );
+        // The forward axes keep counting in document order.
+        assert_eq!(items("/doc/a/x/following::node()[1]", xml), ["Text(t1)"]);
+        assert_eq!(
+            items("/doc/a/x/following::node()[last()]", xml),
+            ["element(b)"]
+        );
+    }
+
+    #[test]
+    fn preceding_axis_excludes_ancestors_and_is_empty_at_the_root() {
+        let xml = "<doc><a><x/></a><b/></doc>";
+        // Ancestors are never on the preceding axis.
+        assert_eq!(
+            items("/doc/a/x/preceding::node()", xml),
+            Vec::<String>::new()
+        );
+        // The root of the tree has nothing before it.
+        assert_eq!(one("count(/preceding::node())", xml), "0");
+        assert_eq!(one("count(/doc/preceding::node())", xml), "0");
+        // Nodes outside the document element are reachable.
+        let pi_xml = "<?target data?><!--c--><doc><a/></doc>";
+        assert_eq!(
+            items("/doc/a/preceding::node()", pi_xml),
+            ["pi(target)", "comment(c)"]
+        );
+        assert_eq!(items("/doc/a/preceding::node()[1]", pi_xml), ["comment(c)"]);
+    }
+
+    #[test]
+    fn preceding_axis_from_attribute_and_namespace_nodes() {
+        let xml = r#"<doc><a/><b c="1"/></doc>"#;
+        assert_eq!(items("/doc/b/@c/preceding::node()", xml), ["element(a)"]);
+        let ns_xml = r#"<doc><a/><b xmlns:p="urn:x"/></doc>"#;
+        assert_eq!(
+            items("/doc/b/namespace::p/preceding::node()", ns_xml),
+            ["element(a)"]
+        );
+    }
+
+    // ---- XDM: a namespace undeclaration is not a namespace node -----------
+
+    #[test]
+    fn namespace_undeclaration_is_not_a_namespace_node() {
+        // `xmlns=""` removes the binding for the default prefix; it is the
+        // absence of a binding, not a namespace node with a zero-length URI.
+        let xml = r#"<chap xmlns="http://c/"><para xmlns=""/></chap>"#;
+        assert_eq!(one("count(/*/namespace::*)", xml), "2");
+        assert_eq!(one("count(/*/*/namespace::*)", xml), "1");
+        assert_eq!(
+            items("/*/*/namespace::*", xml),
+            ["namespace(xml=http://www.w3.org/XML/1998/namespace)"]
+        );
+        assert_eq!(one("string-join(in-scope-prefixes(/*/*),',')", xml), "xml");
+        // No default namespace is in scope on the inner element...
+        assert_eq!(
+            one("string(namespace-uri-for-prefix('', /*/*)) = ''", xml),
+            "true"
+        );
+        // ... while the outer element keeps its binding.
+        assert_eq!(one("namespace-uri-for-prefix('', /*)", xml), "http://c/");
+        assert_eq!(one("string-join(in-scope-prefixes(/*),',')", xml), "xml,");
+        // A prefixed undeclaration (Namespaces 1.1) is equally absent.
+        let prefixed = r#"<chap xmlns:p="urn:x"><para xmlns:p=""/></chap>"#;
+        assert_eq!(one("count(/*/namespace::*)", prefixed), "2");
+        assert_eq!(one("count(/*/*/namespace::*)", prefixed), "1");
+    }
+}
+
+/// Helpers shared by the specification-driven evaluator tests below.
+mod spec_helpers {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::iterator::XmlItem;
+    use crate::xpath::{DomNavigator, DomNodeType, RoXmlNavigator, XPathContext};
+
+    /// One readable line per result item: `kind(detail)` for nodes, the lexical
+    /// form for atomic values.
+    fn describe<N: DomNavigator>(item: &XmlItem<N>) -> String {
+        match item {
+            XmlItem::Atomic(value) => value.to_string_value(),
+            XmlItem::Node(nav) => match nav.node_type() {
+                DomNodeType::Root => "document".to_string(),
+                DomNodeType::Element => format!("element({})", nav.local_name()),
+                DomNodeType::Attribute => {
+                    format!("attribute({}={})", nav.local_name(), nav.value())
+                }
+                DomNodeType::Namespace => {
+                    format!("namespace({}={})", nav.local_name(), nav.value())
+                }
+                DomNodeType::Comment => format!("comment({})", nav.value()),
+                DomNodeType::ProcessingInstruction => format!("pi({})", nav.local_name()),
+                other => format!("{other:?}({})", nav.value()),
+            },
+        }
+    }
+
+    /// Evaluate `expr` over `xml` with the document node as context item.
+    pub(super) fn items(expr: &str, xml: &str) -> Vec<String> {
+        try_items(expr, xml).unwrap_or_else(|e| panic!("{expr}: {e}"))
+    }
+
+    /// Evaluate an expression whose result is a single item.
+    pub(super) fn one(expr: &str, xml: &str) -> String {
+        let result = items(expr, xml);
+        assert_eq!(result.len(), 1, "{expr}: expected one item, got {result:?}");
+        result.into_iter().next().unwrap()
+    }
+
+    /// Evaluate `expr`, returning either the described items or the error's
+    /// specification code (`"<no code>"` for an error without one).
+    pub(super) fn try_items(expr: &str, xml: &str) -> Result<Vec<String>, String> {
+        let names = NameTable::new();
+        // The `xs` prefix is bound so the type expressions below can name the
+        // built-in types the way an ordinary host document would.
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+        let compiled = XPathExpr::compile(expr, &ctx).map_err(code_of)?;
+        let doc = roxmltree::Document::parse(xml).expect("parse xml");
+        let value = compiled
+            .evaluator(&ctx)
+            .run_with_node(RoXmlNavigator::new(&doc))
+            .map_err(code_of)?;
+        Ok(value.into_vec().iter().map(describe).collect())
+    }
+
+    /// The specification code an expression fails with, or a panic if it
+    /// succeeds.
+    pub(super) fn error_code(expr: &str, xml: &str) -> String {
+        match try_items(expr, xml) {
+            Ok(items) => panic!("{expr}: expected an error, got {items:?}"),
+            Err(code) => code,
+        }
+    }
+
+    fn code_of(e: crate::xpath::XPathError) -> String {
+        e.error_code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| format!("<no code> {e}"))
+    }
+}
+
+/// XPath 2.0 §3.2 — the semantics of the `/` operator: a per-item inner focus,
+/// results combined in document order without duplicates, and no mixing of
+/// nodes with atomic values.
+mod path_operator_tests {
+    use super::spec_helpers::{error_code, items, one};
+
+    /// Two `o` elements with two `i` children each.
+    const NESTED: &str =
+        r#"<r><o id="1"><i>a1</i><i>a2</i></o><o id="2"><i>b1</i><i>b2</i></o></r>"#;
+
+    #[test]
+    fn step_predicates_see_one_context_node_at_a_time() {
+        // §3.2.2: "The context size is the number of items in the input
+        // sequence" — the input sequence of a step's predicate is what that
+        // step produced for one context node, not the concatenation.
+        assert_eq!(one(r#"string-join(/r/o/i[last()],",")"#, NESTED), "a2,b2");
+        assert_eq!(
+            one(r#"string-join(/r/o/i[position()=1],",")"#, NESTED),
+            "a1,b1"
+        );
+        assert_eq!(one(r#"string-join(/r/o/i[1],",")"#, NESTED), "a1,b1");
+        assert_eq!(
+            one(r#"string-join(/r/o/i[position()>1],",")"#, NESTED),
+            "a2,b2"
+        );
+        // Parentheses turn the step into a primary expression, and then the
+        // predicate applies to the whole sequence.
+        assert_eq!(one(r#"string-join((/r/o/i)[last()],",")"#, NESTED), "b2");
+        assert_eq!(one(r#"string-join((/r/o/i)[1],",")"#, NESTED), "a1");
+    }
+
+    #[test]
+    fn a_non_step_right_operand_sees_the_position_in_the_left_operand() {
+        // §2.1.2: "the context size in the inner focus for an evaluation of E2
+        // is the number of items in the sequence obtained by evaluating E1".
+        // E1 is `/r/o/i`, which has four items.
+        assert_eq!(
+            one(r#"string-join(/r/o/i/string(last()),",")"#, NESTED),
+            "4,4,4,4"
+        );
+        assert_eq!(
+            one(r#"string-join(/r/o/i/string(position()),",")"#, NESTED),
+            "1,2,3,4"
+        );
+        // E1 is `/r/o`, which has two.
+        assert_eq!(
+            one(r#"string-join(/r/o/concat(@id,":",last()),",")"#, NESTED),
+            "1:2,2:2"
+        );
+    }
+
+    #[test]
+    fn node_results_are_combined_in_document_order() {
+        let doc = r#"<doc><item val="1"/><item val="2"/><item val="3"/><item val="4"/><item val="5"/></doc>"#;
+        // §3.2: "The resulting node sequence is returned in document order."
+        assert_eq!(
+            one(
+                r#"string-join(/doc/(item[5],item[3],item[2])/@val,",")"#,
+                doc
+            ),
+            "2,3,5"
+        );
+        assert_eq!(
+            one(
+                r#"string-join((/r/o[@id="2"],/r/o[@id="1"])/i,",")"#,
+                NESTED
+            ),
+            "a1,a2,b1,b2"
+        );
+        // A reverse axis feeding an atomizing step: the reverse-order axis
+        // result is put into document order before the step runs.
+        assert_eq!(
+            one(
+                r#"string-join(/doc/a/ancestor::node()/name(),"|")"#,
+                "<doc><a/></doc>"
+            ),
+            "|doc"
+        );
+        assert_eq!(
+            one(
+                r#"string-join(/r/o/i/ancestor-or-self::*/name(),"|")"#,
+                NESTED
+            ),
+            "r|o|i|i|o|i|i"
+        );
+    }
+
+    #[test]
+    fn duplicate_nodes_are_eliminated() {
+        // §3.2: "duplicate nodes are eliminated based on node identity".
+        assert_eq!(one("count((/r/o,/r/o)/i)", NESTED), "4");
+        assert_eq!(one("count(./(//i,//i))", NESTED), "4");
+        assert_eq!(one("count((/r/o,/r/o)/@id)", NESTED), "2");
+        // The axis iterators themselves were never the problem.
+        assert_eq!(one("count(//i/ancestor::r)", NESTED), "1");
+        assert_eq!(one("count(//i/parent::o)", NESTED), "2");
+    }
+
+    #[test]
+    fn a_mix_of_nodes_and_atomic_values_is_a_type_error() {
+        // §3.2: "If the multiple evaluations of E2 return at least one node and
+        // at least one atomic value, a type error is raised [err:XPTY0018]."
+        let doc = r#"<doc><item val="1"/><item val="2"/><item val="3"/></doc>"#;
+        assert_eq!(
+            error_code(
+                "count(//item/(if (position()=3) then @* else string(@val)))",
+                doc
+            ),
+            "XPTY0018"
+        );
+        // A single evaluation that mixes them is the same error.
+        assert_eq!(error_code("/doc/(item,'x')", doc), "XPTY0018");
+        // All-atomic and all-node results are both fine.
+        assert_eq!(one(r#"string-join(/doc/item/@val,",")"#, doc), "1,2,3");
+        assert_eq!(one("count(/doc/item)", doc), "3");
+        // An empty evaluation counts as a node sequence, not as a mix.
+        assert_eq!(one("count(/doc/item/(self::item[@val='2']))", doc), "1");
+    }
+
+    #[test]
+    fn an_atomic_left_operand_is_a_type_error() {
+        // §3.2: "Expression E1 is evaluated, and if the result is not a
+        // (possibly empty) sequence of nodes, a type error is raised
+        // [err:XPTY0019]."
+        let doc = "<doc><a/></doc>";
+        assert_eq!(error_code("/doc/name()/a", doc), "XPTY0019");
+        assert_eq!(error_code("/doc/name()/string(.)", doc), "XPTY0019");
+    }
+
+    #[test]
+    fn document_order_holds_for_nested_and_repeated_origins() {
+        // Nested elements of the same name: the concatenation of the per-origin
+        // child sequences is not in document order, so it has to be sorted.
+        let nested = "<doc><a><b>1</b><a><b>2</b></a><b>3</b></a></doc>";
+        assert_eq!(one(r#"string-join(//a/b,",")"#, nested), "1,2,3");
+        assert_eq!(one("count(//a/b)", nested), "3");
+        assert_eq!(one(r#"string-join(//a//b,",")"#, nested), "1,2,3");
+        // `following-sibling` from several origins can select the same node
+        // twice.
+        let flat = "<doc><a/><a/><a/></doc>";
+        assert_eq!(one("count(/doc/a/following-sibling::a)", flat), "2");
+        assert_eq!(one("count(/doc/a/preceding-sibling::a)", flat), "2");
+        assert_eq!(one("count(/doc/a/parent::doc)", flat), "1");
+    }
+
+    #[test]
+    fn an_absolute_path_starting_with_a_primary_expression_sees_the_root() {
+        // A leading "/" is an abbreviation for an initial step that yields the
+        // root of the tree (§3.2), so a primary expression written as the first
+        // step is evaluated with that root as its context item.
+        let doc = "<doc><a/><a/></doc>";
+        assert_eq!(items("/(doc)", doc), ["element(doc)"]);
+        assert_eq!(one("count(/(doc/a))", doc), "2");
+        assert_eq!(items("/(.)", doc), ["document"]);
+    }
+}
+
+/// XPath 2.0 §3.4 / §3.5.1 / §3.5.2 — the error behaviour of the operators.
+mod operator_error_tests {
+    use super::spec_helpers::{error_code, items, one};
+
+    #[test]
+    fn an_operator_type_error_carries_the_type_error_code() {
+        // §3.4: "If the types of the operands, after evaluation, are not a valid
+        // combination for the given operator, according to the rules in
+        // B.2 Operator Mapping, a type error is raised [err:XPTY0004]."
+        assert_eq!(error_code("3 + '2'", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("3 - true()", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("-'a'", "<a/>"), "XPTY0004");
+        // §3.5.1 for the value comparisons.
+        assert_eq!(error_code("3 eq '2'", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("'a' lt 1", "<a/>"), "XPTY0004");
+    }
+
+    #[test]
+    fn a_general_comparison_does_not_swallow_a_type_error() {
+        // §3.5.2 defers each pair to the corresponding value comparison, and
+        // §3.5.1 makes an incomparable pair a type error. `xs:string` against
+        // `xs:integer` is not a valid combination, so neither `=` nor `!=` may
+        // report a boolean.
+        assert_eq!(error_code("'001' = 1", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("'001' != 1", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("'a' < 1", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("'a' >= 1", "<a/>"), "XPTY0004");
+    }
+
+    #[test]
+    fn a_true_pair_still_short_circuits_a_general_comparison() {
+        // §3.5.2: "an implementation may return true as soon as it finds an item
+        // in the first operand and an item in the second operand that have the
+        // required magnitude relationship."
+        assert_eq!(one("(1,'a') = 1", "<a/>"), "true");
+        assert_eq!(one("(1,2) = (2,3)", "<a/>"), "true");
+        assert_eq!(one("(1,2) != (2,3)", "<a/>"), "true");
+        // …but with no true pair the incomparable pair decides.
+        assert_eq!(error_code("(1,'a') = 9", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("(1,'a') != 1", "<a/>"), "XPTY0004");
+    }
+
+    #[test]
+    fn an_operand_sequence_of_more_than_one_item_is_a_type_error() {
+        // §3.4 and §3.5.1: "If the atomized operand is a sequence of length
+        // greater than one, a type error is raised [err:XPTY0004]." The same
+        // rule covers `cast` (§3.10.2) and, through the function conversion
+        // rules, `to` (§3.3.1).
+        assert_eq!(error_code("(2,3,4) eq (2,3)", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("(1,2) + 1", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("-(1,2)", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("(1,2) to 3", "<a/>"), "XPTY0004");
+        assert_eq!(error_code("(1,2) cast as xs:integer", "<a/>"), "XPTY0004");
+        // An empty operand is still the empty sequence, not an error.
+        assert_eq!(items("() eq 1", "<a/>"), Vec::<String>::new());
+        assert_eq!(items("() + 1", "<a/>"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn comparable_operands_are_untouched() {
+        // Guard: the type errors above must not leak into valid combinations.
+        assert_eq!(one("1 = 1", "<a/>"), "true");
+        assert_eq!(one("1 = 2", "<a/>"), "false");
+        assert_eq!(one("'a' = 'a'", "<a/>"), "true");
+        assert_eq!(one("'a' != 'b'", "<a/>"), "true");
+        assert_eq!(one("1 + 1", "<a/>"), "2");
+        assert_eq!(one("1.5 lt 2", "<a/>"), "true");
+        // An untypedAtomic node value is cast, not rejected (§3.5.2).
+        assert_eq!(one("/a/@n = 1", r#"<a n="1"/>"#), "true");
+        assert_eq!(one("/a/@n != 2", r#"<a n="1"/>"#), "true");
+    }
+}
+
+/// XPath 2.0 §3.10.5 — `treat as` raises a dynamic error on every failure path.
+mod treat_as_tests {
+    use super::spec_helpers::{error_code, items, one};
+
+    #[test]
+    fn a_failed_treat_is_a_dynamic_error() {
+        // "If expr1 matches type1, using the rules for SequenceType matching,
+        // the treat expression returns the value of expr1; otherwise, it raises
+        // a dynamic error [err:XPDY0050]."
+        assert_eq!(error_code("(23.5) treat as xs:integer", "<a/>"), "XPDY0050");
+        assert_eq!(
+            error_code("(23,24) treat as xs:decimal", "<a/>"),
+            "XPDY0050"
+        );
+        assert_eq!(error_code("() treat as xs:integer", "<a/>"), "XPDY0050");
+        assert_eq!(error_code("/a treat as text()", "<a/>"), "XPDY0050");
+        assert_eq!(
+            error_code("1 treat as empty-sequence()", "<a/>"),
+            "XPDY0050"
+        );
+        assert_eq!(error_code("(1,2) treat as item()", "<a/>"), "XPDY0050");
+        assert_eq!(error_code("() treat as item()+", "<a/>"), "XPDY0050");
+    }
+
+    #[test]
+    fn a_matching_treat_returns_its_operand() {
+        assert_eq!(one("1 treat as xs:integer", "<a/>"), "1");
+        assert_eq!(items("/a treat as element()", "<a/>"), ["element(a)"]);
+        assert_eq!(
+            items("() treat as xs:integer?", "<a/>"),
+            Vec::<String>::new()
+        );
+        // empty-sequence() has no occurrence indicator of its own (§2.5.4).
+        assert_eq!(
+            items("() treat as empty-sequence()", "<a/>"),
+            Vec::<String>::new()
+        );
+        assert_eq!(one("count((1,2) treat as xs:integer+)", "<a/>"), "2");
+    }
+}
+
+/// XPath 2.0 §2.5.4.2 / §3.10.2 / §3.10.3 — a QName used as an `AtomicType`
+/// must name an atomic type in the in-scope schema types.
+mod atomic_type_name_tests {
+    use super::spec_helpers::{error_code, one};
+
+    #[test]
+    fn an_unknown_type_name_is_a_static_error() {
+        // "If a QName that is used as an AtomicType is not defined as an atomic
+        // type in the in-scope schema types, a static error is raised
+        // [err:XPST0051]."
+        assert_eq!(
+            error_code("'abc' instance of nosuchtype", "<a/>"),
+            "XPST0051"
+        );
+        assert_eq!(error_code("'abc' treat as nosuchtype", "<a/>"), "XPST0051");
+        assert_eq!(error_code("'abc' cast as nosuchtype", "<a/>"), "XPST0051");
+        assert_eq!(
+            error_code("'abc' castable as nosuchtype", "<a/>"),
+            "XPST0051"
+        );
+        // An unprefixed name is in the default element/type namespace, which is
+        // absent here — so `string` is not `xs:string`.
+        assert_eq!(error_code("'abc' instance of string", "<a/>"), "XPST0051");
+        assert_eq!(error_code("'abc' castable as double", "<a/>"), "XPST0051");
+    }
+
+    #[test]
+    fn a_non_atomic_schema_type_name_is_a_static_error() {
+        // The spec's own note: "The names of non-atomic types such as xs:IDREFS
+        // are not accepted."
+        assert_eq!(error_code("1 instance of xs:IDREFS", "<a/>"), "XPST0051");
+        assert_eq!(error_code("1 instance of xs:NMTOKENS", "<a/>"), "XPST0051");
+        assert_eq!(error_code("1 instance of xs:ENTITIES", "<a/>"), "XPST0051");
+        assert_eq!(error_code("3 cast as xs:IDREFS", "<a/>"), "XPST0051");
+        // `xs:anyType` and `xs:anySimpleType` are not atomic types either.
+        assert_eq!(error_code("3 cast as xs:anyType", "<a/>"), "XPST0051");
+        assert_eq!(error_code("3 cast as xs:anySimpleType", "<a/>"), "XPST0051");
+        assert_eq!(error_code("3 instance of xs:anyType", "<a/>"), "XPST0051");
+    }
+
+    #[test]
+    fn the_atomic_type_names_keep_working() {
+        // Guard: the check must not reject a legitimate AtomicType.
+        assert_eq!(one("'abc' instance of xs:string", "<a/>"), "true");
+        assert_eq!(one("1 instance of xs:integer", "<a/>"), "true");
+        // `xs:integer` derives from `xs:decimal`, so subtype substitution
+        // applies (§2.5.4.2).
+        assert_eq!(one("1 instance of xs:decimal", "<a/>"), "true");
+        assert_eq!(one("1 instance of xs:string", "<a/>"), "false");
+        assert_eq!(one("1 castable as xs:string", "<a/>"), "true");
+        assert_eq!(one("'3' cast as xs:integer", "<a/>"), "3");
+        assert_eq!(one("xs:integer('3')", "<a/>"), "3");
+        // `xs:anyAtomicType` is the base of the atomic types, and is itself a
+        // legal AtomicType in a SequenceType.
+        assert_eq!(one("'abc' instance of xs:anyAtomicType", "<a/>"), "true");
+        // `xs:NOTATION` is an atomic type, so naming it is not a static error.
+        assert_eq!(one("'abc' instance of xs:NOTATION", "<a/>"), "false");
+    }
+}
+
+/// XPath 2.0 §3.1.5 and §3.4 — the conversions that XPath 1.0 compatibility
+/// mode adds, and the guarantee that they do nothing when the flag is off.
+mod xpath10_compatibility_conversion_tests {
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::{RoXmlNavigator, XPathContext, XPathError};
+
+    /// Evaluate `expr` in XPath 2.0 syntax, with compatibility mode on or off.
+    fn eval(expr: &str, compat: bool) -> Result<String, XPathError> {
+        let names = NameTable::new();
+        let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+        namespaces.bindings.push((
+            names.add("xs"),
+            names.add("http://www.w3.org/2001/XMLSchema"),
+        ));
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(namespaces)
+            .with_xpath10_compatibility(compat);
+        let value = XPathExpr::compile(expr, &ctx)?
+            .evaluator(&ctx)
+            .run::<RoXmlNavigator<'static>>()?;
+        Ok(value
+            .into_vec()
+            .iter()
+            .map(|item| match item {
+                crate::xpath::iterator::XmlItem::Atomic(v) => v.to_string_value(),
+                crate::xpath::iterator::XmlItem::Node(_) => "node".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(","))
+    }
+
+    /// Evaluate `expr` over `xml` with the document node as context item.
+    fn eval_on(expr: &str, xml: &str, compat: bool) -> Result<String, XPathError> {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names).with_xpath10_compatibility(compat);
+        let doc = ::roxmltree::Document::parse(xml).expect("parse xml");
+        let value = XPathExpr::compile(expr, &ctx)?
+            .evaluator(&ctx)
+            .run_with_node(RoXmlNavigator::new(&doc))?;
+        Ok(value
+            .into_vec()
+            .iter()
+            .map(|item| match item {
+                crate::xpath::iterator::XmlItem::Atomic(v) => v.to_string_value(),
+                crate::xpath::iterator::XmlItem::Node(_) => "node".to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(","))
+    }
+
+    fn on(expr: &str) -> String {
+        eval(expr, true).unwrap_or_else(|e| panic!("{expr}: {e}"))
+    }
+
+    fn off(expr: &str) -> Result<String, XPathError> {
+        eval(expr, false)
+    }
+
+    #[test]
+    fn function_arguments_take_the_first_item_and_are_converted() {
+        // §3.1.5: "If the expected type calls for a single item or optional
+        // single item …, then the value V is effectively replaced by V[1]."
+        assert_eq!(on("string-length(( 'abcd', 'xy' ))"), "4");
+        assert_eq!(on("upper-case(('a','b'))"), "A");
+        // "If the expected type is xs:double or xs:double?, then the value V is
+        // effectively replaced by fn:number(V)."
+        assert_eq!(on("round(concat('20','.7'))"), "21");
+        assert_eq!(on("floor('2.7')"), "2");
+        assert_eq!(on("round((3.6, 9))"), "4");
+        // "If the expected type is xs:string or xs:string?, then the value V is
+        // effectively replaced by fn:string(V)."
+        assert_eq!(on("upper-case(12)"), "12");
+        assert_eq!(on("string-length(true())"), "4");
+        // An argument whose expected type allows a sequence is untouched.
+        assert_eq!(on("count((1,2,3))"), "3");
+        assert_eq!(on("string-join(('a','b'),'-')"), "a-b");
+    }
+
+    #[test]
+    fn arithmetic_operands_take_the_first_item_and_become_numbers() {
+        // §3.4, compatibility mode: first item, then fn:number, and an empty
+        // operand makes the whole expression NaN.
+        assert_eq!(on("1 + (6 to 10)"), "7");
+        assert_eq!(on("(6 to 10) + 1"), "7");
+        assert_eq!(on("1 + ()"), "NaN");
+        assert_eq!(on("() + 1"), "NaN");
+        assert_eq!(on("() * 3"), "NaN");
+        assert_eq!(on("-()"), "NaN");
+        assert_eq!(on("-(2,3)"), "-2");
+        assert_eq!(on("'3' * '4'"), "12");
+        assert_eq!(on("1 + true()"), "2");
+        assert_eq!(on("'x' + 1"), "NaN");
+        // XPath 1.0 arithmetic is always double, and division by zero is not an
+        // error.
+        assert_eq!(on("1 div 0"), "INF");
+        assert_eq!(on("1 + 2"), "3");
+        // The date, time and duration types are not in §3.4's conversion list,
+        // so XPath 2.0's operator mapping still applies to them.
+        assert_eq!(on("xs:date('2001-01-01') - xs:date('2000-01-01')"), "P366D");
+        assert_eq!(
+            on("xs:date('2000-01-01') + xs:dayTimeDuration('P1D')"),
+            "2000-01-02"
+        );
+        // `idiv` has no XPath 1.0 counterpart and keeps its integer result.
+        assert_eq!(on("7 idiv 2"), "3");
+    }
+
+    #[test]
+    fn a_range_operand_takes_its_first_item() {
+        // §3.3.1 types the operands of `to` as xs:integer?, a single optional
+        // item, so only the first §3.1.5 step applies.
+        assert_eq!(on("(1,2) to 3"), "1,2,3");
+        assert_eq!(on("1 to (3,9)"), "1,2,3");
+        // An empty operand still yields the empty sequence, not NaN: the NaN
+        // rule belongs to the arithmetic operators.
+        assert_eq!(on("() to 3"), "");
+        assert_eq!(on("1 to ()"), "");
+    }
+
+    /// §3.1.5 gates all three compatibility steps on "**and an argument is not
+    /// of the expected type**": an argument that already matches its
+    /// parameter's declared sequence type is handed to the function untouched.
+    #[test]
+    fn an_argument_already_of_the_expected_type_is_not_converted() {
+        // `fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?)`:
+        // `()` is a value of type `xs:string?`, so no `V[1]`, no `fn:string`,
+        // and `fn:compare` sees the empty sequence it is specified to return.
+        assert_eq!(on("compare((), '')"), "");
+        assert_eq!(on("compare('', ())"), "");
+        assert_eq!(on("empty(compare((), ''))"), "true");
+        // `fn:resolve-uri($relative as xs:string?, $base as xs:string)`:
+        // likewise, and so no base URI comes back out of it.
+        assert_eq!(on("resolve-uri((), 'http://example.com/')"), "");
+        // An optional numeric parameter behaves the same way.
+        assert_eq!(on("round(())"), "");
+        assert_eq!(on("floor(())"), "");
+        // A single item of the declared type is handed over as it stands.
+        assert_eq!(on("string-length('abcd')"), "4");
+        assert_eq!(on("round(xs:double('1.5'))"), "2");
+    }
+
+    /// The positive half of the same rule: everything that is *not* of the
+    /// expected type still goes through the three steps.
+    #[test]
+    fn an_argument_not_of_the_expected_type_is_still_converted() {
+        const XML: &str = "<r><a>7</a></r>";
+
+        // A node where `xs:string?` is expected is not of the expected type —
+        // the steps run before atomization — so `fn:string(V)` applies.
+        assert_eq!(eval_on("string-length(/r/a)", XML, true).unwrap(), "1");
+        assert_eq!(eval_on("upper-case(/r/a)", XML, true).unwrap(), "7");
+        // A node where `xs:double?` is expected becomes `fn:number(V)`.
+        assert_eq!(eval_on("round(/r/a)", XML, true).unwrap(), "7");
+        // More than one item: `V[1]`, then the step for the item type.
+        assert_eq!(on("string-length(('abcd','xy'))"), "4");
+        assert_eq!(on("compare(('b','zz'), 'b')"), "0");
+        // The empty sequence where a *required* single item is expected does
+        // not match the cardinality, so it is converted:
+        // `fn:string(())` is the zero-length string, and `fn:string-join`
+        // joins with it instead of raising XPTY0004 as it does with the flag
+        // off.
+        assert_eq!(on("string-join(('a','b'), ())"), "ab");
+        // … and `fn:number(())` is NaN, which `fn:substring` then reports by
+        // selecting no characters.
+        assert_eq!(on("substring('hello', ())"), "");
+        assert_eq!(on("string-length(substring('hello', ()))"), "0");
+        // An xs:untypedAtomic and an xs:integer are not of type `xs:string`
+        // either (neither derives from it, and neither promotes to it).
+        assert_eq!(on("upper-case(12)"), "12");
+        assert_eq!(on("string-length(true())"), "4");
+        // An xs:string is not of type `xs:double?`, so `fn:number` applies.
+        assert_eq!(on("floor('2.7')"), "2");
+        // Nor is an xs:decimal, so XPath 1.0's all-arithmetic-is-double shows
+        // through in the result type where XPath 2.0 keeps the decimal.
+        assert_eq!(on("round(1.5) instance of xs:double"), "true");
+        assert_eq!(off("round(1.5) instance of xs:double").unwrap(), "false");
+    }
+
+    /// The condition is about the argument's *static* type, so a path
+    /// expression that happens to select **no** nodes is still not of the
+    /// expected type: its static type is a node sequence, not `xs:double?`.
+    /// The literal `()` is the one expression XPath 2.0 §2.3.4 allows to have
+    /// the static type `empty-sequence()`, and that is what makes
+    /// `fn:compare((), '')` different from `fn:round(doc/none)`.
+    #[test]
+    fn an_empty_path_expression_is_not_of_the_expected_type() {
+        const XML: &str = "<doc><a>7</a></doc>";
+
+        // `round()` over a path that selects no nodes, and `floor()` over a
+        // name that does not exist: both are NaN, which is what a host language
+        // that switches this flag on for a 1.0-era expression expects.
+        assert_eq!(eval_on("round(doc/none)", XML, true).unwrap(), "NaN");
+        assert_eq!(eval_on("floor(nonexistent)", XML, true).unwrap(), "NaN");
+        assert_eq!(eval_on("round(/doc/none)", XML, true).unwrap(), "NaN");
+        assert_eq!(eval_on("round(doc/a[2])", XML, true).unwrap(), "NaN");
+        // The same for a parameter expecting `xs:string?`: an empty path
+        // becomes `fn:string(())`, the zero-length string, so `fn:compare`
+        // returns a number rather than the empty sequence.
+        assert_eq!(eval_on("compare(doc/none, '')", XML, true).unwrap(), "0");
+        // …while the literal empty sequence is of the expected type.
+        assert_eq!(eval_on("compare((), '')", XML, true).unwrap(), "");
+        assert_eq!(eval_on("round(())", XML, true).unwrap(), "");
+        // Parentheses around the literal do not change its type.
+        assert_eq!(eval_on("round((()))", XML, true).unwrap(), "");
+        assert_eq!(eval_on("compare((()), '')", XML, true).unwrap(), "");
+        // Under XPath 2.0 rules all four are the empty sequence.
+        assert_eq!(eval_on("round(doc/none)", XML, false).unwrap(), "");
+        assert_eq!(eval_on("compare(doc/none, '')", XML, false).unwrap(), "");
+        assert_eq!(eval_on("round(())", XML, false).unwrap(), "");
+        assert_eq!(eval_on("compare((), '')", XML, false).unwrap(), "");
+    }
+
+    #[test]
+    fn nothing_changes_when_the_flag_is_off() {
+        // The same expressions under XPath 2.0 rules.
+        assert!(off("round(concat('20','.7'))").is_err());
+        assert!(off("1 + (6 to 10)").is_err());
+        assert!(off("-(2,3)").is_err());
+        assert!(off("(1,2) to 3").is_err());
+        assert!(off("'3' * '4'").is_err());
+        assert!(off("1 + true()").is_err());
+        assert_eq!(off("1 + ()").unwrap(), "");
+        assert_eq!(off("() to 3").unwrap(), "");
+        assert_eq!(off("string-length(('abcd'))").unwrap(), "4");
+        assert_eq!(off("count((1,2,3))").unwrap(), "3");
+        assert_eq!(off("1 + 2").unwrap(), "3");
+        assert_eq!(off("7 idiv 2").unwrap(), "3");
+        assert_eq!(
+            off("xs:date('2001-01-01') - xs:date('2000-01-01')").unwrap(),
+            "P366D"
+        );
+        // `upper-case(12)` is a pre-existing leniency in the function library's
+        // string coercion, not something compatibility mode introduces: it
+        // yields "12" with the flag either way, where §3.1.5 (flag off) calls
+        // for XPTY0004 because xs:integer does not promote to xs:string.
+        assert_eq!(off("upper-case(12)").unwrap(), "12");
+        assert_eq!(on("upper-case(12)"), "12");
+        // The arguments that already match their declared type behave under
+        // XPath 2.0 exactly as they now do with the flag on, which is the
+        // point of the §3.1.5 guard.
+        assert_eq!(off("compare((), '')").unwrap(), "");
+        assert_eq!(off("resolve-uri((), 'http://example.com/')").unwrap(), "");
+        assert_eq!(off("round(())").unwrap(), "");
+        assert_eq!(off("floor(())").unwrap(), "");
+        assert_eq!(off("string-length('abcd')").unwrap(), "4");
+        // …and the ones that do not match still differ: under XPath 2.0 they
+        // are type errors, not conversions.
+        assert!(off("string-length(('abcd','xy'))").is_err());
+        assert!(off("string-join(('a','b'), ())").is_err());
+        // `fn:substring`'s own numeric coercion is lenient with the flag
+        // either way — another pre-existing leniency of the function library,
+        // not something compatibility mode introduces.
+        assert_eq!(off("substring('hello', ())").unwrap(), "");
+    }
+}
+
+/// Helper for the expression-level tests below: compile and evaluate `expr`
+/// with no context item, and return its string value.
+#[cfg(test)]
+fn eval_to_string(expr: &str) -> Result<String, XPathError> {
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::RoXmlNavigator;
+
+    let names = NameTable::new();
+    let mut namespaces = NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        names.add("xs"),
+        names.add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+    XPathExpr::compile(expr, &ctx)?
+        .evaluator(&ctx)
+        .run_string::<RoXmlNavigator<'static>>()
+}
+
+/// XPath 2.0 §A.2.1: `DecimalLiteral ::= ("." Digits) | (Digits "." [0-9]*)`.
+#[test]
+fn decimal_literal_with_a_trailing_period_evaluates() {
+    assert_eq!(eval_to_string("5.").unwrap(), "5");
+    assert_eq!(eval_to_string("5. + 1").unwrap(), "6");
+    assert_eq!(eval_to_string("5. instance of xs:decimal").unwrap(), "true");
+    assert_eq!(eval_to_string("0.").unwrap(), "0");
+    // The other two forms are unchanged.
+    assert_eq!(eval_to_string(".5 + 0.5").unwrap(), "1");
+}
+
+/// XPath 2.0 §3.1.1: the value of a string literal is the characters between
+/// the delimiters; no XML un-escaping happens inside the XPath processor.
+#[test]
+fn string_literals_keep_their_characters_verbatim() {
+    assert_eq!(eval_to_string("concat('a&b','!')").unwrap(), "a&b!");
+    assert_eq!(eval_to_string("concat('a&amp;b','!')").unwrap(), "a&amp;b!");
+    assert_eq!(eval_to_string("string-length('&#13;')").unwrap(), "5");
+    assert_eq!(eval_to_string("'a&foo;b'").unwrap(), "a&foo;b");
+    // A literal carriage return stays a carriage return (codepoint 13).
+    assert_eq!(
+        eval_to_string(
+            "string-join(for $c in string-to-codepoints('a\rb') return string($c), ' ')"
+        )
+        .unwrap(),
+        "97 13 98"
+    );
+    // A doubled delimiter still stands for one.
+    assert_eq!(eval_to_string("'it''s'").unwrap(), "it's");
+}
+
+/// Compile and evaluate `expr` with the document element of `xml` as context
+/// item, returning the string value or the error code.
+#[cfg(test)]
+fn eval_on_doc(expr: &str, xml: &str) -> Result<String, Option<&'static str>> {
+    use crate::namespace::context::NamespaceContextSnapshot;
+    use crate::namespace::table::NameTable;
+    use crate::xpath::api::XPathExpr;
+    use crate::xpath::RoXmlNavigator;
+
+    let names = NameTable::new();
+    let mut namespaces = NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        names.add("xs"),
+        names.add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    namespaces.bindings.push((
+        names.add("xsi"),
+        names.add("http://www.w3.org/2001/XMLSchema-instance"),
+    ));
+    let ctx = XPathContext::new(&names).with_namespaces(namespaces);
+    let doc = roxmltree::Document::parse(xml).expect("well-formed test document");
+    let nav = RoXmlNavigator::new(&doc);
+    let compiled = XPathExpr::compile(expr, &ctx).map_err(|e| e.error_code())?;
+    compiled
+        .evaluator(&ctx)
+        .run_with_node(nav)
+        .map(|v| {
+            v.into_vec()
+                .iter()
+                .map(|item| match item {
+                    XmlItem::Atomic(a) => a.to_string_value(),
+                    XmlItem::Node(_) => "<node>".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .map_err(|e| e.error_code())
+}
+
+/// `fn:min` and `fn:max` accept every type that has an ordering, which
+/// includes the date and time types, not only the numeric ones.
+#[test]
+fn min_and_max_accept_the_ordered_date_and_time_types() {
+    let dates = r#"(xs:date("1996-12-23"), xs:date("1995-12-23"))"#;
+    assert_eq!(
+        eval_to_string(&format!("max({dates})")).unwrap(),
+        "1996-12-23"
+    );
+    assert_eq!(
+        eval_to_string(&format!("min({dates})")).unwrap(),
+        "1995-12-23"
+    );
+    assert_eq!(
+        eval_to_string(&format!("max({dates}) instance of xs:date")).unwrap(),
+        "true"
+    );
+
+    for (expr, expected) in [
+        (
+            r#"max((xs:dateTime("2001-01-01T12:00:00"), xs:dateTime("2002-01-01T12:00:00")))"#,
+            "2002-01-01T12:00:00",
+        ),
+        (
+            r#"min((xs:time("12:00:00"), xs:time("10:00:00")))"#,
+            "10:00:00",
+        ),
+        (
+            r#"max((xs:dayTimeDuration("PT1S"), xs:dayTimeDuration("PT2S")))"#,
+            "PT2S",
+        ),
+        (
+            r#"max((xs:yearMonthDuration("P1Y"), xs:yearMonthDuration("P2Y")))"#,
+            "P2Y",
+        ),
+        (r#"max(("a", "c", "b"))"#, "c"),
+        (r#"min((true(), false()))"#, "false"),
+    ] {
+        assert_eq!(eval_to_string(expr).unwrap(), expected, "{expr}");
+    }
+
+    // A type with no ordering is still rejected.
+    assert!(eval_to_string(r#"max((xs:gYear("2000"), xs:gYear("2001")))"#).is_err());
+    assert!(eval_to_string(r#"max((xs:duration("P1Y"), xs:duration("P2Y")))"#).is_err());
+
+    // …and so is a sequence that mixes primitive types, because `lt` and `gt`
+    // are not defined across them.
+    for expr in [
+        r#"min((xs:dateTime("1996-12-23T13:13:00"), 23, "brian"))"#,
+        r#"max((xs:date("1996-12-23"), 23))"#,
+        r#"max((1, "a"))"#,
+        r#"max((true(), 1))"#,
+        r#"max((xs:dayTimeDuration("PT1S"), xs:yearMonthDuration("P1Y")))"#,
+    ] {
+        assert!(eval_to_string(expr).is_err(), "{expr}");
+    }
+    // The numeric types still mix with one another, and xs:anyURI with strings.
+    assert_eq!(eval_to_string("max((1, 2.5, 3.0e0))").unwrap(), "3");
+    assert_eq!(
+        eval_to_string(r#"max((xs:anyURI("http://b/"), "http://a/"))"#).unwrap(),
+        "http://b/"
+    );
+}
+
+/// `fn:sum`'s `$zero` may itself be the empty sequence, which is not the same
+/// as omitting it.
+#[test]
+fn sum_of_an_empty_sequence_returns_the_supplied_zero() {
+    assert_eq!(eval_to_string("count(sum((), ()))").unwrap(), "0");
+    assert_eq!(eval_to_string("sum(())").unwrap(), "0");
+    assert_eq!(eval_to_string("sum((), 42)").unwrap(), "42");
+    assert_eq!(eval_to_string(r#"sum((), "none")"#).unwrap(), "none");
+}
+
+/// `fn:sum` accumulates with `op:numeric-add`, so a sum of integers is an
+/// integer; `fn:avg` divides by the count, and integer ÷ integer is a decimal.
+#[test]
+fn aggregate_result_types_follow_the_operators() {
+    assert_eq!(
+        eval_to_string("sum((1,2,3)) instance of xs:integer").unwrap(),
+        "true"
+    );
+    assert_eq!(eval_to_string("sum((1,2,3))").unwrap(), "6");
+    assert_eq!(
+        eval_to_string("sum((1,2.5)) instance of xs:decimal").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_to_string("avg((1,2,3)) instance of xs:decimal").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_to_string("min((1,2,3)) instance of xs:integer").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_to_string("max((1,2,3)) instance of xs:integer").unwrap(),
+        "true"
+    );
+}
+
+/// `fn:round-half-to-even` decides a tie on the exact value of the argument,
+/// not on a scaled binary product, and a zero result keeps the argument's sign.
+#[test]
+fn round_half_to_even_uses_the_exact_value() {
+    for (expr, expected) in [
+        // The double nearest 250.025 is above the midpoint, although
+        // multiplying it by 100 gives exactly 25002.5.
+        ("round-half-to-even(250.0250e0, 2)", "250.03"),
+        // The float nearest 150.015 is below the midpoint.
+        ("round-half-to-even(xs:float(150.0150e0), 2)", "150.01"),
+        // A zero result keeps the sign of the argument.
+        ("round-half-to-even(-3.0e0, -2)", "-0"),
+        ("round-half-to-even(-0.3e0)", "-0"),
+        // Genuine ties go to the even candidate.
+        ("round-half-to-even(0.5e0)", "0"),
+        ("round-half-to-even(1.5e0)", "2"),
+        ("round-half-to-even(2.5e0)", "2"),
+        ("round-half-to-even(1.125e0, 2)", "1.12"),
+        ("round-half-to-even(35612.25e0, -2)", "35600"),
+        ("round-half-to-even(3.567812e+3, 2)", "3567.81"),
+        ("round-half-to-even(0.5)", "0"),
+        ("round-half-to-even(1.5)", "2"),
+        ("round-half-to-even(2.5)", "2"),
+        ("round-half-to-even(0)", "0"),
+    ] {
+        assert_eq!(eval_to_string(expr).unwrap(), expected, "{expr}");
+    }
+    // NaN and the infinities are returned unchanged.
+    assert_eq!(
+        eval_to_string("round-half-to-even(1.0e0 div 0.0e0)").unwrap(),
+        "INF"
+    );
+    assert_eq!(
+        eval_to_string("round-half-to-even(-1.0e0 div 0.0e0)").unwrap(),
+        "-INF"
+    );
+}
+
+/// `fn:subsequence` keeps the items whose position `p` satisfies
+/// `round($startingLoc) <= p` and `p < round($startingLoc) + round($length)`,
+/// in xs:double arithmetic — so an infinite or NaN bound falls out of the same
+/// two comparisons.
+#[test]
+fn subsequence_follows_the_position_predicate() {
+    for (expr, expected) in [
+        ("string-join(subsequence((1 to 10), 4, 3), ',')", "4,5,6"),
+        (
+            "string-join(subsequence((1 to 10), 4), ',')",
+            "4,5,6,7,8,9,10",
+        ),
+        ("string-join(subsequence((1 to 5), -1, 3), ',')", "1"),
+        ("string-join(subsequence((1 to 5), 0), ',')", "1,2,3,4,5"),
+        ("count(subsequence((1 to 5), 6))", "0"),
+        ("count(subsequence((1 to 5), 2, 0))", "0"),
+        ("count(subsequence((1 to 5), 2, -1))", "0"),
+        // -INF to +INF sums to NaN, and every comparison with NaN is false.
+        (
+            "count(subsequence(1 to 20, -1.0e0 div 0.0e0, 1.0e0 div 0.0e0))",
+            "0",
+        ),
+        ("count(subsequence(1 to 20, 1, 1.0e0 div 0.0e0))", "20"),
+        ("count(subsequence(1 to 20, 1.0e0 div 0.0e0))", "0"),
+        ("count(subsequence(1 to 20, -1.0e0 div 0.0e0))", "20"),
+        ("count(subsequence(1 to 20, number('x')))", "0"),
+        ("count(subsequence(1 to 20, 1, number('x')))", "0"),
+    ] {
+        assert_eq!(eval_to_string(expr).unwrap(), expected, "{expr}");
+    }
+}
+
+/// `fn:resolve-QName` reports FOCA0002 for a value that is not a lexical
+/// QName and FONS0004 for a prefix the element does not bind.
+#[test]
+fn resolve_qname_error_codes() {
+    let doc = r#"<e xmlns:pre="http://example.com/"/>"#;
+    assert_eq!(
+        eval_on_doc(r#"resolve-QName("pre:+thing", /e)"#, doc),
+        Err(Some("FOCA0002"))
+    );
+    assert_eq!(
+        eval_on_doc(r#"resolve-QName(":thing", /e)"#, doc),
+        Err(Some("FOCA0002"))
+    );
+    assert_eq!(
+        eval_on_doc(r#"resolve-QName("", /e)"#, doc),
+        Err(Some("FOCA0002"))
+    );
+    assert_eq!(
+        eval_on_doc(r#"resolve-QName("post:thing", /e)"#, doc),
+        Err(Some("FONS0004"))
+    );
+    // A bound prefix and an unprefixed name still resolve.
+    assert_eq!(
+        eval_on_doc(
+            r#"namespace-uri-from-QName(resolve-QName("pre:thing", /e))"#,
+            doc
+        )
+        .unwrap(),
+        "http://example.com/"
+    );
+    assert_eq!(
+        eval_on_doc(r#"local-name-from-QName(resolve-QName("thing", /e))"#, doc).unwrap(),
+        "thing"
+    );
+}
+
+/// "nilled" is the post-schema-validation property, so an element that was
+/// never validated is not nilled however it is marked up.
+#[test]
+fn nilled_is_false_for_an_unvalidated_element() {
+    let doc = r#"<doc xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><e xsi:nil="true"/><f/></doc>"#;
+    assert_eq!(eval_on_doc("nilled(/doc/e)", doc).unwrap(), "false");
+    assert_eq!(eval_on_doc("nilled(/doc/f)", doc).unwrap(), "false");
+    // Not an element: the empty sequence.
+    assert_eq!(
+        eval_on_doc("count(nilled(/doc/e/@xsi:nil))", doc).unwrap(),
+        "0"
+    );
 }

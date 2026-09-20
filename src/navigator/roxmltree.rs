@@ -185,6 +185,19 @@ impl<'a> RoXmlNavigator<'a> {
                 for ns in node.namespaces() {
                     let prefix = ns.name();
                     if seen_prefixes.insert(prefix) {
+                        // A zero-length URI is a namespace *undeclaration*
+                        // (`xmlns=""`). It cancels an outer binding rather than
+                        // adding one, so under `All` — the XDM
+                        // `dm:namespace-nodes` accessor, which backs the
+                        // `namespace::` axis and `fn:in-scope-prefixes` — no
+                        // namespace node exists for it. The other scopes are
+                        // internal views of the *declarations* (serialization,
+                        // shallow copy, and the namespace context used to
+                        // resolve QNames while validating), where the
+                        // undeclaration must stay visible.
+                        if scope == NamespaceAxisScope::All && ns.uri().is_empty() {
+                            continue;
+                        }
                         result.push((prefix.map(String::from), ns.uri().to_string()));
                     }
                 }
@@ -268,6 +281,36 @@ impl<'a> RoXmlNavigator<'a> {
         }
 
         false
+    }
+}
+
+/// Read a lexical QName out of a document's source text, starting at `offset`.
+///
+/// The scan stops at the first character that cannot be part of a name in that
+/// position — whitespace, `/`, `>`, `<`, `=` or a quote — which is enough to
+/// delimit an element name inside its start tag and an attribute name before
+/// its `=`. Returns `None` when there is no name there, so the caller can fall
+/// back to the expanded name.
+///
+/// "Whitespace" here is XML's, which is exactly the four characters of XML 1.0
+/// §2.3 production `S ::= (#x20 | #x9 | #xD | #xA)+`, and not Unicode's: the
+/// same section admits `[#x37F-#x1FFF]` into `NameStartChar`, so codepoints
+/// such as U+1680 OGHAM SPACE MARK — whitespace to
+/// [`char::is_whitespace`], a name character to XML — must not end the scan.
+fn qname_at(text: &str, offset: usize) -> Option<&str> {
+    let rest = text.get(offset..)?;
+    let end = rest
+        .find(|c: char| {
+            matches!(
+                c,
+                ' ' | '\t' | '\r' | '\n' | '/' | '>' | '<' | '=' | '"' | '\''
+            )
+        })
+        .unwrap_or(rest.len());
+    if end == 0 {
+        None
+    } else {
+        Some(&rest[..end])
     }
 }
 
@@ -567,25 +610,34 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
     }
 
     fn name(&self) -> &str {
-        // Build the qualified name (prefix:local)
-        // Note: This method has a mutable borrow issue - we'll return local_name for now
-        // In a proper implementation, we'd cache this
         match &self.cursor {
             RoCursor::Node(n) => {
-                // For PI nodes, the name is the target
+                // For PI nodes, the name is the target.
                 if let Some(pi) = n.pi() {
                     pi.target
+                } else if n.is_element() {
+                    // roxmltree exposes the *expanded* name only, and this
+                    // accessor has to hand back a borrowed `&str`, so the
+                    // lexical QName is read back out of the document's own
+                    // source text: an element's range starts at its `<`, and
+                    // its QName follows immediately.
+                    qname_at(self.doc.input_text(), n.range().start + 1)
+                        .unwrap_or_else(|| n.tag_name().name())
                 } else {
-                    // roxmltree doesn't provide a combined qualified name directly
-                    // Return local name for now (proper impl would use name_cache)
+                    // Text, comment and document nodes have no name.
                     n.tag_name().name()
                 }
             }
             RoCursor::Attribute { owner, index } => owner
                 .attributes()
                 .nth(*index)
-                .map(|a| a.name())
+                .map(|a| {
+                    // An attribute's position is the offset of its name.
+                    qname_at(self.doc.input_text(), a.position()).unwrap_or_else(|| a.name())
+                })
                 .unwrap_or(""),
+            // A namespace node's name is its prefix, which carries no prefix
+            // of its own.
             RoCursor::Namespace {
                 namespaces, index, ..
             } => namespaces
@@ -1257,6 +1309,133 @@ mod tests {
                     break;
                 }
             }
+        }
+    }
+    /// `fn:name`'s lexical QName keeps the prefix as the document wrote it.
+    #[test]
+    fn name_returns_the_qualified_name() {
+        let xml = r#"<a:r xmlns:a="http://a/" a:att="v" plain="w"><a:c/><plain/><?pi data?><!--c--></a:r>"#;
+        let doc = Document::parse(xml).unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+
+        // Document node has no name.
+        assert_eq!(nav.name(), "");
+
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.name(), "a:r");
+        assert_eq!(nav.local_name(), "r");
+        assert_eq!(nav.prefix(), "a");
+
+        // Attributes, prefixed and not.
+        let mut attrs = nav.clone();
+        assert!(attrs.move_to_first_attribute());
+        assert_eq!(attrs.name(), "a:att");
+        assert_eq!(attrs.local_name(), "att");
+        assert!(attrs.move_to_next_attribute());
+        assert_eq!(attrs.name(), "plain");
+
+        // A namespace node's name is its prefix.
+        let mut ns = nav.clone();
+        assert!(ns.move_to_first_namespace(crate::navigator::NamespaceAxisScope::All));
+        assert_eq!(ns.name(), "a");
+
+        // Children: prefixed element, unprefixed element, PI, comment.
+        let mut child = nav.clone();
+        assert!(child.move_to_first_child());
+        assert_eq!(child.name(), "a:c");
+        assert!(child.move_to_next_sibling());
+        assert_eq!(child.name(), "plain");
+        assert!(child.move_to_next_sibling());
+        assert_eq!(child.name(), "pi");
+        assert!(child.move_to_next_sibling());
+        assert_eq!(child.name(), "");
+    }
+
+    /// A start tag may be spelled with any amount of trailing whitespace, and
+    /// an empty element closes with `/>`; the scan must stop at both.
+    #[test]
+    fn name_handles_every_start_tag_shape() {
+        for (xml, expected) in [
+            ("<r/>", "r"),
+            ("<r />", "r"),
+            ("<r></r>", "r"),
+            ("<r\n  a='1'/>", "r"),
+            (r#"<p:r xmlns:p="http://p/"/>"#, "p:r"),
+            (r#"<p:r xmlns:p="http://p/"   >x</p:r>"#, "p:r"),
+        ] {
+            let doc = Document::parse(xml).unwrap();
+            let mut nav = RoXmlNavigator::new(&doc);
+            assert!(nav.move_to_first_child());
+            assert_eq!(nav.name(), expected, "{xml}");
+        }
+    }
+
+    /// The name scan uses XML's whitespace, not Unicode's.
+    ///
+    /// XML 1.0 (5th ed.) §2.3 gives `S ::= (#x20 | #x9 | #xD | #xA)+` and, in
+    /// the same production group, admits `[#x37F-#x1FFF]` into `NameStartChar`
+    /// (and so into `NameChar`). U+1680 OGHAM SPACE MARK falls in that range:
+    /// it is a legal name character that [`char::is_whitespace`] nevertheless
+    /// reports as whitespace, so a Unicode scan would truncate the name.
+    #[test]
+    fn a_name_character_that_unicode_calls_whitespace_does_not_end_the_name() {
+        // U+1680 is inside NameStartChar's [#x37F-#x1FFF] range, and Unicode
+        // classifies it as whitespace — the two disagree, which is the point.
+        assert!('\u{1680}'.is_whitespace());
+
+        let xml = "<a\u{1680}b a\u{1680}b='v'/>";
+        let doc = Document::parse(xml).unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.name(), "a\u{1680}b");
+        assert_eq!(nav.local_name(), "a\u{1680}b");
+
+        let mut attr = nav.clone();
+        assert!(attr.move_to_first_attribute());
+        assert_eq!(attr.name(), "a\u{1680}b");
+        assert_eq!(attr.local_name(), "a\u{1680}b");
+
+        // The prefixed forms, where truncation would also lose the colon.
+        let xml = "<p:a\u{1680}b xmlns:p=\"http://p/\" p:a\u{1680}b=\"v\"/>";
+        let doc = Document::parse(xml).unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.name(), "p:a\u{1680}b");
+        assert_eq!(nav.local_name(), "a\u{1680}b");
+        assert_eq!(nav.prefix(), "p");
+
+        let mut attr = nav.clone();
+        assert!(attr.move_to_first_attribute());
+        assert_eq!(attr.name(), "p:a\u{1680}b");
+        assert_eq!(attr.local_name(), "a\u{1680}b");
+
+        // A prefix of its own may hold one too.
+        let xml = "<p\u{1680}q:r xmlns:p\u{1680}q=\"http://p/\"/>";
+        let doc = Document::parse(xml).unwrap();
+        let mut nav = RoXmlNavigator::new(&doc);
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.name(), "p\u{1680}q:r");
+        assert_eq!(nav.prefix(), "p\u{1680}q");
+    }
+
+    /// The four characters of XML 1.0 §2.3 production `S` all end the scan,
+    /// and no other Unicode space character does.
+    #[test]
+    fn only_the_four_xml_whitespace_characters_end_a_name() {
+        for ws in [' ', '\t', '\r', '\n'] {
+            let xml = format!("<r{ws}a='1'/>");
+            let doc = Document::parse(&xml).unwrap();
+            let mut nav = RoXmlNavigator::new(&doc);
+            assert!(nav.move_to_first_child());
+            assert_eq!(nav.name(), "r", "{:?}", ws);
+        }
+        // Other Unicode whitespace inside the [#x37F-#x1FFF] NameChar range.
+        for ws in ['\u{1680}', '\u{180E}'] {
+            let xml = format!("<a{ws}b/>");
+            let doc = Document::parse(&xml).unwrap();
+            let mut nav = RoXmlNavigator::new(&doc);
+            assert!(nav.move_to_first_child());
+            assert_eq!(nav.name(), format!("a{ws}b"), "{:?}", ws);
         }
     }
 }

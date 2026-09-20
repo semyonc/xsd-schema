@@ -24,6 +24,9 @@ pub mod context;
 pub mod error;
 pub mod item_set;
 pub mod iterator;
+// Indexed evaluation of the general comparison operators. Internal: it only
+// ever changes how fast `operators` answers a comparison, never the answer.
+pub(crate) mod general_compare;
 pub mod lexer;
 pub mod node_test;
 pub mod operators;

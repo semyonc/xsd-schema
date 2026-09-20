@@ -16,12 +16,15 @@
 //!
 //! Other node types return `not_implemented` errors for now.
 
-use crate::types::{ItemType, NameTest as RuntimeNameTest, SequenceType, XmlTypeCode};
+use crate::ids::NameId;
+use crate::types::{
+    ItemType, NameTest as RuntimeNameTest, SequenceType, XmlTypeCardinality, XmlTypeCode,
+};
 use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{
     AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode, KindTest,
-    NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode, QuantifiedNode,
-    QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+    NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode, QName as AstQName,
+    QuantifiedNode, QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
 };
 use crate::xpath::axis_iterators::{
     AncestorAxis, AttributeAxis, ChildAxis, DescendantNodeIterator, FollowingNodeIterator,
@@ -32,13 +35,16 @@ use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_ty
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{
-    atomize_to_single_opt, effective_boolean_value, effective_boolean_value_10, XPathValue,
+    atomize_sequence, atomize_to_double, atomize_to_single_opt, atomize_to_string,
+    effective_boolean_value, effective_boolean_value_10, XPathValue,
 };
 use crate::xpath::iterator::{
     DocumentOrderNodeIterator, VecNodeIterator, XmlItem, XmlNodeIterator,
 };
 use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node};
-use crate::xpath::node_test::{matches_item_type_node, NodeTest};
+use crate::xpath::node_test::{
+    matches_item_type_node, name_test_for_principal_kind, principal_node_kind, NodeTest,
+};
 use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::operators::{
     eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter,
@@ -47,6 +53,7 @@ use crate::xpath::operators::{
     general_ne_iter_10,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
+use crate::xpath::DomNodeType;
 use crate::xpath::{DomNavigator, XPathMode};
 
 /// Evaluate an AST node and return the result.
@@ -171,6 +178,18 @@ pub fn eval_node<N: DomNavigator>(
                 args.push(eval_node(arena, *arg_id, ctx)?);
             }
 
+            // XPath 2.0 §3.1.5: in XPath 1.0 compatibility mode the function
+            // conversion rules start with three extra steps.
+            if ctx.static_context.xpath10_compatibility() {
+                apply_function_conversion_10(
+                    arena,
+                    ctx.static_context,
+                    handle,
+                    &func_call.args,
+                    &mut args,
+                )?;
+            }
+
             // Dispatch via the context's eval_function method (supports custom functions)
             ctx.eval_function(handle, args)
         }
@@ -187,8 +206,23 @@ pub fn eval_node<N: DomNavigator>(
             let start_val = eval_node(arena, range.start, ctx)?;
             let end_val = eval_node(arena, range.end, ctx)?;
 
-            let start_opt = atomize_to_single_opt(start_val)?;
-            let end_opt = atomize_to_single_opt(end_val)?;
+            // §3.3.1 gives `to` the operand type `xs:integer?`, so in XPath 1.0
+            // compatibility mode the first §3.1.5 step applies and an operand of
+            // more than one item is truncated to its first item instead of
+            // raising a type error. The `fn:string` / `fn:number` steps do not
+            // apply, because the expected type is neither `xs:string` nor
+            // `xs:double`.
+            let compat = ctx.static_context.xpath10_compatibility();
+            let start_opt = if compat {
+                first_atomized_item(start_val)?
+            } else {
+                atomize_operand(start_val, "xs:integer?")?
+            };
+            let end_opt = if compat {
+                first_atomized_item(end_val)?
+            } else {
+                atomize_operand(end_val, "xs:integer?")?
+            };
 
             match (start_opt, end_opt) {
                 (None, _) | (_, None) => Ok(XPathValue::empty()),
@@ -207,7 +241,18 @@ pub fn eval_node<N: DomNavigator>(
 
         AstNode::UnaryOp(unary_op) => {
             let operand_val = eval_node(arena, unary_op.operand, ctx)?;
-            let opt = atomize_to_single_opt(operand_val)?;
+
+            if ctx.static_context.xpath10_compatibility() {
+                // §3.4: in compatibility mode an empty operand makes the whole
+                // arithmetic expression NaN, so there is no empty result.
+                let result = match arithmetic_operand_10(operand_val)? {
+                    Some(operand) => eval_unary(unary_op.kind, &operand)?,
+                    None => crate::types::XmlValue::double(f64::NAN),
+                };
+                return Ok(XPathValue::from_atomic(result));
+            }
+
+            let opt = atomize_operand(operand_val, "a single numeric value")?;
 
             match opt {
                 None => Ok(XPathValue::empty()),
@@ -274,26 +319,57 @@ pub fn eval_node<N: DomNavigator>(
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 
-                    let left_opt = atomize_to_single_opt(left_val)?;
-                    let right_opt = atomize_to_single_opt(right_val)?;
+                    let is_arithmetic = matches!(
+                        bin_op.kind,
+                        BinaryOpKind::Add
+                            | BinaryOpKind::Sub
+                            | BinaryOpKind::Mul
+                            | BinaryOpKind::Div
+                            | BinaryOpKind::IDiv
+                            | BinaryOpKind::Mod
+                    );
+
+                    // §3.4: in XPath 1.0 compatibility mode an arithmetic
+                    // operand is truncated to its first item, an empty operand
+                    // makes the expression NaN, and a boolean, string, decimal,
+                    // float or untypedAtomic operand is converted with
+                    // `fn:number`. The rule is specific to arithmetic; the value
+                    // comparisons (which XPath 1.0 does not have) keep the 2.0
+                    // rules.
+                    if is_arithmetic && ctx.static_context.xpath10_compatibility() {
+                        let left = arithmetic_operand_10(left_val)?;
+                        let right = arithmetic_operand_10(right_val)?;
+                        let (Some(left), Some(right)) = (left, right) else {
+                            // "If the atomized operand is an empty sequence, the
+                            // result of the arithmetic expression is the
+                            // xs:double value NaN."
+                            return Ok(XPathValue::from_atomic(crate::types::XmlValue::double(
+                                f64::NAN,
+                            )));
+                        };
+                        // After the conversion every numeric operand is an
+                        // xs:double. §3.4's list deliberately leaves the date,
+                        // time and duration types alone, so an operand of one of
+                        // those keeps the XPath 2.0 operator mapping — as does
+                        // `idiv`, which has no XPath 1.0 counterpart and must
+                        // keep its integer result type.
+                        let numeric_pair =
+                            left.type_code.is_numeric() && right.type_code.is_numeric();
+                        let result = if numeric_pair && !matches!(bin_op.kind, BinaryOpKind::IDiv) {
+                            eval_numeric_binary_10(bin_op.kind, &left, &right)?
+                        } else {
+                            eval_binary(bin_op.kind, &left, &right)?
+                        };
+                        return Ok(XPathValue::from_atomic(result));
+                    }
+
+                    let left_opt = atomize_operand(left_val, "a single atomic value")?;
+                    let right_opt = atomize_operand(right_val, "a single atomic value")?;
 
                     match (left_opt, right_opt) {
                         (None, _) | (_, None) => Ok(XPathValue::empty()),
                         (Some(left), Some(right)) => {
-                            let is_arithmetic = matches!(
-                                bin_op.kind,
-                                BinaryOpKind::Add
-                                    | BinaryOpKind::Sub
-                                    | BinaryOpKind::Mul
-                                    | BinaryOpKind::Div
-                                    | BinaryOpKind::Mod
-                            );
-                            let result =
-                                if is_arithmetic && ctx.static_context.xpath10_compatibility() {
-                                    eval_numeric_binary_10(bin_op.kind, &left, &right)?
-                                } else {
-                                    eval_binary(bin_op.kind, &left, &right)?
-                                };
+                            let result = eval_binary(bin_op.kind, &left, &right)?;
                             Ok(XPathValue::from_atomic(result))
                         }
                     }
@@ -496,7 +572,14 @@ fn eval_instance_of<N: DomNavigator>(
 
 /// Evaluate `expr treat as type`.
 ///
-/// Returns the value unchanged if it matches the type, otherwise raises XPTY0004.
+/// Returns the value unchanged if it matches the sequence type, otherwise
+/// raises `XPDY0050`.
+///
+/// XPath 2.0 §3.10.5: "If `expr1` matches `type1`, using the rules for
+/// SequenceType matching, the `treat` expression returns the value of `expr1`;
+/// otherwise, it raises a dynamic error [err:XPDY0050]." That covers every way
+/// the match can fail — the wrong cardinality just as much as the wrong item
+/// type — so `treat as` never raises a type error of its own.
 fn eval_treat_as<N: DomNavigator>(
     operand: XPathValue<N>,
     type_expr: &TypeExprNode,
@@ -505,29 +588,24 @@ fn eval_treat_as<N: DomNavigator>(
     let items = operand.into_vec();
     let count = items.len();
 
-    // Check cardinality
-    if !occurrence_allows_count(type_expr.target_type.occurrence, count) {
-        return Err(XPathError::XPTY0004 {
-            expected: format_sequence_type(&type_expr.target_type, ctx),
-            found: format!("sequence of {} items", count),
-        });
-    }
-
-    // Handle empty-sequence()
+    // Handle empty-sequence() first: §2.5.4 gives it no OccurrenceIndicator of
+    // its own, so it must not be run through the cardinality check.
     let item_type = match &type_expr.target_type.item_type {
         None => {
             // empty-sequence() - only accepts empty
             if count == 0 {
                 return Ok(XPathValue::empty());
             } else {
-                return Err(XPathError::XPTY0004 {
-                    expected: "empty-sequence()".to_string(),
-                    found: format!("sequence of {} items", count),
-                });
+                return Err(XPathError::XPDY0050);
             }
         }
         Some(it) => it,
     };
+
+    // Check cardinality
+    if !occurrence_allows_count(type_expr.target_type.occurrence, count) {
+        return Err(XPathError::XPDY0050);
+    }
 
     // Check each item matches the item type
     for item in &items {
@@ -537,10 +615,7 @@ fn eval_treat_as<N: DomNavigator>(
             type_expr.resolved_atomic_type.as_ref(),
             ctx.static_context,
         ) {
-            return Err(XPathError::XPTY0004 {
-                expected: format_sequence_type(&type_expr.target_type, ctx),
-                found: format_item_type(item),
-            });
+            return Err(XPathError::XPDY0050);
         }
     }
 
@@ -575,8 +650,10 @@ fn eval_cast_as<N: DomNavigator>(
         });
     }
 
-    // Atomize the operand to get at most one atomic value
-    let atomic_opt = atomize_to_single_opt(operand)?;
+    // Atomize the operand to get at most one atomic value. XPath 2.0 §3.10.2:
+    // "If the result of atomization is a sequence of more than one atomic value,
+    // a type error is raised [err:XPTY0004]."
+    let atomic_opt = atomize_operand(operand, "a single atomic value")?;
 
     // Check cardinality
     let allows_empty = matches!(
@@ -667,6 +744,244 @@ fn eval_castable_as<N: DomNavigator>(
     }
 }
 
+/// Atomize an operand of an operator that takes at most one atomic value.
+///
+/// XPath 2.0 states the same rule for arithmetic (§3.4), value comparisons
+/// (§3.5.1), `to` (§3.3.1, via the function conversion rules) and `cast`
+/// (§3.10.2): "If the atomized operand is a sequence of length greater than one,
+/// a type error is raised [err:XPTY0004]." The generic "more than one item"
+/// dynamic error the atomizer raises is therefore turned into that type error
+/// here; every other error passes through unchanged.
+fn atomize_operand<N: DomNavigator>(
+    value: XPathValue<N>,
+    expected: &str,
+) -> Result<Option<crate::types::XmlValue>, XPathError> {
+    atomize_to_single_opt(value).map_err(|e| match e {
+        XPathError::XPDY0050 => XPathError::XPTY0004 {
+            expected: expected.to_string(),
+            found: "a sequence of more than one item".to_string(),
+        },
+        other => other,
+    })
+}
+
+/// The first item of an atomized value, discarding the rest.
+///
+/// This is the first step the function conversion rules take in XPath 1.0
+/// compatibility mode (§3.1.5): "If the expected type calls for a single item or
+/// optional single item …, then the value V is effectively replaced by V[1]."
+fn first_atomized_item<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Option<crate::types::XmlValue>, XPathError> {
+    Ok(atomize_sequence(value)?.into_iter().next())
+}
+
+/// Apply the XPath 1.0 compatibility-mode operand rules to an arithmetic
+/// operand (§3.4).
+///
+/// "Atomization is applied to the operand. … If the atomized operand is an empty
+/// sequence, the result of the arithmetic expression is the `xs:double` value
+/// `NaN` … If the atomized operand is a sequence of length greater than one, any
+/// items after the first item in the sequence are discarded. If the atomized
+/// operand is now an instance of type `xs:boolean`, `xs:string`, `xs:decimal`
+/// (including `xs:integer`), `xs:float`, or `xs:untypedAtomic`, then it is
+/// converted to the type `xs:double` by applying the `fn:number` function."
+///
+/// An operand of any other type — a date, a duration, an `xs:double` — is left
+/// alone, so the XPath 2.0 operators over those types keep working in
+/// compatibility mode.
+///
+/// `None` means the operand atomized to the empty sequence, which makes the
+/// whole arithmetic expression `NaN`.
+fn arithmetic_operand_10<N: DomNavigator>(
+    value: XPathValue<N>,
+) -> Result<Option<crate::types::XmlValue>, XPathError> {
+    let Some(first) = first_atomized_item(value)? else {
+        return Ok(None);
+    };
+    let code = first.type_code;
+    let needs_number = code == XmlTypeCode::Boolean
+        || code == XmlTypeCode::UntypedAtomic
+        || code.is_string_derived()
+        || (code.is_numeric() && code != XmlTypeCode::Double);
+    if needs_number {
+        return Ok(Some(crate::types::XmlValue::double(
+            crate::xpath::atomize::to_number(&first),
+        )));
+    }
+    Ok(Some(first))
+}
+
+/// Apply the three XPath 1.0 compatibility-mode steps of the function conversion
+/// rules to the arguments of a function call (§3.1.5).
+///
+/// "If XPath 1.0 compatibility mode is `true` **and an argument is not of the
+/// expected type**, then the following conversions are applied sequentially to
+/// the argument value V: If the expected type calls for a single item or optional
+/// single item …, then the value V is effectively replaced by V[1]. If the
+/// expected type is `xs:string` or `xs:string?`, then the value V is effectively
+/// replaced by `fn:string(V)`. If the expected type is `xs:double` or
+/// `xs:double?`, then the value V is effectively replaced by `fn:number(V)`."
+///
+/// The emphasised condition gates all three steps together, so an argument that
+/// already matches its parameter's declared sequence type is passed through
+/// untouched — `fn:compare((), '')` keeps its empty sequence, because `()` is a
+/// value of type `xs:string?`, and returns the empty sequence rather than `0`.
+///
+/// The expected types come from the function's signature in the static context;
+/// a function whose signature is unavailable, or an argument beyond the declared
+/// parameters of a variadic function, is left untouched.
+///
+/// # What "of the expected type" means here
+///
+/// The condition is about the argument's **static type**, not about the value
+/// the argument happened to produce: the three steps are part of the *static*
+/// function conversion rules, applied to the operation tree before evaluation
+/// (§2.2.3.1 step SQ6 assigns each expression a static type, and the conversion
+/// rules convert "to the declared type of the function parameter").
+///
+/// §2.2.3.1: "If the Static Typing Feature is not supported, the static types
+/// that are assigned are **implementation-dependent**." This engine does not
+/// implement that feature, so the choice below is its own, and it is the
+/// narrowest one that keeps every observable case right:
+///
+/// * an argument value that is **not** the empty sequence is judged by
+///   [SequenceType matching](SequenceType::matches_sequence) on the value as
+///   supplied — before the atomization and casting of the rules that follow, so
+///   a node where `xs:string?` is expected is *not* of the expected type (and
+///   becomes `fn:string(V)`), and neither is an `xs:untypedAtomic` nor an
+///   `xs:integer`;
+/// * an argument value that **is** the empty sequence counts as being of the
+///   expected type only when the argument *expression* is the literal empty
+///   sequence, whose static type is `empty-sequence()`. §2.3.4 singles that
+///   expression out — "if the static type assigned to an expression other than
+///   `()` or `data(())` is `empty-sequence()`, a static error is raised
+///   \[err:XPST0005\]" — so no other expression may be given that static type.
+///
+/// So `fn:compare((), '')` keeps its empty sequence and returns the empty
+/// sequence rather than `0`, while `fn:round(doc/none)` over a path that selects
+/// no nodes still converts, and is `NaN`: the static type of a path expression
+/// is a node sequence, which is not `xs:double?`, however few nodes it yields.
+fn apply_function_conversion_10<N: DomNavigator>(
+    arena: &AstArena,
+    ctx: &XPathContext<'_>,
+    handle: crate::xpath::functions::FunctionHandle,
+    arg_exprs: &[AstNodeId],
+    args: &mut [XPathValue<N>],
+) -> Result<(), XPathError> {
+    let Some(signature) = ctx.function_catalog().get_signature(handle) else {
+        return Ok(());
+    };
+
+    for (idx, arg) in args.iter_mut().enumerate() {
+        let Some(expected) = signature.param_types.get(idx) else {
+            break;
+        };
+        let single = matches!(
+            expected.cardinality,
+            XmlTypeCardinality::One | XmlTypeCardinality::ZeroOrOne
+        );
+        // None of the three steps can fire for an expected type that is not a
+        // single or optional single item: step 1 says so outright, and steps 2
+        // and 3 name only `xs:string`/`xs:string?` and `xs:double`/`xs:double?`.
+        if !single {
+            continue;
+        }
+        // "… and an argument is not of the expected type".
+        let statically_empty = arg_exprs
+            .get(idx)
+            .is_some_and(|id| is_empty_sequence_expression(arena, *id));
+        if (statically_empty || !arg.is_empty()) && value_matches_sequence_type(arg, expected, ctx)
+        {
+            continue;
+        }
+
+        let taken = std::mem::replace(arg, XPathValue::empty());
+        *arg = match expected.item_type {
+            // `fn:string` of the empty sequence is the zero-length string, and
+            // of a single item its string value.
+            ItemType::AtomicType(XmlTypeCode::String) => {
+                XPathValue::string(atomize_to_string(first_item(taken))?)
+            }
+            // `fn:number` of the empty sequence is NaN.
+            ItemType::AtomicType(XmlTypeCode::Double) => {
+                XPathValue::double(atomize_to_double(first_item(taken))?)
+            }
+            _ => first_item(taken),
+        };
+    }
+
+    Ok(())
+}
+
+/// Whether an expression is the literal empty sequence — the one expression
+/// XPath 2.0 §2.3.4 allows to have the static type `empty-sequence()`.
+///
+/// `()` parses to [`ValueNode::Empty`], and a sequence-construction expression
+/// with no operands is the same expression. Either may be wrapped by the
+/// grammar's step chain: a primary expression used as a function argument
+/// arrives as a single-step relative `PathExpr` over an unfiltered
+/// `FilterExpr`, and those wrappers add nothing to the expression's type, so the
+/// scan looks through them. It does **not** look through anything that can
+/// select nodes (an axis step, an absolute path, a predicate), because the
+/// static type of such an expression is a node sequence whatever it yields.
+fn is_empty_sequence_expression(arena: &AstArena, id: AstNodeId) -> bool {
+    match arena.try_get(id) {
+        Some(AstNode::Value(ValueNode::Empty)) => true,
+        Some(AstNode::Expr(expr)) => match expr.items.as_slice() {
+            [] => true,
+            [only] => is_empty_sequence_expression(arena, *only),
+            _ => false,
+        },
+        // `(…)` as a step: one relative step and no `/`, so the path contributes
+        // nothing of its own.
+        Some(AstNode::PathExpr(path)) => match path.steps.as_slice() {
+            [only] if !path.is_absolute => is_empty_sequence_expression(arena, *only),
+            _ => false,
+        },
+        // A primary expression with no predicates; a predicate makes it a
+        // filtered node sequence.
+        Some(AstNode::FilterExpr(filter)) if filter.predicates.is_empty() => {
+            is_empty_sequence_expression(arena, filter.base)
+        }
+        _ => false,
+    }
+}
+
+/// SequenceType matching for a whole [`XPathValue`], without materialising it.
+///
+/// [`SequenceType::matches_sequence`] wants a slice, and `XPathValue::as_slice`
+/// cannot produce one for the single-item case, so the three shapes are matched
+/// here directly.
+fn value_matches_sequence_type<N: DomNavigator>(
+    value: &XPathValue<N>,
+    expected: &SequenceType,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    if !expected.cardinality.matches_count(value.len()) {
+        return false;
+    }
+    match value {
+        XPathValue::Empty => true,
+        XPathValue::Item(item) => expected.item_type.matches_item(item, ctx),
+        XPathValue::Sequence(items) => items
+            .iter()
+            .all(|item| expected.item_type.matches_item(item, ctx)),
+    }
+}
+
+/// `V[1]`: the first item of a value, or the empty sequence.
+fn first_item<N: DomNavigator>(value: XPathValue<N>) -> XPathValue<N> {
+    match value {
+        XPathValue::Empty => XPathValue::empty(),
+        item @ XPathValue::Item(_) => item,
+        XPathValue::Sequence(items) => match items.into_iter().next() {
+            Some(first) => XPathValue::from_item(first),
+            None => XPathValue::empty(),
+        },
+    }
+}
+
 /// Applies the function conversion rules to an operand of the `to` operator.
 fn to_integer_operand(value: crate::types::XmlValue) -> Result<crate::types::XmlValue, XPathError> {
     if value.type_code == XmlTypeCode::UntypedAtomic {
@@ -745,30 +1060,6 @@ fn format_kind_test(kind: &crate::xpath::ast::KindTest) -> String {
     }
 }
 
-/// Format an XmlItem type for error messages.
-fn format_item_type<N: DomNavigator>(item: &XmlItem<N>) -> String {
-    match item {
-        XmlItem::Node(nav) => {
-            use crate::xpath::DomNodeType;
-            match nav.node_type() {
-                DomNodeType::Root => "document-node()".to_string(),
-                DomNodeType::Element => format!("element({})", nav.local_name()),
-                DomNodeType::Attribute => format!("attribute({})", nav.local_name()),
-                DomNodeType::Text
-                | DomNodeType::Whitespace
-                | DomNodeType::SignificantWhitespace => "text()".to_string(),
-                DomNodeType::Comment => "comment()".to_string(),
-                DomNodeType::ProcessingInstruction => "processing-instruction()".to_string(),
-                DomNodeType::Namespace => "namespace-node()".to_string(),
-                DomNodeType::All => "node()".to_string(),
-            }
-        }
-        XmlItem::Atomic(value) => {
-            format!("{:?}", value.type_code)
-        }
-    }
-}
-
 // ============================================================================
 // Path Expression Evaluation
 // ============================================================================
@@ -826,78 +1117,58 @@ fn eval_path_expr<N: DomNavigator>(
         vec![context_node.clone()]
     };
 
-    // Check if any step is a FilterExpr as the first step (special case)
-    // or if this path might need document order sorting
-    let needs_doc_order = path_needs_document_order(arena, path_expr);
-
-    // Process steps sequentially
+    // Process steps sequentially. Every `/` is the XPath 2.0 §3.2 operation
+    // `E1/E2`, so each step is evaluated once per item of the sequence that
+    // reaches it and the per-item results are combined.
     let mut current_nodes: Vec<XmlItem<N>> =
         starting_nodes.into_iter().map(XmlItem::Node).collect();
+    let mut shape = SequenceShape::SINGLE_NODE;
+    let step_count = path_expr.steps.len();
 
     for (step_idx, &step_id) in path_expr.steps.iter().enumerate() {
-        let step_node = arena.get(step_id);
+        // §3.2: the combined result of every `E1/E2` is "returned in document
+        // order" with "duplicate nodes ... eliminated". That normalization is
+        // only *observable* at the end of the path or by a step that can see
+        // the order, the size or the duplicates of its input. An axis step
+        // cannot: it evaluates its axis and its predicates once per input node,
+        // and its predicates take their focus from the step's own result, so
+        // reordering or de-duplicating its input cannot change its result set.
+        // Deferring the sort to the last step that *can* observe it keeps a
+        // plain path such as `//a/b/c` at a single sort, as before.
+        let normalize = step_idx + 1 == step_count
+            || !matches!(
+                arena.get(path_expr.steps[step_idx + 1]),
+                AstNode::PathStep(_)
+            );
 
-        current_nodes = match step_node {
+        current_nodes = match arena.get(step_id) {
             AstNode::PathStep(path_step) => {
-                eval_path_step(arena, path_step, current_nodes, ctx, step_idx == 0)?
-            }
-            AstNode::FilterExpr(filter_expr) => {
-                // FilterExpr as a step - evaluate it and use its result
-                if step_idx == 0 {
-                    // First step is a FilterExpr - evaluate it directly
-                    let result = eval_filter_expr(arena, filter_expr, ctx)?;
-                    result.into_vec()
+                let axis = path_step.axis;
+                // A forward axis over an input that is already in document
+                // order without duplicates needs no sort at all.
+                let already_ordered = axis_step_keeps_document_order(axis, shape);
+                let items = eval_axis_step(arena, path_step, current_nodes, ctx)?;
+                let sorted = if normalize && !already_ordered {
+                    sort_document_order(items)?
                 } else {
-                    // FilterExpr in a later position - this is applied to each node in sequence
-                    let mut results = Vec::new();
-                    for item in current_nodes {
-                        // Set context to this item and evaluate the filter expression
-                        let saved_context = ctx.context_item.take();
-                        let saved_pos = ctx.context_position;
-                        let saved_size = ctx.context_size;
-
-                        ctx.context_item = Some(item);
-                        ctx.context_position = 1;
-                        ctx.context_size = 1;
-
-                        let step_result = eval_filter_expr(arena, filter_expr, ctx)?;
-                        results.extend(step_result.into_vec());
-
-                        ctx.context_item = saved_context;
-                        ctx.context_position = saved_pos;
-                        ctx.context_size = saved_size;
-                    }
-                    results
-                }
+                    items
+                };
+                shape = axis_step_result_shape(axis, shape, already_ordered || normalize);
+                sorted
+            }
+            _ if step_idx == 0 && current_nodes.is_empty() => {
+                // The path starts with a primary expression and there is no
+                // `/` to its left, so it is evaluated once with the outer
+                // focus.
+                shape = SequenceShape::UNKNOWN;
+                eval_node(arena, step_id, ctx)?.into_vec()
             }
             _ => {
-                // Other expression types (like function calls, parenthesized exprs) as steps
-                if step_idx == 0 && current_nodes.is_empty() {
-                    // First step is a primary expression (function call, etc.) with no initial context
-                    // Evaluate it directly
-                    let result = eval_node(arena, step_id, ctx)?;
-                    result.into_vec()
-                } else {
-                    // Evaluate for each node in the current sequence
-                    let mut results = Vec::new();
-                    for item in current_nodes {
-                        let saved_context = ctx.context_item.take();
-                        let saved_pos = ctx.context_position;
-                        let saved_size = ctx.context_size;
-
-                        ctx.context_item = Some(item);
-                        ctx.context_position = 1;
-                        ctx.context_size = 1;
-
-                        let step_result = eval_node(arena, step_id, ctx)?;
-                        results.extend(step_result.into_vec());
-
-                        ctx.context_item = saved_context;
-                        ctx.context_position = saved_pos;
-                        ctx.context_size = saved_size;
-                    }
-                    results
-                }
+                // `E1/E2` with an arbitrary E2: the inner focus is one item of
+                // E1, at its position in E1, with E1's size (§2.1.2).
+                let items = eval_expr_step(arena, step_id, current_nodes, ctx)?;
+                shape = SequenceShape::UNKNOWN;
+                combine_expr_step_results(items, normalize)?
             }
         };
 
@@ -907,64 +1178,144 @@ fn eval_path_expr<N: DomNavigator>(
         }
     }
 
-    // Apply document order if needed (for paths with reverse axes)
-    if needs_doc_order && !current_nodes.is_empty() {
-        let iter = VecNodeIterator::new(current_nodes);
-        let doc_order_iter = DocumentOrderNodeIterator::new(iter)?;
-        let mut doc_order_iter = doc_order_iter;
-        current_nodes = collect_iterator(&mut doc_order_iter)?;
-    }
-
     Ok(XPathValue::from_sequence(current_nodes))
 }
 
-/// Check if a path expression needs document order sorting.
+/// What is statically known about the node sequence feeding a path step.
 ///
-/// Returns true if the path contains:
-/// - Any reverse axis (parent, ancestor, preceding, preceding-sibling, ancestor-or-self)
-/// - FilterExpr at non-first position
-/// - Descendant/DescendantOrSelf/Following axis followed by non-Attribute/non-Namespace steps
-///   (these can produce duplicates when input nodes have overlapping descendants)
-fn path_needs_document_order(arena: &AstArena, path_expr: &PathExprNode) -> bool {
-    let len = path_expr.steps.len();
-    for (idx, &step_id) in path_expr.steps.iter().enumerate() {
-        match arena.get(step_id) {
-            AstNode::PathStep(step) => {
-                // Reverse axes always need sorting
-                if step.axis.is_reverse() {
-                    return true;
-                }
-                // Descendant/DescendantOrSelf/Following axes need sorting if followed
-                // by non-attribute/non-namespace steps (can produce duplicates)
-                if matches!(
-                    step.axis,
-                    Axis::Descendant | Axis::DescendantOrSelf | Axis::Following
-                ) {
-                    for s in (idx + 1)..len {
-                        if let AstNode::PathStep(next_step) = arena.get(path_expr.steps[s]) {
-                            if !matches!(next_step.axis, Axis::Attribute | Axis::Namespace) {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            AstNode::FilterExpr(_) if idx > 0 => {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
+/// Used only to decide whether the §3.2 "document order, duplicates removed"
+/// normalization of a step's result can be skipped; every field is a
+/// conservative "known to be true", never a guess.
+#[derive(Debug, Clone, Copy)]
+struct SequenceShape {
+    /// Known to be in document order with no duplicates.
+    ordered: bool,
+    /// Known to contain no node that is an ancestor of another node in it.
+    peers: bool,
+    /// Known to contain at most one node.
+    single: bool,
 }
 
-/// Evaluate a single path step against a sequence of nodes.
-fn eval_path_step<N: DomNavigator>(
+impl SequenceShape {
+    /// The start of an absolute or relative path: exactly one node.
+    const SINGLE_NODE: Self = Self {
+        ordered: true,
+        peers: true,
+        single: true,
+    };
+
+    /// Nothing is known (the result of an arbitrary expression).
+    const UNKNOWN: Self = Self {
+        ordered: false,
+        peers: false,
+        single: false,
+    };
+}
+
+/// True when concatenating an axis step's per-node results is guaranteed to
+/// yield document order without duplicates, so the §3.2 normalization of that
+/// step's result would be a no-op.
+fn axis_step_keeps_document_order(axis: Axis, input: SequenceShape) -> bool {
+    match axis {
+        // A reverse axis delivers reverse document order, which always has to
+        // be turned around — except `parent`, which yields at most one node
+        // per origin, so a single origin cannot be out of order.
+        Axis::Parent => input.single,
+        Axis::Ancestor | Axis::AncestorOrSelf | Axis::Preceding | Axis::PrecedingSibling => false,
+        // `self` reproduces its input.
+        Axis::SelfAxis => input.ordered,
+        // These forward axes visit disjoint, document-ordered ranges when the
+        // origins are document-ordered peers; a single origin trivially is one.
+        Axis::Child
+        | Axis::Attribute
+        | Axis::Namespace
+        | Axis::Descendant
+        | Axis::DescendantOrSelf => input.single || (input.ordered && input.peers),
+        // Two peers can share a following sibling (or a following node), so
+        // only a single origin is duplicate-free here.
+        Axis::FollowingSibling | Axis::Following => input.single,
+    }
+}
+
+/// The shape of an axis step's result, given its input's shape.
+///
+/// `normalized` says whether the result is known to be in document order
+/// without duplicates (either because the axis kept that property or because
+/// the step's result was sorted).
+fn axis_step_result_shape(axis: Axis, input: SequenceShape, normalized: bool) -> SequenceShape {
+    // "peers" is a property of the node *set*, independent of its order.
+    let peers = match axis {
+        // Attributes and namespace nodes have no descendants.
+        Axis::Attribute | Axis::Namespace => true,
+        // A child of one node is never an ancestor of a child of a peer.
+        Axis::SelfAxis | Axis::Child => input.peers,
+        // Siblings of a single node are peers; so is its (single) parent.
+        Axis::FollowingSibling | Axis::PrecedingSibling | Axis::Parent => input.single,
+        _ => false,
+    };
+    let single = match axis {
+        Axis::SelfAxis | Axis::Parent => input.single,
+        _ => false,
+    };
+    SequenceShape {
+        ordered: normalized,
+        peers,
+        single,
+    }
+}
+
+/// Sort a node sequence into document order and drop duplicates (§3.2).
+///
+/// A sequence of fewer than two items is returned untouched.
+fn sort_document_order<N: DomNavigator>(
+    items: Vec<XmlItem<N>>,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    if items.len() < 2 {
+        return Ok(items);
+    }
+    let iter = VecNodeIterator::new(items);
+    let mut doc_order_iter = DocumentOrderNodeIterator::new(iter)?;
+    collect_iterator(&mut doc_order_iter)
+}
+
+/// Combine the per-item results of an `E1/E2` whose E2 is not an axis step.
+///
+/// XPath 2.0 §3.2: node results are combined in document order with duplicates
+/// removed, atomic results are concatenated in order, and a result holding both
+/// a node and an atomic value is a type error [err:XPTY0018].
+fn combine_expr_step_results<N: DomNavigator>(
+    items: Vec<XmlItem<N>>,
+    normalize: bool,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    let mut has_node = false;
+    let mut has_atomic = false;
+    for item in &items {
+        match item {
+            XmlItem::Node(_) => has_node = true,
+            XmlItem::Atomic(_) => has_atomic = true,
+        }
+    }
+    if has_node && has_atomic {
+        return Err(XPathError::XPTY0018);
+    }
+    if has_node && normalize {
+        return sort_document_order(items);
+    }
+    Ok(items)
+}
+
+/// Evaluate an axis step against the sequence that reaches it.
+///
+/// XPath 2.0 §3.2.2: the step's predicates are applied to the sequence the
+/// step produces **for one context node**, so their focus size is that
+/// sequence's length and not the length of the concatenation over all context
+/// nodes. The axis itself cannot observe a focus, so it is still evaluated in a
+/// single pass; the pass records where each context node's own run starts.
+fn eval_axis_step<N: DomNavigator>(
     arena: &AstArena,
     step: &PathStepNode,
     input_nodes: Vec<XmlItem<N>>,
     ctx: &mut DynamicContext<'_, N>,
-    _is_first_step: bool,
 ) -> Result<Vec<XmlItem<N>>, XPathError> {
     // Convert input to nodes only (XPTY0019 if atomic values present)
     let nodes: Vec<N> = input_nodes
@@ -987,159 +1338,254 @@ fn eval_path_step<N: DomNavigator>(
 
     // Apply axis iterator
     let xpath_ctx = ctx.static_context.clone();
-    let stepped_items = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter)?;
+    let want_runs = !step.predicates.is_empty();
+    let stepped = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter, want_runs)?;
 
     // Apply predicates if any
     if step.predicates.is_empty() {
-        Ok(stepped_items)
-    } else {
-        eval_predicates(arena, &step.predicates, ctx, stepped_items)
+        return Ok(stepped.items);
     }
+
+    let mut result = Vec::with_capacity(stepped.items.len());
+    for (run, &start) in stepped.run_starts.iter().enumerate() {
+        let end = stepped
+            .run_starts
+            .get(run + 1)
+            .copied()
+            .unwrap_or(stepped.items.len());
+        let run_items = stepped.items[start..end].to_vec();
+        result.extend(eval_predicates(arena, &step.predicates, ctx, run_items)?);
+    }
+    Ok(result)
+}
+
+/// Evaluate `E1/E2` where E2 is not an axis step, giving every item of E1 an
+/// inner focus (§2.1.2: context item, its position in E1, and E1's size).
+fn eval_expr_step<N: DomNavigator>(
+    arena: &AstArena,
+    step_id: AstNodeId,
+    input_nodes: Vec<XmlItem<N>>,
+    ctx: &mut DynamicContext<'_, N>,
+) -> Result<Vec<XmlItem<N>>, XPathError> {
+    // §3.2: "Expression E1 is evaluated, and if the result is not a (possibly
+    // empty) sequence of nodes, a type error is raised [err:XPTY0019]."
+    if input_nodes
+        .iter()
+        .any(|item| matches!(item, XmlItem::Atomic(_)))
+    {
+        return Err(XPathError::XPTY0019);
+    }
+
+    let size = input_nodes.len();
+    let saved_item = ctx.context_item.take();
+    let saved_pos = ctx.context_position;
+    let saved_size = ctx.context_size;
+
+    let mut results: Vec<XmlItem<N>> = Vec::new();
+    let mut outcome = Ok(());
+    for (idx, item) in input_nodes.into_iter().enumerate() {
+        ctx.context_item = Some(item);
+        ctx.context_position = idx + 1;
+        ctx.context_size = size;
+
+        match eval_node(arena, step_id, ctx) {
+            Ok(value) => results.extend(value.into_vec()),
+            Err(e) => {
+                outcome = Err(e);
+                break;
+            }
+        }
+    }
+
+    ctx.context_item = saved_item;
+    ctx.context_position = saved_pos;
+    ctx.context_size = saved_size;
+
+    outcome.map(|()| results)
 }
 
 /// Convert a PathStepNode to a runtime NodeTest.
 fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<NodeTest> {
+    // XPath 2.0 §3.2.1.2: a name test only ever selects nodes of the axis's
+    // principal node kind, and an unprefixed QName picks up the default
+    // element/type namespace only on an axis whose principal node kind is
+    // element.
+    let principal = principal_node_kind(step.axis);
+
     // If we have a resolved_test from binding, use it
     if let Some(ref resolved) = step.resolved_test {
-        return Some(NodeTest::Name(resolved.clone()));
+        return Some(name_test_for_principal_kind(resolved.clone(), principal));
     }
 
     // Otherwise, convert from AST node test
     match &step.test {
         AstNodeTest::Name(name_test) => {
             // Convert AST NameTest to runtime NameTest
-            match (&name_test.prefix, &name_test.local_name) {
+            let resolved = match (&name_test.prefix, &name_test.local_name) {
                 (None, None) => {
                     // * - wildcard
-                    Some(NodeTest::Name(RuntimeNameTest::Wildcard))
+                    RuntimeNameTest::Wildcard
                 }
                 (None, Some(local)) => {
                     // *:local - namespace wildcard
-                    let local_id = ctx.names.add(local);
-                    Some(NodeTest::Name(RuntimeNameTest::NamespaceWildcard(local_id)))
+                    RuntimeNameTest::NamespaceWildcard(ctx.names.add(local))
                 }
                 (Some(prefix), None) => {
                     // prefix:* - local wildcard
-                    if let Some(ns_uri) = ctx.resolve_prefix(prefix) {
-                        let ns_id = ctx.names.add(&ns_uri);
-                        Some(NodeTest::Name(RuntimeNameTest::LocalWildcard(ns_id)))
-                    } else {
-                        None // Unknown prefix
-                    }
+                    let ns_uri = ctx.resolve_prefix(prefix)?; // Unknown prefix
+                    RuntimeNameTest::LocalWildcard(ctx.names.add(&ns_uri))
                 }
                 (Some(prefix), Some(local)) => {
                     // prefix:local - specific QName
                     let local_id = ctx.names.add(local);
-                    let ns_uri = if prefix.is_empty() {
-                        ctx.default_element_ns
-                    } else {
-                        ctx.resolve_prefix(prefix).map(|s| ctx.names.add(&s))
-                    };
+                    let ns_uri = resolve_step_name_ns(prefix, ctx, principal);
                     let qname = crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None);
-                    Some(NodeTest::Name(RuntimeNameTest::QName(qname)))
+                    RuntimeNameTest::QName(qname)
                 }
-            }
+            };
+            Some(name_test_for_principal_kind(resolved, principal))
         }
         AstNodeTest::Kind(kind_test) => {
             // Convert AST KindTest to SequenceType
-            let seq_type = kind_test_to_sequence_type(kind_test);
+            let seq_type = kind_test_to_sequence_type(kind_test, ctx);
             Some(NodeTest::Type(seq_type))
         }
     }
 }
 
-/// Convert an AST KindTest to a SequenceType.
-fn kind_test_to_sequence_type(kind: &KindTest) -> SequenceType {
-    match kind {
-        KindTest::AnyKind => SequenceType::node(),
-        KindTest::Text => SequenceType::one(ItemType::Text),
-        KindTest::Comment => SequenceType::one(ItemType::Comment),
-        KindTest::ProcessingInstruction(target) => {
-            SequenceType::one(ItemType::ProcessingInstruction(target.clone()))
+/// Namespace URI of a QName written in a path step, given the principal node
+/// kind of the step's axis.
+///
+/// XPath 2.0 §3.2.1.2: "An unprefixed QName, when used as a name test on an
+/// axis whose principal node kind is element, has the namespace URI of the
+/// default element/type namespace in the expression context; otherwise, it
+/// has no namespace URI."
+fn resolve_step_name_ns(
+    prefix: &str,
+    ctx: &XPathContext<'_>,
+    principal: DomNodeType,
+) -> Option<NameId> {
+    if prefix.is_empty() {
+        if principal == DomNodeType::Element {
+            ctx.default_element_ns
+        } else {
+            None
         }
-        KindTest::Document(inner) => {
-            let inner_type = inner.as_ref().map(|k| Box::new(kind_test_to_item_type(k)));
-            SequenceType::one(ItemType::Document(inner_type))
-        }
-        KindTest::Element(_) => {
-            // For simplicity, treat as element() without name/type constraints
-            // The actual name test is handled separately
-            SequenceType::one(ItemType::Element(None, None))
-        }
-        KindTest::Attribute(_) => {
-            // For simplicity, treat as attribute() without name/type constraints
-            SequenceType::one(ItemType::Attribute(None, None))
-        }
-        KindTest::SchemaElement(_) | KindTest::SchemaAttribute(_) => {
-            // Schema-aware types - treat as generic element/attribute for now
-            SequenceType::node()
-        }
+    } else {
+        ctx.resolve_prefix(prefix).map(|s| ctx.names.add(&s))
     }
 }
 
+/// Resolve the optional ElementName/AttributeName of an `element(N)` or
+/// `attribute(N)` kind test into a runtime name test.
+///
+/// The name is expanded with the same rule as a step's name test
+/// (§3.2.1.2): the default element/type namespace applies to an element
+/// test, while an unprefixed attribute name is always in no namespace.
+fn kind_test_name(
+    name: &Option<AstQName>,
+    ctx: &XPathContext<'_>,
+    principal: DomNodeType,
+) -> Option<RuntimeNameTest> {
+    let qname = name.as_ref()?;
+    let local_id = ctx.names.add(&qname.local);
+    let ns_uri = resolve_step_name_ns(&qname.prefix, ctx, principal);
+    Some(RuntimeNameTest::QName(
+        crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None),
+    ))
+}
+
+/// Convert an AST KindTest to a SequenceType.
+fn kind_test_to_sequence_type(kind: &KindTest, ctx: &XPathContext<'_>) -> SequenceType {
+    SequenceType::one(kind_test_to_item_type(kind, ctx))
+}
+
 /// Convert an AST KindTest to an ItemType (for nested tests like document-node(element(...))).
-fn kind_test_to_item_type(kind: &KindTest) -> ItemType {
+fn kind_test_to_item_type(kind: &KindTest, ctx: &XPathContext<'_>) -> ItemType {
     match kind {
         KindTest::AnyKind => ItemType::AnyNode,
         KindTest::Text => ItemType::Text,
         KindTest::Comment => ItemType::Comment,
         KindTest::ProcessingInstruction(target) => ItemType::ProcessingInstruction(target.clone()),
         KindTest::Document(inner) => {
-            let inner_type = inner.as_ref().map(|k| Box::new(kind_test_to_item_type(k)));
+            let inner_type = inner
+                .as_ref()
+                .map(|k| Box::new(kind_test_to_item_type(k, ctx)));
             ItemType::Document(inner_type)
         }
-        KindTest::Element(_) => ItemType::Element(None, None),
-        KindTest::Attribute(_) => ItemType::Attribute(None, None),
+        KindTest::Element(test) => {
+            ItemType::Element(kind_test_name(&test.name, ctx, DomNodeType::Element), None)
+        }
+        KindTest::Attribute(test) => ItemType::Attribute(
+            kind_test_name(&test.name, ctx, DomNodeType::Attribute),
+            None,
+        ),
         KindTest::SchemaElement(_) | KindTest::SchemaAttribute(_) => ItemType::AnyNode,
     }
 }
 
+/// The raw items an axis step produced, with the boundaries of the runs the
+/// individual input nodes contributed.
+struct AxisStepItems<N: DomNavigator> {
+    /// Every item the axis yielded, in input-node order then axis order.
+    items: Vec<XmlItem<N>>,
+    /// Offsets in `items` at which each input node's own run starts; empty when
+    /// the caller did not ask for the runs. An input node that yielded nothing
+    /// contributes no run.
+    run_starts: Vec<usize>,
+}
+
 /// Apply an axis iterator to a base iterator.
+///
+/// When `want_runs` is set, the result records where each input node's own run
+/// of results starts, which is what a step's predicates need as their input
+/// sequence (§3.2.2).
 fn apply_axis_iterator<N: DomNavigator>(
     axis: Axis,
     node_test: Option<NodeTest>,
     ctx: XPathContext<'_>,
     base_iter: VecNodeIterator<N>,
-) -> Result<Vec<XmlItem<N>>, XPathError> {
+    want_runs: bool,
+) -> Result<AxisStepItems<N>, XPathError> {
     match axis {
         Axis::Child => {
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, ChildAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Descendant => {
             let mut iter = DescendantNodeIterator::new(ctx, node_test, false, base_iter);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::DescendantOrSelf => {
             let mut iter = DescendantNodeIterator::new(ctx, node_test, true, base_iter);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Attribute => {
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, AttributeAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::SelfAxis => {
             // SelfAxis returns current node via move_to_first, so match_self=false
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, SelfAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Parent => {
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, ParentAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Ancestor => {
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, false, base_iter, AncestorAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::AncestorOrSelf => {
             let mut iter =
                 SequentialAxisNodeIterator::new(ctx, node_test, true, base_iter, AncestorAxis);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::FollowingSibling => {
             let mut iter = SequentialAxisNodeIterator::new(
@@ -1149,7 +1595,7 @@ fn apply_axis_iterator<N: DomNavigator>(
                 base_iter,
                 FollowingSiblingAxis,
             );
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::PrecedingSibling => {
             let mut iter = SequentialAxisNodeIterator::new(
@@ -1159,15 +1605,15 @@ fn apply_axis_iterator<N: DomNavigator>(
                 base_iter,
                 PrecedingSiblingAxis,
             );
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Following => {
             let mut iter = FollowingNodeIterator::new(ctx, node_test, base_iter);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Preceding => {
             let mut iter = PrecedingNodeIterator::new(ctx, node_test, base_iter);
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
         Axis::Namespace => {
             let mut iter = SequentialAxisNodeIterator::new(
@@ -1177,7 +1623,7 @@ fn apply_axis_iterator<N: DomNavigator>(
                 base_iter,
                 NamespaceAxis::default(),
             );
-            collect_iterator(&mut iter)
+            collect_axis_iterator(&mut iter, want_runs)
         }
     }
 }
@@ -1197,6 +1643,54 @@ fn collect_iterator<I: XmlNodeIterator>(
         }
     }
     Ok(results)
+}
+
+/// Collect an axis iterator, optionally splitting the output into the runs the
+/// individual input nodes produced.
+///
+/// Every axis iterator in [`crate::xpath::axis_iterators`] restarts
+/// `sequential_position()` at 1 when it moves on to the next input node, which
+/// is what delimits the runs.
+fn collect_axis_iterator<I: XmlNodeIterator>(
+    iter: &mut I,
+    want_runs: bool,
+) -> Result<AxisStepItems<I::Navigator>, XPathError> {
+    if !want_runs {
+        return Ok(AxisStepItems {
+            items: collect_iterator(iter)?,
+            run_starts: Vec::new(),
+        });
+    }
+
+    let mut results = Vec::new();
+    let mut run_starts = Vec::new();
+    let mut prev_pos = 0usize;
+    while iter.move_next()? {
+        if let Some(item_ref) = iter.current() {
+            let pos = iter.sequential_position();
+            debug_assert!(
+                pos.is_some(),
+                "an axis iterator must report its per-input-node position"
+            );
+            // An iterator that does not report a position keeps extending the
+            // current run, which is the pre-§3.2.2 behaviour rather than a
+            // wrong split.
+            let pos = pos.unwrap_or(prev_pos + 1);
+            if run_starts.is_empty() || pos <= prev_pos {
+                run_starts.push(results.len());
+            }
+            prev_pos = pos;
+            let item = match item_ref {
+                crate::xpath::iterator::XmlItemRef::Node(n) => XmlItem::Node(n.clone()),
+                crate::xpath::iterator::XmlItemRef::Atomic(v) => XmlItem::Atomic(v.clone()),
+            };
+            results.push(item);
+        }
+    }
+    Ok(AxisStepItems {
+        items: results,
+        run_starts,
+    })
 }
 
 // ============================================================================

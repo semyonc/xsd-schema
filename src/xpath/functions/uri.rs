@@ -57,6 +57,13 @@ pub fn resolve_uri<N: DomNavigator>(
         context.base_uri.clone()
     };
 
+    // An argument that is not a valid URI reference is FORG0002, whichever
+    // argument it is; FORG0009 is reserved for a base URI that is well formed
+    // but cannot be resolved against.
+    if !relative.is_empty() && !is_valid_uri_reference(&relative) {
+        return Err(XPathError::invalid_uri_argument(&relative));
+    }
+
     // Validate base URI
     let base = match base {
         None if is_one_arg_form => {
@@ -68,7 +75,7 @@ pub fn resolve_uri<N: DomNavigator>(
             if is_absolute_uri(&relative) {
                 return Ok(make_any_uri(&relative));
             }
-            // Otherwise, error - can't resolve relative against empty
+            // Otherwise there is nothing to resolve against.
             return Err(XPathError::uri_resolution_error(&relative));
         }
         Some(b) if b.is_empty() => {
@@ -86,14 +93,10 @@ pub fn resolve_uri<N: DomNavigator>(
         Some(b) => b,
     };
 
-    // Validate the relative URI is a syntactically valid URI reference
-    if !relative.is_empty() && !is_valid_uri_reference(&relative) {
-        return Err(XPathError::uri_resolution_error(&relative));
-    }
-
-    // Validate the base URI is a syntactically valid absolute URI
+    // The base must itself be a valid URI, and an absolute one: a relative
+    // base has nothing to resolve against (F&O erratum FO.E1).
     if !is_valid_base_uri(&base) {
-        return Err(XPathError::uri_resolution_error(&relative));
+        return Err(XPathError::invalid_uri_argument(&base));
     }
 
     // Resolve the URI
@@ -217,6 +220,16 @@ fn is_absolute_uri(uri: &str) -> bool {
     false
 }
 
+/// Characters that appear in no RFC 3986 production, not even percent-encoded
+/// (they must be escaped before they reach a URI).
+fn is_never_allowed_in_uri(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            ' ' | '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`'
+        )
+}
+
 /// URI components tuple: (scheme, authority, path, query)
 type UriComponents<'a> = (
     Option<String>,
@@ -330,6 +343,13 @@ fn is_valid_uri_reference(uri: &str) -> bool {
         return true;
     }
 
+    // RFC 3986 §3: a URI reference has at most one fragment, introduced by a
+    // single "#", and the fragment itself may not contain one. Characters that
+    // no production allows are rejected too.
+    if uri.matches('#').count() > 1 || uri.chars().any(is_never_allowed_in_uri) {
+        return false;
+    }
+
     // If it's absolute (has a valid scheme), it's a valid URI reference
     if is_absolute_uri(uri) {
         return true;
@@ -357,7 +377,7 @@ fn is_valid_uri_reference(uri: &str) -> bool {
 /// A base URI must have a scheme followed by scheme-specific content.
 /// "http://" alone (scheme + empty authority + empty path) is not a usable base URI.
 fn is_valid_base_uri(uri: &str) -> bool {
-    if !is_absolute_uri(uri) {
+    if !is_valid_uri_reference(uri) || !is_absolute_uri(uri) {
         return false;
     }
 
@@ -541,5 +561,60 @@ mod tests {
         assert_eq!(remove_dot_segments("/../../../g"), "/g");
         assert_eq!(remove_dot_segments("./g"), "g");
         assert_eq!(remove_dot_segments("../../../g"), "g");
+    }
+    // =========================================================================
+    // fn:resolve-uri argument validation
+    // =========================================================================
+
+    fn resolve_code(relative: &str, base: Option<&str>) -> Option<&'static str> {
+        let names = Box::leak(Box::new(NameTable::new()));
+        let mut ctx = create_context(names, Some("http://example.com/base/"));
+        let mut args = vec![XPathValue::string(relative)];
+        if let Some(b) = base {
+            args.push(XPathValue::string(b));
+        }
+        match resolve_uri(&mut ctx, args) {
+            Ok(_) => None,
+            Err(e) => e.error_code(),
+        }
+    }
+
+    /// An argument that is not a valid URI reference is FORG0002, and so is a
+    /// base URI that is not absolute (F&O erratum FO.E1). FORG0009 is left for
+    /// a base that cannot be resolved against.
+    #[test]
+    fn resolve_uri_reports_forg0002_for_an_invalid_argument() {
+        // A relative URI with two "#" is not a URI reference.
+        assert_eq!(
+            resolve_code("##some.uri", Some("http://localhost/base/")),
+            Some("FORG0002")
+        );
+        // Neither is a base with two "#".
+        assert_eq!(
+            resolve_code("some.uri", Some("http://localhost/base/##frag")),
+            Some("FORG0002")
+        );
+        // A relative base has nothing to resolve against.
+        assert_eq!(
+            resolve_code("index.html", Some("/html/base/")),
+            Some("FORG0002")
+        );
+        // Characters no production allows.
+        assert_eq!(
+            resolve_code("a b", Some("http://localhost/base/")),
+            Some("FORG0002")
+        );
+        assert_eq!(
+            resolve_code("a<b", Some("http://localhost/base/")),
+            Some("FORG0002")
+        );
+
+        // Valid arguments still resolve.
+        assert_eq!(
+            resolve_code("index.html", Some("http://localhost/base/")),
+            None
+        );
+        assert_eq!(resolve_code("a#frag", Some("http://localhost/base/")), None);
+        assert_eq!(resolve_code("index.html", None), None);
     }
 }
