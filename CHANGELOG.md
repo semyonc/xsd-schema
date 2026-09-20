@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   order. Filtering 1,000,000 items
   against a 100,000-item sequence goes from days to ~0.4 s; the same filter
   against a one-item sequence is about twice as fast as before.
+- `fn:matches`, `fn:replace` and `fn:tokenize` compile each regular expression
+  once per evaluation run. They recompiled their `$pattern` argument on every
+  call, so a constant pattern inside a predicate —
+  `$items[matches(., '\p{Ll}')]` — paid for a full compile, including the
+  expansion of any Unicode category it names, once per item. The compiled
+  programs of one run are kept in its dynamic context, keyed by
+  `(pattern, flags)`, bounded at 32 entries with least-recently-used eviction,
+  and dropped when the run ends. A pattern that fails to compile is remembered
+  too, and raises the same error every time. Answers, error codes and error
+  messages are unchanged. On a 100,000-item filter `matches(., '\p{Ll}')` goes
+  from 6.6 s to 67 ms; `replace()` in a loop is 23× faster and `tokenize()`
+  39×; a single call, and a pattern computed afresh for every item, cost what
+  they did.
 
 ### Fixed
 

@@ -584,6 +584,11 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     /// allocation-free until the first general comparison is evaluated, and
     /// dropped with the context.
     compare_cache: crate::xpath::compare_cache::GeneralCompareCache,
+    /// Compiled regular expressions reused across the `fn:matches`,
+    /// `fn:replace` and `fn:tokenize` calls of this run; see
+    /// [`regex_cache`](crate::xpath::regex_cache). Empty and allocation-free
+    /// until the first such call, and dropped with the context.
+    regex_cache: crate::xpath::regex_cache::RegexCache,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -603,6 +608,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             function_evaluator: None,
             extension: None,
             compare_cache: Default::default(),
+            regex_cache: Default::default(),
         }
     }
 
@@ -674,6 +680,20 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         &mut self,
     ) -> &mut crate::xpath::compare_cache::GeneralCompareCache {
         &mut self.compare_cache
+    }
+
+    /// The compiled regular expressions of this run.
+    #[inline]
+    pub(crate) fn regex_cache_mut(&mut self) -> &mut crate::xpath::regex_cache::RegexCache {
+        &mut self.regex_cache
+    }
+
+    /// The compiled regular expressions of this run. Test-only: the shipped
+    /// path never reads the cache without also being allowed to fill it.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn regex_cache(&self) -> &crate::xpath::regex_cache::RegexCache {
+        &self.regex_cache
     }
 
     /// Get a variable value by slot ID.

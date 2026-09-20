@@ -6,6 +6,14 @@
 //! - fn:tokenize($input, $pattern, $flags?) - split string by pattern
 //!
 //! Uses the `regexml` crate for native XML Schema 1.1 regex with full Unicode support.
+//!
+//! All three compile their `$pattern` and `$flags` arguments through one private
+//! helper, which reuses the program of a `(pattern, flags)` pair it has already
+//! compiled during the current evaluation run. A pattern that does not change —
+//! a literal in a predicate, say — is therefore compiled once, however many
+//! items the predicate is evaluated for. The reuse is invisible: a compiled
+//! `regexml::Regex` is immutable and builds a fresh matcher for every call, and
+//! a compile that fails yields the same error every time.
 
 use regexml::Regex;
 
@@ -25,7 +33,7 @@ use crate::xpath::iterator::XmlItem;
 /// - FORX0001 if $flags contains invalid characters.
 /// - FORX0002 if $pattern is not a valid regular expression.
 pub fn matches<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -52,7 +60,7 @@ pub fn matches<N: DomNavigator>(
     let flags_str = flags.as_deref().unwrap_or("");
 
     // Build the regex
-    let regex = build_regex(&pattern, flags_str)?;
+    let regex = build_regex(context, &pattern, flags_str)?;
 
     let result = regex.is_match(&input);
 
@@ -69,7 +77,7 @@ pub fn matches<N: DomNavigator>(
 /// - FORX0003 if $pattern matches a zero-length string.
 /// - FORX0004 if $replacement has invalid syntax.
 pub fn replace<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 3 || args.len() > 4 {
@@ -97,7 +105,7 @@ pub fn replace<N: DomNavigator>(
     let input = atomize_to_string(args.pop().unwrap())?;
 
     // Build the regex
-    let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
+    let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
 
     // regexml handles FORX0003 (zero-length match) and FORX0004 (invalid replacement) internally
     let result = regex
@@ -121,7 +129,7 @@ pub fn replace<N: DomNavigator>(
 /// - FORX0002 if $pattern is not a valid regular expression.
 /// - FORX0003 if $pattern matches a zero-length string.
 pub fn tokenize<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -151,7 +159,7 @@ pub fn tokenize<N: DomNavigator>(
     }
 
     // Build the regex
-    let regex = build_regex(&pattern, flags.as_deref().unwrap_or(""))?;
+    let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
 
     // regexml handles FORX0003 (zero-length match) internally
     let token_iter = regex.tokenize(&input).map_err(|e| match e {
@@ -238,6 +246,27 @@ fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathEr
     Ok(())
 }
 
+/// The Regex for an XPath pattern and flags, compiled at most once per
+/// `(pattern, flags)` pair per evaluation run.
+///
+/// The program is compiled by [`compile_regex`] the first time this run asks for
+/// the pair and is kept in the run's
+/// [`regex_cache`](crate::xpath::regex_cache) afterwards, so a pattern that does
+/// not change — a literal in a predicate, say — is compiled once however many
+/// items the predicate is evaluated for. Reuse is invisible: a compiled
+/// `regexml::Regex` is immutable and builds a fresh matcher for each call, and a
+/// compile that fails yields the same error every time because that error is
+/// built from the pattern and the flags alone.
+fn build_regex<'run, N: DomNavigator>(
+    context: &'run mut DynamicContext<'_, N>,
+    pattern: &str,
+    flags: &str,
+) -> Result<&'run Regex, XPathError> {
+    context
+        .regex_cache_mut()
+        .get_or_compile(pattern, flags, || compile_regex(pattern, flags))
+}
+
 /// Build a Regex from an XPath pattern and flags using regexml.
 ///
 /// regexml natively handles XML Schema regex syntax including:
@@ -245,7 +274,7 @@ fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathEr
 /// - XSD-specific escapes `\i`, `\c`, `\I`, `\C`
 /// - Unicode categories `\p{Lu}`, `\P{Lu}`
 /// - Flag handling (s, m, i, x)
-fn build_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
+fn compile_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
     check_xpath20_regex_dialect(pattern, flags)?;
 
     Regex::xpath(pattern, flags).map_err(|e| match e {
@@ -829,6 +858,276 @@ mod tests {
             vec![XPathValue::string("abc"), XPathValue::string("(?:b)")],
         );
         assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+    }
+
+    // =========================================================================
+    // One compilation per (pattern, flags) pair per run
+    //
+    // Every test here asserts the observable result first and the cache
+    // counters second, so that it fails both when the cache changes an answer
+    // and when it silently stops engaging.
+    // =========================================================================
+
+    /// The `true`/`false` a `matches()` result carries.
+    fn boolean_of(value: XPathValue<RoXmlNavigator<'_>>) -> bool {
+        match value {
+            XPathValue::Item(XmlItem::Atomic(v)) => v.as_boolean().expect("xs:boolean"),
+            _ => panic!("expected a single xs:boolean"),
+        }
+    }
+
+    #[test]
+    fn test_a_constant_pattern_is_compiled_once_per_run() {
+        // The shape this cache exists for: one pattern, one call per item.
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for i in 0..200 {
+            let result = matches(
+                &mut ctx,
+                vec![
+                    XPathValue::string(format!("item-{i}")),
+                    XPathValue::string(r"\p{Ll}"),
+                ],
+            )
+            .unwrap();
+            assert!(boolean_of(result), "item-{i} has lowercase letters in it");
+        }
+
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+        assert_eq!(ctx.regex_cache().hits(), 199);
+    }
+
+    #[test]
+    fn test_the_three_functions_share_one_compiled_pattern() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let hit = matches(
+            &mut ctx,
+            vec![XPathValue::string("a,b"), XPathValue::string(",")],
+        )
+        .unwrap();
+        assert!(boolean_of(hit));
+
+        let replaced = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("a,b"),
+                XPathValue::string(","),
+                XPathValue::string(";"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            matches!(replaced, XPathValue::Item(XmlItem::Atomic(ref v)) if v.as_string() == Some("a;b"))
+        );
+
+        let tokens = tokenize(
+            &mut ctx,
+            vec![XPathValue::string("a,b"), XPathValue::string(",")],
+        )
+        .unwrap();
+        assert_eq!(token_strings(tokens), vec!["a", "b"]);
+
+        // One program, built by the `matches()` call and reused by the other two.
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+        assert_eq!(ctx.regex_cache().hits(), 2);
+    }
+
+    #[test]
+    fn test_flags_are_part_of_the_cache_key() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        for _ in 0..2 {
+            let plain = matches(
+                &mut ctx,
+                vec![XPathValue::string("A"), XPathValue::string("a")],
+            )
+            .unwrap();
+            assert!(!boolean_of(plain));
+
+            let folded = matches(
+                &mut ctx,
+                vec![
+                    XPathValue::string("A"),
+                    XPathValue::string("a"),
+                    XPathValue::string("i"),
+                ],
+            )
+            .unwrap();
+            assert!(boolean_of(folded));
+        }
+
+        // Same pattern, two flag strings, two programs.
+        assert_eq!(ctx.regex_cache().compiles(), 2);
+        assert_eq!(ctx.regex_cache().hits(), 2);
+    }
+
+    #[test]
+    fn test_an_invalid_pattern_reports_the_same_error_every_time() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let result = matches(
+                &mut ctx,
+                vec![XPathValue::string("test"), XPathValue::string("[invalid")],
+            );
+            let err = result.err().expect("an invalid pattern must raise");
+            assert!(matches!(err, XPathError::FORX0002 { .. }));
+            seen.push(err.to_string());
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "{seen:?}");
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+        assert_eq!(ctx.regex_cache().hits(), 4);
+    }
+
+    #[test]
+    fn test_an_invalid_flag_reports_the_same_error_every_time() {
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            let result = matches(
+                &mut ctx,
+                vec![
+                    XPathValue::string("test"),
+                    XPathValue::string("test"),
+                    XPathValue::string("z"),
+                ],
+            );
+            let err = result.err().expect("an undefined flag must raise");
+            assert!(matches!(err, XPathError::FORX0001 { .. }));
+            seen.push(err.to_string());
+        }
+        assert!(seen.windows(2).all(|pair| pair[0] == pair[1]), "{seen:?}");
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+    }
+
+    #[test]
+    fn test_a_reused_program_still_raises_forx0003() {
+        // `a?` matches the zero-length string. `matches()` is happy with it and
+        // is what puts it in the cache; `replace()` and `tokenize()` must still
+        // raise FORX0003 from the *reused* program, on every call.
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let hit = matches(
+            &mut ctx,
+            vec![XPathValue::string("test"), XPathValue::string("a?")],
+        )
+        .unwrap();
+        assert!(boolean_of(hit));
+
+        for _ in 0..3 {
+            let result = replace(
+                &mut ctx,
+                vec![
+                    XPathValue::string("test"),
+                    XPathValue::string("a?"),
+                    XPathValue::string("X"),
+                ],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0003 { .. })));
+
+            let result = tokenize(
+                &mut ctx,
+                vec![XPathValue::string("test"), XPathValue::string("a?")],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0003 { .. })));
+        }
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+    }
+
+    #[test]
+    fn test_a_reused_program_still_raises_forx0004() {
+        // The replacement string is not part of the key, so a cache hit must
+        // not carry the previous call's verdict on it.
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let good = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("test"),
+                XPathValue::string("t"),
+                XPathValue::string("X"),
+            ],
+        )
+        .unwrap();
+        assert!(
+            matches!(good, XPathValue::Item(XmlItem::Atomic(ref v)) if v.as_string() == Some("XesX"))
+        );
+
+        for _ in 0..3 {
+            let result = replace(
+                &mut ctx,
+                vec![
+                    XPathValue::string("test"),
+                    XPathValue::string("t"),
+                    XPathValue::string("$x"),
+                ],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0004 { .. })));
+        }
+        assert_eq!(ctx.regex_cache().compiles(), 1);
+    }
+
+    #[test]
+    fn test_the_cache_does_not_outlive_its_run() {
+        let names = NameTable::new();
+        for _ in 0..3 {
+            let mut ctx = create_context(&names);
+            for _ in 0..2 {
+                let hit = matches(
+                    &mut ctx,
+                    vec![XPathValue::string("abc"), XPathValue::string("b")],
+                )
+                .unwrap();
+                assert!(boolean_of(hit));
+            }
+            // Reused inside the run, and a fresh context starts empty again:
+            // the cache belongs to the run, not to the process.
+            assert_eq!(ctx.regex_cache().compiles(), 1);
+            assert_eq!(ctx.regex_cache().hits(), 1);
+        }
+    }
+
+    #[test]
+    fn test_a_pattern_computed_per_item_does_not_grow_the_cache() {
+        // `matches($s, $row/@pattern)` — a new pattern for every item. The cache
+        // must stay bounded and must keep answering correctly.
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+
+        let rounds = crate::xpath::regex_cache::MAX_ENTRIES * 8;
+        for i in 0..rounds {
+            let pattern = format!("^item-{i}$");
+            let hit = matches(
+                &mut ctx,
+                vec![
+                    XPathValue::string(format!("item-{i}")),
+                    XPathValue::string(pattern),
+                ],
+            )
+            .unwrap();
+            assert!(boolean_of(hit));
+            assert!(
+                ctx.regex_cache().len() <= crate::xpath::regex_cache::MAX_ENTRIES,
+                "{} entries resident after {i} patterns",
+                ctx.regex_cache().len()
+            );
+        }
+        assert_eq!(ctx.regex_cache().compiles() as usize, rounds);
+        assert_eq!(ctx.regex_cache().hits(), 0);
+        assert_eq!(
+            ctx.regex_cache().len(),
+            crate::xpath::regex_cache::MAX_ENTRIES
+        );
     }
 
     // =========================================================================

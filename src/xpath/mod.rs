@@ -35,6 +35,10 @@ pub mod lexer;
 pub mod node_test;
 pub mod operators;
 pub mod parser;
+// Reuse of the compiled programs of `fn:matches` / `fn:replace` / `fn:tokenize`
+// across the calls of one evaluation run. Internal, and likewise
+// answer-preserving.
+pub(crate) mod regex_cache;
 pub mod timsort;
 pub mod tree_comparer;
 

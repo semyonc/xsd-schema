@@ -127,6 +127,12 @@ path = "benches/general_compare.rs"
 harness = false
 required-features = ["xsd11"]
 
+[[bench]]
+name = "regex_functions"
+path = "benches/regex_functions.rs"
+harness = false
+required-features = ["xsd11"]
+
 [[example]]
 name = "xquery_without_xquery"
 path = "examples/xquery_without_xquery.rs"
