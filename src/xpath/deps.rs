@@ -102,6 +102,12 @@ pub(crate) struct ExprDependencies {
     /// Bitset over external variable slots (slot `n` is bit `n % 64` of word
     /// `n / 64`). Only slots below the external boundary are recorded.
     referenced_vars: Vec<u64>,
+    /// The distinct slots **at or above** the external boundary that the
+    /// expression references, in first-occurrence order. For a whole compiled
+    /// expression these are its own `for`/`some`/`every` variables; analysing a
+    /// subtree with a boundary of `0` turns this into "every variable slot the
+    /// subtree reads".
+    inner_var_refs: Vec<VarSlotId>,
     uses_focus: bool,
     uses_position: bool,
     uses_last: bool,
@@ -355,10 +361,16 @@ impl Analyzer<'_, '_> {
     }
 
     /// Record a reference to an external variable slot; slots at or above the
-    /// external boundary belong to the expression itself and are ignored.
+    /// external boundary belong to the expression itself and are collected
+    /// separately, in `inner_var_refs`.
     #[inline]
     fn mark_var(&mut self, slot: VarSlotId) {
         if (slot as usize) >= self.external_slot_count {
+            // A handful of range variables at most, so a linear scan beats a
+            // set and keeps the order stable (source order).
+            if !self.deps.inner_var_refs.contains(&slot) {
+                self.deps.inner_var_refs.push(slot);
+            }
             return;
         }
         let word = (slot / 64) as usize;
@@ -487,6 +499,126 @@ fn call_focus_use(call: &FunctionCallNode) -> FocusUse {
         (FunctionId::Lang | FunctionId::Id, 1) => FocusUse::ITEM,
         _ => FocusUse::NONE,
     }
+}
+
+// ============================================================================
+// Run invariance
+// ============================================================================
+
+/// A set of variable slots, held as a bitset.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SlotSet {
+    words: Vec<u64>,
+}
+
+impl SlotSet {
+    /// Whether `slot` is in the set. O(1).
+    #[inline]
+    pub(crate) fn contains(&self, slot: VarSlotId) -> bool {
+        let word = (slot / 64) as usize;
+        match self.words.get(word) {
+            Some(bits) => bits & (1u64 << (slot % 64)) != 0,
+            None => false,
+        }
+    }
+
+    fn insert(&mut self, slot: VarSlotId) {
+        let word = (slot / 64) as usize;
+        if self.words.len() <= word {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1u64 << (slot % 64);
+    }
+}
+
+/// Every variable slot bound by a `for`, `some` or `every` **anywhere** in
+/// `arena`.
+///
+/// A slot outside this set is bound before evaluation starts — by
+/// `XPathEvaluator`'s pending variables or by a host's setup callback — and the
+/// engine never writes it again while the expression runs, so a reference to it
+/// yields the same value however often it is evaluated. A slot inside it is a
+/// range variable, whose value changes with the iteration it belongs to.
+///
+/// The set is deliberately a property of the whole arena rather than of one
+/// scope: a reference to a range variable is then rejected wherever it appears,
+/// which is conservative — a `for` wholly inside the analysed subtree is
+/// rejected as well — and cannot mistake an outer binding for an inner one.
+pub(crate) fn range_var_slots(arena: &AstArena) -> SlotSet {
+    let mut set = SlotSet::default();
+    for (_, node) in arena.iter() {
+        let bindings = match node {
+            AstNode::For(for_node) => &for_node.bindings,
+            AstNode::Quantified(quantified) => &quantified.bindings,
+            _ => continue,
+        };
+        for binding in bindings {
+            if let Some(slot) = binding.slot {
+                set.insert(slot);
+            }
+        }
+    }
+    set
+}
+
+/// The variable slots the subtree rooted at `root` reads, if that subtree
+/// produces the same value every time it is evaluated during one run of the
+/// enclosing expression — and `None` if it does not.
+///
+/// `Some` when the subtree
+///
+/// * reads no part of the focus it is entered with, so re-evaluating it in a
+///   predicate, a later path step, a `for` body or a quantified body cannot
+///   change its value — this is exactly [`ExprDependencies::uses_focus`] applied
+///   to the subtree, with the focus rules documented at the top of this module;
+/// * calls no function: a function result may depend on host state that this
+///   crate cannot inspect (a custom
+///   [`FunctionEvaluator`](crate::xpath::functions::FunctionEvaluator)), or on
+///   dynamic-context state this analysis does not model, and a call may have
+///   effects that skipping the evaluation would skip too;
+/// * references no range variable, i.e. no slot in `range_vars`.
+///
+/// What is left — variable references bound before the run, literals, ranges,
+/// sequence constructors, arithmetic, `if`, type expressions, and paths and
+/// predicates rooted in any of those — is a pure function of state that does not
+/// change while the expression runs. Note that the walk is conservative in the
+/// other direction too: an unclassifiable construct reports a focus read rather
+/// than staying silent.
+///
+/// The returned slots are the ones whose bindings the value depends on, which is
+/// what a caller that caches the value needs in order to notice a rebinding.
+pub(crate) fn run_invariant_vars(
+    arena: &AstArena,
+    root: AstNodeId,
+    ctx: &XPathContext<'_>,
+    range_vars: &SlotSet,
+) -> Option<Vec<VarSlotId>> {
+    // A boundary of 0 puts *every* variable reference of the subtree into
+    // `inner_var_refs`, which is what the range-variable test below needs.
+    let deps = analyze(arena, root, ctx, 0);
+    if deps.uses_focus() || !deps.function_calls().is_empty() {
+        return None;
+    }
+    if deps
+        .inner_var_refs
+        .iter()
+        .any(|&slot| range_vars.contains(slot))
+    {
+        return None;
+    }
+    Some(deps.inner_var_refs)
+}
+
+/// Whether the subtree rooted at `root` is run invariant; see
+/// [`run_invariant_vars`], of which this is the predicate form.
+#[cfg(test)]
+pub(crate) fn is_run_invariant(
+    arena: &AstArena,
+    root: AstNodeId,
+    ctx: &XPathContext<'_>,
+    range_vars: &SlotSet,
+) -> bool {
+    run_invariant_vars(arena, root, ctx, range_vars).is_some()
 }
 
 #[cfg(test)]

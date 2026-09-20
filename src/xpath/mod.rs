@@ -27,6 +27,10 @@ pub mod iterator;
 // Indexed evaluation of the general comparison operators. Internal: it only
 // ever changes how fast `operators` answers a comparison, never the answer.
 pub(crate) mod general_compare;
+// Reuse of a general-comparison index across evaluations of one comparison
+// node, for the duration of one evaluation run. Internal, and likewise
+// answer-preserving.
+pub(crate) mod compare_cache;
 pub mod lexer;
 pub mod node_test;
 pub mod operators;

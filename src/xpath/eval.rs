@@ -382,6 +382,28 @@ pub fn eval_node<N: DomNavigator>(
                 | BinaryOpKind::GeneralLe
                 | BinaryOpKind::GeneralGt
                 | BinaryOpKind::GeneralGe => {
+                    // `=` and `!=` outside XPath 1.0 compatibility mode go
+                    // through `compare_cache`, which may reuse the index of an
+                    // operand that does not change during this run. With nothing
+                    // to reuse it evaluates both operands in source order and
+                    // calls the very same `general_eq_iter`/`general_ne_iter`.
+                    if !ctx.static_context.xpath10_compatibility()
+                        && matches!(
+                            bin_op.kind,
+                            BinaryOpKind::GeneralEq | BinaryOpKind::GeneralNe
+                        )
+                    {
+                        let result = crate::xpath::compare_cache::eval_general_eq_ne(
+                            arena,
+                            id,
+                            bin_op.left,
+                            bin_op.right,
+                            matches!(bin_op.kind, BinaryOpKind::GeneralEq),
+                            ctx,
+                        )?;
+                        return Ok(XPathValue::boolean(result));
+                    }
+
                     let left_val = eval_node(arena, bin_op.left, ctx)?;
                     let right_val = eval_node(arena, bin_op.right, ctx)?;
 

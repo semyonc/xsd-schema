@@ -29,6 +29,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including which error a comparison raises and when, are unchanged. Two
   disjoint sequences of 100,000 items now compare in ~25 ms; before, 10,000
   items already took ~16 s.
+- A `=` or `!=` comparison that is evaluated over and over — the predicate of
+  `$big[. = $c]`, the body of a `for` or a quantified expression — now reuses
+  the index of the operand that does not change during the evaluation, instead
+  of rebuilding it every time. An operand counts as unchanging only if a
+  conservative static analysis says so: it must read no part of the focus, call
+  no function, and reference no variable bound by a `for`, `some` or `every`;
+  on top of that, every reuse re-checks that the variables it was built from
+  have not been rebound. The index lives in the dynamic context of the one
+  evaluation run and is dropped with it, nothing is built before the second
+  evaluation of the same comparison, and the index only answers a comparison
+  when it can prove both the answer and the absence of an error for that pair
+  of operands, so results and errors are unchanged. A host function registered
+  through `FunctionSet` receives `&mut DynamicContext` and may rebind a
+  variable while the other operand of the same comparison is being evaluated;
+  such a write is detected, and the comparison then answers exactly what it
+  would have answered without an index, with both operands evaluated in source
+  order. Filtering 1,000,000 items
+  against a 100,000-item sequence goes from days to ~0.4 s; the same filter
+  against a one-item sequence is about twice as fast as before.
 
 ### Fixed
 

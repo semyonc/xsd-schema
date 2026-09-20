@@ -457,6 +457,11 @@ impl NameBinder {
 pub struct VarStore<V> {
     /// Variable values indexed by slot ID
     values: Vec<Option<V>>,
+    /// How often each slot has been written. A consumer that caches something
+    /// derived from a slot's value uses this to notice a rebinding in O(1),
+    /// whatever the new value happens to be allocated at; see
+    /// [`generation`](Self::generation).
+    generations: Vec<u64>,
 }
 
 impl<V> VarStore<V> {
@@ -466,7 +471,10 @@ impl<V> VarStore<V> {
     pub fn new(size: usize) -> Self {
         let mut values = Vec::with_capacity(size);
         values.resize_with(size, || None);
-        Self { values }
+        Self {
+            values,
+            generations: vec![0; size],
+        }
     }
 
     /// Get a variable value by slot ID.
@@ -478,6 +486,7 @@ impl<V> VarStore<V> {
     pub fn set(&mut self, slot: VarSlotId, value: V) {
         if let Some(cell) = self.values.get_mut(slot as usize) {
             *cell = Some(value);
+            self.bump(slot);
         }
     }
 
@@ -485,6 +494,7 @@ impl<V> VarStore<V> {
     pub fn clear_slot(&mut self, slot: VarSlotId) {
         if let Some(cell) = self.values.get_mut(slot as usize) {
             *cell = None;
+            self.bump(slot);
         }
     }
 
@@ -492,6 +502,27 @@ impl<V> VarStore<V> {
     pub fn clear(&mut self) {
         for cell in &mut self.values {
             *cell = None;
+        }
+        for generation in &mut self.generations {
+            *generation = generation.wrapping_add(1);
+        }
+    }
+
+    /// How often `slot` has been written since the store was created.
+    ///
+    /// Every write goes through [`set`](Self::set), [`clear_slot`](Self::clear_slot)
+    /// or [`clear`](Self::clear), and the store hands out no mutable reference to a
+    /// value, so an unchanged generation means the slot still holds the very value
+    /// it held when the generation was read.
+    #[inline]
+    pub(crate) fn generation(&self, slot: VarSlotId) -> u64 {
+        self.generations.get(slot as usize).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn bump(&mut self, slot: VarSlotId) {
+        if let Some(generation) = self.generations.get_mut(slot as usize) {
+            *generation = generation.wrapping_add(1);
         }
     }
 
@@ -547,6 +578,12 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     ///
     /// See [`with_extension`](Self::with_extension).
     extension: Option<&'a dyn std::any::Any>,
+    /// General-comparison indexes reused across evaluations of one comparison
+    /// node during this run; see
+    /// [`compare_cache`](crate::xpath::compare_cache). Empty and
+    /// allocation-free until the first general comparison is evaluated, and
+    /// dropped with the context.
+    compare_cache: crate::xpath::compare_cache::GeneralCompareCache,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -565,6 +602,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             variables: VarStore::new(var_count),
             function_evaluator: None,
             extension: None,
+            compare_cache: Default::default(),
         }
     }
 
@@ -622,9 +660,32 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
         }
     }
 
+    /// The general-comparison index cache of this run.
+    #[inline]
+    pub(crate) fn general_compare_cache(
+        &self,
+    ) -> &crate::xpath::compare_cache::GeneralCompareCache {
+        &self.compare_cache
+    }
+
+    /// The general-comparison index cache of this run, mutably.
+    #[inline]
+    pub(crate) fn general_compare_cache_mut(
+        &mut self,
+    ) -> &mut crate::xpath::compare_cache::GeneralCompareCache {
+        &mut self.compare_cache
+    }
+
     /// Get a variable value by slot ID.
     pub fn get_variable(&self, slot: VarSlotId) -> Option<&super::functions::XPathValue<N>> {
         self.variables.get(slot)
+    }
+
+    /// How often the variable in `slot` has been written; see
+    /// [`VarStore::generation`].
+    #[inline]
+    pub(crate) fn variable_generation(&self, slot: VarSlotId) -> u64 {
+        self.variables.generation(slot)
     }
 
     /// Set a variable value.

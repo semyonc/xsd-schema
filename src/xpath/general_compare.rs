@@ -70,7 +70,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
+use std::hash::{BuildHasherDefault, Hash, Hasher as _};
 
 use ahash::AHasher;
 use num_bigint::BigInt;
@@ -81,7 +81,7 @@ use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
-use crate::xpath::iterator::{BufferedNodeIterator, XmlNodeIterator};
+use crate::xpath::iterator::{BufferedNodeIterator, XmlItem, XmlItemRef, XmlNodeIterator};
 use crate::xpath::operators::{
     atomize_item, is_date_time_code, is_duration_code, is_string_like, is_temporal_type,
     magnitude_relationship_ctx, numeric_class, value_eq, NumericClass,
@@ -171,6 +171,22 @@ where
     Some((lvals, rvals))
 }
 
+/// Atomize a materialized sequence, dropping nilled items. `None` on any error,
+/// for the same reason [`atomize_all`] gives.
+pub(super) fn atomize_items<N: crate::xpath::DomNavigator>(
+    items: &[XmlItem<N>],
+) -> Option<Vec<XmlValue>> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match atomize_item(XmlItemRef::from_item(item)) {
+            Ok(Some(value)) => out.push(value),
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(out)
+}
+
 /// Atomize a whole sequence, dropping nilled items (which atomize to the empty
 /// sequence and take part in no pair). `None` on any error.
 fn atomize_all<I: XmlNodeIterator>(iter: &I) -> Option<Vec<XmlValue>> {
@@ -199,7 +215,7 @@ fn atomize_all<I: XmlNodeIterator>(iter: &I) -> Option<Vec<XmlValue>> {
 /// The four numeric representations `eq` can promote a pair to, in promotion
 /// order: a pair is compared at the higher of the two operands' groups.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum NumGroup {
+pub(super) enum NumGroup {
     /// Every `xs:integer`-derived type; compared as an exact `BigInt`.
     Int,
     /// `xs:decimal`; compared as an exact `Decimal`.
@@ -226,7 +242,7 @@ fn num_group(class: NumericClass) -> NumGroup {
 /// The arms mirror the dispatch order of the `eq` implementation, so that two
 /// values are comparable exactly when their classes form a comparable pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Class {
+pub(super) enum Class {
     /// `xs:untypedAtomic` — converted per §3.5.2 depending on the other value.
     Untyped,
     Num(NumGroup),
@@ -295,7 +311,7 @@ fn classify(value: &XmlValue) -> Option<Class> {
 
 /// The representation a pair of classes is compared at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Bucket {
+pub(super) enum Bucket {
     Str,
     Num(NumGroup),
     Bool,
@@ -308,7 +324,7 @@ enum Bucket {
 }
 
 /// What happens when a value of class `left` meets a value of class `right`.
-enum PairKind {
+pub(super) enum PairKind {
     /// Comparable; both values map into this bucket.
     Comparable(Bucket),
     /// `eq` raises `BinaryOperatorNotDefined` for every such pair.
@@ -317,7 +333,7 @@ enum PairKind {
     Unsupported,
 }
 
-fn pair_kind(left: Class, right: Class) -> PairKind {
+pub(super) fn pair_kind(left: Class, right: Class) -> PairKind {
     use Class::*;
     match (left, right) {
         // §3.5.2: both untyped, or untyped against a string-like value, are
@@ -477,13 +493,51 @@ fn key_of<'a>(value: &'a XmlValue, class: Class, bucket: Bucket) -> KeyOutcome<'
     }
 }
 
+/// The outcome of hashing the comparison key of a value in one bucket.
+pub(super) enum KeyHash {
+    /// The key hashes to this.
+    Found(u64),
+    /// The value can never compare equal to anything in this bucket (`NaN`), and
+    /// comparing it raises nothing either.
+    Never,
+    /// The conversion the comparison itself would perform fails here, so a hard
+    /// error is possible and nothing may be decided from an index.
+    Failed,
+}
+
+/// Hash the comparison key of `value` in `bucket`.
+///
+/// The obligation on a key is one-directional — `a eq b ⟹ key(a) == key(b)` —
+/// and hashing only weakens it in the harmless direction:
+/// `key(a) == key(b) ⟹ hash(a) == hash(b)`, so `hash(a) != hash(b)` still proves
+/// `¬(a eq b)`, while a hash collision merely produces one more candidate, and
+/// every candidate is confirmed by the real comparison. Keying a table by the
+/// hash instead of by [`Key`] is what lets the table **own** its keys rather than
+/// borrow from the values it indexes — which is what an index that outlives a
+/// single evaluation needs.
+pub(super) fn key_hash(value: &XmlValue, class: Class, bucket: Bucket) -> KeyHash {
+    match key_of(value, class, bucket) {
+        KeyOutcome::Found(key) => {
+            let mut hasher = AHasher::default();
+            key.hash(&mut hasher);
+            KeyHash::Found(hasher.finish())
+        }
+        KeyOutcome::Never => KeyHash::Never,
+        KeyOutcome::Failed => KeyHash::Failed,
+    }
+}
+
 // ============================================================================
 // `=`
 // ============================================================================
 
 /// Run the pair through the real comparison: the §3.5.2 conversions followed by
 /// the `eq` value comparison. Every candidate the index finds goes through here.
-fn confirm(context: &XPathContext, left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+pub(super) fn confirm(
+    context: &XPathContext,
+    left: &XmlValue,
+    right: &XmlValue,
+) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship_ctx(context, left, right)?;
     value_eq(&l, &r)
 }
@@ -566,11 +620,11 @@ fn general_eq_indexed(
     }
 }
 
-fn classify_all(values: &[XmlValue]) -> Option<Vec<Class>> {
+pub(super) fn classify_all(values: &[XmlValue]) -> Option<Vec<Class>> {
     values.iter().map(classify).collect()
 }
 
-fn distinct(classes: &[Class]) -> Vec<Class> {
+pub(super) fn distinct(classes: &[Class]) -> Vec<Class> {
     let mut out: Vec<Class> = Vec::new();
     for &class in classes {
         if !out.contains(&class) {
@@ -665,7 +719,7 @@ fn join_any_true(
 }
 
 /// The first pair in row-major order whose class pair is incomparable.
-fn first_incomparable_pair(
+pub(super) fn first_incomparable_pair(
     lclasses: &[Class],
     rclasses: &[Class],
     incomparable: &[(Class, Class)],
@@ -790,7 +844,7 @@ fn equivalence_bucket(lclasses: &[Class], rclasses: &[Class]) -> Option<Bucket> 
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::namespace::NameTable;
     use crate::navigator::RoXmlNavigator;
@@ -869,10 +923,10 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// xorshift64*, so the corpus is the same on every run and on every host.
-    struct Rng(u64);
+    pub struct Rng(pub u64);
 
     impl Rng {
-        fn next(&mut self) -> u64 {
+        pub fn next(&mut self) -> u64 {
             let mut x = self.0;
             x ^= x << 13;
             x ^= x >> 7;
@@ -881,7 +935,7 @@ mod tests {
             x
         }
 
-        fn below(&mut self, n: usize) -> usize {
+        pub fn below(&mut self, n: usize) -> usize {
             (self.next() % n as u64) as usize
         }
     }
@@ -1175,7 +1229,7 @@ mod tests {
         ]
     }
 
-    fn families(names: &NameTable) -> Vec<Vec<XmlValue>> {
+    pub fn families(names: &NameTable) -> Vec<Vec<XmlValue>> {
         vec![
             strings(),
             untypeds(),
@@ -1192,7 +1246,7 @@ mod tests {
     /// Draw a sequence of 0..=4 values, mostly from one or two families so that
     /// the comparable class pairs are actually exercised, with an occasional
     /// item from anywhere so the mixed and incomparable shapes are too.
-    fn draw(rng: &mut Rng, families: &[Vec<XmlValue>]) -> Vec<XmlValue> {
+    pub fn draw(rng: &mut Rng, families: &[Vec<XmlValue>]) -> Vec<XmlValue> {
         let len = rng.below(5);
         let home = rng.below(families.len());
         let guest = rng.below(families.len());
