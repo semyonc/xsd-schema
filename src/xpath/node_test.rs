@@ -215,82 +215,8 @@ fn matches_item_type<N: DomNavigator>(
             }
             true
         }
-        ItemType::SchemaElement(name) => {
-            if nav.node_type() != DomNodeType::Element {
-                return false;
-            }
-            // Check element name matches
-            if !qname_matches(name, nav, ctx) {
-                return false;
-            }
-            // If schema_set available, validate declaration exists and type derivation
-            if let Some(schema_set) = ctx.schema_set {
-                // Lookup element declaration - must exist for schema-element() to match
-                let ns_id = name.namespace_uri;
-                let Some(elem_key) = schema_set.lookup_element(ns_id, name.local_name) else {
-                    // Declaration not found in schema - no match
-                    return false;
-                };
-                let Some(elem_data) = schema_set.arenas.elements.get(elem_key) else {
-                    return false;
-                };
-                // Check type derivation if declaration has resolved_type
-                if let Some(expected_type) = elem_data.resolved_type {
-                    let Some(actual_type) = nav.schema_type() else {
-                        // Node has no type annotation but declaration expects one
-                        return false;
-                    };
-                    // Node type must derive from declaration type
-                    return schema_set.is_type_derived_from(
-                        TypeKey::Simple(actual_type),
-                        expected_type,
-                        DerivationSet::empty(),
-                    );
-                }
-                // Declaration found, no type constraint - match
-                return true;
-            }
-            // No schema context - fall back to name-only match
-            true
-        }
-        ItemType::SchemaAttribute(name) => {
-            if nav.node_type() != DomNodeType::Attribute {
-                return false;
-            }
-            // Check attribute name matches
-            if !qname_matches(name, nav, ctx) {
-                return false;
-            }
-            // If schema_set available, validate declaration exists and type derivation
-            if let Some(schema_set) = ctx.schema_set {
-                // Lookup attribute declaration - must exist for schema-attribute() to match
-                let ns_id = name.namespace_uri;
-                let Some(attr_key) = schema_set.lookup_attribute(ns_id, name.local_name) else {
-                    // Declaration not found in schema - no match
-                    return false;
-                };
-                let Some(attr_data) = schema_set.arenas.attributes.get(attr_key) else {
-                    return false;
-                };
-                // Check type derivation if declaration has resolved_type
-                if let Some(expected_type) = attr_data.resolved_type {
-                    let Some(actual_type) = nav.schema_type() else {
-                        // Node has no type annotation but declaration expects one
-                        return false;
-                    };
-                    // Node type must derive from declaration type
-                    return schema_set.is_type_derived_from(
-                        TypeKey::Simple(actual_type),
-                        expected_type,
-                        DerivationSet::empty(),
-                    );
-                }
-                // Declaration found, no type constraint - match
-                return true;
-            }
-            // No schema context - fall back to name-only match
-            true
-        }
+        ItemType::SchemaElement(name) => matches_schema_element(nav, name, ctx),
+        ItemType::SchemaAttribute(name) => matches_schema_attribute(nav, name, ctx),
         ItemType::Text => nav.node_type().is_text_like(),
         ItemType::Comment => nav.node_type() == DomNodeType::Comment,
         ItemType::ProcessingInstruction(target) => {
@@ -342,6 +268,184 @@ fn qname_matches<N: DomNavigator>(qname: &QualifiedName, nav: &N, ctx: &XPathCon
     };
 
     nav.local_name() == local && nav.namespace_uri() == ns
+}
+
+// ============================================================================
+// schema-element(N) / schema-attribute(N)
+// ============================================================================
+
+/// `schema-element(N)` matching — XPath 2.0 §2.5.4.4.
+///
+/// This is the **single** implementation of the rule. Every spelling of the
+/// test routes here: `ItemType::SchemaElement` (a step node test, and the
+/// `SequenceType` form after resolution), `KindTest::SchemaElement` (the AST
+/// form used by `instance of` / `treat as`) and `ItemType::matches_node`.
+///
+/// > A `SchemaElementTest` matches a candidate element node if all three of the
+/// > following conditions are satisfied:
+/// >
+/// > 1. The name of the candidate node matches the specified `ElementName` or
+/// >    matches the name of an element in a substitution group headed by an
+/// >    element named `ElementName`.
+/// > 2. `derives-from(AT, ET)` is true, where `AT` is the type annotation of the
+/// >    candidate node and `ET` is the schema type declared for element
+/// >    `ElementName` in the in-scope element declarations.
+/// > 3. If the element declaration for `ElementName` in the in-scope element
+/// >    declarations is not nillable, then the nilled property of the candidate
+/// >    node is false.
+///
+/// Without a schema set in the static context there are no in-scope element
+/// declarations to consult, so the test degrades to a name-only match, which is
+/// what it did before clauses 1 and 3 existed.
+///
+/// §2.5.4.4 also makes an `ElementName` that is *not* in the in-scope element
+/// declarations a static error (`XPST0008`). This crate does not raise it —
+/// neither here nor from the binder — and such a test simply matches nothing.
+pub(crate) fn matches_schema_element<N: DomNavigator>(
+    nav: &N,
+    name: &QualifiedName,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    if nav.node_type() != DomNodeType::Element {
+        return false;
+    }
+    let Some(schema_set) = ctx.schema_set else {
+        // No in-scope element declarations: name-only match.
+        return qname_matches(name, nav, ctx);
+    };
+    let Some(head_key) = schema_set.lookup_element(name.namespace_uri, name.local_name) else {
+        // `ElementName` is not declared; nothing matches it.
+        return false;
+    };
+    let Some(head) = schema_set.arenas.elements.get(head_key) else {
+        return false;
+    };
+
+    // Clause 1: the candidate's own name, or a member of the group `name` heads.
+    if !qname_matches(name, nav, ctx) {
+        let Some(candidate_key) = lookup_node_element_decl(nav, schema_set) else {
+            return false;
+        };
+        if !crate::compiler::substitution::is_substitution_group_member(
+            schema_set,
+            head_key,
+            candidate_key,
+        ) {
+            return false;
+        }
+    }
+
+    // Clause 3: only a nillable declaration accepts a nilled candidate.
+    if !head.nillable && matches!(nav.typed_value(), crate::xpath::TypedValue::Nilled) {
+        return false;
+    }
+
+    // Clause 2: derives-from(AT, ET).
+    derives_from_declared_type(nav, head.resolved_type, schema_set)
+}
+
+/// `schema-attribute(N)` matching — XPath 2.0 §2.5.4.6.
+///
+/// > A `SchemaAttributeTest` matches a candidate attribute node if both of the
+/// > following conditions are satisfied:
+/// >
+/// > 1. The name of the candidate node matches the specified `AttributeName`.
+/// > 2. `derives-from(AT, ET)` is true, where `AT` is the type annotation of the
+/// >    candidate node and `ET` is the schema type declared for attribute
+/// >    `AttributeName` in the in-scope attribute declarations.
+///
+/// There is no substitution group for attributes, and no nilled property, so
+/// the rule is the element one without clauses 1's second half and 3. The
+/// `XPST0008` and no-schema-set remarks of [`matches_schema_element`] apply
+/// unchanged.
+pub(crate) fn matches_schema_attribute<N: DomNavigator>(
+    nav: &N,
+    name: &QualifiedName,
+    ctx: &XPathContext<'_>,
+) -> bool {
+    if nav.node_type() != DomNodeType::Attribute {
+        return false;
+    }
+    if !qname_matches(name, nav, ctx) {
+        return false;
+    }
+    let Some(schema_set) = ctx.schema_set else {
+        return true;
+    };
+    let Some(attr_key) = schema_set.lookup_attribute(name.namespace_uri, name.local_name) else {
+        return false;
+    };
+    let Some(attr) = schema_set.arenas.attributes.get(attr_key) else {
+        return false;
+    };
+    derives_from_declared_type(nav, attr.resolved_type, schema_set)
+}
+
+/// Expand the lexical `ElementName` / `AttributeName` of a
+/// `schema-element(N)` / `schema-attribute(N)` test into the interned
+/// [`QualifiedName`] the matcher takes.
+///
+/// The namespace rule is the one §3.2.1.2 gives a name test on an axis of that
+/// principal node kind: an unprefixed `ElementName` picks up the default
+/// element namespace, while an unprefixed `AttributeName` is in no namespace.
+/// A prefix that the static context cannot expand cannot occur — the binder
+/// rejects it with `XPST0081` — but the name is re-resolved here rather than
+/// carried, so an unexpandable one yields `None` and matches nothing.
+///
+/// Returns `None` for a name that is not a lexical QName at all.
+pub(crate) fn resolve_schema_test_name(
+    name: &str,
+    ctx: &XPathContext<'_>,
+    principal: DomNodeType,
+) -> Option<QualifiedName> {
+    let (prefix, local) = crate::xpath::functions::qname::parse_lexical_qname(name).ok()?;
+    let ns_id = match &prefix {
+        Some(prefix) => Some(ctx.names.add(&ctx.resolve_prefix(prefix)?)),
+        // An unprefixed attribute name is always in no namespace.
+        None if principal == DomNodeType::Attribute => None,
+        None => ctx.default_element_ns,
+    };
+    Some(QualifiedName::new(ns_id, ctx.names.add(&local), None))
+}
+
+/// The global element declaration whose expanded name is the one `nav` carries,
+/// if the schema set has one.
+fn lookup_node_element_decl<N: DomNavigator>(
+    nav: &N,
+    schema_set: &crate::schema::SchemaSet,
+) -> Option<crate::ids::ElementKey> {
+    let local_id = schema_set.name_table.get(nav.local_name())?;
+    let ns = nav.namespace_uri();
+    let ns_id = if ns.is_empty() {
+        None
+    } else {
+        Some(schema_set.name_table.get(ns)?)
+    };
+    schema_set.lookup_element(ns_id, local_id)
+}
+
+/// `derives-from(AT, ET)` for a candidate node and the type a declaration
+/// declares, where `None` for `ET` means the declaration constrains no type.
+///
+/// `AT` is read from [`DomNavigator::type_annotation`], not from
+/// [`DomNavigator::schema_type`], so a node annotated with a **complex** type
+/// participates: the declared type lives in the schema set here, not in a
+/// `SimpleTypeKey` slot of the [`ItemType`], so nothing restricts it to the
+/// simple types. A node with no annotation at all cannot derive from a declared
+/// type and never matches.
+fn derives_from_declared_type<N: DomNavigator>(
+    nav: &N,
+    declared: Option<TypeKey>,
+    schema_set: &crate::schema::SchemaSet,
+) -> bool {
+    let Some(expected) = declared else {
+        // The declaration constrains no type: the name match is the whole test.
+        return true;
+    };
+    let Some(actual) = nav.type_annotation() else {
+        return false;
+    };
+    schema_set.is_type_derived_from(actual, expected, DerivationSet::empty())
 }
 
 // ============================================================================
@@ -510,125 +614,21 @@ pub fn matches_kind_test<N: DomNavigator>(
             }
             true
         }
+        // The two schema tests keep their name in lexical form until here;
+        // resolving it produces the very same `QualifiedName` the
+        // `ItemType::SchemaElement` / `ItemType::SchemaAttribute` spelling
+        // carries, so both spellings then run the one matcher.
         KindTest::SchemaElement(name) => {
-            if nav.node_type() != DomNodeType::Element {
-                return false;
+            match resolve_schema_test_name(name, ctx, DomNodeType::Element) {
+                Some(qname) => matches_schema_element(nav, &qname, ctx),
+                None => false,
             }
-            // Parse the QName string to extract prefix and local name
-            use crate::xpath::functions::qname::parse_lexical_qname;
-            let Ok((prefix_opt, local_name)) = parse_lexical_qname(name) else {
-                return false; // Invalid QName syntax
-            };
-            // Check local name matches
-            if nav.local_name() != local_name {
-                return false;
-            }
-            // Resolve namespace: use prefix if provided, otherwise default element namespace
-            let expected_ns = if let Some(prefix) = &prefix_opt {
-                ctx.resolve_prefix(prefix).unwrap_or_default()
-            } else {
-                ctx.default_element_ns
-                    .and_then(|id| ctx.names.try_resolve(id))
-                    .unwrap_or_default()
-            };
-            // Verify node's namespace matches expected
-            if nav.namespace_uri() != expected_ns {
-                return false;
-            }
-            // If schema_set available, validate declaration exists and type
-            if let Some(schema_set) = ctx.schema_set {
-                // Get local name as NameId - if not found, declaration doesn't exist
-                let Some(local_id) = ctx.names.get(&local_name) else {
-                    return false;
-                };
-                // Get namespace as NameId
-                let ns_id = if expected_ns.is_empty() {
-                    None
-                } else {
-                    ctx.names.get(&expected_ns)
-                };
-                // Lookup element declaration - must exist for schema-element() to match
-                let Some(elem_key) = schema_set.lookup_element(ns_id, local_id) else {
-                    return false;
-                };
-                let Some(elem_data) = schema_set.arenas.elements.get(elem_key) else {
-                    return false;
-                };
-                // Check type derivation if declaration has resolved_type
-                if let Some(expected_type) = elem_data.resolved_type {
-                    let Some(actual_type) = nav.schema_type() else {
-                        return false;
-                    };
-                    return schema_set.is_type_derived_from(
-                        TypeKey::Simple(actual_type),
-                        expected_type,
-                        DerivationSet::empty(),
-                    );
-                }
-                // Declaration found, no type constraint - match
-                return true;
-            }
-            // No schema context - name and namespace already verified
-            true
         }
         KindTest::SchemaAttribute(name) => {
-            if nav.node_type() != DomNodeType::Attribute {
-                return false;
+            match resolve_schema_test_name(name, ctx, DomNodeType::Attribute) {
+                Some(qname) => matches_schema_attribute(nav, &qname, ctx),
+                None => false,
             }
-            // Parse the QName string to extract prefix and local name
-            use crate::xpath::functions::qname::parse_lexical_qname;
-            let Ok((prefix_opt, local_name)) = parse_lexical_qname(name) else {
-                return false; // Invalid QName syntax
-            };
-            // Check local name matches
-            if nav.local_name() != local_name {
-                return false;
-            }
-            // Resolve namespace: use prefix if provided, otherwise empty (attributes default to no namespace)
-            let expected_ns = if let Some(prefix) = &prefix_opt {
-                ctx.resolve_prefix(prefix).unwrap_or_default()
-            } else {
-                String::new() // Unprefixed attributes have no namespace
-            };
-            // Verify node's namespace matches expected
-            if nav.namespace_uri() != expected_ns {
-                return false;
-            }
-            // If schema_set available, validate declaration exists and type
-            if let Some(schema_set) = ctx.schema_set {
-                // Get local name as NameId - if not found, declaration doesn't exist
-                let Some(local_id) = ctx.names.get(&local_name) else {
-                    return false;
-                };
-                // Get namespace as NameId
-                let ns_id = if expected_ns.is_empty() {
-                    None
-                } else {
-                    ctx.names.get(&expected_ns)
-                };
-                // Lookup attribute declaration - must exist for schema-attribute() to match
-                let Some(attr_key) = schema_set.lookup_attribute(ns_id, local_id) else {
-                    return false;
-                };
-                let Some(attr_data) = schema_set.arenas.attributes.get(attr_key) else {
-                    return false;
-                };
-                // Check type derivation if declaration has resolved_type
-                if let Some(expected_type) = attr_data.resolved_type {
-                    let Some(actual_type) = nav.schema_type() else {
-                        return false;
-                    };
-                    return schema_set.is_type_derived_from(
-                        TypeKey::Simple(actual_type),
-                        expected_type,
-                        DerivationSet::empty(),
-                    );
-                }
-                // Declaration found, no type constraint - match
-                return true;
-            }
-            // No schema context - name and namespace already verified
-            true
         }
     }
 }

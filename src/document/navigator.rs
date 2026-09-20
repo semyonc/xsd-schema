@@ -71,9 +71,32 @@ impl<'a> BufferDocNavigator<'a> {
 
     /// Creates a navigator for XSD 1.1 assertion evaluation.
     ///
-    /// The assertion context item is the asserted element, so relative paths
-    /// such as `.//x` traverse its subtree. Leading `/` and `//` are rooted at
-    /// the assertion XDM root, which exposes no synthetic child axis.
+    /// XSD 1.1 §3.13.4.1 clause 1.3 builds the assertion's data model instance
+    /// from the asserted element `E` alone: "The root node of the [XDM]
+    /// instance is constructed from E; the data model instance contains only
+    /// that node and nodes constructed from the [attributes], [children], and
+    /// descendants of E", with the Note "It is a consequence of this
+    /// construction that attempts to refer, in an assertion, to the siblings or
+    /// ancestors of E, or to any part of the input document outside of E
+    /// itself, will be unsuccessful."
+    ///
+    /// So the assertion context item is `E`, relative paths such as `.//x`
+    /// traverse its subtree, and every step that would leave that subtree
+    /// yields nothing: `parent::`, `ancestor::`, `ancestor-or-self::` beyond
+    /// `E`, `following-sibling::`, `preceding-sibling::`, `following::` and
+    /// `preceding::` are all cut at `E` (see
+    /// [`is_tree_top`](Self::is_tree_top)).
+    ///
+    /// `fn:root()` and the absolute paths built on it are the one place this
+    /// differs from [`new_orphan`](Self::new_orphan): they still land on the
+    /// document node, whose child axis is then hidden, so `/x` and `//x` select
+    /// **nothing** rather than reaching into `E`. That is what the W3C XSD 1.1
+    /// test suite requires — `ibmMeta/assertion.testSet` groups
+    /// `d4_3_15ii31` and `d4_3_15ii32`, categorised
+    /// `xsd1_1-Assertions-StayInSubtree`, are documented as
+    /// *"`//` returns empty sequence"* and expect an instance to be **invalid**
+    /// because `count(//ele1) eq 1` and `count(//@attr1) eq 1` are *false*
+    /// inside the very subtree that contains one of each.
     pub fn new_assertion(doc: &'a BufferDocument<'a>, node: u32) -> Self {
         Self {
             assertion_absolute_root: true,
@@ -130,16 +153,34 @@ impl<'a> BufferDocNavigator<'a> {
         self.virtual_parent != NULL && self.current_ns.is_null()
     }
 
-    /// Whether this cursor sits on the node that was declared parentless.
+    /// Whether this cursor sits on the node that has no parent and no siblings
+    /// in the tree this navigator presents: the node declared parentless by
+    /// [`new_orphan`](Self::new_orphan), or the asserted element under
+    /// [`new_assertion`](Self::new_assertion).
+    ///
+    /// XSD 1.1 §3.13.4.1 clause 1.3 builds an assertion's data model instance
+    /// so that it "contains only that node and nodes constructed from the
+    /// [attributes], [children], and descendants of E", with the Note
+    /// "attempts to refer, in an assertion, to the siblings or ancestors of E,
+    /// … will be unsuccessful". The upward and sideways links of E are
+    /// therefore cut exactly as an orphan's are; only `fn:root()` and the
+    /// absolute paths that build on it differ between the two constructors
+    /// (see [`new_assertion`](Self::new_assertion)).
     ///
     /// An attribute or namespace cursor keeps `current` on its **owning
-    /// element**, so `current == orphan_root` is true for the orphan's
-    /// attribute and namespace nodes as well as for the orphan itself. They
-    /// are different nodes, and the parent of such a node *is* the orphan —
-    /// the cut applies only to the orphan's own upward links.
+    /// element**, so `current` equals the boundary node for that element's
+    /// attribute and namespace nodes as well as for the node itself. They are
+    /// different nodes, and the parent of such a node *is* the boundary node —
+    /// the cut applies only to the boundary node's own upward links.
     #[inline]
-    fn is_orphan_root(&self) -> bool {
-        self.orphan_root != NULL && self.current == self.orphan_root && self.virtual_parent == NULL
+    fn is_tree_top(&self) -> bool {
+        if self.virtual_parent != NULL {
+            return false;
+        }
+        if self.orphan_root != NULL && self.current == self.orphan_root {
+            return true;
+        }
+        self.assertion_fragment_root != NULL && self.current == self.assertion_fragment_root
     }
 
     #[inline]
@@ -661,11 +702,11 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
     }
 
     fn move_to_parent(&mut self) -> bool {
-        // The orphan's own upward link is cut, but an attribute or namespace
-        // node *of* the orphan still has it as its parent, and such a cursor
-        // also sits on `orphan_root` — so the virtual parent is resolved
-        // first.
-        if self.is_orphan_root() {
+        // The top node's own upward link is cut, but an attribute or namespace
+        // node *of* it still has it as its parent, and such a cursor also sits
+        // on the same `current` — which `is_tree_top` accounts for, so the
+        // virtual parent is resolved below.
+        if self.is_tree_top() {
             return false;
         }
         if self.virtual_parent != NULL {
@@ -700,7 +741,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         if self.virtual_parent != NULL {
             return false;
         }
-        if self.is_orphan_root() {
+        if self.is_tree_top() {
             return false;
         }
         let sib = self.node().next_sibling;
@@ -715,7 +756,7 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         if self.virtual_parent != NULL {
             return false;
         }
-        if self.is_orphan_root() {
+        if self.is_tree_top() {
             return false;
         }
         let parent_ref = self.node().parent;
@@ -1135,6 +1176,77 @@ mod tests {
         assert!(nav.move_to_first_child()); // subElement1
         assert!(nav.move_to_first_child()); // ele2
         nav.current_ref()
+    }
+
+    /// XSD 1.1 §3.13.4.1 clause 1.3: "The root node of the [XDM] instance is
+    /// constructed from E; the data model instance contains only that node and
+    /// nodes constructed from the [attributes], [children], and descendants of
+    /// E." Note: "attempts to refer, in an assertion, to the siblings or
+    /// ancestors of E, or to any part of the input document outside of E
+    /// itself, will be unsuccessful."
+    ///
+    /// Every axis that leaves the asserted element therefore yields nothing,
+    /// and every axis inside it is unaffected.
+    #[test]
+    fn assertion_navigator_cuts_every_axis_that_leaves_the_asserted_element() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            "<root><before1/><before2/><E a=\"1\"><in1/><deep><in2/></deep></E><after1/><after2/></root>",
+            &arena,
+            &names,
+        );
+        // The `E` element: third child of the document element.
+        let e = {
+            let mut nav = BufferDocNavigator::new(&doc, doc.root());
+            assert!(nav.move_to_first_child()); // root
+            assert!(nav.move_to_first_child()); // before1
+            assert!(nav.move_to_next_sibling()); // before2
+            assert!(nav.move_to_next_sibling()); // E
+            assert_eq!(nav.local_name(), "E");
+            nav.current_ref()
+        };
+        let ctx = XPathContext::new(&names);
+        let count = |expr: &str| {
+            let nav = BufferDocNavigator::new_assertion(&doc, e);
+            XPathExpr::compile(expr, &ctx)
+                .expect("compile")
+                .evaluator(&ctx)
+                .run_with_node(nav)
+                .expect("evaluate")
+                .first()
+                .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+                .unwrap_or_default()
+        };
+
+        // Outward: nothing.
+        for expr in [
+            "count(following::node())",
+            "count(preceding::node())",
+            "count(following-sibling::node())",
+            "count(preceding-sibling::node())",
+            "count(parent::node())",
+            "count(..)",
+            "count(../..)",
+            "count(ancestor::node())",
+        ] {
+            assert_eq!(count(expr), "0", "{expr} must not leave the subtree");
+        }
+        // Inward: unchanged. `ancestor-or-self::` still has the self step.
+        assert_eq!(count("count(ancestor-or-self::node())"), "1");
+        assert_eq!(count("count(.//*)"), "3");
+        assert_eq!(count("count(descendant-or-self::node())"), "4");
+        assert_eq!(count("count(@a)"), "1");
+        assert_eq!(count("count(child::*)"), "2");
+        // An attribute of E still reaches E through its parent axis: the cut
+        // is on E's *own* upward link, not on its attributes'.
+        assert_eq!(count("count(@a/parent::E)"), "1");
+        assert_eq!(count("count(@a/../..)"), "0");
+        // A descendant reaches E, and stops there.
+        assert_eq!(count("count(deep/ancestor::*)"), "1");
+        assert_eq!(count("local-name(deep/ancestor::*)"), "E");
+        assert_eq!(count("count(in1/following::*)"), "2");
+        assert_eq!(count("count(deep/preceding::*)"), "1");
     }
 
     #[test]

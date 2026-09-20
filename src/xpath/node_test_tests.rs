@@ -1017,8 +1017,14 @@ fn element_and_attribute_type_names_reject_an_untyped_node() {
     // The `T?` form only relaxes the nilled requirement, not the type match.
     assert_eq!(value("/doc instance of element(*, xs:untyped?)"), "true");
     assert_eq!(value("/doc instance of element(*, xs:integer?)"), "false");
-    // An unresolvable prefix in the TypeName matches nothing.
-    assert_eq!(value("/doc instance of element(*, nope:t)"), "false");
+    // An unresolvable prefix in the TypeName is the static error XPST0081
+    // (Appendix G), not a test that quietly matches nothing.
+    assert_eq!(
+        XPathExpr::compile("/doc instance of element(*, nope:t)", &ctx)
+            .expect_err("unbound prefix")
+            .error_code(),
+        Some("XPST0081")
+    );
 }
 
 /// On a validated document the annotation is compared with `derives-from`.
@@ -1106,4 +1112,158 @@ fn element_and_attribute_type_names_use_the_real_annotation() {
     // xs:anyType does.
     assert_eq!(value("/doc instance of element(*, xs:anyType)"), "true");
     assert_eq!(value("/doc instance of element(*, xs:string)"), "false");
+}
+
+// ── §2.5.4.4 / §2.5.4.6: schema-element(N) and schema-attribute(N) ─────────
+
+/// Build the fixture schema and instance the two `schema-*` tests below use,
+/// then evaluate `exprs` over it with the schema set attached.
+#[cfg(test)]
+fn schema_test_fixture(exprs: &[&str]) -> Vec<String> {
+    use crate::document::typed_builder::build_typed_document;
+    use crate::document::BufferDocumentOptions;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+    use crate::xpath::XPathExpr;
+    use bumpalo::Bump;
+
+    let mut schema_set = SchemaSet::xsd11();
+    load_and_process_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+             <xs:element name="head" type="xs:string"/>
+             <xs:element name="member" type="xs:token" substitutionGroup="head"/>
+             <xs:element name="deep" type="xs:token" substitutionGroup="member"/>
+             <xs:element name="other" type="xs:string"/>
+             <xs:element name="maybe" type="xs:string" nillable="true"/>
+             <xs:attribute name="ga" type="xs:integer"/>
+             <xs:element name="doc">
+               <xs:complexType>
+                 <xs:sequence>
+                   <xs:element ref="head" minOccurs="0" maxOccurs="unbounded"/>
+                   <xs:element ref="other"/>
+                   <xs:element ref="maybe"/>
+                 </xs:sequence>
+                 <xs:attribute ref="ga"/>
+               </xs:complexType>
+             </xs:element>
+           </xs:schema>"#
+            .as_bytes(),
+        "test.xsd",
+        &mut schema_set,
+        None,
+    )
+    .expect("load schema");
+
+    let arena = Bump::new();
+    let doc = build_typed_document(
+        concat!(
+            r#"<doc ga="3" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">"#,
+            "<head>a</head><member>b</member><deep>c</deep>",
+            r#"<other>d</other><maybe xsi:nil="true"/></doc>"#
+        )
+        .as_bytes(),
+        &arena,
+        &schema_set,
+        BufferDocumentOptions::default(),
+    )
+    .expect("build typed document");
+
+    let mut namespaces = crate::namespace::context::NamespaceContextSnapshot::default();
+    namespaces.bindings.push((
+        schema_set.name_table.add("xs"),
+        schema_set
+            .name_table
+            .add("http://www.w3.org/2001/XMLSchema"),
+    ));
+    let ctx = XPathContext::new(&schema_set.name_table)
+        .with_namespaces(namespaces)
+        .with_schema_set(&schema_set);
+
+    exprs
+        .iter()
+        .map(|expr| {
+            XPathExpr::compile(expr, &ctx)
+                .expect("compile")
+                .evaluator(&ctx)
+                .run_with_node(doc.create_navigator())
+                .expect("evaluate")
+                .first()
+                .and_then(|item| item.as_atomic().map(|v| v.to_string_value()))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+/// XPath 2.0 §2.5.4.4: a `SchemaElementTest` "matches a candidate element node
+/// if all three of the following conditions are satisfied: The name of the
+/// candidate node matches the specified `ElementName` or matches the name of an
+/// element in a substitution group headed by an element named `ElementName`.
+/// `derives-from(AT, ET)` is true … If the element declaration for
+/// `ElementName` … is not nillable, then the nilled property of the candidate
+/// node is false."
+///
+/// The same rule has to hold whether the test is used as a **step** node test
+/// or inside a **SequenceType**.
+#[test]
+fn schema_element_test_matches_the_declaration_as_a_step_and_in_a_sequence_type() {
+    let exprs = [
+        // Step form.
+        "count(//schema-element(head))",
+        "count(//schema-element(other))",
+        "count(//schema-element(maybe))",
+        "count(//schema-element(nosuch))",
+        "count(/doc/schema-element(member))",
+        "string-join(//schema-element(head)/local-name(), ' ')",
+        // SequenceType form: the same answers.
+        "/doc/head instance of schema-element(head)",
+        "/doc/member instance of schema-element(head)",
+        "/doc/deep instance of schema-element(head)",
+        "/doc/other instance of schema-element(head)",
+        "/doc/head instance of schema-element(member)",
+        "/doc/maybe instance of schema-element(maybe)",
+        "/doc instance of schema-element(doc)",
+    ];
+    assert_eq!(
+        schema_test_fixture(&exprs),
+        [
+            // `head`, `member` and `deep` — the head itself plus the two
+            // members of the substitution group it heads (transitively).
+            "3",
+            "1",
+            "1",
+            // An ElementName with no declaration matches nothing.
+            "0",
+            // `member` heads a group containing `deep` only.
+            "2",
+            "head member deep",
+            "true",
+            "true",
+            "true",
+            "false",
+            "false",
+            // `maybe` is nillable, so the nilled node still matches.
+            "true",
+            "true",
+        ]
+    );
+}
+
+/// XPath 2.0 §2.5.4.6: a `SchemaAttributeTest` "matches a candidate attribute
+/// node if both of the following conditions are satisfied: The name of the
+/// candidate node matches the specified `AttributeName`. `derives-from(AT, ET)`
+/// is true …" — there is no substitution group for attributes.
+#[test]
+fn schema_attribute_test_matches_the_declaration_as_a_step_and_in_a_sequence_type() {
+    let exprs = [
+        "count(//schema-attribute(ga))",
+        "count(/doc/schema-attribute(ga))",
+        "count(//schema-attribute(nosuch))",
+        "count(//schema-attribute(head))",
+        "/doc/@ga instance of schema-attribute(ga)",
+        "/doc instance of schema-attribute(ga)",
+    ];
+    assert_eq!(
+        schema_test_fixture(&exprs),
+        ["1", "1", "0", "0", "true", "false"]
+    );
 }

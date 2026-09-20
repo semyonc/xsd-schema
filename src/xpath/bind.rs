@@ -234,12 +234,19 @@ pub fn bind_node(
             bind_node(arena, type_expr.operand, ctx, binder)?;
 
             // Resolve atomic type QName if present
-            if let Some(ItemTypeNode::Atomic(ref qname)) = type_expr.target_type.item_type {
-                let resolved = resolve_atomic_type_qname(qname, ctx)?;
-                check_atomic_type_name(&resolved, qname, ctx)?;
-                if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
-                    node.resolved_atomic_type = Some(resolved);
+            match type_expr.target_type.item_type {
+                Some(ItemTypeNode::Atomic(ref qname)) => {
+                    let resolved = resolve_atomic_type_qname(qname, ctx)?;
+                    check_atomic_type_name(&resolved, qname, ctx)?;
+                    if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
+                        node.resolved_atomic_type = Some(resolved);
+                    }
                 }
+                // A kind test used as an ItemType spells the same QNames a step
+                // node test does, and its prefixes are statically known names
+                // in exactly the same way (XPST0081).
+                Some(ItemTypeNode::Kind(ref kind)) => check_kind_test_prefixes(kind, ctx)?,
+                Some(ItemTypeNode::Item) | None => {}
             }
         }
     }
@@ -289,13 +296,96 @@ fn resolve_node_test_with_axis(
             let resolved = resolve_name_test_with_axis(name_test, ctx, is_attribute_axis)?;
             Ok(Some(resolved))
         }
-        NodeTest::Kind(_) => {
-            // Kind tests (node(), text(), element(), etc.) don't need name resolution
-            // The QNames inside element()/attribute() tests could be resolved,
-            // but that's handled separately during evaluation
+        NodeTest::Kind(kind) => {
+            // A kind test carries no *name test* to resolve — the QNames inside
+            // `element(N, T)` and friends are expanded at evaluation time,
+            // against the same default-element-namespace rule the step uses.
+            // Their prefixes are still statically known names, though, so they
+            // are checked here; see [`check_kind_test_prefixes`].
+            check_kind_test_prefixes(kind, ctx)?;
             Ok(None)
         }
     }
+}
+
+/// Check every namespace prefix a kind test spells, raising `XPST0081` for one
+/// that the statically known namespaces cannot expand.
+///
+/// XPath 2.0, Appendix G: "err:XPST0081 It is a static error if a QName used in
+/// an expression contains a namespace prefix that cannot be expanded into a
+/// namespace URI by using the statically known namespaces." That covers the
+/// element/attribute name and the type name of `element(N, T)` /
+/// `attribute(N, T)`, the `ElementName` of `schema-element(N)` and the
+/// `AttributeName` of `schema-attribute(N)`, and the same again inside a
+/// `document-node(...)`.
+///
+/// An *unprefixed* name is not checked: it expands through the default element
+/// namespace (or, for an attribute name, to no namespace), which never fails.
+fn check_kind_test_prefixes(
+    kind: &crate::xpath::ast::KindTest,
+    ctx: &XPathContext<'_>,
+) -> Result<(), XPathError> {
+    use crate::xpath::ast::KindTest;
+
+    match kind {
+        KindTest::AnyKind
+        | KindTest::Text
+        | KindTest::Comment
+        | KindTest::ProcessingInstruction(_) => Ok(()),
+        KindTest::Document(inner) => match inner {
+            Some(inner) => check_kind_test_prefixes(inner, ctx),
+            None => Ok(()),
+        },
+        KindTest::Element(test) => {
+            check_optional_qname_prefix(test.name.as_ref(), ctx)?;
+            check_optional_qname_prefix(test.type_name.as_ref(), ctx)
+        }
+        KindTest::Attribute(test) => {
+            check_optional_qname_prefix(test.name.as_ref(), ctx)?;
+            check_optional_qname_prefix(test.type_name.as_ref(), ctx)
+        }
+        KindTest::SchemaElement(name) | KindTest::SchemaAttribute(name) => {
+            check_lexical_qname_prefix(name, ctx)
+        }
+    }
+}
+
+/// `XPST0081` unless `qname` is absent, unprefixed, or carries a prefix the
+/// static context can expand.
+fn check_optional_qname_prefix(
+    qname: Option<&QName>,
+    ctx: &XPathContext<'_>,
+) -> Result<(), XPathError> {
+    let Some(qname) = qname else {
+        return Ok(());
+    };
+    check_prefix(&qname.prefix, ctx)
+}
+
+/// The same check for a kind test that keeps its name in lexical form, as
+/// `schema-element(N)` and `schema-attribute(N)` do. A name the parser let
+/// through but that is not a lexical QName is left to evaluation, which does
+/// not match it; only the prefix is this function's concern.
+fn check_lexical_qname_prefix(name: &str, ctx: &XPathContext<'_>) -> Result<(), XPathError> {
+    let Ok((prefix, _)) = crate::xpath::functions::qname::parse_lexical_qname(name) else {
+        return Ok(());
+    };
+    match prefix {
+        Some(prefix) => check_prefix(&prefix, ctx),
+        None => Ok(()),
+    }
+}
+
+/// `XPST0081` unless `prefix` is empty or the static context can expand it.
+fn check_prefix(prefix: &str, ctx: &XPathContext<'_>) -> Result<(), XPathError> {
+    if prefix.is_empty() {
+        return Ok(());
+    }
+    let prefix_id = ctx.names.add(prefix);
+    if ctx.resolve_prefix_id(prefix_id).is_some() {
+        return Ok(());
+    }
+    Err(XPathError::undefined_prefix(prefix))
 }
 
 /// Resolve an AST-level NameTest to a type-system NameTest with interned names.

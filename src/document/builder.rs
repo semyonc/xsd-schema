@@ -134,6 +134,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             qname_table: QNameTable::new(),
             strings: StringStore::new(arena),
             binding_remap: BindingRemapTable::new(),
+            has_type_annotations: false,
             root: root_ref,
             options,
             namespace_pages,
@@ -459,6 +460,12 @@ impl<'a> BufferDocumentBuilder<'a> {
 
     /// Sets the schema binding on a node, returning `true` if the type is complex.
     ///
+    /// This is the one place a [`NodeSchemaBinding`] is attached to a node, so
+    /// it is also where [`BufferDocument::has_type_annotations`] is maintained:
+    /// binding an element or an attribute is exactly what makes
+    /// `DomNavigator::type_annotation()` answer `Some` for that node, and a
+    /// binding is never removed again.
+    ///
     /// Returns [`BufferDocumentError::Overflow`] if the binding table is full.
     pub fn set_node_binding(
         &mut self,
@@ -467,6 +474,12 @@ impl<'a> BufferDocumentBuilder<'a> {
     ) -> Result<bool, BufferDocumentError> {
         let idx = self.doc.binding_remap.register(binding)?;
         let is_complex = matches!(binding.type_key, crate::ids::TypeKey::Complex(_));
+        if matches!(
+            self.doc.nodes.get(node_ref).node_type(),
+            NodeType::Element | NodeType::Attribute
+        ) {
+            self.doc.has_type_annotations = true;
+        }
         self.doc.nodes.update(node_ref, |n| {
             n.set_binding_index(idx);
             if is_complex {

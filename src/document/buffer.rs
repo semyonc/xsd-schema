@@ -42,6 +42,14 @@ pub struct BufferDocument<'a> {
     pub(crate) qname_table: QNameTable,
     pub(crate) strings: StringStore<'a>,
     pub(crate) binding_remap: BindingRemapTable,
+    /// Whether any element or attribute node of this document carries a schema
+    /// type annotation — see [`BufferDocument::has_type_annotations`].
+    ///
+    /// Maintained by
+    /// [`BufferDocumentBuilder::set_node_binding`](super::builder::BufferDocumentBuilder::set_node_binding),
+    /// the single place a [`NodeSchemaBinding`](super::NodeSchemaBinding) is
+    /// ever attached to a node, so it is exact rather than a hint.
+    pub(crate) has_type_annotations: bool,
     pub(crate) root: u32,
     pub(crate) options: BufferDocumentOptions,
     // Side tables
@@ -137,6 +145,53 @@ impl<'a> BufferDocument<'a> {
     #[inline]
     pub fn has_source_spans(&self) -> bool {
         !self.source_spans.is_empty()
+    }
+
+    /// Whether **any** element or attribute node of this document carries a
+    /// schema type annotation.
+    ///
+    /// This is the O(1) form of the walk an XPath host would otherwise have to
+    /// perform — visiting every element and attribute and asking each one for
+    /// [`DomNavigator::type_annotation`] — when it has to reject a typed (or an
+    /// untyped) tree, or take a different path for one.
+    ///
+    /// The answer is **exact**, not a hint: it is `true` if and only if at
+    /// least one node of the document would report
+    /// `DomNavigator::type_annotation() == Some(_)`. It is maintained at the
+    /// one place a binding is attached to a node, so no walk can disagree with
+    /// it.
+    ///
+    /// "Carries a type annotation" means the same thing here as it does for
+    /// [`DomNavigator::type_annotation`]: a node of a document that was never
+    /// schema-validated reports `None`, which is the XDM `xs:untyped` /
+    /// `xs:untypedAtomic` default. Those defaults are therefore *not* counted,
+    /// and a freshly parsed document answers `false`. Only element and
+    /// attribute nodes can be annotated; every other kind reports `None`
+    /// unconditionally and is never counted.
+    ///
+    /// A document built by copying ([`copy_subtree`]) answers according to the
+    /// copy's [`Annotations`] mode: `Annotations::Preserve` carries the
+    /// source's bindings over and can make this `true`, while
+    /// `Annotations::Strip` — the default — always leaves it `false`.
+    ///
+    /// [`DomNavigator::type_annotation`]: crate::navigator::DomNavigator::type_annotation
+    /// [`copy_subtree`]: super::builder::BufferDocumentBuilder::copy_subtree
+    /// [`Annotations`]: super::Annotations
+    ///
+    /// ```
+    /// use xsd_schema::document::BufferDocument;
+    /// use xsd_schema::namespace::NameTable;
+    ///
+    /// let arena = bumpalo::Bump::new();
+    /// let names = NameTable::new();
+    /// let doc = BufferDocument::from_reader_default(b"<a n=\"1\"/>".as_slice(), &arena, &names)?;
+    /// // Parsed, never validated: no node carries an annotation.
+    /// assert!(!doc.has_type_annotations());
+    /// # Ok::<(), xsd_schema::document::BufferDocumentError>(())
+    /// ```
+    #[inline]
+    pub fn has_type_annotations(&self) -> bool {
+        self.has_type_annotations
     }
 
     /// Sets the **document-level base URI**: the base URI a node of this
@@ -330,6 +385,7 @@ mod tests {
             qname_table: QNameTable::new(),
             strings: StringStore::new(arena),
             binding_remap: BindingRemapTable::new(),
+            has_type_annotations: false,
             root: 0,
             options: BufferDocumentOptions::default(),
             namespace_pages: NamespacePageFactory::new(arena),

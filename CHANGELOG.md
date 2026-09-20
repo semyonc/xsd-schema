@@ -309,6 +309,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   equal; two namespace nodes are now deep-equal only when their names — the
   prefix, absent for a default-namespace binding — and their string values, the
   bound namespace URI, both match.
+- `schema-element(N)` and `schema-attribute(N)` used as **step** node tests are
+  the declaration-aware tests of XPath 2.0 §2.5.4.4 and §2.5.4.6. As a step
+  they matched every node on the axis. Both tests, in every spelling — a step,
+  `instance of`, `treat as`, a function signature — are now decided by one
+  implementation, which also gained the substitution-group clause and the
+  nilled clause and accepts a complex-typed declaration. A name that is not
+  declared matches nothing, and without a schema set in the static context the
+  tests remain name-only, as before.
+- Atomizing a namespace node yields `xs:string`, not `xs:untypedAtomic` — the
+  rule that already applied to comments and processing instructions.
+- `fn:namespace-uri-for-prefix` returns the empty sequence, not
+  `xs:anyURI("")`, when the prefix has no binding — including the empty prefix
+  on an element with no default namespace.
+- A namespace prefix with no binding inside a kind test — `element(p:x)`,
+  `attribute(p:a)`, `element(*, p:T)`, `schema-element(p:x)`, the same inside
+  `document-node(...)` or a SequenceType — is the static error `XPST0081`. It
+  silently resolved to no namespace.
+- Under XSD 1.1 assertion scope the data model instance is cut at the asserted
+  element, as §3.13.4.1 clause 1.3 constructs it: `parent::`, `ancestor::`,
+  `following::`, `following-sibling::` and `preceding-sibling::` no longer
+  reach outside it (`preceding::` and the downward axes never did). As the
+  specification's note says, such a reference is not an error, it selects
+  nothing. `/` and `fn:root()` are unchanged: they still answer a document
+  node whose children are hidden, so `//x` inside an assertion is empty, which
+  is what the W3C test suite expects.
 
 ### Added
 
@@ -376,6 +401,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `XPathError::no_namespace_for_prefix` builds `FONS0004`. The namespace and
   the default local name are exposed as `XQT_ERRORS_NAMESPACE` and
   `DEFAULT_RAISED_ERROR`.
+- `BufferDocument::has_type_annotations` — a constant-time, exact answer to
+  "does any element or attribute of this document carry a schema type
+  annotation?", maintained where bindings are attached instead of computed by
+  walking the tree. It is `true` exactly when some node would report
+  `DomNavigator::type_annotation() == Some(_)`, and follows the annotation
+  mode of a copy.
 
 ## [0.2.0] - 2026-09-13
 

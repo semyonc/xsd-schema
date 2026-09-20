@@ -236,10 +236,21 @@ pub fn namespace_uri_from_qname<N: DomNavigator>(
 
 /// fn:namespace-uri-for-prefix($prefix as xs:string?, $element as element()) as xs:anyURI?
 ///
-/// Returns the namespace URI bound to a prefix in the scope of an element.
-/// - Empty prefix or empty string prefix returns the default namespace
-/// - If no default namespace, returns empty string anyURI (not empty sequence)
-/// - Empty result (empty sequence) only if a non-empty prefix is not bound
+/// Returns the namespace URI bound to `$prefix` in the in-scope namespaces of
+/// `$element`.
+///
+/// - An absent (`()`) or zero-length `$prefix` asks for the element's *default*
+///   namespace, i.e. the binding whose prefix is the empty one.
+/// - `xml` is bound in every element's in-scope namespaces, so it always
+///   answers the XML namespace.
+/// - When the prefix — the empty one included — has no binding, the result is
+///   the **empty sequence**, not `xs:anyURI("")`. A namespace undeclaration
+///   (`xmlns=""`) counts as "no binding".
+///
+/// From memory of F&O §14 (the specification is not checked out locally),
+/// corroborated by XQTS `fn-namespace-uri-for-prefix-2` / `-6` / `-16` / `-17`,
+/// which wrap the call in `fn:count(...)` and expect `0`, and by `-3` / `-4`,
+/// which expect the default namespace for `""` and `()`.
 pub fn namespace_uri_for_prefix<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -256,22 +267,13 @@ pub fn namespace_uri_for_prefix<N: DomNavigator>(
     let prefix_arg = args.remove(0);
     let prefix = atomize_to_string_opt(prefix_arg)?;
 
-    // Determine if we're looking for the default namespace
-    let is_default_ns_lookup = prefix.is_none() || prefix.as_deref() == Some("");
-
-    // Lookup namespace
-    let namespace = lookup_namespace_for_prefix_opt(&element, prefix.as_deref());
-
-    match namespace {
+    // An absent prefix is the same request as a zero-length one: the binding
+    // for the empty prefix, i.e. the element's default namespace.
+    match lookup_namespace_for_prefix_opt(&element, prefix.as_deref()) {
         Some(ns) => Ok(make_any_uri(&ns)),
-        None if is_default_ns_lookup => {
-            // For default namespace lookup, return empty anyURI if no default ns
-            Ok(make_any_uri(""))
-        }
-        None => {
-            // For prefixed lookup, return empty sequence if prefix not bound
-            Ok(XPathValue::Empty)
-        }
+        // Not bound — including the empty prefix when the element has no
+        // default namespace, and a prefix undeclared by `xmlns=""`.
+        None => Ok(XPathValue::Empty),
     }
 }
 

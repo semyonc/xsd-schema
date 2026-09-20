@@ -1106,4 +1106,172 @@ mod tests {
             );
         }
     }
+
+    // ── `BufferDocument::has_type_annotations` ────────────────────────
+
+    /// Walks the whole tree and reports whether any element or attribute node
+    /// carries a type annotation — the O(nodes) answer the O(1) accessor must
+    /// agree with exactly.
+    fn walk_finds_an_annotation(doc: &BufferDocument<'_>) -> bool {
+        fn visit(nav: &crate::document::navigator::BufferDocNavigator<'_>) -> bool {
+            if matches!(
+                nav.node_type(),
+                DomNodeType::Element | DomNodeType::Attribute
+            ) && nav.type_annotation().is_some()
+            {
+                return true;
+            }
+            if nav.node_type() == DomNodeType::Element {
+                let mut attr = nav.clone();
+                if attr.move_to_first_attribute() {
+                    loop {
+                        if attr.type_annotation().is_some() {
+                            return true;
+                        }
+                        if !attr.move_to_next_attribute() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let mut child = nav.clone();
+            if child.move_to_first_child() {
+                loop {
+                    if visit(&child) {
+                        return true;
+                    }
+                    if !child.move_to_next_sibling() {
+                        break;
+                    }
+                }
+            }
+            false
+        }
+        visit(&doc.create_navigator())
+    }
+
+    fn annotation_schema() -> SchemaSet {
+        load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="n" type="xs:integer"/>
+                        </xs:sequence>
+                        <xs:attribute name="count" type="xs:integer"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        )
+    }
+
+    #[test]
+    fn has_type_annotations_is_false_for_an_unvalidated_document() {
+        let arena = Bump::new();
+        let names = crate::namespace::NameTable::new();
+        let doc = BufferDocument::from_reader_default(
+            r#"<root count="1"><n>2</n><!--c--><?pi t?></root>"#.as_bytes(),
+            &arena,
+            &names,
+        )
+        .expect("parses");
+        assert!(!doc.has_type_annotations());
+        assert!(!walk_finds_an_annotation(&doc));
+    }
+
+    #[test]
+    fn has_type_annotations_is_true_for_a_typed_document() {
+        let schema_set = annotation_schema();
+        let arena = Bump::new();
+        let doc = build_doc(r#"<root count="1"><n>2</n></root>"#, &arena, &schema_set);
+        assert!(doc.has_type_annotations());
+        assert!(walk_finds_an_annotation(&doc));
+    }
+
+    #[test]
+    fn has_type_annotations_follows_the_copys_annotation_mode() {
+        use crate::document::{Annotations, CopyOptions};
+
+        let schema_set = annotation_schema();
+        let arena = Bump::new();
+        let source = build_doc(r#"<root count="1"><n>2</n></root>"#, &arena, &schema_set);
+        assert!(source.has_type_annotations());
+
+        let mut node = source.create_navigator();
+        assert!(node.move_to_first_child());
+
+        for (annotations, expected) in [(Annotations::Preserve, true), (Annotations::Strip, false)]
+        {
+            let mut builder = crate::document::BufferDocumentBuilder::new(
+                &arena,
+                &schema_set.name_table,
+                Some(&schema_set),
+                BufferDocumentOptions::default(),
+            )
+            .expect("a builder");
+            builder.start_element("out", "", "", &[]).expect("starts");
+            builder.end_of_attributes();
+            builder
+                .copy_subtree(
+                    &node,
+                    CopyOptions {
+                        annotations,
+                        ..CopyOptions::default()
+                    },
+                )
+                .expect("copies");
+            builder.end_element().expect("ends");
+            let copy = builder.finalize().expect("finalizes");
+            assert_eq!(
+                copy.has_type_annotations(),
+                expected,
+                "{annotations:?} copy"
+            );
+            assert_eq!(
+                walk_finds_an_annotation(&copy),
+                expected,
+                "{annotations:?} copy, by walk"
+            );
+        }
+    }
+
+    #[test]
+    fn has_type_annotations_agrees_with_a_full_walk() {
+        let schema_set = annotation_schema();
+        let names = crate::namespace::NameTable::new();
+        for xml in [
+            "<root/>",
+            r#"<root count="1"><n>2</n></root>"#,
+            "<root><n>0</n></root>",
+            r#"<root count="7"><n>-3</n></root>"#,
+        ] {
+            // Unvalidated: never annotated.
+            let arena = Bump::new();
+            let plain = BufferDocument::from_reader_default(xml.as_bytes(), &arena, &names)
+                .expect("parses");
+            assert_eq!(
+                plain.has_type_annotations(),
+                walk_finds_an_annotation(&plain),
+                "untyped {xml}"
+            );
+            assert!(!plain.has_type_annotations(), "untyped {xml}");
+
+            // The same markup through the validating builder. `<root/>` is
+            // invalid against the schema, so it exercises the path where
+            // validation fails and only some nodes get a binding.
+            let arena = Bump::new();
+            if let Ok(typed) = build_typed_document(
+                xml.as_bytes(),
+                &arena,
+                &schema_set,
+                BufferDocumentOptions::default(),
+            ) {
+                assert_eq!(
+                    typed.has_type_annotations(),
+                    walk_finds_an_annotation(&typed),
+                    "typed {xml}"
+                );
+            }
+        }
+    }
 }

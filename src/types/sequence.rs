@@ -249,23 +249,14 @@ impl ItemType {
                 }
                 true
             }
+            // §2.5.4.4 / §2.5.4.6, including the substitution group and the
+            // nilled clause: one implementation, shared with the node-test
+            // module so every spelling of the test agrees.
             Self::SchemaElement(name) => {
-                if nav.node_type() != DomNodeType::Element {
-                    return false;
-                }
-                if !Self::matches_qname(name, nav, ctx) {
-                    return false;
-                }
-                Self::matches_schema_element_decl(nav, name, ctx)
+                crate::xpath::node_test::matches_schema_element(nav, name, ctx)
             }
             Self::SchemaAttribute(name) => {
-                if nav.node_type() != DomNodeType::Attribute {
-                    return false;
-                }
-                if !Self::matches_qname(name, nav, ctx) {
-                    return false;
-                }
-                Self::matches_schema_attribute_decl(nav, name, ctx)
+                crate::xpath::node_test::matches_schema_attribute(nav, name, ctx)
             }
             Self::Text => nav.node_type().is_text_like(),
             Self::Comment => nav.node_type() == DomNodeType::Comment,
@@ -379,68 +370,6 @@ impl ItemType {
         }
         // No schema type on node
         false
-    }
-
-    /// Helper: check schema-element() declaration match.
-    fn matches_schema_element_decl<N: DomNavigator>(
-        nav: &N,
-        name: &QualifiedName,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
-        if let Some(schema_set) = ctx.schema_set {
-            let ns_id = name.namespace_uri;
-            let Some(elem_key) = schema_set.lookup_element(ns_id, name.local_name) else {
-                return false;
-            };
-            let Some(elem_data) = schema_set.arenas.elements.get(elem_key) else {
-                return false;
-            };
-            if let Some(expected_type) = elem_data.resolved_type {
-                let Some(actual_type) = nav.schema_type() else {
-                    return false;
-                };
-                return schema_set.is_type_derived_from(
-                    TypeKey::Simple(actual_type),
-                    expected_type,
-                    DerivationSet::empty(),
-                );
-            }
-            // Declaration found, no type constraint
-            return true;
-        }
-        // No schema context - name already verified
-        true
-    }
-
-    /// Helper: check schema-attribute() declaration match.
-    fn matches_schema_attribute_decl<N: DomNavigator>(
-        nav: &N,
-        name: &QualifiedName,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
-        if let Some(schema_set) = ctx.schema_set {
-            let ns_id = name.namespace_uri;
-            let Some(attr_key) = schema_set.lookup_attribute(ns_id, name.local_name) else {
-                return false;
-            };
-            let Some(attr_data) = schema_set.arenas.attributes.get(attr_key) else {
-                return false;
-            };
-            if let Some(expected_type) = attr_data.resolved_type {
-                let Some(actual_type) = nav.schema_type() else {
-                    return false;
-                };
-                return schema_set.is_type_derived_from(
-                    TypeKey::Simple(actual_type),
-                    expected_type,
-                    DerivationSet::empty(),
-                );
-            }
-            // Declaration found, no type constraint
-            return true;
-        }
-        // No schema context - name already verified
-        true
     }
 }
 

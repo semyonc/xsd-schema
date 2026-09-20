@@ -1542,7 +1542,26 @@ fn kind_test_to_item_type(kind: &KindTest, ctx: &XPathContext<'_>) -> ItemType {
             kind_test_name(&test.name, ctx, DomNodeType::Attribute),
             None,
         ),
-        KindTest::SchemaElement(_) | KindTest::SchemaAttribute(_) => ItemType::AnyNode,
+        // `schema-element(N)` and `schema-attribute(N)` used as a *step* node
+        // test carry the same declaration-aware rule (§2.5.4.4, §2.5.4.6) they
+        // carry inside a SequenceType, so they resolve to the item types that
+        // run that matcher rather than to `AnyNode`.
+        //
+        // A name that is not a lexical QName cannot come out of the parser; if
+        // one did, it is interned whole as the local name, which no node can
+        // have, so the test matches nothing instead of everything.
+        KindTest::SchemaElement(name) => ItemType::SchemaElement(
+            crate::xpath::node_test::resolve_schema_test_name(name, ctx, DomNodeType::Element)
+                .unwrap_or_else(|| {
+                    crate::namespace::qname::QualifiedName::local(ctx.names.add(name))
+                }),
+        ),
+        KindTest::SchemaAttribute(name) => ItemType::SchemaAttribute(
+            crate::xpath::node_test::resolve_schema_test_name(name, ctx, DomNodeType::Attribute)
+                .unwrap_or_else(|| {
+                    crate::namespace::qname::QualifiedName::local(ctx.names.add(name))
+                }),
+        ),
     }
 }
 

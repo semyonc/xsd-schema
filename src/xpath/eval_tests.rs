@@ -4589,3 +4589,169 @@ fn nilled_is_false_for_an_unvalidated_element() {
         "0"
     );
 }
+
+/// XDM §6.4: the typed value of a namespace node is its string value (the
+/// namespace URI) as an `xs:string`; it is never `xs:untypedAtomic`, because a
+/// namespace node carries no type annotation that could make it untyped.
+/// Corroborated by XQTS `K2-NamespaceProp-*` / the `namespace::` accessor
+/// cases, which compare the atomized namespace node with a string.
+#[test]
+fn atomizing_a_namespace_node_yields_xs_string() {
+    let doc = r#"<doc xmlns:p="http://example.com/p"/>"#;
+    assert_eq!(
+        eval_on_doc("data(/doc/namespace::p) instance of xs:string", doc).unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_on_doc("data(/doc/namespace::p) instance of xs:untypedAtomic", doc).unwrap(),
+        "false"
+    );
+    assert_eq!(
+        eval_on_doc("data(/doc/namespace::p)", doc).unwrap(),
+        "http://example.com/p"
+    );
+    // The implicit `xml` binding atomizes the same way.
+    assert_eq!(
+        eval_on_doc("data(/doc/namespace::xml) instance of xs:string", doc).unwrap(),
+        "true"
+    );
+}
+
+/// The same rule for the two other kinds that have no type annotation: a
+/// comment and a processing instruction atomize as `xs:string` (XDM §6.6,
+/// §6.7). These two were already right; the test pins them.
+#[test]
+fn atomizing_a_comment_or_processing_instruction_yields_xs_string() {
+    let doc = r#"<doc><!--c--><?pi t?></doc>"#;
+    assert_eq!(
+        eval_on_doc("data(/doc/comment()) instance of xs:string", doc).unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_on_doc(
+            "data(/doc/processing-instruction()) instance of xs:string",
+            doc
+        )
+        .unwrap(),
+        "true"
+    );
+}
+
+/// `fn:namespace-uri-for-prefix($prefix, $element)`: an empty or absent
+/// `$prefix` asks for the element's *default* namespace, and the result is the
+/// empty sequence when the prefix (including the empty one) is not bound —
+/// never `xs:anyURI("")`.
+///
+/// From memory of F&O §14 (not checked out locally), corroborated by XQTS:
+/// * `fn-namespace-uri-for-prefix-3` — `fn:string(fn:namespace-uri-for-prefix("", $var))`
+///   with `declare default element namespace "http://www.example.com/defaultspace"`
+///   expects `http://www.example.com/defaultspace`;
+/// * `fn-namespace-uri-for-prefix-4` — the same with `()` as the prefix, same result;
+/// * `fn-namespace-uri-for-prefix-2`, `-6`, `-16`, `-17` — `fn:count(...)` of an
+///   unbound prefix expects `0`, i.e. the empty sequence.
+#[test]
+fn namespace_uri_for_prefix_returns_the_default_namespace_or_the_empty_sequence() {
+    let with_default = r#"<doc xmlns="http://example.com/d" xmlns:p="http://example.com/p"/>"#;
+    // The empty prefix and the absent prefix both ask for the default namespace.
+    assert_eq!(
+        eval_on_doc("namespace-uri-for-prefix('', /*)", with_default).unwrap(),
+        "http://example.com/d"
+    );
+    assert_eq!(
+        eval_on_doc("namespace-uri-for-prefix((), /*)", with_default).unwrap(),
+        "http://example.com/d"
+    );
+    assert_eq!(
+        eval_on_doc("namespace-uri-for-prefix('p', /*)", with_default).unwrap(),
+        "http://example.com/p"
+    );
+
+    // No default namespace in scope: the empty sequence, not xs:anyURI("").
+    let no_default = r#"<doc xmlns:p="http://example.com/p"/>"#;
+    assert_eq!(
+        eval_on_doc("count(namespace-uri-for-prefix('', /*))", no_default).unwrap(),
+        "0"
+    );
+    assert_eq!(
+        eval_on_doc("count(namespace-uri-for-prefix((), /*))", no_default).unwrap(),
+        "0"
+    );
+    // An unbound non-empty prefix was already the empty sequence.
+    assert_eq!(
+        eval_on_doc("count(namespace-uri-for-prefix('q', /*))", no_default).unwrap(),
+        "0"
+    );
+
+    // `xml` is bound in every element's in-scope namespaces.
+    assert_eq!(
+        eval_on_doc("namespace-uri-for-prefix('xml', /*)", no_default).unwrap(),
+        "http://www.w3.org/XML/1998/namespace"
+    );
+
+    // The result is an xs:anyURI when there is one.
+    assert_eq!(
+        eval_on_doc(
+            "namespace-uri-for-prefix('p', /*) instance of xs:anyURI",
+            no_default
+        )
+        .unwrap(),
+        "true"
+    );
+}
+
+/// XPath 2.0, Appendix G: "err:XPST0081 It is a static error if a QName used in
+/// an expression contains a namespace prefix that cannot be expanded into a
+/// namespace URI by using the statically known namespaces." A QName inside a
+/// kind test is no exception — `element(p:x)`, `attribute(p:a)`,
+/// `element(*, p:T)` and `schema-element(p:x)` are all QNames used in an
+/// expression.
+mod kind_test_prefix_tests {
+    use super::spec_helpers::{error_code, items, try_items};
+
+    #[test]
+    fn an_unbound_prefix_in_a_kind_test_is_a_static_error() {
+        let doc = "<a/>";
+        // Step node tests.
+        assert_eq!(error_code("//element(p:x)", doc), "XPST0081");
+        assert_eq!(error_code("//attribute(p:a)", doc), "XPST0081");
+        assert_eq!(error_code("//element(*, p:T)", doc), "XPST0081");
+        assert_eq!(error_code("//element(x, p:T)", doc), "XPST0081");
+        assert_eq!(error_code("//attribute(*, p:T)", doc), "XPST0081");
+        assert_eq!(error_code("//schema-element(p:x)", doc), "XPST0081");
+        assert_eq!(error_code("//schema-attribute(p:a)", doc), "XPST0081");
+        // Nested inside document-node().
+        assert_eq!(error_code("//document-node(element(p:x))", doc), "XPST0081");
+        // The same tests inside a SequenceType.
+        assert_eq!(error_code(". instance of element(p:x)", doc), "XPST0081");
+        assert_eq!(error_code(". treat as attribute(p:a)", doc), "XPST0081");
+        assert_eq!(
+            error_code(". instance of schema-element(p:x)", doc),
+            "XPST0081"
+        );
+        assert_eq!(
+            error_code(". instance of document-node(element(p:x))", doc),
+            "XPST0081"
+        );
+    }
+
+    #[test]
+    fn a_bound_or_absent_prefix_in_a_kind_test_still_compiles() {
+        // Guards: nothing that used to compile may stop compiling.
+        let doc = r#"<a n="1"><b/></a>"#;
+        assert_eq!(items("//element(b)", doc), ["element(b)"]);
+        assert_eq!(items("//element()", doc), ["element(a)", "element(b)"]);
+        assert_eq!(items("//element(*)", doc), ["element(a)", "element(b)"]);
+        assert_eq!(items("//attribute(n)", doc), ["attribute(n=1)"]);
+        // A bound prefix on the *type* name compiles (what it then matches is
+        // a separate question, settled by SequenceType matching).
+        assert!(try_items("//element(*, xs:untyped)", doc).is_ok());
+        assert!(try_items("//attribute(*, xs:untypedAtomic)", doc).is_ok());
+        // `xml` is in scope in every static context (XML Names).
+        assert_eq!(items("//attribute(xml:lang)", doc).len(), 0);
+        assert_eq!(items(". instance of element(b)", doc), ["false"]);
+        assert_eq!(
+            items(". instance of document-node(element(a))", doc),
+            ["true"]
+        );
+    }
+}

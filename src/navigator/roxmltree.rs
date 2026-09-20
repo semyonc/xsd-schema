@@ -772,6 +772,21 @@ impl<'a> DomNavigator for RoXmlNavigator<'a> {
         None
     }
 
+    /// `DomNavigator` states that `schema_type()` is the simple-type projection
+    /// of `type_annotation()`, so the test-only override has to answer both or
+    /// a node would report a simple type through one accessor and none through
+    /// the other. Outside tests this navigator is schema-unaware and the answer
+    /// is `None`, exactly as the trait's default provides.
+    fn type_annotation(&self) -> Option<crate::ids::TypeKey> {
+        #[cfg(test)]
+        {
+            if let Some(key) = self.schema_type_override {
+                return Some(crate::ids::TypeKey::Simple(key));
+            }
+        }
+        None
+    }
+
     fn typed_value(&self) -> TypedValue {
         // roxmltree is schema-unaware — all nodes are untyped
         TypedValue::Untyped

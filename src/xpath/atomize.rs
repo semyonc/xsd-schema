@@ -24,7 +24,8 @@ use crate::types::XmlTypeCode;
 ///
 /// Interprets [`TypedValue`] with proper error handling:
 /// - `Value(v)` → `Ok(Some(v))`
-/// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for comment/PI)
+/// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for a
+///   comment, processing instruction or namespace node — XPath 2.0 §I.2)
 /// - `Nilled` → `Ok(None)` (empty sequence)
 /// - `Absent` → `Err(FOTY0012)`
 pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathError> {
@@ -32,9 +33,15 @@ pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathE
         TypedValue::Value(v) => Ok(Some(v)),
         TypedValue::Untyped => {
             let v = match nav.node_type() {
-                DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
-                    XmlValue::string(nav.value())
-                }
+                // XPath 2.0 §I.2 (Incompatibilities when Compatibility Mode is
+                // false): "The typed value of a comment node, processing
+                // instruction node, or namespace node under XPath 2.0 is of
+                // type xs:string, not xs:untypedAtomic." None of these three
+                // kinds can carry a type annotation, so `Untyped` here means
+                // "has no annotation", not "annotated xs:untyped".
+                DomNodeType::Comment
+                | DomNodeType::ProcessingInstruction
+                | DomNodeType::Namespace => XmlValue::string(nav.value()),
                 _ => XmlValue::untyped(nav.value()),
             };
             Ok(Some(v))

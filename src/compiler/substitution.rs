@@ -213,6 +213,41 @@ pub(crate) fn head_type_prohibited_substitutions(
     }
 }
 
+/// Whether `candidate_key` is a member, directly or transitively, of the
+/// substitution group headed by `head_key`.
+///
+/// This is *declared membership only* — the `{substitution group affiliation}`
+/// chain of XSD §3.3.1 — with no `block`, `final` or type-derivation check.
+/// [`is_element_substitutable_for`] adds those; XPath 2.0 §2.5.4.4's
+/// "matches the name of an element in a substitution group headed by an element
+/// named `ElementName`" wants the bare membership relation.
+///
+/// An element is **not** a member of the group it heads itself; callers that
+/// need "the head or one of its members" test the head separately.
+pub(crate) fn is_substitution_group_member(
+    schema_set: &SchemaSet,
+    head_key: ElementKey,
+    candidate_key: ElementKey,
+) -> bool {
+    let Some(candidate_elem) = schema_set.arenas.elements.get(candidate_key) else {
+        return false;
+    };
+    let mut visited = HashSet::new();
+    let mut stack: Vec<ElementKey> = candidate_elem.resolved_substitution_groups.clone();
+    while let Some(sg_head) = stack.pop() {
+        if !visited.insert(sg_head) {
+            continue;
+        }
+        if sg_head == head_key {
+            return true;
+        }
+        if let Some(sg_elem) = schema_set.arenas.elements.get(sg_head) {
+            stack.extend_from_slice(&sg_elem.resolved_substitution_groups);
+        }
+    }
+    false
+}
+
 /// Check if `candidate_key` is validly substitutable for `head_key`
 /// per XSD §3.3.6.3 / §3.9.6 NameAndTypeOK.
 pub(crate) fn is_element_substitutable_for(
@@ -228,23 +263,7 @@ pub(crate) fn is_element_substitutable_for(
     };
 
     // Check declared substitution group membership (direct or transitive).
-    // Walk candidate's declared heads to find head_key.
-    let mut visited = HashSet::new();
-    let mut stack: Vec<ElementKey> = candidate_elem.resolved_substitution_groups.clone();
-    let mut is_member = false;
-    while let Some(sg_head) = stack.pop() {
-        if !visited.insert(sg_head) {
-            continue;
-        }
-        if sg_head == head_key {
-            is_member = true;
-            break;
-        }
-        if let Some(sg_elem) = schema_set.arenas.elements.get(sg_head) {
-            stack.extend_from_slice(&sg_elem.resolved_substitution_groups);
-        }
-    }
-    if !is_member {
+    if !is_substitution_group_member(schema_set, head_key, candidate_key) {
         return false;
     }
 
