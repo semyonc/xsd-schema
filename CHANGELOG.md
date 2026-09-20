@@ -304,6 +304,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `S` — and not at Unicode's, so a name containing U+1680 OGHAM SPACE MARK or
   another character that is a legal XML `NameChar` in `[#x37F-#x1FFF]` is
   returned whole.
+- `fn:deep-equal` compares namespace nodes. A namespace node has no children,
+  so the generic child-sequence comparison reported every pair of them as
+  equal; two namespace nodes are now deep-equal only when their names — the
+  prefix, absent for a default-namespace binding — and their string values, the
+  bound namespace URI, both match.
 
 ### Added
 

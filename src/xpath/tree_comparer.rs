@@ -91,11 +91,13 @@ impl TreeComparer {
         match left.node_type() {
             DomNodeType::Element => self.element_equal(left, right),
             DomNodeType::Attribute => self.attribute_equal(left, right),
+            DomNodeType::Namespace => self.namespace_equal(left, right),
             DomNodeType::Text
             | DomNodeType::Whitespace
             | DomNodeType::SignificantWhitespace
             | DomNodeType::Comment => self.text_equal(&left.value(), &right.value()),
             DomNodeType::ProcessingInstruction => self.processing_instruction_equal(left, right),
+            // Document nodes: their content is their children.
             _ => self.deep_equal(left, right),
         }
     }
@@ -162,6 +164,22 @@ impl TreeComparer {
         left.local_name() == right.local_name() && left.value() == right.value()
     }
 
+    /// Deep equality for two namespace nodes.
+    ///
+    /// A namespace node has no children, so the generic child-sequence
+    /// comparison would make every pair of them equal. Its content is its
+    /// *name* — the prefix, an `xs:NCName`, absent (reported as the empty
+    /// string by every [`DomNavigator`] backend) for a default-namespace
+    /// binding — and its *string value*, the bound namespace URI. Both must
+    /// match.
+    ///
+    /// Neither part is document text, so `ignore_whitespace` deliberately does
+    /// not apply: a namespace URI that differs by whitespace is a different
+    /// URI.
+    fn namespace_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
+        left.local_name() == right.local_name() && left.value_ref() == right.value_ref()
+    }
+
     fn attribute_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
         if left.local_name() != right.local_name() || left.namespace_uri() != right.namespace_uri()
         {
@@ -180,7 +198,18 @@ impl TreeComparer {
         self.values_equal_or_nan(&left_value, &right_value)
     }
 
-    /// Deep equality for two navigator positions (node comparison).
+    /// Deep equality of the **children** of two navigator positions.
+    ///
+    /// This compares the two child sequences pairwise; it deliberately does
+    /// *not* look at the two positions themselves, so their names, attributes
+    /// and node kinds play no part. On two document nodes that is exactly
+    /// `fn:deep-equal`, whose content is its children; on two elements it is
+    /// a *content* comparison — `<a x="1">t</a>` and `<b y="2">t</b>` are
+    /// reported equal here, while `fn:deep-equal` reports them different.
+    ///
+    /// To compare items the way `fn:deep-equal` does, including the node kind
+    /// and name, use [`deep_equal_iter`](Self::deep_equal_iter) over the two
+    /// sequences.
     pub fn deep_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
         let mut left_iter = ChildIter::new(left.clone());
         let mut right_iter = ChildIter::new(right.clone());
@@ -310,8 +339,44 @@ mod tests {
     use num_bigint::BigInt;
     use rust_decimal::Decimal;
 
-    use crate::navigator::RoXmlNavigator;
+    use crate::navigator::{NamespaceAxisScope, RoXmlNavigator};
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
+
+    /// The document element of `doc`.
+    fn ro_element<'d>(doc: &'d roxmltree::Document<'d>) -> RoXmlNavigator<'d> {
+        let mut nav = RoXmlNavigator::new(doc);
+        assert!(nav.move_to_first_child(), "a document element");
+        nav
+    }
+
+    /// The namespace node with prefix `prefix` (`""` = the default binding) on
+    /// the document element of `doc`.
+    fn ro_namespace<'d>(doc: &'d roxmltree::Document<'d>, prefix: &str) -> RoXmlNavigator<'d> {
+        let mut nav = ro_element(doc);
+        assert!(
+            nav.move_to_first_namespace(NamespaceAxisScope::Local),
+            "a locally declared namespace",
+        );
+        loop {
+            if nav.local_name() == prefix {
+                return nav;
+            }
+            assert!(
+                nav.move_to_next_namespace(NamespaceAxisScope::Local),
+                "a namespace node with prefix {prefix:?}",
+            );
+        }
+    }
+
+    /// `fn:deep-equal` over two one-item node sequences, through the same
+    /// entry point the function itself uses.
+    fn nodes_deep_equal<N: DomNavigator>(left: N, right: N) -> bool {
+        let left: VecNodeIterator<N> = VecNodeIterator::new(vec![XmlItem::Node(left)]);
+        let right: VecNodeIterator<N> = VecNodeIterator::new(vec![XmlItem::Node(right)]);
+        TreeComparer::new()
+            .deep_equal_iter(&left, &right)
+            .expect("comparing two node sequences does not raise")
+    }
 
     #[test]
     fn test_deep_equal_ignores_whitespace_nodes() {
@@ -367,5 +432,191 @@ mod tests {
             VecNodeIterator::new(vec![XmlItem::Atomic(XmlValue::float(f32::NAN))]);
 
         assert!(comparer.deep_equal_iter(&left, &right).unwrap());
+    }
+
+    /// Pins the contract of the public [`TreeComparer::deep_equal`]: it
+    /// compares the *children* of the two positions, not the positions
+    /// themselves. Two callers in this crate depend on that — a document-root
+    /// comparison, where it coincides with `fn:deep-equal`, and a
+    /// copied-subtree content check. This test characterises existing
+    /// behaviour; it is not a defect test.
+    #[test]
+    fn deep_equal_compares_children_not_the_two_positions() {
+        let left = roxmltree::Document::parse(r#"<a x="1">t</a>"#).expect("parse xml");
+        let right = roxmltree::Document::parse(r#"<b y="2">t</b>"#).expect("parse xml");
+
+        // Different name, different attributes — same children.
+        assert!(TreeComparer::new().deep_equal(&ro_element(&left), &ro_element(&right)));
+        // Compared as items, the same pair is not deep-equal.
+        assert!(!nodes_deep_equal(ro_element(&left), ro_element(&right)));
+    }
+
+    // ── Namespace nodes ───────────────────────────────────────────────
+    //
+    // Two namespace nodes are deep-equal exactly when their names — the
+    // prefix, absent for a default-namespace binding — are equal and their
+    // string values, the bound namespace URI, are equal.
+
+    #[test]
+    fn namespace_nodes_with_the_same_prefix_and_uri_are_deep_equal() {
+        let left = roxmltree::Document::parse(r#"<r xmlns:a="http://x/"/>"#).expect("parse xml");
+        let right = roxmltree::Document::parse(r#"<r xmlns:a="http://x/"/>"#).expect("parse xml");
+
+        assert!(nodes_deep_equal(
+            ro_namespace(&left, "a"),
+            ro_namespace(&right, "a"),
+        ));
+    }
+
+    #[test]
+    fn namespace_nodes_differing_only_in_prefix_are_not_deep_equal() {
+        let doc = roxmltree::Document::parse(r#"<r xmlns:a="http://x/" xmlns:b="http://x/"/>"#)
+            .expect("parse xml");
+
+        assert!(!nodes_deep_equal(
+            ro_namespace(&doc, "a"),
+            ro_namespace(&doc, "b"),
+        ));
+    }
+
+    #[test]
+    fn namespace_nodes_differing_only_in_uri_are_not_deep_equal() {
+        let left = roxmltree::Document::parse(r#"<r xmlns:a="http://x/"/>"#).expect("parse xml");
+        let right = roxmltree::Document::parse(r#"<r xmlns:a="http://y/"/>"#).expect("parse xml");
+
+        assert!(!nodes_deep_equal(
+            ro_namespace(&left, "a"),
+            ro_namespace(&right, "a"),
+        ));
+    }
+
+    #[test]
+    fn a_default_namespace_node_is_not_deep_equal_to_a_prefixed_one() {
+        let doc = roxmltree::Document::parse(r#"<r xmlns="http://x/" xmlns:a="http://x/"/>"#)
+            .expect("parse xml");
+
+        assert!(!nodes_deep_equal(
+            ro_namespace(&doc, ""),
+            ro_namespace(&doc, "a"),
+        ));
+    }
+
+    #[test]
+    fn default_namespace_nodes_with_the_same_uri_are_deep_equal() {
+        let left = roxmltree::Document::parse(r#"<r xmlns="http://x/"/>"#).expect("parse xml");
+        let right = roxmltree::Document::parse(r#"<r xmlns="http://x/"/>"#).expect("parse xml");
+
+        assert!(nodes_deep_equal(
+            ro_namespace(&left, ""),
+            ro_namespace(&right, ""),
+        ));
+    }
+
+    #[test]
+    fn default_namespace_nodes_with_different_uris_are_not_deep_equal() {
+        let left = roxmltree::Document::parse(r#"<r xmlns="http://x/"/>"#).expect("parse xml");
+        let right = roxmltree::Document::parse(r#"<r xmlns="http://y/"/>"#).expect("parse xml");
+
+        assert!(!nodes_deep_equal(
+            ro_namespace(&left, ""),
+            ro_namespace(&right, ""),
+        ));
+    }
+
+    #[test]
+    fn a_namespace_node_is_not_deep_equal_to_another_kind_with_the_same_string_value() {
+        let doc =
+            roxmltree::Document::parse(r#"<r xmlns:a="http://x/" a="http://x/">http://x/</r>"#)
+                .expect("parse xml");
+        let namespace = ro_namespace(&doc, "a");
+
+        let mut attribute = RoXmlNavigator::new(&doc);
+        assert!(attribute.move_to_first_child(), "a document element");
+        assert!(attribute.move_to_first_attribute(), "an attribute");
+
+        let mut text = RoXmlNavigator::new(&doc);
+        assert!(text.move_to_first_child(), "a document element");
+        assert!(text.move_to_first_child(), "a text node");
+
+        assert_eq!(namespace.value(), attribute.value());
+        assert_eq!(namespace.value(), text.value());
+        assert!(!nodes_deep_equal(namespace.clone(), attribute));
+        assert!(!nodes_deep_equal(namespace, text));
+    }
+
+    #[test]
+    fn a_sequence_of_namespace_nodes_is_compared_item_by_item() {
+        let doc = roxmltree::Document::parse(r#"<r xmlns:a="http://x/" xmlns:b="http://y/"/>"#)
+            .expect("parse xml");
+        let comparer = TreeComparer::new();
+
+        let pair = |first: &str, second: &str| -> VecNodeIterator<RoXmlNavigator<'_>> {
+            VecNodeIterator::new(vec![
+                XmlItem::Node(ro_namespace(&doc, first)),
+                XmlItem::Node(ro_namespace(&doc, second)),
+            ])
+        };
+
+        assert!(comparer
+            .deep_equal_iter(&pair("a", "b"), &pair("a", "b"))
+            .unwrap());
+        assert!(!comparer
+            .deep_equal_iter(&pair("a", "b"), &pair("b", "a"))
+            .unwrap());
+    }
+
+    #[test]
+    fn namespace_nodes_of_a_buffer_document_follow_the_same_rule() {
+        use crate::document::BufferDocument;
+        use crate::namespace::NameTable;
+        use bumpalo::Bump;
+
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let parse = |xml: &'static str| {
+            BufferDocument::from_reader_default(xml.as_bytes(), &arena, &names)
+                .expect("the fixture parses")
+        };
+
+        // The navigator borrows the document, so keep every document alive.
+        let docs = [
+            parse(r#"<r xmlns:a="http://x/"/>"#),
+            parse(r#"<r xmlns:a="http://x/"/>"#),
+            parse(r#"<r xmlns:b="http://x/"/>"#),
+            parse(r#"<r xmlns:a="http://y/"/>"#),
+            parse(r#"<r xmlns="http://x/"/>"#),
+            parse(r#"<r xmlns="http://x/"/>"#),
+        ];
+
+        let namespace = |index: usize| {
+            let mut nav = docs[index].create_navigator();
+            assert!(nav.move_to_first_child(), "a document element");
+            assert!(
+                nav.move_to_first_namespace(NamespaceAxisScope::Local),
+                "a locally declared namespace",
+            );
+            nav
+        };
+
+        assert!(
+            nodes_deep_equal(namespace(0), namespace(1)),
+            "same prefix, same URI"
+        );
+        assert!(
+            !nodes_deep_equal(namespace(0), namespace(2)),
+            "different prefix"
+        );
+        assert!(
+            !nodes_deep_equal(namespace(0), namespace(3)),
+            "different URI"
+        );
+        assert!(
+            !nodes_deep_equal(namespace(0), namespace(4)),
+            "prefixed vs default"
+        );
+        assert!(
+            nodes_deep_equal(namespace(4), namespace(5)),
+            "default binding, same URI"
+        );
     }
 }
