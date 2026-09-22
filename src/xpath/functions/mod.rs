@@ -393,15 +393,14 @@ impl<N: DomNavigator> XPathValue<N> {
         }
     }
 
-    /// Get a reference to items as a slice
+    /// Borrow the items as a slice, without cloning: empty for `Empty`, one
+    /// element for `Item`, and the whole sequence for `Sequence`.
+    ///
+    /// The slice always has [`len`](Self::len) elements, in sequence order.
     pub fn as_slice(&self) -> &[XmlItem<N>] {
         match self {
             Self::Empty => &[],
-            Self::Item(_) => {
-                // Can't return a slice to a single owned item safely
-                // This is a limitation - callers should use into_vec() for this case
-                &[]
-            }
+            Self::Item(item) => std::slice::from_ref(item),
             Self::Sequence(items) => items,
         }
     }
@@ -1192,6 +1191,34 @@ mod tests {
         let value = XPathValue::from_sequence(items);
         assert_eq!(value.len(), 2);
         assert!(!value.is_single());
+    }
+
+    /// `as_slice` agrees with `len` and `first` for all three shapes; the
+    /// single-item shape used to answer with an empty slice.
+    #[test]
+    fn test_xpath_value_as_slice() {
+        let empty: XPathValue<RoXmlNavigator<'static>> = XPathValue::empty();
+        assert!(empty.as_slice().is_empty());
+
+        let single: XPathValue<RoXmlNavigator<'static>> = XPathValue::integer(7);
+        assert!(single.is_single());
+        let slice = single.as_slice();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice.len(), single.len());
+        assert!(std::ptr::eq(&slice[0], single.first().unwrap()));
+        match &slice[0] {
+            XmlItem::Atomic(value) => assert_eq!(value, &XmlValue::integer(7.into())),
+            XmlItem::Node(_) => panic!("expected an atomic item"),
+        }
+
+        let items: Vec<XmlItem<RoXmlNavigator<'static>>> = vec![
+            XmlItem::Atomic(XmlValue::integer(1.into())),
+            XmlItem::Atomic(XmlValue::integer(2.into())),
+        ];
+        let sequence = XPathValue::from_sequence(items);
+        let slice = sequence.as_slice();
+        assert_eq!(slice.len(), 2);
+        assert!(std::ptr::eq(&slice[0], sequence.first().unwrap()));
     }
 
     #[test]

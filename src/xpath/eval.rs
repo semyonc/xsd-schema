@@ -987,26 +987,18 @@ fn is_empty_sequence_expression(arena: &AstArena, id: AstNodeId) -> bool {
     }
 }
 
-/// SequenceType matching for a whole [`XPathValue`], without materialising it.
-///
-/// [`SequenceType::matches_sequence`] wants a slice, and `XPathValue::as_slice`
-/// cannot produce one for the single-item case, so the three shapes are matched
-/// here directly.
+/// SequenceType matching for a whole [`XPathValue`], without materialising it:
+/// [`XPathValue::as_slice`] borrows every shape, the single item included.
 fn value_matches_sequence_type<N: DomNavigator>(
     value: &XPathValue<N>,
     expected: &SequenceType,
     ctx: &XPathContext<'_>,
 ) -> bool {
-    if !expected.cardinality.matches_count(value.len()) {
-        return false;
-    }
-    match value {
-        XPathValue::Empty => true,
-        XPathValue::Item(item) => expected.item_type.matches_item(item, ctx),
-        XPathValue::Sequence(items) => items
+    expected.cardinality.matches_count(value.len())
+        && value
+            .as_slice()
             .iter()
-            .all(|item| expected.item_type.matches_item(item, ctx)),
-    }
+            .all(|item| expected.item_type.matches_item(item, ctx))
 }
 
 /// `V[1]`: the first item of a value, or the empty sequence.

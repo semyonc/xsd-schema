@@ -344,15 +344,6 @@ fn compare_values<N: DomNavigator>(
     }
 }
 
-/// The items of a value, without cloning the single-item case.
-fn items<N: DomNavigator>(value: &XPathValue<N>) -> &[XmlItem<N>] {
-    match value {
-        XPathValue::Empty => &[],
-        XPathValue::Item(item) => std::slice::from_ref(item),
-        XPathValue::Sequence(sequence) => sequence,
-    }
-}
-
 // ============================================================================
 // Which operand is which
 // ============================================================================
@@ -788,7 +779,7 @@ fn install<N: DomNavigator>(
         }
         // Atomize exactly as the pairwise loop would; an error there means the
         // loop may raise, so the comparison must keep running through it.
-        let Some(values) = general_compare::atomize_items(items(value)) else {
+        let Some(values) = general_compare::atomize_items(value.as_slice()) else {
             continue;
         };
         if values.len() < MIN_INVARIANT_ITEMS {
@@ -834,7 +825,7 @@ fn probe<N: DomNavigator>(
         return None;
     }
     // The varying operand, atomized exactly as the pairwise loop atomizes it.
-    let probe_values = general_compare::atomize_items(items(varying))?;
+    let probe_values = general_compare::atomize_items(varying.as_slice())?;
 
     let static_context = ctx.static_context;
     // The static context's default collation, which cannot change during a run,

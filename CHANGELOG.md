@@ -418,6 +418,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BufferDocumentError::DuplicateId`.
 - `XPathError::error_code()` reports `FODC0001` instead of `None` for an
   error carrying that QName.
+- `XPathValue::as_slice` returns a one-element slice for a single item. It
+  returned an empty slice for the `Item` variant, so a caller that borrowed a
+  one-item value as a slice saw no items while `len()` said 1. The slice now
+  always has `len()` elements, in sequence order, and is borrowed without
+  cloning; the signature is unchanged, and a caller that matched the `Item`
+  variant to work around it keeps working.
 - `BufferDocumentBuilder::copy_attribute`, replacing an attribute of the
   same expanded name with one that carries no type annotation — a copy with
   `Annotations::Strip`, or of an untyped attribute — left the earlier

@@ -294,14 +294,7 @@ impl<'a> Value<'a> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn iter(&self) -> impl Iterator<Item = &XmlItem<Nav<'a>>> + '_ {
-        // `XPathValue::as_slice` answers with an empty slice for the singleton
-        // variant, so the three cases are matched here instead.
-        let (single, many): (Option<&XmlItem<Nav<'a>>>, &[XmlItem<Nav<'a>>]) = match &self.0 {
-            XPathValue::Empty => (None, &[]),
-            XPathValue::Item(item) => (Some(item), &[]),
-            XPathValue::Sequence(items) => (None, items.as_slice()),
-        };
-        single.into_iter().chain(many.iter())
+        self.0.as_slice().iter()
     }
 
     /// The wrapped engine value.

@@ -442,7 +442,8 @@ fn sequence(values: &[XmlValue]) -> XPathValue<Nav> {
 }
 
 fn atomics(value: &XPathValue<Nav>) -> Vec<XmlValue> {
-    items(value)
+    value
+        .as_slice()
         .iter()
         .map(|item| match item {
             XmlItem::Atomic(atom) => atom.clone(),
