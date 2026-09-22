@@ -389,6 +389,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of raising. The two rules are unchanged: a `\` must be followed by a
   `\` or a `$`, and a `$` that is not part of such a pair must be followed by
   a digit.
+- `fn:id` selected an element by its `xml:id` only in a document parsed
+  from text, and only when the attribute value was already a clean
+  NCName. The id index is now filled from
+  `BufferDocumentBuilder::attribute`, the one place an attribute node is
+  created, so a document built through the push API, a schema-validated
+  one and a copied subtree all carry their ids; and the index key is the
+  value with XML whitespace stripped and collapsed, so `xml:id="d "`
+  answers to `id(' d')`. Only the key is normalized — the attribute
+  keeps its own value.
+- `fn:id` tokenized its argument on Unicode whitespace and looked up
+  every token. It now follows F&O §15.5.2: the candidate IDREFs are
+  `tokenize(normalize-space($s), ' ')` — XML whitespace only — and a
+  token that is not a lexical NCName is ignored instead of looked up.
+  An `xml:id` whose value is not an NCName is never selected.
+- `fn:id` returned an empty sequence where the specification requires an
+  error: it now raises `FODC0001` when the node it is given is in a tree
+  whose root is not a document node.
+- `fn:id` could return an element of another tree held in the same
+  document buffer. The id index is keyed by tree, and the lookup the
+  navigator uses stays inside the tree containing the reference node.
+- A document buffer holding several trees now indexes the ids of each of
+  them; `BufferDocumentBuilder::register_xml_id` used to do nothing at
+  all for a `Fragment` document. Two elements of one tree with the same
+  id are no longer a reason to refuse a tree built through the push API:
+  the first in document order wins, as the specification requires.
+  Reading a document from text still reports
+  `BufferDocumentError::DuplicateId`.
+- `XPathError::error_code()` reports `FODC0001` instead of `None` for an
+  error carrying that QName.
+- `BufferDocumentBuilder::copy_attribute`, replacing an attribute of the
+  same expanded name with one that carries no type annotation — a copy with
+  `Annotations::Strip`, or of an untyped attribute — left the earlier
+  attribute's annotation on the node, so the new value was reported with the
+  old type. The later attribute now wins with its annotation or the lack of
+  one, and `BufferDocument::has_type_annotations` stays exact.
+
 ### Added
 
 - Collations. The module `xpath::collation` with the trait `Collation`, the
@@ -486,7 +522,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   annotation?", maintained where bindings are attached instead of computed by
   walking the tree. It is `true` exactly when some node would report
   `DomNavigator::type_annotation() == Some(_)`, and follows the annotation
-  mode of a copy.## [0.2.0] - 2026-09-13
+  mode of a copy.
+- `BufferDocument::get_element_by_id_in_tree`, the id lookup scoped to
+  the tree containing a given node. `get_element_by_id` is unchanged for
+  a document holding one tree, and across several trees answers with the
+  element that comes first in document order.
+- An attribute whose typed value is a single `xs:ID` is now an is-id node
+  for `fn:id`, not only `xml:id` (XDM §6.3.4): its type is `xs:ID` or
+  derived from it, or a union whose value is of such a member, or a list of
+  `xs:ID` of length one — and the value is valid. That holds wherever the
+  attribute is annotated: in a document built by `build_typed_document`
+  (including a type chosen by XSD 1.1 conditional type assignment), in a
+  copy made with `Annotations::Preserve`, and wherever
+  `BufferDocumentBuilder::set_node_binding` binds an attribute. Binding it
+  again replaces what the earlier binding filed.
+
+## [0.2.0] - 2026-09-13
 
 A breaking release, in three parts:
 

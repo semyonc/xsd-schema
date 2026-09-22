@@ -72,9 +72,9 @@ impl<'a> BufferDocNavigator<'a> {
     /// Creates a navigator for XSD 1.1 assertion evaluation.
     ///
     /// XSD 1.1 §3.13.4.1 clause 1.3 builds the assertion's data model instance
-    /// from the asserted element `E` alone: "The root node of the [XDM]
+    /// from the asserted element `E` alone: "The root node of the \[XDM\]
     /// instance is constructed from E; the data model instance contains only
-    /// that node and nodes constructed from the [attributes], [children], and
+    /// that node and nodes constructed from the \[attributes\], \[children\], and
     /// descendants of E", with the Note "It is a consequence of this
     /// construction that attempts to refer, in an assertion, to the siblings or
     /// ancestors of E, or to any part of the input document outside of E
@@ -85,7 +85,7 @@ impl<'a> BufferDocNavigator<'a> {
     /// yields nothing: `parent::`, `ancestor::`, `ancestor-or-self::` beyond
     /// `E`, `following-sibling::`, `preceding-sibling::`, `following::` and
     /// `preceding::` are all cut at `E` (see
-    /// [`is_tree_top`](Self::is_tree_top)).
+    /// the private `is_tree_top`).
     ///
     /// `fn:root()` and the absolute paths built on it are the one place this
     /// differs from [`new_orphan`](Self::new_orphan): they still land on the
@@ -1144,8 +1144,20 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         }
     }
 
+    /// The scope of an id is one tree: the search is anchored on this cursor's
+    /// own tree, so a buffer holding several top-level trees never lets one
+    /// reach into another. A cursor presented as parentless
+    /// ([`new_orphan`](Self::new_orphan)) is the root of its own tree, so the
+    /// hit must also lie inside its subtree.
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
-        Ok(self.doc.get_element_by_id(id).map(|r| {
+        let found = self
+            .doc
+            .get_element_by_id_in_tree(self.current, id)
+            .filter(|&r| {
+                self.orphan_root == NULL
+                    || (r >= self.orphan_root && r < self.doc.subtree_end(self.orphan_root))
+            });
+        Ok(found.map(|r| {
             let mut nav = BufferDocNavigator::new(self.doc, r);
             nav.assertion_absolute_root = self.assertion_absolute_root;
             nav.assertion_fragment_root = self.assertion_fragment_root;
@@ -1848,6 +1860,182 @@ mod tests {
         let nav = doc.create_navigator();
 
         assert!(nav.find_element_by_id("missing").unwrap().is_none());
+    }
+
+    /// Evaluates `expr` with `nav` as the context node.
+    fn eval<'d>(
+        names: &NameTable,
+        nav: BufferDocNavigator<'d>,
+        expr: &str,
+    ) -> Result<crate::xpath::XPathValue<BufferDocNavigator<'d>>, crate::xpath::XPathError> {
+        let ctx = XPathContext::new(names);
+        XPathExpr::compile(expr, &ctx)
+            .expect("compile")
+            .evaluator(&ctx)
+            .run_with_node(nav)
+    }
+
+    /// The scope of an id is one *tree*. Two top-level trees in one buffer
+    /// must not see each other's ids.
+    #[test]
+    fn find_element_by_id_stays_inside_one_tree() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::fragment(),
+        )
+        .unwrap();
+        let a = builder.start_element("a", "", "", &[]).unwrap();
+        builder
+            .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "x")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let b = builder.start_element("b", "", "", &[]).unwrap();
+        builder
+            .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "y")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let in_a = BufferDocNavigator::new_orphan(&doc, a);
+        assert!(in_a.find_element_by_id("x").unwrap().is_some(), "own tree");
+        assert!(
+            in_a.find_element_by_id("y").unwrap().is_none(),
+            "the sibling tree's id is out of scope"
+        );
+        let in_b = BufferDocNavigator::new_orphan(&doc, b);
+        assert!(in_b.find_element_by_id("y").unwrap().is_some(), "own tree");
+        assert!(
+            in_b.find_element_by_id("x").unwrap().is_none(),
+            "the sibling tree's id is out of scope"
+        );
+    }
+
+    // ── 12b. fn:id ───────────────────────────────────────────────────
+
+    /// F&O §15.5.2 with the id-index key normalized: the element's `xml:id`
+    /// has a trailing space, the argument has a leading one, and they meet.
+    #[test]
+    fn id_finds_an_element_whose_xml_id_is_padded_with_whitespace() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<doc><div xml:id="id3 "><title>Expressions</title></div></doc>"#,
+            &arena,
+            &names,
+        );
+        let result =
+            eval(&names, doc.create_navigator(), "string(id(' id3')/title)").expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("Expressions"));
+    }
+
+    /// F&O §15.5.2: an is-id node whose value is not a lexical `xs:ID` "will
+    /// never be selected".
+    #[test]
+    fn id_never_selects_a_node_whose_xml_id_is_not_an_ncname() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="1abc"/></doc>"#, &arena, &names);
+        let result = eval(&names, doc.create_navigator(), "count(id('1abc'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(0.0));
+    }
+
+    /// The candidate IDREFs are `tokenize(normalize-space($s), ' ')`, and
+    /// `normalize-space` knows XML whitespace only. U+00A0 is not XML
+    /// whitespace, so `"a\u{a0}b"` is a single token — and not an NCName.
+    #[test]
+    fn id_tokenizes_on_xml_whitespace_only() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(
+            r#"<doc><a xml:id="a"/><b xml:id="b"/></doc>"#,
+            &arena,
+            &names,
+        );
+        let result =
+            eval(&names, doc.create_navigator(), "count(id('a\u{a0}b'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(0.0));
+        // The same two names separated by real XML whitespace do select both.
+        let result =
+            eval(&names, doc.create_navigator(), "count(id(' a\t\nb '))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(2.0));
+    }
+
+    /// A token that is not an NCName is ignored, not an error, and the rest of
+    /// the token list still selects.
+    #[test]
+    fn id_ignores_a_token_that_is_not_an_ncname() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="a"/></doc>"#, &arena, &names);
+        let result =
+            eval(&names, doc.create_navigator(), "count(id('1abc a x:y'))").expect("evaluates");
+        assert_eq!(result.as_f64(), Some(1.0));
+    }
+
+    /// F&O §15.5.2: "If the node ... is in a tree whose root is not a document
+    /// node, [err:FODC0001] is raised."
+    #[test]
+    fn id_raises_fodc0001_when_the_tree_root_is_not_a_document_node() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = build_doc(r#"<doc><a xml:id="a"/></doc>"#, &arena, &names);
+        let elem = {
+            let mut nav = doc.create_navigator();
+            assert!(nav.move_to_first_child());
+            nav.current_ref()
+        };
+        let Err(err) = eval(
+            &names,
+            BufferDocNavigator::new_orphan(&doc, elem),
+            "id('a')",
+        ) else {
+            panic!("a parentless tree root is FODC0001");
+        };
+        assert_eq!(err.error_code(), Some("FODC0001"));
+    }
+
+    /// Duplicates: the first in document order wins, and it is not an error.
+    ///
+    /// The tree is built through the push API, because the text parser refuses
+    /// a duplicate `xml:id` outright (see `BufferDocumentError::DuplicateId`).
+    #[test]
+    fn id_selects_the_first_element_in_document_order() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = crate::document::BufferDocumentBuilder::new(
+            &arena,
+            &names,
+            None,
+            crate::document::BufferDocumentOptions::default(),
+        )
+        .unwrap();
+        builder.start_element("doc", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        for (name, text) in [("a", "first"), ("b", "second")] {
+            builder.start_element(name, "", "", &[]).unwrap();
+            builder
+                .attribute("id", crate::namespace::table::XML_NAMESPACE, "xml", "dup")
+                .unwrap();
+            builder.end_of_attributes();
+            builder.text(text);
+            builder.end_element().unwrap();
+        }
+        builder.end_element().unwrap();
+        let doc = builder.finalize().unwrap();
+
+        let result = eval(
+            &names,
+            doc.create_navigator(),
+            "string-join(id('dup'), '|')",
+        )
+        .expect("evaluates");
+        assert_eq!(result.as_str().as_deref(), Some("first"));
     }
 
     // ── 13. Virtual parent ───────────────────────────────────────────

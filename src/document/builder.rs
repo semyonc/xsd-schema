@@ -4,6 +4,7 @@
 //! its low-level push API (`start_element`, `attribute`, `text`, …) or via
 //! the `build()` method which drives the push API from a quick-xml event stream.
 
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -14,13 +15,21 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use quick_xml::XmlVersion;
 
+use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::namespace::table::XML_NAMESPACE;
 use crate::namespace::NameTable;
+use crate::parser::frames::SimpleTypeVariety;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
+use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::XmlTypeCode;
+use crate::validation::info::ContentType;
 use crate::xml_entity::resolve_general_ref;
 
-use super::buffer::{next_document_serial, BufferDocument};
+use super::buffer::{
+    file_id_claim, id_index_key, next_document_serial, withdraw_id_claim, BufferDocument, IdClaim,
+    IdSlot,
+};
 use super::error::BufferDocumentError;
 use super::{
     BindingRemapTable, BufferDocumentOptions, DocumentKind, ElementIndex, NamespaceNode,
@@ -86,6 +95,21 @@ pub struct BufferDocumentBuilder<'a> {
     pending_spans: Vec<(u32, usize)>,
     #[allow(dead_code)]
     options: BufferDocumentOptions,
+    /// The interned `xml:id` name, so that the check
+    /// [`attribute`](Self::attribute) makes on every attribute is two integer
+    /// comparisons rather than two string comparisons.
+    xml_id_name: (NameId, NameId),
+    /// An id value another element of the same tree already held when the
+    /// last attribute was added; see
+    /// [`dropped_duplicate_id`](Self::dropped_duplicate_id).
+    dropped_duplicate_id: Option<Box<str>>,
+    /// The is-id class of each binding index, filled on first use — see
+    /// [`IdClass`]. Nearly every annotation an attribute carries is
+    /// [`IdClass::Never`], and this makes that answer one vector read.
+    id_classes: Vec<IdClass>,
+    /// How many element and attribute nodes carry a binding, so that
+    /// `has_type_annotations` stays exact when a binding is taken away again.
+    annotated_nodes: usize,
 }
 
 impl<'a> BufferDocumentBuilder<'a> {
@@ -160,6 +184,10 @@ impl<'a> BufferDocumentBuilder<'a> {
             content_states: vec![ContentState::default()],
             pending_spans: Vec::new(),
             options,
+            xml_id_name: (effective_names.add("id"), xml_uri_id),
+            dropped_duplicate_id: None,
+            id_classes: Vec::new(),
+            annotated_nodes: 0,
         })
     }
 
@@ -271,6 +299,17 @@ impl<'a> BufferDocumentBuilder<'a> {
     }
 
     /// Adds an attribute to the current element (two-node pair).
+    ///
+    /// This is the one place an attribute node is created, so it is also where
+    /// an `xml:id` is filed in the document's id index — for a document parsed
+    /// from text, for a typed one, for a copy and for a tree a host builds
+    /// through this API alike. The cost is two integer comparisons per
+    /// attribute (the name is interned either way). An attribute that is an id
+    /// by its *type* rather than its name is filed when its annotation is
+    /// attached, by [`set_node_binding`](Self::set_node_binding).
+    ///
+    /// The builder does not look for an attribute of the same name already on
+    /// the element: calling this twice with one name makes two attribute nodes.
     pub fn attribute(
         &mut self,
         local_name: &str,
@@ -281,6 +320,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         let local_id = self.doc.names.add(local_name);
         let uri_id = self.doc.names.add(ns_uri);
         let prefix_id = self.doc.names.add(prefix);
+
+        // The namespace is tested first: almost every attribute is in no
+        // namespace, so this fails on the first comparison.
+        let is_xml_id = uri_id == self.xml_id_name.1 && local_id == self.xml_id_name.0;
 
         // Same dedup-before-store as element starts: avoid an orphaned
         // `StringStore` entry per attribute occurrence (only the first sighting
@@ -342,6 +385,19 @@ impl<'a> BufferDocumentBuilder<'a> {
         // Mark element as having attrs
         if let Some(state) = self.element_stack.last_mut() {
             state.has_attrs = true;
+        }
+
+        if is_xml_id {
+            if let Some(key) = id_index_key(value) {
+                let claim = IdClaim {
+                    tree: self.tree_of(self.parent),
+                    elem: self.parent,
+                    attr: attr_ref,
+                };
+                if file_id_claim(&mut self.doc.id_elements, &key, claim) {
+                    self.dropped_duplicate_id = Some(key.into());
+                }
+            }
         }
 
         Ok(attr_ref)
@@ -463,8 +519,20 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// This is the one place a [`NodeSchemaBinding`] is attached to a node, so
     /// it is also where [`BufferDocument::has_type_annotations`] is maintained:
     /// binding an element or an attribute is exactly what makes
-    /// `DomNavigator::type_annotation()` answer `Some` for that node, and a
-    /// binding is never removed again.
+    /// `DomNavigator::type_annotation()` answer `Some` for that node.
+    ///
+    /// For the same reason it is where an attribute that is an id by its
+    /// *type* is filed in the id index. XDM 1.0 §6.3.4 makes an attribute
+    /// is-id when its typed value is exactly one atomic value of type `xs:ID`
+    /// or a type derived from it — which takes in a union whose value is of
+    /// its `xs:ID` member and a list of `xs:ID` of length one, and leaves out a
+    /// value the type rejects. The typed value is the one
+    /// `DomNavigator::typed_value()` reports for the node, so `fn:id` and
+    /// `fn:data` always agree, and a copy that keeps the annotation (a typed
+    /// build, a copy with `Annotations::Preserve`, a host binding a node
+    /// itself) is indexed exactly as its source. Binding a node again first
+    /// withdraws what the previous binding filed. An `xml:id` is an id by its
+    /// name whatever its type, and is filed by [`attribute`](Self::attribute).
     ///
     /// Returns [`BufferDocumentError::Overflow`] if the binding table is full.
     pub fn set_node_binding(
@@ -474,10 +542,14 @@ impl<'a> BufferDocumentBuilder<'a> {
     ) -> Result<bool, BufferDocumentError> {
         let idx = self.doc.binding_remap.register(binding)?;
         let is_complex = matches!(binding.type_key, crate::ids::TypeKey::Complex(_));
-        if matches!(
-            self.doc.nodes.get(node_ref).node_type(),
-            NodeType::Element | NodeType::Attribute
-        ) {
+        let node = self.doc.nodes.get(node_ref);
+        let kind = node.node_type();
+        let previous = node.binding_index();
+        if kind == NodeType::Attribute && previous != 0 {
+            self.withdraw_typed_id(node_ref, previous);
+        }
+        if matches!(kind, NodeType::Element | NodeType::Attribute) && previous == 0 {
+            self.annotated_nodes += 1;
             self.doc.has_type_annotations = true;
         }
         self.doc.nodes.update(node_ref, |n| {
@@ -488,7 +560,36 @@ impl<'a> BufferDocumentBuilder<'a> {
                 n.clear_flag(Node::IS_COMPLEX_TYPE);
             }
         });
+        if kind == NodeType::Attribute {
+            self.file_typed_id(node_ref, idx);
+        }
         Ok(is_complex)
+    }
+
+    /// Takes a node's schema binding away again, leaving it unannotated — and,
+    /// for an attribute, withdrawing the id its annotation made it.
+    ///
+    /// Used where a node is replaced by one that carries no annotation: the
+    /// later of two duplicate attributes of a constructed element wins with its
+    /// value *and* its (absent) annotation.
+    pub(crate) fn clear_node_binding(&mut self, node_ref: u32) {
+        let node = self.doc.nodes.get(node_ref);
+        let previous = node.binding_index();
+        if previous == 0 {
+            return;
+        }
+        let kind = node.node_type();
+        if kind == NodeType::Attribute {
+            self.withdraw_typed_id(node_ref, previous);
+        }
+        if matches!(kind, NodeType::Element | NodeType::Attribute) {
+            self.annotated_nodes -= 1;
+            self.doc.has_type_annotations = self.annotated_nodes > 0;
+        }
+        self.doc.nodes.update(node_ref, |n| {
+            n.set_binding_index(0);
+            n.clear_flag(Node::IS_COMPLEX_TYPE);
+        });
     }
 
     /// Sets the `IS_NIL` flag on a node (xsi:nil="true").
@@ -498,20 +599,71 @@ impl<'a> BufferDocumentBuilder<'a> {
         });
     }
 
-    /// Registers an `xml:id` value for the given element.
+    /// Registers an id value for the given element.
     ///
-    /// Returns [`BufferDocumentError::DuplicateId`] if the id has already
-    /// been registered.  This is a no-op in `Fragment` mode.
+    /// [`attribute`](Self::attribute) already does this for an `xml:id`, and
+    /// [`set_node_binding`](Self::set_node_binding) for an attribute whose
+    /// typed value is an `xs:ID`, so this is for an id that comes from
+    /// somewhere else. It is **not** restricted to `Full` documents: the scope
+    /// of an id is one tree, and the index is keyed by tree, so a `Fragment`
+    /// buffer holding several top-level trees is served correctly. A value
+    /// registered here stays registered: no attribute stands behind it, so
+    /// replacing an attribute of the element never withdraws it.
+    ///
+    /// The value is normalized as an index key (XML whitespace stripped and
+    /// collapsed); a value that is not a lexical NCName is ignored, because
+    /// such a node can never be selected.
+    ///
+    /// Returns [`BufferDocumentError::DuplicateId`] if another element of the
+    /// **same tree** already answers to this id. Registering the same element
+    /// twice is accepted and changes nothing.
     pub fn register_xml_id(&mut self, id: &str, elem_ref: u32) -> Result<(), BufferDocumentError> {
-        if self.doc.kind != DocumentKind::Full {
+        let Some(key) = id_index_key(id) else {
             return Ok(());
+        };
+        let tree = self.doc.tree_root_of(elem_ref);
+        let claim = IdClaim {
+            tree,
+            elem: elem_ref,
+            attr: NULL,
+        };
+        match self.doc.id_elements.get_mut(key.as_ref()) {
+            Some(slot) => match slot.in_tree(tree) {
+                Some(first) if first != elem_ref => {
+                    Err(BufferDocumentError::DuplicateId(key.into_owned()))
+                }
+                _ => {
+                    // Filed as a claim of its own even when an attribute of the
+                    // element already made it answer, so that replacing that
+                    // attribute does not take this registration along.
+                    if !slot.has_claim(tree, elem_ref, true) {
+                        slot.add(claim);
+                    }
+                    Ok(())
+                }
+            },
+            None => {
+                self.doc.id_elements.insert(key.into(), IdSlot::One(claim));
+                Ok(())
+            }
         }
-        let id_val: Box<str> = id.into();
-        if self.doc.id_elements.contains_key(&id_val) {
-            return Err(BufferDocumentError::DuplicateId(id_val.into_string()));
-        }
-        self.doc.id_elements.insert(id_val, elem_ref);
-        Ok(())
+    }
+
+    /// Takes the id value the last [`attribute`](Self::attribute) filed for a
+    /// second element of a tree that already had an element with that id.
+    ///
+    /// F&O §15.5.2 selects "the first such element in document order" when
+    /// several elements share an ID value, so such a claim is kept but not
+    /// selected, and it is not an error for the index. This is how a driver
+    /// that reads a real XML document learns about a duplicate `xml:id` without
+    /// paying for a lookup of its own: the index knows, and only it should
+    /// decide what a duplicate means. It answers `None` for a `Fragment`
+    /// buffer, which has never reported duplicates.
+    #[inline]
+    pub(crate) fn dropped_duplicate_id(&mut self) -> Option<Box<str>> {
+        self.dropped_duplicate_id.as_ref()?;
+        let dropped = self.dropped_duplicate_id.take();
+        dropped.filter(|_| self.doc.kind == DocumentKind::Full)
     }
 
     /// Returns `true` when source location tracking is enabled.
@@ -691,6 +843,13 @@ impl<'a> BufferDocumentBuilder<'a> {
 
     /// Replaces the value of an existing attribute node.
     ///
+    /// The id index follows: whatever the old value made the attribute's
+    /// element answer to — as an `xml:id`, or through the attribute's
+    /// annotation — is withdrawn before the value changes, and the new value is
+    /// filed under the same rules afterwards. The annotation itself is the
+    /// caller's business ([`set_node_binding`](Self::set_node_binding) /
+    /// [`clear_node_binding`](Self::clear_node_binding)).
+    ///
     /// The previous value stays interned in the string store; duplicate
     /// attribute names are rare enough that reclaiming it is not worth a
     /// back-reference.
@@ -699,10 +858,132 @@ impl<'a> BufferDocumentBuilder<'a> {
             self.doc.nodes.get(attr_ref).node_type(),
             NodeType::Attribute
         );
+        let binding = self.doc.nodes.get(attr_ref).binding_index();
+        let is_xml_id = self.is_xml_id_attribute(attr_ref);
+        if is_xml_id {
+            let doc = &mut self.doc;
+            let old = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
+            if let Some(key) = id_index_key(old) {
+                withdraw_id_claim(&mut doc.id_elements, &key, attr_ref);
+            }
+        } else if binding != 0 {
+            self.withdraw_typed_id(attr_ref, binding);
+        }
+
         let val_idx = self.doc.strings.store(value);
         self.doc.nodes.update(attr_ref + 1, |n| {
             n.value = val_idx;
         });
+
+        if is_xml_id {
+            if let Some(key) = id_index_key(value) {
+                let owner = self.doc.nodes.get(attr_ref).parent;
+                let claim = IdClaim {
+                    tree: self.tree_of(owner),
+                    elem: owner,
+                    attr: attr_ref,
+                };
+                file_id_claim(&mut self.doc.id_elements, &key, claim);
+            }
+        } else if binding != 0 {
+            self.file_typed_id(attr_ref, binding);
+        }
+    }
+
+    // ── The is-id rule for annotated attributes ──────────────────────
+
+    /// Whether an attribute node is named `xml:id`, which is an id by its name
+    /// whatever its type (XDM 1.0 §6.3.4).
+    fn is_xml_id_attribute(&self, attr_ref: u32) -> bool {
+        let atom = self.doc.qname_table.get(self.doc.nodes.get(attr_ref).value);
+        atom.namespace_uri == self.xml_id_name.1 && atom.local_name == self.xml_id_name.0
+    }
+
+    /// The root of the tree `elem` belongs to — for an element that is open,
+    /// the outermost open element, which costs no parent walk.
+    #[inline]
+    fn tree_of(&self, elem: u32) -> u32 {
+        match self.element_stack.first() {
+            Some(outermost) if elem == self.parent => outermost.node_ref,
+            _ => self.doc.tree_root_of(elem),
+        }
+    }
+
+    /// The is-id class of the binding at `binding_idx`, computed once per
+    /// binding and remembered.
+    fn id_class(&mut self, binding_idx: u32) -> IdClass {
+        let slot = binding_idx as usize;
+        if let Some(&class) = self.id_classes.get(slot) {
+            if class != IdClass::Unknown {
+                return class;
+            }
+        }
+        let class = match (self.doc.schema_set, self.doc.binding_remap.get(binding_idx)) {
+            (Some(schema_set), Some(binding)) => IdClass::of(binding, schema_set),
+            _ => IdClass::Never,
+        };
+        if self.id_classes.len() <= slot {
+            self.id_classes.resize(slot + 1, IdClass::Unknown);
+        }
+        self.id_classes[slot] = class;
+        class
+    }
+
+    /// The claim the attribute `attr_ref` makes when it is bound at
+    /// `binding_idx`, and the binding's type — or `None` when that binding
+    /// cannot make it an id, which for nearly every attribute is one vector
+    /// read.
+    fn typed_id_candidate(
+        &mut self,
+        attr_ref: u32,
+        binding_idx: u32,
+    ) -> Option<(IdClass, TypeKey, &'a SchemaSet, IdClaim)> {
+        let class = self.id_class(binding_idx);
+        if class == IdClass::Never || self.is_xml_id_attribute(attr_ref) {
+            return None;
+        }
+        let type_key = self.doc.binding_remap.get(binding_idx)?.type_key;
+        let schema_set = self.doc.schema_set?;
+        let owner = self.doc.nodes.get(attr_ref).parent;
+        let claim = IdClaim {
+            tree: self.tree_of(owner),
+            elem: owner,
+            attr: attr_ref,
+        };
+        Some((class, type_key, schema_set, claim))
+    }
+
+    /// Files the attribute `attr_ref`, bound at `binding_idx`, when that makes
+    /// it an id. A duplicate is kept but not selected (see [`IdSlot`]), and is
+    /// not reported: ID uniqueness in a validated document is `cvc-id`'s
+    /// business, which the validator reports on its own channel.
+    fn file_typed_id(&mut self, attr_ref: u32, binding_idx: u32) {
+        let Some((class, type_key, schema_set, claim)) =
+            self.typed_id_candidate(attr_ref, binding_idx)
+        else {
+            return;
+        };
+        let doc = &mut self.doc;
+        let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
+        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+            file_id_claim(&mut doc.id_elements, &key, claim);
+        }
+    }
+
+    /// Withdraws what [`file_typed_id`](Self::file_typed_id) filed for the
+    /// attribute while it was bound at `binding_idx`. Called before the value
+    /// or the binding changes, so the key recomputes to the one it was filed
+    /// under.
+    fn withdraw_typed_id(&mut self, attr_ref: u32, binding_idx: u32) {
+        let Some((class, type_key, schema_set, _)) = self.typed_id_candidate(attr_ref, binding_idx)
+        else {
+            return;
+        };
+        let doc = &mut self.doc;
+        let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
+        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+            withdraw_id_claim(&mut doc.id_elements, &key, attr_ref);
+        }
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -988,16 +1269,13 @@ impl<'a> BufferDocumentBuilder<'a> {
             let unescaped = attr.normalized_value(XmlVersion::Implicit1_0)?;
             self.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
 
-            // Detect xml:id
-            if self.doc.kind == DocumentKind::Full
-                && attr_local == "id"
-                && attr_ns_uri == XML_NAMESPACE
-            {
-                let id_val: Box<str> = unescaped.as_ref().into();
-                if self.doc.id_elements.contains_key(&id_val) {
-                    return Err(BufferDocumentError::DuplicateId(id_val.into_string()));
-                }
-                self.doc.id_elements.insert(id_val, elem_ref);
+            // A duplicate `xml:id` is a defect of the *document*, and a driver
+            // reading text is the one place a real document is read, so it is
+            // reported here rather than in `attribute()` — which also has to
+            // serve a host that constructs trees, where F&O §15.5.2 asks for
+            // "the first such element in document order" instead of an error.
+            if let Some(taken) = self.dropped_duplicate_id() {
+                return Err(BufferDocumentError::DuplicateId(taken.into_string()));
             }
         }
 
@@ -1016,6 +1294,137 @@ impl<'a> BufferDocumentBuilder<'a> {
         }
 
         Ok(elem_ref)
+    }
+}
+
+// ── The is-id rule ────────────────────────────────────────────────────
+
+/// What an attribute's annotation can make of its is-id property (XDM 1.0
+/// §6.3.4), decided once per binding.
+///
+/// The property belongs to the *typed value*: an attribute is-id when that is
+/// exactly one atomic value of type `xs:ID` or a type derived from it. For
+/// most annotations the answer does not depend on the value at all, and those
+/// are the ones worth knowing up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdClass {
+    /// Not classified yet.
+    Unknown,
+    /// No value of this type is an `xs:ID`: no `xs:ID` is reachable through
+    /// its derivation, its list item type or its union member types.
+    Never,
+    /// `xs:ID` itself, or a restriction of it with no facet beyond the
+    /// whitespace one every such type has: a value is valid — and its typed
+    /// value one `xs:ID` — exactly when it is a lexical NCName once
+    /// whitespace-collapsed, which is what the index key already checks.
+    PlainId,
+    /// It depends on the value: a restriction of `xs:ID` with facets of its
+    /// own (a value it rejects has no `xs:ID` typed value), a union with an
+    /// `xs:ID` member (it depends which member the value is of), a list of
+    /// `xs:ID` (it depends how many items there are).
+    ByValue,
+}
+
+impl IdClass {
+    fn of(binding: &NodeSchemaBinding, schema_set: &SchemaSet) -> Self {
+        let Some(id) = schema_set.builtin_types().get_by_type_code(XmlTypeCode::Id) else {
+            return IdClass::Never;
+        };
+        match binding.type_key {
+            TypeKey::Simple(sk) => Self::of_simple(sk, id, schema_set, 0),
+            // The navigator gives a complex annotation a typed value only for
+            // text-only content, and only then could it be an `xs:ID`.
+            TypeKey::Complex(_) if binding.content_type == Some(ContentType::TextOnly) => {
+                IdClass::ByValue
+            }
+            TypeKey::Complex(_) => IdClass::Never,
+        }
+    }
+
+    fn of_simple(sk: SimpleTypeKey, id: SimpleTypeKey, schema_set: &SchemaSet, depth: u32) -> Self {
+        // Cycle guard, as the other type-graph walks have.
+        if depth > 32 {
+            return IdClass::Never;
+        }
+        let Some(data) = schema_set.arenas.simple_types.get(sk) else {
+            return IdClass::Never;
+        };
+        let reaches_id = |member: &TypeKey| match member {
+            TypeKey::Simple(member) => {
+                Self::of_simple(*member, id, schema_set, depth + 1) != IdClass::Never
+            }
+            TypeKey::Complex(_) => false,
+        };
+        match data.variety {
+            SimpleTypeVariety::Atomic if schema_set.derives_from(sk, id) => {
+                let mut constraining = (*schema_set.effective_facets(sk)).clone();
+                constraining.whitespace = None;
+                if constraining.is_empty() {
+                    IdClass::PlainId
+                } else {
+                    IdClass::ByValue
+                }
+            }
+            SimpleTypeVariety::Atomic => IdClass::Never,
+            SimpleTypeVariety::List if data.resolved_item_type.as_ref().is_some_and(reaches_id) => {
+                IdClass::ByValue
+            }
+            SimpleTypeVariety::Union if data.resolved_member_types.iter().any(reaches_id) => {
+                IdClass::ByValue
+            }
+            SimpleTypeVariety::List | SimpleTypeVariety::Union => IdClass::Never,
+        }
+    }
+}
+
+/// The index key of an attribute of type `type_key` whose value is `value`,
+/// when it is an id — the `xs:ID` value itself, whitespace-collapsed as
+/// `xs:ID` is.
+///
+/// [`IdClass::ByValue`] computes the typed value exactly as
+/// `BufferDocNavigator::typed_value` does for an annotated attribute — the
+/// same `validate_simple_type` call — so that the index and `fn:data` never
+/// disagree, and a copy that keeps the annotation is indexed as its source.
+fn typed_id_key<'v>(
+    class: IdClass,
+    value: &'v str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<Cow<'v, str>> {
+    match class {
+        IdClass::Never | IdClass::Unknown => None,
+        IdClass::PlainId => id_index_key(value),
+        IdClass::ByValue => {
+            let typed =
+                crate::validation::simple::validate_simple_type(value, type_key, schema_set)
+                    .ok()?
+                    .typed_value;
+            let id = single_id(&typed)?;
+            id_index_key(id).map(|key| Cow::Owned(key.into_owned()))
+        }
+    }
+}
+
+/// The `xs:ID` value a typed value consists of, when it is exactly one atomic
+/// value of type `xs:ID` or a type derived from it.
+///
+/// Every type derived from `xs:ID` validates to the `xs:ID` type code, since
+/// none of the built-in types derives from it. A union value is the value of
+/// the member that matched; a list value is its items, and counts only when
+/// there is exactly one.
+fn single_id(value: &XmlValue) -> Option<&str> {
+    match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::String(id)) if value.type_code == XmlTypeCode::Id => {
+            Some(id)
+        }
+        XmlValueKind::Union(member) => single_id(member),
+        XmlValueKind::List { item_type, items } if *item_type == XmlTypeCode::Id => {
+            match items.as_slice() {
+                [XmlAtomicValue::String(id)] => Some(id),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1720,23 +2129,28 @@ mod tests {
         );
     }
 
+    /// A fragment document registers ids too.
+    ///
+    /// This replaces an earlier test that pinned the opposite ("Fragment mode
+    /// `register_xml_id` should be no-op"). The scope of an id is one *tree*,
+    /// not one buffer, and the index is keyed by tree, so a fragment buffer —
+    /// which may hold several top-level trees — no longer has to opt out.
     #[test]
-    fn fragment_skips_id_registration() {
+    fn fragment_register_xml_id_is_recorded() {
         let arena = Bump::new();
         let names = NameTable::new();
         let mut builder = make_builder_fragment(&arena, &names);
 
         let elem = builder.start_element("item", "", "", &[]).unwrap();
         builder.end_of_attributes();
-        // Manually register an xml:id — should be a no-op in fragment mode
         builder.register_xml_id("myid", elem).unwrap();
         builder.end_element().unwrap();
 
         let doc = builder.finalize().unwrap();
         assert_eq!(
             doc.get_element_by_id("myid"),
-            None,
-            "Fragment mode register_xml_id should be no-op"
+            Some(elem),
+            "a fragment document holds its ids"
         );
     }
 
@@ -1865,4 +2279,172 @@ mod tests {
             .unwrap();
         assert_eq!(result.as_str().as_deref(), Some("a|b"));
     }
+
+    // ── xml:id registration ───────────────────────────────────────────
+
+    /// The key an `xml:id` is filed under is the value with XML whitespace
+    /// stripped at both ends and collapsed inside — the normalization of a
+    /// tokenized attribute type.
+    #[test]
+    fn an_xml_id_is_filed_under_a_whitespace_normalized_key() {
+        let doc = build_from_str_full(
+            r#"<doc><div xml:id="id3 "><title>Expressions</title></div></doc>"#,
+        );
+        // Root(0), doc(1), div(2)
+        assert_eq!(doc.get_element_by_id("id3"), Some(2));
+    }
+
+    /// Only the *key* is normalized: the attribute keeps its own value.
+    #[test]
+    fn a_normalized_key_does_not_change_the_attribute_value() {
+        let doc = build_from_str_full(r#"<doc xml:id=" id3 "/>"#);
+        let mut nav = doc.create_navigator();
+        assert!(nav.move_to_first_child());
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.value(), " id3 ", "the visible value is untouched");
+    }
+
+    /// F&O §15.5.2: "such a node will never be selected", so a value that is
+    /// not a lexical NCName is not indexed at all.
+    #[test]
+    fn an_xml_id_that_is_not_an_ncname_is_never_registered() {
+        let doc = build_from_str_full(r#"<doc xml:id="1abc"/>"#);
+        assert_eq!(doc.get_element_by_id("1abc"), None);
+    }
+
+    /// A tree built through the push API — what a host that constructs trees
+    /// uses — registers its ids like a parsed one.
+    #[test]
+    fn the_push_api_registers_an_xml_id() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+
+        let code = builder.start_element("code", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "d").unwrap();
+        builder.end_of_attributes();
+        builder.text("Damson");
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("d"), Some(code));
+    }
+
+    /// The same through a `Fragment` buffer.
+    #[test]
+    fn the_push_api_registers_an_xml_id_in_a_fragment() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        let code = builder.start_element("code", "", "", &[]).unwrap();
+        builder.attribute("id", XML_NAMESPACE, "xml", "d").unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("d"), Some(code));
+    }
+
+    /// F&O §15.5.2: a well-formed but invalid tree may hold two elements with
+    /// the same id; the first in document order is the one selected, and it is
+    /// not an error. A host that constructs trees must not be refused one.
+    #[test]
+    fn a_duplicate_id_in_a_built_tree_keeps_the_first() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        let first = builder.start_element("a", "", "", &[]).unwrap();
+        builder
+            .attribute("id", XML_NAMESPACE, "xml", "dup")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.start_element("b", "", "", &[]).unwrap();
+        builder
+            .attribute("id", XML_NAMESPACE, "xml", "dup")
+            .unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("dup"), Some(first));
+    }
+
+    /// The scope of an id is one tree. A buffer may hold several top-level
+    /// trees, and the tree-scoped lookup keeps them apart; the unscoped one
+    /// answers with whichever comes first in document order.
+    #[test]
+    fn two_trees_of_one_buffer_do_not_share_ids() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder_fragment(&arena, &names);
+
+        let tree = |builder: &mut BufferDocumentBuilder<'_>, name: &str, id: &str| {
+            let elem = builder.start_element(name, "", "", &[]).unwrap();
+            builder.attribute("id", XML_NAMESPACE, "xml", id).unwrap();
+            builder.end_of_attributes();
+            builder.end_element().unwrap();
+            elem
+        };
+        let a = tree(&mut builder, "a", "x");
+        let b = tree(&mut builder, "b", "y");
+        // A value that occurs in both trees.
+        let c = tree(&mut builder, "c", "shared");
+        let d = tree(&mut builder, "d", "shared");
+        let doc = builder.finalize().unwrap();
+
+        assert_eq!(doc.get_element_by_id_in_tree(a, "x"), Some(a));
+        assert_eq!(doc.get_element_by_id_in_tree(a, "y"), None);
+        assert_eq!(doc.get_element_by_id_in_tree(b, "y"), Some(b));
+        assert_eq!(doc.get_element_by_id_in_tree(b, "x"), None);
+
+        assert_eq!(doc.get_element_by_id_in_tree(c, "shared"), Some(c));
+        assert_eq!(doc.get_element_by_id_in_tree(d, "shared"), Some(d));
+        assert_eq!(
+            doc.get_element_by_id("shared"),
+            Some(c),
+            "unscoped: first in document order"
+        );
+    }
+
+    /// `register_xml_id` still refuses a second element of the same tree, and
+    /// accepts a repeat of the same element.
+    #[test]
+    fn register_xml_id_reports_a_duplicate_within_one_tree() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let mut builder = make_builder(&arena, &names);
+
+        builder.start_element("r", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        let a = builder.start_element("a", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        let b = builder.start_element("b", "", "", &[]).unwrap();
+        builder.end_of_attributes();
+        builder.end_element().unwrap();
+        builder.end_element().unwrap();
+
+        builder.register_xml_id("k", a).unwrap();
+        builder.register_xml_id("k", a).expect("idempotent");
+        assert!(matches!(
+            builder.register_xml_id("k", b),
+            Err(BufferDocumentError::DuplicateId(_))
+        ));
+        // A value that is not a lexical NCName is ignored, not an error.
+        builder.register_xml_id("1abc", b).unwrap();
+
+        let doc = builder.finalize().unwrap();
+        assert_eq!(doc.get_element_by_id("k"), Some(a));
+        assert_eq!(doc.get_element_by_id("1abc"), None);
+    }
 }
+
+#[cfg(test)]
+#[path = "id_index_tests.rs"]
+mod id_index_tests;

@@ -646,7 +646,13 @@ pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
 /// The spec-defined codes this crate reports through an error QName rather
 /// than through a variant of [`XPathError`], and which
 /// [`XPathError::error_code`] therefore resolves back to a `'static` string.
-pub const QNAMED_ERROR_CODES: &[&str] = &[DEFAULT_RAISED_ERROR, "FOCH0004", "FONS0004", "FORG0002"];
+pub const QNAMED_ERROR_CODES: &[&str] = &[
+    DEFAULT_RAISED_ERROR,
+    "FOCH0004",
+    "FODC0001",
+    "FONS0004",
+    "FORG0002",
+];
 
 /// The error QName and description of an error raised by `fn:error`.
 ///

@@ -376,10 +376,13 @@ pub fn root<N: DomNavigator>(
 /// If 1 arg: uses context item as reference node.
 /// If 2 args: second arg is the reference node.
 ///
-/// The reference node determines which document tree to search.
-/// Each string argument is tokenized by whitespace and each token
-/// is looked up via `find_element_by_id`. Results are deduplicated
-/// and returned in document order.
+/// The reference node determines which tree to search: F&O §15.5.2 selects
+/// the elements of the tree containing `$node`, and raises `FODC0001` when
+/// that tree's root is not a document node. The candidate IDREF values are
+/// `for $s in $arg return tokenize(normalize-space($s), ' ')[. castable as
+/// xs:IDREF]`, so tokenization is on XML whitespace and a token that is not
+/// an NCName is ignored — with no error for one that matches nothing.
+/// Results are deduplicated and returned in document order.
 ///
 /// Without DTD/schema ID declarations, the default `find_element_by_id`
 /// returns `None`, so this returns an empty sequence.
@@ -433,9 +436,18 @@ pub fn id<N: DomNavigator>(
         }
     };
 
-    // Navigate reference node to document root
+    // Navigate reference node to the root of its tree. F&O §15.5.2: "If the
+    // node ... is in a tree whose root is not a document node [err:FODC0001]
+    // is raised."
     let mut root_nav = ref_node;
     root_nav.move_to_root();
+    if root_nav.node_type() != DomNodeType::Root {
+        return Err(XPathError::raised(
+            crate::xpath::error::XQT_ERRORS_NAMESPACE,
+            "FODC0001",
+            Some("fn:id: the node is in a tree whose root is not a document node"),
+        ));
+    }
 
     // Collect all ID tokens from the first argument
     let id_arg = args.into_iter().next().unwrap();
@@ -464,26 +476,34 @@ pub fn id<N: DomNavigator>(
     Ok(XPathValue::from_sequence(items))
 }
 
-/// Collect whitespace-tokenized ID strings from an XPathValue argument.
+/// Collect the candidate IDREF values of an `fn:id` argument.
 ///
-/// Per the spec, each string value in the argument is split on whitespace
-/// and each resulting token is an IDREF to look up.
+/// F&O §15.5.2 defines them as `for $s in $arg return
+/// tokenize(normalize-space($s), ' ')[. castable as xs:IDREF]`: each string is
+/// a whitespace-separated token list, tokenized on **XML** whitespace (which
+/// is what `normalize-space` knows — not `char::is_whitespace`), and a token
+/// that is not a lexical NCName is dropped rather than looked up.
 fn collect_id_tokens<N: DomNavigator>(value: XPathValue<N>) -> Vec<String> {
+    /// XML whitespace: space, tab, carriage return, line feed.
+    fn is_xml_space(c: char) -> bool {
+        matches!(c, ' ' | '\t' | '\r' | '\n')
+    }
+
+    fn push_tokens(s: &str, tokens: &mut Vec<String>) {
+        tokens.extend(
+            s.split(is_xml_space)
+                .filter(|token| crate::namespace::is_ncname(token))
+                .map(str::to_string),
+        );
+    }
+
     let mut tokens = Vec::new();
     match value {
         XPathValue::Empty => {}
-        XPathValue::Item(item) => {
-            let s = item_string_value(item);
-            for token in s.split_whitespace() {
-                tokens.push(token.to_string());
-            }
-        }
+        XPathValue::Item(item) => push_tokens(&item_string_value(item), &mut tokens),
         XPathValue::Sequence(items) => {
             for item in items {
-                let s = item_string_value(item);
-                for token in s.split_whitespace() {
-                    tokens.push(token.to_string());
-                }
+                push_tokens(&item_string_value(item), &mut tokens);
             }
         }
     }

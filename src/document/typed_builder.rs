@@ -8,7 +8,6 @@ use std::io::BufRead;
 
 use bumpalo::Bump;
 
-use crate::namespace::table::XML_NAMESPACE;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
 use crate::validation::errors::ValidationError;
@@ -142,19 +141,35 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         let attr_ref =
             self.builder
                 .attribute(view.local_name, view.namespace_uri, view.prefix, view.value)?;
+        // This driver also reads a real XML document, so a duplicate `xml:id`
+        // is reported here exactly as the plain text parser reports it.
+        if let Some(taken) = self.builder.dropped_duplicate_id() {
+            return Err(BufferDocumentError::DuplicateId(taken.into_string()));
+        }
         self.current_attr_ref = Some(attr_ref);
         Ok(())
     }
 
     fn after_attribute(
         &mut self,
-        view: AttributeView<'_>,
+        _view: AttributeView<'_>,
         info: &SchemaInfo,
     ) -> Result<(), Self::Error> {
         let attr_ref = self
             .current_attr_ref
             .take()
             .expect("after_attribute without matching before_attribute");
+        // An attribute of an element with type alternatives is bound once, in
+        // `after_end_of_attributes`, with the type the selected alternative
+        // gives it: whatever this event carries is not final.
+        #[cfg(feature = "xsd11")]
+        if info.deferred_by_cta {
+            self.deferred_attr_refs.push(attr_ref);
+            return Ok(());
+        }
+        // Binding the attribute is also what files it in the id index when
+        // its typed value is an `xs:ID` (`set_node_binding`); an `xml:id` was
+        // filed by `attribute()` already.
         if let Some(tk) = info.schema_type {
             let binding = NodeSchemaBinding {
                 type_key: tk,
@@ -163,17 +178,6 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
                 content_type: None,
             };
             self.builder.set_node_binding(attr_ref, binding)?;
-        }
-        if view.local_name == "id" && view.namespace_uri == XML_NAMESPACE {
-            let owner_elem = *self
-                .elem_ref_stack
-                .last()
-                .expect("xml:id without an open element");
-            self.builder.register_xml_id(view.value, owner_elem)?;
-        }
-        #[cfg(feature = "xsd11")]
-        if info.deferred_by_cta {
-            self.deferred_attr_refs.push(attr_ref);
         }
         Ok(())
     }
@@ -210,6 +214,8 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
                     "deferred attribute count mismatch".into(),
                 ));
             }
+            // The final bindings of the attributes `after_attribute` deferred —
+            // and, through `set_node_binding`, their entries in the id index.
             for (attr_ref, attr_info) in deferred_refs
                 .iter()
                 .zip(view.deferred_attribute_results.iter())
@@ -1273,5 +1279,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Schema-typed xs:ID attributes are is-id nodes ────────────────
+
+    /// F&O §15.5.2: "E has an attribute node whose is-id property is true and
+    /// whose typed value is equal to V". A schema-validated `xs:ID` attribute
+    /// has that property, and it is the annotation the validator attaches that
+    /// says which attributes do.
+    #[test]
+    fn a_schema_typed_id_attribute_is_findable() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="key" type="xs:ID"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_doc(
+            r#"<root><item key="a"/><item key=" b "/></root>"#,
+            &arena,
+            &schema_set,
+        );
+
+        let found = doc.get_element_by_id("a").expect("the xs:ID is indexed");
+        let mut nav = doc.create_navigator_at(found);
+        assert_eq!(nav.local_name(), "item");
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.value(), "a");
+
+        // The key is whitespace-normalized; the attribute value is not.
+        let padded = doc.get_element_by_id("b").expect("a padded xs:ID too");
+        let mut nav = doc.create_navigator_at(padded);
+        assert!(nav.move_to_first_attribute());
+        assert_eq!(nav.value(), " b ", "the visible value is untouched");
+    }
+
+    /// An attribute of an ordinary type is not an is-id node.
+    #[test]
+    fn a_plain_attribute_is_not_indexed_as_an_id() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="key" type="xs:NCName"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let arena = Bump::new();
+        let doc = build_doc(r#"<root key="a"/>"#, &arena, &schema_set);
+        assert_eq!(doc.get_element_by_id("a"), None);
     }
 }

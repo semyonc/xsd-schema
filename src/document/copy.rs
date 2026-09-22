@@ -749,8 +749,10 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// Errors when the element already has a child
     /// ([`CopyError::AttributeAfterContent`]) or when no element is open
     /// ([`CopyError::AttributeOutsideElement`]). An attribute whose expanded
-    /// name the element already carries replaces that one's value — the later
-    /// of two duplicates wins, and keeps the earlier one's prefix.
+    /// name the element already carries replaces that one's value and type
+    /// annotation — the later of two duplicates wins, and keeps the earlier
+    /// one's prefix. What the earlier one made its element answer to in
+    /// `fn:id` goes with it.
     ///
     /// ```
     /// use bumpalo::Bump;
@@ -815,12 +817,16 @@ impl<'a> BufferDocumentBuilder<'a> {
         let namespace_uri = attr.namespace_uri();
         let value = attr.value_ref();
 
-        // A duplicate keeps its place and its prefix; only the value (and the
-        // annotation, when one is preserved) is the later one's.
+        // A duplicate keeps its place and its prefix; its value and its
+        // annotation are the later one's — including the lack of one: an
+        // unannotated attribute must not inherit the earlier one's type.
         if let Some(existing) = self.find_attribute(local_name, namespace_uri) {
             self.set_attribute_value(existing, &value);
-            if let Some(binding) = binding {
-                self.set_node_binding(existing, binding)?;
+            match binding {
+                Some(binding) => {
+                    self.set_node_binding(existing, binding)?;
+                }
+                None => self.clear_node_binding(existing),
             }
             return Ok(());
         }
@@ -1230,6 +1236,31 @@ mod tests {
             "the copy has the same content",
         );
         assert_eq!(xml_of(&copied), r#"<a k="1">t<b/></a>"#);
+    }
+
+    /// A copied subtree is a new tree, and it carries its `xml:id`s: the copy
+    /// goes through `BufferDocumentBuilder::attribute`, which is the one place
+    /// an id is registered.
+    #[test]
+    fn a_copied_subtree_carries_its_ids() {
+        let arena = Bump::new();
+        let names = NameTable::new();
+        let doc = parse(r#"<r><d xml:id="keep"><t>x</t></d></r>"#, &arena, &names);
+        let source = element_at(&doc, &[0, 0]);
+        assert_eq!(source.local_name(), "d");
+
+        let mut builder = new_builder(&arena, &names);
+        builder
+            .copy_subtree(&source, CopyOptions::default())
+            .unwrap();
+        let copied = builder.finalize().unwrap();
+
+        let found = copied
+            .get_element_by_id("keep")
+            .expect("the copy has the id");
+        let mut nav = copied.create_navigator();
+        assert!(nav.move_to_first_child());
+        assert_eq!(nav.current_ref(), found, "the id points at the copy's root");
     }
 
     // ── Content rules ─────────────────────────────────────────────────

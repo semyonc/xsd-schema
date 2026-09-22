@@ -1,5 +1,6 @@
 //! Top-level `BufferDocument` struct assembling all storage primitives.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,6 +27,202 @@ pub(crate) fn next_document_serial() -> u64 {
     NEXT_DOCUMENT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
+/// The flat index of the node every buffer starts with: the document node the
+/// builder allocates first. `BufferDocument::root` normally names it, but
+/// [`BufferDocument::set_cta_fragment`] moves the root onto an element, so the
+/// two cannot be used interchangeably.
+pub(crate) const DOCUMENT_NODE: u32 = 0;
+
+/// The whitespace of XML: space, tab, carriage return and line feed.
+///
+/// This is the set `fn:normalize-space` and the tokenized attribute types work
+/// on, and it is deliberately **not** `char::is_whitespace`, which also matches
+/// NEL, NBSP and the Unicode space separators.
+#[inline]
+fn is_xml_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// `value` with XML whitespace stripped at both ends and collapsed inside.
+fn normalize_space(value: &str) -> Cow<'_, str> {
+    let trimmed = value.trim_matches(is_xml_space);
+    if !trimmed.contains(is_xml_space) {
+        return Cow::Borrowed(trimmed);
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    let mut pending_space = false;
+    for c in trimmed.chars() {
+        if is_xml_space(c) {
+            pending_space = true;
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The key an id value is filed under, or `None` when it is not usable as one.
+///
+/// The key is the value normalized as a tokenized attribute type is — XML
+/// whitespace stripped at both ends and collapsed inside — which is what makes
+/// `xml:id=" d "` answer to `id('d')`. Only the *key* is normalized: the
+/// attribute keeps its own value for `string()`, serialization and copying.
+///
+/// A normalized value that is not a lexical NCName yields `None` and is never
+/// indexed, because F&O §15.5.2 says of an is-id node whose value is not a
+/// lexical `xs:ID` that "such a node will never be selected".
+pub(crate) fn id_index_key(value: &str) -> Option<Cow<'_, str>> {
+    let normalized = normalize_space(value);
+    match &normalized {
+        Cow::Borrowed(s) if crate::namespace::is_ncname(s) => Some(normalized),
+        Cow::Owned(s) if crate::namespace::is_ncname(s) => Some(normalized),
+        _ => None,
+    }
+}
+
+/// One element's claim on an id value.
+///
+/// `attr` is the attribute node that makes `elem` answer to the value — an
+/// `xml:id`, or an attribute whose typed value is an `xs:ID` — so that the
+/// claim can be withdrawn when that attribute's value or annotation is
+/// replaced. It is [`NULL`] for a value filed by
+/// [`BufferDocumentBuilder::register_xml_id`](super::BufferDocumentBuilder::register_xml_id),
+/// which no attribute stands behind and which is never withdrawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IdClaim {
+    /// The root of the tree `elem` belongs to (see
+    /// [`BufferDocument::tree_root_of`]).
+    pub(crate) tree: u32,
+    pub(crate) elem: u32,
+    pub(crate) attr: u32,
+}
+
+/// Every claim on one id value.
+///
+/// The scope of an id is one *tree*, and one buffer can hold several top-level
+/// trees, so a lookup is by `(tree, value)`. The tree is kept here, beside the
+/// element, rather than inside the map key, so that a lookup can borrow a
+/// `&str` straight into the map and never allocate.
+///
+/// Every claim is kept — including a second element's claim on a value its
+/// tree already has, which F&O §15.5.2 never selects — because a claim can be
+/// withdrawn: when the element that was selected gives the value up, the next
+/// one in document order must answer. Lookups therefore take the *smallest*
+/// element reference, and node references are handed out in document order, so
+/// that is exactly F&O §15.5.2's "the first such element in document order".
+#[derive(Debug, Clone)]
+pub(crate) enum IdSlot {
+    /// One claim — the usual case, and free of indirection.
+    One(IdClaim),
+    /// Several claims, in the order they were filed. Empty only transiently,
+    /// after the last claim was withdrawn; the key is then removed.
+    Many(Vec<IdClaim>),
+}
+
+impl IdSlot {
+    fn claims(&self) -> &[IdClaim] {
+        match self {
+            IdSlot::One(claim) => std::slice::from_ref(claim),
+            IdSlot::Many(claims) => claims,
+        }
+    }
+
+    /// The first element in document order with this value inside `tree`.
+    pub(crate) fn in_tree(&self, tree: u32) -> Option<u32> {
+        match self {
+            IdSlot::One(claim) => (claim.tree == tree).then_some(claim.elem),
+            IdSlot::Many(claims) => claims
+                .iter()
+                .filter(|claim| claim.tree == tree)
+                .map(|claim| claim.elem)
+                .min(),
+        }
+    }
+
+    /// The first element in document order, across every tree of the buffer.
+    fn first(&self) -> u32 {
+        self.claims()
+            .iter()
+            .map(|claim| claim.elem)
+            .min()
+            .unwrap_or(NULL)
+    }
+
+    /// Whether `elem` of `tree` holds a claim of the given kind: made by an
+    /// attribute (`manual == false`) or by `register_xml_id` (`manual`).
+    pub(crate) fn has_claim(&self, tree: u32, elem: u32, manual: bool) -> bool {
+        self.claims()
+            .iter()
+            .any(|claim| claim.tree == tree && claim.elem == elem && (claim.attr == NULL) == manual)
+    }
+
+    /// Records `claim`, and answers whether another element of its tree
+    /// already holds the value — i.e. whether the new claim is a duplicate
+    /// that lookups will not select while that one stands.
+    pub(crate) fn add(&mut self, claim: IdClaim) -> bool {
+        let contested = self
+            .claims()
+            .iter()
+            .any(|held| held.tree == claim.tree && held.elem != claim.elem);
+        match self {
+            IdSlot::One(held) => *self = IdSlot::Many(vec![*held, claim]),
+            IdSlot::Many(claims) => claims.push(claim),
+        }
+        contested
+    }
+
+    /// Withdraws the claim `attr` made, if it made one.
+    pub(crate) fn withdraw(&mut self, attr: u32) {
+        match self {
+            IdSlot::One(claim) if claim.attr == attr => *self = IdSlot::Many(Vec::new()),
+            IdSlot::One(_) => {}
+            IdSlot::Many(claims) => claims.retain(|claim| claim.attr != attr),
+        }
+    }
+
+    /// Whether no claim is left, so the key can go.
+    pub(crate) fn is_empty(&self) -> bool {
+        matches!(self, IdSlot::Many(claims) if claims.is_empty())
+    }
+}
+
+/// Files `claim` under `key`, creating the entry if need be; answers whether
+/// another element of the claim's tree already held the value (see
+/// [`IdSlot::add`]).
+pub(crate) fn file_id_claim(
+    index: &mut HashMap<Box<str>, IdSlot>,
+    key: &str,
+    claim: IdClaim,
+) -> bool {
+    match index.get_mut(key) {
+        Some(slot) => slot.add(claim),
+        None => {
+            index.insert(key.into(), IdSlot::One(claim));
+            false
+        }
+    }
+}
+
+/// Withdraws the claim the attribute node `attr` made under `key`, and drops
+/// the key once nothing claims it.
+///
+/// `key` is what the claim was filed under. A caller recomputes it from the
+/// attribute as it stands — its name, its value and its annotation — which is
+/// exact: those are the inputs the key was computed from when it was filed, and
+/// the builder withdraws the claim *before* it changes any of them.
+pub(crate) fn withdraw_id_claim(index: &mut HashMap<Box<str>, IdSlot>, key: &str, attr: u32) {
+    if let Some(slot) = index.get_mut(key) {
+        slot.withdraw(attr);
+        if slot.is_empty() {
+            index.remove(key);
+        }
+    }
+}
+
 /// Compact, cache-friendly XML document representation.
 ///
 /// Built on a flat array of 16-byte [`Node`] structs with power-of-2
@@ -48,7 +245,9 @@ pub struct BufferDocument<'a> {
     /// Maintained by
     /// [`BufferDocumentBuilder::set_node_binding`](super::builder::BufferDocumentBuilder::set_node_binding),
     /// the single place a [`NodeSchemaBinding`](super::NodeSchemaBinding) is
-    /// ever attached to a node, so it is exact rather than a hint.
+    /// ever attached to a node, and by the builder's `clear_node_binding`, the
+    /// one place a binding is taken away (the builder counts the annotated
+    /// nodes), so it is exact rather than a hint.
     pub(crate) has_type_annotations: bool,
     pub(crate) root: u32,
     pub(crate) options: BufferDocumentOptions,
@@ -58,7 +257,12 @@ pub struct BufferDocument<'a> {
     pub(crate) element_namespaces: HashMap<u32, NsRef>,
     pub(crate) element_index: ElementIndex,
     pub(crate) source_spans: NodeSourceSpans,
-    pub(crate) id_elements: HashMap<Box<str>, u32>,
+    /// The id index: every element that answers to an id value — through an
+    /// `xml:id`, an attribute whose typed value is an `xs:ID`, or
+    /// `register_xml_id` — keyed by the normalized value; see
+    /// [`id_index_key`] for the key and [`IdSlot`] for the claims and the tree
+    /// scope.
+    pub(crate) id_elements: HashMap<Box<str>, IdSlot>,
     pub(crate) schema_set: Option<&'a SchemaSet>,
     /// Document-level base URI surfaced by `BufferDocNavigator::base_uri()`
     /// when no `xml:base` is found and the cursor reaches the document root.
@@ -305,9 +509,56 @@ impl<'a> BufferDocument<'a> {
         }
     }
 
-    /// Looks up an element node by its `xml:id` value.
+    /// The root of the tree `node` belongs to.
+    ///
+    /// That is the topmost ancestor below the document node — the node the id
+    /// index is keyed by. A node whose upward link has been cut (the document
+    /// node itself, or an element
+    /// [`set_cta_fragment`](Self::set_cta_fragment) has re-rooted) is its own
+    /// tree root.
+    pub(crate) fn tree_root_of(&self, node: u32) -> u32 {
+        let mut cursor = node;
+        loop {
+            let parent = self.nodes.get(cursor).parent;
+            if parent == NULL || parent == DOCUMENT_NODE {
+                return cursor;
+            }
+            cursor = parent;
+        }
+    }
+
+    /// Looks up an element node by its id: the value of its `xml:id`, or of an
+    /// attribute whose typed value is a single `xs:ID`.
+    ///
+    /// The value is normalized the same way the index key is: XML whitespace
+    /// is stripped at both ends and collapsed inside, and a value that is not
+    /// a lexical NCName never matches.
+    ///
+    /// A buffer can hold more than one tree, and the scope of an id is one
+    /// tree; this looks across all of them and answers with the element that
+    /// comes **first in document order**. Use
+    /// [`get_element_by_id_in_tree`](Self::get_element_by_id_in_tree) to stay
+    /// inside one tree, which is what `fn:id` needs.
     pub fn get_element_by_id(&self, id: &str) -> Option<u32> {
-        self.id_elements.get(id).copied()
+        let key = id_index_key(id)?;
+        self.id_elements.get(key.as_ref()).map(IdSlot::first)
+    }
+
+    /// Looks up an element node by its id **within one tree**.
+    ///
+    /// `node` is any node of the wanted tree — the tree root is resolved from
+    /// it — so a caller can pass the node it already holds. Passing the
+    /// document node means "every tree of this buffer", and then this is
+    /// [`get_element_by_id`](Self::get_element_by_id).
+    pub fn get_element_by_id_in_tree(&self, node: u32, id: &str) -> Option<u32> {
+        let key = id_index_key(id)?;
+        let slot = self.id_elements.get(key.as_ref())?;
+        let tree = self.tree_root_of(node);
+        if tree == DOCUMENT_NODE {
+            Some(slot.first())
+        } else {
+            slot.in_tree(tree)
+        }
     }
 
     // ── CTA fragment configuration ─────────────────────────────────────
@@ -570,9 +821,85 @@ mod tests {
         let arena = Bump::new();
         let names = NameTable::new();
         let mut doc = make_doc(&arena, &names);
-        doc.id_elements.insert("foo".into(), 42);
+        doc.id_elements.insert(
+            "foo".into(),
+            IdSlot::One(IdClaim {
+                tree: 1,
+                elem: 42,
+                attr: 43,
+            }),
+        );
 
         assert_eq!(doc.get_element_by_id("foo"), Some(42));
+        // The lookup normalizes its argument the way the key was normalized.
+        assert_eq!(doc.get_element_by_id("  foo\n"), Some(42));
+        // A value that is not a lexical NCName can never match.
+        assert_eq!(doc.get_element_by_id("fo o"), None);
+    }
+
+    #[test]
+    fn id_index_key_normalizes_and_filters() {
+        assert_eq!(id_index_key("d").as_deref(), Some("d"));
+        assert_eq!(id_index_key(" \t d \r\n").as_deref(), Some("d"));
+        // Collapsing an inner run can only ever produce a non-NCName.
+        assert_eq!(id_index_key("a \t b").as_deref(), None);
+        // U+00A0 is not XML whitespace, and not a NameChar either.
+        assert_eq!(id_index_key("a\u{a0}b").as_deref(), None);
+        assert_eq!(id_index_key("1abc").as_deref(), None);
+        assert_eq!(id_index_key("p:q").as_deref(), None);
+        assert_eq!(id_index_key("   ").as_deref(), None);
+    }
+
+    fn claim(tree: u32, elem: u32, attr: u32) -> IdClaim {
+        IdClaim { tree, elem, attr }
+    }
+
+    #[test]
+    fn an_id_slot_answers_with_the_first_element_of_each_tree() {
+        let mut slot = IdSlot::One(claim(1, 1, 2));
+        assert!(slot.add(claim(1, 9, 10)), "the tree already has one");
+        assert_eq!(slot.in_tree(1), Some(1));
+        assert!(!slot.add(claim(5, 5, 6)), "another tree gets its own entry");
+        assert_eq!(slot.in_tree(5), Some(5));
+        assert_eq!(slot.in_tree(7), None);
+        assert_eq!(slot.first(), 1, "first in document order");
+        // A second claim of the same element is not a duplicate.
+        let mut own = IdSlot::One(claim(1, 1, 2));
+        assert!(!own.add(claim(1, 1, NULL)));
+        assert!(own.has_claim(1, 1, true) && own.has_claim(1, 1, false));
+    }
+
+    #[test]
+    fn withdrawing_a_claim_hands_the_value_to_the_next_element() {
+        let mut slot = IdSlot::One(claim(1, 3, 4));
+        slot.add(claim(1, 9, 10));
+        slot.add(claim(1, 7, 8));
+        slot.withdraw(4);
+        assert_eq!(slot.in_tree(1), Some(7), "next in document order");
+        slot.withdraw(8);
+        assert_eq!(slot.in_tree(1), Some(9));
+        slot.withdraw(99); // no such claim: nothing changes
+        assert_eq!(slot.in_tree(1), Some(9));
+        slot.withdraw(10);
+        assert!(slot.is_empty());
+
+        let mut one = IdSlot::One(claim(1, 3, 4));
+        one.withdraw(5);
+        assert!(!one.is_empty());
+        one.withdraw(4);
+        assert!(one.is_empty());
+    }
+
+    #[test]
+    fn a_withdrawn_last_claim_takes_its_key_along() {
+        let mut index = HashMap::new();
+        assert!(!file_id_claim(&mut index, "k", claim(1, 3, 4)));
+        assert!(file_id_claim(&mut index, "k", claim(1, 5, 6)));
+        withdraw_id_claim(&mut index, "k", 4);
+        assert_eq!(index.get("k").and_then(|slot| slot.in_tree(1)), Some(5));
+        withdraw_id_claim(&mut index, "k", 6);
+        assert!(index.is_empty());
+        withdraw_id_claim(&mut index, "absent", 6); // harmless
     }
 
     #[test]
