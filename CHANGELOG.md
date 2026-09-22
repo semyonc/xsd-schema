@@ -64,6 +64,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `fn:contains`, `fn:starts-with`, `fn:ends-with`, `fn:substring-before` and
+  `fn:substring-after` no longer ignore their `$collation` argument. They
+  atomized it and dropped it, so a call naming any collation at all was
+  answered under the codepoint collation and a collation the implementation
+  does not support went unreported. They now use the collation, and a URI the
+  implementation does not support raises `FOCH0002` as F&O §7.3.1 requires.
+  `fn:index-of`, `fn:distinct-values`, `fn:min` and `fn:max` ignored theirs in
+  the same way and likewise use it now — `fn:min` and `fn:max` only for
+  `xs:string` items, since F&O §15.4.3 ignores the collation for every other
+  type.
 - A name test on the `namespace::` axis now selects namespace nodes. The
   principal node kind of that axis is namespace, and a namespace node's name is
   its prefix, in no namespace — but the name-test matcher rejected every node
@@ -379,9 +389,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of raising. The two rules are unchanged: a `\` must be followed by a
   `\` or a `$`, and a `$` that is not part of such a pair must be followed by
   a digit.
-
 ### Added
 
+- Collations. The module `xpath::collation` with the trait `Collation`, the
+  trait `CollationResolver` and the constant `CODEPOINT_COLLATION_URI`, plus
+  `XPathContext::with_collation_resolver`,
+  `XPathContext::with_default_collation` and
+  `XPathContext::default_collation`. The Unicode codepoint collation is
+  implemented here and is still the default; every other collation is supplied
+  by the host through the resolver callback, so the crate takes no dependency
+  for collation data. A `Collation` need only implement `compare`; an optional
+  `sort_key` lets the engine keep answering a general comparison with a hash
+  index instead of comparing every pair, and an optional `find` (with the
+  provided `starts_with` and `ends_with`) supplies the collation units that
+  `fn:contains`, `fn:starts-with`, `fn:ends-with`, `fn:substring-before` and
+  `fn:substring-after` are defined over — without it they raise `FOCH0004`.
+  The `$collation` argument of `fn:compare`, `fn:contains`, `fn:starts-with`,
+  `fn:ends-with`, `fn:substring-before`, `fn:substring-after`, `fn:index-of`,
+  `fn:distinct-values`, `fn:deep-equal`, `fn:min` and `fn:max`, and the static
+  context's default collation for the value and general comparisons (`eq`,
+  `lt`, `=`, `<`, …, including `=` and `!=` between strings in XPath 1.0
+  compatibility mode, which XPath 2.0 §3.5.2 evaluates with `eq` and `ne`),
+  now go through it; `fn:default-collation()` returns the
+  property rather than a constant. A relative collation URI is resolved
+  against the static base URI (F&O §7.3.1). Nothing changes under the
+  codepoint collation: it is answered without consulting the resolver, on the
+  same code path and at the same speed as before. `XPathError::error_code`
+  reports `FOCH0004` for the new error, which travels as an error QName;
+  `XPathError::collation_no_units` builds it.
 - `XPathContext::with_xpath10_compatibility(bool)` and
   `XPathContext::xpath10_compatibility()`. This is the static-context property
   XPath 2.0 calls *XPath 1.0 compatibility mode*, and it is distinct from
@@ -451,9 +486,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   annotation?", maintained where bindings are attached instead of computed by
   walking the tree. It is `true` exactly when some node would report
   `DomNavigator::type_annotation() == Some(_)`, and follows the annotation
-  mode of a copy.
-
-## [0.2.0] - 2026-09-13
+  mode of a copy.## [0.2.0] - 2026-09-13
 
 A breaking release, in three parts:
 

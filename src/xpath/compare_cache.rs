@@ -108,6 +108,7 @@ use ahash::AHasher;
 
 use crate::types::value::XmlValue;
 use crate::xpath::arena::{AstArena, AstNodeId};
+use crate::xpath::collation::{self, CollationRef};
 use crate::xpath::context::{DynamicContext, VarSlotId, XPathContext};
 use crate::xpath::deps::{self, SlotSet};
 use crate::xpath::error::XPathError;
@@ -397,14 +398,20 @@ impl BucketIndex {
     /// Index every value of `class` in `bucket`, or `None` when a key conversion
     /// fails — a hard error is then possible and this class pair must never be
     /// answered from an index.
-    fn build(values: &[XmlValue], classes: &[Class], class: Class, bucket: Bucket) -> Option<Self> {
+    fn build(
+        values: &[XmlValue],
+        classes: &[Class],
+        class: Class,
+        bucket: Bucket,
+        collation: CollationRef<'_>,
+    ) -> Option<Self> {
         let mut slots: Vec<(u32, u64)> = Vec::new();
         let mut never: Vec<u32> = Vec::new();
         for (index, value) in values.iter().enumerate() {
             if classes[index] != class {
                 continue;
             }
-            match general_compare::key_hash(value, class, bucket) {
+            match general_compare::key_hash(value, class, bucket, collation) {
                 KeyHash::Found(hash) => slots.push((index as u32, hash)),
                 KeyHash::Never => never.push(index as u32),
                 KeyHash::Failed => return None,
@@ -478,9 +485,9 @@ impl CachedOperand {
 
     /// Ensure the table for `(class, bucket)` exists; `false` when it cannot be
     /// built.
-    fn ensure_table(&mut self, class: Class, bucket: Bucket) -> bool {
+    fn ensure_table(&mut self, class: Class, bucket: Bucket, collation: CollationRef<'_>) -> bool {
         if !self.tables.contains_key(&(class, bucket)) {
-            let built = BucketIndex::build(&self.values, &self.classes, class, bucket);
+            let built = BucketIndex::build(&self.values, &self.classes, class, bucket, collation);
             self.tables.insert((class, bucket), built);
         }
         matches!(self.tables.get(&(class, bucket)), Some(Some(_)))
@@ -830,6 +837,12 @@ fn probe<N: DomNavigator>(
     let probe_values = general_compare::atomize_items(items(varying))?;
 
     let static_context = ctx.static_context;
+    // The static context's default collation, which cannot change during a run,
+    // so an index built under it stays keyed the way this probe reads it. Under
+    // the codepoint collation — the default — this is a discriminant test and
+    // every key below is the one it always was.
+    let active = collation::resolve_default(static_context);
+    let collation = active.as_ref();
     let cache = ctx.general_compare_cache_mut();
     let state = cache.state_mut(arena_id, node)?;
     let State::Ready(ready) = state else {
@@ -837,9 +850,21 @@ fn probe<N: DomNavigator>(
     };
     let side = ready.side;
     let outcome = if is_eq {
-        indexed_eq(static_context, side, &mut ready.operand, &probe_values)
+        indexed_eq(
+            static_context,
+            side,
+            &mut ready.operand,
+            &probe_values,
+            collation,
+        )
     } else {
-        indexed_ne(static_context, side, &mut ready.operand, &probe_values)
+        indexed_ne(
+            static_context,
+            side,
+            &mut ready.operand,
+            &probe_values,
+            collation,
+        )
     };
     match outcome {
         FastOutcome::Decided(result) => Some(Ok(result)),
@@ -875,6 +900,7 @@ fn probe_keys(
     classes: &[Class],
     class: Class,
     bucket: Bucket,
+    collation: CollationRef<'_>,
 ) -> Option<ProbeKeys> {
     let mut found: Vec<(usize, u64)> = Vec::new();
     let mut never: Vec<usize> = Vec::new();
@@ -882,7 +908,7 @@ fn probe_keys(
         if classes[index] != class {
             continue;
         }
-        match general_compare::key_hash(value, class, bucket) {
+        match general_compare::key_hash(value, class, bucket, collation) {
             KeyHash::Found(hash) => found.push((index, hash)),
             KeyHash::Never => never.push(index),
             KeyHash::Failed => return None,
@@ -897,6 +923,7 @@ fn indexed_eq(
     side: Side,
     cached: &mut CachedOperand,
     probe: &[XmlValue],
+    collation: CollationRef<'_>,
 ) -> FastOutcome {
     if probe.is_empty() || cached.values.is_empty() {
         return FastOutcome::Decided(false);
@@ -914,13 +941,13 @@ fn indexed_eq(
     // somewhere in the product, and a hard error can preempt a true pair, so
     // nothing may be decided here.
     for &(_, cached_class, bucket) in &joins {
-        if !cached.ensure_table(cached_class, bucket) {
+        if !cached.ensure_table(cached_class, bucket, collation) {
             return FastOutcome::Fallback;
         }
     }
     let mut keys: Vec<Vec<(usize, u64)>> = Vec::with_capacity(joins.len());
     for &(probe_class, _, bucket) in &joins {
-        match probe_keys(probe, &probe_classes, probe_class, bucket) {
+        match probe_keys(probe, &probe_classes, probe_class, bucket, collation) {
             Some((found, _never)) => keys.push(found),
             None => return FastOutcome::Fallback,
         }
@@ -938,7 +965,7 @@ fn indexed_eq(
             while slot != NO_SLOT {
                 let cached_index = table.slots[slot as usize].0 as usize;
                 let (left, right) = side.order(&probe[probe_index], &cached.values[cached_index]);
-                match general_compare::confirm(context, left, right) {
+                match general_compare::confirm(context, left, right, collation) {
                     Ok(true) => return FastOutcome::Decided(true),
                     Ok(false) => {}
                     // A class pair classified as comparable must not raise. That
@@ -961,7 +988,7 @@ fn indexed_eq(
     let (left_values, right_values) = side.order(probe, cached.values.as_slice());
     match general_compare::first_incomparable_pair(left_classes, right_classes, &incomparable) {
         Some((i, j)) => {
-            match general_compare::confirm(context, &left_values[i], &right_values[j]) {
+            match general_compare::confirm(context, &left_values[i], &right_values[j], collation) {
                 Err(err) => FastOutcome::Raise(err),
                 // The class pair was classified as always-raising, so this is
                 // unreachable; falling back is the safe way to say so.
@@ -997,6 +1024,7 @@ fn indexed_ne(
     side: Side,
     cached: &mut CachedOperand,
     probe: &[XmlValue],
+    collation: CollationRef<'_>,
 ) -> FastOutcome {
     if probe.is_empty() || cached.values.is_empty() {
         return FastOutcome::Decided(false);
@@ -1012,13 +1040,13 @@ fn indexed_ne(
     // Phase 1 — as for `=`: unless every key of the product can be computed, a
     // hard error could preempt the unequal pair this would report.
     for &(_, cached_class, bucket) in &joins {
-        if !cached.ensure_table(cached_class, bucket) {
+        if !cached.ensure_table(cached_class, bucket, collation) {
             return FastOutcome::Fallback;
         }
     }
     let mut keys: Vec<ProbeKeys> = Vec::with_capacity(joins.len());
     for &(probe_class, _, bucket) in &joins {
-        match probe_keys(probe, &probe_classes, probe_class, bucket) {
+        match probe_keys(probe, &probe_classes, probe_class, bucket, collation) {
             Some(entry) => keys.push(entry),
             None => return FastOutcome::Fallback,
         }
@@ -1055,7 +1083,7 @@ fn indexed_ne(
             continue;
         };
         let (left, right) = side.order(&probe[probe_index], &cached.values[cached_index]);
-        match general_compare::confirm(context, left, right) {
+        match general_compare::confirm(context, left, right, collation) {
             Ok(false) => return FastOutcome::Decided(true),
             // The keys said these cannot be equal, or the pair was classified as
             // comparable and raised anyway: either way the classification is

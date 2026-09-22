@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use xsd_schema::namespace::table::NameTable;
 use xsd_schema::types::value::XmlValue;
 use xsd_schema::xpath::api::XPathExpr;
+use xsd_schema::xpath::collation::{Collation, CollationResolver};
 use xsd_schema::xpath::iterator::VecNodeIterator;
 use xsd_schema::xpath::operators::general_eq_iter;
 use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathValue, XmlItem};
@@ -154,6 +155,100 @@ fn bench_atomic_shapes(sizes: &[usize], floor: Duration) {
             run_tail_hit = elapsed < GIVE_UP_AFTER;
         } else {
             skipped("(d) single hit at the very end", size);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same shape under a host collation
+// ---------------------------------------------------------------------------
+
+/// An ASCII case-insensitive collation that offers a sort key, so the hash
+/// index keys by it.
+struct Caseless;
+
+impl Collation for Caseless {
+    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        a.bytes()
+            .map(|b| b.to_ascii_lowercase())
+            .cmp(b.bytes().map(|b| b.to_ascii_lowercase()))
+    }
+
+    fn sort_key(&self, s: &str) -> Option<Vec<u8>> {
+        Some(s.bytes().map(|b| b.to_ascii_lowercase()).collect())
+    }
+}
+
+/// The same ordering with no sort key, so the index declines and the pairwise
+/// loop answers.
+struct CaselessNoKey;
+
+impl Collation for CaselessNoKey {
+    fn compare(&self, a: &str, b: &str) -> std::cmp::Ordering {
+        Caseless.compare(a, b)
+    }
+}
+
+#[derive(Debug)]
+struct BenchCollations {
+    with_key: bool,
+}
+
+impl CollationResolver for BenchCollations {
+    fn resolve(&self, _uri: &str) -> Option<std::rc::Rc<dyn Collation>> {
+        Some(if self.with_key {
+            std::rc::Rc::new(Caseless) as std::rc::Rc<dyn Collation>
+        } else {
+            std::rc::Rc::new(CaselessNoKey) as std::rc::Rc<dyn Collation>
+        })
+    }
+}
+
+const BENCH_COLLATION: &str = "http://example.com/collation/bench";
+
+/// What a non-codepoint default collation costs on the `(a)` shape — the one
+/// the index is built for. The codepoint rows above must not move; these are
+/// the price of asking for something else.
+fn bench_collations(sizes: &[usize], floor: Duration) {
+    let names = NameTable::new();
+    let with_key = BenchCollations { with_key: true };
+    let without_key = BenchCollations { with_key: false };
+
+    let keyed = XPathContext::new(&names)
+        .with_collation_resolver(&with_key)
+        .with_default_collation(BENCH_COLLATION);
+    let unkeyed = XPathContext::new(&names)
+        .with_collation_resolver(&without_key)
+        .with_default_collation(BENCH_COLLATION);
+
+    let mut run_keyed = true;
+    let mut run_unkeyed = true;
+
+    for &size in sizes {
+        if run_keyed {
+            let left = sequence(strings("left", size));
+            let right = sequence(strings("right", size));
+            let elapsed = time(floor, || {
+                let hit = general_eq_iter(&keyed, &left, &right).unwrap();
+                assert!(!hit);
+            });
+            row("(e) collation, with sort_key", size, elapsed);
+            run_keyed = elapsed < GIVE_UP_AFTER;
+        } else {
+            skipped("(e) collation, with sort_key", size);
+        }
+
+        if run_unkeyed {
+            let left = sequence(strings("left", size));
+            let right = sequence(strings("right", size));
+            let elapsed = time(floor, || {
+                let hit = general_eq_iter(&unkeyed, &left, &right).unwrap();
+                assert!(!hit);
+            });
+            row("(e) collation, no sort_key", size, elapsed);
+            run_unkeyed = elapsed < GIVE_UP_AFTER;
+        } else {
+            skipped("(e) collation, no sort_key", size);
         }
     }
 }
@@ -518,6 +613,9 @@ fn main() {
     bench_atomic_shapes(sizes, floor);
     bench_untyped_attributes(sizes, floor);
     bench_small_operands(floor);
+    // The codepoint rows above must not move; these show what a host collation
+    // costs, with and without a sort key.
+    bench_collations(sizes, floor);
 
     println!();
     println!("== the same comparison node, evaluated once per item ==");

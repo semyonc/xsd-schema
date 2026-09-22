@@ -12,12 +12,13 @@ use rust_decimal::Decimal;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::BinaryOpKind;
+use crate::xpath::collation;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
-use crate::xpath::operators::{eval_binary, value_gt, value_lt};
+use crate::xpath::operators::{eval_binary, value_gt_collated, value_lt_collated};
 use crate::xpath::DomNavigator;
 
-use super::{atomize_sequence, atomize_to_single_opt, XPathValue};
+use super::{atomize_sequence, atomize_to_single_opt, atomize_to_string_opt, XPathValue};
 
 // ============================================================================
 // fn:sum($arg as xs:anyAtomicType*, $zero as xs:anyAtomicType?) as xs:anyAtomicType?
@@ -112,16 +113,25 @@ pub fn avg<N: DomNavigator>(
 ///
 /// If the sequence is empty, returns the empty sequence.
 /// Per XPath 2.0: If the converted sequence contains NaN, NaN is returned.
+///
+/// F&O §15.4.3 uses the collation — the `$collation` argument, or the static
+/// context's default — only when the items are `xs:string` values (or values of
+/// a type derived from it); for any other type it is ignored. That is why the
+/// collation is resolved *without* the crate-private `ActiveCollation::require`:
+/// a URI nothing supports travels into the comparison and raises FOCH0002 at
+/// the first string comparison, so `min((1, 2), $unsupported)` is 1 while
+/// `min(('a', 'b'), $unsupported)` raises.
 pub fn min<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
         return Err(XPathError::wrong_number_of_arguments("min", 1, args.len()));
     }
 
+    let has_collation_arg = args.len() == 2;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let seq = args.remove(0);
-    // Collation argument (arg 1) is ignored for now
 
     let values = atomize_sequence(seq)?;
 
@@ -146,7 +156,7 @@ pub fn min<N: DomNavigator>(
 
     for value in promoted.iter().skip(1) {
         // Use operators::value_lt for comparison
-        if value_lt(value, &min_value)? {
+        if value_lt_collated(value, &min_value, collation.as_ref())? {
             min_value = value.clone();
         }
     }
@@ -162,16 +172,19 @@ pub fn min<N: DomNavigator>(
 ///
 /// If the sequence is empty, returns the empty sequence.
 /// Per XPath 2.0: If the converted sequence contains NaN, NaN is returned.
+///
+/// The collation is used exactly as [`min`] uses it.
 pub fn max<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.is_empty() || args.len() > 2 {
         return Err(XPathError::wrong_number_of_arguments("max", 1, args.len()));
     }
 
+    let has_collation_arg = args.len() == 2;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let seq = args.remove(0);
-    // Collation argument (arg 1) is ignored for now
 
     let values = atomize_sequence(seq)?;
 
@@ -196,7 +209,7 @@ pub fn max<N: DomNavigator>(
 
     for value in promoted.iter().skip(1) {
         // Use operators::value_gt for comparison
-        if value_gt(value, &max_value)? {
+        if value_gt_collated(value, &max_value, collation.as_ref())? {
             max_value = value.clone();
         }
     }
@@ -207,6 +220,26 @@ pub fn max<N: DomNavigator>(
 // ============================================================================
 // Helper Functions
 // ============================================================================
+
+/// The collation of a `fn:min` / `fn:max` call.
+///
+/// Unlike the other collation-aware functions this one does **not** raise
+/// FOCH0002 for a URI the host does not support: see [`min`] for why.
+fn call_collation<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: &mut Vec<XPathValue<N>>,
+    has_collation_arg: bool,
+) -> Result<crate::xpath::collation::ActiveCollation, XPathError> {
+    let explicit = if has_collation_arg {
+        atomize_to_string_opt(args.pop().unwrap())?
+    } else {
+        None
+    };
+    Ok(collation::resolve_collation_cached(
+        context,
+        explicit.as_deref(),
+    ))
+}
 
 /// Check if a type code is an integer-derived type.
 fn is_integer_type(code: XmlTypeCode) -> bool {

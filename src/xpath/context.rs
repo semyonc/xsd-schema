@@ -13,6 +13,7 @@ use crate::namespace::table::NameTable;
 use crate::schema::SchemaSet;
 use crate::types::value::{DateTimeValue, TimezoneOffset};
 
+use super::collation::CollationResolver;
 use super::functions::{BuiltinCatalog, BuiltinEvaluator, FunctionCatalog, FunctionEvaluator};
 use super::iterator::XmlItem;
 use super::DomNavigator;
@@ -61,6 +62,18 @@ pub struct XPathContext<'a> {
     /// XPath 1.0 compatibility mode, set by
     /// [`with_xpath10_compatibility`](Self::with_xpath10_compatibility).
     xpath10_compatibility: bool,
+    /// Host collations, set by
+    /// [`with_collation_resolver`](Self::with_collation_resolver). `None` means
+    /// the codepoint collation is the only one this context supports.
+    collation_resolver: Option<&'a dyn CollationResolver>,
+    /// The static context's *default collation* property, set by
+    /// [`with_default_collation`](Self::with_default_collation).
+    ///
+    /// `None` is the codepoint collation, and the codepoint URI is normalised
+    /// to `None` when it is set explicitly — so every hot path decides "is the
+    /// default collation the codepoint one" with a discriminant test and never
+    /// a string comparison.
+    default_collation: Option<String>,
 }
 
 impl<'a> XPathContext<'a> {
@@ -79,6 +92,8 @@ impl<'a> XPathContext<'a> {
             function_catalog: None,
             default_function_ns_owned: None,
             xpath10_compatibility: false,
+            collation_resolver: None,
+            default_collation: None,
         }
     }
 
@@ -242,6 +257,77 @@ impl<'a> XPathContext<'a> {
     pub fn function_catalog(&self) -> &dyn FunctionCatalog {
         static BUILTIN: BuiltinCatalog = BuiltinCatalog;
         self.function_catalog.unwrap_or(&BUILTIN)
+    }
+
+    /// Install the host's collations.
+    ///
+    /// Without a resolver the only collation this context supports is the
+    /// Unicode codepoint collation
+    /// ([`CODEPOINT_COLLATION_URI`](crate::xpath::collation::CODEPOINT_COLLATION_URI)),
+    /// and every other collation URI is `FOCH0002` where it is used. With one,
+    /// the `$collation` argument of `fn:compare`, `fn:contains`,
+    /// `fn:starts-with`, `fn:ends-with`, `fn:substring-before`,
+    /// `fn:substring-after`, `fn:index-of`, `fn:distinct-values`,
+    /// `fn:deep-equal`, `fn:min` and `fn:max` — and the default collation set by
+    /// [`with_default_collation`](Self::with_default_collation) — are looked up
+    /// through it.
+    ///
+    /// The resolver is never asked about the codepoint URI, which this crate
+    /// implements itself, and it is asked only when a collation is needed to
+    /// compare strings, so an expression that compares none never reaches it.
+    ///
+    /// See [`collation`](crate::xpath::collation) for a worked example.
+    pub fn with_collation_resolver(mut self, resolver: &'a dyn CollationResolver) -> Self {
+        self.collation_resolver = Some(resolver);
+        self
+    }
+
+    /// Set the static context's *default collation* property.
+    ///
+    /// This is the collation the value and general comparisons (`eq`, `lt`,
+    /// `=`, `<`, …) use for strings, and the one every collation-aware function
+    /// uses when it is called without a `$collation` argument. It is also what
+    /// `fn:default-collation()` returns. Unset, it is the Unicode codepoint
+    /// collation.
+    ///
+    /// The URI is taken as given: XPath 2.0 §2.1.1 makes the default collation a
+    /// static-context property that is already an absolute URI, so — unlike a
+    /// `$collation` *argument* — it is not resolved against the base URI. It is
+    /// not validated here either: an unsupported default collation raises
+    /// `FOCH0002` where a string comparison needs it, and never disturbs an
+    /// expression that compares no strings.
+    pub fn with_default_collation(mut self, uri: impl Into<String>) -> Self {
+        let uri = uri.into();
+        // The codepoint collation is the absence of a default collation, so
+        // that the hot paths never compare this URI at all.
+        self.default_collation =
+            (uri != crate::xpath::collation::CODEPOINT_COLLATION_URI).then_some(uri);
+        self
+    }
+
+    /// The static context's default collation URI — the codepoint collation
+    /// when [`with_default_collation`](Self::with_default_collation) has not
+    /// set another one.
+    pub fn default_collation(&self) -> &str {
+        self.default_collation
+            .as_deref()
+            .unwrap_or(crate::xpath::collation::CODEPOINT_COLLATION_URI)
+    }
+
+    /// The default collation URI, or `None` when it is the codepoint collation.
+    ///
+    /// The internal counterpart of [`default_collation`](Self::default_collation):
+    /// `None` is the answer the comparison paths want, because it needs no
+    /// resolution at all.
+    #[inline]
+    pub(crate) fn default_collation_uri(&self) -> Option<&str> {
+        self.default_collation.as_deref()
+    }
+
+    /// The host's collation resolver, if one was installed.
+    #[inline]
+    pub(crate) fn collation_resolver(&self) -> Option<&'a dyn CollationResolver> {
+        self.collation_resolver
     }
 
     /// Resolve a prefix to a namespace URI.
@@ -589,6 +675,12 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     /// [`regex_cache`](crate::xpath::regex_cache). Empty and allocation-free
     /// until the first such call, and dropped with the context.
     regex_cache: crate::xpath::regex_cache::RegexCache,
+    /// Collations resolved through the host's
+    /// [`CollationResolver`](crate::xpath::collation::CollationResolver) during
+    /// this run; see [`collation`](crate::xpath::collation). Empty and
+    /// allocation-free unless a non-codepoint collation is used, and dropped
+    /// with the context.
+    collation_cache: crate::xpath::collation::CollationCache,
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -609,6 +701,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             extension: None,
             compare_cache: Default::default(),
             regex_cache: Default::default(),
+            collation_cache: Default::default(),
         }
     }
 
@@ -694,6 +787,20 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     #[inline]
     pub(crate) fn regex_cache(&self) -> &crate::xpath::regex_cache::RegexCache {
         &self.regex_cache
+    }
+
+    /// The collations resolved during this run.
+    #[inline]
+    pub(crate) fn collation_cache_mut(&mut self) -> &mut crate::xpath::collation::CollationCache {
+        &mut self.collation_cache
+    }
+
+    /// The collations resolved during this run. Test-only, like
+    /// [`regex_cache`](Self::regex_cache).
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn collation_cache(&self) -> &crate::xpath::collation::CollationCache {
+        &self.collation_cache
     }
 
     /// Get a variable value by slot ID.

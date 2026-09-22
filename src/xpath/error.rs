@@ -239,7 +239,7 @@ pub enum XPathError {
     /// This is the XPath 2.0 §3.4 / §3.5.1 type error: "If the types of the
     /// operands, after evaluation, are not a valid combination for the given
     /// operator, according to the rules in B.2 Operator Mapping, a type error is
-    /// raised [err:XPTY0004]." The dedicated variant carries the operator and
+    /// raised \[err:XPTY0004\]." The dedicated variant carries the operator and
     /// the two type names for the message; its
     /// [`error_code`](XPathError::error_code) is `XPTY0004`.
     #[error("[XPTY0004] Operator '{operator}' is not defined for arguments of type '{left_type}' and '{right_type}'")]
@@ -477,6 +477,27 @@ impl XPathError {
         }
     }
 
+    /// FOCH0004: the collation does not support collation units.
+    ///
+    /// Raised by the five substring functions — `fn:contains`,
+    /// `fn:starts-with`, `fn:ends-with`, `fn:substring-before`,
+    /// `fn:substring-after` — which F&O §7.5 defines over collation units, when
+    /// the collation in force has no notion of them (a
+    /// [`Collation`](crate::xpath::collation::Collation) that leaves
+    /// [`find`](crate::xpath::collation::Collation::find) at its default). The
+    /// code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`]. [`XPathError::error_code`] answers
+    /// `Some("FOCH0004")`.
+    pub fn collation_no_units(collation: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "FOCH0004",
+            Some(&format!(
+                "Collation '{collation}' does not support collation units"
+            )),
+        )
+    }
+
     /// Build a dynamic error identified by an error QName.
     ///
     /// `fn:error` may raise *any* error QName, so such an error cannot be one
@@ -625,7 +646,7 @@ pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
 /// The spec-defined codes this crate reports through an error QName rather
 /// than through a variant of [`XPathError`], and which
 /// [`XPathError::error_code`] therefore resolves back to a `'static` string.
-pub const QNAMED_ERROR_CODES: &[&str] = &[DEFAULT_RAISED_ERROR, "FONS0004", "FORG0002"];
+pub const QNAMED_ERROR_CODES: &[&str] = &[DEFAULT_RAISED_ERROR, "FOCH0004", "FONS0004", "FORG0002"];
 
 /// The error QName and description of an error raised by `fn:error`.
 ///

@@ -12,9 +12,10 @@ use crate::validation::info::ContentType;
 use crate::validation::runtime::determine_content_type;
 
 use super::ast::BinaryOpKind;
+use super::collation::CollationRef;
 use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
-use super::operators::eval_binary;
+use super::operators::eval_binary_collated;
 use super::string_ops::is_xml_whitespace;
 use super::{DomNavigator, DomNodeType};
 
@@ -117,6 +118,12 @@ pub(crate) struct NodeComparer<'s> {
     ignore_whitespace: bool,
     function_rules: bool,
     schema_set: Option<&'s SchemaSet>,
+    /// The collation every string comparison of the `fn:deep-equal` rules uses
+    /// — text, comments, processing-instruction contents, typed values and
+    /// free-standing atomic items — but never a *name*. [`TreeComparer`] is the
+    /// codepoint collation, which is what a round-trip check wants and what it
+    /// has always done.
+    collation: CollationRef<'s>,
 }
 
 impl NodeComparer<'static> {
@@ -126,6 +133,7 @@ impl NodeComparer<'static> {
             ignore_whitespace,
             function_rules: false,
             schema_set: None,
+            collation: CollationRef::Codepoint,
         }
     }
 }
@@ -141,20 +149,39 @@ impl<'s> NodeComparer<'s> {
     ///
     /// `ignore_whitespace` is `false`: `fn:deep-equal` compares text nodes
     /// exactly, and the option exists for test harnesses, not for the function.
-    pub(crate) fn deep_equal_function(schema_set: Option<&'s SchemaSet>) -> Self {
+    pub(crate) fn deep_equal_function(
+        schema_set: Option<&'s SchemaSet>,
+        collation: CollationRef<'s>,
+    ) -> Self {
         Self {
             ignore_whitespace: false,
             function_rules: true,
             schema_set,
+            collation,
         }
+    }
+
+    /// String equality under this comparer's collation.
+    ///
+    /// [`CollationRef::equals`] can only fail for
+    /// [`CollationRef::Unsupported`], which cannot reach here: `fn:deep-equal`
+    /// resolves its collation with
+    /// [`require`](crate::xpath::collation::ActiveCollation::require), so an
+    /// unsupported URI has already raised FOCH0002 before any node is looked
+    /// at, and [`TreeComparer`] is always the codepoint collation.
+    #[inline]
+    fn collated_equal(&self, left: &str, right: &str) -> bool {
+        self.collation.equals(left, right).unwrap_or(false)
     }
 
     fn text_equal(&self, left: &str, right: &str) -> bool {
         if self.ignore_whitespace {
-            normalize_whitespace(left, WhitespaceMode::Collapse)
-                == normalize_whitespace(right, WhitespaceMode::Collapse)
+            self.collated_equal(
+                &normalize_whitespace(left, WhitespaceMode::Collapse),
+                &normalize_whitespace(right, WhitespaceMode::Collapse),
+            )
         } else {
-            left == right
+            self.collated_equal(left, right)
         }
     }
 
@@ -190,7 +217,11 @@ impl<'s> NodeComparer<'s> {
             return true;
         }
 
-        if let Ok(result) = eval_binary(BinaryOpKind::ValueEq, &left, &right) {
+        // `eq` under this comparer's collation: a string pair is compared with
+        // it, every other pair ignores it.
+        if let Ok(result) =
+            eval_binary_collated(BinaryOpKind::ValueEq, &left, &right, self.collation)
+        {
             return result.as_boolean().unwrap_or(false);
         }
 
@@ -399,8 +430,13 @@ impl<'s> NodeComparer<'s> {
         true
     }
 
+    /// Two processing-instruction nodes are deep-equal when their names and
+    /// their string values are equal (F&O §15.3.1). The *name* is a name, so it
+    /// is compared by codepoints whatever the collation; the content is a
+    /// string value, so it is not.
     fn processing_instruction_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        left.local_name() == right.local_name() && left.value() == right.value()
+        left.local_name() == right.local_name()
+            && self.collated_equal(&left.value(), &right.value())
     }
 
     /// Deep equality for two namespace nodes.
@@ -416,7 +452,13 @@ impl<'s> NodeComparer<'s> {
     /// not apply: a namespace URI that differs by whitespace is a different
     /// URI.
     fn namespace_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
-        left.local_name() == right.local_name() && left.value_ref() == right.value_ref()
+        // The prefix is the node's *name*, so it is never collated. The bound
+        // URI is the node's string value, and XPath 2.0 §B.1 is explicit that
+        // "functions and operators that compare strings using the default
+        // collation also compare xs:anyURI values using the default
+        // collation", so it is.
+        left.local_name() == right.local_name()
+            && self.collated_equal(&left.value_ref(), &right.value_ref())
     }
 
     fn attribute_equal<N: DomNavigator>(&self, left: &N, right: &N) -> bool {
@@ -650,7 +692,7 @@ mod tests {
     /// entry point the function itself uses.
     fn nodes_deep_equal<N: DomNavigator>(left: N, right: N) -> bool {
         sequences_deep_equal(
-            &NodeComparer::deep_equal_function(None),
+            &NodeComparer::deep_equal_function(None, CollationRef::Codepoint),
             vec![XmlItem::Node(left)],
             vec![XmlItem::Node(right)],
         )
@@ -1113,7 +1155,7 @@ mod tests {
             right: BufferDocNavigator<'_>,
         ) -> bool {
             sequences_deep_equal(
-                &NodeComparer::deep_equal_function(schema_set),
+                &NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint),
                 vec![XmlItem::Node(left)],
                 vec![XmlItem::Node(right)],
             )

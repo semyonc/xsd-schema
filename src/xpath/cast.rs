@@ -640,7 +640,7 @@ fn builtin_base_type(code: XmlTypeCode) -> Option<XmlTypeCode> {
 /// This is SequenceType matching for an AtomicType item type (XPath 2.0
 /// §2.5.4): the value's type must be the named type itself or a type derived
 /// from it by restriction. The relation is computed by walking
-/// [`builtin_base_type`] up to `xs:anyAtomicType`, so every branch of the
+/// `builtin_base_type` up to `xs:anyAtomicType`, so every branch of the
 /// built-in hierarchy is modelled, not just the string and numeric ones.
 ///
 /// Two consequences worth naming, because they used to be wrong:

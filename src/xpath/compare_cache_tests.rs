@@ -89,10 +89,11 @@ fn check_stream(
     for varying in stream {
         let (left, right) = side.order(varying.as_slice(), invariant);
         let expected = pairwise(context, left, right, is_eq);
+        let active = crate::xpath::collation::resolve_default(context);
         let outcome = if is_eq {
-            indexed_eq(context, side, &mut operand, varying)
+            indexed_eq(context, side, &mut operand, varying, active.as_ref())
         } else {
-            indexed_ne(context, side, &mut operand, varying)
+            indexed_ne(context, side, &mut operand, varying, active.as_ref())
         };
         total += 1;
         let got: Result<bool, XPathError> = match outcome {
@@ -258,12 +259,28 @@ fn an_answer_does_not_depend_on_the_order_of_the_stream() {
         let side = Side::Right;
         let ahead: Vec<String> = stream
             .iter()
-            .map(|varying| describe(indexed_eq(&context, side, &mut forwards, varying)))
+            .map(|varying| {
+                describe(indexed_eq(
+                    &context,
+                    side,
+                    &mut forwards,
+                    varying,
+                    CollationRef::Codepoint,
+                ))
+            })
             .collect();
         let mut behind: Vec<String> = stream
             .iter()
             .rev()
-            .map(|varying| describe(indexed_eq(&context, side, &mut backwards, varying)))
+            .map(|varying| {
+                describe(indexed_eq(
+                    &context,
+                    side,
+                    &mut backwards,
+                    varying,
+                    CollationRef::Codepoint,
+                ))
+            })
             .collect();
         behind.reverse();
         assert_eq!(ahead, behind, "invariant = {invariant:?}");
@@ -832,7 +849,7 @@ fn the_footprint_of_an_index_is_proportional_to_the_operand() {
         PairKind::Comparable(bucket) => bucket,
         _ => panic!("integers compare with integers"),
     };
-    assert!(operand.ensure_table(class, bucket));
+    assert!(operand.ensure_table(class, bucket, CollationRef::Codepoint));
     let per_value = operand.footprint() / 1000;
     println!(
         "index footprint: {} bytes for 1000 xs:integer items, {} per item \

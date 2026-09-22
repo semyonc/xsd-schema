@@ -79,12 +79,13 @@ use rust_decimal::Decimal;
 use crate::namespace::qname::QualifiedName;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
+use crate::xpath::collation::CollationRef;
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::{BufferedNodeIterator, XmlItem, XmlItemRef, XmlNodeIterator};
 use crate::xpath::operators::{
     atomize_item, is_date_time_code, is_duration_code, is_string_like, is_temporal_type,
-    magnitude_relationship_ctx, numeric_class, value_eq, NumericClass,
+    magnitude_relationship_ctx, numeric_class, value_eq_collated, NumericClass,
 };
 
 /// Hasher used for the join tables. A `BuildHasherDefault` is a ZST, so a table
@@ -115,13 +116,14 @@ pub(super) fn try_indexed_eq<I1, I2>(
     context: &XPathContext,
     left: &I1,
     right: &BufferedNodeIterator<I2>,
+    collation: CollationRef<'_>,
 ) -> Option<Result<bool, XPathError>>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let (lvals, rvals) = collect_operands(left, right)?;
-    match general_eq_indexed(context, &lvals, &rvals) {
+    match general_eq_indexed(context, &lvals, &rvals, collation) {
         FastOutcome::Decided(result) => Some(Ok(result)),
         FastOutcome::Raise(err) => Some(Err(err)),
         FastOutcome::Fallback => None,
@@ -134,13 +136,14 @@ where
 pub(super) fn try_indexed_ne<I1, I2>(
     left: &I1,
     right: &BufferedNodeIterator<I2>,
+    collation: CollationRef<'_>,
 ) -> Option<Result<bool, XPathError>>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let (lvals, rvals) = collect_operands(left, right)?;
-    match general_ne_indexed(&lvals, &rvals) {
+    match general_ne_indexed(&lvals, &rvals, collation) {
         FastOutcome::Decided(result) => Some(Ok(result)),
         FastOutcome::Raise(err) => Some(Err(err)),
         FastOutcome::Fallback => None,
@@ -370,6 +373,12 @@ pub(super) fn pair_kind(left: Class, right: Class) -> PairKind {
 #[derive(Debug, PartialEq, Eq, Hash)]
 enum Key<'a> {
     Str(Cow<'a, str>),
+    /// The [`sort_key`](crate::xpath::collation::Collation::sort_key) of a string value, under a
+    /// non-codepoint collation. The obligation on a key —
+    /// `a eq b ⟹ key(a) == key(b)` — is exactly what a sort key promises, so
+    /// the index stays sound; the codepoint collation never produces this arm
+    /// and keeps [`Key::Str`].
+    Bytes(Vec<u8>),
     Int(&'a BigInt),
     Dec(Decimal),
     /// `f32` bit pattern, with `-0.0` folded onto `0.0`.
@@ -434,9 +443,35 @@ fn untyped_as_double(value: &XmlValue) -> Option<f64> {
 ///
 /// Every arm uses the accessor the real comparison uses, so a `Failed` here is
 /// exactly a comparison that would have raised.
-fn key_of<'a>(value: &'a XmlValue, class: Class, bucket: Bucket) -> KeyOutcome<'a> {
+///
+/// `collation` is `None` for the Unicode codepoint collation, in which case
+/// every arm is what it always was. Under a host collation only `Bucket::Str`
+/// changes, and only that bucket may: it is the one bucket whose `eq` the
+/// collation redefines. `Bucket::Opaque` compares values structurally whatever
+/// the collation, and `to_string_value` remains a sound key proxy for it. A
+/// collation that offers no [`sort_key`](crate::xpath::collation::Collation::sort_key) makes the string
+/// bucket `Failed`, which sends the whole comparison to the pairwise loop —
+/// where the collation is applied by `eq` itself.
+fn key_of<'a>(
+    value: &'a XmlValue,
+    class: Class,
+    bucket: Bucket,
+    collation: CollationRef<'_>,
+) -> KeyOutcome<'a> {
     match bucket {
-        Bucket::Str => KeyOutcome::Found(Key::Str(string_key(value))),
+        Bucket::Str => match collation {
+            CollationRef::Codepoint => KeyOutcome::Found(Key::Str(string_key(value))),
+            CollationRef::Custom(collation) => match collation.sort_key(&string_key(value)) {
+                Some(key) => KeyOutcome::Found(Key::Bytes(key)),
+                // No sort key: the index has no sound key for this bucket, so
+                // the comparison goes back to the pairwise loop, which applies
+                // the collation through `eq` itself.
+                None => KeyOutcome::Failed,
+            },
+            // FOCH0002 belongs to the comparison, not to the index; declining
+            // sends the pair to the pairwise loop, which raises it there.
+            CollationRef::Unsupported(_) => KeyOutcome::Failed,
+        },
         Bucket::Num(group) => {
             if class == Class::Untyped {
                 // Untyped only ever reaches a numeric bucket as `xs:double`.
@@ -515,8 +550,13 @@ pub(super) enum KeyHash {
 /// hash instead of by [`Key`] is what lets the table **own** its keys rather than
 /// borrow from the values it indexes — which is what an index that outlives a
 /// single evaluation needs.
-pub(super) fn key_hash(value: &XmlValue, class: Class, bucket: Bucket) -> KeyHash {
-    match key_of(value, class, bucket) {
+pub(super) fn key_hash(
+    value: &XmlValue,
+    class: Class,
+    bucket: Bucket,
+    collation: CollationRef<'_>,
+) -> KeyHash {
+    match key_of(value, class, bucket, collation) {
         KeyOutcome::Found(key) => {
             let mut hasher = AHasher::default();
             key.hash(&mut hasher);
@@ -537,9 +577,10 @@ pub(super) fn confirm(
     context: &XPathContext,
     left: &XmlValue,
     right: &XmlValue,
+    collation: CollationRef<'_>,
 ) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship_ctx(context, left, right)?;
-    value_eq(&l, &r)
+    value_eq_collated(&l, &r, collation)
 }
 
 /// One comparable class pair, with the keys of the values it joins.
@@ -552,6 +593,7 @@ fn general_eq_indexed(
     context: &XPathContext,
     lvals: &[XmlValue],
     rvals: &[XmlValue],
+    collation: CollationRef<'_>,
 ) -> FastOutcome {
     if lvals.is_empty() || rvals.is_empty() {
         return FastOutcome::Decided(false);
@@ -583,11 +625,11 @@ fn general_eq_indexed(
     // pair, so the whole comparison goes back to the pairwise loop.
     let mut prepared: Vec<Join<'_>> = Vec::with_capacity(joins.len());
     for &(lc, rc, bucket) in &joins {
-        let left = match collect_keys(lvals, &lclasses, lc, bucket) {
+        let left = match collect_keys(lvals, &lclasses, lc, bucket, collation) {
             Some(keys) => keys,
             None => return FastOutcome::Fallback,
         };
-        let right = match collect_keys(rvals, &rclasses, rc, bucket) {
+        let right = match collect_keys(rvals, &rclasses, rc, bucket, collation) {
             Some(keys) => keys,
             None => return FastOutcome::Fallback,
         };
@@ -597,7 +639,7 @@ fn general_eq_indexed(
     // Phase 2 — hash join. No hard error is possible from here on, so the first
     // confirmed true pair decides the comparison whatever its position.
     for join in &prepared {
-        match join_any_true(context, lvals, rvals, join) {
+        match join_any_true(context, lvals, rvals, join, collation) {
             Ok(true) => return FastOutcome::Decided(true),
             Ok(false) => {}
             Err(_) => return FastOutcome::Fallback,
@@ -610,7 +652,7 @@ fn general_eq_indexed(
         return FastOutcome::Decided(false);
     }
     match first_incomparable_pair(&lclasses, &rclasses, &incomparable) {
-        Some((i, j)) => match confirm(context, &lvals[i], &rvals[j]) {
+        Some((i, j)) => match confirm(context, &lvals[i], &rvals[j], collation) {
             Err(err) => FastOutcome::Raise(err),
             // The class pair was classified as always-raising, so this is
             // unreachable; falling back is the safe way to say so.
@@ -641,13 +683,14 @@ fn collect_keys<'a>(
     classes: &[Class],
     class: Class,
     bucket: Bucket,
+    collation: CollationRef<'_>,
 ) -> Option<Vec<(usize, Key<'a>)>> {
     let mut out = Vec::new();
     for (index, value) in values.iter().enumerate() {
         if classes[index] != class {
             continue;
         }
-        match key_of(value, class, bucket) {
+        match key_of(value, class, bucket, collation) {
             KeyOutcome::Found(key) => out.push((index, key)),
             KeyOutcome::Never => {}
             KeyOutcome::Failed => return None,
@@ -687,6 +730,7 @@ fn join_any_true(
     lvals: &[XmlValue],
     rvals: &[XmlValue],
     join: &Join<'_>,
+    collation: CollationRef<'_>,
 ) -> Result<bool, XPathError> {
     if join.left.is_empty() || join.right.is_empty() {
         return Ok(false);
@@ -709,7 +753,7 @@ fn join_any_true(
             } else {
                 (&lvals[*probe_index], &rvals[hit])
             };
-            if confirm(context, left, right)? {
+            if confirm(context, left, right, collation)? {
                 return Ok(true);
             }
             slot = table.next[slot];
@@ -763,14 +807,20 @@ pub(super) fn first_incomparable_pair(
 /// but only for the buckets in which `eq` is a genuine equivalence relation, so
 /// that "every pair is equal" is the same statement as "all keys are equal":
 ///
-/// * `Str` — codepoint equality of the string values;
+/// * `Str` — equality of the string values under the collation in force
+///   (codepoint equality unless a host collation is installed, in which case a
+///   collation with no sort key declines the index altogether);
 /// * `Bool` — equality of two booleans;
 /// * `Num(Int)` — exact `BigInt` equality.
 ///
 /// Numeric buckets that involve `xs:float`/`xs:double` are excluded because
 /// promotion makes `eq` non-transitive across them, and everything else falls
 /// back.
-fn general_ne_indexed(lvals: &[XmlValue], rvals: &[XmlValue]) -> FastOutcome {
+fn general_ne_indexed(
+    lvals: &[XmlValue],
+    rvals: &[XmlValue],
+    collation: CollationRef<'_>,
+) -> FastOutcome {
     if lvals.is_empty() || rvals.is_empty() {
         return FastOutcome::Decided(false);
     }
@@ -789,10 +839,11 @@ fn general_ne_indexed(lvals: &[XmlValue], rvals: &[XmlValue]) -> FastOutcome {
     let mut reference: Option<Key<'_>> = None;
     for (values, classes) in [(lvals, &lclasses), (rvals, &rclasses)] {
         for (index, value) in values.iter().enumerate() {
-            let key = match key_of(value, classes[index], bucket) {
+            let key = match key_of(value, classes[index], bucket, collation) {
                 KeyOutcome::Found(key) => key,
                 // `Never` cannot occur: none of the three buckets is a float
-                // bucket. `Failed` means the comparison itself would raise.
+                // bucket. `Failed` means the comparison itself would raise, or
+                // that the collation in force cannot produce a sort key.
                 KeyOutcome::Never | KeyOutcome::Failed => return FastOutcome::Fallback,
             };
             match &reference {
@@ -876,7 +927,10 @@ pub(super) mod tests {
 
         let expected = general_eq_iter_pairwise(context, &left_iter, &right_buf);
 
-        let actual = try_indexed_eq(context, &left_iter, &right_buf);
+        // The very collation the pairwise loop just used, so that the two
+        // paths are compared under the same rule whatever the context says.
+        let active = crate::xpath::collation::resolve_default(context);
+        let actual = try_indexed_eq(context, &left_iter, &right_buf, active.as_ref());
 
         match actual {
             Some(got) => {
@@ -901,7 +955,8 @@ pub(super) mod tests {
 
         let expected = general_ne_iter_pairwise(context, &left_iter, &right_buf);
 
-        let actual = try_indexed_ne(&left_iter, &right_buf);
+        let active = crate::xpath::collation::resolve_default(context);
+        let actual = try_indexed_ne(&left_iter, &right_buf, active.as_ref());
 
         match actual {
             Some(got) => {
@@ -1370,7 +1425,8 @@ pub(super) mod tests {
     fn indexed_eq(context: &XPathContext, left: &[XmlValue], right: &[XmlValue]) -> bool {
         let left_iter = iter_of(left);
         let right_buf = BufferedNodeIterator::preload(iter_of(right)).unwrap();
-        try_indexed_eq(context, &left_iter, &right_buf)
+        let active = crate::xpath::collation::resolve_default(context);
+        try_indexed_eq(context, &left_iter, &right_buf, active.as_ref())
             .expect("the index path should have decided this comparison")
             .expect("the comparison should not raise")
     }
@@ -1378,7 +1434,8 @@ pub(super) mod tests {
     fn indexed_eq_error(context: &XPathContext, left: &[XmlValue], right: &[XmlValue]) -> String {
         let left_iter = iter_of(left);
         let right_buf = BufferedNodeIterator::preload(iter_of(right)).unwrap();
-        let result = try_indexed_eq(context, &left_iter, &right_buf);
+        let active = crate::xpath::collation::resolve_default(context);
+        let result = try_indexed_eq(context, &left_iter, &right_buf, active.as_ref());
         format!(
             "{}",
             result
@@ -1710,7 +1767,8 @@ pub(super) mod tests {
         ];
         let left_iter = iter_of(&left);
         let right_buf = BufferedNodeIterator::preload(iter_of(&right)).unwrap();
-        let result = try_indexed_eq(&context, &left_iter, &right_buf);
+        let active = crate::xpath::collation::resolve_default(&context);
+        let result = try_indexed_eq(&context, &left_iter, &right_buf, active.as_ref());
         assert!(
             result.is_none(),
             "a failing cast must hand the comparison back to the pairwise loop"

@@ -5,6 +5,7 @@
 
 use crate::types::value::XmlValue;
 use crate::types::XmlTypeCode;
+use crate::xpath::collation::{self, ActiveCollation};
 use crate::xpath::error::XPathError;
 use crate::xpath::iterator::XmlItem;
 use crate::xpath::string_ops;
@@ -17,17 +18,25 @@ use super::{
 };
 use crate::xpath::context::DynamicContext;
 
-/// Default collation URI (codepoint collation).
-const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
-
-/// Validate collation URI - only default collation is supported.
-/// Returns Ok(()) if collation is valid (default or empty), FOCH0002 otherwise.
-fn validate_collation(collation: Option<&str>) -> Result<(), XPathError> {
-    match collation {
-        None => Ok(()),
-        Some(c) if c.is_empty() || c == DEFAULT_COLLATION => Ok(()),
-        Some(c) => Err(XPathError::unknown_collation(c)),
-    }
+/// The collation of a call: its `$collation` argument if it has one, and
+/// otherwise the static context's default collation.
+///
+/// The argument is taken off the back of `args`, so the caller keeps its
+/// positional arguments where they were. Unlike the comparison operators, a
+/// function that takes a `$collation` argument needs the collation whatever its
+/// other arguments turn out to be, so an unsupported URI is FOCH0002 here and
+/// not later ([`ActiveCollation::require`]).
+fn call_collation<N: DomNavigator>(
+    context: &mut DynamicContext<'_, N>,
+    args: &mut Vec<XPathValue<N>>,
+    has_collation_arg: bool,
+) -> Result<ActiveCollation, XPathError> {
+    let explicit = if has_collation_arg {
+        Some(atomize_to_string_required(args.pop().unwrap())?)
+    } else {
+        None
+    };
+    collation::resolve_collation_cached(context, explicit.as_deref()).require()
 }
 
 // ============================================================================
@@ -365,8 +374,15 @@ pub fn escape_html_uri<N: DomNavigator>(
 /// fn:contains($arg1 as xs:string?, $arg2 as xs:string?, $collation as xs:string) as xs:boolean
 ///
 /// Checks if a string contains a substring.
+///
+/// F&O §7.5.3 defines the answer over *collation units*: true when some
+/// substring of `$arg1` has the collation units of `$arg2`. Under the codepoint
+/// collation a collation unit is a codepoint and that is plain substring
+/// search; under a host collation it is
+/// [`Collation::find`](crate::xpath::collation::Collation::find), and a
+/// collation that has no collation units raises FOCH0004.
 pub fn contains<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -377,14 +393,17 @@ pub fn contains<N: DomNavigator>(
         ));
     }
 
-    if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let source = atomize_to_string(args.remove(0))?;
     let substring = atomize_to_string(args.remove(0))?;
-    // Collation argument is ignored for now (uses default Unicode codepoint collation)
 
-    let result = string_ops::contains(&source, &substring);
+    let result = match collation.as_ref().custom() {
+        None => string_ops::contains(&source, &substring),
+        Some(custom) => {
+            collation::collated_find(custom, collation.uri(), &source, &substring)?.is_some()
+        }
+    };
     Ok(XPathValue::boolean(result))
 }
 
@@ -392,8 +411,11 @@ pub fn contains<N: DomNavigator>(
 /// fn:starts-with($arg1 as xs:string?, $arg2 as xs:string?, $collation as xs:string) as xs:boolean
 ///
 /// Checks if a string starts with a prefix.
+///
+/// F&O §7.5.2: true when some *prefix* of `$arg1` has the collation units of
+/// `$arg2`; see [`contains`] for what that means under a host collation.
 pub fn starts_with<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -404,14 +426,15 @@ pub fn starts_with<N: DomNavigator>(
         ));
     }
 
-    if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let source = atomize_to_string(args.remove(0))?;
     let prefix = atomize_to_string(args.remove(0))?;
-    // Collation argument is ignored for now
 
-    let result = string_ops::starts_with(&source, &prefix);
+    let result = match collation.as_ref().custom() {
+        None => string_ops::starts_with(&source, &prefix),
+        Some(custom) => collation::collated_starts_with(custom, collation.uri(), &source, &prefix)?,
+    };
     Ok(XPathValue::boolean(result))
 }
 
@@ -419,8 +442,11 @@ pub fn starts_with<N: DomNavigator>(
 /// fn:ends-with($arg1 as xs:string?, $arg2 as xs:string?, $collation as xs:string) as xs:boolean
 ///
 /// Checks if a string ends with a suffix.
+///
+/// F&O §7.5.2: true when some *suffix* of `$arg1` has the collation units of
+/// `$arg2`; see [`contains`] for what that means under a host collation.
 pub fn ends_with<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -431,14 +457,15 @@ pub fn ends_with<N: DomNavigator>(
         ));
     }
 
-    if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let source = atomize_to_string(args.remove(0))?;
     let suffix = atomize_to_string(args.remove(0))?;
-    // Collation argument is ignored for now
 
-    let result = string_ops::ends_with(&source, &suffix);
+    let result = match collation.as_ref().custom() {
+        None => string_ops::ends_with(&source, &suffix),
+        Some(custom) => collation::collated_ends_with(custom, collation.uri(), &source, &suffix)?,
+    };
     Ok(XPathValue::boolean(result))
 }
 
@@ -446,8 +473,12 @@ pub fn ends_with<N: DomNavigator>(
 /// fn:substring-before($arg1 as xs:string?, $arg2 as xs:string?, $collation as xs:string) as xs:string
 ///
 /// Returns the substring before the first occurrence of the pattern.
+///
+/// F&O §7.5.4: the part of `$arg1` that precedes the *first* minimal match of
+/// `$arg2`'s collation units, and the zero-length string when there is none;
+/// see [`contains`] for what a minimal match is under a host collation.
 pub fn substring_before<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -458,14 +489,20 @@ pub fn substring_before<N: DomNavigator>(
         ));
     }
 
-    if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let source = atomize_to_string(args.remove(0))?;
     let pattern = atomize_to_string(args.remove(0))?;
-    // Collation argument is ignored for now
 
-    let result = string_ops::substring_before(&source, &pattern);
+    let result = match collation.as_ref().custom() {
+        None => string_ops::substring_before(&source, &pattern),
+        Some(custom) => {
+            match collation::collated_find(custom, collation.uri(), &source, &pattern)? {
+                Some((start, _)) => collation::slice_at(&source, 0..start)?.to_string(),
+                None => String::new(),
+            }
+        }
+    };
     Ok(XPathValue::string(result))
 }
 
@@ -473,8 +510,12 @@ pub fn substring_before<N: DomNavigator>(
 /// fn:substring-after($arg1 as xs:string?, $arg2 as xs:string?, $collation as xs:string) as xs:string
 ///
 /// Returns the substring after the first occurrence of the pattern.
+///
+/// F&O §7.5.5: the part of `$arg1` that follows the *first* minimal match of
+/// `$arg2`'s collation units, and the zero-length string when there is none;
+/// see [`contains`] for what a minimal match is under a host collation.
 pub fn substring_after<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -485,14 +526,20 @@ pub fn substring_after<N: DomNavigator>(
         ));
     }
 
-    if args.len() == 3 {
-        let _collation = atomize_to_string_required(args.pop().unwrap())?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let source = atomize_to_string(args.remove(0))?;
     let pattern = atomize_to_string(args.remove(0))?;
-    // Collation argument is ignored for now
 
-    let result = string_ops::substring_after(&source, &pattern);
+    let result = match collation.as_ref().custom() {
+        None => string_ops::substring_after(&source, &pattern),
+        Some(custom) => {
+            match collation::collated_find(custom, collation.uri(), &source, &pattern)? {
+                Some((_, end)) => collation::slice_at(&source, end..source.len())?.to_string(),
+                None => String::new(),
+            }
+        }
+    };
     Ok(XPathValue::string(result))
 }
 
@@ -615,9 +662,11 @@ fn atomize_to_codepoint(value: &XmlValue) -> Result<u32, XPathError> {
 /// fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?) as xs:integer?
 /// fn:compare($comparand1 as xs:string?, $comparand2 as xs:string?, $collation as xs:string) as xs:integer?
 ///
-/// Compares two strings.
+/// Compares two strings under a collation: -1, 0 or 1 as `$comparand1` sorts
+/// before, equal to or after `$comparand2`. With no `$collation` argument the
+/// static context's default collation is used (F&O §7.3.2).
 pub fn compare<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if args.len() < 2 || args.len() > 3 {
@@ -628,17 +677,21 @@ pub fn compare<N: DomNavigator>(
         ));
     }
 
-    // Validate collation if provided (third argument)
-    if args.len() == 3 {
-        let collation = atomize_to_string_required(args.pop().unwrap())?;
-        validate_collation(Some(&collation))?;
-    }
+    let has_collation_arg = args.len() == 3;
+    let collation = call_collation(context, &mut args, has_collation_arg)?;
     let s1 = atomize_to_string_opt(args.remove(0))?;
     let s2 = atomize_to_string_opt(args.remove(0))?;
 
     match (s1, s2) {
         (Some(a), Some(b)) => {
-            let result = string_ops::compare(&a, &b);
+            let result = match collation.as_ref().custom() {
+                None => string_ops::compare(&a, &b),
+                Some(custom) => match custom.compare(&a, &b) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                },
+            };
             Ok(XPathValue::integer(result as i64))
         }
         _ => Ok(XPathValue::empty()),
@@ -648,6 +701,10 @@ pub fn compare<N: DomNavigator>(
 /// fn:codepoint-equal($comparand1 as xs:string?, $comparand2 as xs:string?) as xs:boolean?
 ///
 /// Compares two strings by codepoint.
+///
+/// This function has no `$collation` argument and takes no collation from the
+/// static context: F&O §7.3.3 defines it as `fn:compare` under the Unicode
+/// codepoint collation, whatever the default collation is.
 pub fn codepoint_equal<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -985,7 +1042,7 @@ mod tests {
         let args = vec![
             XPathValue::string("abc"),
             XPathValue::string("abd"),
-            XPathValue::string(DEFAULT_COLLATION),
+            XPathValue::string(crate::xpath::collation::CODEPOINT_COLLATION_URI),
         ];
         let result = compare(&mut ctx, args).unwrap();
         match result {

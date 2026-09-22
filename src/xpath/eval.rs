@@ -47,10 +47,8 @@ use crate::xpath::node_test::{
 };
 use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::operators::{
-    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter,
-    general_eq_iter_10, general_ge_iter, general_ge_iter_10, general_gt_iter, general_gt_iter_10,
-    general_le_iter, general_le_iter_10, general_lt_iter, general_lt_iter_10, general_ne_iter,
-    general_ne_iter_10,
+    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter, general_ge_iter,
+    general_gt_iter, general_le_iter, general_lt_iter, general_ne_iter,
 };
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNodeType;
@@ -369,7 +367,24 @@ pub fn eval_node<N: DomNavigator>(
                     match (left_opt, right_opt) {
                         (None, _) | (_, None) => Ok(XPathValue::empty()),
                         (Some(left), Some(right)) => {
-                            let result = eval_binary(bin_op.kind, &left, &right)?;
+                            // XPath 2.0 §2.1.1 makes the static context's
+                            // default collation "the collation to be used by
+                            // functions and operators for comparing and
+                            // ordering values of type xs:string and xs:anyURI
+                            // (and types derived from them)", and §B.2 spells
+                            // `A eq B` for two `xs:string` values as
+                            // `op:numeric-equal(fn:compare(A, B), 0)`. Only the
+                            // comparison operators read it; the arithmetic ones
+                            // ignore it, and resolving it costs a discriminant
+                            // test when it is the codepoint collation.
+                            let active =
+                                crate::xpath::collation::resolve_collation_cached(ctx, None);
+                            let result = crate::xpath::operators::eval_binary_collated(
+                                bin_op.kind,
+                                &left,
+                                &right,
+                                active.as_ref(),
+                            )?;
                             Ok(XPathValue::from_atomic(result))
                         }
                     }
@@ -444,15 +459,17 @@ pub fn eval_node<N: DomNavigator>(
                     let right_iter = VecNodeIterator::new(right_val.into_vec());
 
                     let result = if ctx.static_context.xpath10_compatibility() {
-                        match bin_op.kind {
-                            BinaryOpKind::GeneralEq => general_eq_iter_10(&left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralNe => general_ne_iter_10(&left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralLt => general_lt_iter_10(&left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralLe => general_le_iter_10(&left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralGt => general_gt_iter_10(&left_iter, &right_iter)?,
-                            BinaryOpKind::GeneralGe => general_ge_iter_10(&left_iter, &right_iter)?,
-                            _ => unreachable!(),
-                        }
+                        // §3.5.2 compares the converted operands with `eq`,
+                        // `ne`, …, so two strings are compared under the
+                        // default collation, as the value comparisons above
+                        // compare them.
+                        let active = crate::xpath::collation::resolve_collation_cached(ctx, None);
+                        crate::xpath::operators::general_compare_iter_10(
+                            bin_op.kind,
+                            &left_iter,
+                            &right_iter,
+                            active.as_ref(),
+                        )?
                     } else {
                         match bin_op.kind {
                             BinaryOpKind::GeneralEq => {

@@ -139,8 +139,10 @@ fn make_any_uri<N: DomNavigator>(uri: &str) -> XPathValue<N> {
 
 /// Resolve a relative URI reference against a base URI.
 ///
-/// This implements a simplified RFC 3986 URI resolution algorithm.
-fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
+/// This implements a simplified RFC 3986 URI resolution algorithm. It is
+/// crate-visible because a relative *collation* URI is resolved the same way
+/// (F&O §7.3.1); see [`collation`](crate::xpath::collation).
+pub(crate) fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
     // If relative is already absolute (has scheme), return as-is
     if is_absolute_uri(relative) {
         return Ok(relative.to_string());
@@ -202,7 +204,10 @@ fn resolve_uri_reference(relative: &str, base: &str) -> Result<String, ()> {
 }
 
 /// Check if a URI is absolute (has a scheme).
-fn is_absolute_uri(uri: &str) -> bool {
+///
+/// Crate-visible for the same reason as
+/// [`resolve_uri_reference`].
+pub(crate) fn is_absolute_uri(uri: &str) -> bool {
     // A scheme is a letter followed by letters, digits, +, -, or .
     // followed by :
     if let Some(colon_pos) = uri.find(':') {

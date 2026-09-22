@@ -17,9 +17,6 @@ use crate::xpath::DomNavigator;
 use super::{atomize_sequence, XPathValue};
 use crate::xpath::iterator::XmlItem;
 
-/// Default collation URI (codepoint collation)
-const DEFAULT_COLLATION: &str = "http://www.w3.org/2005/xpath-functions/collation/codepoint";
-
 /// fn:position() as xs:integer
 ///
 /// Returns the context position of the current item within the sequence
@@ -158,10 +155,13 @@ pub fn data<N: DomNavigator>(
 
 /// fn:default-collation() as xs:string
 ///
-/// Returns the value of the default collation property from the static context.
-/// The default collation is the Unicode codepoint collation.
+/// Returns the value of the default collation property from the static context
+/// — the URI a host passed to
+/// [`XPathContext::with_default_collation`](crate::xpath::XPathContext::with_default_collation),
+/// and otherwise the Unicode codepoint collation, which F&O §7.3.1 makes the
+/// default when the static context names none.
 pub fn default_collation<N: DomNavigator>(
-    _context: &mut DynamicContext<'_, N>,
+    context: &mut DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
     if !args.is_empty() {
@@ -171,7 +171,9 @@ pub fn default_collation<N: DomNavigator>(
             args.len(),
         ));
     }
-    Ok(XPathValue::string(DEFAULT_COLLATION))
+    Ok(XPathValue::string(
+        context.static_context.default_collation(),
+    ))
 }
 
 /// `fn:error()`
@@ -460,7 +462,10 @@ mod tests {
 
         let result = default_collation(&mut ctx, vec![]).unwrap();
         if let XPathValue::Item(XmlItem::Atomic(value)) = result {
-            assert_eq!(value.as_string(), Some(DEFAULT_COLLATION));
+            assert_eq!(
+                value.as_string(),
+                Some(crate::xpath::collation::CODEPOINT_COLLATION_URI)
+            );
         } else {
             panic!("Expected string");
         }

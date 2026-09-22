@@ -22,6 +22,7 @@ use crate::types::value::{
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
 use crate::xpath::cast::cast_to;
+use crate::xpath::collation::{self, CollationRef};
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
 use crate::xpath::general_compare;
@@ -76,10 +77,37 @@ pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathEr
 }
 
 /// Evaluate a binary operator for two atomic values.
+///
+/// String operands are compared under the Unicode codepoint collation. To
+/// compare them under the static context's default collation instead — which is
+/// what the `eq`, `ne`, `lt`, `le`, `gt` and `ge` operators of an expression do
+/// — the engine uses the crate-private `eval_binary_collated`.
 pub fn eval_binary(
     op: BinaryOpKind,
     left: &XmlValue,
     right: &XmlValue,
+) -> Result<XmlValue, XPathError> {
+    eval_binary_collated(op, left, right, CollationRef::Codepoint)
+}
+
+/// [`eval_binary`] with an explicit collation for string operands.
+///
+/// `collation` is [`CollationRef::Codepoint`] for the Unicode codepoint
+/// collation, which takes the very same code path [`eval_binary`] always took.
+///
+/// XPath 2.0 §2.1.1 defines the static context's default collation as "the
+/// collation to be used by functions and operators for comparing and ordering
+/// values of type `xs:string` and `xs:anyURI` (and types derived from them)",
+/// and §B.2 Operator Mapping spells the `eq` of two `xs:string` values as
+/// `op:numeric-equal(fn:compare(A, B), 0)` — `fn:compare` under the default
+/// collation. `xs:anyURI` has the same row, and §B.1 adds the note that
+/// "functions and operators that compare strings using the default collation
+/// also compare `xs:anyURI` values using the default collation".
+pub(crate) fn eval_binary_collated(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
 ) -> Result<XmlValue, XPathError> {
     match op {
         BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul | BinaryOpKind::Div => {
@@ -90,22 +118,22 @@ pub fn eval_binary(
         }
         BinaryOpKind::IDiv | BinaryOpKind::Mod => eval_numeric_binary(op, left, right),
         BinaryOpKind::GeneralEq | BinaryOpKind::ValueEq => {
-            Ok(XmlValue::boolean(compare_eq(left, right)?))
+            Ok(XmlValue::boolean(compare_eq(left, right, collation)?))
         }
         BinaryOpKind::GeneralNe | BinaryOpKind::ValueNe => {
-            Ok(XmlValue::boolean(!compare_eq(left, right)?))
+            Ok(XmlValue::boolean(!compare_eq(left, right, collation)?))
         }
         BinaryOpKind::GeneralGt | BinaryOpKind::ValueGt => {
-            Ok(XmlValue::boolean(compare_gt(left, right)?))
+            Ok(XmlValue::boolean(compare_gt(left, right, collation)?))
         }
         BinaryOpKind::GeneralGe | BinaryOpKind::ValueGe => {
-            Ok(XmlValue::boolean(compare_ge(left, right)?))
+            Ok(XmlValue::boolean(compare_ge(left, right, collation)?))
         }
         BinaryOpKind::GeneralLt | BinaryOpKind::ValueLt => {
-            Ok(XmlValue::boolean(compare_lt(left, right)?))
+            Ok(XmlValue::boolean(compare_lt(left, right, collation)?))
         }
         BinaryOpKind::GeneralLe | BinaryOpKind::ValueLe => {
-            Ok(XmlValue::boolean(compare_le(left, right)?))
+            Ok(XmlValue::boolean(compare_le(left, right, collation)?))
         }
         BinaryOpKind::And | BinaryOpKind::Or => eval_boolean_logic(op, left, right),
         BinaryOpKind::Is | BinaryOpKind::Before | BinaryOpKind::After => {
@@ -189,7 +217,11 @@ fn eval_boolean_logic(
     Ok(XmlValue::boolean(result))
 }
 
-fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+fn compare_eq(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
@@ -213,7 +245,8 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     }
 
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
-        return Ok(left.to_string_value() == right.to_string_value());
+        let (left_value, right_value) = (left.to_string_value(), right.to_string_value());
+        return collation.equals(&left_value, &right_value);
     }
 
     if left.type_code == right.type_code {
@@ -229,7 +262,11 @@ fn compare_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     Err(operator_not_defined("op:eq", left, right))
 }
 
-fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
+fn compare_gt(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
@@ -250,30 +287,44 @@ fn compare_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     if is_string_like(left.type_code) && is_string_like(right.type_code) {
         let left_value = left.to_string_value();
         let right_value = right.to_string_value();
-        return Ok(compare_string_values(&left_value, &right_value) == Ordering::Greater);
+        return Ok(
+            compare_string_values(&left_value, &right_value, collation)? == Ordering::Greater
+        );
     }
 
     Err(operator_not_defined("op:gt", left, right))
 }
 
-fn compare_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    match compare_eq(left, right) {
+fn compare_ge(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match compare_eq(left, right, collation) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_gt(left, right),
-        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right),
+        Ok(false) => compare_gt(left, right, collation),
+        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right, collation),
         Err(err) => Err(err),
     }
 }
 
-fn compare_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_gt(right, left)
+fn compare_lt(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_gt(right, left, collation)
 }
 
-fn compare_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    match compare_eq(left, right) {
+fn compare_le(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    match compare_eq(left, right, collation) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_lt(left, right),
-        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right),
+        Ok(false) => compare_lt(left, right, collation),
+        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right, collation),
         Err(err) => Err(err),
     }
 }
@@ -459,8 +510,20 @@ fn list_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
     }
 }
 
-fn compare_string_values(left: &str, right: &str) -> Ordering {
-    left.cmp(right)
+/// The order two string values are in, under `collation`.
+///
+/// [`CollationRef::Codepoint`] is `str::cmp` — the only thing this function ever
+/// did, and still the only thing it does unless a host has installed a
+/// [`CollationResolver`](crate::xpath::collation::CollationResolver) *and* named
+/// a different default collation. A URI the host does not support raises
+/// FOCH0002 here, which is exactly where F&O §7.3.1 wants it: at the string
+/// comparison that needed the collation.
+fn compare_string_values(
+    left: &str,
+    right: &str,
+    collation: CollationRef<'_>,
+) -> Result<Ordering, XPathError> {
+    collation.compare(left, right)
 }
 
 fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
@@ -2279,28 +2342,58 @@ pub(super) fn atomize_item<N: DomNavigator>(
 ///
 /// This is the core equality comparison used by both value and general comparisons.
 /// For general comparisons, use `magnitude_relationship` first to promote UntypedAtomic values.
+///
+/// Strings are compared under the Unicode codepoint collation; the collated
+/// twins below take the collation the expression is actually evaluated with.
 pub fn value_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_eq(left, right)
+    compare_eq(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for greater-than (value comparison).
 pub fn value_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_gt(left, right)
+    compare_gt(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for greater-than-or-equal (value comparison).
 pub fn value_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_ge(left, right)
+    compare_ge(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for less-than (value comparison).
 pub fn value_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_lt(left, right)
+    compare_lt(left, right, CollationRef::Codepoint)
 }
 
 /// Compare two values for less-than-or-equal (value comparison).
 pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_le(left, right)
+    compare_le(left, right, CollationRef::Codepoint)
+}
+
+/// [`value_eq`] under `collation` (`None` = codepoint).
+pub(crate) fn value_eq_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_eq(left, right, collation)
+}
+
+/// [`value_gt`] under `collation` (`None` = codepoint).
+pub(crate) fn value_gt_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_gt(left, right, collation)
+}
+
+/// [`value_lt`] under `collation` (`None` = codepoint).
+pub(crate) fn value_lt_collated(
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+) -> Result<bool, XPathError> {
+    compare_lt(left, right, collation)
 }
 
 // ============================================================================
@@ -2313,13 +2406,13 @@ pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 /// For sequence comparisons, use `general_eq_seq`.
 pub fn general_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_eq(&l, &r)
+    compare_eq(&l, &r, CollationRef::Codepoint)
 }
 
 /// General greater-than comparison with magnitude relationship promotion (single values).
 pub fn general_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_gt(&l, &r)
+    compare_gt(&l, &r, CollationRef::Codepoint)
 }
 
 /// General not-equal comparison with magnitude relationship promotion (single values).
@@ -2330,19 +2423,19 @@ pub fn general_ne(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError>
 /// General greater-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_ge(&l, &r)
+    compare_ge(&l, &r, CollationRef::Codepoint)
 }
 
 /// General less-than comparison with magnitude relationship promotion (single values).
 pub fn general_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_lt(&l, &r)
+    compare_lt(&l, &r, CollationRef::Codepoint)
 }
 
 /// General less-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_le(&l, &r)
+    compare_le(&l, &r, CollationRef::Codepoint)
 }
 
 // ============================================================================
@@ -2360,18 +2453,27 @@ where
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
 
+    // The static context's default collation, resolved once for the whole
+    // comparison rather than once per pair. Under the codepoint collation —
+    // the default, and the only collation without a host resolver — this is an
+    // `Option::is_none()` and `collation` stays `None`, which is the code path
+    // every line below took before collations existed.
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
+
     // Walk a bounded prefix of the Cartesian product first. Every comparison
     // whose product is no larger than the budget, and every comparison whose
     // first true pair falls inside it, is decided at exactly the cost it had
     // before — which is what the small comparisons in predicates need.
-    if let Some(result) = general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS)? {
+    if let Some(result) = general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    {
         return Ok(result);
     }
 
     // Only a genuinely large product gets here. A hash index answers the same
     // question in O(|A| + |B|) for the operand shapes where that is provably
     // the same answer, errors included; it declines everything else.
-    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf) {
+    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf, collation) {
         return result;
     }
 
@@ -2398,7 +2500,8 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    Ok(general_eq_scan(context, left, right_buf, usize::MAX)?.unwrap_or(false))
+    let active = collation::resolve_default(context);
+    Ok(general_eq_scan(context, left, right_buf, usize::MAX, active.as_ref())?.unwrap_or(false))
 }
 
 /// Walk at most `budget` pairs of the product in row-major order.
@@ -2412,6 +2515,7 @@ fn general_eq_scan<I1, I2>(
     left: &I1,
     right_buf: &BufferedNodeIterator<I2>,
     budget: usize,
+    collation: CollationRef<'_>,
 ) -> Result<Option<bool>, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2450,7 +2554,7 @@ where
             remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => return Ok(Some(true)),
                 Ok(false) => continue,
                 Err(err) if is_operator_not_defined(&err) => {
@@ -2479,14 +2583,18 @@ where
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
 
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
+
     // `!=` already stops at the first unequal pair, so the bounded prefix
     // decides it in practice; the index is only there for the degenerate
     // all-equal product, and it declines everything else.
-    if let Some(result) = general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS)? {
+    if let Some(result) = general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    {
         return Ok(result);
     }
 
-    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf) {
+    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf, collation) {
         return result;
     }
 
@@ -2503,7 +2611,8 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    Ok(general_ne_scan(context, left, right_buf, usize::MAX)?.unwrap_or(false))
+    let active = collation::resolve_default(context);
+    Ok(general_ne_scan(context, left, right_buf, usize::MAX, active.as_ref())?.unwrap_or(false))
 }
 
 /// The `!=` counterpart of [`general_eq_scan`]; see it for what `Ok(None)` means.
@@ -2512,6 +2621,7 @@ fn general_ne_scan<I1, I2>(
     left: &I1,
     right_buf: &BufferedNodeIterator<I2>,
     budget: usize,
+    collation: CollationRef<'_>,
 ) -> Result<Option<bool>, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2549,7 +2659,7 @@ where
             remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(Some(true)),
                 Err(err) if is_operator_not_defined(&err) => {
@@ -2577,6 +2687,8 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
     let mut left_iter = left.clone();
 
     while left_iter.move_next()? {
@@ -2599,7 +2711,7 @@ where
             };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_lt(&l, &r) {
+            match value_lt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2620,6 +2732,8 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
     let mut left_iter = left.clone();
 
     while left_iter.move_next()? {
@@ -2642,14 +2756,14 @@ where
             };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_lt(&l, &r) {
+            match value_lt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2670,6 +2784,8 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
     let mut left_iter = left.clone();
 
     while left_iter.move_next()? {
@@ -2692,7 +2808,7 @@ where
             };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_gt(&l, &r) {
+            match value_gt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2713,6 +2829,8 @@ where
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    let active = collation::resolve_default(context);
+    let collation = active.as_ref();
     let mut left_iter = left.clone();
 
     while left_iter.move_next()? {
@@ -2735,14 +2853,14 @@ where
             };
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq(&l, &r) {
+            match value_eq_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_gt(&l, &r) {
+            match value_gt_collated(&l, &r, collation) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2825,7 +2943,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralEq, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralEq,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general not-equal comparison (iterator-based, Cartesian product).
@@ -2834,7 +2957,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralNe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralNe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general less-than comparison (iterator-based, Cartesian product).
@@ -2843,7 +2971,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralLt, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralLt,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general less-than-or-equal comparison (iterator-based, Cartesian product).
@@ -2852,7 +2985,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralLe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralLe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general greater-than comparison (iterator-based, Cartesian product).
@@ -2861,7 +2999,12 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralGt, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralGt,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
 /// XPath 1.0 general greater-than-or-equal comparison (iterator-based, Cartesian product).
@@ -2870,14 +3013,35 @@ where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
-    general_compare_iter_10(BinaryOpKind::GeneralGe, left, right)
+    general_compare_iter_10(
+        BinaryOpKind::GeneralGe,
+        left,
+        right,
+        CollationRef::Codepoint,
+    )
 }
 
-/// Shared implementation for all XPath 1.0 general comparison iterators.
-fn general_compare_iter_10<I1, I2>(
+/// The XPath 1.0 compatibility-mode general comparison under `collation`.
+///
+/// XPath 2.0 §3.5.2 evaluates a general comparison in compatibility mode by
+/// converting the operands and then: "After performing the conversions
+/// described above, the atomic values are compared using one of the value
+/// comparison operators eq, ne, lt, le, gt, or ge, depending on whether the
+/// general comparison operator was =, !=, <, <=, >, or >=." A value comparison
+/// of two strings uses the default collation (§3.5.1; §B.2 maps it to
+/// `fn:compare`), so the engine passes the static context's default collation
+/// here — the same collation `eq` uses — and the public `general_*_iter_10`
+/// functions, which have no static context, pass the codepoint collation.
+///
+/// Only `=` and `!=` can reach a string comparison: for `<`, `<=`, `>` and `>=`
+/// every operand is converted with `fn:number` first (§3.5.2 rule 3). An
+/// unsupported collation is therefore FOCH0002 exactly where two strings are
+/// compared, and nowhere else.
+pub(crate) fn general_compare_iter_10<I1, I2>(
     op: BinaryOpKind,
     left: &I1,
     right: &I2,
+    collation: CollationRef<'_>,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2906,14 +3070,25 @@ where
             };
             let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
 
-            let satisfied = match op {
-                BinaryOpKind::GeneralEq => compare_eq(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralNe => !compare_eq(&l, &r).unwrap_or(true),
-                BinaryOpKind::GeneralLt => compare_lt(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralLe => compare_le(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralGt => compare_gt(&l, &r).unwrap_or(false),
-                BinaryOpKind::GeneralGe => compare_ge(&l, &r).unwrap_or(false),
+            let compared = match op {
+                BinaryOpKind::GeneralEq => compare_eq(&l, &r, collation),
+                BinaryOpKind::GeneralNe => compare_eq(&l, &r, collation).map(|eq| !eq),
+                BinaryOpKind::GeneralLt => compare_lt(&l, &r, collation),
+                BinaryOpKind::GeneralLe => compare_le(&l, &r, collation),
+                BinaryOpKind::GeneralGt => compare_gt(&l, &r, collation),
+                BinaryOpKind::GeneralGe => compare_ge(&l, &r, collation),
                 _ => unreachable!(),
+            };
+            let satisfied = match compared {
+                Ok(satisfied) => satisfied,
+                // A collation nobody supplies is FOCH0002 when two strings
+                // are compared (F&O §7.3.1); it must not read as "no match".
+                Err(err @ XPathError::FOCH0002 { .. }) => return Err(err),
+                // After `coerce_for_comparison_10` both operands are booleans,
+                // doubles or strings, so no other comparison error can arise;
+                // this is the pair-does-not-match reading the compatibility
+                // path has had since it was written.
+                Err(_) => false,
             };
 
             if satisfied {
@@ -3735,8 +3910,8 @@ mod tests {
         );
         let right = left.clone();
 
-        assert!(compare_ge(&left, &right).unwrap());
-        assert!(compare_le(&left, &right).unwrap());
+        assert!(compare_ge(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(compare_le(&left, &right, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3760,8 +3935,8 @@ mod tests {
             },
         );
 
-        assert!(compare_eq(&left, &right).unwrap());
-        assert!(!compare_eq(&left, &different).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(!compare_eq(&left, &different, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -3769,7 +3944,7 @@ mod tests {
         let inner = XmlValue::string("hello");
         let left = XmlValue::new(XmlTypeCode::String, XmlValueKind::Union(Box::new(inner)));
         let right = XmlValue::string("hello");
-        assert!(compare_eq(&left, &right).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -4072,7 +4247,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Boolean);
         assert_eq!(r.type_code, XmlTypeCode::Boolean);
-        assert!(compare_eq(&l, &r).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -4083,7 +4258,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.as_boolean(), Some(false));
         assert_eq!(r.as_boolean(), Some(true));
-        assert!(!compare_eq(&l, &r).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -4094,7 +4269,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralLt, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_lt(&l, &r).unwrap());
+        assert!(compare_lt(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -4105,7 +4280,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::String);
         assert_eq!(r.type_code, XmlTypeCode::String);
-        assert!(!compare_eq(&l, &r).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
@@ -4116,7 +4291,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_eq(&l, &r).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
     }
 
     #[test]
