@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Under XSD 1.0, `derivation-ok-restriction` rejected an element restricting
+  an optional choice through a branch that is itself optional — for example
+  `XAdESTimeStampType` in the XAdES 1.3.2 schema used by UBL 2.1, which
+  restricts `choice{0,1}(Include{0,unbounded}, ReferenceInfo{1,unbounded})`
+  to `Include{0,unbounded}`. A base choice was checked by folding its
+  occurrence range into each branch, never by the §3.9.6 rule, and a guard
+  that keeps this shortcut from accepting an optional element against a
+  *required* branch (W3C `particlesHa161`, invalid for 1.0) tested the derived
+  element's `minOccurs` rather than the branch it maps to. Particle Derivation
+  OK (Elt:All/Choice/Sequence -- RecurseAsIfGroup) is now applied first: the
+  element, wrapped in an implicit `choice{1,1}`, is checked with RecurseLax,
+  and the guard and the folding fallback apply only when that fails. XSD 1.1
+  already accepted the schema. Both W3C suites are unchanged (identical
+  failure sets), and so is the GAEB DA XML 3.3 corpus.
+
+### Changed
+
+- Under XSD 1.0, an element declared directly in a restriction no longer
+  restricts a base choice whose `minOccurs` is 2 or more: `a{2,2}` against
+  `choice{2,2}(a, b)` is now rejected. RecurseAsIfGroup fixes the implicit
+  group's occurrence range at 1..1, which fails Occurrence Range OK against
+  the base choice. That is the letter of the 1.0 Recommendation, unchanged by
+  any erratum, and what Xerces-J and .NET implement; processors that accept it
+  (XSV, Saxon) deliberately depart from 1.0 towards the 1.1 rule. A repeated
+  group that particle normalization folds into the same range, such as
+  `sequence{2,2}(a)`, is still checked as a group and accepted. Against a
+  repeated choice with `minOccurs` 0 or 1 the previous, laxer result is kept,
+  as W3C `particlesZ001`'s schema test expects. XSD 1.1 restriction is
+  language subsumption (§3.4.6.4) and accepts all of these.
+
 ## [0.2.1] - 2026-10-03
 
 ### Behaviour changes

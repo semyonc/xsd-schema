@@ -3931,6 +3931,352 @@ fn load_strict(xsd: &str, xsd11: bool) -> SchemaResult<PipelineStats> {
     load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None)
 }
 
+/// Check the implicit group range separately from the element range in
+/// XSD 1.0 RecurseAsIfGroup, including the restriction used by XAdES.
+#[test]
+fn test_xades_element_choice_recurse_as_if_group() {
+    struct Case {
+        label: &'static str,
+        choice_min: &'static str,
+        choice_max: &'static str,
+        base_min: &'static str,
+        base_max: &'static str,
+        derived_min: &'static str,
+        derived_max: &'static str,
+        derived_name: &'static str,
+        derived_type: &'static str,
+        accepted: bool,
+    }
+    const XADES: Case = Case {
+        label: "xades",
+        choice_min: "0",
+        choice_max: "1",
+        base_min: "0",
+        base_max: "unbounded",
+        derived_min: "0",
+        derived_max: "unbounded",
+        derived_name: "Include",
+        derived_type: "xs:string",
+        accepted: true,
+    };
+    let cases = [
+        XADES,
+        Case {
+            label: "required_choice_optional_branch",
+            choice_min: "1",
+            ..XADES
+        },
+        Case {
+            label: "narrow_occurrences",
+            derived_min: "1",
+            derived_max: "2",
+            ..XADES
+        },
+        Case {
+            label: "required_branch",
+            base_min: "1",
+            derived_min: "1",
+            ..XADES
+        },
+        Case {
+            label: "lower_branch_min",
+            base_min: "1",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "increase_branch_max",
+            base_max: "2",
+            derived_max: "3",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "unbounded_branch_max",
+            base_max: "2",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "wrong_element",
+            derived_name: "Other",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "unrelated_type",
+            derived_type: "xs:integer",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "derived_type",
+            derived_type: "xs:token",
+            ..XADES
+        },
+        Case {
+            label: "required_group_repetition",
+            choice_min: "2",
+            choice_max: "2",
+            accepted: false,
+            ..XADES
+        },
+        Case {
+            label: "optional_group_repetition",
+            choice_max: "2",
+            ..XADES
+        },
+    ];
+    for Case {
+        label,
+        choice_min,
+        choice_max,
+        base_min,
+        base_max,
+        derived_min,
+        derived_max,
+        derived_name,
+        derived_type,
+        accepted,
+    } in cases
+    {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+          <xs:complexType name="Base" abstract="true"><xs:sequence>
+            <xs:choice minOccurs="{choice_min}" maxOccurs="{choice_max}">
+              <xs:element name="Include" type="xs:string" minOccurs="{base_min}" maxOccurs="{base_max}"/>
+              <xs:element name="ReferenceInfo" type="xs:string" maxOccurs="unbounded"/>
+            </xs:choice><xs:element name="End" type="xs:string"/>
+          </xs:sequence></xs:complexType>
+          <xs:complexType name="Restricted"><xs:complexContent><xs:restriction base="Base"><xs:sequence>
+            <xs:element name="{derived_name}" type="{derived_type}" minOccurs="{derived_min}" maxOccurs="{derived_max}"/>
+            <xs:element name="End" type="xs:string"/>
+          </xs:sequence></xs:restriction></xs:complexContent></xs:complexType>
+          <xs:element name="root" type="Restricted"/>
+        </xs:schema>"#
+        );
+        let result = load_strict(&xsd, false);
+        assert_eq!(result.is_ok(), accepted, "case {label}: {result:?}");
+    }
+}
+
+/// In XSD 1.0, an element's implicit 1..1 group cannot restrict choice{2,2}.
+/// A real repeated group may do so, even after normalization folds it into
+/// the same element range. XSD 1.1 accepts both forms by language subsumption.
+#[test]
+fn test_required_choice_repetition_preserves_group_origin() {
+    let cases = [
+        (
+            "element_occurrences",
+            r#"<xs:sequence><xs:element name="a" type="xs:string" minOccurs="2" maxOccurs="2"/></xs:sequence>"#,
+            false,
+            true,
+        ),
+        (
+            "nested_unit_wrappers",
+            r#"<xs:sequence><xs:choice><xs:element name="a" type="xs:string" minOccurs="2" maxOccurs="2"/></xs:choice></xs:sequence>"#,
+            false,
+            true,
+        ),
+        (
+            "named_unit_wrapper",
+            r#"<xs:group ref="pair"/>"#,
+            false,
+            true,
+        ),
+        (
+            "repeated_sequence",
+            r#"<xs:sequence minOccurs="2" maxOccurs="2"><xs:element name="a" type="xs:string"/></xs:sequence>"#,
+            true,
+            true,
+        ),
+        (
+            "repeated_choice_under_unit_wrapper",
+            r#"<xs:sequence><xs:choice minOccurs="2" maxOccurs="2"><xs:element name="a" type="xs:string"/></xs:choice></xs:sequence>"#,
+            true,
+            true,
+        ),
+        (
+            "repeated_sequence_under_nested_unit_wrappers",
+            r#"<xs:sequence><xs:choice><xs:sequence minOccurs="2" maxOccurs="2"><xs:element name="a" type="xs:string"/></xs:sequence></xs:choice></xs:sequence>"#,
+            true,
+            true,
+        ),
+        (
+            "repeated_named_group_under_unit_wrapper",
+            r#"<xs:sequence><xs:group ref="single" minOccurs="2" maxOccurs="2"/></xs:sequence>"#,
+            true,
+            true,
+        ),
+        (
+            "folded_group_below_base_minimum",
+            r#"<xs:sequence minOccurs="0"><xs:element name="a" type="xs:string"/></xs:sequence>"#,
+            false,
+            false,
+        ),
+        (
+            "folded_group_above_base_maximum",
+            r#"<xs:sequence minOccurs="3" maxOccurs="3"><xs:element name="a" type="xs:string"/></xs:sequence>"#,
+            false,
+            false,
+        ),
+        (
+            "folded_group_with_unrelated_type",
+            r#"<xs:sequence minOccurs="2" maxOccurs="2"><xs:element name="a" type="xs:integer"/></xs:sequence>"#,
+            false,
+            false,
+        ),
+    ];
+    for (label, content, accepted_xsd10, accepted_xsd11) in cases {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:group name="single"><xs:sequence>
+                    <xs:element name="a" type="xs:string"/>
+                </xs:sequence></xs:group>
+                <xs:group name="pair"><xs:sequence>
+                    <xs:element name="a" type="xs:string" minOccurs="2" maxOccurs="2"/>
+                </xs:sequence></xs:group>
+                <xs:complexType name="Base">
+                    <xs:choice minOccurs="2" maxOccurs="2">
+                        <xs:element name="a" type="xs:string"/>
+                        <xs:element name="b" type="xs:string"/>
+                    </xs:choice>
+                </xs:complexType>
+                <xs:complexType name="Restricted">
+                    <xs:complexContent><xs:restriction base="Base">
+                        {content}
+                    </xs:restriction></xs:complexContent>
+                </xs:complexType>
+            </xs:schema>"#
+        );
+        for (xsd11, accepted) in [(false, accepted_xsd10), (true, accepted_xsd11)] {
+            let result = load_strict(&xsd, xsd11);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "case {label}, xsd11={xsd11}: {result:?}"
+            );
+            if let Err(error) = result {
+                assert!(
+                    matches!(
+                        error,
+                        SchemaError::StructuralError {
+                            constraint: "derivation-ok-restriction",
+                            ..
+                        }
+                    ),
+                    "case {label}, xsd11={xsd11}: {error:?}"
+                );
+            }
+        }
+    }
+}
+
+/// W3C msData/particles/particlesZ001.xsd: the suite accepts this schema
+/// using a lax interpretation of RecurseAsIfGroup for repeated choices.
+#[test]
+fn test_xsd10_conformance_particles_z001() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="Base">
+            <xs:sequence>
+                <xs:element name="annotation" minOccurs="0"/>
+                <xs:choice minOccurs="0" maxOccurs="unbounded">
+                    <xs:element name="element"/>
+                    <xs:element name="any"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="Derived">
+            <xs:complexContent><xs:restriction base="Base">
+                <xs:sequence>
+                    <xs:element name="annotation" minOccurs="0"/>
+                    <xs:element name="element" minOccurs="0" maxOccurs="unbounded"/>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesZ001: {result:?}");
+}
+
+/// W3C msData/particles/particlesHa165.xsd: normalization folds the
+/// single-child choice's 1..2 range into its element.
+#[test]
+fn test_xsd10_conformance_particles_ha165() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="base">
+            <xs:sequence>
+                <xs:choice maxOccurs="2">
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="derived">
+            <xs:complexContent><xs:restriction base="base">
+                <xs:sequence>
+                    <xs:choice maxOccurs="2">
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:choice>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesHa165: {result:?}");
+}
+
+/// W3C msData/particles/particlesHa167.xsd: normalization folds the
+/// single-child sequence's 1..2 range into its element.
+#[test]
+fn test_xsd10_conformance_particles_ha167() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="base">
+            <xs:sequence>
+                <xs:choice maxOccurs="2">
+                    <xs:element name="a" type="xs:string"/>
+                    <xs:element name="b" type="xs:string"/>
+                </xs:choice>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="derived">
+            <xs:complexContent><xs:restriction base="base">
+                <xs:sequence>
+                    <xs:sequence maxOccurs="2">
+                        <xs:element name="a" type="xs:string"/>
+                    </xs:sequence>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesHa167: {result:?}");
+}
+
+/// W3C msData/particles/particlesV009.xsd: a sequence with range 1..2
+/// restricts a choice with range 0..2, before single-child normalization.
+#[test]
+fn test_xsd10_conformance_particles_v009() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:complexType name="B">
+            <xs:choice minOccurs="0" maxOccurs="2">
+                <xs:element name="e1"/>
+                <xs:element name="e2"/>
+                <xs:element name="e3"/>
+            </xs:choice>
+        </xs:complexType>
+        <xs:complexType name="R">
+            <xs:complexContent><xs:restriction base="B">
+                <xs:sequence maxOccurs="2">
+                    <xs:element name="e1"/>
+                </xs:sequence>
+            </xs:restriction></xs:complexContent>
+        </xs:complexType>
+    </xs:schema>"#;
+    let result = load_strict(xsd, false);
+    assert!(result.is_ok(), "particlesV009: {result:?}");
+}
+
 /// §3.9.6 RecurseLax maps the *raw* {particles} of the two choices and checks
 /// the choices' own occurrence ranges separately.  Folding the parent choice's
 /// occurs into every branch makes each derived branch optional as soon as the

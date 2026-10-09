@@ -183,12 +183,14 @@ fn particle_restricts_unfolded(
                         max_occurs: Some(1),
                         source: derived.source.clone(),
                         collapsed_from: None,
+                        folded_group_occurs: false,
                     }],
                 }),
                 min_occurs: derived.min_occurs,
                 max_occurs: derived.max_occurs,
                 source: derived.source.clone(),
                 collapsed_from: None,
+                folded_group_occurs: derived.folded_group_occurs,
             };
             if particle_restricts_unfolded(schema_set, &expanded, base) {
                 return true;
@@ -196,8 +198,41 @@ fn particle_restricts_unfolded(
         }
     }
 
-    // XSD 1.0: A non-choice optional particle cannot restrict an optional non-repeated
-    // multi-branch choice. The expand_choice_branches approach merges choice occurs into
+    // XSD 1.0 RecurseAsIfGroup (Elt:Choice) treats the element as the sole
+    // child of a choice with range 1..1, checked with RecurseLax. Success is
+    // final. On failure, a folded group may still need the occurs-folding fallback.
+    // Normalization may have folded a single-child group's occurs into the
+    // element (particlesHa165/Ha167/V009), and the W3C suite accepts the lax
+    // interpretation for repeated choices (particlesZ001).
+    if let (NormalizedParticleTerm::Element(_), NormalizedParticleTerm::Group(base_group)) =
+        (&derived.term, &base.term)
+    {
+        if schema_set.is_xsd10() && base_group.compositor == Compositor::Choice {
+            let implicit_range_fits =
+                occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs);
+            if implicit_range_fits
+                && choice_branches_restrict_ordered(
+                    schema_set,
+                    std::slice::from_ref(derived),
+                    &base_group.particles,
+                )
+            {
+                return true;
+            }
+
+            // An element with only unit wrappers really has an implicit 1..1
+            // group. Its own occurrences cannot satisfy required group repetition.
+            // If normalization folded non-unit group occurrences, let the fallback
+            // check that range instead.
+            if !implicit_range_fits && !derived.folded_group_occurs {
+                return false;
+            }
+        }
+    }
+
+    // Unless accepted above, an XSD 1.0 non-choice optional particle cannot
+    // restrict an optional non-repeated multi-branch choice.
+    // The expand_choice_branches approach merges choice occurs into
     // branches, which gives wrong results for RecurseLax when max_occurs=1.
     // For repeated choices (max>1), the spec is ambiguous — provisionally accept.
     if schema_set.is_xsd10()
@@ -546,6 +581,9 @@ fn expand_choice_branches(particle: &NormalizedParticle) -> Option<Vec<Normalize
                     max_occurs,
                     source: particle.source.clone().or(child.source.clone()),
                     collapsed_from: None,
+                    folded_group_occurs: particle.folded_group_occurs
+                        || child.folded_group_occurs
+                        || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
                 })
             })
             .collect(),
@@ -1067,6 +1105,9 @@ fn expand_top_level_choices_for_unordered(
                         max_occurs: new_max,
                         source: branch.source.clone(),
                         collapsed_from: None,
+                        folded_group_occurs: p.folded_group_occurs
+                            || branch.folded_group_occurs
+                            || !occurs_is_unit(p.min_occurs, p.max_occurs),
                     });
                 }
             }

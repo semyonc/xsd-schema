@@ -24,6 +24,10 @@ pub(super) struct NormalizedParticle {
     /// structural, so the restriction check has to be able to put that group
     /// back; see the re-expansion step in `particle_restricts`.
     pub(super) collapsed_from: Option<Compositor>,
+    /// A non-unit group occurrence range was folded into this particle.
+    /// Unlike `collapsed_from`, this survives nested unit wrappers, allowing
+    /// XSD 1.0 restriction checks to distinguish repeated groups from elements.
+    pub(super) folded_group_occurs: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +119,7 @@ impl<'a> ParticleNormalizer<'a> {
             max_occurs: particle.max_occurs,
             source: particle.source.clone(),
             collapsed_from: None,
+            folded_group_occurs: false,
         }))
     }
 
@@ -363,6 +368,7 @@ pub(super) fn normalized_effective_base_particle(
                     max_occurs: Some(1),
                     source: None,
                     collapsed_from: None,
+                    folded_group_occurs: false,
                 })
             }
         }
@@ -430,6 +436,7 @@ pub(super) fn normalize_model_group_as_particle(
         max_occurs: group_data.max_occurs,
         source: group_data.source.clone(),
         collapsed_from: None,
+        folded_group_occurs: false,
     };
 
     // `normalize_particle` collapses every child; the outer wrapper we
@@ -557,12 +564,16 @@ pub(super) fn collapse_single_child_groups(mut particle: NormalizedParticle) -> 
             NormalizedParticleTerm::Group(group) => Some(group.compositor),
             _ => None,
         };
+        let folded_group_occurs = particle.folded_group_occurs
+            || child.folded_group_occurs
+            || !occurs_is_unit(particle.min_occurs, particle.max_occurs);
         particle = NormalizedParticle {
             term: child.term,
             min_occurs,
             max_occurs,
             source: particle.source.clone().or(child.source),
             collapsed_from: compositor,
+            folded_group_occurs,
         };
     }
 }
@@ -619,6 +630,9 @@ pub(super) fn fold_single_child_group(particle: &NormalizedParticle) -> Option<N
                 max_occurs,
                 source: particle.source.clone().or(child.source.clone()),
                 collapsed_from: None,
+                folded_group_occurs: particle.folded_group_occurs
+                    || child.folded_group_occurs
+                    || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
             });
         }
     }
