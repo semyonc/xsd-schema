@@ -23,6 +23,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the guard and the folding fallback apply only when that fails. XSD 1.1
   already accepted the schema. Both W3C suites are unchanged (identical
   failure sets), and so is the GAEB DA XML 3.3 corpus.
+- The timezone offset of the date/time types was parsed as two integers
+  around a `:`, so malformed and out-of-range offsets were accepted —
+  `+1:30`, `+01:+30`, `+01:60`, `+14:01`, `+15:00` — and `09:15:00+15:00`
+  was a valid `xs:time` with a 15-hour offset (found with UBL invoice
+  fixtures). The offset must now match `timezoneFrag` (Datatypes §D.2.2)
+  exactly: two-digit hours and minutes, minutes below 60, and at most `14:00`
+  either way. In XPath, a cast from such a string — `cast as`, `castable as`,
+  an `xs:*` constructor function, or a comparison that casts an untyped
+  value — now raises `FORG0001`.
+- The month and day fields of `xs:date`, `xs:dateTime`, `xs:gYearMonth`,
+  `xs:gMonthDay`, `xs:gDay` and `xs:gMonth` were parsed as integers and only
+  range-checked, so `2002-002-15`, `2002-2-15`, `---001` and `--+2` were
+  accepted. They must now be exactly two digits (`monthFrag`, `dayFrag`).
+  And with a negative year, `xs:date` and `xs:gYearMonth` ignored anything
+  after the last field: `-2024-01-15-junk` was a valid date, and
+  `-2024-01-15-15:00` lost its out-of-range timezone instead of being
+  rejected. Such values are now invalid, and XPath casts from them raise
+  `FORG0001`.
 
 ### Changed
 
