@@ -7,57 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [0.2.2] - 2026-10-10
 
-- Under XSD 1.0, `derivation-ok-restriction` rejected an element restricting
-  an optional choice through a branch that is itself optional — for example
-  `XAdESTimeStampType` in the XAdES 1.3.2 schema used by UBL 2.1, which
-  restricts `choice{0,1}(Include{0,unbounded}, ReferenceInfo{1,unbounded})`
-  to `Include{0,unbounded}`. A base choice was checked by folding its
-  occurrence range into each branch, never by the §3.9.6 rule, and a guard
-  that keeps this shortcut from accepting an optional element against a
-  *required* branch (W3C `particlesHa161`, invalid for 1.0) tested the derived
-  element's `minOccurs` rather than the branch it maps to. Particle Derivation
-  OK (Elt:All/Choice/Sequence -- RecurseAsIfGroup) is now applied first: the
-  element, wrapped in an implicit `choice{1,1}`, is checked with RecurseLax,
-  and the guard and the folding fallback apply only when that fails. XSD 1.1
-  already accepted the schema. Both W3C suites are unchanged (identical
-  failure sets), and so is the GAEB DA XML 3.3 corpus.
-- The timezone offset of the date/time types was parsed as two integers
-  around a `:`, so malformed and out-of-range offsets were accepted —
-  `+1:30`, `+01:+30`, `+01:60`, `+14:01`, `+15:00` — and `09:15:00+15:00`
-  was a valid `xs:time` with a 15-hour offset (found with UBL invoice
-  fixtures). The offset must now match `timezoneFrag` (Datatypes §D.2.2)
-  exactly: two-digit hours and minutes, minutes below 60, and at most `14:00`
-  either way. In XPath, a cast from such a string — `cast as`, `castable as`,
-  an `xs:*` constructor function, or a comparison that casts an untyped
-  value — now raises `FORG0001`.
-- The month and day fields of `xs:date`, `xs:dateTime`, `xs:gYearMonth`,
-  `xs:gMonthDay`, `xs:gDay` and `xs:gMonth` were parsed as integers and only
-  range-checked, so `2002-002-15`, `2002-2-15`, `---001` and `--+2` were
-  accepted. They must now be exactly two digits (`monthFrag`, `dayFrag`).
-  And with a negative year, `xs:date` and `xs:gYearMonth` ignored anything
-  after the last field: `-2024-01-15-junk` was a valid date, and
-  `-2024-01-15-15:00` lost its out-of-range timezone instead of being
-  rejected. Such values are now invalid, and XPath casts from them raise
-  `FORG0001`.
-- Instance validation accepted children that an optional or repeated group
-  forbids when the group starts or ends with an unbounded particle:
-  `(X, Y*)?, Z` accepted `<Y/><Z/>` although `Y` may only follow `X`, and
-  so did `(X, Y+)?`, `(Y*, X)?`, `(X, Y*){0,3}`, `(X, Y*)*` and
-  `choice{0,1}(sequence(X, Y*))` (found with GAEB DA XML 3.3, where DA85
-  `tgItem` accepted `QtySplit` without `Qty`). The content-model compiler drew
-  the loop edge of `*` and `+` between the repeated particle's own boundary
-  states, so the bypass of the enclosing optional group, or the link to its
-  next particle, ran into or out of the loop. Loops now get their own entry
-  and exit states. Present since 0.1.1. Both W3C suites are unchanged
-  (identical failure sets), and so is the GAEB corpus.
-- A particle with `minOccurs="0" maxOccurs="0"` inside an `xs:choice` made the
-  choice accept empty content: `choice(e1{0,0}, e2)` accepted no children
-  although `e2` is required. Such a particle maps to no component at all
-  (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2), and it is now left out of
-  the choice; a choice left with no particles accepts nothing unless it is
-  itself optional. It is also no longer a sibling for `notQName="##definedSibling"`.
+### Behaviour changes
+
+This release removes no public item and changes no signature. It fixes
+validation defects, and validation is stricter as a result: some schemas and
+instances that 0.2.1 accepted are now rejected. Each point is detailed under
+*Changed* or *Fixed*.
+
+- **Content models.** Children that an optional or repeated group forbids are
+  now invalid — `(X, Y*)?, Z` accepted `<Y/><Z/>` although `Y` may only
+  follow `X` — and so is empty content for a choice whose other branches have
+  `maxOccurs="0"`. `NfaFragment::repeat_star` and `repeat_plus` now wrap the
+  loop in a fresh entry and exit state, two states more; code that inspects a
+  fragment's structure, rather than the language it accepts, sees that, and
+  state numbers in `inspect_content_model` reports shift. In debug builds
+  `NfaFragment::concat`, `alternate`, `optional` and `fragment_to_table` now
+  assert that nothing inside a fragment re-enters its start state or leaves
+  its end state, so a hand-built fragment that breaks this panics there.
+- **Date and time lexical forms.** A timezone offset must match `timezoneFrag`
+  exactly (two-digit hours and minutes, minutes below 60, at most `14:00`),
+  month and day fields are exactly two digits, and nothing may follow a
+  negative-year date. Such values are invalid, XPath casts from them raise
+  `FORG0001`, and `castable as` returns `false` for them.
+- **XSD 1.0 restriction.** An element declared directly in a restriction no
+  longer restricts a base choice whose `minOccurs` is 2 or more. The other way
+  round, an element restricting an optional choice through an optional branch
+  — UBL 2.1's XAdES `XAdESTimeStampType` — is now accepted.
 
 ### Changed
 
@@ -73,6 +50,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repeated choice with `minOccurs` 0 or 1 the previous, laxer result is kept,
   as W3C `particlesZ001`'s schema test expects. XSD 1.1 restriction is
   language subsumption (§3.4.6.4) and accepts all of these.
+
+### Fixed
+
+- Under XSD 1.0, `derivation-ok-restriction` rejected an element restricting
+  an optional choice through a branch that is itself optional — for example
+  `XAdESTimeStampType` in the XAdES 1.3.2 schema used by UBL 2.1, which
+  restricts `choice{0,1}(Include{0,unbounded}, ReferenceInfo{1,unbounded})`
+  to `Include{0,unbounded}`. A base choice was checked by folding its
+  occurrence range into each branch, never by the XSD 1.0 §3.9.6 rule, and a guard
+  that keeps this shortcut from accepting an optional element against a
+  *required* branch (W3C `particlesHa161`, invalid for 1.0) tested the derived
+  element's `minOccurs` rather than the branch it maps to. For a base choice,
+  Particle Derivation OK (Elt:All/Choice/Sequence -- RecurseAsIfGroup) is now
+  applied first: the
+  element, wrapped in an implicit `choice{1,1}`, is checked with RecurseLax,
+  and the guard and the folding fallback apply only when that fails. XSD 1.1
+  already accepted the schema. Both W3C suites are unchanged (identical
+  failure sets), and so is the GAEB DA XML 3.3 corpus.
+- The timezone offset of the date/time types was parsed as two integers
+  around a `:`, so malformed and out-of-range offsets were accepted —
+  `+1:30`, `+01:60`, `+14:01`, `+15:00`, and `+01:-30`, which read as
+  `+00:30` — and `09:15:00+15:00`
+  was a valid `xs:time` with a 15-hour offset (found with UBL invoice
+  fixtures). The offset must now match `timezoneFrag` (Datatypes §D.2.2)
+  exactly: two-digit hours and minutes, minutes below 60, and at most `14:00`
+  either way. In XPath, a cast from such a string — `cast as`, an `xs:*`
+  constructor function, or a comparison that casts an untyped value — now
+  raises `FORG0001`, and `castable as` returns `false`.
+- The month and day fields of `xs:date`, `xs:dateTime`, `xs:gYearMonth`,
+  `xs:gMonthDay`, `xs:gDay` and `xs:gMonth` were parsed as integers and only
+  range-checked, so `2002-002-15`, `2002-2-15`, `---001` and `--+2` were
+  accepted. They must now be exactly two digits (`monthFrag`, `dayFrag`).
+  And with a negative year, `xs:date` and `xs:gYearMonth` ignored anything
+  after the last field: `-2024-01-15-junk` was a valid date, and
+  `-2024-01-15-15:00` was accepted with a `-15:00` offset. Such values are
+  now invalid, and XPath casts from them raise `FORG0001`.
+- Instance validation accepted children that an optional or repeated group
+  forbids when the group starts or ends with an unbounded particle:
+  `(X, Y*)?, Z` accepted `<Y/><Z/>` although `Y` may only follow `X`, and
+  so did `(X, Y+)?`, `(Y*, X)?`, `(X, Y*){0,3}`, `(X, Y*)*` and
+  `choice{0,1}(sequence(X, Y*))` (found with GAEB DA XML 3.3, where DA85
+  `tgItem` accepted `QtySplit` without `Qty`). The content-model compiler drew
+  the loop edge of `*` and `+` between the repeated particle's own boundary
+  states, so the bypass of the enclosing optional group, or the link to its
+  next particle, ran into or out of the loop. Loops now get their own entry
+  and exit states. Present in every release since 0.1.0. Both W3C suites are unchanged
+  (identical failure sets), and so is the GAEB corpus.
+- A particle with `minOccurs="0" maxOccurs="0"` inside an `xs:choice` made the
+  choice accept empty content: `choice(e1{0,0}, e2)` accepted no children
+  although `e2` is required. Such a particle maps to no component at all
+  (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2), and it is now left out of
+  the choice; a choice left with no particles accepts nothing unless it is
+  itself optional. It is also no longer a sibling for `notQName="##definedSibling"`.
 
 ## [0.2.1] - 2026-10-03
 
@@ -1714,7 +1744,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/semyonc/xsd-schema/compare/v0.1.5...v0.2.0
 [0.1.5]: https://github.com/semyonc/xsd-schema/compare/v0.1.4...v0.1.5
