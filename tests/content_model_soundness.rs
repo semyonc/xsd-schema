@@ -1,11 +1,17 @@
 //! Content models must not accept child sequences their particles forbid.
 //!
-//! Kleene star and plus drew their loop edge between the body's own start and
-//! end states. Combinators attach edges to those boundary states — the bypass
-//! of an optional group, the link of a sequence, an enclosing loop — which then
-//! entered or left the loop: `(X, Y*)?, Z` accepted `<Y/><Z/>` although `Y`
-//! may only follow `X`. A real schema hit it: GAEB DA XML 3.3 DA85 `tgItem`,
-//! `choice{0,1}(sequence(Qty, QtySplit*))`.
+//! Two compiler defects let instance validation accept invalid documents:
+//!
+//! * Kleene star and plus drew their loop edge between the body's own start
+//!   and end states. Combinators attach edges to those boundary states — the
+//!   bypass of an optional group, the link of a sequence, an enclosing loop —
+//!   which then entered or left the loop: `(X, Y*)?, Z` accepted `<Y/><Z/>`
+//!   although `Y` may only follow `X`. A real schema hit it: GAEB DA XML 3.3
+//!   DA85 `tgItem`, `choice{0,1}(sequence(Qty, QtySplit*))`.
+//! * A particle with minOccurs=maxOccurs=0 "maps to no component at all"
+//!   (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2), but inside a choice it
+//!   compiled to an empty branch: `choice(e1{0,0}, e2)` accepted no children
+//!   although `e2` is required.
 //!
 //! Every case runs in XSD 1.0 and XSD 1.1 mode through the streaming driver.
 
@@ -205,5 +211,126 @@ fn controls_without_an_enclosing_optional_group() {
         &root_schema(&format!("<xs:sequence>{X}{Y_STAR}</xs:sequence>{Z}")),
         &["<root><X/><Y/><Z/></root>"],
         &["<root><Y/><Z/></root>"],
+    );
+}
+
+/// `<doc>` whose content is the given `xs:choice` (or other model group).
+fn doc_schema(content: &str) -> String {
+    format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:group name="g"><xs:sequence><xs:element name="g1"/></xs:sequence></xs:group>
+  <xs:element name="doc"><xs:complexType>{content}</xs:complexType></xs:element>
+</xs:schema>"#
+    )
+}
+
+#[test]
+fn zero_occurrence_element_is_not_a_choice_branch() {
+    let xsd = doc_schema(
+        r#"<xs:choice><xs:element name="e1" minOccurs="0" maxOccurs="0"/><xs:element name="e2"/></xs:choice>"#,
+    );
+    check(
+        "choice(e1{0,0}, e2)",
+        &xsd,
+        &["<doc><e2/></doc>"],
+        &["<doc/>", "<doc><e1/></doc>"],
+    );
+}
+
+#[test]
+fn zero_occurrence_group_ref_and_wildcard_are_not_choice_branches() {
+    let group = doc_schema(
+        r#"<xs:choice><xs:group ref="g" minOccurs="0" maxOccurs="0"/><xs:element name="e2"/></xs:choice>"#,
+    );
+    check(
+        "choice(g{0,0}, e2)",
+        &group,
+        &["<doc><e2/></doc>"],
+        &["<doc/>", "<doc><g1/></doc>"],
+    );
+
+    let wildcard = doc_schema(
+        r#"<xs:choice><xs:any processContents="skip" minOccurs="0" maxOccurs="0"/><xs:element name="e2"/></xs:choice>"#,
+    );
+    check(
+        "choice(any{0,0}, e2)",
+        &wildcard,
+        &["<doc><e2/></doc>"],
+        &["<doc/>", "<doc><other/></doc>"],
+    );
+}
+
+#[test]
+fn choice_whose_only_branches_have_zero_occurrences() {
+    // No particles remain: a required choice accepts nothing at all, not even
+    // empty content; an optional one accepts only empty content.
+    let required =
+        doc_schema(r#"<xs:choice><xs:element name="e1" minOccurs="0" maxOccurs="0"/></xs:choice>"#);
+    check(
+        "choice(e1{0,0})",
+        &required,
+        &[],
+        &["<doc/>", "<doc><e1/></doc>"],
+    );
+
+    let optional = doc_schema(
+        r#"<xs:choice minOccurs="0"><xs:element name="e1" minOccurs="0" maxOccurs="0"/></xs:choice>"#,
+    );
+    check(
+        "choice{0,1}(e1{0,0})",
+        &optional,
+        &["<doc/>"],
+        &["<doc><e1/></doc>"],
+    );
+}
+
+#[test]
+fn only_the_zero_occurrence_particle_itself_disappears() {
+    // The inner sequence keeps existing with no particles of its own, so it
+    // matches empty content and the choice does accept `<doc/>`.
+    let nested = doc_schema(
+        r#"<xs:choice><xs:sequence><xs:element name="e1" minOccurs="0" maxOccurs="0"/></xs:sequence><xs:element name="e2"/></xs:choice>"#,
+    );
+    check(
+        "choice(sequence(e1{0,0}), e2)",
+        &nested,
+        &["<doc/>", "<doc><e2/></doc>"],
+        &["<doc><e1/></doc>"],
+    );
+
+    // In a sequence a zero-occurrence particle always behaved as absent.
+    let sequence = doc_schema(
+        r#"<xs:sequence><xs:element name="e1" minOccurs="0" maxOccurs="0"/><xs:element name="e2"/></xs:sequence>"#,
+    );
+    check(
+        "sequence(e1{0,0}, e2)",
+        &sequence,
+        &["<doc><e2/></doc>"],
+        &["<doc/>", "<doc><e1/><e2/></doc>"],
+    );
+}
+
+/// A zero-occurrence element declares no sibling, so `##definedSibling` does
+/// not exclude its name.
+#[cfg(feature = "xsd11")]
+#[test]
+fn zero_occurrence_element_is_not_a_defined_sibling() {
+    let xsd = doc_schema(
+        r###"<xs:sequence>
+             <xs:element name="e1" minOccurs="0" maxOccurs="0"/>
+             <xs:element name="e2"/>
+             <xs:any processContents="skip" notQName="##definedSibling" minOccurs="0"/>
+           </xs:sequence>"###,
+    );
+    let set = schema(&xsd, true);
+    assert_eq!(
+        validity(&set, "<doc><e2/><e1/></doc>"),
+        Some(SchemaValidity::Valid),
+        "e1 maps to no component, so the wildcard admits it"
+    );
+    assert_eq!(
+        validity(&set, "<doc><e2/><e2/></doc>"),
+        Some(SchemaValidity::Invalid),
+        "e2 is a real sibling and stays excluded"
     );
 }

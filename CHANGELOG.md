@@ -52,6 +52,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   next particle, ran into or out of the loop. Loops now get their own entry
   and exit states. Present since 0.1.1. Both W3C suites are unchanged
   (identical failure sets), and so is the GAEB corpus.
+- A particle with `minOccurs="0" maxOccurs="0"` inside an `xs:choice` made the
+  choice accept empty content: `choice(e1{0,0}, e2)` accepted no children
+  although `e2` is required. Such a particle maps to no component at all
+  (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2), and it is now left out of
+  the choice; a choice left with no particles accepts nothing unless it is
+  itself optional. It is also no longer a sibling for `notQName="##definedSibling"`.
 
 ### Changed
 
