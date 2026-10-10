@@ -2491,15 +2491,22 @@ fn split_timezone(s: &str) -> (&str, Option<TimezoneOffset>) {
     }
 }
 
-/// Parse timezone offset (HH:MM)
+/// Parse a timezone offset (HH:MM), bounded by 14:00.
 fn parse_timezone_offset(s: &str, negative: bool) -> Option<TimezoneOffset> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
+    let [h1 @ b'0'..=b'9', h2 @ b'0'..=b'9', b':', m1 @ b'0'..=b'9', m2 @ b'0'..=b'9'] =
+        s.as_bytes()
+    else {
+        return None;
+    };
+
+    let hours = (h1 - b'0') * 10 + (h2 - b'0');
+    let minutes = (m1 - b'0') * 10 + (m2 - b'0');
+
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
         return None;
     }
-    let hours: i8 = parts[0].parse().ok()?;
-    let minutes: i8 = parts[1].parse().ok()?;
-    let offset = hours as i16 * 60 + minutes as i16;
+
+    let offset = i16::from(hours) * 60 + i16::from(minutes);
     Some(TimezoneOffset(if negative { -offset } else { offset }))
 }
 
@@ -4382,6 +4389,34 @@ mod tests {
         let v = TimeValidator;
         let result = v.validate("10:30:00").unwrap();
         assert_eq!(result.type_code, XmlTypeCode::Time);
+    }
+
+    #[test]
+    fn test_time_validator_timezone_offsets() {
+        let validator = TimeValidator;
+
+        for offset in [
+            "", "Z", "+00:00", "-00:00", "+01:30", "-01:30", "+13:59", "-13:59", "+14:00", "-14:00",
+        ] {
+            let input = format!("09:15:00{offset}");
+            let result = validator.validate(&input);
+            assert!(
+                result.is_ok(),
+                "expected valid time {input:?}, got {result:?}"
+            );
+        }
+
+        for offset in [
+            "+1:30", "-1:30", "+01:3", "-01:3", "+001:30", "+01:030", "+01:60", "-01:60", "+14:01",
+            "-14:01", "+14:59", "-14:59", "+15:00", "-15:00", "+24:00", "-24:00", "+", "-", "+01",
+            "+01:", "++01:30", "+01:+30",
+        ] {
+            let input = format!("09:15:00{offset}");
+            assert!(
+                validator.validate(&input).is_err(),
+                "expected invalid time {input:?} to be rejected"
+            );
+        }
     }
 
     #[test]
