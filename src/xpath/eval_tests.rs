@@ -4430,6 +4430,48 @@ fn decimal_literal_with_a_trailing_period_evaluates() {
     assert_eq!(eval_to_string(".5 + 0.5").unwrap(), "1");
 }
 
+/// Datatypes §D.2.2: a timezone offset must match `timezoneFrag` and month and
+/// day fields `monthFrag` / `dayFrag`; nothing may follow a negative-year
+/// date. A cast from such a string raises FORG0001 through `cast as` and the
+/// `xs:*` constructor functions alike, while `castable as` answers `false` —
+/// it never raises a cast error.
+#[test]
+fn casts_reject_malformed_timezones_and_date_fields() {
+    for (lexical, ty) in [
+        ("09:15:00+15:00", "time"),
+        ("09:15:00+01:-30", "time"),
+        ("2002-10-10+1:30", "date"),
+        ("2002-2-15", "date"),
+        ("-2024-01-15-junk", "date"),
+        ("2002-10-10T09:15:00+14:01", "dateTime"),
+    ] {
+        let cast = eval_to_string(&format!("'{lexical}' cast as xs:{ty}"));
+        assert!(
+            matches!(cast, Err(XPathError::FORG0001 { .. })),
+            "'{lexical}' cast as xs:{ty}: {cast:?}"
+        );
+        let constructor = eval_to_string(&format!("xs:{ty}('{lexical}')"));
+        assert!(
+            matches!(constructor, Err(XPathError::FORG0001 { .. })),
+            "xs:{ty}('{lexical}'): {constructor:?}"
+        );
+        assert_eq!(
+            eval_to_string(&format!("'{lexical}' castable as xs:{ty}")).unwrap(),
+            "false",
+            "'{lexical}' castable as xs:{ty}"
+        );
+    }
+    // The boundary values stay castable.
+    assert_eq!(
+        eval_to_string("'09:15:00+14:00' castable as xs:time").unwrap(),
+        "true"
+    );
+    assert_eq!(
+        eval_to_string("'2002-10-10-14:00' castable as xs:date").unwrap(),
+        "true"
+    );
+}
+
 /// XPath 2.0 §3.1.1: the value of a string literal is the characters between
 /// the delimiters; no XML un-escaping happens inside the XPath processor.
 #[test]

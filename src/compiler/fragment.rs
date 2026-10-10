@@ -234,8 +234,10 @@ impl NfaFragment {
 
     /// Kleene star: self*
     ///
-    /// Allows zero or more repetitions of the fragment: the loop of
-    /// `wrap_loop` plus an entry → exit bypass.
+    /// Allows zero or more repetitions of the fragment. The body is wrapped
+    /// in a fresh entry and a fresh exit state — entry → body, body → body
+    /// (repeat), body → exit — plus an entry → exit bypass, so the loop edge
+    /// never touches a state that composition attaches edges to.
     pub fn repeat_star(self) -> NfaFragment {
         let mut frag = self.wrap_loop();
         let exit_id = frag.end as StateId;
@@ -246,9 +248,10 @@ impl NfaFragment {
 
     /// Plus repetition: self+
     ///
-    /// Requires at least one occurrence, then allows more: the loop of
-    /// `wrap_loop` with no bypass. Nullable iff one
-    /// occurrence can match empty, so `self.nullable` carries over.
+    /// Requires at least one occurrence, then allows more: the same fresh
+    /// entry, exit and loop as [`repeat_star`](Self::repeat_star), without the
+    /// bypass. Nullable iff one occurrence can match empty, so
+    /// `self.nullable` carries over.
     pub fn repeat_plus(self) -> NfaFragment {
         self.wrap_loop()
     }
