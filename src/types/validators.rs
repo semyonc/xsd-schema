@@ -2287,10 +2287,23 @@ fn valid_year_lexical(year_str: &str) -> bool {
     true
 }
 
+/// Parse a month or day field, which is exactly two ASCII digits per the
+/// `monthFrag` / `dayFrag` productions of XSD Part 2 §D.2.2. Ranges are
+/// checked by the callers. (`str::parse::<u8>` would also accept `5`, `005`
+/// and `+5`.)
+fn parse_two_digit_field(s: &str) -> Option<u8> {
+    let [d1 @ b'0'..=b'9', d2 @ b'0'..=b'9'] = s.as_bytes() else {
+        return None;
+    };
+    Some((d1 - b'0') * 10 + (d2 - b'0'))
+}
+
 /// Parse date part (YYYY-MM-DD)
 fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u8, u8)> {
     let parts: Vec<&str> = s.split('-').collect();
-    let (year_str, year, month, day) = if s.starts_with('-') && parts.len() >= 4 {
+    // A negative year splits into a leading empty segment; any further
+    // segment (e.g. a timezone `split_timezone` did not accept) is an error.
+    let (year_str, year, month, day) = if s.starts_with('-') && parts.len() == 4 {
         // Negative year
         let year_str = format!("-{}", parts[1]);
         let year: i32 = year_str
@@ -2300,16 +2313,14 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
                 type_name,
                 message: "Invalid year".to_string(),
             })?;
-        let month: u8 = parts[2]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let month =
+            parse_two_digit_field(parts[2]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name,
                 message: "Invalid month".to_string(),
             })?;
-        let day: u8 = parts[3]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let day =
+            parse_two_digit_field(parts[3]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name,
                 message: "Invalid day".to_string(),
@@ -2324,16 +2335,14 @@ fn parse_date_part(s: &str, type_name: &'static str) -> ValidationResult<(i32, u
                 type_name,
                 message: "Invalid year".to_string(),
             })?;
-        let month: u8 = parts[1]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let month =
+            parse_two_digit_field(parts[1]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name,
                 message: "Invalid month".to_string(),
             })?;
-        let day: u8 = parts[2]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let day =
+            parse_two_digit_field(parts[2]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name,
                 message: "Invalid day".to_string(),
@@ -2515,7 +2524,9 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
     let (date_str, tz) = split_timezone(s);
     let parts: Vec<&str> = date_str.split('-').collect();
 
-    let (year_str, year, month) = if date_str.starts_with('-') && parts.len() >= 3 {
+    // As in `parse_date_part`, a negative year must leave exactly three
+    // segments; anything after the month is an error.
+    let (year_str, year, month) = if date_str.starts_with('-') && parts.len() == 3 {
         let year_str = format!("-{}", parts[1]);
         let year: i32 = year_str
             .parse()
@@ -2524,9 +2535,8 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
                 type_name: "gYearMonth",
                 message: "Invalid year".to_string(),
             })?;
-        let month: u8 = parts[2]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let month =
+            parse_two_digit_field(parts[2]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name: "gYearMonth",
                 message: "Invalid month".to_string(),
@@ -2541,9 +2551,8 @@ fn parse_gyearmonth(s: &str) -> ValidationResult<GYearMonthValue> {
                 type_name: "gYearMonth",
                 message: "Invalid year".to_string(),
             })?;
-        let month: u8 = parts[1]
-            .parse()
-            .map_err(|_| ValidationError::InvalidLexical {
+        let month =
+            parse_two_digit_field(parts[1]).ok_or_else(|| ValidationError::InvalidLexical {
                 value: s.to_string(),
                 type_name: "gYearMonth",
                 message: "Invalid month".to_string(),
@@ -2621,20 +2630,16 @@ fn parse_gmonthday(s: &str) -> ValidationResult<GMonthDayValue> {
         });
     }
 
-    let month: u8 = parts[0]
-        .parse()
-        .map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gMonthDay",
-            message: "Invalid month".to_string(),
-        })?;
-    let day: u8 = parts[1]
-        .parse()
-        .map_err(|_| ValidationError::InvalidLexical {
-            value: s.to_string(),
-            type_name: "gMonthDay",
-            message: "Invalid day".to_string(),
-        })?;
+    let month = parse_two_digit_field(parts[0]).ok_or_else(|| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "gMonthDay",
+        message: "Invalid month".to_string(),
+    })?;
+    let day = parse_two_digit_field(parts[1]).ok_or_else(|| ValidationError::InvalidLexical {
+        value: s.to_string(),
+        type_name: "gMonthDay",
+        message: "Invalid day".to_string(),
+    })?;
 
     if !(1..=12).contains(&month) {
         return Err(ValidationError::InvalidLexical {
@@ -2677,9 +2682,8 @@ fn parse_gday(s: &str) -> ValidationResult<GDayValue> {
         });
     }
 
-    let day: u8 = day_str[3..]
-        .parse()
-        .map_err(|_| ValidationError::InvalidLexical {
+    let day =
+        parse_two_digit_field(&day_str[3..]).ok_or_else(|| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gDay",
             message: "Invalid day".to_string(),
@@ -2707,9 +2711,8 @@ fn parse_gmonth(s: &str) -> ValidationResult<GMonthValue> {
         });
     }
 
-    let month: u8 = month_str[2..]
-        .parse()
-        .map_err(|_| ValidationError::InvalidLexical {
+    let month =
+        parse_two_digit_field(&month_str[2..]).ok_or_else(|| ValidationError::InvalidLexical {
             value: s.to_string(),
             type_name: "gMonth",
             message: "Invalid month".to_string(),
@@ -4416,6 +4419,78 @@ mod tests {
                 validator.validate(&input).is_err(),
                 "expected invalid time {input:?} to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn test_negative_year_rejects_trailing_segments() {
+        // A negative year must not let an unaccepted timezone (or anything
+        // else) after the last field slip through and be dropped.
+        let result = DateValidator.validate("-2024-01-15-05:00").unwrap();
+        match result.value {
+            XmlValueKind::Atomic(XmlAtomicValue::Date(d)) => {
+                assert_eq!((d.year, d.month, d.day), (-2024, 1, 15));
+                assert_eq!(d.timezone, Some(TimezoneOffset(-300)));
+            }
+            other => panic!("expected a date, got {other:?}"),
+        }
+        for input in ["-2024-01-15", "-2024-01-15Z", "-2024-01-15+14:00"] {
+            assert!(DateValidator.validate(input).is_ok(), "{input:?}");
+        }
+        for input in ["-2024-05", "-2024-05Z", "-2024-05-05:00"] {
+            assert!(GYearMonthValidator.validate(input).is_ok(), "{input:?}");
+        }
+
+        for input in [
+            "-2024-01-15-15:00",
+            "-2024-01-15-14:01",
+            "-2024-01-15-1:30",
+            "-2024-01-15-junk",
+            "-2024-01-15-01-01",
+        ] {
+            assert!(DateValidator.validate(input).is_err(), "{input:?}");
+        }
+        for input in [
+            "-2024-05-15:00",
+            "-2024-05-14:01",
+            "-2024-05-junk",
+            "-2024-05-01",
+        ] {
+            assert!(GYearMonthValidator.validate(input).is_err(), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn test_month_and_day_fields_are_two_digits() {
+        assert!(DateValidator.validate("2002-02-15").is_ok());
+        assert!(DateTimeValidator.validate("2002-02-15T12:44:05").is_ok());
+        assert!(GYearMonthValidator.validate("2002-02").is_ok());
+        assert!(GMonthDayValidator.validate("--02-15").is_ok());
+        assert!(GDayValidator.validate("---01").is_ok());
+        assert!(GMonthValidator.validate("--02").is_ok());
+
+        for input in [
+            "2002-002-15",
+            "2002-2-15",
+            "2002-02-5",
+            "2002-02-015",
+            "2002-+2-15",
+        ] {
+            assert!(DateValidator.validate(input).is_err(), "{input:?}");
+        }
+        assert!(DateValidator.validate("-2002-002-15").is_err());
+        assert!(DateTimeValidator.validate("2002-002-15T12:44:05").is_err());
+        for input in ["2002-002", "2002-2", "2002-+2", "-2002-002"] {
+            assert!(GYearMonthValidator.validate(input).is_err(), "{input:?}");
+        }
+        for input in ["--002-15", "--2-15", "--02-5", "--02-015", "--+2-15"] {
+            assert!(GMonthDayValidator.validate(input).is_err(), "{input:?}");
+        }
+        for input in ["---001", "---1", "---+1"] {
+            assert!(GDayValidator.validate(input).is_err(), "{input:?}");
+        }
+        for input in ["--002", "--2", "--+2"] {
+            assert!(GMonthValidator.validate(input).is_err(), "{input:?}");
         }
     }
 
