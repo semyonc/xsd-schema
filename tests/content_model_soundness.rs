@@ -174,6 +174,53 @@ fn loop_inside_repeated_groups() {
     );
 }
 
+#[test]
+fn nested_loops_and_counted_prefixes_inside_optional_groups() {
+    // A star of a starred group: two loops share no boundary state.
+    let nested = root_schema(&format!(
+        r#"<xs:sequence minOccurs="0">{X}<xs:sequence minOccurs="0" maxOccurs="unbounded">{Y_STAR}</xs:sequence></xs:sequence>{Z}"#
+    ));
+    check(
+        "(X, (Y*)*)?, Z",
+        &nested,
+        &["<root><Z/></root>", "<root><X/><Y/><Y/><Z/></root>"],
+        &["<root><Y/><Z/></root>"],
+    );
+
+    // minOccurs above the unroll threshold with no maximum compiles to a
+    // counted prefix followed by a star.
+    let counted_prefix = root_schema(&format!(
+        r#"<xs:sequence minOccurs="0">{X}<xs:element name="Y" minOccurs="17" maxOccurs="unbounded"/></xs:sequence>{Z}"#
+    ));
+    let y17 = "<Y/>".repeat(17);
+    let y18 = "<Y/>".repeat(18);
+    let y16 = "<Y/>".repeat(16);
+    check(
+        "(X, Y{17,∞})?, Z",
+        &counted_prefix,
+        &[
+            "<root><Z/></root>",
+            &format!("<root><X/>{y17}<Z/></root>"),
+            &format!("<root><X/>{y18}<Z/></root>"),
+        ],
+        &[
+            &format!("<root>{y17}<Z/></root>"),
+            &format!("<root><X/>{y16}<Z/></root>"),
+        ],
+    );
+
+    // A plus at the start of an optional group cannot skip what follows it.
+    let plus_first = root_schema(&format!(
+        r#"<xs:sequence minOccurs="0">{Y_PLUS}{X}</xs:sequence>{Z}"#
+    ));
+    check(
+        "(Y+, X)?, Z",
+        &plus_first,
+        &["<root><Z/></root>", "<root><Y/><Y/><X/><Z/></root>"],
+        &["<root><Y/><Z/></root>", "<root><X/><Z/></root>"],
+    );
+}
+
 /// The shape of GAEB DA XML 3.3 DA85 `tgItem`: `QtySplit` may only follow `Qty`.
 #[test]
 fn optional_choice_of_a_sequence_ending_in_a_loop() {
