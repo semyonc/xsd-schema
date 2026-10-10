@@ -41,6 +41,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-2024-01-15-15:00` lost its out-of-range timezone instead of being
   rejected. Such values are now invalid, and XPath casts from them raise
   `FORG0001`.
+- Instance validation accepted children that an optional or repeated group
+  forbids when the group starts or ends with an unbounded particle:
+  `(X, Y*)?, Z` accepted `<Y/><Z/>` although `Y` may only follow `X`, and
+  so did `(X, Y+)?`, `(Y*, X)?`, `(X, Y*){0,3}`, `(X, Y*)*` and
+  `choice{0,1}(sequence(X, Y*))` (found with GAEB DA XML 3.3, where DA85
+  `tgItem` accepted `QtySplit` without `Qty`). The content-model compiler drew
+  the loop edge of `*` and `+` between the repeated particle's own boundary
+  states, so the bypass of the enclosing optional group, or the link to its
+  next particle, ran into or out of the loop. Loops now get their own entry
+  and exit states. Present since 0.1.1. Both W3C suites are unchanged
+  (identical failure sets), and so is the GAEB corpus.
 
 ### Changed
 
