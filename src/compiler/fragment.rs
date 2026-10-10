@@ -129,6 +129,8 @@ impl NfaFragment {
 
         self.assert_ids_normalized();
         other.assert_ids_normalized();
+        self.debug_assert_isolated_boundaries();
+        other.debug_assert_isolated_boundaries();
 
         let state_offset = self.states.len();
         let counter_offset = self.counter_defs.len() as CounterId;
@@ -169,6 +171,8 @@ impl NfaFragment {
 
         self.assert_ids_normalized();
         other.assert_ids_normalized();
+        self.debug_assert_isolated_boundaries();
+        other.debug_assert_isolated_boundaries();
 
         // Create new start and end states
         let new_start_id = (self.states.len() + other.states.len()) as StateId;
@@ -220,6 +224,7 @@ impl NfaFragment {
     /// to be skipped entirely.
     pub fn optional(mut self) -> NfaFragment {
         self.assert_ids_normalized();
+        self.debug_assert_isolated_boundaries();
         // Add epsilon from start to end
         let end_id = self.end as StateId;
         self.states[self.start].add_epsilon(end_id);
@@ -229,33 +234,97 @@ impl NfaFragment {
 
     /// Kleene star: self*
     ///
-    /// Allows zero or more repetitions of the fragment.
-    /// Adds loop back from end to start, plus makes it optional.
-    pub fn repeat_star(mut self) -> NfaFragment {
-        self.assert_ids_normalized();
-        // Add epsilon loop from end back to start
-        let start_id = self.start as StateId;
-        self.states[self.end].add_epsilon(start_id);
-
-        // Make optional (zero occurrences allowed) — already normalized
-        let end_id = self.end as StateId;
-        self.states[self.start].add_epsilon(end_id);
-        self.nullable = true;
-        self
+    /// Allows zero or more repetitions of the fragment: the loop of
+    /// `wrap_loop` plus an entry → exit bypass.
+    pub fn repeat_star(self) -> NfaFragment {
+        let mut frag = self.wrap_loop();
+        let exit_id = frag.end as StateId;
+        frag.states[frag.start].add_epsilon(exit_id);
+        frag.nullable = true;
+        frag
     }
 
     /// Plus repetition: self+
     ///
-    /// Requires at least one occurrence, then allows more.
-    /// Adds loop back from end to start (no optional bypass).
-    pub fn repeat_plus(mut self) -> NfaFragment {
+    /// Requires at least one occurrence, then allows more: the loop of
+    /// `wrap_loop` with no bypass. Nullable iff one
+    /// occurrence can match empty, so `self.nullable` carries over.
+    pub fn repeat_plus(self) -> NfaFragment {
+        self.wrap_loop()
+    }
+
+    /// Thompson loop: wrap the body in a fresh entry and a fresh exit.
+    ///
+    /// ```text
+    /// entry --ε--> body.start
+    /// body.end --ε--> body.start   [repeat]
+    /// body.end --ε--> exit         [leave]
+    /// ```
+    ///
+    /// The loop edge must stay strictly inside the fragment. Composition
+    /// attaches edges to a fragment's boundary states — `optional` adds
+    /// start → end, `concat` links end → next start, an enclosing loop adds
+    /// its own edges — so a loop edge drawn between the body's own boundary
+    /// states lets those edges enter or leave the loop: `(X, Y*)?` then
+    /// accepted `Y` without `X`, because the bypass landed on `Y*`'s end and
+    /// the loop edge led from there back into `Y`. See
+    /// [`debug_assert_isolated_boundaries`](Self::debug_assert_isolated_boundaries).
+    fn wrap_loop(mut self) -> NfaFragment {
         self.assert_ids_normalized();
-        // Add epsilon loop from end back to start
-        let start_id = self.start as StateId;
-        self.states[self.end].add_epsilon(start_id);
-        // nullable iff one occurrence can match empty
-        // (self.nullable is already set from the body)
-        self
+        let body_start = self.start as StateId;
+        let entry_id = self.states.len() as StateId;
+        let exit_id = entry_id + 1;
+
+        let mut entry = NfaState::epsilon(entry_id, None);
+        entry.add_epsilon(body_start);
+        self.states[self.end].add_epsilon(body_start);
+        self.states[self.end].add_epsilon(exit_id);
+        self.states.push(entry);
+        self.states.push(NfaState::epsilon(exit_id, None));
+
+        let frag = NfaFragment::with_counters(
+            self.states,
+            entry_id as usize,
+            exit_id as usize,
+            self.counter_defs,
+            self.nullable,
+        );
+        frag.debug_assert_isolated_boundaries();
+        frag
+    }
+
+    /// Debug check of the invariant every combinator relies on: no
+    /// transition inside the fragment enters its start state, and its end
+    /// state has no outgoing transition (an epsilon self-loop, which
+    /// `optional` creates on a one-state epsilon fragment, is harmless and
+    /// allowed).
+    ///
+    /// `optional`, `concat` and `alternate` draw edges from or to a
+    /// fragment's boundary states. They only mean what they say if nothing
+    /// inside the fragment can reach the start again or continue past the
+    /// end — otherwise a bypass enters a loop body or a link leaves one.
+    fn debug_assert_isolated_boundaries(&self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
+        let start = self.start as StateId;
+        let end = self.end as StateId;
+        for state in &self.states {
+            for t in &state.transitions {
+                debug_assert!(
+                    t.target != start || state.id == start,
+                    "fragment start state {start} is entered from state {} inside the fragment",
+                    state.id
+                );
+            }
+        }
+        debug_assert!(
+            self.states[self.end]
+                .transitions
+                .iter()
+                .all(|t| t.target == end),
+            "fragment end state {end} has outgoing transitions inside the fragment"
+        );
     }
 
     /// Repeat exactly n times: self{n}
@@ -450,6 +519,7 @@ impl Default for FragmentBuilder {
 /// as start/accept states.
 pub fn fragment_to_table(fragment: NfaFragment) -> NfaTable {
     fragment.assert_ids_normalized();
+    fragment.debug_assert_isolated_boundaries();
 
     let start_state = fragment.start as StateId;
     let accept_state = fragment.end as StateId;
@@ -548,17 +618,22 @@ mod tests {
         let frag = builder.single_term(make_element_term(1), None);
         let star = frag.repeat_star();
 
-        // Check epsilon loop from end to start
-        let end = &star.states[star.end];
-        assert!(end
-            .epsilon_transitions()
-            .any(|t| t == star.start as StateId));
+        // Body (term state 0, exit 1) wrapped in a fresh entry and exit.
+        assert_eq!(star.states.len(), 4);
+        let (body_start, body_end) = (0, 1);
+        let exit = star.end as StateId;
 
-        // Check optional bypass
-        let start = &star.states[star.start];
-        assert!(start
-            .epsilon_transitions()
-            .any(|t| t == star.end as StateId));
+        let entry = &star.states[star.start];
+        assert!(entry.epsilon_transitions().any(|t| t == body_start));
+        assert!(entry.epsilon_transitions().any(|t| t == exit)); // bypass
+
+        let end_of_body = &star.states[body_end];
+        assert!(end_of_body.epsilon_transitions().any(|t| t == body_start)); // repeat
+        assert!(end_of_body.epsilon_transitions().any(|t| t == exit)); // leave
+
+        // The loop stays inside: nothing leaves the exit.
+        assert!(star.states[star.end].transitions.is_empty());
+        assert!(star.nullable);
     }
 
     #[test]
@@ -567,17 +642,115 @@ mod tests {
         let frag = builder.single_term(make_element_term(1), None);
         let plus = frag.repeat_plus();
 
-        // Check epsilon loop from end to start
-        let end = &plus.states[plus.end];
-        assert!(end
-            .epsilon_transitions()
-            .any(|t| t == plus.start as StateId));
+        assert_eq!(plus.states.len(), 4);
+        let (body_start, body_end) = (0, 1);
+        let exit = plus.end as StateId;
 
+        let entry = &plus.states[plus.start];
+        assert!(entry.epsilon_transitions().any(|t| t == body_start));
         // Should NOT have optional bypass
-        let start = &plus.states[plus.start];
-        assert!(!start
-            .epsilon_transitions()
-            .any(|t| t == plus.end as StateId));
+        assert!(!entry.epsilon_transitions().any(|t| t == exit));
+
+        let end_of_body = &plus.states[body_end];
+        assert!(end_of_body.epsilon_transitions().any(|t| t == body_start)); // repeat
+        assert!(end_of_body.epsilon_transitions().any(|t| t == exit)); // leave
+
+        assert!(plus.states[plus.end].transitions.is_empty());
+        assert!(!plus.nullable);
+    }
+
+    /// Run `word` (element names) through the table; true when it is accepted.
+    fn accepts(table: &NfaTable, word: &[u32]) -> bool {
+        use super::super::nfa::ActiveStates;
+        use crate::schema::model::XsdVersion;
+        let mut states = ActiveStates::from_nfa(table);
+        for &name in word {
+            states = states.advance(table, NameId(name), None, None, None, XsdVersion::V1_0);
+            if states.is_empty() {
+                return false;
+            }
+        }
+        states.contains_accept(table)
+    }
+
+    /// A loop's boundary edges must not be reachable from the boundary states
+    /// other combinators attach to. With the loop edge drawn between the
+    /// body's own start and end, `optional()`'s start → end bypass landed on
+    /// the star's end and the loop edge led back into the body, so the group
+    /// below accepted `Y` without the required `X` before it.
+    #[test]
+    fn test_loops_inside_optional_and_repeated_groups() {
+        const X: u32 = 1;
+        const Y: u32 = 2;
+        let b = FragmentBuilder::new();
+        let x = || b.single_term(make_element_term(X), None);
+        let y = || b.single_term(make_element_term(Y), None);
+
+        struct Case {
+            label: &'static str,
+            frag: NfaFragment,
+            valid: Vec<Vec<u32>>,
+            invalid: Vec<Vec<u32>>,
+        }
+        let case = |label, frag, valid, invalid| Case {
+            label,
+            frag,
+            valid,
+            invalid,
+        };
+        let cases = vec![
+            case(
+                "(X, Y*)?",
+                x().concat(y().repeat_star()).optional(),
+                vec![vec![], vec![X], vec![X, Y], vec![X, Y, Y]],
+                vec![vec![Y], vec![Y, Y], vec![Y, X]],
+            ),
+            case(
+                "(X, Y+)?",
+                x().concat(y().repeat_plus()).optional(),
+                vec![vec![], vec![X, Y], vec![X, Y, Y]],
+                vec![vec![Y], vec![X], vec![Y, Y]],
+            ),
+            case(
+                "(Y*, X)?",
+                y().repeat_star().concat(x()).optional(),
+                vec![vec![], vec![X], vec![Y, X], vec![Y, Y, X]],
+                vec![vec![Y], vec![Y, Y], vec![X, Y]],
+            ),
+            case(
+                "(X, Y*){0,3}",
+                x().concat(y().repeat_star()).repeat_range(0, Some(3)),
+                vec![vec![], vec![X, Y], vec![X, X, Y, X]],
+                vec![vec![Y], vec![Y, X], vec![X, X, X, X]],
+            ),
+            case(
+                "(X, Y*)*",
+                x().concat(y().repeat_star()).repeat_star(),
+                vec![vec![], vec![X], vec![X, Y, X, Y, Y]],
+                vec![vec![Y], vec![Y, X]],
+            ),
+            case(
+                "(Y+)?",
+                y().repeat_plus().optional(),
+                vec![vec![], vec![Y], vec![Y, Y]],
+                vec![vec![X]],
+            ),
+        ];
+        for Case {
+            label,
+            frag,
+            valid,
+            invalid,
+        } in cases
+        {
+            let table = fragment_to_table(frag);
+            for w in &valid {
+                assert!(accepts(&table, w), "{label} must accept {w:?}");
+            }
+            for w in &invalid {
+                assert!(!accepts(&table, w), "{label} must reject {w:?}");
+            }
+        }
     }
 
     #[test]

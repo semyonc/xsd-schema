@@ -407,14 +407,28 @@ impl<'a> CompileContext<'a> {
         let new_siblings = self.collect_sibling_element_qnames(particles);
         let saved_siblings = std::mem::replace(&mut self.current_sibling_elements, new_siblings);
 
-        let mut result = self.compile_particle_with_index(&particles[0], 0)?;
-        for (i, particle) in particles[1..].iter().enumerate() {
-            let frag = self.compile_particle_with_index(particle, i + 1)?;
-            result = result.alternate(frag);
+        // A particle with minOccurs=maxOccurs=0 "maps to no component at all"
+        // (§3.3.2, §3.7.2, §3.8.2, §3.10.2), so it is not a branch of the choice. Its
+        // occurrence wrapper is an epsilon fragment, and alternating that in
+        // would make the choice accept empty content — `choice(e1{0,0}, e2)`
+        // accepted no children although `e2` is required. Such a particle is
+        // still compiled, and its fragment discarded, so the flat element
+        // index stays aligned with `resolved_particle_elements`. With every
+        // branch gone the choice has no particles and is unsatisfiable.
+        let mut result: Option<NfaFragment> = None;
+        for (i, particle) in particles.iter().enumerate() {
+            let frag = self.compile_particle_with_index(particle, i)?;
+            if particle.max_occurs == Some(0) {
+                continue;
+            }
+            result = Some(match result {
+                Some(acc) => acc.alternate(frag),
+                None => frag,
+            });
         }
 
         self.current_sibling_elements = saved_siblings;
-        Ok(result)
+        Ok(result.unwrap_or_else(|| self.builder.dead_fragment()))
     }
 
     /// Compile an all-group (xs:all) as NFA — used as fallback for nested
@@ -889,7 +903,9 @@ impl<'a> CompileContext<'a> {
             return Vec::new();
         }
         let mut result = Vec::new();
-        for p in particles {
+        // A particle with minOccurs=maxOccurs=0 maps to no component, so it
+        // declares no sibling element.
+        for p in particles.iter().filter(|p| p.max_occurs != Some(0)) {
             match &p.term {
                 ParticleTerm::Element(elem) => {
                     if let Some(ref_name) = &elem.ref_name {
