@@ -367,8 +367,33 @@ impl ContentValidatorState {
             } => {
                 // Once the suffix open-content section has begun, declared
                 // all-group particles are no longer eligible to match.
+                //
+                // Structures §3.8.4.1.3: "if one of the Particles in M
+                // ·attributes· an element information item to a ·wildcard
+                // particle·, and a ·competing· Particle ·attributes· the same
+                // item to an ·element particle·, then the ·element particle·
+                // is used for validation." Hence two passes: an element
+                // particle that still accepts the item wins over a wildcard,
+                // whatever their declaration order. One whose {max occurs}
+                // is used up has no ·path· through it any more, so it no
+                // longer ·competes·, and a wildcard may take the item (the
+                // Note there: in `<xs:all><xs:any/><xs:element name="a"/>`,
+                // `<a/><a/>` attributes the first `a` to the element and the
+                // second to the wildcard).
                 if !*suffix_locked {
-                    for (i, particle) in model.particles.iter().enumerate() {
+                    let candidates = model
+                        .particles
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| matches!(p.term, NfaTerm::Element { .. }))
+                        .chain(
+                            model
+                                .particles
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, p)| matches!(p.term, NfaTerm::Wildcard { .. })),
+                        );
+                    for (i, particle) in candidates {
                         if !state.can_accept(model, i) {
                             continue;
                         }

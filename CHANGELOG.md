@@ -7,6 +7,178 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-10-15
+
+### Behaviour changes
+
+This release removes no public item and changes no signature. It fixes panics
+and validation defects — three of which accepted invalid instances — so some
+results change. Those changes are listed here; the remaining fixes are under
+*Fixed* and *Performance*.
+
+- **Wildcards across namespaces.** `##other` and `##targetNamespace` in a
+  wildcard now always refer to the target namespace of the schema document
+  that declares the wildcard (Structures §3.10.2.2), also when the wildcard is
+  inherited by an extension in another namespace or comes from a model group
+  of another namespace. Such wildcards were read in the deriving type's
+  namespace, so valid instances were rejected and **invalid instances were
+  accepted**. Unique Particle Attribution (`cos-nonambig`) is now decided with
+  each wildcard's own namespace too: schemas that were falsely rejected compile,
+  and conflicts through a model group of another namespace — a wildcard and an
+  element, or two wildcards — are now found (as Xerces-J); likewise the XSD 1.1
+  wildcard type-table check (§3.8.6.3).
+- **`##other` attribute wildcards (XSD 1.1).** `<xs:anyAttribute
+  namespace="##other"/>` no longer admits unqualified attributes in XSD 1.1
+  mode: `##other` excludes ·absent· as well as the target namespace (Structures
+  §3.10.2.2), as it already did in XSD 1.0 and for `<xs:any>`. Such attributes
+  were **accepted**. Attribute-wildcard intersections, extension unions and
+  restriction checks use the corrected set, so restricting an `##other`
+  attribute wildcard to `##local` or to `notNamespace="##targetNamespace"`, or
+  adding an unqualified attribute the base wildcard does not allow, is now
+  rejected (`derivation-ok-restriction`), and restricting
+  `notNamespace="##targetNamespace ##local"` by `##other` is now accepted.
+- **Empty extension content.** A `complexContent` extension whose explicit
+  content is empty — `<xs:sequence/>`, `<xs:all/>`, `<xs:choice minOccurs="0"/>`
+  or a model group with `maxOccurs="0"` — now has its base type's content type
+  (Structures §3.4.2.3.3 clause 4.2.2), as with no particle at all. Such
+  extensions were rejected; the compiled content model (and the
+  `compiler::inspect` view) is now the base's.
+- **`xs:decimal` beyond `rust_decimal`.** Every `xs:decimal` value is validated
+  exactly, at any size and precision. A valid value that `rust_decimal::Decimal`
+  cannot hold exactly (a magnitude above 79228162514264337593543950335, or more
+  than 28 fraction digits) is no longer rejected
+  ([#25](https://github.com/semyonc/xsd-schema/issues/25)) nor rounded: its typed
+  value is its canonical representation (Datatypes §3.3.3.2: no `+`, no leading
+  or trailing zeros, no decimal point for an integer), an `XmlAtomicValue::String`
+  with the `xs:decimal` type code (`XmlValue::as_decimal` returns `None`), and
+  the validator reports a warning with code `xs-decimal-capacity` (Datatypes
+  §5.4). `XmlAtomicValue::Decimal` is unchanged. See the README, "Implementation
+  limits".
+- **Decimal facets on the exact value.** `totalDigits`, `fractionDigits` and the
+  bound facets of `xs:decimal` and the integer types are decided on the exact
+  value: values with more than 28 fraction digits are no longer checked after
+  rounding (`fractionDigits="28"` accepted 29 fraction digits), bound literals
+  larger or more precise than `rust_decimal` holds are enforced instead of
+  rejected when the schema is compiled, integer values above
+  79228162514264337593543950335 are checked against their facets (they were
+  not), and `totalDigits` counts leading fraction zeros as Datatypes §4.3.11.3
+  defines (`0.05` needs two digits). `enumeration` on these types compares
+  values: `1.00` matches `1.0`, and `+1` and `01` match `1`.
+- **XPath decimals.** Casting a string to `xs:decimal`, and a decimal literal,
+  follows F&O §17.1.1: a value too large to be held raises `FOAR0002` (was
+  `FORG0001`), a nonzero value whose magnitude is below 10⁻²⁸ underflows to `0`
+  (F&O §6.2), and any other value with more digits than are held raises
+  `FOCA0006` instead of being rounded. A decimal held as a string compares
+  exactly and casts to `xs:string` (its canonical form, F&O §17.1.2),
+  `xs:boolean`, `xs:integer` (truncation), `xs:double` and `xs:float` (nearest
+  value); arithmetic on it raises `FOAR0002`.
+- **XSD 1.1 assertions on such values.** An assertion (`xs:assert`,
+  `xs:assertion`) whose evaluation fails only because it computed with an
+  `xs:decimal` beyond `rust_decimal`'s capacity is not counted as false: its
+  outcome is unknown, and the value carries the `xs-decimal-capacity` warning
+  (Datatypes §5.4). Any other error still fails the assertion (Structures
+  §3.13.4.1), also when such a value occurs elsewhere in the instance — an
+  overflow of values that are held, a division by zero, a literal that cannot
+  be cast.
+- **All-groups (XSD 1.1).** An element that both an element particle and a
+  wildcard of an `xs:all` group can take is now attributed to the element
+  particle (Structures §3.8.4.1.3); it went to whichever came first in
+  declaration order. A wildcard declared before the element, or inherited from
+  the base type of an all-group extension, captured the element, so valid
+  instances were rejected, and an element taken by a `processContents="skip"`
+  wildcard was not validated against its declaration. Once the element
+  particle's `maxOccurs` is used up, further matching elements go to the
+  wildcard, as before. Verdicts change in both directions: for example
+  `<xs:all><xs:any/><xs:element name="a" maxOccurs="2"/></xs:all>` now rejects
+  `<a/><a/>` and accepts `<a/><x/><a/>`.
+- **Conversion API.** `TypeConverter::to_decimal` (and `promote_to` with
+  `xs:decimal`) of an `xs:untypedAtomic` follows F&O §17.1.1 like the XPath
+  cast: a nonzero magnitude below 10⁻²⁸ gives `0` (it was rounded, sometimes
+  to ±10⁻²⁸), a value too large gives `Err(ConversionError::Overflow)` (it was
+  `InvalidValue`), and one more precise than `rust_decimal` holds gives
+  `Overflow` too (it was rounded); a decimal held in lexical form gives
+  `Overflow`;
+  `TypeConverter::cast` of such a string to `xs:decimal` now succeeds, with the
+  canonical form as the value; `XmlValue::as_double` returns the nearest double for a decimal
+  held in lexical form; `xpath::error::QNAMED_ERROR_CODES` includes `FOCA0006`.
+  `compiler::inspect` shows a wildcard used in another namespace's content
+  model with its namespaces resolved (`Not([…])`, `List([…])`) rather than as
+  `##other` or `##targetNamespace`.
+
+### Fixed
+
+- A schema document that fails to assemble (for example on a duplicate
+  declaration, `sch-props-correct`) made the next document load panic with an
+  index out of bounds. The error is now reported, and the failed document leaves
+  nothing in the schema set — none of its components, name bindings, source map
+  or deferred parsing errors. Before, its declarations could also replace
+  earlier ones of the same name.
+- Extending `xs:anyType` or a mixed type with empty explicit content was rejected
+  with `cos-ct-extends`; see *Behaviour changes*. Under XSD 1.0 a
+  `<xs:sequence/>` extension of a simple-content base is accepted as the base's
+  content type, and `maxOccurs="0"` explicit content whose declarations would
+  conflict with the base's no longer counts (Element Declarations Consistent
+  applies only to components that exist, §3.8.2). XSD 1.1 still rejects complex
+  content over a simple-content base.
+- An XSD 1.1 extension inheriting the base's open content was rejected with
+  `cos-ct-extends` when the base's wildcard used `##other` or
+  `##targetNamespace` from another namespace.
+- XPath `xs:decimal` arithmetic that overflowed `rust_decimal` (`+`, `-`, `*`,
+  `div`, `idiv`, `mod`, and `xs:dayTimeDuration` multiplied or divided by a
+  decimal) panicked; it now raises `FOAR0002` (`FODT0002` for the duration).
+- `fn:round-half-to-even` on an `xs:decimal` with a precision of −19 or less
+  overflowed `i64` computing its scale (a panic in debug builds); it is now
+  exact, or `FOAR0002` when the result exceeds the range (5 × 10²⁸ with
+  precision −29 rounds to the even multiple, 0). A decimal just above a
+  midpoint is no longer rounded as the midpoint
+  (`round-half-to-even(5.0000000000000000000000000001, -1)` gave 0; it gives
+  10), and an `xs:integer` with a very large negative precision (such as
+  −2147483647) no longer computes 10^k for minutes.
+- An `xs:integer` beyond `rust_decimal`'s range compared with, or promoted to,
+  `xs:decimal` raised an internal error; comparisons are now exact and
+  arithmetic raises `FOAR0002`. `fn:distinct-values` and `fn:index-of` never
+  found two such integers equal.
+- XPath `div`, `idiv` and `mod` of an `xs:decimal` or `xs:integer` by zero
+  raise `FOAR0001` (F&O §6.2.4–§6.2.6) also when the dividend is beyond
+  `rust_decimal`'s range; they raised `FOAR0002`.
+- An `xs:decimal` zero is never negative: `-0.0`, unary minus on a decimal
+  zero, `fn:ceiling` of a decimal between −1 and 0,
+  `fn:seconds-from-duration` of a negative duration without seconds, and a tiny
+  negative `xs:float` or `xs:double` cast to `xs:decimal` (in XPath and through
+  `TypeConverter`) gave `-0`; they give `0`, and a decimal zero always displays
+  as `0`. `xs:float` and `xs:double` keep IEEE negative zero.
+- Bound consistency (a lower bound not above an upper bound, Datatypes
+  §4.3.7–§4.3.10) is decided in the type's value space: exactly for
+  `xs:decimal` and the integer types, on float values for `xs:float`. An
+  `xs:float` restriction whose bounds are the same float but different doubles
+  (`0.1000000001` and `0.1`) was rejected with `cos-st-restricts`.
+  `FacetSet::merge_with_base`, which does not know the type, compares the bounds
+  as doubles as before.
+- After `SchemaSet::source_maps.drop_all()`, every schema document parsed
+  afterwards got document id 0, so whatever is looked up by document — the
+  target namespace that a wildcard's `##other` and `##targetNamespace` refer
+  to, an assertion's `xpathDefaultNamespace` — was read from the first
+  document. A document's id is now its index in `SchemaSet::documents`.
+- Identity-constraint fields, fixed and default values and union enumerations
+  compare decimals by exact value, and a union with an `xs:decimal` member no
+  longer validates a large decimal against a later member such as `xs:string`.
+  An item of a list whose item type is a union reports the
+  `xs-decimal-capacity` warning when its decimal member holds it.
+
+### Performance
+
+- Schema compilation, Unique Particle Attribution: the `cos-nonambig` check
+  rebuilt the substitution-group map for every complex type and compared every
+  pair of element particles reachable from each content-model state. It now
+  builds the map once per schema set and finds competing particles through an
+  index from expanded name (own and substitutable names) to the first particle
+  carrying it. Verdicts and reported errors are unchanged — a differential test
+  compares the check with the previous one on generated content models, and
+  both W3C suites give the same results. Large WSDL schema sets compile one to
+  two orders of magnitude faster (vSphere 10.4 s → 0.09 s, NetSuite 5.0 s →
+  0.5 s, Workday Financial Management 2.1 s → 0.04 s), with unchanged peak
+  memory. `check_upa` and `check_all_group_upa` are unchanged.
+
 ## [0.2.2] - 2026-10-10
 
 ### Behaviour changes
@@ -1744,7 +1916,8 @@ Performance-focused release. No breaking changes to the public API.
 Initial release: XML Schema (XSD 1.0/1.1) validator with PSVI and a built-in
 XPath 2.0 engine.
 
-[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/semyonc/xsd-schema/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/semyonc/xsd-schema/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/semyonc/xsd-schema/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/semyonc/xsd-schema/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/semyonc/xsd-schema/compare/v0.1.5...v0.2.0

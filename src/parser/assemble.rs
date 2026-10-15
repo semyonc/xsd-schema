@@ -3,7 +3,7 @@
 //! Converts `SchemaFrameResult` into `SchemaDocument` and registers top-level
 //! components in the schema set arenas and namespace tables.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::arenas::{
     AttributeDeclData, AttributeGroupData, ComplexTypeDefData, ElementDeclData,
@@ -25,8 +25,8 @@ use crate::schema::composition::{
     ComponentIdentity, ComponentKey, ComponentKind, DocumentComponentIndex,
 };
 use crate::schema::model::{
-    FormChoice, ImportDirective, IncludeDirective, OverrideComponent, OverrideDirective,
-    RedefineDirective, SchemaDocument,
+    FormChoice, ImportDirective, IncludeDirective, NamespaceTable, OverrideComponent,
+    OverrideDirective, RedefineDirective, SchemaDocument,
 };
 use crate::schema::wildcard::{
     ElementWildcard, NamespaceConstraint, ProcessContents as SchemaProcessContents,
@@ -52,6 +52,63 @@ pub struct SchemaAssembler<'a> {
     identity_constraint_names: HashSet<NameId>,
     /// Per-document component index being built during assembly
     doc_components: DocumentComponentIndex,
+    /// Side effects on `schema_set` made by this assembly, in order; undone in
+    /// reverse by [`SchemaAssembler::rollback`] when the document fails to
+    /// assemble, so a rejected document leaves no component behind.
+    undo_log: Vec<AssemblyEffect>,
+}
+
+/// One reversible side effect of [`SchemaAssembler::assemble`] on the schema set.
+#[derive(Debug, Clone, Copy)]
+enum AssemblyEffect {
+    /// A component was allocated in the arenas.
+    Allocated(ComponentKey),
+    /// `name` was bound in the namespace table of `namespace`; `previous` is
+    /// the binding it replaced (of the same kind), if any.
+    Bound {
+        namespace: Option<NameId>,
+        name: NameId,
+        previous: PreviousBinding,
+    },
+    /// The namespace table of this namespace was created.
+    NamespaceCreated(Option<NameId>),
+}
+
+/// The binding a namespace-table registration replaced, by symbol space.
+#[derive(Debug, Clone, Copy)]
+enum PreviousBinding {
+    Type(Option<TypeKey>),
+    Element(Option<ElementKey>),
+    Attribute(Option<AttributeKey>),
+    ModelGroup(Option<ModelGroupKey>),
+    AttributeGroup(Option<AttributeGroupKey>),
+    Notation(Option<NotationKey>),
+    IdentityConstraint(Option<IdentityConstraintKey>),
+}
+
+impl PreviousBinding {
+    /// Put the replaced binding back (or remove `name` when there was none).
+    fn restore(self, table: &mut NamespaceTable, name: NameId) {
+        fn put<K>(map: &mut HashMap<NameId, K>, name: NameId, previous: Option<K>) {
+            match previous {
+                Some(key) => {
+                    map.insert(name, key);
+                }
+                None => {
+                    map.remove(&name);
+                }
+            }
+        }
+        match self {
+            PreviousBinding::Type(p) => put(&mut table.types, name, p),
+            PreviousBinding::Element(p) => put(&mut table.elements, name, p),
+            PreviousBinding::Attribute(p) => put(&mut table.attributes, name, p),
+            PreviousBinding::ModelGroup(p) => put(&mut table.model_groups, name, p),
+            PreviousBinding::AttributeGroup(p) => put(&mut table.attribute_groups, name, p),
+            PreviousBinding::Notation(p) => put(&mut table.notations, name, p),
+            PreviousBinding::IdentityConstraint(p) => put(&mut table.identity_constraints, name, p),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +131,109 @@ impl<'a> SchemaAssembler<'a> {
             final_default,
             identity_constraint_names: HashSet::new(),
             doc_components: DocumentComponentIndex::new(),
+            undo_log: Vec::new(),
         }
     }
 
+    /// Assemble one schema document: register its top-level components in
+    /// the schema set and return the [`SchemaDocument`].
+    ///
+    /// On error the schema set is left as it was before the call: every
+    /// component this document allocated is removed again and every
+    /// namespace-table binding it made (including one that replaced an
+    /// existing binding of the same name) is restored.
     pub fn assemble(
+        &mut self,
+        schema: SchemaFrameResult,
+        doc_id: DocumentId,
+        base_uri: &str,
+    ) -> SchemaResult<SchemaDocument> {
+        let result = self.assemble_document(schema, doc_id, base_uri);
+        if result.is_err() {
+            self.rollback();
+        }
+        self.undo_log.clear();
+        result
+    }
+
+    /// Undo, in reverse order, every side effect recorded in `undo_log`.
+    fn rollback(&mut self) {
+        let schema_set = &mut *self.schema_set;
+        for effect in self.undo_log.drain(..).rev() {
+            match effect {
+                AssemblyEffect::Allocated(key) => {
+                    // `entries_mut` is the only `&mut` access to the arenas
+                    // (it also clears the effective-facet cache, which is
+                    // harmless on this error path).
+                    let arenas = schema_set.arenas.entries_mut();
+                    match key {
+                        ComponentKey::Type(TypeKey::Simple(k)) => {
+                            arenas.simple_types.remove(k);
+                        }
+                        ComponentKey::Type(TypeKey::Complex(k)) => {
+                            arenas.complex_types.remove(k);
+                        }
+                        ComponentKey::Element(k) => {
+                            arenas.elements.remove(k);
+                        }
+                        ComponentKey::Attribute(k) => {
+                            arenas.attributes.remove(k);
+                        }
+                        ComponentKey::ModelGroup(k) => {
+                            arenas.model_groups.remove(k);
+                        }
+                        ComponentKey::AttributeGroup(k) => {
+                            arenas.attribute_groups.remove(k);
+                        }
+                        ComponentKey::Notation(k) => {
+                            arenas.notations.remove(k);
+                        }
+                        ComponentKey::IdentityConstraint(k) => {
+                            arenas.identity_constraints.remove(k);
+                        }
+                    }
+                }
+                AssemblyEffect::Bound {
+                    namespace,
+                    name,
+                    previous,
+                } => {
+                    if let Some(table) = schema_set.namespaces.get_mut(&namespace) {
+                        previous.restore(table, name);
+                    }
+                }
+                AssemblyEffect::NamespaceCreated(namespace) => {
+                    schema_set.namespaces.remove(&namespace);
+                }
+            }
+        }
+    }
+
+    /// Record an arena allocation made by this assembly.
+    fn allocated(&mut self, key: ComponentKey) {
+        self.undo_log.push(AssemblyEffect::Allocated(key));
+    }
+
+    /// The namespace table of `namespace`, created (and the creation
+    /// recorded) when it does not exist yet.
+    fn namespace_table(&mut self, namespace: Option<NameId>) -> &mut NamespaceTable {
+        if !self.schema_set.namespaces.contains_key(&namespace) {
+            self.undo_log
+                .push(AssemblyEffect::NamespaceCreated(namespace));
+        }
+        self.schema_set.get_or_create_namespace(namespace)
+    }
+
+    /// Record a namespace-table binding made by this assembly.
+    fn bound(&mut self, namespace: Option<NameId>, name: NameId, previous: PreviousBinding) {
+        self.undo_log.push(AssemblyEffect::Bound {
+            namespace,
+            name,
+            previous,
+        });
+    }
+
+    fn assemble_document(
         &mut self,
         schema: SchemaFrameResult,
         doc_id: DocumentId,
@@ -168,6 +324,7 @@ impl<'a> SchemaAssembler<'a> {
                 };
                 let key = self.schema_set.arenas.alloc_simple_type(data);
                 let type_key = TypeKey::Simple(key);
+                self.allocated(ComponentKey::Type(type_key));
                 if register {
                     self.register_type(name, type_key, source_ref.as_ref())?;
                 }
@@ -244,6 +401,7 @@ impl<'a> SchemaAssembler<'a> {
                 };
                 let key = self.schema_set.arenas.alloc_complex_type(data);
                 let type_key = TypeKey::Complex(key);
+                self.allocated(ComponentKey::Type(type_key));
                 if register {
                     self.register_type(name, type_key, source_ref.as_ref())?;
                 }
@@ -396,12 +554,21 @@ impl<'a> SchemaAssembler<'a> {
                     annotation: ic.annotation,
                     source: ic.source,
                 });
+            self.allocated(ComponentKey::IdentityConstraint(key));
             // Register in namespace table for @ref resolution. Identity
             // constraints share one symbol space per namespace (§3.11.1),
             // so a name already registered by another schema document of
             // the same namespace is a collision, not an overwrite.
-            let ns_table = self.schema_set.get_or_create_namespace(target_namespace);
-            if ns_table.identity_constraints.insert(ic_name, key).is_some() {
+            let previous = self
+                .namespace_table(target_namespace)
+                .identity_constraints
+                .insert(ic_name, key);
+            self.bound(
+                target_namespace,
+                ic_name,
+                PreviousBinding::IdentityConstraint(previous),
+            );
+            if previous.is_some() {
                 let location = self.schema_set.locate(ic_source.as_ref());
                 let name_str = self.schema_set.name_table.resolve(ic_name);
                 return Err(SchemaError::structural(
@@ -453,6 +620,7 @@ impl<'a> SchemaAssembler<'a> {
             deferred_type_error: None,
         };
         let key = self.schema_set.arenas.alloc_element(data);
+        self.allocated(ComponentKey::Element(key));
         if register {
             self.register_element(name, key, source_ref.as_ref())?;
         }
@@ -502,6 +670,7 @@ impl<'a> SchemaAssembler<'a> {
             resolved_ref: None,
         };
         let key = self.schema_set.arenas.alloc_attribute(data);
+        self.allocated(ComponentKey::Attribute(key));
         if register {
             self.register_attribute(name, key, source_ref.as_ref())?;
         }
@@ -549,6 +718,7 @@ impl<'a> SchemaAssembler<'a> {
                     redefine_requires_restriction_check: false,
                 };
                 let key = self.schema_set.arenas.alloc_model_group(data);
+                self.allocated(ComponentKey::ModelGroup(key));
                 if register {
                     self.register_model_group(name, key, source_ref.as_ref())?;
                 }
@@ -587,6 +757,7 @@ impl<'a> SchemaAssembler<'a> {
                     redefine_requires_restriction_check: false,
                 };
                 let key = self.schema_set.arenas.alloc_attribute_group(data);
+                self.allocated(ComponentKey::AttributeGroup(key));
                 if register {
                     self.register_attribute_group(name, key, source_ref.as_ref())?;
                 }
@@ -621,6 +792,7 @@ impl<'a> SchemaAssembler<'a> {
             source,
         };
         let key = self.schema_set.arenas.alloc_notation(data);
+        self.allocated(ComponentKey::Notation(key));
         if register {
             self.register_notation(name, key, source_ref.as_ref())?;
         }
@@ -635,10 +807,10 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_type(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self.namespace_table(namespace).register_type(name, key);
+        self.bound(namespace, name, PreviousBinding::Type(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate type declaration '{}'", name_str),
@@ -673,10 +845,10 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_element(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self.namespace_table(namespace).register_element(name, key);
+        self.bound(namespace, name, PreviousBinding::Element(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate element declaration '{}'", name_str),
@@ -695,10 +867,12 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_attribute(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self
+            .namespace_table(namespace)
+            .register_attribute(name, key);
+        self.bound(namespace, name, PreviousBinding::Attribute(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate attribute declaration '{}'", name_str),
@@ -717,10 +891,12 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_model_group(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self
+            .namespace_table(namespace)
+            .register_model_group(name, key);
+        self.bound(namespace, name, PreviousBinding::ModelGroup(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate group declaration '{}'", name_str),
@@ -743,10 +919,12 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_attribute_group(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self
+            .namespace_table(namespace)
+            .register_attribute_group(name, key);
+        self.bound(namespace, name, PreviousBinding::AttributeGroup(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate attribute group declaration '{}'", name_str),
@@ -769,10 +947,10 @@ impl<'a> SchemaAssembler<'a> {
     ) -> SchemaResult<()> {
         let location = source.and_then(|s| self.schema_set.source_maps.locate(s));
         let name_str = self.schema_set.name_table.resolve(name).to_string();
-        let ns_table = self
-            .schema_set
-            .get_or_create_namespace(self.target_namespace);
-        if ns_table.register_notation(name, key).is_some() {
+        let namespace = self.target_namespace;
+        let previous = self.namespace_table(namespace).register_notation(name, key);
+        self.bound(namespace, name, PreviousBinding::Notation(previous));
+        if previous.is_some() {
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Duplicate notation declaration '{}'", name_str),

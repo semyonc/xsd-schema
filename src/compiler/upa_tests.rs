@@ -1,3 +1,4 @@
+use super::reference::elements_overlap;
 use super::*;
 use crate::compiler::compile::cap_for_upa;
 use crate::compiler::{fragment_to_table, FragmentBuilder, NfaTerm};
@@ -23,7 +24,10 @@ fn create_test_schema_set_v11() -> SchemaSet {
     SchemaSet::with_version(XsdVersion::V1_1)
 }
 
-fn element_data(name: NameId, target_namespace: Option<NameId>) -> crate::arenas::ElementDeclData {
+pub(super) fn element_data(
+    name: NameId,
+    target_namespace: Option<NameId>,
+) -> crate::arenas::ElementDeclData {
     crate::arenas::ElementDeclData {
         name: Some(name),
         target_namespace,
@@ -879,6 +883,398 @@ fn test_element_wildcard_subst_member_excluded_by_not_qnames() {
         "should detect conflict: member not excluded by notQName"
     );
     assert_cos_nonambig(result.unwrap_err());
+}
+
+// ========================================================================
+// Element-element conflicts through the name index (0.2.3) — corner cases.
+// `upa_differential_tests.rs` compares the index with the 0.2.2 pairwise
+// scan on generated inputs; these pin the cases one by one.
+// ========================================================================
+
+fn global_element(
+    schema_set: &mut SchemaSet,
+    name: NameId,
+    namespace: Option<NameId>,
+    is_abstract: bool,
+    heads: &[crate::ids::ElementKey],
+) -> crate::ids::ElementKey {
+    let mut data = element_data(name, namespace);
+    data.is_abstract = is_abstract;
+    data.resolved_substitution_groups = heads.to_vec();
+    schema_set.arenas.alloc_element(data)
+}
+
+fn span(n: usize) -> Option<SourceRef> {
+    Some(SourceRef::new(0, SourceSpan::new(n, n + 1)))
+}
+
+/// `<xs:choice>` of the given particles, one origin each.
+fn choice_of(particles: Vec<(NfaTerm, Option<SourceRef>)>) -> NfaTable {
+    let builder = FragmentBuilder::new();
+    let mut particles = particles.into_iter();
+    let (term, origin) = particles.next().expect("at least one particle");
+    let mut choice = builder.single_term(term, origin);
+    for (term, origin) in particles {
+        choice = choice.alternate(builder.single_term(term, origin));
+    }
+    fragment_to_table(choice)
+}
+
+fn reachable_terms(particles: Vec<(NfaTerm, Option<SourceRef>)>) -> Vec<ReachableTerm> {
+    particles
+        .into_iter()
+        .map(|(term, origin)| ReachableTerm { term, origin })
+        .collect()
+}
+
+/// The span starts of the two particles an element-element error names
+/// (`None` for a particle without an origin), after checking that the 0.2.2
+/// pairwise scan reports the identical error.
+fn element_conflict_locations(
+    elements: &[ReachableTerm],
+    schema_set: &SchemaSet,
+) -> Option<(Option<usize>, Option<usize>)> {
+    let map = upa_substitution_map(schema_set);
+    let new = check_element_element_conflicts(elements, 7, schema_set, &map);
+    let old = super::reference::check_element_element_conflicts(elements, 7, schema_set, &map);
+    assert_eq!(format!("{new:?}"), format!("{old:?}"));
+    match new.err().map(|error| *error) {
+        None => None,
+        Some(UpaError::ElementElementConflict {
+            first_location,
+            second_location,
+            ..
+        }) => Some((
+            first_location.map(|s| s.span.start),
+            second_location.map(|s| s.span.start),
+        )),
+        Some(other) => panic!("expected an element-element conflict, got {other:?}"),
+    }
+}
+
+/// A substitution-group member competes by its expanded name: the same local
+/// name in another namespace does not compete with it (§3.9.4.1.2 "matches":
+/// same expanded name, or substitutable).
+#[test]
+fn test_substitution_member_same_local_name_other_namespace() {
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let mut schema_set = SchemaSet::with_version(version);
+        let ns1 = Some(schema_set.name_table.add("urn:one"));
+        let ns2 = Some(schema_set.name_table.add("urn:two"));
+        let head = schema_set.name_table.add("head");
+        let m = schema_set.name_table.add("m");
+        let head_key = global_element(&mut schema_set, head, ns1, false, &[]);
+        global_element(&mut schema_set, m, ns2, false, &[head_key]);
+
+        let head_ref = NfaTerm::element(head, ns1, Some(head_key));
+        let other_ns = choice_of(vec![
+            (head_ref.clone(), span(1)),
+            (NfaTerm::element(m, ns1, None), span(2)),
+        ]);
+        assert!(
+            check_upa(&other_ns, &schema_set, None).is_ok(),
+            "{version:?}"
+        );
+
+        let member_ns = choice_of(vec![
+            (head_ref, span(1)),
+            (NfaTerm::element(m, ns2, None), span(2)),
+        ]);
+        assert_cos_nonambig(check_upa(&member_ns, &schema_set, None).unwrap_err());
+    }
+}
+
+/// Two heads sharing a member (XSD 1.1 `substitutionGroup` lists) compete
+/// although their own names differ.
+#[test]
+fn test_two_heads_sharing_a_member_compete() {
+    let mut schema_set = create_test_schema_set_v11();
+    let h1 = schema_set.name_table.add("h1");
+    let h2 = schema_set.name_table.add("h2");
+    let m = schema_set.name_table.add("m");
+    let h1_key = global_element(&mut schema_set, h1, None, false, &[]);
+    let h2_key = global_element(&mut schema_set, h2, None, false, &[]);
+    global_element(&mut schema_set, m, None, false, &[h1_key, h2_key]);
+
+    let nfa = choice_of(vec![
+        (NfaTerm::element(h1, None, Some(h1_key)), span(1)),
+        (NfaTerm::element(h2, None, Some(h2_key)), span(2)),
+    ]);
+    assert_cos_nonambig(check_upa(&nfa, &schema_set, None).unwrap_err());
+}
+
+/// Under XSD 1.0 an abstract head's substitutable set omits its own name and,
+/// with no members, is empty; two references to it still compete by name.
+#[test]
+fn test_abstract_head_without_members_competes_by_name() {
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let mut schema_set = SchemaSet::with_version(version);
+        let a = schema_set.name_table.add("a");
+        let a_key = global_element(&mut schema_set, a, None, true, &[]);
+
+        let map = upa_substitution_map(&schema_set);
+        if version == XsdVersion::V1_0 {
+            assert!(
+                map[&a_key].is_empty(),
+                "abstract head, no members: empty set"
+            );
+        }
+
+        let nfa = choice_of(vec![
+            (NfaTerm::element(a, None, Some(a_key)), span(1)),
+            (NfaTerm::element(a, None, Some(a_key)), span(2)),
+        ]);
+        assert_cos_nonambig(check_upa(&nfa, &schema_set, None).unwrap_err());
+    }
+}
+
+/// An abstract head competes with its members in both versions.
+#[test]
+fn test_abstract_head_competes_with_its_member() {
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let mut schema_set = SchemaSet::with_version(version);
+        let a = schema_set.name_table.add("a");
+        let m = schema_set.name_table.add("m");
+        let a_key = global_element(&mut schema_set, a, None, true, &[]);
+        let m_key = global_element(&mut schema_set, m, None, false, &[a_key]);
+
+        let nfa = choice_of(vec![
+            (NfaTerm::element(a, None, Some(a_key)), span(1)),
+            (NfaTerm::element(m, None, Some(m_key)), span(2)),
+        ]);
+        assert_cos_nonambig(check_upa(&nfa, &schema_set, None).unwrap_err());
+    }
+}
+
+/// An abstract member takes part in its head's set for UPA only under XSD 1.1
+/// (W3C Bugzilla 4337), so a head and its abstract member compete only there.
+#[test]
+fn test_abstract_member_competes_only_under_xsd11() {
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let mut schema_set = SchemaSet::with_version(version);
+        let h = schema_set.name_table.add("h");
+        let x = schema_set.name_table.add("x");
+        let h_key = global_element(&mut schema_set, h, None, false, &[]);
+        let x_key = global_element(&mut schema_set, x, None, true, &[h_key]);
+
+        let nfa = choice_of(vec![
+            (NfaTerm::element(h, None, Some(h_key)), span(1)),
+            (NfaTerm::element(x, None, Some(x_key)), span(2)),
+        ]);
+        let result = check_upa(&nfa, &schema_set, None);
+        match version {
+            XsdVersion::V1_0 => assert!(result.is_ok()),
+            XsdVersion::V1_1 => assert_cos_nonambig(result.unwrap_err()),
+        }
+    }
+}
+
+/// The UPA map is the plain map under XSD 1.0 and the one with abstract
+/// members under XSD 1.1; the pipeline builds it once per pass.
+#[test]
+fn test_upa_substitution_map_follows_version() {
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let mut schema_set = SchemaSet::with_version(version);
+        let h = schema_set.name_table.add("h");
+        let x = schema_set.name_table.add("x");
+        let h_key = global_element(&mut schema_set, h, None, false, &[]);
+        global_element(&mut schema_set, x, None, true, &[h_key]);
+
+        let plain = build_substitution_group_map(&schema_set);
+        let with_abstract = build_substitution_group_map_with_abstract(&schema_set);
+        assert_ne!(plain, with_abstract);
+        let expected = match version {
+            XsdVersion::V1_0 => plain,
+            XsdVersion::V1_1 => with_abstract,
+        };
+        assert_eq!(upa_substitution_map(&schema_set), expected);
+    }
+}
+
+/// The schema-set pass builds the map once and checks every type with it: a
+/// conflict that only the XSD 1.1 map shows (an abstract member) in the
+/// *second* complex type is still found, and only under XSD 1.1.
+#[test]
+fn test_upa_pass_reuses_the_version_map_across_types() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="head" type="xs:string"/>
+        <xs:element name="member" type="xs:string" substitutionGroup="head" abstract="true"/>
+        <xs:complexType name="First">
+            <xs:sequence>
+                <xs:element ref="head"/>
+                <xs:element name="other" type="xs:string"/>
+            </xs:sequence>
+        </xs:complexType>
+        <xs:complexType name="Second">
+            <xs:choice>
+                <xs:element ref="head"/>
+                <xs:element ref="member"/>
+            </xs:choice>
+        </xs:complexType>
+    </xs:schema>"#;
+
+    let mut xsd10 = SchemaSet::new();
+    crate::pipeline::load_and_process_schema(xsd.as_bytes(), "upa.xsd", &mut xsd10, None)
+        .expect("XSD 1.0: an abstract member does not compete with its head");
+
+    let mut xsd11 = SchemaSet::with_version(XsdVersion::V1_1);
+    let error =
+        crate::pipeline::load_and_process_schema(xsd.as_bytes(), "upa.xsd", &mut xsd11, None)
+            .expect_err("XSD 1.1: the abstract member competes with its head");
+    assert_cos_nonambig(error);
+}
+
+/// `xs:all`: element particles compete by name and by substitution group;
+/// the error names state 0 (no NFA).
+#[test]
+fn test_all_group_element_conflicts() {
+    use crate::compiler::all_group::AllParticle;
+    use crate::compiler::particle::MaxOccurs;
+
+    let mut schema_set = create_test_schema_set_v11();
+    let h = schema_set.name_table.add("h");
+    let m = schema_set.name_table.add("m");
+    let n = schema_set.name_table.add("n");
+    let h_key = global_element(&mut schema_set, h, None, false, &[]);
+    let m_key = global_element(&mut schema_set, m, None, false, &[h_key]);
+    let n_key = global_element(&mut schema_set, n, None, false, &[]);
+
+    let all = |terms: Vec<NfaTerm>| AllGroupModel {
+        particles: terms
+            .into_iter()
+            .enumerate()
+            .map(|(i, term)| AllParticle {
+                term,
+                min_occurs: 1,
+                max_occurs: MaxOccurs::Bounded(1),
+                source: span(i + 1),
+            })
+            .collect(),
+        open_content: None,
+        outer_optional: false,
+    };
+    let h_ref = NfaTerm::element(h, None, Some(h_key));
+    let m_ref = NfaTerm::element(m, None, Some(m_key));
+    let n_ref = NfaTerm::element(n, None, Some(n_key));
+
+    let ok = all(vec![h_ref.clone(), n_ref.clone()]);
+    assert!(check_all_group_upa(&ok, &schema_set, None).is_ok());
+
+    for model in [
+        all(vec![n_ref.clone(), h_ref.clone(), m_ref]),
+        all(vec![h_ref, n_ref.clone(), n_ref]),
+    ] {
+        let error = check_all_group_upa(&model, &schema_set, None).unwrap_err();
+        assert!(error.to_string().contains("at state 0"), "{error}");
+        assert_cos_nonambig(error);
+    }
+}
+
+/// Wildcard terms take no part in the element-element check; an element
+/// competing with a wildcard is left to the element-wildcard check (an error
+/// under XSD 1.0 only).
+#[test]
+fn test_element_element_check_leaves_wildcards_to_their_own_check() {
+    let schema_set = create_test_schema_set();
+    let a = schema_set.name_table.add("a");
+    let b = schema_set.name_table.add("b");
+    let any = || NfaTerm::wildcard(NamespaceConstraint::Any, ProcessContents::Lax);
+
+    let elements = reachable_terms(vec![
+        (any(), span(1)),
+        (NfaTerm::element(a, None, None), span(2)),
+        (any(), span(3)),
+        (NfaTerm::element(b, None, None), span(4)),
+    ]);
+    assert_eq!(element_conflict_locations(&elements, &schema_set), None);
+
+    let nfa = choice_of(vec![
+        (NfaTerm::element(a, None, None), span(1)),
+        (any(), span(2)),
+    ]);
+    let error = check_upa(&nfa, &schema_set, None).unwrap_err();
+    assert!(
+        error.to_string().contains("conflicts with wildcard"),
+        "{error}"
+    );
+    assert!(check_upa(&nfa, &create_test_schema_set_v11(), None).is_ok());
+}
+
+/// With several competing pairs the first in pairwise order is reported —
+/// the smallest first index, then the smallest second — as 0.2.2 did.
+#[test]
+fn test_element_element_conflict_reports_first_pair_in_scan_order() {
+    let schema_set = create_test_schema_set();
+    let a = schema_set.name_table.add("a");
+    let b = schema_set.name_table.add("b");
+    let elem = |name| NfaTerm::element(name, None, None);
+
+    // Pairs (0,3) on `b` and (1,2) on `a`: (0,3) comes first.
+    let elements = reachable_terms(vec![
+        (elem(b), span(1)),
+        (elem(a), span(2)),
+        (elem(a), span(3)),
+        (elem(b), span(4)),
+    ]);
+    assert_eq!(
+        element_conflict_locations(&elements, &schema_set),
+        Some((Some(1), Some(4)))
+    );
+
+    // Index 0 competes with 2 (`a`) and 3 (`a`): the smaller partner wins,
+    // whichever key finds it.
+    let elements = reachable_terms(vec![
+        (elem(a), span(1)),
+        (elem(b), span(2)),
+        (elem(a), span(3)),
+        (elem(a), span(4)),
+    ]);
+    assert_eq!(
+        element_conflict_locations(&elements, &schema_set),
+        Some((Some(1), Some(3)))
+    );
+}
+
+/// Copies of one particle made by occurrence unrolling share its origin and
+/// do not compete; particles without an origin always do.
+#[test]
+fn test_element_element_unrolled_copies_and_sourceless_particles() {
+    let schema_set = create_test_schema_set();
+    let a = schema_set.name_table.add("a");
+    let elem = || NfaTerm::element(a, None, None);
+
+    let copies = reachable_terms(vec![(elem(), span(1)), (elem(), span(1))]);
+    assert_eq!(element_conflict_locations(&copies, &schema_set), None);
+
+    let sourceless = reachable_terms(vec![(elem(), None), (elem(), None)]);
+    assert_eq!(
+        element_conflict_locations(&sourceless, &schema_set),
+        Some((None, None))
+    );
+
+    // The first particle's copy is skipped, the distinct particle is not.
+    let mixed = reachable_terms(vec![
+        (elem(), span(1)),
+        (elem(), span(1)),
+        (elem(), span(2)),
+    ]);
+    assert_eq!(
+        element_conflict_locations(&mixed, &schema_set),
+        Some((Some(1), Some(2)))
+    );
+
+    // A particle without an origin competes with a copy-carrying one.
+    let b = schema_set.name_table.add("b");
+    let later = reachable_terms(vec![
+        (elem(), span(1)),
+        (NfaTerm::element(b, None, None), span(5)),
+        (elem(), span(1)),
+        (elem(), None),
+    ]);
+    assert_eq!(
+        element_conflict_locations(&later, &schema_set),
+        Some((Some(1), None))
+    );
 }
 
 // ========================================================================

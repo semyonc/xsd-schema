@@ -257,6 +257,31 @@ impl SchemaSet {
         source.and_then(|s| self.source_maps.locate(s))
     }
 
+    /// The namespace that `##other` and `##targetNamespace` denote in a
+    /// wildcard (`<xs:any>`, `<xs:anyAttribute>`) declared at `source`.
+    ///
+    /// Structures §3.10.2.2 fixes it by the wildcard's own schema document:
+    /// for `##other` the {namespaces} are "a set consisting of ·absent· and,
+    /// if the targetNamespace [attribute] of the `<schema>` ancestor element
+    /// information item is present, its ·actual value·", and a
+    /// `##targetNamespace` member is "the ·actual value· of the
+    /// targetNamespace [attribute] of the `<schema>` ancestor element
+    /// information item if present, otherwise ·absent·". This is that
+    /// document's target namespace (after chameleon adoption, §4.2.3), not
+    /// the target namespace of a type that inherits the wildcard or of a
+    /// type whose content refers to a model group or attribute group of
+    /// another namespace. `fallback` is used when the declaring document is
+    /// unknown (synthesized wildcards).
+    pub(crate) fn wildcard_target_namespace(
+        &self,
+        source: Option<&SourceRef>,
+        fallback: Option<NameId>,
+    ) -> Option<NameId> {
+        source
+            .and_then(|s| self.documents.get(s.doc_id as usize))
+            .map_or(fallback, |doc| doc.target_namespace)
+    }
+
     /// Returns `true` if any parsing errors were collected during error-recovery parsing.
     pub fn has_parsing_errors(&self) -> bool {
         !self.parsing_errors.is_empty()

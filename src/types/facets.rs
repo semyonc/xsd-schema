@@ -1035,7 +1035,23 @@ impl FacetSet {
     ///
     /// Returns a new FacetSet combining base and derived facets, or an error
     /// if the derivation rules are violated.
+    ///
+    /// The facets' datatype is not known here, so a lower bound is checked
+    /// against an upper one by comparing the two literals as `f64` numbers
+    /// (literals that are not numbers are not compared).
     pub fn merge_with_base(&self, base: &FacetSet) -> FacetResult<FacetSet> {
+        self.merge_with_base_ordered(base, BoundOrder::Unknown)
+    }
+
+    /// [`FacetSet::merge_with_base`] for facets of a datatype whose order
+    /// relation `order` names: the bounds are compared in that value space
+    /// (Datatypes 1.1 §4.3.7–§4.3.10 compare bound values "according to the
+    /// datatype's order relation").
+    pub(crate) fn merge_with_base_ordered(
+        &self,
+        base: &FacetSet,
+        order: BoundOrder,
+    ) -> FacetResult<FacetSet> {
         // XSD Datatypes Part 2 §4.3.1.4 "length and minLength or maxLength":
         // both `length` and `minLength` in {facets} is an error UNLESS
         // (1.1) minLength <= length AND (1.2) some restriction ancestor has
@@ -1358,13 +1374,13 @@ impl FacetSet {
         }
 
         // === Validate conflicting facets ===
-        result.validate_consistency()?;
+        result.validate_consistency(order)?;
 
         Ok(result)
     }
 
     /// Validate internal consistency of facets
-    fn validate_consistency(&self) -> FacetResult<()> {
+    fn validate_consistency(&self, order: BoundOrder) -> FacetResult<()> {
         // Check minLength <= maxLength
         if let (Some(min), Some(max)) = (&self.min_length, &self.max_length) {
             if min.value > max.value {
@@ -1421,7 +1437,7 @@ impl FacetSet {
         // Check numeric bound consistency (minInclusive vs maxInclusive, etc.)
         // Uses decimal parsing for numeric comparison
         if let (Some(min_incl), Some(max_incl)) = (&self.min_inclusive, &self.max_inclusive) {
-            if let Some(cmp) = compare_decimal_strings(&min_incl.value, &max_incl.value) {
+            if let Some(cmp) = order.compare(&min_incl.value, &max_incl.value) {
                 if cmp == std::cmp::Ordering::Greater {
                     return Err(FacetError::conflicting(format!(
                         "minInclusive '{}' is greater than maxInclusive '{}'",
@@ -1431,7 +1447,7 @@ impl FacetSet {
             }
         }
         if let (Some(min_excl), Some(max_excl)) = (&self.min_exclusive, &self.max_exclusive) {
-            if let Some(cmp) = compare_decimal_strings(&min_excl.value, &max_excl.value) {
+            if let Some(cmp) = order.compare(&min_excl.value, &max_excl.value) {
                 if cmp != std::cmp::Ordering::Less {
                     return Err(FacetError::conflicting(format!(
                         "minExclusive '{}' must be less than maxExclusive '{}'",
@@ -1441,7 +1457,7 @@ impl FacetSet {
             }
         }
         if let (Some(min_incl), Some(max_excl)) = (&self.min_inclusive, &self.max_exclusive) {
-            if let Some(cmp) = compare_decimal_strings(&min_incl.value, &max_excl.value) {
+            if let Some(cmp) = order.compare(&min_incl.value, &max_excl.value) {
                 if cmp != std::cmp::Ordering::Less {
                     return Err(FacetError::conflicting(format!(
                         "minInclusive '{}' must be less than maxExclusive '{}'",
@@ -1451,7 +1467,7 @@ impl FacetSet {
             }
         }
         if let (Some(min_excl), Some(max_incl)) = (&self.min_exclusive, &self.max_inclusive) {
-            if let Some(cmp) = compare_decimal_strings(&min_excl.value, &max_incl.value) {
+            if let Some(cmp) = order.compare(&min_excl.value, &max_incl.value) {
                 if cmp != std::cmp::Ordering::Less {
                     return Err(FacetError::conflicting(format!(
                         "minExclusive '{}' must be less than maxInclusive '{}'",
@@ -1571,71 +1587,166 @@ impl FacetSet {
     }
 
     /// Validate a decimal value against numeric facets
+    ///
+    /// `totalDigits` and `fractionDigits` follow their definitions on the value
+    /// (Datatypes 1.1 §4.3.11.3 / §4.3.12.3): the value is `i / 10^n` with
+    /// `|i| < 10^totalDigits` and `0 ≤ n ≤ totalDigits`, resp.
+    /// `0 ≤ n ≤ fractionDigits` — so `0.05` needs two total digits. Bound
+    /// facets compare exactly, including bounds that are themselves beyond
+    /// what `rust_decimal::Decimal` holds.
     pub fn validate_decimal(&self, value: &rust_decimal::Decimal) -> FacetResult<()> {
-        // Check totalDigits
+        self.check_decimal_facets(
+            count_total_digits(value) as usize,
+            count_fraction_digits(value) as usize,
+            |bound| compare_decimal_with_bound(value, bound),
+            || value.to_string(),
+        )
+    }
+
+    /// [`FacetSet::validate_decimal`] for a value of any size and precision.
+    pub(crate) fn validate_exact_decimal(
+        &self,
+        value: &super::exact_decimal::ExactDecimal,
+    ) -> FacetResult<()> {
+        self.check_decimal_facets(
+            value.total_digits(),
+            value.fraction_digits(),
+            |bound| {
+                let bound = super::exact_decimal::ExactDecimal::parse(&normalize_whitespace(
+                    bound,
+                    WhitespaceMode::Collapse,
+                ))?;
+                Some(value.cmp(&bound))
+            },
+            || value.to_string(),
+        )
+    }
+
+    /// The value-based facets of an `xs:decimal`-family typed value — digits
+    /// and bounds on the exact value, then `pattern` on the lexical form and
+    /// `enumeration` by value (Datatypes 1.1 §4.3.5.4: "A value in a ·value
+    /// space· is facet-valid with respect to ·enumeration· if and only if the
+    /// value is equal or identical to one of the values specified in
+    /// {value}"; §3.3.3: "the number 2.0 is not distinct from the number
+    /// 2.00").
+    ///
+    /// `value` is the typed value a decimal-family validator produced from
+    /// `normalized`, its whitespace-collapsed lexical form.
+    pub(crate) fn validate_decimal_family(
+        &self,
+        value: &super::value::XmlValue,
+        normalized: &str,
+    ) -> FacetResult<()> {
+        use super::exact_decimal::ExactDecimal;
+        use super::value::{XmlAtomicValue, XmlValueKind};
+        match &value.value {
+            XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => self.validate_decimal(d)?,
+            XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => match integer_as_decimal(i) {
+                Some(d) => self.validate_decimal(&d)?,
+                None => self.validate_exact_decimal(&ExactDecimal::from_bigint(i))?,
+            },
+            _ => {
+                if let Some(exact) = ExactDecimal::from_value(value) {
+                    self.validate_exact_decimal(&exact)?;
+                }
+            }
+        }
+        self.validate_patterns_only(normalized)?;
+        self.validate_decimal_enumeration(value, normalized)
+    }
+
+    /// `enumeration` for an `xs:decimal`-family value, compared by value. A
+    /// lexically identical member is accepted without parsing anything.
+    fn validate_decimal_enumeration(
+        &self,
+        value: &super::value::XmlValue,
+        normalized: &str,
+    ) -> FacetResult<()> {
+        use super::exact_decimal::ExactDecimal;
+        let Some(ref enumeration) = self.enumeration else {
+            return Ok(());
+        };
+        if enumeration.values.contains(normalized) {
+            return Ok(());
+        }
+        let found = ExactDecimal::from_value(value).is_some_and(|exact| {
+            enumeration.values.iter().any(|member| {
+                ExactDecimal::parse(&normalize_whitespace(member, WhitespaceMode::Collapse))
+                    .is_some_and(|m| m == exact)
+            })
+        });
+        if found {
+            Ok(())
+        } else {
+            Err(FacetError::enumeration(normalized))
+        }
+    }
+
+    /// The digit and bound facets, given the value's digit counts, a
+    /// comparison of the value with a bound literal (`None` when the literal
+    /// does not parse — such a bound was rejected when the schema compiled),
+    /// and the value's display form for messages.
+    fn check_decimal_facets(
+        &self,
+        total_digits: usize,
+        fraction_digits: usize,
+        compare_with: impl Fn(&str) -> Option<std::cmp::Ordering>,
+        display: impl Fn() -> String,
+    ) -> FacetResult<()> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let saturate = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+
         if let Some(ref td) = self.total_digits {
-            let total = count_total_digits(value);
-            if total > td.value {
+            if total_digits > td.value as usize {
                 return Err(FacetError::TotalDigitsViolation {
-                    actual: total,
+                    actual: saturate(total_digits),
                     max: td.value,
                 });
             }
         }
 
-        // Check fractionDigits
         if let Some(ref fd) = self.fraction_digits {
-            let frac = count_fraction_digits(value);
-            if frac > fd.value {
+            if fraction_digits > fd.value as usize {
                 return Err(FacetError::FractionDigitsViolation {
-                    actual: frac,
+                    actual: saturate(fraction_digits),
                     max: fd.value,
                 });
             }
         }
 
-        // Check numeric bounds
         if let Some(ref min) = self.min_inclusive {
-            if let Ok(bound) = rust_decimal::Decimal::from_str_exact(&min.value) {
-                if *value < bound {
-                    return Err(FacetError::MinInclusiveViolation {
-                        value: value.to_string(),
-                        min: min.value.clone(),
-                    });
-                }
+            if compare_with(&min.value) == Some(Less) {
+                return Err(FacetError::MinInclusiveViolation {
+                    value: display(),
+                    min: min.value.clone(),
+                });
             }
         }
 
         if let Some(ref max) = self.max_inclusive {
-            if let Ok(bound) = rust_decimal::Decimal::from_str_exact(&max.value) {
-                if *value > bound {
-                    return Err(FacetError::MaxInclusiveViolation {
-                        value: value.to_string(),
-                        max: max.value.clone(),
-                    });
-                }
+            if compare_with(&max.value) == Some(Greater) {
+                return Err(FacetError::MaxInclusiveViolation {
+                    value: display(),
+                    max: max.value.clone(),
+                });
             }
         }
 
         if let Some(ref min) = self.min_exclusive {
-            if let Ok(bound) = rust_decimal::Decimal::from_str_exact(&min.value) {
-                if *value <= bound {
-                    return Err(FacetError::MinExclusiveViolation {
-                        value: value.to_string(),
-                        min: min.value.clone(),
-                    });
-                }
+            if matches!(compare_with(&min.value), Some(Less | Equal)) {
+                return Err(FacetError::MinExclusiveViolation {
+                    value: display(),
+                    min: min.value.clone(),
+                });
             }
         }
 
         if let Some(ref max) = self.max_exclusive {
-            if let Ok(bound) = rust_decimal::Decimal::from_str_exact(&max.value) {
-                if *value >= bound {
-                    return Err(FacetError::MaxExclusiveViolation {
-                        value: value.to_string(),
-                        max: max.value.clone(),
-                    });
-                }
+            if matches!(compare_with(&max.value), Some(Greater | Equal)) {
+                return Err(FacetError::MaxExclusiveViolation {
+                    value: display(),
+                    max: max.value.clone(),
+                });
             }
         }
 
@@ -1859,13 +1970,56 @@ fn is_whitespace_more_restrictive(derived: WhitespaceMode, base: WhitespaceMode)
     }
 }
 
-/// Compare two strings as decimal/integer values.
-/// Returns None if either string cannot be parsed as a number.
-fn compare_decimal_strings(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    // Try parsing as f64 for general numeric comparison
-    let a_val: f64 = a.trim().parse().ok()?;
-    let b_val: f64 = b.trim().parse().ok()?;
-    a_val.partial_cmp(&b_val)
+/// The order relation in which [`FacetSet::merge_with_base_ordered`] compares
+/// a lower bound with an upper bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundOrder {
+    /// The datatype is not known: numeric literals compare as `f64`.
+    Unknown,
+    /// `xs:decimal` and the types derived from it: exactly, at any size and
+    /// precision.
+    Decimal,
+    /// `xs:float`: as the `f32` values the literals denote.
+    Float,
+    /// `xs:double`: as the `f64` values the literals denote.
+    Double,
+}
+
+impl BoundOrder {
+    /// The order of the datatypes whose primitive is `primitive`; `Unknown`
+    /// for the non-numeric primitives (their bounds are compared elsewhere,
+    /// on typed values).
+    pub(crate) fn for_primitive(primitive: Option<super::PrimitiveTypeCode>) -> Self {
+        match primitive {
+            Some(super::PrimitiveTypeCode::Decimal) => BoundOrder::Decimal,
+            Some(super::PrimitiveTypeCode::Float) => BoundOrder::Float,
+            Some(super::PrimitiveTypeCode::Double) => BoundOrder::Double,
+            _ => BoundOrder::Unknown,
+        }
+    }
+
+    /// The order of two bound literals, or `None` when either is not a
+    /// literal of the datatype (such a bound is rejected on its own) or the
+    /// two are unordered (`NaN`).
+    ///
+    /// Exact comparison is right only for `xs:decimal`: two `xs:double`
+    /// literals that differ beyond double precision, such as `0.1` and
+    /// `0.10000000000000000001`, denote the same value.
+    fn compare(self, a: &str, b: &str) -> Option<std::cmp::Ordering> {
+        use super::exact_decimal::ExactDecimal;
+        use super::validators::{parse_double, parse_float};
+        let (a, b) = (a.trim(), b.trim());
+        match self {
+            BoundOrder::Decimal => Some(ExactDecimal::parse(a)?.cmp(&ExactDecimal::parse(b)?)),
+            BoundOrder::Float => parse_float(a).ok()?.partial_cmp(&parse_float(b).ok()?),
+            BoundOrder::Double => parse_double(a).ok()?.partial_cmp(&parse_double(b).ok()?),
+            BoundOrder::Unknown => {
+                let a: f64 = a.parse().ok()?;
+                let b: f64 = b.parse().ok()?;
+                a.partial_cmp(&b)
+            }
+        }
+    }
 }
 
 /// Apply whitespace normalization to a string.
@@ -1988,34 +2142,52 @@ fn collapse_whitespace(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Count total significant digits in a decimal value.
-///
-/// Per Datatypes Part 2 §4.3.11.4 the `totalDigits` constraint counts the
-/// digits of the unscaled integer mantissa `j` in the canonical
-/// representation `i = j × 10^-k` (with leading zeros excluded). For
-/// example `0.12345 = 12345 × 10^-5` has totalDigits = 5 — the leading `0`
-/// before the decimal point in the lexical form must not be counted.
+/// The `totalDigits` a decimal value needs (Datatypes 1.1 §4.3.11.3): the
+/// value is `i / 10^n` with `|i| < 10^t` and `0 ≤ n ≤ t`. With the value
+/// normalized to the mantissa `i` and scale `n` (no trailing zeros), that is
+/// the larger of the digit count of `i` and `n` — `0.12345 = 12345 × 10^-5`
+/// needs five digits (the leading `0` of the lexical form is not one of them),
+/// and `0.05 = 5 × 10^-2` needs two.
 fn count_total_digits(value: &rust_decimal::Decimal) -> u32 {
-    let normalized = value.abs().normalize();
+    let normalized = value.normalize();
     let mut m = normalized.mantissa().unsigned_abs();
-    if m == 0 {
-        return 1;
-    }
     let mut count = 0u32;
     while m > 0 {
         count += 1;
         m /= 10;
     }
-    count
+    count.max(normalized.scale()).max(1)
 }
 
-/// Count fraction digits in a decimal value
+/// The `fractionDigits` a decimal value needs (Datatypes 1.1 §4.3.12.3): the
+/// scale of the normalized value.
 fn count_fraction_digits(value: &rust_decimal::Decimal) -> u32 {
-    let s = value.normalize().to_string();
-    match s.find('.') {
-        Some(pos) => (s.len() - pos - 1) as u32,
-        None => 0,
+    value.normalize().scale()
+}
+
+/// An `xs:integer` value as a `rust_decimal::Decimal`, when it fits.
+fn integer_as_decimal(value: &num_bigint::BigInt) -> Option<rust_decimal::Decimal> {
+    match i64::try_from(value) {
+        Ok(small) => Some(rust_decimal::Decimal::from(small)),
+        Err(_) => value.to_string().parse().ok(),
     }
+}
+
+/// The order of a decimal value relative to a bound literal, exactly — also
+/// when the bound is beyond what `rust_decimal::Decimal` holds. `None` when
+/// the literal is not an `xs:decimal` lexical form.
+fn compare_decimal_with_bound(
+    value: &rust_decimal::Decimal,
+    bound: &str,
+) -> Option<std::cmp::Ordering> {
+    if let Ok(bound) = rust_decimal::Decimal::from_str_exact(bound) {
+        return Some(value.cmp(&bound));
+    }
+    let bound = super::exact_decimal::ExactDecimal::parse(&normalize_whitespace(
+        bound,
+        WhitespaceMode::Collapse,
+    ))?;
+    Some(super::exact_decimal::ExactDecimal::from_decimal(value).cmp(&bound))
 }
 
 /// Format a float value for error messages (XSD canonical form)
@@ -2704,6 +2876,147 @@ mod tests {
 
         let val = Decimal::from_str("101").unwrap();
         assert!(facets.validate_decimal(&val).is_err());
+    }
+
+    /// Datatypes 1.1 §4.3.11.3: "|i| < 10^t and 0 ≤ n ≤ t" — `0.05` is
+    /// `5 / 10^2`, so it needs two total digits, not one.
+    #[test]
+    fn test_validate_decimal_total_digits_counts_leading_fraction_zeros() {
+        let mut facets = FacetSet::new();
+        facets.set_total_digits(1, FacetFixed::Default, None);
+        assert!(facets
+            .validate_decimal(&Decimal::from_str("0.05").unwrap())
+            .is_err());
+        assert!(facets
+            .validate_decimal(&Decimal::from_str("0.5").unwrap())
+            .is_ok());
+        assert!(facets
+            .validate_decimal(&Decimal::from_str("-0.500").unwrap())
+            .is_ok());
+        assert!(facets.validate_decimal(&Decimal::ZERO).is_ok());
+        facets.set_total_digits(2, FacetFixed::Default, None);
+        assert!(facets
+            .validate_decimal(&Decimal::from_str("0.05").unwrap())
+            .is_ok());
+    }
+
+    /// Bounds beyond what `Decimal` holds still bind (0.2.2 skipped a bound
+    /// that `Decimal::from_str_exact` refused).
+    #[test]
+    fn test_validate_decimal_with_bounds_beyond_capacity() {
+        let huge = "100000000000000000000000000000000000000";
+        let mut facets = FacetSet::new();
+        facets.set_min_inclusive(huge.into(), FacetFixed::Default, None);
+        assert!(facets.validate_decimal(&Decimal::MAX).is_err());
+
+        let mut facets = FacetSet::new();
+        facets.set_max_inclusive(huge.into(), FacetFixed::Default, None);
+        assert!(facets.validate_decimal(&Decimal::MAX).is_ok());
+        facets.set_max_inclusive(format!("-{huge}"), FacetFixed::Default, None);
+        assert!(facets.validate_decimal(&Decimal::MIN).is_err());
+
+        // 1 − 10^-32: more fraction digits than `Decimal` holds.
+        let below_one = "0.99999999999999999999999999999999";
+        let mut facets = FacetSet::new();
+        facets.set_min_exclusive(below_one.into(), FacetFixed::Default, None);
+        assert!(facets.validate_decimal(&Decimal::ONE).is_ok());
+        let mut facets = FacetSet::new();
+        facets.set_max_exclusive(below_one.into(), FacetFixed::Default, None);
+        assert!(facets.validate_decimal(&Decimal::ONE).is_err());
+        // Trailing zeros past 28 places do not change the bound's value.
+        let mut facets = FacetSet::new();
+        facets.set_max_inclusive(
+            "1.000000000000000000000000000000000".into(),
+            FacetFixed::Default,
+            None,
+        );
+        assert!(facets.validate_decimal(&Decimal::ONE).is_ok());
+    }
+
+    /// Datatypes 1.1 §4.3.7–§4.3.10: a lower bound above an upper bound is
+    /// an error, "according to the datatype's order relation" — exact for
+    /// `xs:decimal`, in the float or double value space for those types.
+    #[test]
+    fn test_bound_consistency_in_the_datatype_value_space() {
+        let bounds = |min: &str, max: &str| {
+            let mut facets = FacetSet::new();
+            facets.set_min_inclusive(min.into(), FacetFixed::Default, None);
+            facets.set_max_inclusive(max.into(), FacetFixed::Default, None);
+            facets
+        };
+        let base = FacetSet::new();
+        let consistent =
+            |facets: &FacetSet, order| facets.merge_with_base_ordered(&base, order).is_ok();
+        // The same double, spelled two ways.
+        let dbl = bounds("0.10000000000000000001", "0.1");
+        assert!(consistent(&dbl, BoundOrder::Double));
+        assert!(consistent(&dbl, BoundOrder::Unknown));
+        assert!(!consistent(&dbl, BoundOrder::Decimal));
+        // The same float, but two doubles.
+        let flt = bounds("0.1000000001", "0.1");
+        assert!(consistent(&flt, BoundOrder::Float));
+        assert!(!consistent(&flt, BoundOrder::Double));
+        // Decimals beyond double precision.
+        let dec = bounds(
+            "1.00000000000000000000000000002",
+            "1.00000000000000000000000000001",
+        );
+        assert!(!consistent(&dec, BoundOrder::Decimal));
+        assert!(consistent(&dec, BoundOrder::Double));
+        // Genuine conflicts in every order; special values in float/double.
+        for order in [
+            BoundOrder::Decimal,
+            BoundOrder::Float,
+            BoundOrder::Double,
+            BoundOrder::Unknown,
+        ] {
+            assert!(!consistent(&bounds("0.2", "0.1"), order), "{order:?}");
+            assert!(consistent(&bounds("0.1", "0.2"), order), "{order:?}");
+        }
+        assert!(consistent(&bounds("-INF", "INF"), BoundOrder::Double));
+        assert!(!consistent(&bounds("INF", "-INF"), BoundOrder::Float));
+        // The public method keeps comparing as f64.
+        assert!(dbl.merge_with_base(&base).is_ok());
+        assert!(dec.merge_with_base(&base).is_ok());
+    }
+
+    #[test]
+    fn test_validate_exact_decimal() {
+        use crate::types::exact_decimal::ExactDecimal;
+        let x = |s: &str| ExactDecimal::parse(s).unwrap();
+        let mut facets = FacetSet::new();
+        facets.set_fraction_digits(28, FacetFixed::Default, None);
+        facets.set_min_exclusive("1".into(), FacetFixed::Default, None);
+        assert!(facets
+            .validate_exact_decimal(&x("1.0000000000000000000000000001"))
+            .is_ok());
+        assert!(matches!(
+            facets.validate_exact_decimal(&x("1.00000000000000000000000000001")),
+            Err(FacetError::FractionDigitsViolation {
+                actual: 29,
+                max: 28
+            })
+        ));
+        assert!(matches!(
+            facets.validate_exact_decimal(&x("1.000")),
+            Err(FacetError::MinExclusiveViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_decimal_family_enumeration_by_value() {
+        use crate::types::exact_decimal::decimal_typed_value;
+        let mut facets = FacetSet::new();
+        facets.add_enumeration("1.0".to_string(), None);
+        facets.add_enumeration("100000000000000000000000000000000000000".to_string(), None);
+        let check =
+            |lexical: &str| facets.validate_decimal_family(&decimal_typed_value(lexical), lexical);
+        assert!(check("1.0").is_ok());
+        assert!(check("1.00").is_ok());
+        assert!(check("+1").is_ok());
+        assert!(check("100000000000000000000000000000000000000.000").is_ok());
+        assert!(check("1.1").is_err());
+        assert!(check("100000000000000000000000000000000000001").is_err());
     }
 
     #[test]

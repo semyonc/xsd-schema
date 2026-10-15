@@ -2164,10 +2164,9 @@ fn eval_value<N: DomNavigator>(
                 let d: f64 = s.parse().unwrap_or(f64::NAN);
                 Ok(XPathValue::double(d))
             } else {
-                let d: rust_decimal::Decimal = s.parse().map_err(|_| XPathError::FORG0001 {
-                    value: s.clone(),
-                    target_type: "xs:decimal".to_string(),
-                })?;
+                // XPath 2.0 §3.1.1: the value of a decimal literal is the
+                // literal cast to xs:decimal — never a rounded neighbour.
+                let d = crate::xpath::cast::decimal_from_lexical(s)?;
                 Ok(XPathValue::decimal(d))
             }
         }

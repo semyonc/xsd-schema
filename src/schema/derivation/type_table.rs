@@ -390,7 +390,11 @@ pub fn validate_wildcard_element_type_table_consistency(
                 if matches!(wc.process_contents, ProcessContents::Skip) {
                     return false;
                 }
-                wildcard_result_admits_qname(wc, target_ns, *l_ns, *l_name)
+                // A wildcard reached through a model group of another
+                // namespace keeps the meaning of `##other` /
+                // `##targetNamespace` of its own schema document (§3.10.2.2).
+                let wc_ns = schema_set.wildcard_target_namespace(wc.source.as_ref(), target_ns);
+                wildcard_result_admits_qname(wc, wc_ns, *l_ns, *l_name)
             });
             if !admitted {
                 continue;

@@ -36,6 +36,31 @@ disputes: W3C-queried tests (Bugzilla 4146/4680/4957/6901/29085), tests that
 contradict other accepted tests in the same suite (the `elemM002` /
 `xsd015.e` family vs. Saxon's `Missing` group), or documented waivers.
 
+## Implementation limits
+
+**`xs:decimal`.** The value space of `xs:decimal` is unbounded, and every value
+is validated exactly: `totalDigits`, `fractionDigits`, the bound facets,
+`enumeration`, fixed/default values and identity-constraint fields are decided
+on the exact value, however large or precise. The typed value
+(`XmlAtomicValue::Decimal`, a `rust_decimal::Decimal`) holds a value exactly
+when it is `m / 10^s` for integers with `|m| ≤ 2^96 − 1 =
+79228162514264337593543950335` and `0 ≤ s ≤ 28` (trailing fraction zeros do not
+count). Every value that a `totalDigits` facet of 28 accepts qualifies
+(Datatypes §4.3.11.3 makes it `i / 10^n` with `|i| < 10^28 < 2^96` and
+`n ≤ 28`); a count of significant digits does not decide it — `10^−29` and
+`10^29` have one each and do not qualify. A valid value beyond that is never
+rounded: its typed value is its canonical representation (Datatypes §3.3.3.2),
+an `XmlAtomicValue::String` with the `xs:decimal` type code, and the validator
+reports a warning with code `xs-decimal-capacity` (Datatypes 1.1 §5.4). In XPath
+such a value compares exactly and casts to `xs:string` (the canonical form),
+`xs:boolean`, `xs:integer` (truncation), `xs:double` and `xs:float` (nearest
+value), while arithmetic on it raises `FOAR0002`. Casting a string to
+`xs:decimal` (or writing a decimal literal) follows F&O §17.1.1 and §6.2: a
+magnitude larger than held raises `FOAR0002`, a non-zero magnitude below
+`10^−28` (the smallest positive value held) underflows to `0`, and any other
+value with more precision than is held raises `FOCA0006`. `xs:integer` values
+have no size limit (`BigInt`).
+
 ## Benchmark
 
 Instance-validation throughput and memory for `xsd-schema`'s three ingestion

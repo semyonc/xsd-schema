@@ -42,7 +42,7 @@ use crate::parser::frames::{
     create_frame, create_frame_recovering, xsd_names, Frame, FrameResult, SchemaFrameResult,
     SkipFrame,
 };
-use crate::parser::location::{SourceLocation, SourceMap, SourceRef, SourceSpan};
+use crate::parser::location::{SourceLocation, SourceMap, SourceMapStorage, SourceRef, SourceSpan};
 use crate::parser::reader::{split_qname, TrackedReader};
 use crate::parser::structure::{
     validate_attribute_group_structure, validate_attribute_structure,
@@ -275,8 +275,13 @@ pub fn parse_schema_with_chameleon(
     let source_text = String::from_utf8_lossy(xml).into_owned();
     let source_map = SourceMap::new(base_uri.to_string(), source_text);
 
-    // Pre-assign document ID (will be used when we add the source map later)
-    let doc_id = schema_set.source_maps.len() as DocumentId;
+    // Pre-assign the document ID: the index this document will take in
+    // `documents`. Every `SourceRef` of the document carries it, and
+    // `documents[doc_id]` is how the document is found again (for example the
+    // target namespace a wildcard's `##other` refers to). It is not taken from
+    // `source_maps`, which keeps nothing once `SourceMapStorage::drop_all`
+    // has run.
+    let doc_id = schema_set.documents.len() as DocumentId;
 
     // Create parser state with reference to source_map
     let mut state = ParserState::new(
@@ -356,8 +361,6 @@ pub fn parse_schema_with_chameleon(
         .ok_or_else(|| SchemaError::internal("No schema result produced during parsing"))?;
     drop(state);
 
-    schema_set.parsing_errors.extend(parsing_errors);
-
     // Record the declared targetNamespace before chameleon adoption.
     let declared_target_namespace = root_schema.target_namespace;
 
@@ -389,14 +392,33 @@ pub fn parse_schema_with_chameleon(
         }
     }
 
-    // Add the source map to storage now that parsing is complete
-    // Note: We ensured doc_id matches the position where this will be added
+    // Add the source map to storage now that parsing is complete; assembly
+    // locates its errors through it. A storage that retains source maps
+    // keeps them parallel to `documents`, so the map lands at `doc_id`.
+    let retains_maps = !matches!(schema_set.source_maps, SourceMapStorage::None);
     let added_id = schema_set.source_maps.add(source_map);
-    debug_assert_eq!(doc_id, added_id, "Document ID mismatch");
+    debug_assert!(
+        !retains_maps || added_id == doc_id,
+        "Document ID mismatch: source map {added_id}, document {doc_id}"
+    );
 
-    let mut doc = assemble_schema(schema_set, doc_id, base_uri, root_schema)?;
+    // A document that fails to assemble must leave no trace: the assembler
+    // has already withdrawn its components, and its source map goes too.
+    // A source map left behind would hand the next document an id one past
+    // the end of `documents` (`source_maps` and `documents` are parallel
+    // tables indexed by `DocumentId`).
+    let mut doc = match assemble_schema(schema_set, doc_id, base_uri, root_schema) {
+        Ok(doc) => doc,
+        Err(e) => {
+            schema_set.source_maps.truncate(doc_id as usize);
+            return Err(e);
+        }
+    };
     doc.declared_target_namespace = declared_target_namespace;
     schema_set.documents.push(doc);
+    // Deferred (error-recovery) parsing errors are kept only for a document
+    // that made it into the set.
+    schema_set.parsing_errors.extend(parsing_errors);
 
     Ok(doc_id)
 }

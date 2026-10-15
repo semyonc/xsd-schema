@@ -414,15 +414,23 @@ fn validate_simple_restriction(
 
     // Validate that derived facets are more restrictive
     if let Some(ref base_facets) = base_facets {
-        // FacetSet.merge_with_base validates derivation rules
-        type_def.facets.merge_with_base(base_facets).map_err(|e| {
-            let (location, type_name) = type_error_context(schema_set, type_def);
-            SchemaError::structural(
-                "cos-st-restricts",
-                format!("Simple type '{}' has invalid restriction: {}", type_name, e),
-                location,
-            )
-        })?;
+        // FacetSet.merge_with_base validates derivation rules; the bounds are
+        // compared in the value space of the type's primitive.
+        let order = crate::types::facets::BoundOrder::for_primitive(
+            primitive_type_code(schema_set, type_def)
+                .and_then(crate::types::PrimitiveTypeCode::from_type_code),
+        );
+        type_def
+            .facets
+            .merge_with_base_ordered(base_facets, order)
+            .map_err(|e| {
+                let (location, type_name) = type_error_context(schema_set, type_def);
+                SchemaError::structural(
+                    "cos-st-restricts",
+                    format!("Simple type '{}' has invalid restriction: {}", type_name, e),
+                    location,
+                )
+            })?;
     }
 
     // Validate that facet values are in the base type's value space
@@ -1010,7 +1018,7 @@ fn is_bound_self_violation(
     let Some(b) = parse_past_own_bound(schema_set, base_key, &base_bound) else {
         return false;
     };
-    v.typed_value == b.typed_value
+    crate::validation::simple::typed_values_equal(&v.typed_value, &b.typed_value)
 }
 
 /// Parse `value` as an instance of `base_key`, falling back to the nearest

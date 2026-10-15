@@ -8,9 +8,9 @@ use crate::ids::ModelGroupKey;
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::frames::DerivationMethod;
 use crate::parser::frames::{
-    ComplexContentResult, Compositor, ElementFrameResult, ModelGroupDefResult, NamespaceToken,
-    NotQNameItem, OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef,
-    TypeRefResult, WildcardNamespace, WildcardResult,
+    ComplexContentResult, Compositor, ElementFrameResult, ModelGroupDefResult, NotQNameItem,
+    OpenContentResult, ParticleResult, ParticleTerm, ProcessContents, QNameRef, TypeRefResult,
+    WildcardNamespace, WildcardResult,
 };
 use crate::parser::location::SourceRef;
 use crate::schema::model::{DefaultOpenContent, XsdVersion};
@@ -283,13 +283,8 @@ impl<'a> CompileContext<'a> {
         wildcard: &WildcardResult,
         source: Option<&SourceRef>,
     ) -> NfaCompileResult<NfaFragment> {
-        let mut namespace_constraint = self.convert_wildcard_namespace(&wildcard.namespace);
+        let namespace_constraint = self.wildcard_namespace_constraint(wildcard);
         let process_contents = self.convert_process_contents(wildcard.process_contents);
-
-        // Override with notNamespace if present
-        if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
-            namespace_constraint = not_ns;
-        }
 
         // Expand notQName items — use current_sibling_elements for ##definedSibling
         let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
@@ -496,12 +491,8 @@ impl<'a> CompileContext<'a> {
                     self.build_element_term(elem, particle.source.as_ref().or(source))?
                 }
                 ParticleTerm::Any(wildcard) => {
-                    let mut ns = self.convert_wildcard_namespace(&wildcard.namespace);
+                    let ns = self.wildcard_namespace_constraint(wildcard);
                     let pc = self.convert_process_contents(wildcard.process_contents);
-                    // Override with notNamespace if present
-                    if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
-                        ns = not_ns;
-                    }
                     let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
                     NfaTerm::wildcard_with_not_qnames(ns, pc, not_qnames)
                 }
@@ -649,11 +640,8 @@ impl<'a> CompileContext<'a> {
                     self.build_element_term(elem, particle.source.as_ref().or(source))?
                 }
                 ParticleTerm::Any(wildcard) => {
-                    let mut ns = self.convert_wildcard_namespace(&wildcard.namespace);
+                    let ns = self.wildcard_namespace_constraint(wildcard);
                     let pc = self.convert_process_contents(wildcard.process_contents);
-                    if let Some(not_ns) = self.convert_not_namespace(&wildcard.not_namespace) {
-                        ns = not_ns;
-                    }
                     let not_qnames = self.expand_not_qnames(&wildcard.not_qname);
                     NfaTerm::wildcard_with_not_qnames(ns, pc, not_qnames)
                 }
@@ -829,35 +817,43 @@ impl<'a> CompileContext<'a> {
         Ok(())
     }
 
-    /// Convert WildcardNamespace to NamespaceConstraint
-    fn convert_wildcard_namespace(&self, ns: &WildcardNamespace) -> NamespaceConstraint {
-        match ns {
+    /// The `{namespace constraint}` of a wildcard particle, as a term of the
+    /// content model being compiled.
+    ///
+    /// `##targetNamespace` and `##other` denote the target namespace of the
+    /// schema document that declares the wildcard (Structures §3.10.2.2; see
+    /// [`SchemaSet::wildcard_target_namespace`]). The symbolic forms are
+    /// evaluated against the target namespace of the type whose content model
+    /// they end up in (UPA check, instance validation), so they are kept only
+    /// when that is the declaring namespace; a wildcard reached through a
+    /// model group of another namespace gets the explicit constraint.
+    fn wildcard_namespace_constraint(&self, wildcard: &WildcardResult) -> NamespaceConstraint {
+        let declared = self
+            .schema_set
+            .wildcard_target_namespace(wildcard.source.as_ref(), self.target_namespace);
+        if !wildcard.not_namespace.is_empty() {
+            return NamespaceConstraint::Not(
+                wildcard
+                    .not_namespace
+                    .iter()
+                    .map(|t| t.resolve(declared))
+                    .collect(),
+            );
+        }
+        let constraint = match &wildcard.namespace {
             WildcardNamespace::Any => NamespaceConstraint::Any,
             WildcardNamespace::Other => NamespaceConstraint::Other,
             WildcardNamespace::TargetNamespace => NamespaceConstraint::TargetNamespace,
             WildcardNamespace::Local => NamespaceConstraint::Local,
-            WildcardNamespace::List(list) => NamespaceConstraint::List(
-                list.iter()
-                    .map(|t| t.resolve(self.target_namespace))
-                    .collect(),
-            ),
+            WildcardNamespace::List(list) => {
+                NamespaceConstraint::List(list.iter().map(|t| t.resolve(declared)).collect())
+            }
+        };
+        if declared == self.target_namespace {
+            constraint
+        } else {
+            pin_namespace_constraint(constraint, declared)
         }
-    }
-
-    /// Convert WildcardResult's not_namespace to NamespaceConstraint::Not if non-empty.
-    /// Returns None if not_namespace is empty (no override).
-    fn convert_not_namespace(
-        &self,
-        not_namespace: &[NamespaceToken],
-    ) -> Option<NamespaceConstraint> {
-        if not_namespace.is_empty() {
-            return None;
-        }
-        let excluded: Vec<Option<NameId>> = not_namespace
-            .iter()
-            .map(|t| t.resolve(self.target_namespace))
-            .collect();
-        Some(NamespaceConstraint::Not(excluded))
     }
 
     /// Convert parser ProcessContents to types ProcessContents
@@ -1150,7 +1146,12 @@ fn compile_base_all_group(
     let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
     let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
     match base_matcher {
-        ContentModelMatcher::AllGroup(model) => Ok(Some(model)),
+        ContentModelMatcher::AllGroup(mut model) => {
+            if base_type_def.target_namespace != type_def.target_namespace {
+                pin_all_group_namespaces(&mut model, base_type_def.target_namespace);
+            }
+            Ok(Some(model))
+        }
         _ => Ok(None),
     }
 }
@@ -1186,6 +1187,83 @@ fn try_xsd10_empty_base_all_extension(
     Ok(Some(compile_top_level_all_group_ref_matcher(
         ctx, schema_set, type_def, particle, group_data,
     )?))
+}
+
+/// The explicit form of a symbolic `##other` / `##targetNamespace`
+/// constraint whose wildcard is declared in a schema document with target
+/// namespace `declared` (Structures §3.10.2.2: `##other` is "not" with the
+/// namespaces ·absent· and the target namespace, if present). Other
+/// constraints are returned unchanged.
+fn pin_namespace_constraint(
+    constraint: NamespaceConstraint,
+    declared: Option<NameId>,
+) -> NamespaceConstraint {
+    match constraint {
+        NamespaceConstraint::Other => match declared {
+            Some(ns) => NamespaceConstraint::Not(vec![Some(ns), None]),
+            None => NamespaceConstraint::Not(vec![None]),
+        },
+        NamespaceConstraint::TargetNamespace => NamespaceConstraint::List(vec![declared]),
+        other => other,
+    }
+}
+
+/// Make every symbolic `##other` / `##targetNamespace` wildcard constraint of
+/// a matcher compiled for a type of target namespace `declared` explicit.
+///
+/// The symbolic forms are evaluated against the namespace of the type that
+/// owns the content model; a base type's matcher embedded in the content
+/// model of an extension in another namespace must keep the base's meaning
+/// (a wildcard's namespaces are fixed by its own schema document,
+/// Structures §3.10.2.2).
+fn pin_wildcard_namespaces(matcher: &mut ContentModelMatcher, declared: Option<NameId>) {
+    match matcher {
+        ContentModelMatcher::Nfa(table) => pin_table_namespaces(table, declared),
+        ContentModelMatcher::AllGroup(model) => pin_all_group_namespaces(model, declared),
+        ContentModelMatcher::WithOpenContent { nfa, wildcard, .. } => {
+            pin_table_namespaces(nfa, declared);
+            if let Some(wildcard) = wildcard {
+                pin_constraint(&mut wildcard.namespace_constraint, declared);
+            }
+        }
+    }
+}
+
+/// [`pin_wildcard_namespaces`] for an all-group model.
+fn pin_all_group_namespaces(model: &mut AllGroupModel, declared: Option<NameId>) {
+    for particle in &mut model.particles {
+        pin_term(&mut particle.term, declared);
+    }
+    if let Some(open_content) = model.open_content.as_mut() {
+        pin_constraint(&mut open_content.namespace_constraint, declared);
+    }
+}
+
+fn pin_table_namespaces(table: &mut NfaTable, declared: Option<NameId>) {
+    for state in &mut table.states {
+        if let Some(term) = state.term.as_mut() {
+            pin_term(term, declared);
+        }
+    }
+}
+
+fn pin_term(term: &mut NfaTerm, declared: Option<NameId>) {
+    if let NfaTerm::Wildcard {
+        namespace_constraint,
+        ..
+    } = term
+    {
+        pin_constraint(namespace_constraint, declared);
+    }
+}
+
+fn pin_constraint(constraint: &mut NamespaceConstraint, declared: Option<NameId>) {
+    if matches!(
+        constraint,
+        NamespaceConstraint::Other | NamespaceConstraint::TargetNamespace
+    ) {
+        *constraint = pin_namespace_constraint(std::mem::take(constraint), declared);
+    }
 }
 
 /// Convert an `AllGroupModel` into an NFA table for concatenation with
@@ -1500,8 +1578,11 @@ fn compile_nfa_matcher(
             {
                 base_target_ns = base_type_def.target_namespace;
             }
-            let base_matcher =
+            let mut base_matcher =
                 compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
+            if base_type_def.target_namespace != type_def.target_namespace {
+                pin_wildcard_namespaces(&mut base_matcher, base_type_def.target_namespace);
+            }
             match base_matcher {
                 ContentModelMatcher::Nfa(nfa) => Some(nfa),
                 ContentModelMatcher::WithOpenContent {

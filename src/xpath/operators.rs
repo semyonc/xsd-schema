@@ -724,7 +724,9 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
         }
         if let Some(right_duration) = as_year_month_duration(right) {
             let ratio = year_month_div_duration(duration, right_duration)?;
-            return Ok(XmlValue::decimal(ratio));
+            return Ok(XmlValue::decimal(
+                crate::types::exact_decimal::unsigned_zero(ratio),
+            ));
         }
         return Err(unsupported_operator(BinaryOpKind::Div, left, right));
     }
@@ -737,7 +739,9 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
         }
         if let Some(right_duration) = as_day_time_duration(right) {
             let ratio = day_time_div_duration(duration, right_duration)?;
-            return Ok(XmlValue::decimal(ratio));
+            return Ok(XmlValue::decimal(
+                crate::types::exact_decimal::unsigned_zero(ratio),
+            ));
         }
         return Err(unsupported_operator(BinaryOpKind::Div, left, right));
     }
@@ -746,7 +750,10 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 }
 
 fn numeric_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    let (left_val, right_val, class) = promote_numeric(left, right)?;
+    let (left_val, right_val, class) = match promote_numeric(left, right) {
+        Ok(promoted) => promoted,
+        Err(err) => return exact_decimal_order(left, right, err).map(|o| o == Ordering::Equal),
+    };
     Ok(match class {
         NumericClass::Float => {
             let (l, r) = float_pair(left_val, right_val)?;
@@ -768,7 +775,10 @@ fn numeric_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
 }
 
 fn numeric_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    let (left_val, right_val, class) = promote_numeric(left, right)?;
+    let (left_val, right_val, class) = match promote_numeric(left, right) {
+        Ok(promoted) => promoted,
+        Err(err) => return exact_decimal_order(left, right, err).map(|o| o == Ordering::Greater),
+    };
     Ok(match class {
         NumericClass::Float => {
             let (l, r) = float_pair(left_val, right_val)?;
@@ -787,6 +797,86 @@ fn numeric_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
             l > r
         }
     })
+}
+
+/// Order two decimal-family operands exactly when promoting them to
+/// `xs:decimal` failed for capacity — one is an `xs:decimal` carried in
+/// lexical form, or an `xs:integer` beyond `rust_decimal`'s range. The
+/// comparison operators are defined on the values (F&O §6.3), and comparing
+/// two decimals needs no arithmetic, so the answer is exact rather than an
+/// error. Any other failure is returned unchanged.
+fn exact_decimal_order(
+    left: &XmlValue,
+    right: &XmlValue,
+    err: XPathError,
+) -> Result<Ordering, XPathError> {
+    if err.is_decimal_capacity_error() {
+        if let Some(order) = crate::types::exact_decimal::decimal_values_cmp(left, right) {
+            return Ok(order);
+        }
+    }
+    Err(err)
+}
+
+/// The `Decimal` of an `xs:decimal`-family operand, or FOAR0002 when it is
+/// beyond what `rust_decimal::Decimal` holds — an `xs:decimal` carried in
+/// lexical form, or an `xs:integer` promoted to `xs:decimal` outside its
+/// range. F&O §6.2: "For xs:decimal operations, overflow behavior ·must·
+/// raise an error \[err:FOAR0002\]."
+///
+/// Only a value no `Decimal` holds is a capacity error. An `xs:decimal` whose
+/// payload is a string that does spell a value `Decimal` holds is converted
+/// and used — the validator never makes one, so such a value can only come
+/// from a typing mistake, and it must not pass for one beyond capacity (and so
+/// let an assertion be skipped). A string that is not a decimal at all is the
+/// internal error it always was.
+pub(crate) fn decimal_operand(value: &XmlValue) -> Result<Decimal, XPathError> {
+    if let Some(d) = value.as_decimal() {
+        return Ok(d);
+    }
+    let Some(exact) = crate::types::exact_decimal::ExactDecimal::from_value(value) else {
+        return Err(XPathError::internal("Expected decimal value"));
+    };
+    if let Ok(d) = exact.to_decimal() {
+        return Ok(d);
+    }
+    if crate::types::exact_decimal::lexical_decimal(value).is_some()
+        && MARK_CAPACITY_OPERANDS.with(std::cell::Cell::get)
+    {
+        Err(XPathError::decimal_capacity_operand())
+    } else {
+        Err(XPathError::FOAR0002)
+    }
+}
+
+thread_local! {
+    /// Whether [`decimal_operand`] marks the FOAR0002 it raises for an
+    /// `xs:decimal` carried as a string; see [`with_decimal_capacity_marks`].
+    static MARK_CAPACITY_OPERANDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `evaluate` with the FOAR0002 that arithmetic raises for an
+/// `xs:decimal` operand beyond `rust_decimal`'s capacity marked
+/// ([`XPathError::decimal_capacity_operand`]).
+///
+/// The validator evaluates XSD 1.1 assertions this way. A valid value that
+/// this implementation carries as a string is one whose processing it "cannot
+/// … with assured correctness" (Datatypes 1.1 §5.4); an assertion that fails
+/// because it computed with such a value has an unknown outcome, while one
+/// that raises any other error — an overflow of in-range operands, a division
+/// by zero — is not satisfied (Structures §3.13.4.1). Only the marked error
+/// tells the two apart: it is raised exactly where such an operand is
+/// converted, so an unrelated value elsewhere in the instance cannot excuse a
+/// genuine error. The previous setting is restored on return (and on unwind).
+pub(crate) fn with_decimal_capacity_marks<R>(evaluate: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MARK_CAPACITY_OPERANDS.with(|mark| mark.set(self.0));
+        }
+    }
+    let _restore = Restore(MARK_CAPACITY_OPERANDS.with(|mark| mark.replace(true)));
+    evaluate()
 }
 
 fn eval_numeric_unary(value: &XmlValue) -> Result<XmlValue, XPathError> {
@@ -820,6 +910,7 @@ fn eval_numeric_unary_op(value: &XmlValue, negate: bool) -> Result<XmlValue, XPa
     } else {
         match value {
             NumericValue::Integer(v) => NumericValue::Integer(-v),
+            // A negative zero is made 0 in `numeric_to_xml_value`.
             NumericValue::Decimal(v) => NumericValue::Decimal(-v),
             NumericValue::Float(v) => NumericValue::Float(-v),
             NumericValue::Double(v) => NumericValue::Double(-v),
@@ -834,7 +925,24 @@ fn eval_numeric_binary(
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<XmlValue, XPathError> {
-    let (left_val, right_val, class) = promote_numeric(left, right)?;
+    let (left_val, right_val, class) = match promote_numeric(left, right) {
+        Ok(promoted) => promoted,
+        // F&O §6.2.4–§6.2.6: an xs:decimal or xs:integer division (`div`,
+        // `idiv`, `mod`) by zero raises FOAR0001, whatever the dividend. A
+        // dividend beyond `rust_decimal`'s capacity fails its conversion
+        // first; that must not turn a certain FOAR0001 into the capacity
+        // error FOAR0002.
+        Err(err)
+            if matches!(
+                op,
+                BinaryOpKind::Div | BinaryOpKind::IDiv | BinaryOpKind::Mod
+            ) && err.is_decimal_capacity_error()
+                && is_exact_zero(right) =>
+        {
+            return Err(XPathError::FOAR0001);
+        }
+        Err(err) => return Err(err),
+    };
     let result_type = binary_result_type(op, class);
 
     match op {
@@ -855,7 +963,9 @@ fn numeric_add(
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l + r),
-        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l + r),
+        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            NumericValue::Decimal(l.checked_add(r).ok_or(XPathError::FOAR0002)?)
+        }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l + r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l + r),
         _ => return Err(XPathError::internal("Numeric add type mismatch")),
@@ -870,7 +980,9 @@ fn numeric_sub(
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l - r),
-        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l - r),
+        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            NumericValue::Decimal(l.checked_sub(r).ok_or(XPathError::FOAR0002)?)
+        }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l - r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l - r),
         _ => return Err(XPathError::internal("Numeric sub type mismatch")),
@@ -885,7 +997,9 @@ fn numeric_mul(
 ) -> Result<XmlValue, XPathError> {
     let result = match (left, right) {
         (NumericValue::Integer(l), NumericValue::Integer(r)) => NumericValue::Integer(l * r),
-        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => NumericValue::Decimal(l * r),
+        (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
+            NumericValue::Decimal(l.checked_mul(r).ok_or(XPathError::FOAR0002)?)
+        }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l * r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l * r),
         _ => return Err(XPathError::internal("Numeric mul type mismatch")),
@@ -906,13 +1020,17 @@ fn numeric_div(
             }
             let left_dec = decimal_from_bigint(&l)?;
             let right_dec = decimal_from_bigint(&r)?;
-            NumericValue::Decimal((left_dec / right_dec).round_dp(XPATH_DECIMAL_DIV_SCALE))
+            let quotient = left_dec
+                .checked_div(right_dec)
+                .ok_or(XPathError::FOAR0002)?;
+            NumericValue::Decimal(quotient.round_dp(XPATH_DECIMAL_DIV_SCALE))
         }
         (NumericValue::Decimal(l), NumericValue::Decimal(r)) => {
             if r.is_zero() {
                 return Err(XPathError::FOAR0001);
             }
-            NumericValue::Decimal((l / r).round_dp(XPATH_DECIMAL_DIV_SCALE))
+            let quotient = l.checked_div(r).ok_or(XPathError::FOAR0002)?;
+            NumericValue::Decimal(quotient.round_dp(XPATH_DECIMAL_DIV_SCALE))
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l / r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l / r),
@@ -939,7 +1057,7 @@ fn numeric_idiv(left: NumericValue, right: NumericValue) -> Result<XmlValue, XPa
             if r.is_zero() {
                 return Err(XPathError::FOAR0001);
             }
-            let q = (l / r).trunc();
+            let q = l.checked_div(r).ok_or(XPathError::FOAR0002)?.trunc();
             NumericValue::Integer(decimal_to_bigint(&q)?)
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => {
@@ -999,7 +1117,7 @@ fn numeric_mod(
             if r.is_zero() {
                 return Err(XPathError::FOAR0001);
             }
-            NumericValue::Decimal(l % r)
+            NumericValue::Decimal(l.checked_rem(r).ok_or(XPathError::FOAR0002)?)
         }
         (NumericValue::Float(l), NumericValue::Float(r)) => NumericValue::Float(l % r),
         (NumericValue::Double(l), NumericValue::Double(r)) => NumericValue::Double(l % r),
@@ -1183,6 +1301,16 @@ fn is_integer_class(class: NumericClass) -> bool {
     )
 }
 
+/// Whether an `xs:decimal` or `xs:integer` operand is zero. (An `xs:decimal`
+/// carried as a string is never zero: zero always fits a `Decimal`.)
+fn is_exact_zero(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => d.is_zero(),
+        XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => i.sign() == num_bigint::Sign::NoSign,
+        _ => false,
+    }
+}
+
 fn to_integer_value(value: &XmlValue) -> Result<BigInt, XPathError> {
     match &value.value {
         XmlValueKind::Atomic(XmlAtomicValue::Integer(v)) => Ok(v.clone()),
@@ -1192,12 +1320,7 @@ fn to_integer_value(value: &XmlValue) -> Result<BigInt, XPathError> {
 
 fn to_numeric_value(value: &XmlValue, class: NumericClass) -> Result<NumericValue, XPathError> {
     match class {
-        NumericClass::Decimal => {
-            let decimal = value
-                .as_decimal()
-                .ok_or_else(|| XPathError::internal("Expected decimal value"))?;
-            Ok(NumericValue::Decimal(decimal))
-        }
+        NumericClass::Decimal => Ok(NumericValue::Decimal(decimal_operand(value)?)),
         NumericClass::Float => {
             let val = value
                 .as_double()
@@ -1214,11 +1337,13 @@ fn to_numeric_value(value: &XmlValue, class: NumericClass) -> Result<NumericValu
     }
 }
 
+/// An `xs:integer` promoted to `xs:decimal`; FOAR0002 beyond
+/// `rust_decimal`'s range (F&O §6.2, decimal overflow).
 fn decimal_from_bigint(value: &BigInt) -> Result<Decimal, XPathError> {
     value
         .to_string()
         .parse::<Decimal>()
-        .map_err(|_| XPathError::internal("Failed to convert integer to decimal"))
+        .map_err(|_| XPathError::FOAR0002)
 }
 
 fn decimal_to_bigint(value: &Decimal) -> Result<BigInt, XPathError> {
@@ -1232,7 +1357,12 @@ fn decimal_to_bigint(value: &Decimal) -> Result<BigInt, XPathError> {
 fn numeric_to_xml_value(value: NumericValue, type_code: XmlTypeCode) -> XmlValue {
     let value = match value {
         NumericValue::Integer(v) => XmlValueKind::Atomic(XmlAtomicValue::Integer(v)),
-        NumericValue::Decimal(v) => XmlValueKind::Atomic(XmlAtomicValue::Decimal(v)),
+        // xs:decimal has no negative zero (Datatypes §3.3.3): `-0.0` is 0,
+        // whose canonical form is "0", not "-0". Float and double keep
+        // IEEE's negative zero.
+        NumericValue::Decimal(v) => XmlValueKind::Atomic(XmlAtomicValue::Decimal(
+            crate::types::exact_decimal::unsigned_zero(v),
+        )),
         NumericValue::Float(v) => XmlValueKind::Atomic(XmlAtomicValue::Float(v)),
         NumericValue::Double(v) => XmlValueKind::Atomic(XmlAtomicValue::Double(v)),
     };
@@ -1441,9 +1571,7 @@ fn numeric_to_decimal(value: &XmlValue) -> Result<Decimal, XPathError> {
             Decimal::from_f64(val)
                 .ok_or_else(|| XPathError::internal("Failed to convert float to decimal"))
         }
-        _ => value
-            .as_decimal()
-            .ok_or_else(|| XPathError::internal("Expected decimal value")),
+        _ => decimal_operand(value),
     }
 }
 
@@ -1750,7 +1878,10 @@ fn day_time_mul_numeric(
     value: &DayTimeDurationValue,
     factor: Decimal,
 ) -> Result<DayTimeDurationValue, XPathError> {
-    let total = day_time_total_seconds(value)? * factor;
+    // F&O §10.6.3: an overflowing duration is FODT0002.
+    let total = day_time_total_seconds(value)?
+        .checked_mul(factor)
+        .ok_or(XPathError::FODT0002)?;
     day_time_from_seconds(total)
 }
 
@@ -1761,7 +1892,9 @@ fn day_time_div_numeric(
     if divisor.is_zero() {
         return Err(XPathError::internal("Division by zero"));
     }
-    let total = day_time_total_seconds(value)? / divisor;
+    let total = day_time_total_seconds(value)?
+        .checked_div(divisor)
+        .ok_or(XPathError::FODT0002)?;
     day_time_from_seconds(total)
 }
 

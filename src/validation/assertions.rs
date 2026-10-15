@@ -168,7 +168,8 @@ fn compute_dollar_value<'doc>(
     governing_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
 ) -> XPathValue<BufferDocNavigator<'doc>> {
-    use crate::types::value::{XmlValue, XmlValueKind};
+    use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+    use crate::types::XmlTypeCode;
     use crate::xpath::iterator::XmlItem;
 
     let ct = &schema_set.arenas.complex_types[governing_ct_key];
@@ -188,13 +189,48 @@ fn compute_dollar_value<'doc>(
             // list item. The simple-type validator stores list items in
             // `XmlValueKind::List`; unwrap to a sequence so XPath sees a
             // multi-item input.
+            //
+            // Each member is typed with the list's item type, as in 0.2.2 —
+            // with one exception. A list of a union stores every member as a
+            // string, whichever member type validated it, and its item type is
+            // that of its last member; a string spelling a decimal beyond
+            // `rust_decimal`'s capacity there may be one the union's
+            // `xs:string` member validated, so it is not handed out as an
+            // `xs:decimal` (arithmetic on it would pass for a capacity error
+            // and skip the assertion, with no capacity warning). Such a member
+            // is an `xs:string`, as `data()` gives it. In a list whose item type
+            // is in the decimal family, a string member is exactly such a
+            // decimal and stays one.
             if let XmlValueKind::List { item_type, items } = &result.typed_value.value {
                 let item_type_code = *item_type;
+                let item_type_is_union = crate::validation::simple::list_item_type_if_union(
+                    &result.typed_value,
+                    schema_set,
+                )
+                .is_some();
+                let capacity_strings =
+                    crate::types::exact_decimal::list_strings_are_capacity_decimals(
+                        item_type_code,
+                        items,
+                        Some(item_type_is_union),
+                    );
                 let xpath_items: Vec<XmlItem<BufferDocNavigator<'doc>>> = items
                     .iter()
                     .cloned()
                     .map(|atom| {
-                        XmlItem::Atomic(XmlValue::new(item_type_code, XmlValueKind::Atomic(atom)))
+                        let type_code = match &atom {
+                            XmlAtomicValue::String(s)
+                                if item_type_code == XmlTypeCode::Decimal
+                                    && !capacity_strings
+                                    && crate::types::exact_decimal::is_capacity_decimal_member(
+                                        s,
+                                    ) =>
+                            {
+                                XmlTypeCode::String
+                            }
+                            _ => item_type_code,
+                        };
+                        XmlItem::Atomic(XmlValue::new(type_code, XmlValueKind::Atomic(atom)))
                     })
                     .collect();
                 return XPathValue::from_sequence(xpath_items);
@@ -266,13 +302,25 @@ pub(crate) fn evaluate_complex_type_assertions(
         let nav = BufferDocNavigator::new_assertion(doc, element_ref);
         let value_for_eval = dollar_value.clone();
 
-        let result = match expr
-            .evaluator(&ctx)
-            .run_with_node_and_setup(Some(nav), |eval| {
-                eval.set_variable_by_name("value", value_for_eval)
-                    .expect("$value declared via compile_with_vars");
-            }) {
+        let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
+            expr.evaluator(&ctx)
+                .run_with_node_and_setup(Some(nav), |eval| {
+                    eval.set_variable_by_name("value", value_for_eval)
+                        .expect("$value declared via compile_with_vars");
+                })
+        }) {
             Ok(r) => r,
+            // Datatypes 1.1 §5.4: an `xs:decimal` beyond this implementation's
+            // capacity "must not be treated as invalid". An assertion whose
+            // error comes from computing with such a value — the error is
+            // marked where that operand is converted, so a huge value
+            // elsewhere in the subtree cannot excuse an unrelated error — has
+            // an unknown outcome, not a false one; the value itself was
+            // reported with the capacity warning when it was validated. Any
+            // other error fails the assertion (Structures §3.13.4.1).
+            Err(e) if e.is_decimal_capacity_operand() => {
+                continue;
+            }
             Err(e) => {
                 errors.push(errors::error(
                     "cvc-assertion",

@@ -73,6 +73,9 @@ pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathE
 #[derive(Debug)]
 pub(crate) struct ListMembers {
     item_type: XmlTypeCode,
+    /// Whether the members stored as strings are `xs:decimal`s beyond
+    /// capacity (see `member_type`).
+    capacity_strings: bool,
     items: std::vec::IntoIter<XmlAtomicValue>,
 }
 
@@ -83,7 +86,7 @@ impl Iterator for ListMembers {
     fn next(&mut self) -> Option<XmlValue> {
         let atom = self.items.next()?;
         Some(XmlValue::new(
-            member_type(self.item_type, &atom),
+            list_member_type(self.item_type, &atom, self.capacity_strings),
             XmlValueKind::Atomic(atom),
         ))
     }
@@ -125,9 +128,22 @@ impl ListMembers {
 /// without an error code, so such a member is typed `xs:string`, which is what
 /// it holds. (The exact type of each member — the union member type actually
 /// chosen, XDM §3.3.1.2 — needs a representation that records it per member.)
+///
+/// The other string-held member is an `xs:decimal` beyond `rust_decimal`'s
+/// capacity, which the validator keeps as its canonical string; such a member
+/// stays an `xs:decimal` when `capacity_strings` says the list's string
+/// members are exactly those
+/// ([`list_strings_are_capacity_decimals`](crate::types::exact_decimal::list_strings_are_capacity_decimals)).
+/// A string member of a list of a union never is — it may be a number the
+/// union's `xs:string` member validated — so it is an `xs:string`, as in 0.2.2.
 #[inline]
-fn member_type(item_type: XmlTypeCode, atom: &XmlAtomicValue) -> XmlTypeCode {
+pub(crate) fn list_member_type(
+    item_type: XmlTypeCode,
+    atom: &XmlAtomicValue,
+    capacity_strings: bool,
+) -> XmlTypeCode {
     match atom {
+        XmlAtomicValue::String(_) if capacity_strings => XmlTypeCode::Decimal,
         XmlAtomicValue::String(_)
             if !item_type.is_string_derived() && item_type != XmlTypeCode::UntypedAtomic =>
         {
@@ -154,6 +170,9 @@ pub(crate) fn unpack_list(value: XmlValue) -> Result<ListMembers, XmlValue> {
             ..
         } => Ok(ListMembers {
             item_type,
+            capacity_strings: crate::types::exact_decimal::list_strings_are_capacity_decimals(
+                item_type, &items, None,
+            ),
             items: items.into_iter(),
         }),
         XmlValue {

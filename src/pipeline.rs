@@ -808,6 +808,11 @@ fn validate_particle_occurs_recursive(
 }
 
 fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
+    // The substitution-group map depends on the schema set only, which this
+    // pass does not change: build it once, on first use, rather than once per
+    // complex type (a walk of every element declaration each time).
+    let mut substitution_sets: Option<crate::compiler::SubstitutionGroupMap> = None;
+
     for (_, type_def) in schema_set.arenas.complex_types.iter() {
         // Skip built-in types (xs:anyType etc.) — they have no source location
         // and are valid by construction.
@@ -842,16 +847,24 @@ fn validate_all_upa_constraints(schema_set: &SchemaSet) -> SchemaResult<()> {
                 )
             })?;
 
+        let substitution_sets = substitution_sets
+            .get_or_insert_with(|| crate::compiler::upa_substitution_map(schema_set));
         match matcher {
             crate::compiler::ContentModelMatcher::Nfa(nfa)
             | crate::compiler::ContentModelMatcher::WithOpenContent { nfa, .. } => {
-                crate::compiler::check_upa(&nfa, schema_set, type_def.target_namespace)?;
+                crate::compiler::check_upa_with_substitutions(
+                    &nfa,
+                    schema_set,
+                    type_def.target_namespace,
+                    substitution_sets,
+                )?;
             }
             crate::compiler::ContentModelMatcher::AllGroup(model) => {
-                crate::compiler::check_all_group_upa(
+                crate::compiler::check_all_group_upa_with_substitutions(
                     &model,
                     schema_set,
                     type_def.target_namespace,
+                    substitution_sets,
                 )?;
             }
         }

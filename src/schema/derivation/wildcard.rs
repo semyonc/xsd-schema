@@ -600,13 +600,11 @@ pub(super) fn validate_open_content_extension(
     }
 
     // Clause 1.4.3.2.2.4: BOT.{wildcard}.{namespace constraint} ⊆ EOT.{wildcard}.
+    // Each wildcard is read against the namespace its effective open content
+    // records for it: EOT inherited from BOT keeps the base's namespace
+    // (`##other` is fixed by the wildcard's own schema document, §3.10.2.2).
     if let (Some(bot_wc), Some(eot_wc)) = (bot.wildcard.as_ref(), eot.wildcard.as_ref()) {
-        if !is_wildcard_ns_subset(
-            bot_wc,
-            base.target_namespace,
-            eot_wc,
-            derived.target_namespace,
-        ) {
+        if !is_wildcard_ns_subset(bot_wc, bot.target_namespace, eot_wc, eot.target_namespace) {
             return Err(SchemaError::structural(
                 "cos-ct-extends",
                 format!(

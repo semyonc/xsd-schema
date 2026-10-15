@@ -256,6 +256,18 @@ impl SourceMapStorage {
         }
     }
 
+    /// Drop the source maps of documents `len..`, keeping the first `len`.
+    ///
+    /// Used to withdraw the source map of a document that failed to
+    /// assemble, so the source maps stay parallel to `SchemaSet::documents`.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        match self {
+            SourceMapStorage::Full(maps) => maps.truncate(len),
+            SourceMapStorage::Compact(maps) => maps.truncate(len),
+            SourceMapStorage::None => {}
+        }
+    }
+
     /// Resolve SourceRef to SourceLocation
     pub fn locate(&self, source_ref: &SourceRef) -> Option<SourceLocation> {
         match self {

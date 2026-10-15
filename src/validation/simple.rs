@@ -64,7 +64,68 @@ pub fn fixed_values_equal(
     let Ok(b_result) = validate_simple_type(b, tk, schema_set) else {
         return false;
     };
-    a_result.typed_value == b_result.typed_value
+    typed_values_equal(&a_result.typed_value, &b_result.typed_value)
+}
+
+/// Value equality of two typed values of the same type, as the fixed/default
+/// checks need it: structural, except that `xs:decimal`-family values compare
+/// by exact value, so a decimal carried in lexical form (beyond
+/// `rust_decimal`'s capacity) equals every other spelling of the same number
+/// (Datatypes 1.1 §3.3.3: "the number 2.0 is not distinct from the number
+/// 2.00").
+pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
+    a == b || crate::types::exact_decimal::decimal_values_equal(a, b) == Some(true)
+}
+
+/// The first `xs:decimal` inside a valid typed value that is carried as a
+/// string because `rust_decimal::Decimal` cannot hold it — the value itself, a
+/// union's member value, or a list item — as its canonical representation; the
+/// runtime reports it with the capacity warning (Datatypes 1.1 §5.4).
+///
+/// `normalized` is the value's PSVI `[schema normalized value]`. A list whose
+/// item type is a union stores every item as a string, whichever member type
+/// validated it, and records a single item type for all of them, so the item
+/// type cannot tell which items are decimals. For such a list the items
+/// spelled as an `xs:decimal` of more than 28 digits — the only spellings that
+/// can be beyond capacity — are validated against the union again, and the
+/// member type that accepts each one decides.
+pub(crate) fn capacity_decimal(
+    value: &XmlValue,
+    normalized: Option<&str>,
+    schema_set: &SchemaSet,
+) -> Option<String> {
+    use crate::types::exact_decimal::{first_lexical_decimal, lexical_decimal, EXACT_DIGITS};
+    match &value.value {
+        XmlValueKind::Union(inner) => capacity_decimal(inner, normalized, schema_set),
+        XmlValueKind::List { .. } => {
+            let Some(item_type) = list_item_type_if_union(value, schema_set) else {
+                return first_lexical_decimal(value).map(str::to_owned);
+            };
+            let normalized = normalize_whitespace(normalized?, WhitespaceMode::Collapse);
+            normalized
+                .split(' ')
+                .filter(|token| {
+                    token.bytes().filter(u8::is_ascii_digit).count() > EXACT_DIGITS
+                        && crate::types::validators::is_valid_xsd_decimal_lexical(token)
+                })
+                .find_map(|token| {
+                    let item = validate_simple_type_inner(token, item_type, schema_set).ok()?;
+                    lexical_decimal(&item.typed_value).map(str::to_owned)
+                })
+        }
+        _ => first_lexical_decimal(value).map(str::to_owned),
+    }
+}
+
+/// The item type of a list value, when that item type is a union.
+pub(crate) fn list_item_type_if_union(value: &XmlValue, schema_set: &SchemaSet) -> Option<TypeKey> {
+    let list = schema_set.arenas.simple_types.get(value.schema_type?)?;
+    let item_type = list.resolved_item_type?;
+    let TypeKey::Simple(item_sk) = item_type else {
+        return None;
+    };
+    let item = schema_set.arenas.simple_types.get(item_sk)?;
+    (item.variety == SimpleTypeVariety::Union).then_some(item_type)
 }
 
 /// Value-space equality when the instance's typed value is already computed.
@@ -87,7 +148,7 @@ pub fn fixed_matches_typed(
     let Ok(fixed_result) = validate_simple_type(fixed, tk, schema_set) else {
         return false;
     };
-    *instance_typed == fixed_result.typed_value
+    typed_values_equal(instance_typed, &fixed_result.typed_value)
 }
 
 /// PERF_LAZY_PSVI Phase 2 — opt-out fast path.
@@ -231,21 +292,25 @@ fn validate_numeric_lexical(
     }
 
     // Value-space facets (totalDigits / fractionDigits / min* / max*) need the
-    // value as a `Decimal`. This is the same decimal-string conversion
-    // `XmlValue::as_decimal` performs (never `Decimal::from_i128`, whose
-    // num-traits default downcasts through `i64`).
+    // value as a `Decimal`, and only one that holds it exactly will do: a form
+    // of more than 28 digits may need more than `Decimal` carries (it would be
+    // rounded), so it defers to the full path, which decides on the exact
+    // value — and, for `xs:decimal`, reports the capacity notice. (Never
+    // `Decimal::from_i128`, whose num-traits default downcasts through `i64`.)
+    if normalized.bytes().filter(u8::is_ascii_digit).count()
+        > crate::types::exact_decimal::EXACT_DIGITS
+    {
+        return None;
+    }
     match normalized.parse::<Decimal>() {
         Ok(d) if facets.validate_decimal(&d).is_err() => return None,
         Ok(_) => {}
-        // `xs:decimal`: an unparseable lexical defers to the full path. Integer
-        // family: a valid integer (the i128 gate passed) beyond `Decimal`'s
-        // range — `as_decimal` returns `None` there too, so the full path also
-        // skips value-space facets; nothing more to check here.
-        Err(_) if code == XmlTypeCode::Decimal => return None,
-        Err(_) => {}
+        Err(_) => return None,
     }
 
-    // Lexical pattern / enumeration facets — what the numeric validators apply.
+    // Lexical pattern / enumeration facets. A lexically matching enumeration
+    // member is also a value match; a mismatch defers to the full path, which
+    // compares enumerations by value.
     if facets.validate_string_patterns_enums(normalized).is_err() {
         return None;
     }
@@ -672,7 +737,18 @@ fn validate_union_type(
                         |s| {
                             VALIDATOR_REGISTRY
                                 .validate(type_code, s)
-                                .map(|v| v.to_string_value() == check_value)
+                                .map(|v| {
+                                    // Decimals compare by exact value: a
+                                    // value carried in lexical form has no
+                                    // canonical string to compare.
+                                    match crate::types::exact_decimal::decimal_values_equal(
+                                        &v,
+                                        &result.typed_value,
+                                    ) {
+                                        Some(equal) => equal,
+                                        None => v.to_string_value() == check_value,
+                                    }
+                                })
                                 .unwrap_or(false)
                         },
                         &check_value,
@@ -812,25 +888,46 @@ fn evaluate_assertion_facets(
                 )
             })?;
 
-        // Convert typed value to XPathValue
-        let xpath_value = typed_value.to_xpath_value::<RoXmlNavigator<'static>>(item_schema_type);
+        // Convert typed value to XPathValue. The item type of a list tells
+        // whether its members stored as strings can be decimals beyond
+        // capacity: never for a union item type, whose members are all stored
+        // as strings.
+        let item_type_is_union = item_schema_type
+            .and_then(|sk| schema_set.arenas.simple_types.get(sk))
+            .map(|st| st.variety == SimpleTypeVariety::Union);
+        let xpath_value = typed_value
+            .to_xpath_value_with::<RoXmlNavigator<'static>>(item_schema_type, item_type_is_union);
 
         // Evaluate with $value bound
-        let result = expr
-            .evaluator(&ctx)
-            .run_with::<RoXmlNavigator<'static>, _>(|eval| {
-                eval.set_variable_by_name("value", xpath_value).unwrap();
-            })
-            .map_err(|e| {
-                errors::error(
+        let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
+            expr.evaluator(&ctx)
+                .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+                    eval.set_variable_by_name("value", xpath_value).unwrap();
+                })
+        }) {
+            Ok(result) => result,
+            // Datatypes 1.1 §5.4: an `xs:decimal` beyond this implementation's
+            // capacity "must not be treated as invalid". When the assertion
+            // raises its error because it computed with such a value — and
+            // only then: the error is marked where that operand is converted
+            // — its outcome is unknown, not false; the value is reported with
+            // its capacity warning instead. Any other error (an overflow of
+            // in-range operands, a division by zero, FOCA0006 for a literal)
+            // fails the assertion (Structures §3.13.4.1).
+            Err(e) if e.is_decimal_capacity_operand() => {
+                continue;
+            }
+            Err(e) => {
+                return Err(errors::error(
                     "cvc-assertion",
                     format!(
                         "Failed to evaluate assertion test '{}': {}",
                         assertion.test, e
                     ),
                     location.clone(),
-                )
-            })?;
+                ));
+            }
+        };
 
         // Effective boolean value must be true
         let ebv = effective_boolean_value(&result).map_err(|e| {

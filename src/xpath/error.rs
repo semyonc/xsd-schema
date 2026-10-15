@@ -550,6 +550,67 @@ impl XPathError {
         )
     }
 
+    /// FOCA0006: a string cast to `xs:decimal` has more digits of precision
+    /// than the implementation holds.
+    ///
+    /// F&O §17.1.1: "In casting to xs:decimal or to a type derived from
+    /// xs:decimal, if the value is not too large or too small but nevertheless
+    /// cannot be represented accurately with the number of decimal digits
+    /// available to the implementation, the implementation may round to the
+    /// nearest representable value or may raise a dynamic error
+    /// \[err:FOCA0006\]." This crate raises it rather than round: its
+    /// `xs:decimal` holds a 96-bit mantissa with at most 28 fraction digits.
+    /// A value too small to be held at all — a magnitude below 10^−28 — is an
+    /// underflow instead, and casts to 0 (F&O §6.2).
+    /// The code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`]. [`XPathError::error_code`] answers
+    /// `Some("FOCA0006")`.
+    pub(crate) fn decimal_too_precise(lexical: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "FOCA0006",
+            Some(&format!(
+                "'{lexical}' has more digits of precision than xs:decimal holds here \
+                 (a 96-bit mantissa with at most 28 fraction digits)"
+            )),
+        )
+    }
+
+    /// Whether this error is how the engine reports an `xs:decimal` beyond its
+    /// capacity: `FOAR0002` (overflow — arithmetic on a decimal carried in
+    /// lexical form, or a result too large) or `FOCA0006` (too precise to
+    /// cast).
+    pub(crate) fn is_decimal_capacity_error(&self) -> bool {
+        matches!(self, XPathError::FOAR0002)
+            || self.is_decimal_capacity_operand()
+            || self.raised_error().is_some_and(|raised| {
+                raised.namespace_uri == XQT_ERRORS_NAMESPACE && raised.local_name == "FOCA0006"
+            })
+    }
+
+    /// `FOAR0002` raised because an operand is an `xs:decimal` that this
+    /// implementation carries as a string — a valid value beyond what
+    /// `rust_decimal::Decimal` holds — while
+    /// [`with_decimal_capacity_marks`](crate::xpath::operators::with_decimal_capacity_marks)
+    /// is in force.
+    ///
+    /// The validator evaluates XSD 1.1 assertions that way, so it can tell an
+    /// assertion whose outcome is unknown because of the implementation's
+    /// capacity (Datatypes 1.1 §5.4) from one that genuinely raised an error.
+    /// Outside that scope the same condition is the plain
+    /// [`XPathError::FOAR0002`]; this form never reaches a caller of the public
+    /// API, and [`XPathError::error_code`] reports it as `FOAR0002` all the
+    /// same.
+    pub(crate) fn decimal_capacity_operand() -> Self {
+        XPathError::Internal(DECIMAL_CAPACITY_OPERAND.to_string())
+    }
+
+    /// Whether this is the error [`XPathError::decimal_capacity_operand`]
+    /// builds.
+    pub(crate) fn is_decimal_capacity_operand(&self) -> bool {
+        matches!(self, XPathError::Internal(message) if message == DECIMAL_CAPACITY_OPERAND)
+    }
+
     /// FONS0004: no namespace binding for a prefix.
     ///
     /// The code has no dedicated variant, so it travels as an error QName; see
@@ -639,6 +700,7 @@ impl XPathError {
             // operator mapping covers is a type error.
             XPathError::BinaryOperatorNotDefined { .. } => Some("XPTY0004"),
             XPathError::UnaryOperatorNotDefined { .. } => Some("XPTY0004"),
+            XPathError::Internal(_) if self.is_decimal_capacity_operand() => Some("FOAR0002"),
             XPathError::Internal(_) => self.raised_error().and_then(|raised| {
                 if raised.namespace_uri != XQT_ERRORS_NAMESPACE {
                     return None;
@@ -660,11 +722,17 @@ pub const XQT_ERRORS_NAMESPACE: &str = "http://www.w3.org/2005/xqt-errors";
 /// The local name of the default error QName of `fn:error`.
 pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
 
+/// The message of [`XPathError::decimal_capacity_operand`]. It does not start
+/// with `Q{`, so no error QName — and nothing `fn:error` raises — reads as it.
+const DECIMAL_CAPACITY_OPERAND: &str =
+    "[FOAR0002] xs:decimal operand beyond the capacity of this implementation";
+
 /// The spec-defined codes this crate reports through an error QName rather
 /// than through a variant of [`XPathError`], and which
 /// [`XPathError::error_code`] therefore resolves back to a `'static` string.
 pub const QNAMED_ERROR_CODES: &[&str] = &[
     DEFAULT_RAISED_ERROR,
+    "FOCA0006",
     "FOCH0004",
     "FODC0001",
     "FONS0004",
