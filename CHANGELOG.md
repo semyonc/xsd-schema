@@ -52,8 +52,8 @@ results change. Those changes are listed here; the remaining fixes are under
   or trailing zeros, no decimal point for an integer), an `XmlAtomicValue::String`
   with the `xs:decimal` type code (`XmlValue::as_decimal` returns `None`), and
   the validator reports a warning with code `xs-decimal-capacity` (Datatypes
-  §5.4). `XmlAtomicValue::Decimal` is unchanged. See the README, "Implementation
-  limits".
+  §5.4). `XmlAtomicValue::Decimal` is unchanged. See
+  [Implementation Limits](doc/IMPLEMENTATION_LIMITS.md).
 - **Decimal facets on the exact value.** `totalDigits`, `fractionDigits` and the
   bound facets of `xs:decimal` and the integer types are decided on the exact
   value: values with more than 28 fraction digits are no longer checked after
