@@ -731,7 +731,146 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
         return Err(first_error);
     }
 
+    // Every QName in the content particles is resolved (or reported) by
+    // now, so an extension's empty explicit content can be dropped.
+    drop_empty_explicit_extension_content(schema_set);
+
     Ok(stats)
+}
+
+/// Give a `<complexContent><extension>` whose *explicit content* is empty
+/// the same representation as one with no particle at all.
+///
+/// Structures §3.4.2.3.3 clause 2 defines the ·explicit content· as empty
+/// when "2.1.1 There is no `<group>`, `<all>`, `<choice>` or `<sequence>`
+/// among the [children]; 2.1.2 There is an `<all>` or `<sequence>` among the
+/// [children] with no [children] of its own excluding `<annotation>`; 2.1.3
+/// There is among the [children] a `<choice>` element whose minOccurs
+/// [attribute] has the ·actual value· 0 and which has no [children] of its
+/// own except for `<annotation>`; 2.1.4 The `<group>`, `<all>`, `<choice>` or
+/// `<sequence>` element among the [children] has a maxOccurs [attribute]
+/// with an ·actual value· of 0". The four cases are one and the same
+/// component-level fact, and clause 4.2.2 gives the extension the base's
+/// content type: "If the {base type definition} is a complex type definition
+/// whose {content type}.{variety} = element-only or mixed and the ·effective
+/// content· is empty, then {base type definition}.{content type}". (With
+/// ·effective mixed· true, clause 3.1.1 turns the empty explicit content into
+/// an empty-sequence particle, exactly as for clause 2.1.1.)
+///
+/// Every consumer of the content type (the `cos-ct-extends` checks, the
+/// effective-content normalization, the content-model compiler and the PSVI
+/// content type) already implements that rule for clause 2.1.1, i.e. for
+/// `particle: None`; the parser keeps clauses 2.1.2–2.1.4 as a particle. This
+/// pass maps them onto clause 2.1.1, so the content type is built from the
+/// base in every consumer.
+///
+/// The particle is dropped only when no check that runs after reference
+/// resolution could still report an error in it, so the change never hides
+/// an error in the schema document: it is kept when its occurrence ranges
+/// are invalid (`p-props-correct`, `cos-all-limited`), and — for clause 2.1.4
+/// with content (`maxOccurs="0"` around declarations) — when a local element
+/// type or group reference in it does not resolve, a local element in it
+/// carries a value constraint, an explicit `targetNamespace`, identity
+/// constraints or type alternatives (checked only once local elements are
+/// allocated), or a wildcard in it has a `notQName` list (checked after
+/// reference resolution).
+fn drop_empty_explicit_extension_content(schema_set: &mut SchemaSet) {
+    use crate::parser::frames::{
+        particle_is_explicit_empty, ComplexContentResult, DerivationMethod, ParticleResult,
+        ParticleTerm,
+    };
+
+    /// `min occurs <= max occurs` throughout the particle tree.
+    fn occurs_consistent(particle: &ParticleResult) -> bool {
+        particle
+            .max_occurs
+            .is_none_or(|max| particle.min_occurs <= max)
+            && match &particle.term {
+                ParticleTerm::Group(group) => group.particles.iter().all(occurs_consistent),
+                _ => true,
+            }
+    }
+
+    /// Nothing in the particle tree is left for a later check to reject.
+    /// Element references and QName visibility were checked during reference
+    /// resolution; local element type references, group references and the
+    /// properties below are checked later, when the particle is compiled or
+    /// its local elements are allocated.
+    fn nothing_left_to_check(schema_set: &SchemaSet, particle: &ParticleResult) -> bool {
+        match &particle.term {
+            ParticleTerm::Element(element) => {
+                if element.ref_name.is_some() {
+                    return true;
+                }
+                let type_resolves = match &element.type_ref {
+                    Some(TypeRefResult::QName(qname)) => {
+                        check_namespace_visible(schema_set, qname, element.source.as_ref(), "Type")
+                            .is_ok()
+                            && (schema_set
+                                .lookup_type(qname.namespace, qname.local_name)
+                                .is_some()
+                                || schema_set
+                                    .get_built_in_type_by_qname(qname.namespace, qname.local_name)
+                                    .is_some())
+                    }
+                    _ => true,
+                };
+                type_resolves
+                    && element.default_value.is_none()
+                    && element.fixed_value.is_none()
+                    && element.target_namespace.is_none()
+                    && element.identity_constraints.is_empty()
+                    && element.identity_constraint_refs.is_empty()
+                    && element.alternatives.is_empty()
+            }
+            ParticleTerm::Group(group) => {
+                group.ref_name.as_ref().is_none_or(|qname| {
+                    schema_set
+                        .lookup_model_group(qname.namespace, qname.local_name)
+                        .is_some()
+                }) && group
+                    .particles
+                    .iter()
+                    .all(|child| nothing_left_to_check(schema_set, child))
+            }
+            ParticleTerm::Any(wildcard) => wildcard.not_qname.is_empty(),
+        }
+    }
+
+    let xsd_version = schema_set.xsd_version;
+    let empty_extensions: Vec<ComplexTypeKey> = schema_set
+        .arenas
+        .complex_types
+        .iter()
+        .filter_map(|(key, type_def)| {
+            let ComplexContentResult::Complex(def) = &type_def.content else {
+                return None;
+            };
+            let particle = def.particle.as_ref()?;
+            let droppable = def.derivation == DerivationMethod::Extension
+                && particle_is_explicit_empty(particle)
+                && occurs_consistent(particle)
+                && nothing_left_to_check(schema_set, particle)
+                && (crate::compiler::is_top_level_all_group(particle).is_none()
+                    || crate::compiler::validate_outer_all_group_occurs(particle, xsd_version)
+                        .is_ok());
+            droppable.then_some(key)
+        })
+        .collect();
+    if empty_extensions.is_empty() {
+        return;
+    }
+    let arenas = schema_set.arenas.entries_mut();
+    for key in empty_extensions {
+        if let Some(type_def) = arenas.complex_types.get_mut(key) {
+            if let ComplexContentResult::Complex(def) = &mut type_def.content {
+                def.particle = None;
+            }
+            // Indexed by the dropped particle's element positions.
+            type_def.resolved_content_particle_types.clear();
+            type_def.resolved_content_particle_elements.clear();
+        }
+    }
 }
 
 /// Datatypes §3.3.20: "The value space of NOTATION is the set of QNames of

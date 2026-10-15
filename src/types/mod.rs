@@ -20,6 +20,7 @@ pub mod builtin;
 pub mod complex;
 pub mod convert;
 pub mod equality;
+pub(crate) mod exact_decimal;
 pub mod facets;
 #[cfg(feature = "xsd11")]
 pub mod sequence;

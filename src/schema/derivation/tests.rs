@@ -781,7 +781,7 @@ fn admits(
     attr_ns: Option<NameId>,
     attr_name: NameId,
 ) -> bool {
-    let eff = normalize_attribute_wildcard(schema_set, w, target_ns);
+    let eff = normalize_attribute_wildcard(w, target_ns);
     effective_wildcard_allows_attribute(schema_set, &eff, attr_ns, attr_name)
 }
 
@@ -820,27 +820,20 @@ fn test_effective_wildcard_other_admits_different_ns() {
 }
 
 #[test]
-fn test_effective_wildcard_other_absent_ns_xsd10_vs_xsd11() {
-    // §3.10.4.2 `##other` differs by version:
-    //   - XSD 1.0: excludes both the target namespace AND the absent namespace.
-    //   - XSD 1.1: excludes only the target namespace; the absent namespace is admitted.
-    let schema_10 = SchemaSet::new(); // defaults to XSD 1.0
-    let tns = schema_10.name_table.add("urn:foo");
-    let name = schema_10.name_table.add("local_attr");
-    let w = default_wildcard(WildcardNamespace::Other);
-
-    assert!(
-        !admits(&schema_10, &w, Some(tns), None, name),
-        "XSD 1.0: ##other must NOT admit the absent namespace"
-    );
-
-    let schema_11 = SchemaSet::xsd11();
-    let tns11 = schema_11.name_table.add("urn:foo");
-    let name11 = schema_11.name_table.add("local_attr");
-    assert!(
-        admits(&schema_11, &w, Some(tns11), None, name11),
-        "XSD 1.1: ##other MUST admit the absent namespace"
-    );
+fn test_effective_wildcard_other_absent_ns_xsd10_and_xsd11() {
+    // §3.10.2.2 / §3.10.4.3 clause 2: `##other` is not({target namespace,
+    // absent}) in XSD 1.0 and XSD 1.1 alike, so the absent namespace is
+    // never admitted.
+    for schema_set in [SchemaSet::new(), SchemaSet::xsd11()] {
+        let tns = schema_set.name_table.add("urn:foo");
+        let name = schema_set.name_table.add("local_attr");
+        let w = default_wildcard(WildcardNamespace::Other);
+        assert!(
+            !admits(&schema_set, &w, Some(tns), None, name),
+            "xsd11={}: ##other must NOT admit the absent namespace",
+            schema_set.is_xsd11()
+        );
+    }
 }
 
 #[test]
@@ -1055,9 +1048,8 @@ fn wildcard_with_ns(namespace: WildcardNamespace) -> WildcardResult {
 
 #[test]
 fn test_normalize_any() {
-    let schema_set = SchemaSet::new();
     let wc = wildcard_with_ns(WildcardNamespace::Any);
-    let eff = normalize_attribute_wildcard(&schema_set, &wc, None);
+    let eff = normalize_attribute_wildcard(&wc, None);
     assert!(matches!(eff.namespace, CanonicalNs::Any));
 }
 
@@ -1073,7 +1065,7 @@ fn test_normalize_list_resolves_tokens() {
         NamespaceToken::TargetNamespace,
         NamespaceToken::Local,
     ]));
-    let eff = normalize_attribute_wildcard(&schema_set, &wc, Some(target));
+    let eff = normalize_attribute_wildcard(&wc, Some(target));
     match eff.namespace {
         CanonicalNs::Enum(set) => {
             assert!(set.contains(&Some(ns_a)));
@@ -1086,63 +1078,45 @@ fn test_normalize_list_resolves_tokens() {
 }
 
 #[test]
-fn test_normalize_other_xsd10_vs_xsd11() {
-    // Pins the fix documented at types/complex.rs:287-303 — XSD 1.0
-    // `##other` excludes {target, absent}; XSD 1.1 excludes {target}
-    // only.
-    let schema_10 = SchemaSet::new();
-    let schema_11 = SchemaSet::xsd11();
-    let target_10 = schema_10.name_table.add("http://t");
-    let target_11 = schema_11.name_table.add("http://t");
+fn test_normalize_other_excludes_target_and_absent() {
+    // §3.10.2.2: `##other` maps to {variety} not with {namespaces} "a set
+    // consisting of ·absent· and, if the targetNamespace [attribute] of
+    // the <schema> ancestor element information item is present, its
+    // ·actual value·" — for `<anyAttribute>` in XSD 1.1 as in XSD 1.0.
+    // The XSD 1.1 attribute path used to drop absent (C24).
+    let schema_set = SchemaSet::new();
+    let target = schema_set.name_table.add("http://t");
 
-    let wc10 = wildcard_with_ns(WildcardNamespace::Other);
-    let wc11 = wildcard_with_ns(WildcardNamespace::Other);
+    let wc = wildcard_with_ns(WildcardNamespace::Other);
+    let eff = normalize_attribute_wildcard(&wc, Some(target));
 
-    let eff10 = normalize_attribute_wildcard(&schema_10, &wc10, Some(target_10));
-    let eff11 = normalize_attribute_wildcard(&schema_11, &wc11, Some(target_11));
-
-    match eff10.namespace {
+    match eff.namespace {
         CanonicalNs::Not(set) => {
-            assert!(set.contains(&Some(target_10)));
-            assert!(set.contains(&None), "XSD 1.0 ##other excludes absent");
+            assert!(set.contains(&Some(target)));
+            assert!(set.contains(&None), "##other excludes absent");
+            assert_eq!(set.len(), 2);
         }
-        _ => panic!("expected Not"),
-    }
-    match eff11.namespace {
-        CanonicalNs::Not(set) => {
-            assert!(set.contains(&Some(target_11)));
-            assert!(!set.contains(&None), "XSD 1.1 ##other admits absent");
-        }
-        _ => panic!("expected Not"),
+        other => panic!("expected Not, got {:?}", other),
     }
 }
 
 #[test]
 fn test_normalize_other_absent_target_namespace() {
-    // Regression: when the schema has no target namespace, the
-    // "target namespace" IS the absent namespace (None), so
-    // ##other must exclude None even in XSD 1.1. An earlier
-    // implementation skipped inserting None for XSD 1.1 when
-    // target_ns was None, producing Not({}) ≡ Any and incorrectly
-    // accepting invalid derivations for no-targetNamespace schemas.
-    let schema_10 = SchemaSet::new();
-    let schema_11 = SchemaSet::xsd11();
-
+    // When the schema has no target namespace, ##other is not({absent}):
+    // an empty exclusion set would be Not({}) ≡ Any and accept invalid
+    // derivations for no-targetNamespace schemas.
     let wc = wildcard_with_ns(WildcardNamespace::Other);
-    let eff10 = normalize_attribute_wildcard(&schema_10, &wc, None);
-    let eff11 = normalize_attribute_wildcard(&schema_11, &wc, None);
+    let eff = normalize_attribute_wildcard(&wc, None);
 
-    for (label, eff) in [("XSD 1.0", eff10), ("XSD 1.1", eff11)] {
-        match eff.namespace {
-            CanonicalNs::Not(set) => {
-                assert!(
-                    set.contains(&None),
-                    "{}: ##other with absent target MUST exclude the absent namespace",
-                    label,
-                );
-            }
-            other => panic!("{}: expected Not, got {:?}", label, other),
+    match eff.namespace {
+        CanonicalNs::Not(set) => {
+            assert!(
+                set.contains(&None),
+                "##other with absent target MUST exclude the absent namespace",
+            );
+            assert_eq!(set.len(), 1);
         }
+        other => panic!("expected Not, got {:?}", other),
     }
 }
 
@@ -1232,7 +1206,7 @@ fn test_normalize_folds_not_namespace() {
     // Any wildcard with not_namespace=[ns_a] becomes Not({ns_a}).
     let mut wc = wildcard_with_ns(WildcardNamespace::Any);
     wc.not_namespace = vec![NamespaceToken::Uri(ns_a)];
-    let eff = normalize_attribute_wildcard(&schema_set, &wc, None);
+    let eff = normalize_attribute_wildcard(&wc, None);
     match eff.namespace {
         CanonicalNs::Not(set) => {
             assert_eq!(set.len(), 1);

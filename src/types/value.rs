@@ -180,6 +180,15 @@ impl XmlValue {
     }
 
     /// Try to get as decimal
+    ///
+    /// `None` also for an `xs:decimal` value beyond what `rust_decimal`
+    /// holds exactly — one that is not `m / 10^s` with an integer
+    /// `|m| ≤ 2^96 − 1` (79228162514264337593543950335) and `s ≤ 28`, such as
+    /// a magnitude above that bound or more than 28 fraction digits. Such a
+    /// value is valid; its typed value is its canonical representation
+    /// (Datatypes §3.3.3.2), an [`XmlAtomicValue::String`] with the type code
+    /// [`XmlTypeCode::Decimal`], and [`XmlValue::to_string_value`] returns
+    /// that form. It is never rounded to a nearby `Decimal`.
     pub fn as_decimal(&self) -> Option<Decimal> {
         match &self.value {
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => Some(*d),
@@ -206,6 +215,13 @@ impl XmlValue {
             XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Some(*f as f64),
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => d.to_string().parse().ok(),
             XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => i.to_string().parse().ok(),
+            // An `xs:decimal` carried in lexical form (see `as_decimal`): the
+            // nearest double, as casting `xs:decimal` to `xs:double` gives it.
+            XmlValueKind::Atomic(XmlAtomicValue::String(s))
+                if self.type_code == XmlTypeCode::Decimal =>
+            {
+                crate::types::exact_decimal::ExactDecimal::parse(s).map(|d| d.to_f64())
+            }
             _ => None,
         }
     }
@@ -232,6 +248,18 @@ impl XmlValue {
         &self,
         item_schema_type: Option<SimpleTypeKey>,
     ) -> crate::xpath::XPathValue<N> {
+        self.to_xpath_value_with(item_schema_type, None)
+    }
+
+    /// [`XmlValue::to_xpath_value`] for a caller that knows from the schema
+    /// whether a list's item type is a union (`Some`); see
+    /// [`list_strings_are_capacity_decimals`](crate::types::exact_decimal::list_strings_are_capacity_decimals).
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn to_xpath_value_with<N: crate::xpath::DomNavigator>(
+        &self,
+        item_schema_type: Option<SimpleTypeKey>,
+        item_type_is_union: Option<bool>,
+    ) -> crate::xpath::XPathValue<N> {
         use crate::xpath::iterator::XmlItem;
         use crate::xpath::XPathValue;
 
@@ -240,21 +268,36 @@ impl XmlValue {
                 XPathValue::from_atomic(self.clone())
             }
             XmlValueKind::List { item_type, items } => {
+                // A decimal member beyond `rust_decimal`'s capacity is stored
+                // as its canonical string; it is still an `xs:decimal`. Every
+                // other string member is an `xs:string`, as in 0.2.2 — in
+                // particular every member of a list of a union.
+                let capacity_strings =
+                    crate::types::exact_decimal::list_strings_are_capacity_decimals(
+                        *item_type,
+                        items,
+                        item_type_is_union,
+                    );
                 let xml_items: Vec<XmlItem<N>> = items
                     .iter()
                     .map(|atom| {
+                        let type_code = match atom {
+                            XmlAtomicValue::String(_) if capacity_strings => XmlTypeCode::Decimal,
+                            _ => atom.type_code(),
+                        };
                         let val = XmlValue {
-                            type_code: atom.type_code(),
+                            type_code,
                             schema_type: item_schema_type,
                             value: XmlValueKind::Atomic(atom.clone()),
                         };
                         XmlItem::Atomic(val)
                     })
                     .collect();
-                let _ = item_type; // item_type already embedded in each atom's type_code
                 XPathValue::from_sequence(xml_items)
             }
-            XmlValueKind::Union(inner) => inner.to_xpath_value(item_schema_type),
+            XmlValueKind::Union(inner) => {
+                inner.to_xpath_value_with(item_schema_type, item_type_is_union)
+            }
         }
     }
 }
@@ -292,7 +335,26 @@ pub enum XmlAtomicValue {
     Boolean(bool),
 
     // Numeric types
-    /// xs:decimal
+    /// xs:decimal, when `rust_decimal::Decimal` holds the value exactly: the
+    /// value is `m / 10^s` for integers `m` and `s` with
+    /// `|m| ≤ 2^96 − 1` (79228162514264337593543950335 — a 96-bit mantissa)
+    /// and `0 ≤ s ≤ 28`. Every value that a `totalDigits` facet of 28
+    /// accepts qualifies: Datatypes §4.3.11.3 makes it `i / 10^n` with
+    /// `|i| < 10^28 < 2^96` and `0 ≤ n ≤ 28`. A count of significant digits
+    /// does not decide it: `0.00000000000000000000000000001` (10^−29) and
+    /// `100000000000000000000000000000` (10^29) have one each and do not
+    /// qualify.
+    ///
+    /// The value space of `xs:decimal` is unbounded. A larger or more precise
+    /// valid value is validated exactly — digits, bounds, enumeration and
+    /// equality are decided on the exact value — but its typed value is its
+    /// canonical representation (Datatypes §3.3.3.2: no sign for a positive
+    /// value, no leading or trailing zeros, no decimal point for an integer):
+    /// an [`XmlAtomicValue::String`] inside
+    /// an [`XmlValue`] whose `type_code` is [`XmlTypeCode::Decimal`]. The
+    /// validator reports such a value with a warning (code
+    /// `xs-decimal-capacity`), and XPath arithmetic on it raises `FOAR0002`
+    /// instead of computing with a rounded number.
     Decimal(Decimal),
     /// xs:integer and derived integer types
     Integer(BigInt),
@@ -405,8 +467,12 @@ impl fmt::Display for XmlAtomicValue {
             Self::String(s) => write!(f, "{}", s),
             Self::Boolean(b) => write!(f, "{}", if *b { "true" } else { "false" }),
             Self::Decimal(d) => {
-                // XSD canonical form: no trailing zeros for integers
-                if d.fract().is_zero() {
+                // XSD canonical form: no trailing zeros for integers, and
+                // zero is `0` — xs:decimal has no negative zero, though a
+                // `rust_decimal` zero can carry a sign.
+                if d.is_zero() {
+                    f.write_str("0")
+                } else if d.fract().is_zero() {
                     write!(f, "{}", d.trunc())
                 } else {
                     write!(f, "{}", d.normalize())

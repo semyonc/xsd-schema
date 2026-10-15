@@ -70,6 +70,9 @@ pub use substitution::{
     validate_all_substitution_groups, SubstitutionGroupMap,
 };
 pub use upa::{check_all_group_upa, check_upa};
+pub(crate) use upa::{
+    check_all_group_upa_with_substitutions, check_upa_with_substitutions, upa_substitution_map,
+};
 
 use crate::types::complex::{OpenContentMode as TypesOpenContentMode, WildcardRef};
 

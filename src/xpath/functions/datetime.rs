@@ -226,7 +226,10 @@ fn xml_decimal(d: Decimal) -> XmlValue {
     XmlValue {
         type_code: XmlTypeCode::Decimal,
         schema_type: None,
-        value: XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)),
+        // The seconds of a negative duration with no seconds are 0, not -0.
+        value: XmlValueKind::Atomic(XmlAtomicValue::Decimal(
+            crate::types::exact_decimal::unsigned_zero(d),
+        )),
     }
 }
 

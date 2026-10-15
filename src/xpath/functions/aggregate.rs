@@ -460,9 +460,13 @@ fn numeric_divide(value: &XmlValue, count: usize) -> Result<XmlValue, XPathError
             Ok(XmlValue::float(v / count as f32))
         }
         XmlTypeCode::Decimal => {
-            let v = value.as_decimal().unwrap();
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let v = crate::xpath::operators::decimal_operand(value)?;
             let count_decimal = Decimal::from(count as u64);
-            Ok(XmlValue::decimal(v / count_decimal))
+            let quotient = v.checked_div(count_decimal).ok_or(XPathError::FOAR0002)?;
+            Ok(XmlValue::decimal(
+                crate::types::exact_decimal::unsigned_zero(quotient),
+            ))
         }
         // `fn:avg` divides the sum by the count with `op:numeric-divide`, and
         // dividing two xs:integers yields an xs:decimal.
@@ -470,10 +474,15 @@ fn numeric_divide(value: &XmlValue, count: usize) -> Result<XmlValue, XPathError
             let v = value.as_integer().ok_or_else(|| XPathError::FORG0006 {
                 message: "Expected integer value".to_string(),
             })?;
-            let d: Decimal = v.to_string().parse().map_err(|_| XPathError::FORG0006 {
-                message: "Failed to convert integer to decimal".to_string(),
-            })?;
-            Ok(XmlValue::decimal(d / Decimal::from(count as u64)))
+            // An xs:integer sum beyond `rust_decimal`'s range cannot be
+            // divided as an xs:decimal: FOAR0002 (F&O §6.2).
+            let d: Decimal = v.to_string().parse().map_err(|_| XPathError::FOAR0002)?;
+            let quotient = d
+                .checked_div(Decimal::from(count as u64))
+                .ok_or(XPathError::FOAR0002)?;
+            Ok(XmlValue::decimal(
+                crate::types::exact_decimal::unsigned_zero(quotient),
+            ))
         }
         XmlTypeCode::YearMonthDuration => {
             let dur = get_year_month_duration(value)?;

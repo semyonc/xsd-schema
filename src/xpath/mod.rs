@@ -71,6 +71,10 @@ pub(crate) mod deps;
 // High-level public API
 pub mod api;
 
+// `xs:decimal` values beyond `rust_decimal`'s capacity, end to end.
+#[cfg(test)]
+mod decimal_capacity_tests;
+
 // Re-export navigator types for backward compatibility
 pub use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, RoXmlNavigator, TypedValue,

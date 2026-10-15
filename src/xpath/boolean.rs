@@ -51,6 +51,15 @@ pub fn effective_boolean_value(value: &XmlValue) -> Result<bool, XPathError> {
         // Boolean: use the value directly
         XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => Ok(*b),
 
+        // An xs:decimal carried in lexical form (beyond `rust_decimal`) is a
+        // number: non-zero is true.
+        XmlValueKind::Atomic(XmlAtomicValue::String(_))
+            if crate::types::exact_decimal::lexical_decimal(value).is_some() =>
+        {
+            Ok(crate::types::exact_decimal::ExactDecimal::from_value(value)
+                .is_some_and(|d| !d.is_zero()))
+        }
+
         // String types: non-empty is true
         XmlValueKind::Atomic(XmlAtomicValue::String(s)) => Ok(!s.is_empty()),
         XmlValueKind::UntypedAtomic(s) => Ok(!s.is_empty()),

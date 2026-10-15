@@ -12,7 +12,11 @@
 //! | Element-Wildcard    | Error   | Allowed (elem wins) |
 //! | Wildcard-Wildcard   | Error   | Error               |
 
-use std::collections::HashSet;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
+
+use ahash::AHasher;
 use thiserror::Error;
 
 use crate::error::{SchemaError, SchemaResult};
@@ -191,16 +195,6 @@ fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> Reachable
     result
 }
 
-/// Check if two elements have the same qualified name (name + namespace)
-fn elements_overlap(
-    name1: NameId,
-    ns1: Option<NameId>,
-    name2: NameId,
-    ns2: Option<NameId>,
-) -> bool {
-    name1 == name2 && ns1 == ns2
-}
-
 fn element_substitutable_names(
     term: &NfaTerm,
     substitution_sets: &SubstitutionGroupMap,
@@ -226,13 +220,6 @@ fn element_substitutable_names(
     }
 }
 
-fn name_sets_overlap(names1: &SubstitutableNameSet, names2: &SubstitutableNameSet) -> bool {
-    if names1.len() > names2.len() {
-        return names2.iter().any(|name| names1.contains(name));
-    }
-    names1.iter().any(|name| names2.contains(name))
-}
-
 /// Check if an element namespace matches a wildcard constraint
 fn element_wildcard_overlap(
     element_namespace: Option<NameId>,
@@ -244,8 +231,8 @@ fn element_wildcard_overlap(
         NamespaceConstraint::Any => true,
 
         NamespaceConstraint::Other => {
-            // ##other matches any namespace except the target namespace
-            // (and typically excludes absent namespace too in XSD 1.0)
+            // ##other matches any namespace except the target namespace and
+            // ·absent· — in both XSD versions (Structures §3.10.2.2)
             other_matches_namespace(element_namespace, target_namespace, xsd_version)
         }
 
@@ -306,8 +293,8 @@ fn wildcards_overlap(
         // ##other vs ##targetNamespace: no overlap (mutually exclusive)
         (Other, TargetNamespace) | (TargetNamespace, Other) => false,
 
-        // ##other vs ##local: overlap if target namespace is not None
-        // (##other excludes target ns, ##local is None, so overlap if target ns != None)
+        // ##other vs ##local: never overlap — ##other excludes ·absent·, the
+        // only namespace ##local admits (Structures §3.10.2.2)
         (Other, Local) | (Local, Other) => {
             other_matches_namespace(None, target_namespace, xsd_version)
         }
@@ -339,6 +326,113 @@ fn wildcards_overlap(
     }
 }
 
+/// The two ways two element particles compete (§3.8.6.4 Unique Particle
+/// Attribution: "A content model must not contain two element particles which
+/// compete with each other"), as keys of the index
+/// [`first_element_element_conflict`] builds. An element item matches an
+/// element declaration if it has the declaration's expanded name, or if its
+/// expanded name resolves to a declaration substitutable for it (§3.9.4.1.2,
+/// "matches").
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CompetitionKey {
+    /// The particle's own expanded name `(local name, namespace)`. Two
+    /// particles with the same expanded name compete, whatever their
+    /// substitution sets (an abstract head's set under XSD 1.0 omits its own
+    /// name and can be empty).
+    Name(NameId, Option<NameId>),
+    /// One expanded name of the particle's substitutable set: the head and
+    /// its substitutable members from the [`SubstitutionGroupMap`], or the
+    /// particle's own name when the map has no entry for it
+    /// ([`element_substitutable_names`]).
+    Substitutable(NameId, Option<NameId>),
+}
+
+/// Per-key state of [`first_element_element_conflict`]: the first particle
+/// that carries the key, and whether a later particle with a different
+/// origin has already been paired with it.
+#[derive(Clone, Copy)]
+struct KeyRun {
+    first: usize,
+    paired: bool,
+}
+
+/// Find the first competing pair of element particles in `elements`.
+///
+/// Two particles `i < j` compete when they do not come from the same particle
+/// (`same_particle_origin`) and either their expanded names are equal or their
+/// substitutable sets share a name. "First" is the pairwise order: the
+/// smallest `i`, then the smallest `j`, which is the pair the former
+/// all-pairs scan reported (O(k²) set intersections per NFA state).
+///
+/// One pass over the particles in order with an index from key to the first
+/// particle that carries it, O(Σ |substitutable set|) per state:
+///
+/// - Every competing pair shares a key; conversely two particles sharing a key
+///   compete unless they come from the same particle.
+/// - "Same origin" is an equivalence on particles with a source (copies made
+///   by occurrence unrolling); a particle without a source is in a class of
+///   its own. So within the particles carrying one key, the first particle
+///   `f` competes with a later one iff some later particle's class differs
+///   from `f`'s, and the smallest such partner is the first such particle.
+/// - If any pair `(i, j)` competes through a key whose first particle `f` is
+///   before `i`, then `f` competes too — with `i` when their classes differ,
+///   otherwise with `j`. So the smallest competing `i` is the first particle
+///   of some key, and its smallest partner is the minimum, over the keys it
+///   comes first in, of the first particle in a different class.
+///
+/// Hence the answer is the minimum of `(first, partner)` over the keys, which
+/// the pass records as it finds each key's partner. Neither the order of the
+/// map's iteration nor that of a substitutable set enters the result.
+fn first_element_element_conflict(
+    elements: &[ReachableTerm],
+    substitution_sets: &SubstitutionGroupMap,
+) -> Option<(usize, usize)> {
+    let mut index: HashMap<CompetitionKey, KeyRun, BuildHasherDefault<AHasher>> =
+        HashMap::with_capacity_and_hasher(2 * elements.len(), Default::default());
+    let mut first_pair: Option<(usize, usize)> = None;
+
+    for (j, elem) in elements.iter().enumerate() {
+        let NfaTerm::Element {
+            name,
+            namespace,
+            element_key,
+            ..
+        } = &elem.term
+        else {
+            continue;
+        };
+
+        let mut visit = |key: CompetitionKey| match index.entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(KeyRun {
+                    first: j,
+                    paired: false,
+                });
+            }
+            Entry::Occupied(mut slot) => {
+                let run = slot.get_mut();
+                if !run.paired && !same_particle_origin(&elements[run.first].origin, &elem.origin) {
+                    run.paired = true;
+                    let pair = (run.first, j);
+                    first_pair = Some(first_pair.map_or(pair, |best| best.min(pair)));
+                }
+            }
+        };
+
+        visit(CompetitionKey::Name(*name, *namespace));
+        match element_key.and_then(|key| substitution_sets.get(&key)) {
+            Some(names) => {
+                for &(member_name, member_namespace) in names {
+                    visit(CompetitionKey::Substitutable(member_name, member_namespace));
+                }
+            }
+            None => visit(CompetitionKey::Substitutable(*name, *namespace)),
+        }
+    }
+
+    first_pair
+}
+
 /// Check element-element conflicts in reachable terms
 fn check_element_element_conflicts(
     elements: &[ReachableTerm],
@@ -346,62 +440,46 @@ fn check_element_element_conflicts(
     schema_set: &SchemaSet,
     substitution_sets: &SubstitutionGroupMap,
 ) -> UpaResult<()> {
-    let element_sets: Vec<SubstitutableNameSet> = elements
-        .iter()
-        .map(|elem| element_substitutable_names(&elem.term, substitution_sets))
-        .collect();
+    let Some((i, j)) = first_element_element_conflict(elements, substitution_sets) else {
+        return Ok(());
+    };
+    let (elem1, elem2) = (&elements[i], &elements[j]);
+    let (
+        NfaTerm::Element {
+            name: name1,
+            namespace: ns1,
+            ..
+        },
+        NfaTerm::Element {
+            name: name2,
+            namespace: ns2,
+            ..
+        },
+    ) = (&elem1.term, &elem2.term)
+    else {
+        unreachable!("first_element_element_conflict pairs element terms only");
+    };
 
-    for i in 0..elements.len() {
-        for j in (i + 1)..elements.len() {
-            let elem1 = &elements[i];
-            let elem2 = &elements[j];
+    let first_name = schema_set
+        .name_table
+        .try_resolve(*name1)
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let second_name = schema_set
+        .name_table
+        .try_resolve(*name2)
+        .unwrap_or_else(|| "<unknown>".to_string());
 
-            // Skip copies of the same particle from occurrence unrolling
-            if same_particle_origin(&elem1.origin, &elem2.origin) {
-                continue;
-            }
-
-            if let (
-                NfaTerm::Element {
-                    name: name1,
-                    namespace: ns1,
-                    ..
-                },
-                NfaTerm::Element {
-                    name: name2,
-                    namespace: ns2,
-                    ..
-                },
-            ) = (&elem1.term, &elem2.term)
-            {
-                if elements_overlap(*name1, *ns1, *name2, *ns2)
-                    || name_sets_overlap(&element_sets[i], &element_sets[j])
-                {
-                    let first_name = schema_set
-                        .name_table
-                        .try_resolve(*name1)
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    let second_name = schema_set
-                        .name_table
-                        .try_resolve(*name2)
-                        .unwrap_or_else(|| "<unknown>".to_string());
-
-                    return Err(Box::new(UpaError::ElementElementConflict {
-                        first_name,
-                        second_name,
-                        first_name_id: *name1,
-                        first_namespace: *ns1,
-                        second_name_id: *name2,
-                        second_namespace: *ns2,
-                        state_id: from_state_id,
-                        first_location: elem1.origin.clone(),
-                        second_location: elem2.origin.clone(),
-                    }));
-                }
-            }
-        }
-    }
-    Ok(())
+    Err(Box::new(UpaError::ElementElementConflict {
+        first_name,
+        second_name,
+        first_name_id: *name1,
+        first_namespace: *ns1,
+        second_name_id: *name2,
+        second_namespace: *ns2,
+        state_id: from_state_id,
+        first_location: elem1.origin.clone(),
+        second_location: elem2.origin.clone(),
+    }))
 }
 
 /// Check element-wildcard conflicts in reachable terms (XSD 1.0 only)
@@ -543,15 +621,40 @@ pub fn check_upa(
     schema_set: &SchemaSet,
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
-    let xsd_version = schema_set.xsd_version;
+    check_upa_with_substitutions(
+        nfa,
+        schema_set,
+        target_namespace,
+        &upa_substitution_map(schema_set),
+    )
+}
+
+/// Build the substitution-group map the UPA check runs with.
+///
+/// The map depends on the schema set only, so a pass over many content models
+/// builds it once and passes it to [`check_upa_with_substitutions`] and
+/// [`check_all_group_upa_with_substitutions`]; building it costs a walk of
+/// every element declaration.
+pub(crate) fn upa_substitution_map(schema_set: &SchemaSet) -> SubstitutionGroupMap {
     // Per XSD 1.1 (W3C Bugzilla 4337), abstract elements participate in the
     // substitution group for cos-nonambig (UPA) purposes even though they
     // can't appear in instances.
-    let substitution_sets = if schema_set.is_xsd11() {
+    if schema_set.is_xsd11() {
         build_substitution_group_map_with_abstract(schema_set)
     } else {
         build_substitution_group_map(schema_set)
-    };
+    }
+}
+
+/// [`check_upa`] with a substitution-group map built by
+/// [`upa_substitution_map`] for the same schema set.
+pub(crate) fn check_upa_with_substitutions(
+    nfa: &NfaTable,
+    schema_set: &SchemaSet,
+    target_namespace: Option<NameId>,
+    substitution_sets: &SubstitutionGroupMap,
+) -> SchemaResult<()> {
+    let xsd_version = schema_set.xsd_version;
 
     // Check from each state in the NFA
     for state in &nfa.states {
@@ -562,7 +665,7 @@ pub fn check_upa(
             &reachable.elements,
             state.id,
             schema_set,
-            &substitution_sets,
+            substitution_sets,
         ) {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
@@ -576,7 +679,7 @@ pub fn check_upa(
                 target_namespace,
                 xsd_version,
                 schema_set,
-                &substitution_sets,
+                substitution_sets,
             ) {
                 return Err(upa_error_to_schema_error(schema_set, error));
             }
@@ -616,12 +719,23 @@ pub fn check_all_group_upa(
     schema_set: &SchemaSet,
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
+    check_all_group_upa_with_substitutions(
+        model,
+        schema_set,
+        target_namespace,
+        &upa_substitution_map(schema_set),
+    )
+}
+
+/// [`check_all_group_upa`] with a substitution-group map built by
+/// [`upa_substitution_map`] for the same schema set.
+pub(crate) fn check_all_group_upa_with_substitutions(
+    model: &AllGroupModel,
+    schema_set: &SchemaSet,
+    target_namespace: Option<NameId>,
+    substitution_sets: &SubstitutionGroupMap,
+) -> SchemaResult<()> {
     let xsd_version = schema_set.xsd_version;
-    let substitution_sets = if schema_set.is_xsd11() {
-        build_substitution_group_map_with_abstract(schema_set)
-    } else {
-        build_substitution_group_map(schema_set)
-    };
 
     let mut elements: Vec<ReachableTerm> = Vec::new();
     let mut wildcards: Vec<ReachableTerm> = Vec::new();
@@ -644,7 +758,7 @@ pub fn check_all_group_upa(
         &elements,
         ALL_GROUP_STATE_ID,
         schema_set,
-        &substitution_sets,
+        substitution_sets,
     ) {
         return Err(upa_error_to_schema_error(schema_set, error));
     }
@@ -661,6 +775,16 @@ pub fn check_all_group_upa(
     Ok(())
 }
 
+/// The 0.2.2 element–element check (all pairs per state, substitution map
+/// built per call), kept verbatim for the differential tests.
+#[cfg(test)]
+#[path = "upa_reference.rs"]
+mod reference;
+
 #[cfg(test)]
 #[path = "upa_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "upa_differential_tests.rs"]
+mod differential_tests;

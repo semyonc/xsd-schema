@@ -209,14 +209,16 @@ fn numeric_values_equal_inner(left: &XmlValue, right: &XmlValue, nan_equal: bool
 
     // If either operand is xs:float, promote the other to float
     if lt == XmlTypeCode::Float || rt == XmlTypeCode::Float {
-        let lf = match &left.value {
+        // An xs:decimal carried in lexical form (beyond `rust_decimal`) has
+        // no `Decimal`; it promotes to its nearest float exactly the same way.
+        let as_f32 = |v: &XmlValue| match &v.value {
             crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Some(*f),
-            _ => left.as_decimal().and_then(|d| d.to_f32()),
+            _ => v.as_decimal().and_then(|d| d.to_f32()).or_else(|| {
+                crate::types::exact_decimal::ExactDecimal::from_value(v).map(|d| d.to_f32())
+            }),
         };
-        let rf = match &right.value {
-            crate::types::value::XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Some(*f),
-            _ => right.as_decimal().and_then(|d| d.to_f32()),
-        };
+        let lf = as_f32(left);
+        let rf = as_f32(right);
         if let (Some(l), Some(r)) = (lf, rf) {
             if nan_equal && l.is_nan() && r.is_nan() {
                 return true;
@@ -229,11 +231,14 @@ fn numeric_values_equal_inner(left: &XmlValue, right: &XmlValue, nan_equal: bool
         return false;
     }
 
-    // Both are decimal/integer — compare as Decimal (exact)
+    // Both are decimal/integer — compare as Decimal (exact), or by exact
+    // value when one is beyond what `Decimal` holds (an xs:decimal carried in
+    // lexical form, an xs:integer past `Decimal::MAX`).
     if is_decimal_or_int(lt) && is_decimal_or_int(rt) {
         if let (Some(l), Some(r)) = (left.as_decimal(), right.as_decimal()) {
             return l == r;
         }
+        return crate::types::exact_decimal::decimal_values_equal(left, right) == Some(true);
     }
 
     false

@@ -834,7 +834,27 @@ pub fn is_valid_xsd_decimal_lexical(s: &str) -> bool {
     i == bytes.len()
 }
 
+/// The typed value of an `xs:decimal` lexical form (`raw` before, `normalized`
+/// after whitespace collapse) — see [`DecimalValidator::validate`].
+fn decimal_value(raw: &str, normalized: &str) -> ValidationResult<XmlValue> {
+    if !is_valid_xsd_decimal_lexical(normalized) {
+        return Err(ValidationError::InvalidLexical {
+            value: raw.to_string(),
+            type_name: "decimal",
+            message: format!("Invalid xs:decimal lexical form: '{}'", normalized),
+        });
+    }
+    Ok(super::exact_decimal::decimal_typed_value(normalized))
+}
+
 /// Validator for xs:decimal
+///
+/// Values are validated exactly at any size and precision. Exactly
+/// representable values — those `rust_decimal::Decimal` holds: `m / 10^s` with
+/// an integer `|m| ≤ 2^96 − 1` (79228162514264337593543950335, a 96-bit
+/// mantissa) and `0 ≤ s ≤ 28` — are typed as [`XmlAtomicValue::Decimal`];
+/// larger or more precise values are carried as their canonical string (see
+/// [`DecimalValidator::validate`]).
 pub struct DecimalValidator;
 
 impl TypeValidator for DecimalValidator {
@@ -851,32 +871,29 @@ impl TypeValidator for DecimalValidator {
         WhitespaceMode::Collapse
     }
 
+    /// Parse an `xs:decimal` lexical form into its typed value.
+    ///
+    /// The value space of `xs:decimal` is unbounded (Datatypes 1.1 §3.3.3).
+    /// A value that `rust_decimal::Decimal` holds exactly — `m / 10^s` with an
+    /// integer `|m| ≤ 2^96 − 1 = 79228162514264337593543950335` and
+    /// `0 ≤ s ≤ 28`, trailing fraction zeros dropped — is an
+    /// [`XmlAtomicValue::Decimal`], never rounded. Any other valid value is
+    /// still valid: its typed value is its canonical representation
+    /// (Datatypes §3.3.3.2, e.g. `1000…0.5` for `+01000…0.500`) as
+    /// [`XmlAtomicValue::String`] with the [`XmlTypeCode::Decimal`] type
+    /// code (so [`XmlValue::as_decimal`] returns `None` for it). Facets are
+    /// checked on the exact value either way, and the instance validator
+    /// reports such a value as a warning with code `xs-decimal-capacity`
+    /// (Datatypes 1.1 §5.4 Partial Implementation of Infinite Datatypes).
     fn validate(&self, value: &str) -> ValidationResult<XmlValue> {
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        if !is_valid_xsd_decimal_lexical(&normalized) {
-            return Err(ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "decimal",
-                message: format!("Invalid xs:decimal lexical form: '{}'", normalized),
-            });
-        }
-        normalized
-            .parse::<Decimal>()
-            .map(XmlValue::decimal)
-            .map_err(|e| ValidationError::InvalidLexical {
-                value: value.to_string(),
-                type_name: "decimal",
-                message: e.to_string(),
-            })
+        decimal_value(value, &normalized)
     }
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
-        let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        let result = decimal_value(value, &normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -926,11 +943,8 @@ impl TypeValidator for IntegerValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -1115,7 +1129,7 @@ pub fn is_valid_xsd_float_lexical(s: &str) -> bool {
 }
 
 /// Parse XSD float with special value handling
-fn parse_float(s: &str) -> Result<f32, String> {
+pub(crate) fn parse_float(s: &str) -> Result<f32, String> {
     if !is_valid_xsd_float_lexical(s) {
         return Err(format!("Invalid xs:float lexical form: '{}'", s));
     }
@@ -1130,7 +1144,7 @@ fn parse_float(s: &str) -> Result<f32, String> {
 }
 
 /// Parse XSD double with special value handling
-fn parse_double(s: &str) -> Result<f64, String> {
+pub(crate) fn parse_double(s: &str) -> Result<f64, String> {
     if !is_valid_xsd_float_lexical(s) {
         return Err(format!("Invalid xs:double lexical form: '{}'", s));
     }
@@ -3043,11 +3057,8 @@ impl TypeValidator for LongValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3102,11 +3113,8 @@ impl TypeValidator for IntValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3161,11 +3169,8 @@ impl TypeValidator for ShortValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3220,11 +3225,8 @@ impl TypeValidator for ByteValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3283,11 +3285,8 @@ impl TypeValidator for NonNegativeIntegerValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3346,11 +3345,8 @@ impl TypeValidator for PositiveIntegerValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3409,11 +3405,8 @@ impl TypeValidator for NonPositiveIntegerValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3472,11 +3465,8 @@ impl TypeValidator for NegativeIntegerValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3531,11 +3521,8 @@ impl TypeValidator for UnsignedLongValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3590,11 +3577,8 @@ impl TypeValidator for UnsignedIntValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3649,11 +3633,8 @@ impl TypeValidator for UnsignedShortValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 
@@ -3708,11 +3689,8 @@ impl TypeValidator for UnsignedByteValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
-        if let Some(d) = result.as_decimal() {
-            facets.validate_decimal(&d)?;
-        }
         let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
+        facets.validate_decimal_family(&result, &normalized)?;
         Ok(result)
     }
 

@@ -293,6 +293,11 @@ fn cast_to_boolean(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => !d.is_zero(),
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => *f != 0.0 && !f.is_nan(),
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => *d != 0.0 && !d.is_nan(),
+        // An xs:decimal carried in lexical form (beyond `rust_decimal`).
+        _ if crate::types::exact_decimal::lexical_decimal(value).is_some() => {
+            crate::types::exact_decimal::ExactDecimal::from_value(value)
+                .is_some_and(|d| !d.is_zero())
+        }
         _ => {
             let s = string_val.trim();
             match s {
@@ -311,10 +316,13 @@ fn cast_to_boolean(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
 fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPathError> {
     let result = match &value.value {
         XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => *d,
+        // F&O §17.1.1: "In casting to numerics, if the value is too large or
+        // too small to be accurately represented by the implementation, it is
+        // handled as an overflow or underflow as defined in 6.2" — FOAR0002.
         XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => i
             .to_string()
             .parse::<Decimal>()
-            .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
+            .map_err(|_| XPathError::FOAR0002)?,
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
                 return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
@@ -322,8 +330,10 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             if *f == 0.0 {
                 Decimal::ZERO
             } else {
-                Decimal::try_from(*f)
-                    .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?
+                crate::types::exact_decimal::unsigned_zero(
+                    Decimal::try_from(*f)
+                        .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
+                )
             }
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
@@ -333,8 +343,10 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             if *d == 0.0 {
                 Decimal::ZERO
             } else {
-                Decimal::try_from(*d)
-                    .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?
+                crate::types::exact_decimal::unsigned_zero(
+                    Decimal::try_from(*d)
+                        .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?,
+                )
             }
         }
         XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
@@ -344,19 +356,48 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
                 Decimal::ZERO
             }
         }
-        _ => {
-            // F&O casting to xs:decimal uses the XSD lexical mapping, which is
-            // narrower than what `rust_decimal`'s parser accepts (no exponent).
-            let trimmed = string_val.trim();
-            if !crate::types::validators::is_valid_xsd_decimal_lexical(trimmed) {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
-            }
-            trimmed
-                .parse::<Decimal>()
-                .map_err(|_| XPathError::invalid_cast_value(string_val, "xs:decimal"))?
-        }
+        _ => decimal_from_lexical(string_val)?,
     };
     Ok(XmlValue::decimal(result))
+}
+
+/// The `xs:decimal` a string or `xs:untypedAtomic` value casts to, and the
+/// value of an XPath decimal literal (XPath 2.0 §3.1.1 casts those the same
+/// way).
+///
+/// F&O §17.1.1 maps the string with the XSD lexical mapping — narrower than
+/// what `rust_decimal`'s parser accepts (no exponent, no `_`), so outside it
+/// the cast fails with FORG0001. Then: "In casting to numerics, if the value
+/// is too large or too small to be accurately represented by the
+/// implementation, it is handled as an overflow or underflow as defined in
+/// 6.2", where "For xs:decimal operations, overflow behavior ·must· raise an
+/// error \[err:FOAR0002\]. On underflow, 0.0 must be returned." So a
+/// magnitude beyond `rust_decimal`'s 96-bit mantissa raises FOAR0002, and a
+/// non-zero magnitude below 10^−28 — the smallest positive value held — is 0
+/// (never a negative zero). Otherwise "if the value is not too large or too
+/// small but nevertheless cannot be represented accurately with the number of
+/// decimal digits available to the implementation, the implementation may
+/// round to the nearest representable value or may raise a dynamic error
+/// \[err:FOCA0006\]" — this crate raises FOCA0006 (more than 28 fraction
+/// digits, or a mantissa beyond 96 bits, at a magnitude of 10^−28 or more)
+/// rather than round.
+pub(crate) fn decimal_from_lexical(text: &str) -> Result<Decimal, XPathError> {
+    use crate::types::exact_decimal::{parse_decimal_exact, DecimalParseError, ExactDecimal};
+    let trimmed = text.trim();
+    if !crate::types::validators::is_valid_xsd_decimal_lexical(trimmed) {
+        return Err(XPathError::invalid_cast_value(text, "xs:decimal"));
+    }
+    match parse_decimal_exact(trimmed) {
+        Ok(d) => Ok(d),
+        Err(DecimalParseError::TooLarge) => Err(XPathError::FOAR0002),
+        Err(DecimalParseError::TooPrecise)
+            if ExactDecimal::parse(trimmed).is_some_and(|d| d.is_below_smallest_decimal()) =>
+        {
+            Ok(Decimal::ZERO)
+        }
+        Err(DecimalParseError::TooPrecise) => Err(XPathError::decimal_too_precise(trimmed)),
+        Err(DecimalParseError::Invalid) => Err(XPathError::invalid_cast_value(text, "xs:decimal")),
+    }
 }
 
 /// Cast a value to integer.
@@ -393,6 +434,13 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             })?
         }
         XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => BigInt::from(if *b { 1 } else { 0 }),
+        // An xs:decimal carried in lexical form: F&O §17.1.3.4, "SV with the
+        // fractional part discarded", exactly.
+        _ if crate::types::exact_decimal::lexical_decimal(value).is_some() => {
+            crate::types::exact_decimal::ExactDecimal::from_value(value)
+                .map(|d| d.trunc_to_bigint())
+                .ok_or_else(|| XPathError::invalid_cast_value(string_val, "xs:integer"))?
+        }
         _ => string_val
             .trim()
             .parse::<BigInt>()

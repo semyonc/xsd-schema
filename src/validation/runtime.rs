@@ -3535,6 +3535,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         self.schema_set,
                     ) {
                         Ok(result) => {
+                            self.note_decimal_capacity(
+                                &result.typed_value,
+                                result.normalized_value.as_deref(),
+                            );
                             ev_state.member_type = result.member_type;
                             ev_state.typed_value = Some(result.typed_value);
                             ev_state.normalized_value = result.normalized_value;
@@ -4605,6 +4609,44 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.emit_error(err);
     }
 
+    /// Report an `xs:decimal` value that was validated exactly but is beyond
+    /// what `rust_decimal::Decimal` holds, so its typed value is its canonical
+    /// string. Datatypes 1.1 §5.4: such a value "must not be treated as invalid,
+    /// and the unsupported value must not be quietly changed to a supported
+    /// value", and the processor "must indicate to the user and/or downstream
+    /// application that it cannot process the input data with assured
+    /// correctness" — a warning, not a validity error.
+    ///
+    /// Reported only while [`ValidationFlags::REPORT_WARNINGS`] is set (the
+    /// default); the typed value's shape (an `xs:decimal` type code with a
+    /// string payload) tells a downstream consumer the same thing either way.
+    fn note_decimal_capacity(&mut self, typed_value: &XmlValue, normalized: Option<&str>) {
+        if !self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
+            return;
+        }
+        let Some(lexical) =
+            super::simple::capacity_decimal(typed_value, normalized, self.schema_set)
+        else {
+            return;
+        };
+        let at = if self.element_path.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", self.element_path)
+        };
+        let message = format!(
+            "xs:decimal value '{lexical}'{at} is valid but exceeds the decimal capacity of \
+             this implementation (a 96-bit mantissa with at most 28 fraction digits); \
+             facets were checked on the exact value, and the typed value is carried as \
+             its canonical string, so arithmetic on it raises FOAR0002"
+        );
+        self.sink.on_warning(ValidationWarning {
+            code: crate::types::exact_decimal::DECIMAL_CAPACITY_WARNING,
+            message,
+            location: self.current_location.clone(),
+        });
+    }
+
     /// Mark the current element as invalid.
     fn mark_current_invalid(&mut self) {
         if let Some(s) = self.validation_stack.last_mut() {
@@ -5598,6 +5640,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if !used_fast_path {
                 match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                     Ok(result) => {
+                        self.note_decimal_capacity(
+                            &result.typed_value,
+                            result.normalized_value.as_deref(),
+                        );
                         member_type = result.member_type;
                         typed_value = Some(result.typed_value);
                         normalized_value = result.normalized_value;
@@ -6248,6 +6294,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
+                            self.note_decimal_capacity(
+                                &result.typed_value,
+                                result.normalized_value.as_deref(),
+                            );
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
@@ -6357,6 +6407,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
+                            self.note_decimal_capacity(
+                                &result.typed_value,
+                                result.normalized_value.as_deref(),
+                            );
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;

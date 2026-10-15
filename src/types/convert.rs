@@ -16,6 +16,7 @@
 use num_bigint::BigInt;
 use rust_decimal::Decimal;
 
+use super::exact_decimal::{parse_decimal_exact, unsigned_zero, DecimalParseError, ExactDecimal};
 #[cfg(feature = "xsd11")]
 use super::sequence::{ItemType, SequenceType};
 use super::validators::{is_valid_xsd_decimal_lexical, ValidationError, ValidatorRegistry};
@@ -144,6 +145,11 @@ impl TypeConverter {
 
     /// Convert value to boolean (effective boolean value)
     pub fn to_boolean(&self, value: &XmlValue) -> ConversionResult<bool> {
+        // An xs:decimal carried in lexical form (beyond `rust_decimal`) is a
+        // number, not a string: true when it is not zero.
+        if let Some(exact) = lexical_decimal_value(value) {
+            return Ok(!exact.is_zero());
+        }
         match &value.value {
             XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => Ok(*b),
             XmlValueKind::Atomic(XmlAtomicValue::String(s)) => Ok(!s.is_empty()),
@@ -161,6 +167,11 @@ impl TypeConverter {
 
     /// Convert value to double (numeric promotion)
     pub fn to_double(&self, value: &XmlValue) -> ConversionResult<f64> {
+        // An xs:decimal carried in lexical form: the nearest double, as
+        // casting xs:decimal to xs:double gives it (F&O §17.1.3.2).
+        if let Some(exact) = lexical_decimal_value(value) {
+            return Ok(exact.to_f64());
+        }
         match &value.value {
             XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => Ok(*d),
             XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => Ok(*f as f64),
@@ -196,7 +207,33 @@ impl TypeConverter {
     }
 
     /// Convert value to decimal
+    ///
+    /// Never rounds a value it can hold. An `xs:untypedAtomic` is cast as
+    /// F&O §17.1.1 casts a string to `xs:decimal` — "if the value is too large
+    /// or too small to be accurately represented by the implementation, it is
+    /// handled as an overflow or underflow as defined in 6.2", where "overflow
+    /// behavior ·must· raise an error \[err:FOAR0002\]. On underflow, 0.0 must
+    /// be returned": a magnitude above `Decimal::MAX`
+    /// (79228162514264337593543950335) is [`ConversionError::Overflow`], and a
+    /// non-zero magnitude below 10^−28, the smallest positive value held,
+    /// returns 0. Any other value that is not `m / 10^s` with
+    /// `|m| ≤ 2^96 − 1` and `s ≤ 28` (more digits than are held) is
+    /// [`ConversionError::Overflow`] too, rather than a rounded value (F&O
+    /// allows rounding or `FOCA0006` there; `ConversionError` has no variant of
+    /// its own for it). An `xs:decimal` already carried in lexical form and an
+    /// `xs:integer` beyond `Decimal`'s range are [`ConversionError::Overflow`]
+    /// as well. A float or double converts to the nearest `Decimal` (0 below
+    /// 10^−28); zero is never negative.
     pub fn to_decimal(&self, value: &XmlValue) -> ConversionResult<Decimal> {
+        if let Some(exact) = lexical_decimal_value(value) {
+            // A string payload that spells a value `Decimal` holds is that
+            // value (the validator never stores one; only a typing mistake
+            // could); one beyond capacity is `Overflow`.
+            return exact.to_decimal().map_err(|_| ConversionError::Overflow {
+                value: value.to_string_value(),
+                target_type: "decimal",
+            });
+        }
         match &value.value {
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => Ok(*d),
             XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => {
@@ -215,10 +252,12 @@ impl TypeConverter {
                         message: "Cannot convert NaN or Infinity to decimal".to_string(),
                     });
                 }
-                Decimal::try_from(*f).map_err(|_| ConversionError::Overflow {
-                    value: f.to_string(),
-                    target_type: "decimal",
-                })
+                Decimal::try_from(*f)
+                    .map(unsigned_zero)
+                    .map_err(|_| ConversionError::Overflow {
+                        value: f.to_string(),
+                        target_type: "decimal",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
                 if d.is_nan() || d.is_infinite() {
@@ -228,10 +267,12 @@ impl TypeConverter {
                         message: "Cannot convert NaN or Infinity to decimal".to_string(),
                     });
                 }
-                Decimal::try_from(*d).map_err(|_| ConversionError::Overflow {
-                    value: d.to_string(),
-                    target_type: "decimal",
-                })
+                Decimal::try_from(*d)
+                    .map(unsigned_zero)
+                    .map_err(|_| ConversionError::Overflow {
+                        value: d.to_string(),
+                        target_type: "decimal",
+                    })
             }
             XmlValueKind::Atomic(XmlAtomicValue::Boolean(b)) => {
                 Ok(if *b { Decimal::ONE } else { Decimal::ZERO })
@@ -251,11 +292,28 @@ impl TypeConverter {
                         message: "Not a valid decimal".to_string(),
                     });
                 }
-                trimmed.parse().map_err(|_| ConversionError::InvalidValue {
-                    value: s.clone(),
-                    target_type: "decimal",
-                    message: "Not a valid decimal".to_string(),
-                })
+                // Exact, 0 on underflow, or an error — `rust_decimal`'s
+                // parser would round a form with more than 28 fraction digits.
+                match parse_decimal_exact(trimmed) {
+                    Ok(d) => Ok(d),
+                    Err(DecimalParseError::Invalid) => Err(ConversionError::InvalidValue {
+                        value: s.clone(),
+                        target_type: "decimal",
+                        message: "Not a valid decimal".to_string(),
+                    }),
+                    Err(DecimalParseError::TooPrecise)
+                        if ExactDecimal::parse(trimmed)
+                            .is_some_and(|d| d.is_below_smallest_decimal()) =>
+                    {
+                        Ok(Decimal::ZERO)
+                    }
+                    Err(DecimalParseError::TooLarge | DecimalParseError::TooPrecise) => {
+                        Err(ConversionError::Overflow {
+                            value: s.clone(),
+                            target_type: "decimal",
+                        })
+                    }
+                }
             }
             _ => Err(ConversionError::TypeMismatch {
                 from: value.type_code,
@@ -266,6 +324,10 @@ impl TypeConverter {
 
     /// Convert value to integer
     pub fn to_integer(&self, value: &XmlValue) -> ConversionResult<BigInt> {
+        // An xs:decimal carried in lexical form: truncated, exactly.
+        if let Some(exact) = lexical_decimal_value(value) {
+            return Ok(exact.trunc_to_bigint());
+        }
         match &value.value {
             XmlValueKind::Atomic(XmlAtomicValue::Integer(i)) => Ok(i.clone()),
             XmlValueKind::Atomic(XmlAtomicValue::Decimal(d)) => {
@@ -443,6 +505,12 @@ impl Default for TypeConverter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The exact value of an `xs:decimal` carried in lexical form (see
+/// [`XmlAtomicValue::Decimal`]); `None` for every other value.
+fn lexical_decimal_value(value: &XmlValue) -> Option<ExactDecimal> {
+    super::exact_decimal::lexical_decimal(value).and_then(ExactDecimal::parse)
 }
 
 /// Check if casting from one type to another is allowed
@@ -692,6 +760,122 @@ impl IntoXmlValue for &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `xs:decimal` beyond `rust_decimal`'s capacity: never rounded,
+    /// converted exactly where the result is defined.
+    #[test]
+    fn test_conversions_of_decimals_beyond_capacity() {
+        let converter = TypeConverter::new();
+        let huge = "10000000000000000000000000000000000000000";
+        let big = crate::types::exact_decimal::decimal_typed_value(huge);
+        assert_eq!(big.as_decimal(), None);
+        assert!(converter.to_boolean(&big).unwrap());
+        assert_eq!(converter.to_double(&big).unwrap(), 1e40);
+        assert_eq!(
+            converter.to_integer(&big).unwrap(),
+            huge.parse::<BigInt>().unwrap()
+        );
+        assert!(matches!(
+            converter.to_decimal(&big),
+            Err(ConversionError::Overflow { .. })
+        ));
+        assert_eq!(converter.to_string(&big), huge);
+        let precise =
+            crate::types::exact_decimal::decimal_typed_value("-1.00000000000000000000000000009");
+        assert_eq!(converter.to_integer(&precise).unwrap(), BigInt::from(-1));
+        // untypedAtomic → xs:decimal: exact or an error, never rounded.
+        for text in ["0.12345678901234567890123456789", huge] {
+            assert!(
+                matches!(
+                    converter.to_decimal(&XmlValue::untyped(text)),
+                    Err(ConversionError::Overflow { .. })
+                ),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            converter
+                .to_decimal(&XmlValue::untyped("1.000000000000000000000000000000000"))
+                .unwrap(),
+            Decimal::ONE
+        );
+        // The validator-backed cast keeps the value, in lexical form.
+        let cast = converter
+            .cast(&XmlValue::untyped(huge), XmlTypeCode::Decimal)
+            .unwrap();
+        assert_eq!(cast.type_code, XmlTypeCode::Decimal);
+        assert_eq!(cast.to_string_value(), huge);
+    }
+
+    /// F&O §17.1.1 / §6.2 for `to_decimal` of an `xs:untypedAtomic`: a
+    /// non-zero magnitude below 10^-28 underflows to 0; one too large, or in
+    /// range with more digits than are held, is still `Overflow`.
+    #[test]
+    fn test_to_decimal_underflow_returns_zero() {
+        let converter = TypeConverter::new();
+        let z27 = "0".repeat(27);
+        let z28 = "0".repeat(28);
+        for tiny in [
+            format!("0.{z28}1"),
+            format!("-0.{z28}5"),
+            format!(" .{z28}99999 "),
+            format!("0.{z28}100000"),
+        ] {
+            let untyped = XmlValue::untyped(tiny.as_str());
+            let d = converter.to_decimal(&untyped).unwrap();
+            assert!(d.is_zero() && !d.is_sign_negative(), "{tiny}: {d}");
+            let promoted = converter
+                .promote_to(&untyped, XmlTypeCode::Decimal)
+                .unwrap();
+            assert_eq!(promoted.to_string_value(), "0", "{tiny}");
+        }
+        // 10^-28 itself is held.
+        assert_eq!(
+            converter
+                .to_decimal(&XmlValue::untyped(format!("-0.{z27}1").as_str()))
+                .unwrap(),
+            Decimal::new(-1, 28)
+        );
+        for not_underflow in [
+            format!("0.{z27}15"),
+            "0.12345678901234567890123456789".to_string(),
+            "79228162514264337593543950336".to_string(),
+        ] {
+            assert!(
+                matches!(
+                    converter.to_decimal(&XmlValue::untyped(not_underflow.as_str())),
+                    Err(ConversionError::Overflow { .. })
+                ),
+                "{not_underflow}"
+            );
+        }
+        // A decimal already held in lexical form is not a cast from a string.
+        let held = crate::types::exact_decimal::decimal_typed_value(&format!("0.{z28}1"));
+        assert!(matches!(
+            converter.to_decimal(&held),
+            Err(ConversionError::Overflow { .. })
+        ));
+        // `cast` validates the string, as schema validation does: the exact
+        // value, carried as its canonical string.
+        let cast = converter
+            .cast(
+                &XmlValue::untyped(format!("0.{z28}10").as_str()),
+                XmlTypeCode::Decimal,
+            )
+            .unwrap();
+        assert_eq!(cast.to_string_value(), format!("0.{z28}1"));
+        // A float or double: the nearest decimal, never a negative zero.
+        for value in [
+            XmlValue::double(-1.0e-40),
+            XmlValue::double(-0.0),
+            XmlValue::float(-1.0e-40),
+        ] {
+            let d = converter.to_decimal(&value).unwrap();
+            assert!(d.is_zero() && !d.is_sign_negative(), "{value:?}");
+            let cast = converter.cast(&value, XmlTypeCode::Decimal).unwrap();
+            assert_eq!(cast.to_string_value(), "0", "{value:?}");
+        }
+    }
 
     #[test]
     fn test_to_boolean() {

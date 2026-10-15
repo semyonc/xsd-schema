@@ -8,9 +8,10 @@
 //! - fn:round-half-to-even
 
 use num_bigint::BigInt;
-use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
+use crate::types::exact_decimal::unsigned_zero;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
@@ -92,11 +93,9 @@ fn numeric_abs(value: &XmlValue) -> Result<XmlValue, XPathError> {
             Ok(XmlValue::float(f.abs()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
-                expected: "xs:decimal".to_string(),
-                found: format!("{:?}", value.type_code),
-            })?;
-            Ok(XmlValue::decimal(d.abs()))
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let d = crate::xpath::operators::decimal_operand(value)?;
+            Ok(XmlValue::decimal(unsigned_zero(d.abs())))
         }
         _ if is_integer_type(value.type_code) => {
             let i = value.as_integer().ok_or_else(|| XPathError::XPTY0004 {
@@ -167,10 +166,8 @@ fn numeric_ceiling(value: &XmlValue) -> Result<XmlValue, XPathError> {
             Ok(XmlValue::float(f.ceil()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
-                expected: "xs:decimal".to_string(),
-                found: format!("{:?}", value.type_code),
-            })?;
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let d = crate::xpath::operators::decimal_operand(value)?;
             // Decimal doesn't have ceil(), use manual calculation
             let truncated = d.trunc();
             let result = if d > truncated {
@@ -178,7 +175,8 @@ fn numeric_ceiling(value: &XmlValue) -> Result<XmlValue, XPathError> {
             } else {
                 truncated
             };
-            Ok(XmlValue::decimal(result))
+            // `(-0.5).trunc()` is a negative zero: ceiling(-0.5) is 0.
+            Ok(XmlValue::decimal(unsigned_zero(result)))
         }
         _ if is_integer_type(value.type_code) => {
             // For integers, ceiling is identity
@@ -240,10 +238,8 @@ fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
             Ok(XmlValue::float(f.floor()))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
-                expected: "xs:decimal".to_string(),
-                found: format!("{:?}", value.type_code),
-            })?;
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let d = crate::xpath::operators::decimal_operand(value)?;
             // Decimal doesn't have floor(), use manual calculation
             let truncated = d.trunc();
             let result = if d < truncated {
@@ -251,7 +247,7 @@ fn numeric_floor(value: &XmlValue) -> Result<XmlValue, XPathError> {
             } else {
                 truncated
             };
-            Ok(XmlValue::decimal(result))
+            Ok(XmlValue::decimal(unsigned_zero(result)))
         }
         _ if is_integer_type(value.type_code) => {
             // For integers, floor is identity
@@ -321,13 +317,11 @@ fn numeric_round(value: &XmlValue) -> Result<XmlValue, XPathError> {
             Ok(XmlValue::float(round_half_toward_positive_infinity_f32(f)))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
-                expected: "xs:decimal".to_string(),
-                found: format!("{:?}", value.type_code),
-            })?;
-            Ok(XmlValue::decimal(
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let d = crate::xpath::operators::decimal_operand(value)?;
+            Ok(XmlValue::decimal(unsigned_zero(
                 round_half_toward_positive_infinity_decimal(d),
-            ))
+            )))
         }
         _ if is_integer_type(value.type_code) => {
             // For integers, round is identity
@@ -483,11 +477,11 @@ fn numeric_round_half_to_even(value: &XmlValue, precision: i32) -> Result<XmlVal
             Ok(XmlValue::float(round_half_to_even_f32(f, precision)))
         }
         XmlTypeCode::Decimal => {
-            let d = value.as_decimal().ok_or_else(|| XPathError::XPTY0004 {
-                expected: "xs:decimal".to_string(),
-                found: format!("{:?}", value.type_code),
-            })?;
-            Ok(XmlValue::decimal(round_half_to_even_decimal(d, precision)?))
+            // FOAR0002 for an xs:decimal beyond `rust_decimal`'s capacity.
+            let d = crate::xpath::operators::decimal_operand(value)?;
+            Ok(XmlValue::decimal(unsigned_zero(
+                round_half_to_even_decimal(d, precision)?,
+            )))
         }
         _ if is_integer_type(value.type_code) => {
             // For integers with non-negative precision, return as-is
@@ -622,18 +616,33 @@ fn round_half_to_even_f32(f: f32, precision: i32) -> f32 {
 }
 
 /// Round half to even for Decimal with given precision.
+///
+/// F&O §6.4.5: the result is the value "rounded to a given precision", "if
+/// two such values are equally near (e.g. if the fractional part in $arg is
+/// exactly .500...), the function returns the one whose least significant
+/// digit is even". For a negative precision `-k` that is the nearest multiple
+/// of 10^k, an exact midpoint going to the even multiple. It is computed
+/// exactly, in integers on the mantissa (`d` is `m / 10^s`: a multiple of
+/// 10^k is one of 10^(k+s) in units of 10^-s), so a value just above a
+/// midpoint is never taken for the midpoint (dividing by 10^k in `Decimal`
+/// would round its last digits away). A result `Decimal` cannot hold — a
+/// non-zero multiple of 10^29, say — is the overflow FOAR0002 (F&O §6.2);
+/// a result of 0 is always held.
 fn round_half_to_even_decimal(d: Decimal, precision: i32) -> Result<Decimal, XPathError> {
     if precision < 0 {
-        // For negative precision, we need to round to powers of 10
-        let abs_precision = (-precision) as u32;
-        let scale = Decimal::from_i64(10_i64.pow(abs_precision))
-            .ok_or_else(|| XPathError::internal("Failed to create decimal scale"))?;
-
-        // Divide, round, multiply
-        let scaled = d / scale;
-        let rounded =
-            scaled.round_dp_with_strategy(0, rust_decimal::RoundingStrategy::MidpointNearestEven);
-        Ok(rounded * scale)
+        let k = precision.unsigned_abs();
+        // Every `Decimal` is below 7.93 × 10^28 < 5 × 10^29 in magnitude, so
+        // for k ≥ 30 the nearest multiple of 10^k is 0.
+        if k >= 30 {
+            return Ok(Decimal::ZERO);
+        }
+        let scale = d.scale();
+        let mantissa = BigInt::from(d.mantissa());
+        let rounded = round_half_to_even_integer(&mantissa, -((k + scale) as i32));
+        // `rounded` is a multiple of 10^(k+s), so this division is exact.
+        let units = rounded / BigInt::from(10).pow(scale);
+        crate::types::exact_decimal::parse_decimal_exact(&units.to_string())
+            .map_err(|_| XPathError::FOAR0002)
     } else {
         Ok(d.round_dp_with_strategy(
             precision as u32,
@@ -648,8 +657,14 @@ fn round_half_to_even_integer(i: &BigInt, precision: i32) -> BigInt {
         return i.clone();
     }
 
-    // For negative precision, round to powers of 10
-    let abs_precision = (-precision) as u32;
+    // For negative precision, round to powers of 10. A value of `n` digits is
+    // below 10^n ≤ 10^(k−1) < half of 10^k when k > n, so it rounds to 0 —
+    // without building 10^k for a precision such as -1000000000.
+    let abs_precision = precision.unsigned_abs();
+    let digits = i.magnitude().to_string().len();
+    if abs_precision as usize > digits {
+        return BigInt::from(0);
+    }
     let scale = BigInt::from(10).pow(abs_precision);
     let half_scale = &scale / 2;
 

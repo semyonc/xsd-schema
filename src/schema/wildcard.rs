@@ -15,7 +15,8 @@ pub enum NamespaceConstraint {
     #[default]
     Any,
 
-    /// Other namespaces allowed (##other) - excludes target namespace
+    /// Other namespaces allowed (##other) - excludes the target namespace
+    /// and absent (no namespace)
     Other,
 
     /// Specific set of namespaces

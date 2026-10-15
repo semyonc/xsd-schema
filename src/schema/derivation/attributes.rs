@@ -194,8 +194,8 @@ fn collect_inherited_attribute_uses(
 // constraint (`CanonicalNs`) in which all `WildcardNamespace` variants have
 // been normalized to either `Any`, an explicit positive set, or a
 // complement set, with `not_namespace` exclusions already folded in and
-// `##other` resolved against XSD version. Intersection then reduces to
-// pure set theory on `HashSet<Option<NameId>>`.
+// `##other` resolved to not({target namespace, absent}). Intersection then
+// reduces to pure set theory on `HashSet<Option<NameId>>`.
 //
 // Intentionally private to this module — the canonical form never leaks
 // into the arena model.
@@ -204,8 +204,8 @@ fn collect_inherited_attribute_uses(
 ///
 /// All `WildcardNamespace` variants normalize to one of these three cases,
 /// with `not_namespace` exclusions already folded in and `##other`
-/// resolved via XSD-version-aware rules (XSD 1.0 excludes absent namespace,
-/// XSD 1.1 does not).
+/// resolved to `Not({target namespace, absent})` (§3.10.2.2; XSD 1.0 and
+/// 1.1 alike).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CanonicalNs {
     /// Every namespace is allowed.
@@ -234,7 +234,6 @@ pub(crate) struct EffectiveAttributeWildcard {
 /// `##other`, `##targetNamespace`, `##local`, list tokens, and folding in
 /// `not_namespace` exclusions against `target_ns`.
 pub(super) fn normalize_attribute_wildcard(
-    schema_set: &SchemaSet,
     wc: &WildcardResult,
     target_ns: Option<NameId>,
 ) -> EffectiveAttributeWildcard {
@@ -244,20 +243,15 @@ pub(super) fn normalize_attribute_wildcard(
     let base: CanonicalNs = match &wc.namespace {
         WildcardNamespace::Any => CanonicalNs::Any,
         WildcardNamespace::Other => {
-            // Version-aware ##other exclusion set (§3.10.1):
-            //   XSD 1.0: excludes {target_ns, absent}
-            //   XSD 1.1: excludes {target_ns} only
-            //
-            // When the schema has no target namespace, the "target
-            // namespace" IS the absent namespace (None), so
-            // `target_ns` is inserted unconditionally to capture that
-            // case. For XSD 1.0 with a non-absent target, we additionally
-            // insert None (HashSet dedupes if target is already None).
+            // §3.10.2.2: `##other` is {variety} not with {namespaces} "a
+            // set consisting of ·absent· and, if the targetNamespace
+            // [attribute] of the <schema> ancestor element information
+            // item is present, its ·actual value·" — in XSD 1.0 and 1.1
+            // alike, for `<anyAttribute>` as for `<any>`. With no target
+            // namespace the set is {absent} (the HashSet dedupes).
             let mut excl = HashSet::new();
             excl.insert(target_ns);
-            if schema_set.is_xsd10() {
-                excl.insert(None);
-            }
+            excl.insert(None);
             CanonicalNs::Not(excl)
         }
         WildcardNamespace::TargetNamespace => {
@@ -583,7 +577,7 @@ pub(crate) fn effective_attribute_wildcard(
     local_target_ns: Option<NameId>,
     attribute_groups: &[AttributeGroupKey],
 ) -> SchemaResult<Option<EffectiveAttributeWildcard>> {
-    let local = local_wc.map(|w| normalize_attribute_wildcard(schema_set, w, local_target_ns));
+    let local = local_wc.map(|w| normalize_attribute_wildcard(w, local_target_ns));
 
     let mut w: Vec<EffectiveAttributeWildcard> = Vec::new();
     for &ag_key in attribute_groups {
@@ -817,7 +811,7 @@ fn effective_attribute_wildcard_for_group(
     let local = ag
         .attribute_wildcard
         .as_ref()
-        .map(|w| normalize_attribute_wildcard(schema_set, w, ag.target_namespace));
+        .map(|w| normalize_attribute_wildcard(w, ag.target_namespace));
 
     let mut w: Vec<EffectiveAttributeWildcard> = Vec::new();
     for &nested_key in &ag.resolved_attribute_groups {

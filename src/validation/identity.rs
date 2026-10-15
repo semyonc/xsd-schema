@@ -15,7 +15,7 @@ use crate::parser::frames::{IdentityKind, QNameRef};
 use crate::parser::location::SourceLocation;
 use crate::schema::model::XsdVersion;
 use crate::types::value::XmlValue;
-use crate::types::PrimitiveTypeCode;
+use crate::types::{PrimitiveTypeCode, XmlTypeCode};
 
 use super::active_axis::ActiveAxis;
 use super::asttree::{Asttree, IdentityXPathError};
@@ -62,9 +62,27 @@ fn xml_value_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
     // Singleton-list ↔ atomic equality (XSD §3.11.4)
     match (extract_single_atomic(a), extract_single_atomic(b)) {
         (Some(va), Some(vb)) => {
-            va == vb || xml_atomic_datetime_eq(va, vb) || xml_atomic_nan_eq(va, vb)
+            va == vb
+                || xml_atomic_datetime_eq(va, vb)
+                || xml_atomic_nan_eq(va, vb)
+                || xml_atomic_decimal_eq(a.type_code, va, b.type_code, vb)
         }
         _ => false,
+    }
+}
+
+/// IC equality for two values of the `xs:decimal` primitive: by value,
+/// exactly. Same-variant pairs take the allocation-free comparison; anything
+/// else — a `Decimal` against an `Integer`, a decimal carried in lexical form
+/// because it is beyond `rust_decimal`'s capacity, an `xs:integer` beyond it,
+/// a singleton list — goes through [`xml_value_ic_eq`], whose atomic path
+/// compares decimal-family atoms by exact value.
+fn decimal_family_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
+    use crate::types::value::{XmlAtomicValue as V, XmlValueKind as K};
+    match (&a.value, &b.value) {
+        (K::Atomic(V::Decimal(x)), K::Atomic(V::Decimal(y))) => x == y,
+        (K::Atomic(V::Integer(x)), K::Atomic(V::Integer(y))) => x == y,
+        _ => xml_value_ic_eq(a, b),
     }
 }
 
@@ -79,6 +97,25 @@ fn xml_atomic_nan_eq(
     match (a, b) {
         (V::Double(x), V::Double(y)) => x.is_nan() && y.is_nan(),
         (V::Float(x), V::Float(y)) => x.is_nan() && y.is_nan(),
+        _ => false,
+    }
+}
+
+/// Exact value equality of two decimal-family atoms, each typed by its
+/// value's type code (a list member by its list's item type), so that a
+/// member carried in lexical form compares by value too.
+fn xml_atomic_decimal_eq(
+    a_type: XmlTypeCode,
+    a: &crate::types::value::XmlAtomicValue,
+    b_type: XmlTypeCode,
+    b: &crate::types::value::XmlAtomicValue,
+) -> bool {
+    use crate::types::exact_decimal::ExactDecimal;
+    match (
+        ExactDecimal::from_atomic(a_type, a),
+        ExactDecimal::from_atomic(b_type, b),
+    ) {
+        (Some(x), Some(y)) => x == y,
         _ => false,
     }
 }
@@ -268,10 +305,7 @@ impl PartialEq for KeyFieldValue {
                         // different storage variants (Decimal vs Integer) must be
                         // compared numerically, not structurally.
                         if pa == PrimitiveTypeCode::Decimal {
-                            match (a.as_decimal(), b.as_decimal()) {
-                                (Some(da), Some(db)) => da == db,
-                                _ => xml_value_ic_eq(a, b),
-                            }
+                            decimal_family_ic_eq(a, b)
                         } else {
                             xml_value_ic_eq(a, b)
                         }

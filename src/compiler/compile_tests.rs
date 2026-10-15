@@ -770,7 +770,7 @@ fn test_wildcard_ref_from_result_resolves_target_namespace_in_list() {
     let target_ns = schema_set.name_table.add("http://target.example.com");
     let other_ns = schema_set.name_table.add("http://other.example.com");
 
-    use NamespaceToken;
+    use crate::parser::frames::NamespaceToken;
 
     let wildcard = WildcardResult {
         namespace: WildcardNamespace::List(vec![
@@ -807,7 +807,7 @@ fn test_wildcard_ref_from_result_resolves_target_namespace_in_not_namespace() {
     let schema_set = SchemaSet::with_version(XsdVersion::V1_1);
     let target_ns = schema_set.name_table.add("http://target.example.com");
 
-    use NamespaceToken;
+    use crate::parser::frames::NamespaceToken;
 
     let wildcard = WildcardResult {
         namespace: WildcardNamespace::Any,
@@ -903,7 +903,7 @@ fn test_open_content_from_result_e2e_with_not_namespace() {
     doc.target_namespace = Some(target_ns);
     schema_set.documents.push(doc);
 
-    use NamespaceToken;
+    use crate::parser::frames::NamespaceToken;
 
     let oc_result = OpenContentResult {
         mode: OpenContentMode::Interleave,
