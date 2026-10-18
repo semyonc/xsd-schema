@@ -30,6 +30,11 @@ use crate::xpath::XPathMode;
 /// - Resolves variable references to slot indices
 /// - Validates namespace prefixes
 ///
+/// The results are stored on the nodes (`PathStepNode::resolved_test`,
+/// `TypeExprNode::resolved_atomic_type`, and a crate-private resolved item
+/// type on `instance of` / `treat as` nodes). They describe the tree as it was
+/// bound: after editing a bound node, bind it again.
+///
 /// # Arguments
 /// * `arena` - The AST arena containing all nodes
 /// * `id` - The ID of the node to bind
@@ -254,6 +259,26 @@ pub fn bind_node(
                 Some(ItemTypeNode::Kind(ref kind)) => check_kind_test_prefixes(kind, ctx)?,
                 Some(ItemTypeNode::Item) | None => {}
             }
+
+            // `instance of` / `treat as`: resolve the item type once, here,
+            // rather than for every item the expression tests.
+            if matches!(
+                type_expr.kind,
+                TypeExprKind::InstanceOf | TypeExprKind::TreatAs
+            ) {
+                if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
+                    node.resolved_item_type = match &node.target_type.item_type {
+                        Some(item_type) => {
+                            Some(crate::xpath::node_test::item_type_of_item_type_node(
+                                item_type,
+                                node.resolved_atomic_type.as_ref(),
+                                ctx,
+                            )?)
+                        }
+                        None => None,
+                    };
+                }
+            }
         }
     }
 
@@ -306,8 +331,9 @@ fn resolve_node_test_with_axis(
             // A kind test carries no *name test* to resolve — the QNames inside
             // `element(N, T)` and friends are expanded at evaluation time,
             // against the same default-element-namespace rule the step uses.
-            // Their prefixes are still statically known names, though, so they
-            // are checked here; see [`check_kind_test_prefixes`].
+            // Their prefixes are still statically known names, though, and the
+            // type and declaration names must be in the static context, so
+            // they are checked here; see [`check_kind_test_prefixes`].
             check_kind_test_prefixes(kind, ctx)?;
             Ok(None)
         }
@@ -327,6 +353,12 @@ fn resolve_node_test_with_axis(
 ///
 /// An *unprefixed* name is not checked: it expands through the default element
 /// namespace (or, for an attribute name, to no namespace), which never fails.
+///
+/// The names that must be in the static context are checked here as well
+/// (`XPST0008`): the `TypeName` of `element(N, T)` / `attribute(N, T)` must be
+/// in the in-scope schema types ([`check_type_name_in_scope`]), and the name of
+/// `schema-element(N)` / `schema-attribute(N)` in the in-scope declarations
+/// ([`check_schema_declaration_in_scope`]).
 fn check_kind_test_prefixes(
     kind: &crate::xpath::ast::KindTest,
     ctx: &XPathContext<'_>,
@@ -352,9 +384,57 @@ fn check_kind_test_prefixes(
             check_optional_qname_prefix(test.type_name.as_ref(), ctx)?;
             check_type_name_in_scope(test.type_name.as_ref(), ctx)
         }
-        KindTest::SchemaElement(name) | KindTest::SchemaAttribute(name) => {
-            check_lexical_qname_prefix(name, ctx)
+        KindTest::SchemaElement(name) => {
+            check_lexical_qname_prefix(name, ctx)?;
+            check_schema_declaration_in_scope(name, ctx, crate::xpath::DomNodeType::Element)
         }
+        KindTest::SchemaAttribute(name) => {
+            check_lexical_qname_prefix(name, ctx)?;
+            check_schema_declaration_in_scope(name, ctx, crate::xpath::DomNodeType::Attribute)
+        }
+    }
+}
+
+/// `XPST0008` unless the `ElementName` of a `schema-element(N)` (or the
+/// `AttributeName` of a `schema-attribute(N)`) names a declaration in the
+/// in-scope element (attribute) declarations.
+///
+/// XPath 2.0 §2.5.4.4: "If the ElementName specified in the SchemaElementTest
+/// is not found in the in-scope element declarations, a static error is raised
+/// \[err:XPST0008\]." §2.5.4.6 says the same of an `AttributeName` and the
+/// in-scope attribute declarations. Those are part of the static context
+/// (§2.1.1, "In-scope element declarations. Each element declaration is
+/// identified either by an expanded QName (for a top-level element
+/// declaration) or by an implementation-dependent element identifier (for a
+/// local element declaration)"): here the top-level declarations of the schema
+/// set attached to the static context. A context with no schema set has none,
+/// so every such test is `XPST0008` there.
+///
+/// The name expands as the matcher expands it (an unprefixed `ElementName` in
+/// the default element/type namespace, an unprefixed `AttributeName` in no
+/// namespace); its prefix has already been checked (XPST0081).
+fn check_schema_declaration_in_scope(
+    name: &str,
+    ctx: &XPathContext<'_>,
+    principal: crate::xpath::DomNodeType,
+) -> Result<(), XPathError> {
+    let declared = crate::xpath::node_test::resolve_schema_test_name(name, ctx, principal)
+        .zip(ctx.schema_set)
+        .is_some_and(|(qname, schema_set)| {
+            if principal == crate::xpath::DomNodeType::Attribute {
+                schema_set
+                    .lookup_attribute(qname.namespace_uri, qname.local_name)
+                    .is_some()
+            } else {
+                schema_set
+                    .lookup_element(qname.namespace_uri, qname.local_name)
+                    .is_some()
+            }
+        });
+    if declared {
+        Ok(())
+    } else {
+        Err(XPathError::undefined_qname(name))
     }
 }
 
@@ -365,7 +445,9 @@ fn check_kind_test_prefixes(
 /// \[err:XPST0008\]" (§2.5.4.5 for attributes). The in-scope schema types are
 /// the built-in types of the XML Schema namespace — which include `xs:untyped`
 /// and `xs:untypedAtomic` (§2.5.1) — plus, when a schema set is attached, its
-/// named types. An unprefixed `TypeName` is in the default element/type
+/// named types. §2.5.1 leaves the predefined set to the host; this engine's is
+/// every built-in type it knows, the XSD 1.1 ones included, whatever the
+/// schema set's version (see `TypeTest::BuiltIn`). An unprefixed `TypeName` is in the default element/type
 /// namespace. The prefix has already been checked (XPST0081).
 fn check_type_name_in_scope(
     type_name: Option<&QName>,
@@ -552,7 +634,9 @@ fn resolve_atomic_type_qname(
 /// accepted."
 ///
 /// The in-scope schema types are the built-in types of the XML Schema namespace
-/// plus, when a schema set is attached to the static context, its named types.
+/// plus, when a schema set is attached to the static context, its named types;
+/// of those, only the atomic ones qualify — not a union or list type of the
+/// schema, nor a restriction of one.
 ///
 /// Note: `xs:NOTATION` and `xs:anyAtomicType` are atomic types and so pass this
 /// check; §3.10.2 forbids them as the target of a `cast` with a separate rule
@@ -593,10 +677,12 @@ fn check_atomic_type_name(
     }
 
     // A name outside the XML Schema namespace can only be in the in-scope schema
-    // types when a schema set is attached, and must be a simple type there.
+    // types when a schema set is attached, and must be an *atomic* simple type
+    // there: a union or a list type (or a restriction of one) is a simple type
+    // but not an atomic type, so it is XPST0051 just like a complex type.
     let schema_set = ctx.schema_set.ok_or_else(unknown)?;
     match schema_set.lookup_type(resolved.namespace_uri, resolved.local_name) {
-        Some(crate::ids::TypeKey::Simple(_)) => Ok(()),
+        Some(key) if crate::xpath::node_test::is_atomic_simple_type(schema_set, key) => Ok(()),
         _ => Err(unknown()),
     }
 }
@@ -647,8 +733,9 @@ fn check_cast_target(
 /// `xs:unsignedShort(42)` is equivalent to `42 cast as xs:unsignedShort`.
 ///
 /// Returns `Ok(Some(type_expr))` if this is a valid constructor function,
-/// `Ok(None)` if it's not a constructor (fall through to normal lookup),
-/// or `Err` for invalid usage (e.g. `xs:NOTATION(...)` is XPST0051).
+/// `Ok(None)` if it's not a constructor (fall through to normal lookup, which
+/// makes `xs:NOTATION(...)` and `xs:anyAtomicType(...)` XPST0017), or `Err`
+/// when the type name cannot be resolved.
 fn try_bind_constructor_function(
     func_call: &FunctionCallNode,
     namespace: &str,
@@ -670,14 +757,19 @@ fn try_bind_constructor_function(
         None => return Ok(None),
     };
 
-    // NOTATION is not allowed as a constructor target (XPST0051)
-    if type_code == XmlTypeCode::Notation {
-        return Err(XPathError::unknown_type(&func_call.local_name));
-    }
-
-    // List types and abstract types are not constructor functions —
-    // fall through to normal function lookup (which will produce XPST0017)
-    if type_code.is_list() || matches!(type_code, XmlTypeCode::AnyType | XmlTypeCode::AnySimpleType)
+    // XPath 2.0 §3.10.4: "For every atomic type in the in-scope schema types
+    // (except xs:NOTATION and xs:anyAtomicType, which are not instantiable), a
+    // constructor function is implicitly defined." So neither of those two,
+    // nor a list type or an abstract type, is a constructor function — fall
+    // through to normal function lookup, which produces XPST0017.
+    if type_code.is_list()
+        || matches!(
+            type_code,
+            XmlTypeCode::AnyType
+                | XmlTypeCode::AnySimpleType
+                | XmlTypeCode::Notation
+                | XmlTypeCode::AnyAtomicType
+        )
     {
         return Ok(None);
     }

@@ -72,60 +72,28 @@ pub fn fixed_values_equal(
 /// by exact value, so a decimal carried in lexical form (beyond
 /// `rust_decimal`'s capacity) equals every other spelling of the same number
 /// (Datatypes 1.1 §3.3.3: "the number 2.0 is not distinct from the number
-/// 2.00").
+/// 2.00"), and that a list compares member for member by value
+/// ([`values_equal_or_identical`](super::identity::values_equal_or_identical)):
+/// each member carries the type that validated it, and which member type of a
+/// union (or which restriction) that was does not matter — Datatypes §2.2.1:
+/// restrictions do not create new values.
 pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
-    a == b || crate::types::exact_decimal::decimal_values_equal(a, b) == Some(true)
+    a == b
+        || crate::types::exact_decimal::decimal_values_equal(a, b) == Some(true)
+        || ((holds_list(a) || holds_list(b)) && super::identity::values_equal_or_identical(a, b))
 }
 
 /// The first `xs:decimal` inside a valid typed value that is carried as a
 /// string because `rust_decimal::Decimal` cannot hold it — the value itself, a
-/// union's member value, or a list item — as its canonical representation; the
-/// runtime reports it with the capacity warning (Datatypes 1.1 §5.4).
+/// union's member value, or a list member — as its canonical representation;
+/// the runtime reports it with the capacity warning (Datatypes 1.1 §5.4).
 ///
-/// `normalized` is the value's PSVI `[schema normalized value]`. A list whose
-/// item type is a union stores every item as a string, whichever member type
-/// validated it, and records a single item type for all of them, so the item
-/// type cannot tell which items are decimals. For such a list the items
-/// spelled as an `xs:decimal` of more than 28 digits — the only spellings that
-/// can be beyond capacity — are validated against the union again, and the
-/// member type that accepts each one decides.
-pub(crate) fn capacity_decimal(
-    value: &XmlValue,
-    normalized: Option<&str>,
-    schema_set: &SchemaSet,
-) -> Option<String> {
-    use crate::types::exact_decimal::{first_lexical_decimal, lexical_decimal, EXACT_DIGITS};
-    match &value.value {
-        XmlValueKind::Union(inner) => capacity_decimal(inner, normalized, schema_set),
-        XmlValueKind::List { .. } => {
-            let Some(item_type) = list_item_type_if_union(value, schema_set) else {
-                return first_lexical_decimal(value).map(str::to_owned);
-            };
-            let normalized = normalize_whitespace(normalized?, WhitespaceMode::Collapse);
-            normalized
-                .split(' ')
-                .filter(|token| {
-                    token.bytes().filter(u8::is_ascii_digit).count() > EXACT_DIGITS
-                        && crate::types::validators::is_valid_xsd_decimal_lexical(token)
-                })
-                .find_map(|token| {
-                    let item = validate_simple_type_inner(token, item_type, schema_set).ok()?;
-                    lexical_decimal(&item.typed_value).map(str::to_owned)
-                })
-        }
-        _ => first_lexical_decimal(value).map(str::to_owned),
-    }
-}
-
-/// The item type of a list value, when that item type is a union.
-pub(crate) fn list_item_type_if_union(value: &XmlValue, schema_set: &SchemaSet) -> Option<TypeKey> {
-    let list = schema_set.arenas.simple_types.get(value.schema_type?)?;
-    let item_type = list.resolved_item_type?;
-    let TypeKey::Simple(item_sk) = item_type else {
-        return None;
-    };
-    let item = schema_set.arenas.simple_types.get(item_sk)?;
-    (item.variety == SimpleTypeVariety::Union).then_some(item_type)
+/// Every list member carries the type that validated it — for a list whose
+/// item type is a union, the member type of the union that accepted it — so a
+/// member is such a decimal exactly when it is one, whatever the other members
+/// are.
+pub(crate) fn capacity_decimal(value: &XmlValue) -> Option<String> {
+    crate::types::exact_decimal::first_lexical_decimal(value).map(str::to_owned)
 }
 
 /// Value-space equality when the instance's typed value is already computed.
@@ -515,7 +483,7 @@ fn validate_atomic_type(
             }
             // XSD 1.1: evaluate assertion facets
             #[cfg(feature = "xsd11")]
-            evaluate_assertion_facets(&val, &facets, schema_set, Some(sk))?;
+            evaluate_assertion_facets(&val, &facets, schema_set)?;
             Ok(SimpleTypeResult {
                 typed_value: val,
                 member_type: None,
@@ -625,24 +593,23 @@ fn validate_list_type(
         normalized.split(' ').collect()
     };
 
-    // Validate each item
+    // Validate each item. A member keeps the typed value its validation gave
+    // it — its own type code and `schema_type` — and, when the item type is a
+    // union, the value of the member type that accepted it (XPath 2.0 §2.5.2:
+    // "when the type annotation of a node is a union type, the typed value of
+    // the node will be an instance of one of the member types of the union").
     let mut items = Vec::with_capacity(items_str.len());
-    let mut item_type_code = XmlTypeCode::UntypedAtomic;
     for item_str in &items_str {
         let result = validate_simple_type_inner(item_str, item_type_key, schema_set)?;
-        item_type_code = result.typed_value.type_code;
-        match result.typed_value.value {
-            XmlValueKind::Atomic(atom) => items.push(atom),
-            XmlValueKind::UntypedAtomic(s) => {
-                items.push(crate::types::value::XmlAtomicValue::String(s));
-            }
-            _ => {
-                items.push(crate::types::value::XmlAtomicValue::String(
-                    result.typed_value.to_string_value(),
-                ));
-            }
-        }
+        items.push(list_member(result.typed_value));
     }
+    // The declared item type's code; a union's is that of its base type,
+    // `xs:anySimpleType`.
+    let item_type_code = match item_type_key {
+        TypeKey::Simple(item_sk) => resolve_type_code(item_sk, schema_set),
+        TypeKey::Complex(_) => None,
+    }
+    .unwrap_or(XmlTypeCode::UntypedAtomic);
 
     // Check list-level facets (length, minLength, maxLength, pattern, enumeration)
     let facets = schema_set.effective_facets(sk);
@@ -655,13 +622,30 @@ fn validate_list_type(
                 errors::from_facet_error(code, e, None)
             })?;
 
-        // Pattern/enumeration on the normalized string representation
-        facets
-            .validate_string_patterns_enums(&normalized)
-            .map_err(|e| {
-                let code = errors::facet_constraint_code(&e);
-                errors::from_facet_error(code, e, None)
-            })?;
+        // Datatypes §4.3.4: a pattern constrains the lexical space — the
+        // normalized string.
+        facets.validate_patterns_only(&normalized).map_err(|e| {
+            let code = errors::facet_constraint_code(&e);
+            errors::from_facet_error(code, e, None)
+        })?;
+
+        // Datatypes §4.3.5.4 / §2.4.1.2: an enumeration value is a whole list,
+        // compared with the instance's value — same length, members pairwise
+        // equal in the value space of the type that validated each. A
+        // lexically identical enumeration value is a match without parsing.
+        if let Some(enumeration) = &facets.enumeration {
+            if !enumeration.values.contains(normalized.as_ref()) {
+                facets
+                    .validate_enum_value_space(
+                        |literal| list_literal_matches(literal, &items, item_type_key, schema_set),
+                        &normalized,
+                    )
+                    .map_err(|e| {
+                        let code = errors::facet_constraint_code(&e);
+                        errors::from_facet_error(code, e, None)
+                    })?;
+            }
+        }
     }
 
     // Use the list type's own code (e.g. IdRefs, NmTokens, Entities) when it
@@ -682,16 +666,60 @@ fn validate_list_type(
 
     // XSD 1.1: evaluate assertion facets ($value is the sequence of list items)
     #[cfg(feature = "xsd11")]
-    {
-        let item_sk = item_type_key.as_simple();
-        evaluate_assertion_facets(&typed_value, &facets, schema_set, item_sk)?;
-    }
+    evaluate_assertion_facets(&typed_value, &facets, schema_set)?;
 
     Ok(SimpleTypeResult {
         typed_value,
         member_type: None,
         normalized_value: Some(normalized.into_owned()),
     })
+}
+
+/// Whether the list value `literal` — an enumeration value of a list type —
+/// is the list whose members are `members`: same length, and each item of the
+/// literal, validated against the item type, equal or identical to the member
+/// at its position (Datatypes §2.4.1.2). An item that does not validate
+/// matches nothing.
+fn list_literal_matches(
+    literal: &str,
+    members: &[XmlValue],
+    item_type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> bool {
+    let collapsed = normalize_whitespace(literal, WhitespaceMode::Collapse);
+    let tokens: Vec<&str> = if collapsed.is_empty() {
+        Vec::new()
+    } else {
+        collapsed.split(' ').collect()
+    };
+    tokens.len() == members.len()
+        && tokens.iter().zip(members).all(|(token, member)| {
+            validate_simple_type_inner(token, item_type_key, schema_set).is_ok_and(|item| {
+                super::identity::values_equal_or_identical(&list_member(item.typed_value), member)
+            })
+        })
+}
+
+/// Whether `value` is a list value, possibly inside union wrappers.
+pub(crate) fn holds_list(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::List { .. } => true,
+        XmlValueKind::Union(inner) => holds_list(inner),
+        _ => false,
+    }
+}
+
+/// A list member as the list stores it: the typed value of one item, with the
+/// union wrappers taken off (nested unions included), so that the member is
+/// the atomic value of the member type that validated it — with that type's
+/// code and `schema_type`.
+fn list_member(mut value: XmlValue) -> XmlValue {
+    loop {
+        match value.value {
+            XmlValueKind::Union(inner) => value = *inner,
+            _ => return value,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,9 +760,28 @@ fn validate_union_type(
                 // matched primitive type and compare canonical forms (handles float/
                 // double rounding and duration leading-zero differences)
                 let type_code = result.typed_value.type_code;
+                // A member type that is a list has no single primitive type to
+                // re-parse with: map the enumeration value through the member
+                // types, as the union's own lexical mapping does, and compare
+                // the two lists (Datatypes §2.4.1.2).
+                let member_is_list = holds_list(&result.typed_value);
                 facets
                     .validate_enum_value_space(
                         |s| {
+                            if member_is_list {
+                                return st_data
+                                    .resolved_member_types
+                                    .iter()
+                                    .find_map(|&m| {
+                                        validate_simple_type_inner(s, m, schema_set).ok()
+                                    })
+                                    .is_some_and(|literal| {
+                                        super::identity::values_equal_or_identical(
+                                            &literal.typed_value,
+                                            &result.typed_value,
+                                        )
+                                    });
+                            }
                             VALIDATOR_REGISTRY
                                 .validate(type_code, s)
                                 .map(|v| {
@@ -767,12 +814,7 @@ fn validate_union_type(
 
             // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
             #[cfg(feature = "xsd11")]
-            {
-                let item_sk = member_key.as_simple().and_then(|sk| {
-                    crate::types::sequence::resolve_list_item_schema_type(sk, schema_set)
-                });
-                evaluate_assertion_facets(&inner, &facets, schema_set, item_sk)?;
-            }
+            evaluate_assertion_facets(&inner, &facets, schema_set)?;
 
             return Ok(SimpleTypeResult {
                 normalized_value: result.normalized_value,
@@ -837,7 +879,6 @@ fn evaluate_assertion_facets(
     typed_value: &XmlValue,
     facets: &FacetSet,
     schema_set: &SchemaSet,
-    item_schema_type: Option<SimpleTypeKey>,
 ) -> Result<(), ValidationError> {
     use crate::xpath::api::XPathExpr;
     use crate::xpath::functions::effective_boolean_value;
@@ -888,15 +929,9 @@ fn evaluate_assertion_facets(
                 )
             })?;
 
-        // Convert typed value to XPathValue. The item type of a list tells
-        // whether its members stored as strings can be decimals beyond
-        // capacity: never for a union item type, whose members are all stored
-        // as strings.
-        let item_type_is_union = item_schema_type
-            .and_then(|sk| schema_set.arenas.simple_types.get(sk))
-            .map(|st| st.variety == SimpleTypeVariety::Union);
-        let xpath_value = typed_value
-            .to_xpath_value_with::<RoXmlNavigator<'static>>(item_schema_type, item_type_is_union);
+        // Convert typed value to XPathValue: a list gives its members, each
+        // with the type that validated it.
+        let xpath_value = typed_value.to_xpath_value::<RoXmlNavigator<'static>>();
 
         // Evaluate with $value bound
         let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
@@ -1508,25 +1543,74 @@ mod xsd11_tests {
         let tk = element_type(&schema, "e");
         let result = validate_simple_type("1 2 3", tk, &schema).unwrap();
 
-        // Resolve list item schema type
+        // The list's item type
         let list_sk = tk.as_simple().expect("should be simple type");
         let item_sk = resolve_list_item_schema_type(list_sk, &schema);
 
-        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
-            result.typed_value.to_xpath_value(item_sk);
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> = result.typed_value.to_xpath_value();
 
         // Should produce a sequence of 3 items
         let items = xpath_val.into_vec();
         assert_eq!(items.len(), 3, "list should produce 3 XPath items");
 
-        // Each item should have schema_type set
+        // Each item carries the item type it was validated with
         for item in &items {
             let val = item.as_atomic().expect("should be atomic");
-            assert!(
-                val.schema_type.is_some(),
-                "each list item should have schema_type"
+            assert_eq!(
+                val.schema_type, item_sk,
+                "each list item should have the item type as its schema_type"
             );
         }
+    }
+
+    /// The members of a list whose item type is a union are the values of the
+    /// member types that validated them (XPath 2.0 §2.5.2); the list records
+    /// the declared item type, whose code is that of a union's base type.
+    #[test]
+    fn test_list_of_union_members_have_their_member_types() {
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:simpleType name="small">
+                    <xs:restriction base="xs:integer"><xs:maxInclusive value="9"/></xs:restriction>
+                </xs:simpleType>
+                <xs:simpleType name="smallOrString">
+                    <xs:union memberTypes="small xs:string"/>
+                </xs:simpleType>
+                <xs:simpleType name="nested">
+                    <xs:union memberTypes="xs:date smallOrString"/>
+                </xs:simpleType>
+                <xs:simpleType name="l"><xs:list itemType="nested"/></xs:simpleType>
+                <xs:element name="e" type="l"/>
+            </xs:schema>"#,
+        );
+        let tk = element_type(&schema, "e");
+        let result = validate_simple_type("5 x 2020-01-01 10", tk, &schema).unwrap();
+        let XmlValueKind::List { item_type, items } = &result.typed_value.value else {
+            panic!("expected a list value, got {:?}", result.typed_value);
+        };
+        assert_eq!(*item_type, XmlTypeCode::AnySimpleType);
+        let named = |name: &str| {
+            let id = schema.name_table.get(name).expect("interned");
+            schema.lookup_type(None, id).and_then(|tk| tk.as_simple())
+        };
+        let members: Vec<(XmlTypeCode, String, bool)> = items
+            .iter()
+            .map(|m| {
+                assert!(matches!(m.value, XmlValueKind::Atomic(_)), "{m:?}");
+                (m.type_code, m.to_string_value(), m.schema_type.is_some())
+            })
+            .collect();
+        assert_eq!(
+            members,
+            [
+                (XmlTypeCode::Integer, "5".to_string(), true),
+                (XmlTypeCode::String, "x".to_string(), true),
+                (XmlTypeCode::Date, "2020-01-01".to_string(), true),
+                (XmlTypeCode::String, "10".to_string(), true),
+            ]
+        );
+        assert_eq!(items[0].schema_type, named("small"));
+        assert_eq!(result.typed_value.to_string_value(), "5 x 2020-01-01 10");
     }
 
     #[test]
@@ -1542,8 +1626,7 @@ mod xsd11_tests {
         let tk = element_type(&schema, "e");
         let result = validate_simple_type("42", tk, &schema).unwrap();
 
-        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
-            result.typed_value.to_xpath_value(None);
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> = result.typed_value.to_xpath_value();
 
         // Union unwraps to the inner atomic value
         let items = xpath_val.into_vec();
@@ -1561,8 +1644,7 @@ mod xsd11_tests {
         let tk = element_type(&schema, "e");
         let result = validate_simple_type("42", tk, &schema).unwrap();
 
-        let xpath_val: XPathValue<RoXmlNavigator<'static>> =
-            result.typed_value.to_xpath_value(None);
+        let xpath_val: XPathValue<RoXmlNavigator<'static>> = result.typed_value.to_xpath_value();
 
         let items = xpath_val.into_vec();
         assert_eq!(items.len(), 1, "atomic should produce single item");

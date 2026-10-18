@@ -3535,10 +3535,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         self.schema_set,
                     ) {
                         Ok(result) => {
-                            self.note_decimal_capacity(
-                                &result.typed_value,
-                                result.normalized_value.as_deref(),
-                            );
+                            self.note_decimal_capacity(&result.typed_value);
                             ev_state.member_type = result.member_type;
                             ev_state.typed_value = Some(result.typed_value);
                             ev_state.normalized_value = result.normalized_value;
@@ -3548,10 +3545,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // doesn't see namespaces, so an undeclared prefix
                             // (e.g. `xmlns:xsi` per W3C bug 4053) must be
                             // flagged here against the element's snapshot.
-                            // Apply only to single (atomic) QName/NOTATION
-                            // values — list-of-QName tokens are handled
-                            // elsewhere and may legitimately use any prefix
-                            // syntax in the joined text.
+                            // This applies to a single (atomic) QName/NOTATION
+                            // value; list members are checked one by one below.
                             let needs_qname_check =
                                 ev_state.typed_value.as_ref().is_some_and(|v| {
                                     matches!(v.value, crate::types::value::XmlValueKind::Atomic(_))
@@ -3584,6 +3579,47 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                             );
                                             ev_state.validity = SchemaValidity::Invalid;
                                         }
+                                    }
+                                }
+                            }
+                            // The same check for every QName / NOTATION member
+                            // of a list value (a list of `xs:QName`, or of a
+                            // union with a QName or NOTATION member type).
+                            let list_value = ev_state
+                                .typed_value
+                                .as_ref()
+                                .filter(|v| super::simple::holds_list(v));
+                            if let (Some(value), Some(ctx), SchemaValidity::Valid) =
+                                (list_value, ev_state.ns_context.as_ref(), ev_state.validity)
+                            {
+                                match resolve_list_qname_members(
+                                    value,
+                                    ctx,
+                                    &self.schema_set.name_table,
+                                ) {
+                                    Ok(Some(resolved)) => ev_state.typed_value = Some(resolved),
+                                    Ok(None) => {}
+                                    Err(prefix) => {
+                                        let elem_name = self
+                                            .schema_set
+                                            .name_table
+                                            .resolve(ev_state.local_name)
+                                            .to_string();
+                                        let err = errors::error(
+                                            "cvc-datatype-valid.1.2.1",
+                                            format!(
+                                                "Element '{}' has QName value '{}' with undeclared prefix '{}'",
+                                                elem_name,
+                                                ev_state.text_content.trim(),
+                                                prefix
+                                            ),
+                                            self.current_location.clone(),
+                                        );
+                                        self.report_validation_error_to(
+                                            err,
+                                            &mut ev_state.error_codes,
+                                        );
+                                        ev_state.validity = SchemaValidity::Invalid;
                                     }
                                 }
                             }
@@ -4620,13 +4656,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Reported only while [`ValidationFlags::REPORT_WARNINGS`] is set (the
     /// default); the typed value's shape (an `xs:decimal` type code with a
     /// string payload) tells a downstream consumer the same thing either way.
-    fn note_decimal_capacity(&mut self, typed_value: &XmlValue, normalized: Option<&str>) {
+    fn note_decimal_capacity(&mut self, typed_value: &XmlValue) {
         if !self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
             return;
         }
-        let Some(lexical) =
-            super::simple::capacity_decimal(typed_value, normalized, self.schema_set)
-        else {
+        let Some(lexical) = super::simple::capacity_decimal(typed_value) else {
             return;
         };
         let at = if self.element_path.is_empty() {
@@ -5294,30 +5328,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Check if a type (possibly a union) transitively contains xs:ID or xs:IDREF
-    /// as a member type. Used for list(union(ID, ...)) detection.
-    fn union_has_id_idref(&self, type_key: TypeKey) -> bool {
-        let sk = match type_key {
-            TypeKey::Simple(sk) => sk,
-            _ => return false,
-        };
-        // Direct check: is this type itself ID or IDREF?
-        if let Some(code) = self.schema_set.get_type_code(sk) {
-            if matches!(code, XmlTypeCode::Id | XmlTypeCode::IdRef) {
-                return true;
-            }
-        }
-        // Check union members
-        if let Some(st) = self.schema_set.arenas.simple_types.get(sk) {
-            for &member_key in &st.resolved_member_types {
-                if self.union_has_id_idref(member_key) {
-                    return true;
-                }
-            }
-        }
-        false
-    }
-
     /// Check if an ENTITY/ENTITIES value names declared unparsed entities.
     ///
     /// §3.16.4 String Valid clause 3: "Every ENTITY value in V is a declared
@@ -5333,13 +5343,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // Collect undeclared names first to avoid borrow conflict with report_error
         let mut undeclared: Vec<String> = Vec::new();
 
-        // Check list values first — handles both built-in xs:ENTITIES and
-        // custom <xs:list itemType="xs:ENTITY"> which has type_code=Entity
-        // but XmlValueKind::List.
-        if let XmlValueKind::List { item_type, items } = &typed_value.value {
-            if *item_type == XmlTypeCode::Entity || typed_value.type_code == XmlTypeCode::Entities {
-                for item in items {
-                    let name = item.to_string();
+        // A union value's ENTITY values are those of the member type that
+        // validated it (a list member type included, `xs:ENTITIES` say), so
+        // look through the union wrappers first — as `collect_id_idref` does.
+        let mut typed_value = typed_value;
+        while let XmlValueKind::Union(inner) = &typed_value.value {
+            typed_value = inner.as_ref();
+        }
+
+        // Check list values first — built-in xs:ENTITIES, a custom
+        // <xs:list itemType="xs:ENTITY">, and a list of a union with an
+        // xs:ENTITY member: every member carries the type that validated it,
+        // so exactly the ENTITY members are names to check.
+        if let XmlValueKind::List { items, .. } = &typed_value.value {
+            for item in items {
+                if item.type_code == XmlTypeCode::Entity {
+                    let name = item.to_string_value();
                     if !entities.contains(&name) {
                         undeclared.push(name);
                     }
@@ -5404,59 +5423,28 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             effective = inner.as_ref();
         }
 
-        // Check list values — handles custom list-of-ID, list-of-IDREF,
-        // and list-of-union(ID/IDREF, ...) types.
-        if let XmlValueKind::List { item_type, items } = &effective.value {
-            // First check: is the list's item type a union containing ID/IDREF?
-            // If so, per-item type codes vary; re-validate each token individually
-            // to identify which items are ID vs IDREF vs other (§3.17.5.2).
-            let union_resolved = effective
-                .schema_type
-                .and_then(|sk| self.schema_set.arenas.simple_types.get(sk))
-                .and_then(|st| st.resolved_item_type)
-                .filter(|item_tk| self.union_has_id_idref(*item_tk));
-            if let Some(item_type_key) = union_resolved {
-                for token in value_str.split_whitespace() {
-                    if let Ok(result) =
-                        super::simple::validate_simple_type(token, item_type_key, self.schema_set)
-                    {
-                        match result.typed_value.type_code {
-                            XmlTypeCode::Id => {
-                                self.register_id_value(token.to_string(), owner_serial);
-                            }
-                            XmlTypeCode::IdRef => {
-                                self.pending_idrefs.push((
-                                    token.to_string(),
-                                    self.current_location.clone(),
-                                    self.element_path.clone(),
-                                ));
-                            }
-                            _ => {} // e.g. integer — not ID/IDREF
-                        }
+        // List values — built-in xs:IDREFS, custom lists of xs:ID / xs:IDREF,
+        // and lists of a union with an ID / IDREF member type: every member
+        // carries the type that validated it (§3.17.5.2: eligible items include
+        // types "derived or constructed directly or indirectly from" ID/IDREF),
+        // so each member is dispatched on its own type.
+        if let XmlValueKind::List { items, .. } = &effective.value {
+            for item in items {
+                match item.type_code {
+                    XmlTypeCode::Id => {
+                        self.register_id_value(item.to_string_value(), owner_serial);
                     }
-                }
-                return;
-            }
-            // Simple case: all items have the same type (non-union item type)
-            match *item_type {
-                XmlTypeCode::Id => {
-                    for item in items {
-                        self.register_id_value(item.to_string(), owner_serial);
-                    }
-                    return;
-                }
-                XmlTypeCode::IdRef => {
-                    for item in items {
+                    XmlTypeCode::IdRef => {
                         self.pending_idrefs.push((
-                            item.to_string(),
+                            item.to_string_value(),
                             self.current_location.clone(),
                             self.element_path.clone(),
                         ));
                     }
-                    return;
+                    _ => {} // e.g. integer — not ID/IDREF
                 }
-                _ => {}
             }
+            return;
         }
 
         // Fall back to type_code-based dispatch for atomic values and
@@ -5467,15 +5455,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.register_id_value(normalized, owner_serial);
             }
             XmlTypeCode::IdRef | XmlTypeCode::IdRefs => {
-                if let XmlValueKind::List { items, .. } = &effective.value {
-                    for item in items {
-                        self.pending_idrefs.push((
-                            item.to_string(),
-                            self.current_location.clone(),
-                            self.element_path.clone(),
-                        ));
-                    }
-                } else if effective.type_code == XmlTypeCode::IdRefs {
+                if effective.type_code == XmlTypeCode::IdRefs {
                     // Fallback for IdRefs without parsed list: split lexical text
                     for token in value_str.split_whitespace() {
                         self.pending_idrefs.push((
@@ -5640,10 +5620,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if !used_fast_path {
                 match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                     Ok(result) => {
-                        self.note_decimal_capacity(
-                            &result.typed_value,
-                            result.normalized_value.as_deref(),
-                        );
+                        self.note_decimal_capacity(&result.typed_value);
                         member_type = result.member_type;
                         typed_value = Some(result.typed_value);
                         normalized_value = result.normalized_value;
@@ -6037,11 +6014,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         typed_value: Option<&XmlValue>,
         value: &str,
     ) -> Result<Option<XmlValue>, String> {
-        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        use crate::types::value::{QNameValue, XmlAtomicValue, XmlValueKind};
         let Some(tv) = typed_value else {
             return Ok(None);
         };
-        if tv.type_code != XmlTypeCode::QName && tv.type_code != XmlTypeCode::Notation {
+        let is_list = super::simple::holds_list(tv);
+        // A list carries the code of its item type, which for a list of a
+        // union is `xs:anySimpleType` whatever its members are: a list is
+        // decided by its members' own codes below.
+        if !is_list && tv.type_code != XmlTypeCode::QName && tv.type_code != XmlTypeCode::Notation {
             return Ok(None);
         }
         let Some(ctx) = self
@@ -6051,11 +6032,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         else {
             return Ok(None);
         };
+        // A list value (also the one a union's chosen member type gave):
+        // every QName / NOTATION member on its own.
+        if is_list {
+            return resolve_list_qname_members(tv, ctx, &self.schema_set.name_table);
+        }
         let qn = match parse_qname_with_snapshot(value, ctx, &self.schema_set.name_table, true) {
             Ok(qn) => qn,
             Err(QNameError::UndefinedPrefix(prefix)) => return Err(prefix),
             Err(_) => return Ok(None),
         };
+        let qn = QNameValue::new(qn, &self.schema_set.name_table);
         let atom = if tv.type_code == XmlTypeCode::Notation {
             XmlAtomicValue::Notation(qn)
         } else {
@@ -6080,7 +6067,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ns_context: Option<&NamespaceContextSnapshot>,
         name_table: &crate::namespace::table::NameTable,
     ) -> Option<XmlValue> {
-        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        use crate::types::value::{QNameValue, XmlAtomicValue, XmlValueKind};
         let val = typed_value.as_ref()?;
         if val.type_code != XmlTypeCode::QName && val.type_code != XmlTypeCode::Notation {
             return None;
@@ -6097,6 +6084,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
         let ctx = ns_context?;
         let qn = parse_qname_with_snapshot(string_value, ctx, name_table, true).ok()?;
+        let qn = QNameValue::new(qn, name_table);
         let atom = if val.type_code == XmlTypeCode::Notation {
             XmlAtomicValue::Notation(qn)
         } else {
@@ -6294,10 +6282,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
-                            self.note_decimal_capacity(
-                                &result.typed_value,
-                                result.normalized_value.as_deref(),
-                            );
+                            self.note_decimal_capacity(&result.typed_value);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
@@ -6407,10 +6392,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if let Some(type_key) = attr_type {
                     match super::simple::validate_simple_type(value, type_key, self.schema_set) {
                         Ok(result) => {
-                            self.note_decimal_capacity(
-                                &result.typed_value,
-                                result.normalized_value.as_deref(),
-                            );
+                            self.note_decimal_capacity(&result.typed_value);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
@@ -6866,6 +6848,75 @@ fn resolve_base_uri(xml_base: &str, inherited: &str) -> String {
         xml_base.to_string()
     } else {
         format!("{}{}", base_dir, xml_base)
+    }
+}
+
+/// Resolve the `xs:QName` / `xs:NOTATION` members of a list value — the value
+/// itself, or the list a union's chosen member type gave — against the
+/// instance namespace context `ctx`. Datatypes §3.3.18: the QName lexical
+/// mapping "depends on the namespace bindings in scope where the literal
+/// occurs"; the simple-type validator has none, so each such member comes back
+/// as its lexical form under the QName / NOTATION code.
+///
+/// `Ok(Some(v))` is the value with those members resolved; `Ok(None)` means
+/// nothing needed resolving; `Err(prefix)` names the first member prefix that
+/// `ctx` binds nowhere (`cvc-datatype-valid.1.2.1`, as for an atomic value).
+fn resolve_list_qname_members(
+    value: &XmlValue,
+    ctx: &NamespaceContextSnapshot,
+    names: &crate::namespace::table::NameTable,
+) -> Result<Option<XmlValue>, String> {
+    use crate::types::value::{QNameValue, XmlAtomicValue, XmlValueKind};
+    match &value.value {
+        XmlValueKind::Union(inner) => Ok(resolve_list_qname_members(inner, ctx, names)?.map(
+            |resolved| XmlValue {
+                type_code: value.type_code,
+                schema_type: value.schema_type,
+                value: XmlValueKind::Union(Box::new(resolved)),
+            },
+        )),
+        XmlValueKind::List { item_type, items } => {
+            let mut resolved: Option<Vec<XmlValue>> = None;
+            for (index, member) in items.iter().enumerate() {
+                let lexical = match &member.value {
+                    XmlValueKind::Atomic(XmlAtomicValue::String(s))
+                        if matches!(
+                            member.type_code,
+                            XmlTypeCode::QName | XmlTypeCode::Notation
+                        ) =>
+                    {
+                        s
+                    }
+                    _ => continue,
+                };
+                let qn = match parse_qname_with_snapshot(lexical, ctx, names, true) {
+                    Ok(qn) => QNameValue::new(qn, names),
+                    Err(QNameError::UndefinedPrefix(prefix)) => return Err(prefix),
+                    // Lexical errors were the simple-type validator's to report.
+                    Err(_) => continue,
+                };
+                let atom = if member.type_code == XmlTypeCode::Notation {
+                    XmlAtomicValue::Notation(qn)
+                } else {
+                    XmlAtomicValue::QName(qn)
+                };
+                let members = resolved.get_or_insert_with(|| items.clone());
+                members[index] = XmlValue {
+                    type_code: member.type_code,
+                    schema_type: member.schema_type,
+                    value: XmlValueKind::Atomic(atom),
+                };
+            }
+            Ok(resolved.map(|items| XmlValue {
+                type_code: value.type_code,
+                schema_type: value.schema_type,
+                value: XmlValueKind::List {
+                    item_type: *item_type,
+                    items,
+                },
+            }))
+        }
+        _ => Ok(None),
     }
 }
 

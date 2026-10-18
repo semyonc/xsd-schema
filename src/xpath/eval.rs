@@ -22,9 +22,9 @@ use crate::types::{
 };
 use crate::xpath::arena::{AstArena, AstNodeId};
 use crate::xpath::ast::{
-    AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode, KindTest,
-    NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode, QName as AstQName,
-    QuantifiedNode, QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
+    AstNode, Axis, BinaryOpKind, FilterExprNode, ForBinding, ForNode, ItemTypeNode,
+    NodeTest as AstNodeTest, OccurrenceIndicator, PathExprNode, PathStepNode, QuantifiedNode,
+    QuantifierKind, TypeExprKind, TypeExprNode, ValueNode,
 };
 use crate::xpath::axis_iterators::{
     AncestorAxis, AttributeAxis, ChildAxis, DescendantNodeIterator, FollowingNodeIterator,
@@ -628,17 +628,32 @@ fn eval_instance_of<N: DomNavigator>(
 
     // Check each item matches the item type
     for item in &items {
-        if !matches_item_type_node(
-            item,
-            item_type,
-            type_expr.resolved_atomic_type.as_ref(),
-            ctx.static_context,
-        ) {
+        if !item_matches_type_expr(item, item_type, type_expr, ctx) {
             return Ok(XPathValue::boolean(false));
         }
     }
 
     Ok(XPathValue::boolean(true))
+}
+
+/// Whether `item` matches the item type of an `instance of` / `treat as`:
+/// against the item type the binder resolved, or — for an expression tree that
+/// was never bound — by resolving it now.
+fn item_matches_type_expr<N: DomNavigator>(
+    item: &XmlItem<N>,
+    item_type: &ItemTypeNode,
+    type_expr: &TypeExprNode,
+    ctx: &DynamicContext<'_, N>,
+) -> bool {
+    match &type_expr.resolved_item_type {
+        Some(resolved) => resolved.matches_item(item, ctx.static_context),
+        None => matches_item_type_node(
+            item,
+            item_type,
+            type_expr.resolved_atomic_type.as_ref(),
+            ctx.static_context,
+        ),
+    }
 }
 
 /// Evaluate `expr treat as type`.
@@ -650,7 +665,8 @@ fn eval_instance_of<N: DomNavigator>(
 /// SequenceType matching, the `treat` expression returns the value of `expr1`;
 /// otherwise, it raises a dynamic error [err:XPDY0050]." That covers every way
 /// the match can fail — the wrong cardinality just as much as the wrong item
-/// type — so `treat as` never raises a type error of its own.
+/// type — so `treat as` never raises a type error of its own. The error says
+/// which sequence type was expected and what the operand was.
 fn eval_treat_as<N: DomNavigator>(
     operand: XPathValue<N>,
     type_expr: &TypeExprNode,
@@ -658,6 +674,7 @@ fn eval_treat_as<N: DomNavigator>(
 ) -> Result<XPathValue<N>, XPathError> {
     let items = operand.into_vec();
     let count = items.len();
+    let mismatch = |found: String| Err(XPathError::treat_mismatch(&type_expr.target_type, found));
 
     // Handle empty-sequence() first: §2.5.4 gives it no OccurrenceIndicator of
     // its own, so it must not be run through the cardinality check.
@@ -667,7 +684,7 @@ fn eval_treat_as<N: DomNavigator>(
             if count == 0 {
                 return Ok(XPathValue::empty());
             } else {
-                return Err(XPathError::XPDY0050);
+                return mismatch(describe_items(&items));
             }
         }
         Some(it) => it,
@@ -675,23 +692,64 @@ fn eval_treat_as<N: DomNavigator>(
 
     // Check cardinality
     if !occurrence_allows_count(type_expr.target_type.occurrence, count) {
-        return Err(XPathError::XPDY0050);
+        return mismatch(describe_items(&items));
     }
 
     // Check each item matches the item type
-    for item in &items {
-        if !matches_item_type_node(
-            item,
-            item_type,
-            type_expr.resolved_atomic_type.as_ref(),
-            ctx.static_context,
-        ) {
-            return Err(XPathError::XPDY0050);
+    for (index, item) in items.iter().enumerate() {
+        if !item_matches_type_expr(item, item_type, type_expr, ctx) {
+            return mismatch(if count == 1 {
+                describe_item(item)
+            } else {
+                format!(
+                    "a sequence of {count} items whose item {} is {}",
+                    index + 1,
+                    describe_item(item)
+                )
+            });
         }
     }
 
     // Return the original value
     Ok(XPathValue::from_sequence(items))
+}
+
+/// A short description of a value for an error message: "the empty sequence",
+/// "a sequence of 3 items", or the one item.
+fn describe_items<N: DomNavigator>(items: &[XmlItem<N>]) -> String {
+    match items {
+        [] => "the empty sequence".to_string(),
+        [item] => describe_item(item),
+        _ => format!("a sequence of {} items", items.len()),
+    }
+}
+
+/// A short description of one item for an error message: "an xs:string
+/// value", "an element node named 'a'", "a text node".
+fn describe_item<N: DomNavigator>(item: &XmlItem<N>) -> String {
+    match item {
+        XmlItem::Atomic(value) => match value.type_code.local_name() {
+            Some(name) => format!("an xs:{name} value"),
+            None => "an atomic value".to_string(),
+        },
+        XmlItem::Node(nav) => {
+            let kind = match nav.node_type() {
+                DomNodeType::Root => "a document node",
+                DomNodeType::Element => "an element node",
+                DomNodeType::Attribute => "an attribute node",
+                DomNodeType::Namespace => "a namespace node",
+                DomNodeType::ProcessingInstruction => "a processing-instruction node",
+                DomNodeType::Comment => "a comment node",
+                _ => "a text node",
+            };
+            let name = nav.name();
+            if name.is_empty() {
+                kind.to_string()
+            } else {
+                format!("{kind} named '{name}'")
+            }
+        }
+    }
 }
 
 /// Evaluate `expr cast as type`.
@@ -738,7 +796,7 @@ fn eval_cast_as<N: DomNavigator>(
                 Ok(XPathValue::empty())
             } else {
                 Err(XPathError::XPTY0004 {
-                    expected: format_sequence_type(&type_expr.target_type, ctx),
+                    expected: type_expr.target_type.to_string(),
                     found: "empty-sequence()".to_string(),
                 })
             }
@@ -1047,76 +1105,6 @@ fn to_integer_operand(value: crate::types::XmlValue) -> Result<crate::types::Xml
     Ok(value)
 }
 
-/// Format a sequence type for error messages.
-fn format_sequence_type<N: DomNavigator>(
-    seq_type: &crate::xpath::ast::SequenceTypeNode,
-    _ctx: &DynamicContext<'_, N>,
-) -> String {
-    let item_str = match &seq_type.item_type {
-        None => "empty-sequence()".to_string(),
-        Some(ItemTypeNode::Item) => "item()".to_string(),
-        Some(ItemTypeNode::Atomic(qname)) => {
-            if qname.prefix.is_empty() {
-                qname.local.clone()
-            } else {
-                format!("{}:{}", qname.prefix, qname.local)
-            }
-        }
-        Some(ItemTypeNode::Kind(kind)) => format_kind_test(kind),
-    };
-
-    let occ_str = match seq_type.occurrence {
-        OccurrenceIndicator::One => "",
-        OccurrenceIndicator::ZeroOrOne => "?",
-        OccurrenceIndicator::ZeroOrMore => "*",
-        OccurrenceIndicator::OneOrMore => "+",
-    };
-
-    format!("{}{}", item_str, occ_str)
-}
-
-/// Format a kind test for error messages.
-fn format_kind_test(kind: &crate::xpath::ast::KindTest) -> String {
-    use crate::xpath::ast::KindTest;
-    match kind {
-        KindTest::AnyKind => "node()".to_string(),
-        KindTest::Text => "text()".to_string(),
-        KindTest::Comment => "comment()".to_string(),
-        KindTest::ProcessingInstruction(None) => "processing-instruction()".to_string(),
-        KindTest::ProcessingInstruction(Some(name)) => {
-            format!("processing-instruction('{}')", name)
-        }
-        KindTest::Document(None) => "document-node()".to_string(),
-        KindTest::Document(Some(inner)) => {
-            format!("document-node({})", format_kind_test(inner))
-        }
-        KindTest::Element(test) => {
-            if let Some(ref qname) = test.name {
-                if qname.prefix.is_empty() {
-                    format!("element({})", qname.local)
-                } else {
-                    format!("element({}:{})", qname.prefix, qname.local)
-                }
-            } else {
-                "element()".to_string()
-            }
-        }
-        KindTest::Attribute(test) => {
-            if let Some(ref qname) = test.name {
-                if qname.prefix.is_empty() {
-                    format!("attribute({})", qname.local)
-                } else {
-                    format!("attribute({}:{})", qname.prefix, qname.local)
-                }
-            } else {
-                "attribute()".to_string()
-            }
-        }
-        KindTest::SchemaElement(name) => format!("schema-element({})", name),
-        KindTest::SchemaAttribute(name) => format!("schema-attribute({})", name),
-    }
-}
-
 // ============================================================================
 // Path Expression Evaluation
 // ============================================================================
@@ -1134,7 +1122,7 @@ fn format_kind_test(kind: &crate::xpath::ast::KindTest) -> String {
 fn document_root<N: DomNavigator>(context_node: &N) -> Result<N, XPathError> {
     let root = get_root(context_node);
     if root.node_type() != DomNodeType::Root {
-        return Err(XPathError::XPDY0050);
+        return Err(XPathError::root_not_a_document());
     }
     Ok(root)
 }
@@ -1404,7 +1392,7 @@ fn eval_axis_step<N: DomNavigator>(
     }
 
     // Convert the step's node test to runtime NodeTest
-    let node_test = step_to_node_test(step, ctx.static_context);
+    let node_test = step_to_node_test(step, ctx.static_context)?;
 
     // Create the base iterator from input nodes
     let base_iter = VecNodeIterator::new(nodes.into_iter().map(XmlItem::Node).collect());
@@ -1412,23 +1400,11 @@ fn eval_axis_step<N: DomNavigator>(
     // Apply axis iterator
     let xpath_ctx = ctx.static_context.clone();
     let want_runs = !step.predicates.is_empty();
-    let mut stepped = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter, want_runs)?;
-
-    // `element(N, T)` / `attribute(N, T)` (also inside `document-node(...)`):
-    // the runtime node test above carries the name and the kind but not the
-    // TypeName or the nilled clause, so refine its result with the matcher
-    // `instance of` uses (XPath 2.0 §2.5.4.3, §2.5.4.5) — before the
-    // predicates, which see only the nodes the whole test selects.
-    if let AstNodeTest::Kind(kind_test) = &step.test {
-        if kind_test_has_type_name(kind_test) {
-            stepped.retain(|item| match item {
-                XmlItem::Node(nav) => {
-                    crate::xpath::node_test::matches_kind_test(nav, kind_test, ctx.static_context)
-                }
-                XmlItem::Atomic(_) => false,
-            });
-        }
-    }
+    // The runtime node test carries the whole kind test — for `element(N, T)`
+    // and `attribute(N, T)` the TypeName and the nilled clause too (XPath 2.0
+    // §2.5.4.3, §2.5.4.5) — so the predicates below see only the nodes the
+    // whole test selects.
+    let stepped = apply_axis_iterator(step.axis, node_test, xpath_ctx, base_iter, want_runs)?;
 
     // Apply predicates if any
     if step.predicates.is_empty() {
@@ -1494,7 +1470,13 @@ fn eval_expr_step<N: DomNavigator>(
 }
 
 /// Convert a PathStepNode to a runtime NodeTest.
-fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<NodeTest> {
+///
+/// Fails only for a kind test whose names a bound expression cannot fail to
+/// resolve (see `node_test::item_type_of_kind_test`).
+fn step_to_node_test(
+    step: &PathStepNode,
+    ctx: &XPathContext<'_>,
+) -> Result<Option<NodeTest>, XPathError> {
     // XPath 2.0 §3.2.1.2: a name test only ever selects nodes of the axis's
     // principal node kind, and an unprefixed QName picks up the default
     // element/type namespace only on an axis whose principal node kind is
@@ -1503,7 +1485,10 @@ fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<Node
 
     // If we have a resolved_test from binding, use it
     if let Some(ref resolved) = step.resolved_test {
-        return Some(name_test_for_principal_kind(resolved.clone(), principal));
+        return Ok(Some(name_test_for_principal_kind(
+            resolved.clone(),
+            principal,
+        )));
     }
 
     // Otherwise, convert from AST node test
@@ -1521,7 +1506,10 @@ fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<Node
                 }
                 (Some(prefix), None) => {
                     // prefix:* - local wildcard
-                    let ns_uri = ctx.resolve_prefix(prefix)?; // Unknown prefix
+                    let Some(ns_uri) = ctx.resolve_prefix(prefix) else {
+                        // Unknown prefix
+                        return Ok(None);
+                    };
                     RuntimeNameTest::LocalWildcard(ctx.names.add(&ns_uri))
                 }
                 (Some(prefix), Some(local)) => {
@@ -1532,13 +1520,11 @@ fn step_to_node_test(step: &PathStepNode, ctx: &XPathContext<'_>) -> Option<Node
                     RuntimeNameTest::QName(qname)
                 }
             };
-            Some(name_test_for_principal_kind(resolved, principal))
+            Ok(Some(name_test_for_principal_kind(resolved, principal)))
         }
-        AstNodeTest::Kind(kind_test) => {
-            // Convert AST KindTest to SequenceType
-            let seq_type = kind_test_to_sequence_type(kind_test, ctx);
-            Some(NodeTest::Type(seq_type))
-        }
+        AstNodeTest::Kind(kind_test) => Ok(Some(NodeTest::Type(SequenceType::one(
+            crate::xpath::node_test::item_type_of_kind_test(kind_test, ctx)?,
+        )))),
     }
 }
 
@@ -1565,84 +1551,6 @@ fn resolve_step_name_ns(
     }
 }
 
-/// Resolve the optional ElementName/AttributeName of an `element(N)` or
-/// `attribute(N)` kind test into a runtime name test.
-///
-/// The name is expanded with the same rule as a step's name test
-/// (§3.2.1.2): the default element/type namespace applies to an element
-/// test, while an unprefixed attribute name is always in no namespace.
-fn kind_test_name(
-    name: &Option<AstQName>,
-    ctx: &XPathContext<'_>,
-    principal: DomNodeType,
-) -> Option<RuntimeNameTest> {
-    let qname = name.as_ref()?;
-    let local_id = ctx.names.add(&qname.local);
-    let ns_uri = resolve_step_name_ns(&qname.prefix, ctx, principal);
-    Some(RuntimeNameTest::QName(
-        crate::namespace::qname::QualifiedName::new(ns_uri, local_id, None),
-    ))
-}
-
-/// Convert an AST KindTest to a SequenceType.
-fn kind_test_to_sequence_type(kind: &KindTest, ctx: &XPathContext<'_>) -> SequenceType {
-    SequenceType::one(kind_test_to_item_type(kind, ctx))
-}
-
-/// Convert an AST KindTest to an ItemType (for nested tests like document-node(element(...))).
-fn kind_test_to_item_type(kind: &KindTest, ctx: &XPathContext<'_>) -> ItemType {
-    match kind {
-        KindTest::AnyKind => ItemType::AnyNode,
-        KindTest::Text => ItemType::Text,
-        KindTest::Comment => ItemType::Comment,
-        KindTest::ProcessingInstruction(target) => ItemType::ProcessingInstruction(target.clone()),
-        KindTest::Document(inner) => {
-            let inner_type = inner
-                .as_ref()
-                .map(|k| Box::new(kind_test_to_item_type(k, ctx)));
-            ItemType::Document(inner_type)
-        }
-        KindTest::Element(test) => {
-            ItemType::Element(kind_test_name(&test.name, ctx, DomNodeType::Element), None)
-        }
-        KindTest::Attribute(test) => ItemType::Attribute(
-            kind_test_name(&test.name, ctx, DomNodeType::Attribute),
-            None,
-        ),
-        // `schema-element(N)` and `schema-attribute(N)` used as a *step* node
-        // test carry the same declaration-aware rule (§2.5.4.4, §2.5.4.6) they
-        // carry inside a SequenceType, so they resolve to the item types that
-        // run that matcher rather than to `AnyNode`.
-        //
-        // A name that is not a lexical QName cannot come out of the parser; if
-        // one did, it is interned whole as the local name, which no node can
-        // have, so the test matches nothing instead of everything.
-        KindTest::SchemaElement(name) => ItemType::SchemaElement(
-            crate::xpath::node_test::resolve_schema_test_name(name, ctx, DomNodeType::Element)
-                .unwrap_or_else(|| {
-                    crate::namespace::qname::QualifiedName::local(ctx.names.add(name))
-                }),
-        ),
-        KindTest::SchemaAttribute(name) => ItemType::SchemaAttribute(
-            crate::xpath::node_test::resolve_schema_test_name(name, ctx, DomNodeType::Attribute)
-                .unwrap_or_else(|| {
-                    crate::namespace::qname::QualifiedName::local(ctx.names.add(name))
-                }),
-        ),
-    }
-}
-
-/// Whether a kind test names a `TypeName` — `element(N, T)`, `attribute(N, T)`,
-/// or either inside `document-node(...)`.
-fn kind_test_has_type_name(kind: &KindTest) -> bool {
-    match kind {
-        KindTest::Element(test) => test.type_name.is_some(),
-        KindTest::Attribute(test) => test.type_name.is_some(),
-        KindTest::Document(Some(inner)) => kind_test_has_type_name(inner),
-        _ => false,
-    }
-}
-
 /// The raw items an axis step produced, with the boundaries of the runs the
 /// individual input nodes contributed.
 struct AxisStepItems<N: DomNavigator> {
@@ -1652,35 +1560,6 @@ struct AxisStepItems<N: DomNavigator> {
     /// the caller did not ask for the runs. An input node that yielded nothing
     /// contributes no run.
     run_starts: Vec<usize>,
-}
-
-impl<N: DomNavigator> AxisStepItems<N> {
-    /// Keep the items `keep` accepts, in order, and move the run boundaries
-    /// with them; a run left with no item is dropped, as if its input node had
-    /// yielded nothing.
-    fn retain(&mut self, mut keep: impl FnMut(&XmlItem<N>) -> bool) {
-        let items = std::mem::take(&mut self.items);
-        let bounds = std::mem::take(&mut self.run_starts);
-        let mut kept: Vec<XmlItem<N>> = Vec::with_capacity(items.len());
-        let mut starts: Vec<usize> = Vec::with_capacity(bounds.len());
-        let mut run = 0;
-        let mut run_kept_one = false;
-        for (index, item) in items.into_iter().enumerate() {
-            while run + 1 < bounds.len() && bounds[run + 1] <= index {
-                run += 1;
-                run_kept_one = false;
-            }
-            if keep(&item) {
-                if !bounds.is_empty() && !run_kept_one {
-                    starts.push(kept.len());
-                    run_kept_one = true;
-                }
-                kept.push(item);
-            }
-        }
-        self.items = kept;
-        self.run_starts = starts;
-    }
 }
 
 /// Apply an axis iterator to a base iterator.

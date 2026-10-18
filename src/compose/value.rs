@@ -733,7 +733,7 @@ mod tests {
     /// accessor takes at most one of them.
     #[test]
     fn a_packed_list_value_atomizes_to_its_members() {
-        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        use crate::types::value::XmlValueKind;
         use crate::types::XmlTypeCode;
 
         let list = |members: &[i64]| -> Value<'_> {
@@ -743,7 +743,7 @@ mod tests {
                     item_type: XmlTypeCode::Integer,
                     items: members
                         .iter()
-                        .map(|&m| XmlAtomicValue::Integer(BigInt::from(m)))
+                        .map(|&m| XmlValue::integer(BigInt::from(m)))
                         .collect(),
                 },
             ))

@@ -164,6 +164,12 @@ fn can_cast(source: XmlTypeCode, target: XmlTypeCode) -> bool {
         return target_ua_or_string || target == XmlTypeCode::AnyUri;
     }
 
+    // QName / NOTATION → uA, string (F&O §17.1.2 gives the result:
+    // `prefix:local`, or the local name); the same type was decided above.
+    if matches!(source, XmlTypeCode::QName | XmlTypeCode::Notation) {
+        return target_ua_or_string;
+    }
+
     false
 }
 

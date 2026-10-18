@@ -3902,7 +3902,10 @@ impl TypeValidator for NmTokensValidator {
                     message: format!("Invalid NMTOKEN: '{}'", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::NmToken,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(
@@ -3966,7 +3969,10 @@ impl TypeValidator for IdRefsValidator {
                     message: format!("Invalid IDREF: '{}' (must be NCName)", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::IdRef,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(
@@ -4030,7 +4036,10 @@ impl TypeValidator for EntitiesValidator {
                     message: format!("Invalid ENTITY: '{}' (must be NCName)", token),
                 });
             }
-            items.push(XmlAtomicValue::String(token.to_string()));
+            items.push(XmlValue::new(
+                XmlTypeCode::Entity,
+                XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+            ));
         }
 
         Ok(XmlValue::new(

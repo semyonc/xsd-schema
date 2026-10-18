@@ -15,7 +15,7 @@ use crate::types::value::XmlValue;
 use crate::xpath::cast::type_matches;
 use crate::xpath::context::XPathContext;
 use crate::xpath::iterator::XmlItem;
-use crate::xpath::{DomNavigator, DomNodeType};
+use crate::xpath::DomNavigator;
 
 /// XPath2 sequence type cardinality
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -73,8 +73,93 @@ impl fmt::Display for XmlTypeCardinality {
     }
 }
 
+/// The `TypeName` of an `element(N, T)` or `attribute(N, T)` test, resolved:
+/// the expected type `ET` of `derives-from(AT, ET)` (XPath 2.0 §2.5.4).
+///
+/// Most type names are a [`TypeKey`] of the schema set in the static context
+/// — simple or complex. Two kinds of name have no key there, and still have to
+/// be expressible, because XPath 2.0 §2.5.1 puts the predefined types in the
+/// in-scope schema types of *every* static context:
+///
+/// * `xs:untyped`, "used as the type annotation of an element node that has not
+///   been validated" (§2.5.1), which is an XDM type with no schema component;
+/// * a predefined type of the `xs` namespace when the static context has no
+///   schema set (or one that lacks the type: an XSD 1.0 set has no
+///   `xs:anyAtomicType` or `xs:untypedAtomic`).
+///
+/// A node with no type annotation is untyped: an element is annotated
+/// `xs:untyped`, an attribute `xs:untypedAtomic` (§2.5.1: "An attribute that
+/// has been validated in skip mode is represented in the data model by an
+/// attribute node with the type annotation xs:untypedAtomic"). Matching treats
+/// `xs:untyped` as derived from `xs:anyType` only, and `xs:untypedAtomic` as an
+/// atomic type ("xs:untypedAtomic is an atomic type", §2.5.1) derived from
+/// `xs:anyAtomicType`, `xs:anySimpleType` and `xs:anyType`; "No predefined
+/// schema types are derived from xs:untyped", nor from `xs:untypedAtomic`
+/// (§2.5.1).
+///
+/// # Canonical form
+///
+/// The binder spells every name of the `xs` namespace as
+/// [`TypeTest::Untyped`] or [`TypeTest::BuiltIn`], never as the schema set's
+/// key for that type, and every other name as [`TypeTest::Schema`]. A host may
+/// also build `Schema(key)` with the key of a predefined type: it **matches**
+/// exactly like the `BuiltIn` spelling, but the derived `PartialEq` and `Hash`
+/// tell the two apart. [`TypeTest::canonical`] maps such a key to the binder's
+/// spelling, so compare canonical forms.
+///
+/// The enum is `#[non_exhaustive]`: a later release may add a way to name a
+/// type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TypeTest {
+    /// A type definition of the schema set in the static context, simple or
+    /// complex. `derives-from` is that set's derivation relation.
+    Schema(TypeKey),
+    /// A predefined type of the `xs` namespace, by its code — e.g.
+    /// `xs:integer`, `xs:anyType`, `xs:untypedAtomic`. Matched against the
+    /// schema set's built-in type of that code when there is one.
+    ///
+    /// XPath 2.0 §2.5.1 leaves the predefined types to the host ("a set of
+    /// predefined schema types that is determined by the host language"). This
+    /// engine's are every built-in type it knows, the XSD 1.1 types
+    /// `xs:dateTimeStamp` and `xs:error` included, whatever schema set — or none
+    /// — is attached: the same set `instance of`, `cast as` and the constructor
+    /// functions accept. An annotated node of an XSD 1.0 set never derives
+    /// from an XSD 1.1-only type, so such a test simply matches none of its
+    /// nodes; `xs:anyAtomicType` still covers every atomic type there.
+    BuiltIn(XmlTypeCode),
+    /// `xs:untyped`.
+    Untyped,
+}
+
+impl TypeTest {
+    /// The canonical spelling of this test against `schema_set`: a
+    /// [`TypeTest::Schema`] key of one of the set's predefined types becomes
+    /// [`TypeTest::BuiltIn`] with that type's code (`xs:anyType` included);
+    /// everything else is returned as it is. Two tests that name the same type
+    /// have equal canonical forms. The binder already produces this form.
+    pub fn canonical(&self, schema_set: &crate::schema::SchemaSet) -> TypeTest {
+        match *self {
+            TypeTest::Schema(key) if schema_set.is_any_type(key) => {
+                TypeTest::BuiltIn(XmlTypeCode::AnyType)
+            }
+            TypeTest::Schema(TypeKey::Simple(simple)) => match schema_set.get_type_code(simple) {
+                Some(code) => TypeTest::BuiltIn(code),
+                None => *self,
+            },
+            other => other,
+        }
+    }
+}
+
 /// Item type in a sequence type
+///
+/// The enum and its two struct-like variants are `#[non_exhaustive]`: build the
+/// element and attribute tests with [`ItemType::element`] and
+/// [`ItemType::attribute`], and match them with `..`, so that a later release
+/// can add an item type or a field without breaking a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ItemType {
     /// item() - any item
     AnyItem,
@@ -82,10 +167,28 @@ pub enum ItemType {
     AnyNode,
     /// document-node() with optional element type
     Document(Option<Box<ItemType>>),
-    /// element() with optional name and type
-    Element(Option<NameTest>, Option<SimpleTypeKey>),
-    /// attribute() with optional name and type
-    Attribute(Option<NameTest>, Option<SimpleTypeKey>),
+    /// `element()`, `element(N)`, `element(N, T)` or `element(N, T?)` —
+    /// XPath 2.0 §2.5.4.3.
+    #[non_exhaustive]
+    Element {
+        /// The `ElementName`, or a wildcard; `None` for `element()`.
+        name: Option<NameTest>,
+        /// The `TypeName`; `None` when the test names no type.
+        type_test: Option<TypeTest>,
+        /// `T?`: whether a nilled element matches too. Only meaningful with a
+        /// `type_test` — without one, the nilled property never matters, and
+        /// [`ItemType::element`] keeps it `false`.
+        nillable: bool,
+    },
+    /// `attribute()`, `attribute(N)` or `attribute(N, T)` — XPath 2.0
+    /// §2.5.4.5.
+    #[non_exhaustive]
+    Attribute {
+        /// The `AttributeName`, or a wildcard; `None` for `attribute()`.
+        name: Option<NameTest>,
+        /// The `TypeName`; `None` when the test names no type.
+        type_test: Option<TypeTest>,
+    },
     /// schema-element()
     SchemaElement(QualifiedName),
     /// schema-attribute()
@@ -105,14 +208,37 @@ pub enum ItemType {
 }
 
 impl ItemType {
+    /// `element(name, T)` / `element(name, T?)`: an element test, with
+    /// `nillable` the `?` after the type name (§2.5.4.3).
+    ///
+    /// `element()` is `ItemType::element(None, None, false)`, `element(*)`
+    /// `ItemType::element(Some(NameTest::Wildcard), None, false)`.
+    ///
+    /// Without a `type_test` the nilled property never matters ("element(
+    /// ElementName) matches any element node whose name is ElementName,
+    /// regardless of its type annotation or nilled property"), so `nillable`
+    /// is then normalized to `false`: `element(n)` has one spelling.
+    pub fn element(name: Option<NameTest>, type_test: Option<TypeTest>, nillable: bool) -> Self {
+        Self::Element {
+            name,
+            nillable: nillable && type_test.is_some(),
+            type_test,
+        }
+    }
+
+    /// `attribute(name, T)`: an attribute test (§2.5.4.5).
+    pub fn attribute(name: Option<NameTest>, type_test: Option<TypeTest>) -> Self {
+        Self::Attribute { name, type_test }
+    }
+
     /// Get the type code for this item type
     pub fn type_code(&self) -> XmlTypeCode {
         match self {
             Self::AnyItem => XmlTypeCode::Item,
             Self::AnyNode => XmlTypeCode::Node,
             Self::Document(_) => XmlTypeCode::Document,
-            Self::Element(_, _) | Self::SchemaElement(_) => XmlTypeCode::Element,
-            Self::Attribute(_, _) | Self::SchemaAttribute(_) => XmlTypeCode::Attribute,
+            Self::Element { .. } | Self::SchemaElement(_) => XmlTypeCode::Element,
+            Self::Attribute { .. } | Self::SchemaAttribute(_) => XmlTypeCode::Attribute,
             Self::Text => XmlTypeCode::Text,
             Self::Comment => XmlTypeCode::Comment,
             Self::ProcessingInstruction(_) => XmlTypeCode::ProcessingInstruction,
@@ -128,8 +254,8 @@ impl ItemType {
             self,
             Self::AnyNode
                 | Self::Document(_)
-                | Self::Element(_, _)
-                | Self::Attribute(_, _)
+                | Self::Element { .. }
+                | Self::Attribute { .. }
                 | Self::SchemaElement(_)
                 | Self::SchemaAttribute(_)
                 | Self::Text
@@ -156,118 +282,12 @@ impl ItemType {
     }
 
     /// Check if a node matches this item type.
+    ///
+    /// The one node matcher a step node test, `instance of` and `treat as`
+    /// also run (XPath 2.0 §2.5.4.2 – §2.5.4.6), so every spelling of a test
+    /// agrees.
     fn matches_node<N: DomNavigator>(&self, nav: &N, ctx: &XPathContext<'_>) -> bool {
-        match self {
-            Self::AnyItem => true,
-            Self::AnyNode => true,
-            Self::Document(None) => nav.node_type() == DomNodeType::Root,
-            Self::Document(Some(inner)) => {
-                if nav.node_type() != DomNodeType::Root {
-                    return false;
-                }
-                // Per XPath 2.0 spec: document-node(E) matches a document node that
-                // contains exactly one element child (optionally with comment/PI nodes),
-                // and that element must match E.
-                let mut cursor = nav.clone();
-                if !cursor.move_to_first_child() {
-                    return false;
-                }
-
-                let mut element_count = 0;
-                let mut matching_element: Option<N> = None;
-
-                loop {
-                    let node_type = cursor.node_type();
-                    match node_type {
-                        DomNodeType::Element => {
-                            element_count += 1;
-                            if element_count > 1 {
-                                // More than one element child - reject
-                                return false;
-                            }
-                            // Store this element to check against inner type
-                            matching_element = Some(cursor.clone());
-                        }
-                        DomNodeType::Comment | DomNodeType::ProcessingInstruction => {
-                            // Comments and PIs are allowed
-                        }
-                        DomNodeType::Text
-                        | DomNodeType::Whitespace
-                        | DomNodeType::SignificantWhitespace => {
-                            // Text nodes in document (outside root element) are typically
-                            // whitespace. Per spec, whitespace-only text nodes may appear.
-                        }
-                        _ => {
-                            // Other node types (shouldn't appear at document level)
-                        }
-                    }
-                    if !cursor.move_to_next_sibling() {
-                        break;
-                    }
-                }
-
-                // Must have exactly one element child
-                if element_count != 1 {
-                    return false;
-                }
-
-                // The single element must match the inner type
-                match matching_element {
-                    Some(elem) => inner.matches_node(&elem, ctx),
-                    None => false,
-                }
-            }
-            Self::Element(name_test, schema_type) => {
-                if nav.node_type() != DomNodeType::Element {
-                    return false;
-                }
-                if let Some(test) = name_test {
-                    if !Self::matches_name_test(test, nav, ctx) {
-                        return false;
-                    }
-                }
-                if let Some(expected) = schema_type {
-                    if !Self::matches_schema_type(nav, *expected, ctx) {
-                        return false;
-                    }
-                }
-                true
-            }
-            Self::Attribute(name_test, schema_type) => {
-                if nav.node_type() != DomNodeType::Attribute {
-                    return false;
-                }
-                if let Some(test) = name_test {
-                    if !Self::matches_name_test(test, nav, ctx) {
-                        return false;
-                    }
-                }
-                if let Some(expected) = schema_type {
-                    if !Self::matches_schema_type(nav, *expected, ctx) {
-                        return false;
-                    }
-                }
-                true
-            }
-            // §2.5.4.4 / §2.5.4.6, including the substitution group and the
-            // nilled clause: one implementation, shared with the node-test
-            // module so every spelling of the test agrees.
-            Self::SchemaElement(name) => {
-                crate::xpath::node_test::matches_schema_element(nav, name, ctx)
-            }
-            Self::SchemaAttribute(name) => {
-                crate::xpath::node_test::matches_schema_attribute(nav, name, ctx)
-            }
-            Self::Text => nav.node_type().is_text_like(),
-            Self::Comment => nav.node_type() == DomNodeType::Comment,
-            Self::ProcessingInstruction(target) => {
-                nav.node_type() == DomNodeType::ProcessingInstruction
-                    && target.as_ref().is_none_or(|name| nav.local_name() == name)
-            }
-            Self::NamespaceNode => nav.node_type() == DomNodeType::Namespace,
-            // Atomic types don't match nodes
-            Self::AtomicType(_) | Self::SchemaAtomicType(_) => false,
-        }
+        crate::xpath::node_test::matches_item_type(self, nav, ctx)
     }
 
     /// Check if an atomic value matches this item type.
@@ -294,8 +314,8 @@ impl ItemType {
             }
             // All node types don't match atomics
             Self::Document(_)
-            | Self::Element(_, _)
-            | Self::Attribute(_, _)
+            | Self::Element { .. }
+            | Self::Attribute { .. }
             | Self::SchemaElement(_)
             | Self::SchemaAttribute(_)
             | Self::Text
@@ -303,73 +323,6 @@ impl ItemType {
             | Self::ProcessingInstruction(_)
             | Self::NamespaceNode => false,
         }
-    }
-
-    /// Helper: check if a node matches a name test.
-    fn matches_name_test<N: DomNavigator>(
-        test: &NameTest,
-        nav: &N,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
-        match test {
-            NameTest::Wildcard => true,
-            NameTest::NamespaceWildcard(local_id) => {
-                // *:local - match any namespace with specific local name
-                match ctx.resolve_name(*local_id) {
-                    Some(local) => nav.local_name() == local,
-                    None => false,
-                }
-            }
-            NameTest::LocalWildcard(ns_id) => {
-                // prefix:* - match any local name in specific namespace
-                match ctx.resolve_name(*ns_id) {
-                    Some(ns) => nav.namespace_uri() == ns,
-                    None => false,
-                }
-            }
-            NameTest::QName(qname) => Self::matches_qname(qname, nav, ctx),
-        }
-    }
-
-    /// Helper: check if a node matches a QualifiedName.
-    fn matches_qname<N: DomNavigator>(
-        qname: &QualifiedName,
-        nav: &N,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
-        let local = match ctx.resolve_name(qname.local_name) {
-            Some(local) => local,
-            None => return false,
-        };
-        let ns = match qname.namespace_uri {
-            Some(id) => match ctx.resolve_name(id) {
-                Some(ns) => ns,
-                None => return false,
-            },
-            None => String::new(),
-        };
-        nav.local_name() == local && nav.namespace_uri() == ns
-    }
-
-    /// Helper: check schema type derivation for element/attribute.
-    fn matches_schema_type<N: DomNavigator>(
-        nav: &N,
-        expected: SimpleTypeKey,
-        ctx: &XPathContext<'_>,
-    ) -> bool {
-        if let Some(actual) = nav.schema_type() {
-            if let Some(schema_set) = ctx.schema_set {
-                return schema_set.is_type_derived_from(
-                    TypeKey::Simple(actual),
-                    TypeKey::Simple(expected),
-                    DerivationSet::empty(),
-                );
-            }
-            // Fallback to equality without schema set
-            return actual == expected;
-        }
-        // No schema type on node
-        false
     }
 }
 
@@ -392,6 +345,119 @@ impl NameTest {
     /// Check if this is a wildcard (matches any name)
     pub fn is_wildcard(&self) -> bool {
         matches!(self, Self::Wildcard)
+    }
+}
+
+/// A diagnostic form. A name test holds interned names, which print as their
+/// [`NameId`](crate::ids::NameId)s (`$7`) because no name table is at hand:
+/// `*`, `*:$7`, `Q{$3}*`, `Q{$3}$7`, or `$7` for a name in no namespace.
+impl fmt::Display for NameTest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Wildcard => f.write_str("*"),
+            Self::NamespaceWildcard(local) => write!(f, "*:{local}"),
+            Self::LocalWildcard(ns) => write!(f, "Q{{{ns}}}*"),
+            Self::QName(qname) => write_qualified_name(f, qname),
+        }
+    }
+}
+
+/// `xs:untyped`, `xs:integer` (a built-in by its code) or the key of a schema
+/// type (`SimpleTypeKey(…)`, `ComplexTypeKey(…)`), which has no name without
+/// its schema set.
+impl fmt::Display for TypeTest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Untyped => f.write_str("xs:untyped"),
+            Self::BuiltIn(code) => match code.local_name() {
+                Some(name) => write!(f, "xs:{name}"),
+                None => write!(f, "{code:?}"),
+            },
+            Self::Schema(TypeKey::Simple(key)) => write!(f, "{key:?}"),
+            Self::Schema(TypeKey::Complex(key)) => write!(f, "{key:?}"),
+        }
+    }
+}
+
+fn write_qualified_name(f: &mut fmt::Formatter<'_>, qname: &QualifiedName) -> fmt::Result {
+    match qname.namespace_uri {
+        Some(ns) => write!(f, "Q{{{ns}}}{}", qname.local_name),
+        None => write!(f, "{}", qname.local_name),
+    }
+}
+
+/// The item type in the XPath 2.0 SequenceType syntax (§2.5.3), with interned
+/// names and schema types in the diagnostic forms of [`NameTest`] and
+/// [`TypeTest`]: e.g. `element(*, xs:untyped?)`, `attribute($7)`.
+impl fmt::Display for ItemType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ItemType::AnyItem => f.write_str("item()"),
+            ItemType::AnyNode => f.write_str("node()"),
+            ItemType::Document(None) => f.write_str("document-node()"),
+            ItemType::Document(Some(inner)) => write!(f, "document-node({inner})"),
+            ItemType::Element {
+                name,
+                type_test,
+                nillable,
+            } => {
+                f.write_str("element(")?;
+                match (name, type_test) {
+                    (None, None) => {}
+                    (name, type_test) => {
+                        match name {
+                            Some(name) => write!(f, "{name}")?,
+                            None => f.write_str("*")?,
+                        }
+                        if let Some(type_test) = type_test {
+                            write!(f, ", {type_test}")?;
+                            if *nillable {
+                                f.write_str("?")?;
+                            }
+                        }
+                    }
+                }
+                f.write_str(")")
+            }
+            ItemType::Attribute { name, type_test } => {
+                f.write_str("attribute(")?;
+                match (name, type_test) {
+                    (None, None) => {}
+                    (name, type_test) => {
+                        match name {
+                            Some(name) => write!(f, "{name}")?,
+                            None => f.write_str("*")?,
+                        }
+                        if let Some(type_test) = type_test {
+                            write!(f, ", {type_test}")?;
+                        }
+                    }
+                }
+                f.write_str(")")
+            }
+            ItemType::SchemaElement(qname) => {
+                f.write_str("schema-element(")?;
+                write_qualified_name(f, qname)?;
+                f.write_str(")")
+            }
+            ItemType::SchemaAttribute(qname) => {
+                f.write_str("schema-attribute(")?;
+                write_qualified_name(f, qname)?;
+                f.write_str(")")
+            }
+            ItemType::Text => f.write_str("text()"),
+            ItemType::Comment => f.write_str("comment()"),
+            ItemType::ProcessingInstruction(None) => f.write_str("processing-instruction()"),
+            ItemType::ProcessingInstruction(Some(name)) => {
+                write!(f, "processing-instruction({name})")
+            }
+            ItemType::NamespaceNode => f.write_str("namespace-node()"),
+            ItemType::AtomicType(code) => match code.local_name() {
+                Some(name) => write!(f, "xs:{name}"),
+                None => write!(f, "{code:?}"),
+            },
+            ItemType::SchemaAtomicType(key) => write!(f, "{key:?}"),
+        }
     }
 }
 
@@ -618,39 +684,7 @@ impl fmt::Display for SequenceType {
         }
 
         // Format item type
-        match &self.item_type {
-            ItemType::AnyItem => write!(f, "item()")?,
-            ItemType::AnyNode => write!(f, "node()")?,
-            ItemType::Document(None) => write!(f, "document-node()")?,
-            ItemType::Document(Some(elem)) => write!(f, "document-node({:?})", elem)?,
-            ItemType::Element(None, None) => write!(f, "element()")?,
-            ItemType::Element(Some(name), None) => write!(f, "element({:?})", name)?,
-            ItemType::Element(name, Some(_type_key)) => {
-                write!(f, "element({:?}, ...)", name)?;
-            }
-            ItemType::Attribute(None, None) => write!(f, "attribute()")?,
-            ItemType::Attribute(Some(name), None) => write!(f, "attribute({:?})", name)?,
-            ItemType::Attribute(name, Some(_type_key)) => {
-                write!(f, "attribute({:?}, ...)", name)?;
-            }
-            ItemType::SchemaElement(qn) => write!(f, "schema-element({:?})", qn)?,
-            ItemType::SchemaAttribute(qn) => write!(f, "schema-attribute({:?})", qn)?,
-            ItemType::Text => write!(f, "text()")?,
-            ItemType::Comment => write!(f, "comment()")?,
-            ItemType::ProcessingInstruction(None) => write!(f, "processing-instruction()")?,
-            ItemType::ProcessingInstruction(Some(name)) => {
-                write!(f, "processing-instruction({})", name)?;
-            }
-            ItemType::NamespaceNode => write!(f, "namespace-node()")?,
-            ItemType::AtomicType(code) => {
-                if let Some(name) = code.local_name() {
-                    write!(f, "xs:{}", name)?;
-                } else {
-                    write!(f, "{:?}", code)?;
-                }
-            }
-            ItemType::SchemaAtomicType(_key) => write!(f, "schema-type(...)")?,
-        }
+        write!(f, "{}", self.item_type)?;
 
         // Format cardinality
         write!(f, "{}", self.cardinality)?;
@@ -723,6 +757,69 @@ mod tests {
         assert_eq!(SequenceType::string_optional().to_string(), "xs:string?");
         assert_eq!(SequenceType::nodes().to_string(), "node()*");
         assert_eq!(SequenceType::integer().to_string(), "xs:integer");
+    }
+
+    /// The element and attribute tests display in the SequenceType syntax,
+    /// interned names as their ids and schema types as their keys.
+    #[test]
+    fn test_element_and_attribute_item_type_display() {
+        let table = NameTable::new();
+        let ns = table.add("urn:x");
+        let local = table.add("a");
+        let qname = QualifiedName::new(Some(ns), local, None);
+        let q = |s: String| {
+            s.replace("$ns", &ns.to_string())
+                .replace("$l", &local.to_string())
+        };
+
+        assert_eq!(
+            SequenceType::one(ItemType::element(None, None, false)).to_string(),
+            "element()"
+        );
+        assert_eq!(
+            ItemType::element(Some(NameTest::Wildcard), None, false).to_string(),
+            "element(*)"
+        );
+        assert_eq!(
+            ItemType::element(Some(NameTest::QName(qname.clone())), None, false).to_string(),
+            q("element(Q{$ns}$l)".to_string())
+        );
+        assert_eq!(
+            ItemType::element(None, Some(TypeTest::Untyped), true).to_string(),
+            "element(*, xs:untyped?)"
+        );
+        assert_eq!(
+            SequenceType::star(ItemType::element(
+                Some(NameTest::QName(qname.clone())),
+                Some(TypeTest::BuiltIn(XmlTypeCode::Integer)),
+                false
+            ))
+            .to_string(),
+            q("element(Q{$ns}$l, xs:integer)*".to_string())
+        );
+        // A schema type has no name without its schema set: its key prints.
+        let schema_set = crate::schema::SchemaSet::new();
+        let any_type = TypeKey::Complex(schema_set.any_type_key());
+        let shown = ItemType::element(None, Some(TypeTest::Schema(any_type)), false).to_string();
+        assert!(shown.starts_with("element(*, ComplexTypeKey("), "{shown}");
+        assert_eq!(ItemType::attribute(None, None).to_string(), "attribute()");
+        assert_eq!(
+            ItemType::attribute(
+                Some(NameTest::NamespaceWildcard(local)),
+                Some(TypeTest::BuiltIn(XmlTypeCode::UntypedAtomic))
+            )
+            .to_string(),
+            q("attribute(*:$l, xs:untypedAtomic)".to_string())
+        );
+        assert_eq!(
+            SequenceType::optional(ItemType::attribute(Some(NameTest::LocalWildcard(ns)), None))
+                .to_string(),
+            q("attribute(Q{$ns}*)?".to_string())
+        );
+        assert_eq!(
+            ItemType::Document(Some(Box::new(ItemType::SchemaElement(qname)))).to_string(),
+            q("document-node(schema-element(Q{$ns}$l))".to_string())
+        );
     }
 
     #[test]
@@ -948,7 +1045,7 @@ mod tests {
     #[test]
     fn test_element_item_type_matches_element() {
         // element() matches element nodes
-        let item_type = ItemType::Element(None, None);
+        let item_type = ItemType::element(None, None, false);
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
 
@@ -1060,7 +1157,7 @@ mod tests {
     #[test]
     fn test_document_node_with_element_single_element() {
         // document-node(element()) matches document with exactly one element child
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(None, None, false))));
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
 
@@ -1073,7 +1170,7 @@ mod tests {
     #[test]
     fn test_document_node_with_element_allows_comments() {
         // document-node(element()) allows comments alongside the element
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(None, None, false))));
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
 
@@ -1087,7 +1184,7 @@ mod tests {
     #[test]
     fn test_document_node_with_element_allows_pi() {
         // document-node(element()) allows processing instructions alongside the element
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(None, None, false))));
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
 
@@ -1100,7 +1197,7 @@ mod tests {
     #[test]
     fn test_document_node_with_element_rejects_no_element() {
         // document-node(element()) rejects document with no element children
-        let item_type = ItemType::Document(Some(Box::new(ItemType::Element(None, None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(None, None, false))));
         let table = NameTable::new();
         let ctx = XPathContext::new(&table);
 
@@ -1121,8 +1218,11 @@ mod tests {
         let root_id = table.add("root");
         let qname = QualifiedName::local(root_id);
         let name_test = NameTest::QName(qname);
-        let item_type =
-            ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(
+            Some(name_test),
+            None,
+            false,
+        ))));
         let ctx = XPathContext::new(&table);
 
         let doc = roxmltree::Document::parse("<root/>").expect("parse xml");
@@ -1138,8 +1238,11 @@ mod tests {
         let root_id = table.add("root");
         let qname = QualifiedName::local(root_id);
         let name_test = NameTest::QName(qname);
-        let item_type =
-            ItemType::Document(Some(Box::new(ItemType::Element(Some(name_test), None))));
+        let item_type = ItemType::Document(Some(Box::new(ItemType::element(
+            Some(name_test),
+            None,
+            false,
+        ))));
         let ctx = XPathContext::new(&table);
 
         let doc = roxmltree::Document::parse("<other/>").expect("parse xml");

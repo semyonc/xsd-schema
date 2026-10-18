@@ -15,7 +15,7 @@
 use crate::ids::NameId;
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::NameTable;
-use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
@@ -139,7 +139,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(namespace_uri, local_name, prefix);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 DomNodeType::ProcessingInstruction => {
@@ -148,7 +148,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(None, local_name, None);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 DomNodeType::Namespace => {
@@ -157,7 +157,7 @@ pub fn node_name<N: DomNavigator>(
                     let qname = QualifiedName::new(None, local_name, None);
                     Ok(XPathValue::from_atomic(XmlValue::new(
                         XmlTypeCode::QName,
-                        XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
+                        XmlValueKind::Atomic(XmlAtomicValue::QName(QNameValue::new(qname, names))),
                     )))
                 }
                 // Text, Comment, Document nodes have no name

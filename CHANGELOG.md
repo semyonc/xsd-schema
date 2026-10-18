@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `XPathError`, `FunctionId` and `ItemType` are `#[non_exhaustive]`: a `match`
+  on them needs a wildcard arm, and later variants are additive.
+- Errors identified by an error QName — what `fn:error` raises, a host's own
+  codes, and the specification codes without a variant of their own — are the
+  new variant `XPathError::Raised(RaisedErrorInfo)` instead of an `Internal`
+  message. `XPathError::raised`, `raised_error` and `error_code` keep working;
+  the `Display` of such an error is `[CODE] description`.
+- `XPathError::XPDY0050` carries a message (`XPDY0050 { message }`), and
+  XPST0080 is a variant of its own (`XPST0080 { type_name }`, no longer in
+  `QNAMED_ERROR_CODES`). `XPathError::more_than_one_item()` returns `XPTY0004`
+  (XPath 2.0 §3.1.5); `XPDY0050` is the code of `treat as` and of a leading `/`
+  outside a document.
+- `FunctionId` has a new variant, `Error`.
+- `ItemType::Element` and `ItemType::Attribute` are struct variants,
+  `Element { name, type_test, nillable }` and `Attribute { name, type_test }`,
+  built with `ItemType::element` / `ItemType::attribute`. Their type is a
+  `TypeTest` (`#[non_exhaustive]`): a schema type key — simple or complex —, a
+  predefined `xs` type by its code, or `xs:untyped`; `TypeTest::canonical` gives
+  the spelling the binder produces. `ItemType::element` without a type ignores
+  `nillable`. The element and attribute tests of a host-built `ItemType` read
+  the node's type annotation (complex types included) and the untyped rules
+  (`xs:untyped`, `xs:untypedAtomic`).
+- `xpath::ast::TypeExprNode` has a crate-private field, so it cannot be built
+  with a struct literal outside the crate: use `TypeExprNode::new`. Bind a node
+  again after editing it.
+- `XmlAtomicValue::QName` and `XmlAtomicValue::Notation` hold a `QNameValue`
+  instead of a `QualifiedName`: the expanded name (`QNameValue::name()`)
+  together with its string form, so such a value converts to a string without
+  a name table. Build one with `QNameValue::new(name, &name_table)`.
+- `XmlValueKind::List::items` is a `Vec<XmlValue>` (it was a
+  `Vec<XmlAtomicValue>`): each member carries its own type code and
+  `schema_type` — the item type's or, for a list whose item type is a union,
+  those of the member type that validated that member. `item_type` is the code
+  of the declared item type (`xs:anySimpleType` for a union); it was the type
+  of the last member. `XmlValue::to_xpath_value` takes no argument.
+- `SequenceType`'s `Display` prints element, attribute, document and schema
+  tests in SequenceType syntax.
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -14,12 +54,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Lend it to a run with `XPathEvaluator::with_regex_cache`, or
   `DynamicContext::with_regex_cache` / `set_regex_cache` (inside a `run_with`
   callback). A host that evaluates the same expressions once per item — for
-  example an XSLT processor's `xsl:if` inside `xsl:for-each` — then compiles
-  each pattern once instead of once per evaluation. Bounded (64 entries by
+  example a test evaluated for every item of a loop — then compiles each
+  pattern once instead of once per evaluation. Bounded (64 entries by
   default, `RegexCache::with_capacity`, least recently used dropped), `Send`
   but not `Sync`, no global state. Without one, each run keeps its own cache as
   before.
 - `compose::Composer` keeps one such cache for all its evaluations.
+
+- `fn:error` is a built-in function, with the four signatures of F&O §3; a
+  host's own registration of it still takes precedence. The error object
+  travels with the error (`RaisedErrorInfo::error_object`).
+- `XPathError::host(namespace, local, description, payload)`: a host error with
+  a code of its own and a payload of the host's own error type, read back with
+  `XPathError::downcast_host_payload` / `host_payload`, or as the error's
+  `source()`. `RaisedErrorInfo` implements `std::error::Error`; cloning a
+  raised error shares its data. Also `XPathError::treat_mismatch` and
+  `root_not_a_document`.
+- `types::QNameValue` (`new`, `name`, `prefix`, `local_name`, `lexical`): its
+  `Display` is the lexical form, and its equality ignores the prefix.
+- `TypeTest`, `ItemType::element`, `ItemType::attribute`, and `Display` for
+  `ItemType`, `NameTest`, `TypeTest` and the AST sequence types.
 
 ### Changed
 
@@ -52,6 +106,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `FacetError::InvalidPattern` messages are the engine's `Display` text
   (`invalid regular expression: …`) instead of its `Debug` form.
 
+- XSD 1.1 assertions: an assertion whose test is a static error now — a
+  `schema-element(N)` / `schema-attribute(N)` with an undeclared `N`, or a
+  union or list type in `instance of`, `treat as`, `cast` or `castable` —
+  fails with `cvc-assertion`, as other static errors in assertions already
+  did.
+
+### Fixed
+
+- Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
+  (`xs:string($q)`, `$q cast as xs:string`) raised `XPTY0004`; it gives
+  `prefix:local`, or the local name (F&O §17.1.2). Every other string
+  conversion of such a value — `fn:string`, `concat`, `string-join`,
+  `XmlValue::to_string_value`, `Display` — gave an internal debug form
+  (`QName(Some(NameId(…)):…)`) and now gives the same lexical form.
+- The typed value of an `xs:NOTATION`-typed node was an `xs:QName` value, and a
+  member of a list of `xs:QName` was a string under the QName type code, so
+  `eq` and `namespace-uri-from-QName` failed on it.
+- The members of a list whose item type is a union are typed with the member
+  type that validated each of them (XPath 2.0 §2.5.2) — in `fn:data` and in
+  `$value` of an assertion on a simple type and on a complex type with simple
+  content: `data(@a)[2] + 1` on `x 1` (a union of `xs:integer` and
+  `xs:string`) is `2` (it raised `XPTY0004`), and `$value` of a complex type
+  with simple content no longer types every member with the last member's type
+  (`abc` was an `xs:decimal`). A member that the union's `xs:decimal` member
+  type validated beyond `rust_decimal`'s capacity is an `xs:decimal` with the
+  capacity warning, as any other such value.
+- `xs:ENTITY` values inside a union value — a union with an `xs:ENTITIES` or
+  `xs:ENTITY` member, also as the item type of a list — are checked against the
+  document's unparsed entities (Structures §3.16.4); an undeclared entity was
+  accepted. The `xs:ENTITY`, `xs:ID` and `xs:IDREF` members of a list of a
+  union are recognized by their own member type: an integer member was checked
+  as an entity name when the list's last member was an ENTITY, and an ENTITY
+  member was not checked otherwise.
+- An `xs:QName` or `xs:NOTATION` member of a list whose prefix is not declared
+  is invalid (`cvc-datatype-valid.1.2.1`), as an atomic value already was — in
+  a list of `xs:QName` with more than one member, in a list of a union with a
+  QName member, and in any such list as element content, none of which was
+  checked.
+- A list type's `enumeration` compares the instance with each enumerated list
+  member for member in value space (Datatypes §4.3.5.4, §2.4.1.2): `01 2`
+  matches `enumeration="1 2"` on a list of `xs:integer`, and `1 x` matches
+  `1.0 x` on a list of a union of `xs:decimal` and `xs:string`. `pattern` still
+  constrains the lexical form. A union whose chosen member type is a list
+  compares its enumeration the same way (an enumerated list never matched).
+- Identity constraints compare list values member for member, each member in
+  its own value space (Structures §3.11.4, Datatypes §2.2.1): a list of
+  `xs:integer` `1 2` and a list of `xs:decimal` `1.0 2` are equal keys, and an
+  integer member of a list of a union no longer equals the string `1` of a
+  list of `xs:string`.
+- XSD 1.1 type alternatives: a test that calls an XML Schema constructor
+  function that does not exist (`xs:anyAtomicType('a')`, `xs:NOTATION('a')`)
+  or casts to `xs:NOTATION` / `xs:anyAtomicType` makes the schema invalid
+  (`src-ct-alternative`, Structures §3.12.6); the alternative was skipped.
+- `schema-element(N)` / `schema-attribute(N)` with an `N` that is not declared
+  is the static error XPST0008 (XPath 2.0 §2.5.4.4, §2.5.4.6), also when no
+  schema set is attached.
+- A union or list type as the type of `instance of`, `treat as`, `cast` or
+  `castable` is the static error XPST0051 (XPath 2.0 §2.5.4.2).
+- `instance of` / `treat as` a user-defined atomic type match by derivation
+  (XPath 2.0 §2.5.4.2); they were always false.
+- `instance of` / `treat as` `element(N)` expand an unprefixed `N` with the
+  default element namespace, as a path step does (XPath 2.0 §2.5.4).
+- `element(*, xs:anyAtomicType)` / `attribute(*, xs:anyAtomicType)` match
+  annotated atomic nodes with an XSD 1.0 schema set too.
+- `document-node(E)` matches a document with exactly one element child and
+  otherwise only comments and processing instructions (XPath 2.0 §2.5.4.2), in
+  every form of the test.
+- `xs:NOTATION(…)` and `xs:anyAtomicType(…)` name no function (XPST0017, XPath
+  2.0 §3.10.4); they were XPST0051 and a dynamic `XPTY0004`.
+- A failed `treat as` says which sequence type was expected and what the
+  operand was.
+
 ### Performance
 
 - Each `xs:pattern` is compiled once: XSD 1.1 patterns were compiled two to
@@ -63,6 +189,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   163 ms and takes 4.4 ms.
 - `fn:translate` with a long `$mapString` is linear instead of
   `|$arg| × |$mapString|` (a map of a whole Unicode category took minutes).
+
+- Validating list values is about 5–10 % faster: the members of a list of a
+  union are no longer converted to strings and validated again.
+- A path step with a named kind test (`element(c)`) compares names without
+  allocating, about twice as fast; `instance of` / `treat as` resolve their
+  type once per expression.
 
 ## [0.2.3] - 2026-10-15
 

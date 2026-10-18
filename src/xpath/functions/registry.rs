@@ -1099,6 +1099,26 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
         FunctionId::DefaultCollation,
         FunctionSignature::new(FN_NAMESPACE, "default-collation", vec![], string()),
     ));
+    // F&O §3: `fn:error() as none`, `fn:error($error as xs:QName) as none`,
+    // `fn:error($error as xs:QName?, $description as xs:string) as none`,
+    // `fn:error($error as xs:QName?, $description as xs:string,
+    // $error-object as item()*) as none`. One entry for the four arities: the
+    // declared types matter only to XPath 1.0 compatibility mode, which
+    // converts a single-item parameter the same way for `xs:QName` and
+    // `xs:QName?`, and the implementation enforces each arity's own types
+    // (see `special::error`). `none` has no SequenceType spelling; the
+    // empty sequence stands for "never returns".
+    registry.register(FunctionEntry::new(
+        FunctionId::Error,
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "error",
+            0,
+            3,
+            vec![qname_opt(), string(), any()],
+            empty(),
+        ),
+    ));
 
     // ========================================================================
     // Conversion Functions
@@ -1182,6 +1202,26 @@ mod tests {
         let entry = FUNCTION_REGISTRY.by_id(FunctionId::Position);
         assert!(entry.is_some());
         assert_eq!(entry.unwrap().signature.local_name, "position");
+    }
+
+    /// `fn:error` is a built-in at arities 0 to 3, in both function
+    /// namespaces.
+    #[test]
+    fn test_registry_error_is_built_in() {
+        for arity in 0..=3 {
+            let entry = FUNCTION_REGISTRY
+                .lookup(FN_NAMESPACE, "error", arity)
+                .unwrap_or_else(|| panic!("fn:error#{arity}"));
+            assert_eq!(entry.id, FunctionId::Error);
+            assert!(entry.signature.return_type.is_empty_sequence());
+        }
+        assert!(FUNCTION_REGISTRY.lookup(FN_NAMESPACE, "error", 4).is_none());
+        assert_eq!(
+            FUNCTION_REGISTRY
+                .lookup(FN_2010_NAMESPACE, "error", 2)
+                .map(|e| e.id),
+            Some(FunctionId::Error)
+        );
     }
 
     #[test]

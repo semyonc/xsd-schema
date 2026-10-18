@@ -16,7 +16,7 @@ use crate::xpath::{DomNodeType, NamespaceAxisScope};
 
 use super::{atomize_to_single_opt, atomize_to_string_opt, XPathValue};
 use crate::namespace::qname::{is_ncname, QualifiedName};
-use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::xpath::iterator::XmlItem;
 
@@ -495,7 +495,7 @@ fn create_qname_value<N: DomNavigator>(
     let ns_id = namespace_uri.map(|ns| names.add(ns));
     let prefix_id = prefix.map(|p| names.add(p));
 
-    let qn = QualifiedName::new(ns_id, local_id, prefix_id);
+    let qn = QNameValue::new(QualifiedName::new(ns_id, local_id, prefix_id), names);
 
     // Create a QName value
     let value = XmlValue::new(

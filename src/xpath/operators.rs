@@ -16,8 +16,8 @@ use crate::namespace::qname::QualifiedName;
 use crate::schema::model::SchemaSet;
 use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{
-    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, TimeValue, TimezoneOffset,
-    XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
+    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, QNameValue, TimeValue,
+    TimezoneOffset, XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
 };
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
@@ -512,7 +512,17 @@ fn list_values_equal(left: &XmlValue, right: &XmlValue) -> bool {
                 item_type: right_item_type,
                 items: right_items,
             },
-        ) => left_item_type == right_item_type && left_items == right_items,
+        ) => {
+            // Members compare by type and value; which schema type (a
+            // restriction, the member a union chose) validated them does not
+            // matter.
+            left_item_type == right_item_type
+                && left_items.len() == right_items.len()
+                && left_items
+                    .iter()
+                    .zip(right_items)
+                    .all(|(l, r)| l.type_code == r.type_code && l.value == r.value)
+        }
         _ => false,
     }
 }
@@ -2394,6 +2404,18 @@ pub(crate) fn cast_to_qname_with_context(
 ) -> Result<XmlValue, XPathError> {
     use crate::xpath::functions::qname::parse_lexical_qname;
 
+    // A value of the target type is already a resolved name: re-reading its
+    // lexical form would resolve its prefix against the static context
+    // instead of the bindings it was made with.
+    if value.type_code == type_code
+        && matches!(
+            value.value,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(_) | XmlAtomicValue::Notation(_))
+        )
+    {
+        return Ok(value.clone());
+    }
+
     let lexical = value.to_string_value();
 
     // Parse prefix:local or local (reuse existing validated parser)
@@ -2418,12 +2440,17 @@ pub(crate) fn cast_to_qname_with_context(
     // Build QualifiedName
     let local_id = context.names.add(&local_name);
     let prefix_id = prefix.as_ref().map(|p| context.names.add(p));
-    let qn = QualifiedName::new(namespace_uri, local_id, prefix_id);
+    let qn = QNameValue::new(
+        QualifiedName::new(namespace_uri, local_id, prefix_id),
+        context.names,
+    );
+    let atom = if type_code == XmlTypeCode::Notation {
+        XmlAtomicValue::Notation(qn)
+    } else {
+        XmlAtomicValue::QName(qn)
+    };
 
-    Ok(XmlValue::new(
-        type_code,
-        XmlValueKind::Atomic(XmlAtomicValue::QName(qn)),
-    ))
+    Ok(XmlValue::new(type_code, XmlValueKind::Atomic(atom)))
 }
 
 /// Perform magnitude relationship promotion with context-aware casting.
@@ -4112,7 +4139,7 @@ mod tests {
         // QName ordering isn't defined, but equality is.
         let names = NameTable::new();
         let local = names.add("a");
-        let qname = QualifiedName::local(local);
+        let qname = QNameValue::new(QualifiedName::local(local), &names);
         let left = XmlValue::new(
             XmlTypeCode::QName,
             XmlValueKind::Atomic(XmlAtomicValue::QName(qname)),
@@ -4123,16 +4150,20 @@ mod tests {
         assert!(compare_le(&left, &right, CollationRef::Codepoint).unwrap());
     }
 
+    fn nmtoken(token: &str) -> XmlValue {
+        XmlValue::new(
+            XmlTypeCode::NmToken,
+            XmlValueKind::Atomic(XmlAtomicValue::String(token.to_string())),
+        )
+    }
+
     #[test]
     fn test_list_equality() {
         let left = XmlValue::new(
             XmlTypeCode::NmTokens,
             XmlValueKind::List {
                 item_type: XmlTypeCode::NmToken,
-                items: vec![
-                    XmlAtomicValue::String("a".to_string()),
-                    XmlAtomicValue::String("b".to_string()),
-                ],
+                items: vec![nmtoken("a"), nmtoken("b")],
             },
         );
         let right = left.clone();
@@ -4140,7 +4171,7 @@ mod tests {
             XmlTypeCode::NmTokens,
             XmlValueKind::List {
                 item_type: XmlTypeCode::NmToken,
-                items: vec![XmlAtomicValue::String("a".to_string())],
+                items: vec![nmtoken("a")],
             },
         );
 

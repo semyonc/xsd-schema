@@ -7,10 +7,12 @@
 //!
 //! - `XmlValue` is a typed container for XSD values
 //! - `XmlAtomicValue` holds the actual parsed value
-//! - QName and NOTATION values use `QualifiedName` (namespace-resolved)
-//! - List values store sequences of atomic values with a known item type
+//! - QName and NOTATION values are a [`QNameValue`]: the namespace-resolved
+//!   [`QualifiedName`] together with its lexical form
+//! - List values hold one `XmlValue` per member, each with its own type
 
 use std::fmt;
+use std::sync::Arc;
 
 use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
@@ -19,6 +21,7 @@ use rust_decimal::Decimal;
 use super::{PrimitiveTypeCode, XmlTypeCode};
 use crate::ids::SimpleTypeKey;
 use crate::namespace::qname::QualifiedName;
+use crate::namespace::table::NameTable;
 
 /// A typed XSD value with type information.
 ///
@@ -154,7 +157,7 @@ impl XmlValue {
             XmlValueKind::Atomic(atom) => atom.to_string(),
             XmlValueKind::List { items, .. } => items
                 .iter()
-                .map(|v| v.to_string())
+                .map(XmlValue::to_string_value)
                 .collect::<Vec<_>>()
                 .join(" "),
             XmlValueKind::Union(inner) => inner.to_string_value(),
@@ -226,40 +229,25 @@ impl XmlValue {
         }
     }
 
-    /// Try to get as QName
+    /// Try to get as QName: the expanded name of an
+    /// [`XmlAtomicValue::QName`] (see [`QNameValue::name`]).
     pub fn as_qname(&self) -> Option<&QualifiedName> {
         match &self.value {
-            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)) => Some(qn),
+            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)) => Some(qn.name()),
             _ => None,
         }
     }
 
-    /// Convert this `XmlValue` to an `XPathValue` for use as `$value` in assertion evaluation.
+    /// Convert this `XmlValue` to an `XPathValue`, for instance as `$value`
+    /// in assertion evaluation.
     ///
     /// - **Atomic/UntypedAtomic** → single `XPathValue::Item`
-    /// - **List** → `XPathValue::Sequence` of atomic items, each with `item_schema_type`
-    /// - **Union** → recursively converts the inner value
-    ///
-    /// The `item_schema_type` parameter is needed because `XmlValueKind::List` stores bare
-    /// `XmlAtomicValue` items without per-item `schema_type`. Callers pass it from the
-    /// list type's `resolved_item_type`.
+    /// - **List** → `XPathValue::Sequence` of its members, each with the type
+    ///   and `schema_type` it was validated with
+    /// - **Union** → recursively converts the member value (so a union whose
+    ///   chosen member type is a list type gives that list's members)
     #[cfg(feature = "xsd11")]
-    pub fn to_xpath_value<N: crate::xpath::DomNavigator>(
-        &self,
-        item_schema_type: Option<SimpleTypeKey>,
-    ) -> crate::xpath::XPathValue<N> {
-        self.to_xpath_value_with(item_schema_type, None)
-    }
-
-    /// [`XmlValue::to_xpath_value`] for a caller that knows from the schema
-    /// whether a list's item type is a union (`Some`); see
-    /// [`list_strings_are_capacity_decimals`](crate::types::exact_decimal::list_strings_are_capacity_decimals).
-    #[cfg(feature = "xsd11")]
-    pub(crate) fn to_xpath_value_with<N: crate::xpath::DomNavigator>(
-        &self,
-        item_schema_type: Option<SimpleTypeKey>,
-        item_type_is_union: Option<bool>,
-    ) -> crate::xpath::XPathValue<N> {
+    pub fn to_xpath_value<N: crate::xpath::DomNavigator>(&self) -> crate::xpath::XPathValue<N> {
         use crate::xpath::iterator::XmlItem;
         use crate::xpath::XPathValue;
 
@@ -267,37 +255,10 @@ impl XmlValue {
             XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_) => {
                 XPathValue::from_atomic(self.clone())
             }
-            XmlValueKind::List { item_type, items } => {
-                // A decimal member beyond `rust_decimal`'s capacity is stored
-                // as its canonical string; it is still an `xs:decimal`. Every
-                // other string member is an `xs:string`, as in 0.2.2 — in
-                // particular every member of a list of a union.
-                let capacity_strings =
-                    crate::types::exact_decimal::list_strings_are_capacity_decimals(
-                        *item_type,
-                        items,
-                        item_type_is_union,
-                    );
-                let xml_items: Vec<XmlItem<N>> = items
-                    .iter()
-                    .map(|atom| {
-                        let type_code = match atom {
-                            XmlAtomicValue::String(_) if capacity_strings => XmlTypeCode::Decimal,
-                            _ => atom.type_code(),
-                        };
-                        let val = XmlValue {
-                            type_code,
-                            schema_type: item_schema_type,
-                            value: XmlValueKind::Atomic(atom.clone()),
-                        };
-                        XmlItem::Atomic(val)
-                    })
-                    .collect();
-                XPathValue::from_sequence(xml_items)
+            XmlValueKind::List { items, .. } => {
+                XPathValue::from_sequence(items.iter().cloned().map(XmlItem::Atomic).collect())
             }
-            XmlValueKind::Union(inner) => {
-                inner.to_xpath_value_with(item_schema_type, item_type_is_union)
-            }
+            XmlValueKind::Union(inner) => inner.to_xpath_value(),
         }
     }
 }
@@ -307,12 +268,22 @@ impl XmlValue {
 pub enum XmlValueKind {
     /// A single atomic value
     Atomic(XmlAtomicValue),
-    /// A list of atomic values (e.g., NMTOKENS)
+    /// A list value (e.g., NMTOKENS): the typed value of a list type.
     List {
-        /// The type code of list items
+        /// The type code of the list's declared item type: the item type's
+        /// built-in type code, or that of the built-in type it is derived
+        /// from (`xs:integer` for a restriction of it). An item type that is
+        /// a union has no single one: its code is `xs:anySimpleType`, the
+        /// base type of every union. Each member carries its own type.
         item_type: XmlTypeCode,
-        /// The list items
-        items: Vec<XmlAtomicValue>,
+        /// The members, in order: one atomic value each
+        /// ([`XmlValueKind::Atomic`], or [`XmlValueKind::UntypedAtomic`]
+        /// for an item type of `xs:anySimpleType`), with the `type_code` and
+        /// `schema_type` of the type that validated it — the item type, or,
+        /// when the item type is a union, the member type of the union that
+        /// validated that member (XPath 2.0 §2.5.2). A member is never a
+        /// list, and never wrapped in [`XmlValueKind::Union`].
+        items: Vec<XmlValue>,
     },
     /// A union value (actual type determined at runtime)
     Union(Box<XmlValue>),
@@ -399,9 +370,128 @@ pub enum XmlAtomicValue {
 
     // QName types (namespace-resolved)
     /// xs:QName
-    QName(QualifiedName),
+    QName(QNameValue),
     /// xs:NOTATION
-    Notation(QualifiedName),
+    Notation(QNameValue),
+}
+
+/// The value of an `xs:QName` or `xs:NOTATION`
+/// ([`XmlAtomicValue::QName`], [`XmlAtomicValue::Notation`]): an expanded
+/// name — a [`QualifiedName`] of interned ids — together with the string form
+/// of the value, so that it converts to a string with no [`NameTable`] at
+/// hand.
+///
+/// The string form is the one F&O §17.1.2 gives for casting to `xs:string`:
+/// "if the qualified name has a prefix, then TV is the concatenation of the
+/// prefix of SV, a single colon (:), and the local name of SV. otherwise TV is
+/// the local-name." It is what `Display`, [`XmlValue::to_string_value`],
+/// `fn:string` and every cast to a string give.
+///
+/// Equality and hashing follow [`QualifiedName`]: namespace URI and local
+/// name, never the prefix (F&O §11.2.1 `op:QName-equal`: "The prefix parts of
+/// $arg1 and $arg2, if any, are ignored"). The ids are only comparable with
+/// ids of the same [`NameTable`].
+///
+/// Cloning is cheap (the value is shared).
+#[derive(Clone)]
+pub struct QNameValue(Arc<QNameParts>);
+
+struct QNameParts {
+    name: QualifiedName,
+    /// `prefix:local`, or `local` when there is no prefix.
+    lexical: Box<str>,
+    /// The length of the prefix in `lexical`; 0 when there is none.
+    prefix_len: usize,
+}
+
+impl QNameValue {
+    /// The value of `name`, whose prefix and local name are resolved in
+    /// `names` to build the string form. An empty prefix counts as no prefix.
+    ///
+    /// `names` must be the table `name`'s ids were interned in: with any other
+    /// table the string form is wrong — another name's text, or, for an id the
+    /// table does not hold, the empty string (a debug build asserts that both
+    /// ids are held).
+    pub fn new(name: QualifiedName, names: &NameTable) -> Self {
+        debug_assert!(
+            names.try_resolve_ref(name.local_name).is_some()
+                && name
+                    .prefix
+                    .is_none_or(|p| names.try_resolve_ref(p).is_some()),
+            "QNameValue::new: the name's ids are not in this name table"
+        );
+        let local = names.try_resolve_ref(name.local_name).unwrap_or("");
+        let prefix = name
+            .prefix
+            .and_then(|p| names.try_resolve_ref(p))
+            .unwrap_or("");
+        let lexical: Box<str> = if prefix.is_empty() {
+            local.into()
+        } else {
+            format!("{prefix}:{local}").into()
+        };
+        QNameValue(Arc::new(QNameParts {
+            name,
+            lexical,
+            prefix_len: prefix.len(),
+        }))
+    }
+
+    /// The expanded name: namespace URI, local name and prefix, as ids.
+    pub fn name(&self) -> &QualifiedName {
+        &self.0.name
+    }
+
+    /// The prefix, or `None` when the value has none.
+    pub fn prefix(&self) -> Option<&str> {
+        match self.0.prefix_len {
+            0 => None,
+            n => Some(&self.0.lexical[..n]),
+        }
+    }
+
+    /// The local name.
+    pub fn local_name(&self) -> &str {
+        match self.0.prefix_len {
+            0 => &self.0.lexical,
+            n => &self.0.lexical[n + 1..],
+        }
+    }
+
+    /// The string form: `prefix:local`, or `local` when there is no prefix
+    /// (F&O §17.1.2).
+    pub fn lexical(&self) -> &str {
+        &self.0.lexical
+    }
+}
+
+impl PartialEq for QNameValue {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.name == other.0.name
+    }
+}
+
+impl Eq for QNameValue {}
+
+impl std::hash::Hash for QNameValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.name.hash(state);
+    }
+}
+
+impl fmt::Display for QNameValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0.lexical)
+    }
+}
+
+impl fmt::Debug for QNameValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QNameValue")
+            .field("lexical", &self.lexical())
+            .field("name", self.name())
+            .finish()
+    }
 }
 
 impl XmlAtomicValue {
@@ -504,13 +594,8 @@ impl fmt::Display for XmlAtomicValue {
                 )
             }
             Self::AnyUri(uri) => write!(f, "{}", uri),
-            Self::QName(qn) => {
-                // Display with prefix if available
-                write!(f, "QName({:?}:{})", qn.namespace_uri, qn.local_name.0)
-            }
-            Self::Notation(n) => {
-                write!(f, "NOTATION({:?}:{})", n.namespace_uri, n.local_name.0)
-            }
+            // F&O §17.1.2: `prefix:local`, or the local name.
+            Self::QName(qn) | Self::Notation(qn) => fmt::Display::fmt(qn, f),
         }
     }
 }
@@ -1313,5 +1398,85 @@ mod tests {
     fn test_base64_binary_display() {
         let v = XmlAtomicValue::Base64Binary(b"Hello".to_vec());
         assert_eq!(format!("{}", v), "SGVsbG8=");
+    }
+
+    /// F&O §17.1.2: a QName or NOTATION converts to `prefix:local`, or to the
+    /// local name when it has no prefix — with no name table at hand.
+    #[test]
+    fn test_qname_value_string_form() {
+        let names = NameTable::new();
+        let ns = names.add("urn:x");
+        let local = names.add("local");
+        let prefix = names.add("p");
+        let empty = names.add("");
+        let prefixed = QNameValue::new(QualifiedName::new(Some(ns), local, Some(prefix)), &names);
+        assert_eq!(prefixed.lexical(), "p:local");
+        assert_eq!(prefixed.prefix(), Some("p"));
+        assert_eq!(prefixed.local_name(), "local");
+        assert_eq!(prefixed.name().namespace_uri, Some(ns));
+        let bare = QNameValue::new(QualifiedName::new(Some(ns), local, None), &names);
+        assert_eq!((bare.lexical(), bare.prefix()), ("local", None));
+        // An empty prefix is no prefix.
+        let empty_prefix = QNameValue::new(QualifiedName::new(None, local, Some(empty)), &names);
+        assert_eq!(
+            (empty_prefix.lexical(), empty_prefix.prefix()),
+            ("local", None)
+        );
+
+        for (code, atom) in [
+            (XmlTypeCode::QName, XmlAtomicValue::QName(prefixed.clone())),
+            (
+                XmlTypeCode::Notation,
+                XmlAtomicValue::Notation(prefixed.clone()),
+            ),
+        ] {
+            assert_eq!(atom.to_string(), "p:local");
+            let value = XmlValue::new(code, XmlValueKind::Atomic(atom));
+            assert_eq!(value.to_string_value(), "p:local");
+        }
+        let qname = XmlValue::new(
+            XmlTypeCode::QName,
+            XmlValueKind::Atomic(XmlAtomicValue::QName(prefixed.clone())),
+        );
+        assert_eq!(qname.as_qname(), Some(prefixed.name()));
+    }
+
+    /// F&O §11.2.1: equality (and so hashing) ignores the prefix.
+    #[test]
+    fn test_qname_value_equality_ignores_the_prefix() {
+        use std::hash::BuildHasher;
+        let names = NameTable::new();
+        let ns = names.add("urn:x");
+        let local = names.add("l");
+        let p = QNameValue::new(
+            QualifiedName::new(Some(ns), local, Some(names.add("p"))),
+            &names,
+        );
+        let q = QNameValue::new(
+            QualifiedName::new(Some(ns), local, Some(names.add("q"))),
+            &names,
+        );
+        let other = QNameValue::new(
+            QualifiedName::new(None, local, Some(names.add("p"))),
+            &names,
+        );
+        assert_eq!(p, q);
+        assert_ne!(p, other);
+        let state = std::collections::hash_map::RandomState::new();
+        assert_eq!(state.hash_one(&p), state.hash_one(&q));
+    }
+
+    /// A list's string value joins its members' string values with spaces.
+    #[test]
+    fn test_list_string_value_joins_members() {
+        let list = XmlValue::new(
+            XmlTypeCode::AnySimpleType,
+            XmlValueKind::List {
+                item_type: XmlTypeCode::AnySimpleType,
+                items: vec![XmlValue::integer(BigInt::from(1)), XmlValue::string("x")],
+            },
+        );
+        assert_eq!(list.to_string_value(), "1 x");
+        assert!(list.is_list());
     }
 }

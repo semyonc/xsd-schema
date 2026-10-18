@@ -1453,12 +1453,10 @@ fn single_id(value: &XmlValue) -> Option<&str> {
             Some(id)
         }
         XmlValueKind::Union(member) => single_id(member),
-        XmlValueKind::List { item_type, items } if *item_type == XmlTypeCode::Id => {
-            match items.as_slice() {
-                [XmlAtomicValue::String(id)] => Some(id),
-                _ => None,
-            }
-        }
+        XmlValueKind::List { items, .. } => match items.as_slice() {
+            [member] => single_id(member),
+            _ => None,
+        },
         _ => None,
     }
 }

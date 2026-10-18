@@ -101,21 +101,33 @@ pub fn validate_cta_xpath(schema_set: &SchemaSet) -> SchemaResult<()> {
 /// XPath compile errors that genuinely indicate a broken schema.
 ///
 /// Per §3.12.4, a CTA test that violates the static context is a
-/// schema validity error. Static errors that mean the XPath author
-/// got something wrong — undefined variables, unbound prefixes,
-/// syntax problems, unknown atomic-type names — should reject the
-/// schema. Errors that just reflect this engine's incomplete
-/// function library (XPST0017 — function not found) should NOT
-/// reject the schema; they only mean the test will not evaluate
-/// at runtime.
+/// schema validity error, and Type Alternative Properties Correct
+/// (§3.12.6) clause 2 requires the {test} to satisfy XPath Valid
+/// (§3.13.6.2), whose clause 2 is "X does not produce any static
+/// error". Static errors that mean the XPath author got something
+/// wrong — undefined variables, unbound prefixes, syntax problems,
+/// unknown atomic-type names, a `cast` to `xs:NOTATION` or
+/// `xs:anyAtomicType` (XPST0080) — reject the schema. So does a call
+/// of a function in the XML Schema namespace that does not exist
+/// (XPST0017): the only functions there are the constructor functions
+/// of the built-in atomic types, one argument each, which this engine
+/// knows completely (XPath 2.0 §3.10.4) — `xs:NOTATION('a')`,
+/// `xs:anyAtomicType('a')` and `xs:integer(@a, 2)` name no function.
+/// A missing function of any other namespace (XPST0017) only reflects
+/// this engine's incomplete function library and does NOT reject the
+/// schema; it means the test will not evaluate at runtime.
 fn is_schema_invalidating_error(err: &XPathError) -> bool {
-    matches!(
-        err,
+    match err {
         XPathError::XPST0003 { .. }
-            | XPathError::XPST0008 { .. }
-            | XPathError::XPST0051 { .. }
-            | XPathError::XPST0081 { .. }
-    )
+        | XPathError::XPST0008 { .. }
+        | XPathError::XPST0051 { .. }
+        | XPathError::XPST0080 { .. }
+        | XPathError::XPST0081 { .. } => true,
+        XPathError::XPST0017 { namespace, .. } => {
+            namespace == crate::namespace::table::XS_NAMESPACE
+        }
+        _ => false,
+    }
 }
 
 /// Resolve the default-element-namespace for an alternative's static
@@ -333,4 +345,67 @@ fn report_user_defined_type(
         ),
         location,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::SchemaError;
+    use crate::pipeline::load_and_process_schema;
+    use crate::schema::SchemaSet;
+
+    /// Load a one-element XSD 1.1 schema whose type alternative has `test`,
+    /// and return the constraint of the schema error, if any.
+    fn cta_verdict(test: &str) -> Option<&'static str> {
+        let schema = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+                          xmlns:t="urn:t" targetNamespace="urn:t">
+                 <xs:element name="e">
+                   <xs:alternative test="{test}" type="xs:string"/>
+                 </xs:element>
+               </xs:schema>"#
+        );
+        let mut schema_set = SchemaSet::xsd11();
+        match load_and_process_schema(schema.as_bytes(), "cta.xsd", &mut schema_set, None) {
+            Ok(_) => None,
+            Err(SchemaError::StructuralError { constraint, .. }) => Some(constraint),
+            Err(other) => panic!("{test}: unexpected error {other:?}"),
+        }
+    }
+
+    /// Structures 1.1 §3.12.6 (Type Alternative Properties Correct) clause 2:
+    /// the {test} satisfies XPath Valid (§3.13.6.2), whose clause 2 requires
+    /// that "X does not produce any static error". A call of a function in the
+    /// XML Schema namespace that is not a constructor function, and a `cast` to
+    /// `xs:NOTATION` / `xs:anyAtomicType`, are such static errors (XPath 2.0
+    /// §3.10.4: XPST0017; §3.10.2: XPST0080); unlike a function of the
+    /// function library this engine may lack, constructor functions are fully
+    /// known, so these are schema errors, not skipped alternatives.
+    #[test]
+    fn static_errors_of_constructor_calls_and_casts_reject_the_schema() {
+        let tests = [
+            "xs:NOTATION('a') = 'a'",
+            "xs:anyAtomicType('a') = 'a'",
+            "xs:integer(@a, 2) = 1",
+            "'a' cast as xs:NOTATION = 'a'",
+            "@a castable as xs:anyAtomicType",
+            "exists(self::schema-element(t:nosuch))",
+            "$nosuch = 1",
+            // Well-formed tests are accepted.
+            "xs:integer(@a) = 1",
+            "@a castable as xs:integer",
+            "not(@a)",
+            // A function of another namespace that the function library
+            // lacks is still treated as this engine's limitation: the
+            // alternative is skipped, not the schema rejected (the existing
+            // policy).
+            "t:f(@a)",
+        ];
+        let verdicts: Vec<Option<&str>> = tests.iter().map(|t| cta_verdict(t)).collect();
+        let error = Some("src-ct-alternative");
+        assert_eq!(
+            verdicts,
+            [error, error, error, error, error, error, error, None, None, None, None],
+            "{tests:?}"
+        );
+    }
 }

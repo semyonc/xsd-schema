@@ -12,10 +12,28 @@
 //! - FONS: Namespace errors
 //! - FODT: Date/time errors
 
+use std::fmt;
+use std::sync::Arc;
+
 use thiserror::Error;
 
+use crate::types::value::XmlValue;
+
 /// XPath-specific error type with W3C specification error codes.
+///
+/// Most variants stand for one specification code each. An error that is
+/// identified by an **error QName** instead — what `fn:error` raises, what a
+/// host's own function raises with a code of its choosing, and the
+/// specification codes that have no variant of their own — is
+/// [`XPathError::Raised`].
+///
+/// The enum is `#[non_exhaustive]`: later releases may add variants (a code
+/// that travels as [`XPathError::Raised`] today may get one), so a `match`
+/// outside this crate needs a wildcard arm. Code that needs the specification
+/// code of any error should ask [`XPathError::error_code`] and
+/// [`XPathError::raised_error`] rather than match variants.
 #[derive(Debug, Clone, Error)]
+#[non_exhaustive]
 pub enum XPathError {
     // ========================================================================
     // Static Errors (XPST)
@@ -40,6 +58,23 @@ pub enum XPathError {
         namespace: String,
     },
 
+    /// XPST0080: the target type of a `cast as` or `castable as` expression is
+    /// `xs:NOTATION` or `xs:anyAtomicType`.
+    ///
+    /// XPath 2.0 §3.10.2: "The target type must be an atomic type that is in
+    /// the in-scope schema types \[err:XPST0051\]. In addition, the target
+    /// type cannot be xs:NOTATION or xs:anyAtomicType \[err:XPST0080\]."
+    /// §3.10.3 says the same of `castable`. A static error: the binder raises
+    /// it when the expression is compiled.
+    #[error(
+        "[XPST0080] '{type_name}' cannot be the target type of a cast or castable \
+         expression: xs:NOTATION and xs:anyAtomicType are not instantiable"
+    )]
+    XPST0080 {
+        /// The target type as the expression spells it.
+        type_name: String,
+    },
+
     /// XPST0081: Prefix cannot be expanded to namespace URI.
     #[error("[XPST0081] Prefix '{prefix}' cannot be expanded to a namespace URI")]
     XPST0081 { prefix: String },
@@ -51,16 +86,24 @@ pub enum XPathError {
     #[error("[XPDY0002] {message}")]
     XPDY0002 { message: String },
 
-    /// XPDY0050: a value does not match a required sequence type.
+    /// XPDY0050: the operand of a `treat as` expression does not match its
+    /// sequence type, or a path starts with `/` or `//` in a tree whose root
+    /// is not a document node.
     ///
-    /// The specification defines this code for the `treat as` expression — "It
-    /// is a dynamic error if the dynamic type of the operand of a treat
-    /// expression does not match the sequence type specified by the treat
-    /// expression" (XPath 2.0 §3.10.5, Appendix G) — and it is also what this
-    /// crate raises when a sequence of more than one item reaches a place that
-    /// requires a single item.
-    #[error("[XPDY0050] More than one item in sequence where single item expected")]
-    XPDY0050,
+    /// XPath 2.0 Appendix G: "It is a dynamic error if the dynamic type of the
+    /// operand of a treat expression does not match the sequence type specified
+    /// by the treat expression. This error might also be raised by a path
+    /// expression beginning with "/" or "//" if the context node is not in a
+    /// tree that is rooted at a document node." The message says which, and
+    /// for `treat as` what was expected and what was found.
+    ///
+    /// A value of more than one item where one is expected is not this code
+    /// but `XPTY0004` (§3.1.5); see [`XPathError::more_than_one_item`].
+    #[error("[XPDY0050] {message}")]
+    XPDY0050 {
+        /// What did not match.
+        message: String,
+    },
 
     // ========================================================================
     // Type Errors (XPTY)
@@ -258,6 +301,33 @@ pub enum XPathError {
     UnaryOperatorNotDefined { operator: String, arg_type: String },
 
     // ========================================================================
+    // Errors identified by an error QName
+    // ========================================================================
+    /// An error identified by an **error QName** rather than by a variant of
+    /// its own.
+    ///
+    /// Three kinds of error travel here:
+    ///
+    /// * what `fn:error` raises — any QName the expression chooses, with its
+    ///   description and error object (F&O §3);
+    /// * an error a **host** raises from a function it registered, with a code
+    ///   of its own and, optionally, a payload of its own type that the engine
+    ///   carries through unchanged ([`XPathError::host`],
+    ///   [`XPathError::downcast_host_payload`]);
+    /// * the specification codes that have no variant of their own, such as
+    ///   `FONS0004` (see [`QNAMED_ERROR_CODES`]).
+    ///
+    /// Build one with [`XPathError::raised`] or [`XPathError::host`]; read it
+    /// with [`XPathError::raised_error`] or through the [`RaisedErrorInfo`]
+    /// accessors. [`XPathError::error_code`] reports the codes of
+    /// [`QNAMED_ERROR_CODES`].
+    ///
+    /// Its [`Error::source`](std::error::Error::source) is the host payload,
+    /// when there is one.
+    #[error(transparent)]
+    Raised(RaisedErrorInfo),
+
+    // ========================================================================
     // Internal/General Errors
     // ========================================================================
     /// Internal error for unexpected failures.
@@ -337,9 +407,38 @@ impl XPathError {
         }
     }
 
-    /// Create XPDY0050 more than one item error.
+    /// The type error for a value of more than one item where at most one is
+    /// expected.
+    ///
+    /// XPath 2.0 §3.1.5: "If, after the above conversions, the resulting value
+    /// does not match the expected type according to the rules for
+    /// SequenceType Matching, a type error is raised \[err:XPTY0004\]"; the
+    /// operators state the same rule for their operands (§3.4, §3.5.1,
+    /// §3.10.2). Before 0.3.0 this constructor returned `XPDY0050`, which is
+    /// the code of a failed `treat as` (§3.10.5) instead.
     pub fn more_than_one_item() -> Self {
-        XPathError::XPDY0050
+        XPathError::XPTY0004 {
+            expected: "a single item".to_string(),
+            found: "a sequence of more than one item".to_string(),
+        }
+    }
+
+    /// XPDY0050 for a failed `treat as` (XPath 2.0 §3.10.5): `expected` is the
+    /// sequence type of the expression, `found` describes the operand.
+    pub fn treat_mismatch(expected: impl fmt::Display, found: impl fmt::Display) -> Self {
+        XPathError::XPDY0050 {
+            message: format!("treat as {expected}: the operand is {found}"),
+        }
+    }
+
+    /// XPDY0050 for a path that starts with `/` or `//` where the root of the
+    /// context node's tree is not a document node (XPath 2.0 §3.2).
+    pub fn root_not_a_document() -> Self {
+        XPathError::XPDY0050 {
+            message: "a path starting with '/' or '//' needs a tree rooted at a document node, \
+                      and the root of the context node's tree is not one"
+                .to_string(),
+        }
     }
 
     /// Create XPTY0004 type mismatch error.
@@ -498,27 +597,110 @@ impl XPathError {
         )
     }
 
-    /// Build a dynamic error identified by an error QName.
+    /// Build an error identified by an error QName — an
+    /// [`XPathError::Raised`].
     ///
     /// `fn:error` may raise *any* error QName, so such an error cannot be one
-    /// of this enum's fixed, code-per-variant arms. It travels in
-    /// [`XPathError::Internal`] under a canonical encoding —
-    /// `Q{namespace}local: description` — which [`XPathError::raised_error`]
-    /// reads back. Callers should use those two entry points rather than the
-    /// message text, which is not part of the API contract.
-    ///
-    /// The same carrier serves the spec-defined codes that have no dedicated
-    /// variant yet, such as `FONS0004`; [`XPathError::error_code`] resolves
-    /// those back to their `'static` code string.
+    /// of this enum's fixed, code-per-variant arms. Read it back with
+    /// [`XPathError::raised_error`]. The same variant serves the spec-defined
+    /// codes that have no dedicated variant, such as `FONS0004`;
+    /// [`XPathError::error_code`] resolves those back to their `'static` code
+    /// string.
     ///
     /// `namespace_uri` is empty for an error QName in no namespace.
     pub fn raised(namespace_uri: &str, local_name: &str, description: Option<&str>) -> Self {
-        let mut message = format!("Q{{{namespace_uri}}}{local_name}");
-        if let Some(description) = description {
-            message.push_str(": ");
-            message.push_str(description);
+        XPathError::Raised(RaisedErrorInfo::new(
+            namespace_uri,
+            local_name,
+            description,
+            Vec::new(),
+            None,
+        ))
+    }
+
+    /// An error a **host** raises from a function it registered, identified by
+    /// an error QName of its choosing and carrying a payload of the host's own
+    /// type.
+    ///
+    /// The engine treats it like any other [`XPathError::Raised`] — it
+    /// propagates unchanged out of the evaluation, and its QName and
+    /// description read back through [`XPathError::raised_error`] — and never
+    /// looks inside the payload. The host gets its own error back with
+    /// [`XPathError::downcast_host_payload`], so it needs no side channel to
+    /// carry what an `XPathError` cannot express (a location, an origin, a
+    /// type of its own).
+    ///
+    /// ```
+    /// use xsd_schema::xpath::error::{XPathError, XQT_ERRORS_NAMESPACE};
+    ///
+    /// #[derive(Debug, Clone, PartialEq)]
+    /// struct HostError {
+    ///     code: String,
+    ///     line: u32,
+    /// }
+    /// impl std::fmt::Display for HostError {
+    ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    ///         write!(f, "{} at line {}", self.code, self.line)
+    ///     }
+    /// }
+    /// impl std::error::Error for HostError {}
+    ///
+    /// let mine = HostError { code: "HOST0001".into(), line: 7 };
+    /// let err = XPathError::host(XQT_ERRORS_NAMESPACE, "HOST0001", Some("no such thing"), mine.clone());
+    ///
+    /// assert_eq!(err.raised_error().unwrap().local_name, "HOST0001");
+    /// assert_eq!(err.downcast_host_payload::<HostError>(), Some(&mine));
+    /// // A clone shares the payload.
+    /// assert_eq!(err.clone().downcast_host_payload::<HostError>(), Some(&mine));
+    /// ```
+    pub fn host<E>(
+        namespace_uri: &str,
+        local_name: &str,
+        description: Option<&str>,
+        payload: E,
+    ) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        XPathError::Raised(RaisedErrorInfo::new(
+            namespace_uri,
+            local_name,
+            description,
+            Vec::new(),
+            Some(Arc::new(payload)),
+        ))
+    }
+
+    /// What `fn:error` raises: an error QName, a description and the error
+    /// object, already reduced to atomic values (see
+    /// [`RaisedErrorInfo::error_object`]).
+    pub(crate) fn raised_with_object(
+        namespace_uri: &str,
+        local_name: &str,
+        description: Option<&str>,
+        error_object: Vec<XmlValue>,
+    ) -> Self {
+        XPathError::Raised(RaisedErrorInfo::new(
+            namespace_uri,
+            local_name,
+            description,
+            error_object,
+            None,
+        ))
+    }
+
+    /// The payload a host attached with [`XPathError::host`], if this error
+    /// carries one.
+    pub fn host_payload(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        match self {
+            XPathError::Raised(info) => info.host_payload(),
+            _ => None,
         }
-        XPathError::Internal(message)
+    }
+
+    /// The host payload as a `T`, if this error carries one of that type.
+    pub fn downcast_host_payload<T: std::error::Error + 'static>(&self) -> Option<&T> {
+        self.host_payload()?.downcast_ref::<T>()
     }
 
     /// FORG0002: an argument that is not a valid URI reference.
@@ -535,19 +717,10 @@ impl XPathError {
 
     /// XPST0080: the target type of a `cast as` or `castable as` expression is
     /// `xs:NOTATION` or `xs:anyAtomicType` (XPath 2.0 §3.10.2, §3.10.3).
-    ///
-    /// The code has no dedicated variant, so it travels as an error QName; see
-    /// [`XPathError::raised`]. [`XPathError::error_code`] answers
-    /// `Some("XPST0080")`.
     pub(crate) fn cast_target_not_instantiable(type_name: &str) -> Self {
-        XPathError::raised(
-            XQT_ERRORS_NAMESPACE,
-            "XPST0080",
-            Some(&format!(
-                "'{type_name}' cannot be the target type of a cast: \
-                 xs:NOTATION and xs:anyAtomicType are not instantiable"
-            )),
-        )
+        XPathError::XPST0080 {
+            type_name: type_name.to_string(),
+        }
     }
 
     /// FOCA0006: a string cast to `xs:decimal` has more digits of precision
@@ -623,47 +796,38 @@ impl XPathError {
         )
     }
 
-    /// The error QName and description of an error identified by a QName.
+    /// The error QName and description of an [`XPathError::Raised`] error.
     ///
     /// Returns `None` for every error that has a variant of its own; see
     /// [`XPathError::raised`].
     pub fn raised_error(&self) -> Option<RaisedError<'_>> {
-        let XPathError::Internal(message) = self else {
-            return None;
-        };
-        let rest = message.strip_prefix("Q{")?;
-        // A namespace URI cannot contain "}", so the first one ends it.
-        let (namespace_uri, rest) = rest.split_once('}')?;
-        // A local name is an NCName, so the first ":" ends it.
-        let (local_name, description) = match rest.split_once(": ") {
-            Some((local_name, description)) => (local_name, Some(description)),
-            None => (rest, None),
-        };
-        if local_name.is_empty() {
-            return None;
+        match self {
+            XPathError::Raised(info) => Some(info.as_raised_error()),
+            _ => None,
         }
-        Some(RaisedError {
-            namespace_uri,
-            local_name,
-            description,
-        })
     }
 
     /// Get the error code (e.g., "XPTY0004") if this is a spec-defined error.
     ///
-    /// An error identified by an error QName (see [`XPathError::raised`])
-    /// reports its code when that code is one of [`QNAMED_ERROR_CODES`].
-    /// Any other QName returns `None`, because the code is not a `'static`
-    /// string; read it from [`XPathError::raised_error`] instead.
+    /// An error identified by an error QName (an [`XPathError::Raised`])
+    /// reports its code only when the QName is in the
+    /// [`XQT_ERRORS_NAMESPACE`] **and** its local name is one of
+    /// [`QNAMED_ERROR_CODES`] — the codes this crate itself raises that way.
+    /// Every other QName returns `None`, even one that spells a code of the
+    /// specifications, such as `fn:error(xs:QName('err:FORG0001'))`, or a
+    /// host's own code (its `Display` still prints `[FORG0001]`): the answer is
+    /// a `'static` string, and those codes are not known statically. Read any
+    /// raised error's QName from [`XPathError::raised_error`] instead.
     pub fn error_code(&self) -> Option<&'static str> {
         match self {
             XPathError::XPST0003 { .. } => Some("XPST0003"),
             XPathError::XPST0008 { .. } => Some("XPST0008"),
             XPathError::XPST0051 { .. } => Some("XPST0051"),
             XPathError::XPST0017 { .. } => Some("XPST0017"),
+            XPathError::XPST0080 { .. } => Some("XPST0080"),
             XPathError::XPST0081 { .. } => Some("XPST0081"),
             XPathError::XPDY0002 { .. } => Some("XPDY0002"),
-            XPathError::XPDY0050 => Some("XPDY0050"),
+            XPathError::XPDY0050 { .. } => Some("XPDY0050"),
             XPathError::XPTY0004 { .. } => Some("XPTY0004"),
             XPathError::XPTY0004Cast { .. } => Some("XPTY0004"),
             XPathError::XPTY0018 => Some("XPTY0018"),
@@ -701,15 +865,16 @@ impl XPathError {
             XPathError::BinaryOperatorNotDefined { .. } => Some("XPTY0004"),
             XPathError::UnaryOperatorNotDefined { .. } => Some("XPTY0004"),
             XPathError::Internal(_) if self.is_decimal_capacity_operand() => Some("FOAR0002"),
-            XPathError::Internal(_) => self.raised_error().and_then(|raised| {
-                if raised.namespace_uri != XQT_ERRORS_NAMESPACE {
+            XPathError::Internal(_) => None,
+            XPathError::Raised(info) => {
+                if info.namespace_uri() != XQT_ERRORS_NAMESPACE {
                     return None;
                 }
                 QNAMED_ERROR_CODES
                     .iter()
                     .copied()
-                    .find(|code| *code == raised.local_name)
-            }),
+                    .find(|code| *code == info.local_name())
+            }
         }
     }
 }
@@ -722,14 +887,19 @@ pub const XQT_ERRORS_NAMESPACE: &str = "http://www.w3.org/2005/xqt-errors";
 /// The local name of the default error QName of `fn:error`.
 pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
 
-/// The message of [`XPathError::decimal_capacity_operand`]. It does not start
-/// with `Q{`, so no error QName — and nothing `fn:error` raises — reads as it.
+/// The message of [`XPathError::decimal_capacity_operand`], an
+/// [`XPathError::Internal`]: nothing `fn:error` or a host raises (an
+/// [`XPathError::Raised`]) can be taken for it.
 const DECIMAL_CAPACITY_OPERAND: &str =
     "[FOAR0002] xs:decimal operand beyond the capacity of this implementation";
 
-/// The spec-defined codes this crate reports through an error QName rather
-/// than through a variant of [`XPathError`], and which
-/// [`XPathError::error_code`] therefore resolves back to a `'static` string.
+/// The spec-defined codes this crate reports through an error QName — an
+/// [`XPathError::Raised`] in the [`XQT_ERRORS_NAMESPACE`] — rather than
+/// through a variant of their own, and which [`XPathError::error_code`]
+/// therefore resolves back to a `'static` string.
+///
+/// (`XPST0080` was on this list before 0.3.0; it is now
+/// [`XPathError::XPST0080`].)
 pub const QNAMED_ERROR_CODES: &[&str] = &[
     DEFAULT_RAISED_ERROR,
     "FOCA0006",
@@ -737,13 +907,140 @@ pub const QNAMED_ERROR_CODES: &[&str] = &[
     "FODC0001",
     "FONS0004",
     "FORG0002",
-    "XPST0080",
 ];
 
-/// The error QName and description of an error raised by `fn:error`.
+/// What an [`XPathError::Raised`] error carries: the error QName, the
+/// description, the error object of `fn:error`, and a host's payload.
+///
+/// The fields are private so that later releases can add to them; read them
+/// with the accessors. Cloning is cheap: the data lives behind one shared,
+/// reference-counted allocation, so a clone (and a clone of the
+/// [`XPathError`] holding it) copies a pointer. Its
+/// [`Error::source`](std::error::Error::source) is the host payload.
+#[derive(Clone)]
+pub struct RaisedErrorInfo {
+    inner: Arc<RaisedErrorData>,
+}
+
+struct RaisedErrorData {
+    namespace_uri: String,
+    local_name: String,
+    description: Option<String>,
+    error_object: Vec<XmlValue>,
+    payload: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
+}
+
+impl RaisedErrorInfo {
+    fn new(
+        namespace_uri: &str,
+        local_name: &str,
+        description: Option<&str>,
+        error_object: Vec<XmlValue>,
+        payload: Option<Arc<dyn std::error::Error + Send + Sync + 'static>>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(RaisedErrorData {
+                namespace_uri: namespace_uri.to_string(),
+                local_name: local_name.to_string(),
+                description: description.map(str::to_string),
+                error_object,
+                payload,
+            }),
+        }
+    }
+
+    /// Namespace URI of the error QName (`""` for no namespace).
+    pub fn namespace_uri(&self) -> &str {
+        &self.inner.namespace_uri
+    }
+
+    /// Local name of the error QName.
+    pub fn local_name(&self) -> &str {
+        &self.inner.local_name
+    }
+
+    /// The description (`fn:error`'s `$description`), if one was supplied.
+    pub fn description(&self) -> Option<&str> {
+        self.inner.description.as_deref()
+    }
+
+    /// The error object of `fn:error($error, $description, $error-object)`,
+    /// as atomic values; empty for every other error.
+    ///
+    /// F&O §3 leaves how the error object reaches the environment
+    /// implementation-dependent. An `XPathError` outlives the documents of the
+    /// evaluation that raised it, so it cannot hold their nodes: an atomic item
+    /// of the error object is kept as it is, and a node is represented by its
+    /// string value as an `xs:untypedAtomic`.
+    pub fn error_object(&self) -> &[XmlValue] {
+        &self.inner.error_object
+    }
+
+    /// The payload a host attached with [`XPathError::host`], if any.
+    pub fn host_payload(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
+        self.inner.payload.as_deref()
+    }
+
+    /// Whether `self` and `other` are clones of one error, sharing its data.
+    #[cfg(test)]
+    pub(crate) fn shares_data_with(&self, other: &RaisedErrorInfo) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// The borrowed view [`XPathError::raised_error`] returns.
+    pub fn as_raised_error(&self) -> RaisedError<'_> {
+        RaisedError {
+            namespace_uri: self.namespace_uri(),
+            local_name: self.local_name(),
+            description: self.description(),
+        }
+    }
+}
+
+impl fmt::Debug for RaisedErrorInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RaisedErrorInfo")
+            .field("namespace_uri", &self.inner.namespace_uri)
+            .field("local_name", &self.inner.local_name)
+            .field("description", &self.inner.description)
+            .field("error_object", &self.inner.error_object)
+            .field("host_payload", &self.inner.payload)
+            .finish()
+    }
+}
+
+/// The host payload, when there is one, is the source.
+impl std::error::Error for RaisedErrorInfo {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.inner
+            .payload
+            .as_deref()
+            .map(|payload| payload as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// `[code] description`: the local name alone as the code for a QName in the
+/// [`XQT_ERRORS_NAMESPACE`], the EQName `Q{namespace}local` for any other.
+impl fmt::Display for RaisedErrorInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.namespace_uri() == XQT_ERRORS_NAMESPACE {
+            write!(f, "[{}]", self.local_name())?;
+        } else {
+            write!(f, "[Q{{{}}}{}]", self.namespace_uri(), self.local_name())?;
+        }
+        match self.description() {
+            Some(description) => write!(f, " {description}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The error QName and description of an [`XPathError::Raised`] error — what
+/// `fn:error` or a host raised.
 ///
 /// Produced by [`XPathError::raised_error`]. `namespace_uri` is empty when the
-/// error QName is in no namespace.
+/// error QName is in no namespace. The owned form, with the error object and
+/// the host payload, is [`RaisedErrorInfo`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RaisedError<'a> {
@@ -767,6 +1064,14 @@ mod tests {
         );
         assert_eq!(
             XPathError::more_than_one_item().error_code(),
+            Some("XPTY0004")
+        );
+        assert_eq!(
+            XPathError::treat_mismatch("xs:integer", "a sequence of 2 items").error_code(),
+            Some("XPDY0050")
+        );
+        assert_eq!(
+            XPathError::root_not_a_document().error_code(),
             Some("XPDY0050")
         );
         assert_eq!(
@@ -788,5 +1093,163 @@ mod tests {
         let err = XPathError::internal("something went wrong");
         assert!(err.to_string().contains("something went wrong"));
         assert_eq!(err.error_code(), None);
+        assert!(err.raised_error().is_none());
+    }
+
+    /// `XPathError` stays usable across threads and cheap to move.
+    #[test]
+    fn xpath_error_is_send_sync_and_small() {
+        fn assert_send_sync<T: Send + Sync + 'static>() {}
+        assert_send_sync::<XPathError>();
+        // The QName-identified variant is one pointer; the largest variants
+        // hold three `String`s.
+        assert!(std::mem::size_of::<XPathError>() <= 80);
+    }
+
+    /// An error identified by an error QName is a variant of its own, and the
+    /// Wave A entry points read it back.
+    #[test]
+    fn a_raised_error_is_a_variant_with_its_qname() {
+        let err = XPathError::raised("urn:x", "boom", Some("why"));
+        let XPathError::Raised(info) = &err else {
+            panic!("expected XPathError::Raised, got {err:?}");
+        };
+        assert_eq!(info.namespace_uri(), "urn:x");
+        assert_eq!(info.local_name(), "boom");
+        assert_eq!(info.description(), Some("why"));
+        assert!(info.error_object().is_empty());
+        assert!(info.host_payload().is_none());
+        let view = err.raised_error().expect("a raised error");
+        assert_eq!(
+            (view.namespace_uri, view.local_name, view.description),
+            ("urn:x", "boom", Some("why"))
+        );
+        // A QName outside the error namespace has no `'static` code.
+        assert_eq!(err.error_code(), None);
+        assert_eq!(err.to_string(), "[Q{urn:x}boom] why");
+
+        // In the error namespace, a listed code resolves; the code prints bare.
+        let err = XPathError::raised(XQT_ERRORS_NAMESPACE, "FONS0004", None);
+        assert_eq!(err.error_code(), Some("FONS0004"));
+        assert_eq!(err.to_string(), "[FONS0004]");
+        let err = XPathError::raised(XQT_ERRORS_NAMESPACE, "XTDE9999", Some("d"));
+        assert_eq!(err.error_code(), None);
+        assert_eq!(err.to_string(), "[XTDE9999] d");
+
+        // No namespace.
+        let err = XPathError::raised("", "bare", None);
+        assert_eq!(err.raised_error().unwrap().namespace_uri, "");
+        assert_eq!(err.to_string(), "[Q{}bare]");
+
+        // The codes that travel as QNames are raised as `Raised`.
+        assert!(matches!(
+            XPathError::no_namespace_for_prefix("p"),
+            XPathError::Raised(_)
+        ));
+        assert_eq!(
+            XPathError::invalid_uri_argument("::").error_code(),
+            Some("FORG0002")
+        );
+        // An internal error with the old text encoding is not a raised error.
+        assert!(XPathError::internal("Q{urn:x}boom: why")
+            .raised_error()
+            .is_none());
+    }
+
+    /// A host error round-trips through the variant with its own payload.
+    #[test]
+    fn a_host_error_carries_its_payload() {
+        #[derive(Debug, Clone, PartialEq)]
+        struct HostError(&'static str, u32);
+        impl std::fmt::Display for HostError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{} at {}", self.0, self.1)
+            }
+        }
+        impl std::error::Error for HostError {}
+
+        let err = XPathError::host(
+            XQT_ERRORS_NAMESPACE,
+            "HOST0001",
+            Some("the host failed"),
+            HostError("HOST0001", 42),
+        );
+        assert_eq!(
+            err.downcast_host_payload::<HostError>(),
+            Some(&HostError("HOST0001", 42))
+        );
+        assert_eq!(
+            err.host_payload().map(|p| p.to_string()),
+            Some("HOST0001 at 42".to_string())
+        );
+        // A different type does not downcast.
+        assert!(err.downcast_host_payload::<std::fmt::Error>().is_none());
+        // The engine sees an ordinary raised error.
+        let view = err.raised_error().unwrap();
+        assert_eq!(view.local_name, "HOST0001");
+        assert_eq!(view.description, Some("the host failed"));
+        assert_eq!(err.to_string(), "[HOST0001] the host failed");
+        // Clones share the payload.
+        let copy = err.clone();
+        assert_eq!(
+            copy.downcast_host_payload::<HostError>(),
+            Some(&HostError("HOST0001", 42))
+        );
+        // No other error has a payload.
+        assert!(XPathError::raised("urn:x", "e", None)
+            .host_payload()
+            .is_none());
+        assert!(XPathError::FOAR0001.host_payload().is_none());
+    }
+
+    /// R12: a clone of a raised error shares its data, and `source()` is the
+    /// host payload. R11: `error_code()` reports only the listed codes for a
+    /// raised error; `raised_error()` has every QName.
+    #[test]
+    fn raised_errors_clone_cheaply_and_expose_the_payload_as_source() {
+        #[derive(Debug)]
+        struct HostError;
+        impl std::fmt::Display for HostError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("the host's own error")
+            }
+        }
+        impl std::error::Error for HostError {}
+
+        let err = XPathError::host(XQT_ERRORS_NAMESPACE, "HOST0001", Some("d"), HostError);
+        let copy = err.clone();
+        let (XPathError::Raised(a), XPathError::Raised(b)) = (&err, &copy) else {
+            panic!("raised errors");
+        };
+        assert!(a.shares_data_with(b), "a clone must share the data");
+        let source = std::error::Error::source(&err).expect("the payload is the source");
+        assert_eq!(source.to_string(), "the host's own error");
+        assert!(source.downcast_ref::<HostError>().is_some());
+        assert!(std::error::Error::source(&XPathError::raised("urn:x", "e", None)).is_none());
+
+        // R11.
+        let forg = XPathError::raised(XQT_ERRORS_NAMESPACE, "FORG0001", None);
+        assert_eq!(forg.error_code(), None);
+        assert_eq!(forg.raised_error().unwrap().local_name, "FORG0001");
+    }
+
+    /// XPST0080 and XPDY0050 are variants with their own text.
+    #[test]
+    fn xpst0080_and_xpdy0050_have_variants_and_messages() {
+        let err = XPathError::cast_target_not_instantiable("xs:NOTATION");
+        assert!(matches!(&err, XPathError::XPST0080 { type_name } if type_name == "xs:NOTATION"));
+        assert_eq!(err.error_code(), Some("XPST0080"));
+        assert!(err.raised_error().is_none());
+        assert!(err.to_string().starts_with("[XPST0080] 'xs:NOTATION'"));
+
+        let err = XPathError::treat_mismatch("xs:integer", "a sequence of 2 items");
+        assert!(matches!(&err, XPathError::XPDY0050 { .. }));
+        assert_eq!(
+            err.to_string(),
+            "[XPDY0050] treat as xs:integer: the operand is a sequence of 2 items"
+        );
+        assert!(XPathError::root_not_a_document()
+            .to_string()
+            .contains("document node"));
     }
 }

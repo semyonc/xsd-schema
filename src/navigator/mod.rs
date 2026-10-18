@@ -44,9 +44,10 @@ pub enum NavigatorError {
 ///
 /// A list type's typed value is one `Value` of kind
 /// [`XmlValueKind::List`](crate::types::value::XmlValueKind::List), which XPath
-/// atomization sees as one atomic value per member; an element whose complex
-/// type has empty content has an empty list as its `Value` (XDM 1.0 §6.2.4:
-/// the empty sequence).
+/// atomization sees as one atomic value per member, each of the type that
+/// validated it (for a list whose item type is a union, the member type that
+/// accepted that member); an element whose complex type has empty content has
+/// an empty list as its `Value` (XDM 1.0 §6.2.4: the empty sequence).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TypedValue {
     /// Schema-validated typed atomic value.

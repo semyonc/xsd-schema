@@ -54,8 +54,12 @@ use super::context::DynamicContext;
 ///
 /// Each variant corresponds to a built-in XPath 2.0 function.
 /// This enum allows bind-time function resolution without generic type parameters.
+///
+/// The enum is `#[non_exhaustive]`: a later release may add built-in functions,
+/// so a `match` outside this crate needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u16)]
+#[non_exhaustive]
 pub enum FunctionId {
     // ========== String Functions ==========
     /// fn:concat($arg1, $arg2, ...)
@@ -278,6 +282,15 @@ pub enum FunctionId {
     Data,
     /// fn:default-collation()
     DefaultCollation,
+    /// fn:error(), fn:error($error), fn:error($error, $description),
+    /// fn:error($error, $description, $error-object)
+    ///
+    /// One registry entry serves the four arities, so signature introspection
+    /// ([`BuiltinCatalog::get_signature`]) reports the parameters
+    /// `xs:QName?, xs:string, item()*` for each — for arity 1 that is
+    /// `xs:QName?` where F&O declares `xs:QName`. The function itself enforces
+    /// each arity's own types (see [`special::error`]).
+    Error,
 
     // ========== Boolean Functions ==========
     /// fn:true()
@@ -741,6 +754,7 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Trace => special::trace(context, args),
         FunctionId::Data => special::data(context, args),
         FunctionId::DefaultCollation => special::default_collation(context, args),
+        FunctionId::Error => special::error(context, args),
 
         // ====================================================================
         // Sequence functions (basic)

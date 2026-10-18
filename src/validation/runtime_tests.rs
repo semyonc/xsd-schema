@@ -8559,7 +8559,10 @@ fn test_ic_singleton_list_equals_atomic() {
             XmlTypeCode::Name,
             XmlValueKind::List {
                 item_type: XmlTypeCode::Name,
-                items: vec![XmlAtomicValue::String("alpha".to_string())],
+                items: vec![XmlValue::new(
+                    XmlTypeCode::Name,
+                    XmlValueKind::Atomic(XmlAtomicValue::String("alpha".to_string())),
+                )],
             },
         )),
     };
@@ -8569,6 +8572,186 @@ fn test_ic_singleton_list_equals_atomic() {
         "atomic xs:Name must equal singleton list-of-xs:Name for IC"
     );
     assert_eq!(singleton_list, atomic, "equality must be symmetric");
+}
+
+/// Run `<root>` with one `<item k="…"/>` per key and one `<ref r="…"/>` per
+/// reference, and return the constraint codes of the errors.
+fn ic_list_key_errors(xsd: &str, keys: &[&str], refs: &[&str]) -> Vec<String> {
+    let schema_set = load_schema(xsd);
+    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let validator = SchemaValidator::new(&schema_set, flags);
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    for (element, attribute, values) in [("item", "k", keys), ("ref", "r", refs)] {
+        for value in values {
+            v.validate_element(element, "", None, None, &ns);
+            v.validate_attribute(attribute, "", value);
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+        }
+    }
+    v.validate_end_element();
+    v.end_validation().ok();
+    v.sink
+        .errors
+        .iter()
+        .map(|e| e.constraint.to_string())
+        .collect()
+}
+
+/// A key on `item/@k`, a list of `key_item`, and a keyref on `ref/@r`, a list
+/// of `ref_item`.
+fn list_key_schema(key_item: &str, ref_item: &str) -> String {
+    format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="intOrString"><xs:union memberTypes="xs:integer xs:string"/></xs:simpleType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="k" use="required">
+                                    <xs:simpleType><xs:list itemType="{key_item}"/></xs:simpleType>
+                                </xs:attribute>
+                            </xs:complexType>
+                        </xs:element>
+                        <xs:element name="ref" minOccurs="0" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:attribute name="r" use="required">
+                                    <xs:simpleType><xs:list itemType="{ref_item}"/></xs:simpleType>
+                                </xs:attribute>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:key name="itemKey">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@k"/>
+                </xs:key>
+                <xs:keyref name="itemRef" refer="itemKey">
+                    <xs:selector xpath="ref"/>
+                    <xs:field xpath="@r"/>
+                </xs:keyref>
+            </xs:element>
+        </xs:schema>"#
+    )
+}
+
+/// §3.11.4 clauses 4.2.2 and 4.3: key-sequences are compared member for
+/// member, "pairwise equal or identical, as defined by Equality and Identity
+/// in [XML Schema: Datatypes]". Datatypes §2.2.1: two lists are identical when
+/// "they have the same length and … the items of A are pairwise identical to
+/// the items of B"; "'+2', treated as a decimal, '+2', treated as an integer,
+/// and '+2', treated as a byte, all denote the same value", while "values from
+/// different primitive datatypes' value spaces are made artificially
+/// distinct". So the members of a list of a union of xs:integer and xs:string
+/// are compared in the value space of the member type that validated each:
+/// `1 x` and `01 x` are one key; the integer member `1` is not the string `1`
+/// that a list of xs:string holds; and a list of xs:integer `1 2` and a list
+/// of xs:decimal `1.0 2` hold the same values.
+#[test]
+fn test_ic_list_keys_compare_members_by_value() {
+    const DUP: &str = "cvc-identity-constraint.4.2.2";
+    const NO_MATCH: &str = "cvc-identity-constraint.4.3";
+    let union_keys = list_key_schema("intOrString", "intOrString");
+    let errors = ic_list_key_errors(&union_keys, &["1 x", "01 x"], &[]);
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+    let errors = ic_list_key_errors(&union_keys, &["x 1", "x +1"], &[]);
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+    for distinct in [["1 x", "1 y"], ["1 x", "1.0 x"], ["1 x", "1 x 2"]] {
+        let errors = ic_list_key_errors(&union_keys, &distinct, &[]);
+        assert!(
+            errors.is_empty(),
+            "{distinct:?} are different keys, errors={errors:?}"
+        );
+    }
+    let errors = ic_list_key_errors(&union_keys, &["1 x"], &["01 x"]);
+    assert!(
+        errors.is_empty(),
+        "`01 x` refers to `1 x`, errors={errors:?}"
+    );
+
+    // The integer 1 is not the string "1".
+    let errors = ic_list_key_errors(
+        &list_key_schema("intOrString", "xs:string"),
+        &["1 x"],
+        &["1 x"],
+    );
+    assert!(
+        errors.iter().any(|e| e.starts_with(NO_MATCH)),
+        "an xs:string list does not refer to an integer member, errors={errors:?}"
+    );
+    let errors = ic_list_key_errors(
+        &list_key_schema("intOrString", "xs:string"),
+        &["a x"],
+        &["a x"],
+    );
+    assert!(errors.is_empty(), "string members match, errors={errors:?}");
+}
+
+/// §3.11.4 and Datatypes §2.2.1 (see above): a list of xs:integer and a list
+/// of xs:decimal hold values of one primitive datatype, compared by value.
+#[test]
+fn test_ic_integer_and_decimal_list_keys_share_a_value_space() {
+    const DUP: &str = "cvc-identity-constraint.4.2.2";
+    let errors = ic_list_key_errors(
+        &list_key_schema("xs:integer", "xs:decimal"),
+        &["1 2"],
+        &["1.0 2"],
+    );
+    assert!(
+        errors.is_empty(),
+        "`1.0 2` refers to `1 2`, errors={errors:?}"
+    );
+    let errors = ic_list_key_errors(
+        &list_key_schema("xs:integer", "xs:integer"),
+        &["1 2", "01 2"],
+        &[],
+    );
+    assert!(errors.iter().any(|e| e == DUP), "errors={errors:?}");
+}
+
+/// §3.16.4 String Valid clause 3 ("Every ENTITY value in V is a declared
+/// entity name") applies to the members of a list of a union that the union's
+/// xs:ENTITY member validated — and only to those.
+#[test]
+fn test_entity_in_list_of_union_is_checked_per_member() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:simpleType name="intOrEntity"><xs:union memberTypes="xs:integer xs:ENTITY"/></xs:simpleType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:attribute name="pics" use="required">
+                        <xs:simpleType><xs:list itemType="intOrEntity"/></xs:simpleType>
+                    </xs:attribute>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#,
+    );
+    let entity_errors = |value: &str| {
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let mut entities = std::collections::HashSet::new();
+        entities.insert("mylogo".to_string());
+        v.set_unparsed_entities(entities);
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("pics", "", value);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.end_validation().ok();
+        v.sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint == "cvc-datatype-valid.1.2.1")
+            .count()
+    };
+    // `5` is an xs:integer, not an entity name; `mylogo` is declared.
+    assert_eq!(entity_errors("5 mylogo"), 0);
+    // `other` is an ENTITY value and is not declared.
+    assert_eq!(entity_errors("other 5"), 1);
 }
 
 /// Phase 3: XSD 1.1 allows same ID value on same element via multiple ID attributes.

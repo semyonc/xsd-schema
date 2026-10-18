@@ -432,20 +432,30 @@ fn test_bind_constructor_xs_unsigned_short() {
     }
 }
 
+/// XPath 2.0 §3.10.4: there is a constructor function "for every atomic type in
+/// the in-scope schema types (except xs:NOTATION and xs:anyAtomicType, which are
+/// not instantiable)", so a call of either names no function (XPST0017 — XQTS
+/// `K-SeqExprCast-65`, `-1480`).
 #[test]
 fn test_bind_constructor_notation_rejected() {
-    let names = NameTable::new();
-    let ctx = make_xs_context(&names);
-    let mut binder = NameBinder::new();
+    for local in ["NOTATION", "anyAtomicType"] {
+        let names = NameTable::new();
+        let ctx = make_xs_context(&names);
+        let mut binder = NameBinder::new();
 
-    let mut arena = AstArena::new();
-    let arg = arena.add(AstNode::Value(ValueNode::String("x".to_string())));
-    let func_id = make_function_call(&mut arena, "xs", "NOTATION", vec![arg]);
-    let root = wrap_in_expr(&mut arena, func_id);
+        let mut arena = AstArena::new();
+        let arg = arena.add(AstNode::Value(ValueNode::String("x".to_string())));
+        let func_id = make_function_call(&mut arena, "xs", local, vec![arg]);
+        let root = wrap_in_expr(&mut arena, func_id);
 
-    let result = bind_node(&mut arena, root, &ctx, &mut binder);
-    assert!(result.is_err());
-    assert_eq!(result.unwrap_err().error_code(), Some("XPST0051"));
+        let result = bind_node(&mut arena, root, &ctx, &mut binder);
+        assert!(result.is_err(), "xs:{local}");
+        assert_eq!(
+            result.unwrap_err().error_code(),
+            Some("XPST0017"),
+            "xs:{local}"
+        );
+    }
 }
 
 #[test]

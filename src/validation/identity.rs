@@ -33,11 +33,83 @@ fn extract_single_atomic(value: &XmlValue) -> Option<&crate::types::value::XmlAt
     match &value.value {
         crate::types::value::XmlValueKind::Atomic(a) => Some(a),
         crate::types::value::XmlValueKind::List { items, .. } if items.len() == 1 => {
-            Some(&items[0])
+            extract_single_atomic(&items[0])
         }
         crate::types::value::XmlValueKind::Union(inner) => extract_single_atomic(inner),
         _ => None,
     }
+}
+
+/// The value a field holds with its union wrappers taken off.
+fn unwrap_union(value: &XmlValue) -> &XmlValue {
+    match &value.value {
+        crate::types::value::XmlValueKind::Union(inner) => unwrap_union(inner),
+        _ => value,
+    }
+}
+
+/// The members of a list value, or `None` for any other value.
+fn list_members(value: &XmlValue) -> Option<&[XmlValue]> {
+    match &value.value {
+        crate::types::value::XmlValueKind::List { items, .. } => Some(items),
+        _ => None,
+    }
+}
+
+/// IC equality of two atomic values (Datatypes §2.2.1, §2.2.2): values of
+/// different primitive datatypes are distinct; within one, value-space
+/// equality or identity. `None` when either has no primitive datatype, so the
+/// caller decides on the string forms.
+fn atomic_ic_eq(a: &XmlValue, b: &XmlValue) -> Option<bool> {
+    match (a.primitive_type(), b.primitive_type()) {
+        (Some(pa), Some(pb)) if pa == pb => {
+            // XSD value-space equality: for the decimal hierarchy
+            // (xs:decimal, xs:integer, and all derived integer types)
+            // different storage variants (Decimal vs Integer) must be
+            // compared numerically, not structurally.
+            Some(if pa == PrimitiveTypeCode::Decimal {
+                decimal_family_ic_eq(a, b)
+            } else {
+                xml_value_ic_eq(a, b)
+            })
+        }
+        (Some(_), Some(_)) => Some(false), // different primitive types → never equal
+        _ => None,
+    }
+}
+
+/// Whether two typed values are "equal or identical" in the sense of
+/// Datatypes §2.2.1 / §2.2.2 — the comparison identity constraints
+/// (Structures §3.11.4) and the `enumeration` facet of a list type
+/// (Datatypes §4.3.5.4, §2.4.1.2: "enumerated values are compared to the
+/// entire ·list·") both rely on. A list compares member for member, each
+/// member in the value space of the type that validated it; values of
+/// different primitive datatypes are distinct; a value without a primitive
+/// datatype (`xs:untypedAtomic`) compares by its string. `schema_type` never
+/// matters: restrictions do not create new values.
+pub(crate) fn values_equal_or_identical(a: &XmlValue, b: &XmlValue) -> bool {
+    let (a, b) = (unwrap_union(a), unwrap_union(b));
+    if list_members(a).is_some() || list_members(b).is_some() {
+        return list_ic_eq(a, b);
+    }
+    atomic_ic_eq(a, b).unwrap_or_else(|| a.to_string_value() == b.to_string_value())
+}
+
+/// IC equality when at least one of the two values is a list: §3.11.4 clause
+/// 4 compares members "pairwise", and Datatypes §2.2.1 makes two lists the
+/// same list when "they have the same length and … the items of A are
+/// pairwise identical to the items of B" — so there is only one empty list,
+/// whatever its item type. An atomic value counts as a list of that one value
+/// (§3.11.4: "single atomic values are not distinguished from lists with
+/// single items"). Each member carries the type that validated it, so a list
+/// of a union compares every member in its own member type's value space.
+fn list_ic_eq(a: &XmlValue, b: &XmlValue) -> bool {
+    let a_members = list_members(a).unwrap_or(std::slice::from_ref(a));
+    let b_members = list_members(b).unwrap_or(std::slice::from_ref(b));
+    a_members.len() == b_members.len()
+        && a_members.iter().zip(b_members).all(|(x, y)| {
+            atomic_ic_eq(x, y).unwrap_or_else(|| x.to_string_value() == y.to_string_value())
+        })
 }
 
 /// IC value-space equality: compare type_code + value, ignoring schema_type.
@@ -102,8 +174,8 @@ fn xml_atomic_nan_eq(
 }
 
 /// Exact value equality of two decimal-family atoms, each typed by its
-/// value's type code (a list member by its list's item type), so that a
-/// member carried in lexical form compares by value too.
+/// value's type code (a list member by its own, the type that validated it),
+/// so that a member carried in lexical form compares by value too.
 fn xml_atomic_decimal_eq(
     a_type: XmlTypeCode,
     a: &crate::types::value::XmlAtomicValue,
@@ -286,6 +358,11 @@ impl CompiledIdentityConstraint {
 ///   via `XmlValue::PartialEq` (structural comparison of `XmlValueKind`).
 /// - Different primitive types are *never* equal (no type promotion for IC equality).
 /// - If either value is untyped, compare `string_value` (string equality).
+/// - If either value is a list, compare member for member (Structures
+///   §3.11.4: "pairwise equal or identical"), each member by the rules above
+///   in the type that validated it — for a list of a union, the member type
+///   that accepted it; an atomic value counts as a list of one member, and
+///   all empty lists are equal (Datatypes §2.2.1).
 #[derive(Debug, Clone)]
 pub struct KeyFieldValue {
     pub string_value: String,
@@ -296,23 +373,11 @@ impl PartialEq for KeyFieldValue {
     fn eq(&self, other: &Self) -> bool {
         match (&self.typed_value, &other.typed_value) {
             (Some(a), Some(b)) => {
-                let prim_a = a.primitive_type();
-                let prim_b = b.primitive_type();
-                match (prim_a, prim_b) {
-                    (Some(pa), Some(pb)) if pa == pb => {
-                        // XSD value-space equality: for the decimal hierarchy
-                        // (xs:decimal, xs:integer, and all derived integer types)
-                        // different storage variants (Decimal vs Integer) must be
-                        // compared numerically, not structurally.
-                        if pa == PrimitiveTypeCode::Decimal {
-                            decimal_family_ic_eq(a, b)
-                        } else {
-                            xml_value_ic_eq(a, b)
-                        }
-                    }
-                    (Some(_), Some(_)) => false, // different primitive types → never equal
-                    _ => self.string_value == other.string_value,
+                let (a, b) = (unwrap_union(a), unwrap_union(b));
+                if list_members(a).is_some() || list_members(b).is_some() {
+                    return list_ic_eq(a, b);
                 }
+                atomic_ic_eq(a, b).unwrap_or_else(|| self.string_value == other.string_value)
             }
             _ => self.string_value == other.string_value,
         }

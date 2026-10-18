@@ -7,8 +7,8 @@
 //! - fn:data($arg) - atomize a sequence
 //! - fn:default-collation() - return default collation URI
 //! - fn:error($error?, $description, $error-object?) - raise a dynamic error
-//!   (not registered in the built-in catalog; see [`error`] for the four
-//!   signatures and the argument types it enforces)
+//!   (see [`error`] for the four signatures and the argument types it
+//!   enforces)
 
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
@@ -187,13 +187,17 @@ pub fn default_collation<N: DomNavigator>(
 /// the description is that QName's own URI.
 ///
 /// The function never returns a value: its declared return type is the empty
-/// type `none`, so every call is an error. `$error-object` is accepted and
-/// ignored — this engine has nowhere to attach it, and no caller can observe
-/// it.
+/// type `none`, so every call is an error — an
+/// [`XPathError::Raised`].
 ///
 /// Read the raised error's QName and description back with
 /// [`XPathError::raised_error`]; [`XPathError::error_code`] reports
-/// `FOER0000` for the default QName.
+/// `FOER0000` for the default QName. `$error-object` travels with the error as
+/// atomic values ([`RaisedErrorInfo::error_object`]): an atomic item as it is,
+/// a node as its string value, typed `xs:untypedAtomic` — the error outlives
+/// the documents its nodes belong to.
+///
+/// [`RaisedErrorInfo::error_object`]: crate::xpath::error::RaisedErrorInfo::error_object
 ///
 /// # Argument types
 ///
@@ -219,12 +223,14 @@ pub fn default_collation<N: DomNavigator>(
 /// declared types of the registered signature, so `error((), 42)` there becomes
 /// `error((), '42')` and raises `FOER0000` rather than a type error.
 ///
-/// # Not in the built-in catalog
+/// # A built-in
 ///
-/// This release does **not** register `error` among the built-in functions, so
-/// `error()` in an expression is an unknown function (`XPST0017`) unless a host
-/// registers it. Register one signature per arity, so that each arity declares
-/// the types F&O gives it:
+/// `error` is a built-in function ([`FunctionId::Error`](super::FunctionId::Error))
+/// at arities 0 to 3, so `error()` needs no registration. A host that registers
+/// its own `fn:error` — as one had to before 0.3.0 — keeps working: a function
+/// a [`FunctionSet`](super::FunctionSet) registers takes precedence over the
+/// built-in of the same name and arity. The registration below is the one a
+/// host used before; it now changes nothing:
 ///
 /// ```
 /// use xsd_schema::namespace::table::NameTable;
@@ -286,10 +292,21 @@ pub fn error<N: DomNavigator>(
     // `fn:error(fn:QName(…, 'err:FOER0000'), 'http://www.w3.org/2005/xqt-errors#FOER0000')`.
     let no_arguments = arity == 0;
 
-    // $error-object as item()*: accepted and discarded, and no type to enforce.
-    if arity == 3 {
-        args.pop();
-    }
+    // $error-object as item()*: no type to enforce. It is carried as atomic
+    // values, a node by its string value (see the function's documentation).
+    let error_object: Vec<crate::types::value::XmlValue> = if arity == 3 {
+        args.pop()
+            .unwrap()
+            .into_vec()
+            .into_iter()
+            .map(|item| match item {
+                XmlItem::Atomic(value) => value,
+                XmlItem::Node(nav) => crate::types::value::XmlValue::untyped(nav.value()),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // $description as xs:string: required wherever it is present at all.
     let description = if arity >= 2 {
@@ -344,7 +361,12 @@ pub fn error<N: DomNavigator>(
         (None, false) => None,
     };
 
-    Err(XPathError::raised(&namespace_uri, &local_name, description))
+    Err(XPathError::raised_with_object(
+        &namespace_uri,
+        &local_name,
+        description,
+        error_object,
+    ))
 }
 
 /// The `$description as xs:string` argument of `fn:error`, under the function
@@ -534,7 +556,8 @@ mod tests {
     }
 
     // =========================================================================
-    // fn:error, registered by a host the way the function's rustdoc shows
+    // fn:error: the built-in, and a host registration the way the function's
+    // rustdoc shows
     // =========================================================================
 
     mod host_registered_error {
@@ -625,22 +648,90 @@ mod tests {
             raise_with(&error_functions(), expr, false)
         }
 
-        /// `fn:error` is **not** one of the built-in functions in this release:
-        /// without a host registration it is an unknown function at every
-        /// arity it accepts.
+        /// Since 0.3.0 `fn:error` is a built-in function: with no host
+        /// registration it compiles at every arity it accepts and raises what
+        /// the host-registered function raises.
         #[test]
-        fn error_is_not_a_builtin_function() {
+        fn error_is_a_builtin_function() {
             let names = NameTable::new();
             let ctx = XPathContext::new(&names);
-            for expr in [
-                "error()",
-                "error(())",
-                "error((), 'boom')",
-                "error((), 'boom', 42)",
-            ] {
-                let err = XPathExpr::compile(expr, &ctx).expect_err(expr);
-                assert_eq!(err.error_code(), Some("XPST0017"), "{expr}");
-            }
+            let run = |expr: &str| -> XPathError {
+                let compiled =
+                    XPathExpr::compile(expr, &ctx).unwrap_or_else(|e| panic!("{expr}: {e}"));
+                match compiled.evaluator(&ctx).run::<RoXmlNavigator<'static>>() {
+                    Err(e) => e,
+                    Ok(_) => panic!("fn:error must never return a value: {expr}"),
+                }
+            };
+            assert_eq!(run("error()").error_code(), Some("FOER0000"));
+            assert_eq!(run("error(())").error_code(), Some("XPTY0004"));
+            let err = run("error((), 'boom')");
+            assert_eq!(err.raised_error().unwrap().description, Some("boom"));
+            let err = run("error(QName('urn:x', 'x:e'), 'boom', (42, 'a'))");
+            let XPathError::Raised(info) = &err else {
+                panic!("expected a raised error, got {err:?}");
+            };
+            assert_eq!((info.namespace_uri(), info.local_name()), ("urn:x", "e"));
+            // The error object travels as atomic values.
+            let object: Vec<String> = info
+                .error_object()
+                .iter()
+                .map(|v| v.to_string_value())
+                .collect();
+            assert_eq!(object, ["42", "a"]);
+            // Four arguments is no signature of the function.
+            assert_eq!(
+                XPathExpr::compile("error((), 'a', 1, 2)", &ctx)
+                    .expect_err("arity 4")
+                    .error_code(),
+                Some("XPST0017")
+            );
+        }
+
+        /// A node in the error object is carried by its string value, as
+        /// `xs:untypedAtomic`.
+        #[test]
+        fn a_node_in_the_error_object_is_carried_by_its_string_value() {
+            let names = NameTable::new();
+            let ctx = XPathContext::new(&names);
+            let doc = roxmltree::Document::parse("<a>x<b>y</b></a>").expect("parse xml");
+            let Err(err) = XPathExpr::compile("error((), 'd', (/a, 1))", &ctx)
+                .expect("compile")
+                .evaluator(&ctx)
+                .run_with_node(RoXmlNavigator::new(&doc))
+            else {
+                panic!("fn:error must never return a value");
+            };
+            let XPathError::Raised(info) = &err else {
+                panic!("expected a raised error, got {err:?}");
+            };
+            let object: Vec<(String, crate::types::XmlTypeCode)> = info
+                .error_object()
+                .iter()
+                .map(|v| (v.to_string_value(), v.type_code))
+                .collect();
+            assert_eq!(
+                object,
+                [
+                    ("xy".to_string(), crate::types::XmlTypeCode::UntypedAtomic),
+                    ("1".to_string(), crate::types::XmlTypeCode::Integer),
+                ]
+            );
+        }
+
+        /// A host that registers its own `fn:error` supersedes the built-in.
+        #[test]
+        fn a_host_registered_error_supersedes_the_built_in() {
+            let mut functions: FunctionSet<RoXmlNavigator<'static>> = FunctionSet::with_builtins();
+            functions.register(
+                DynamicFunctionSignature::new(FN_NAMESPACE, "error", vec![], empty()),
+                |_ctx, _args| Err(XPathError::raised("urn:host", "mine", None)),
+            );
+            let err = raise_with(&functions, "error()", false);
+            assert_eq!(err.raised_error().unwrap().namespace_uri, "urn:host");
+            // The arities the host did not register stay the built-in's.
+            let err = raise_with(&functions, "error((), 'b')", false);
+            assert_eq!(err.raised_error().unwrap().local_name, DEFAULT_RAISED_ERROR);
         }
 
         #[test]

@@ -18,6 +18,9 @@ pub enum TypeExprKind {
 }
 
 /// Type expression (`instance of`, `treat as`, `cast as`, `castable as`).
+///
+/// Build one with [`TypeExprNode::new`]: the node also holds a crate-private
+/// binding cache, so it has no struct-literal form outside this crate.
 #[derive(Debug, Clone)]
 pub struct TypeExprNode {
     /// Kind of type expression.
@@ -31,6 +34,18 @@ pub struct TypeExprNode {
     /// Resolved atomic type QName (populated during binding for Atomic item types).
     /// Uses interned NameIds and resolved namespace URIs.
     pub resolved_atomic_type: Option<crate::namespace::qname::QualifiedName>,
+    /// The target item type resolved against the static context — names
+    /// expanded, type names looked up — for `instance of` and `treat as`.
+    /// Populated during binding, so evaluation matches every item against it
+    /// without resolving the item type again; `None` before binding (and for
+    /// `cast as` / `castable as`, which use `resolved_atomic_type`).
+    ///
+    /// Crate-private: it is the binder's cache, not part of the node a host
+    /// builds or reads. Evaluation resolves `target_type` itself when it is
+    /// `None`, so a node built with [`TypeExprNode::new`] is matched correctly
+    /// unbound; after editing `target_type` of a bound node, bind it again
+    /// (as for `resolved_atomic_type`), which recomputes it.
+    pub(crate) resolved_item_type: Option<crate::types::sequence::ItemType>,
 }
 
 impl TypeExprNode {
@@ -46,6 +61,7 @@ impl TypeExprNode {
             target_type,
             span,
             resolved_atomic_type: None,
+            resolved_item_type: None,
         }
     }
 }
@@ -108,4 +124,39 @@ pub enum ItemTypeNode {
     Atomic(QName),
     /// Kind test (`node()`, `element()`, etc.).
     Kind(KindTest),
+}
+
+/// The indicator as the grammar spells it: nothing, `?`, `*` or `+`.
+impl std::fmt::Display for OccurrenceIndicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            OccurrenceIndicator::One => "",
+            OccurrenceIndicator::ZeroOrOne => "?",
+            OccurrenceIndicator::ZeroOrMore => "*",
+            OccurrenceIndicator::OneOrMore => "+",
+        })
+    }
+}
+
+/// The item type as the expression spells it: `item()`, a QName, or a kind
+/// test.
+impl std::fmt::Display for ItemTypeNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemTypeNode::Item => f.write_str("item()"),
+            ItemTypeNode::Atomic(qname) => write!(f, "{qname}"),
+            ItemTypeNode::Kind(kind) => write!(f, "{kind}"),
+        }
+    }
+}
+
+/// The sequence type as the expression spells it, e.g. `xs:integer?` or
+/// `empty-sequence()` (XPath 2.0 §2.5.3).
+impl std::fmt::Display for SequenceTypeNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.item_type {
+            None => f.write_str("empty-sequence()"),
+            Some(item_type) => write!(f, "{item_type}{}", self.occurrence),
+        }
+    }
 }

@@ -534,49 +534,80 @@ impl<'a> BufferDocNavigator<'a> {
     /// Post-process a typed value for QName/Notation: resolve the lexical
     /// form against the navigator's in-scope namespaces if the inner atomic
     /// is still stored as a `String` (the simple-type validator has no
-    /// namespace context, so QName/Notation values come back lexically).
+    /// namespace context, so QName/Notation values come back lexically) —
+    /// the value itself, a union's member value, and every member of a list
+    /// (of `xs:QName`, or of a union with a QName or NOTATION member type).
     ///
-    /// Returns the value unchanged for any other type or shape.
+    /// Returns the value unchanged for any other type or shape, and a lexical
+    /// form that does not resolve unchanged.
     fn resolve_qname_typed_value(
         &self,
         value: crate::types::value::XmlValue,
     ) -> crate::types::value::XmlValue {
-        use crate::namespace::qname::QualifiedName;
-        use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
-        use crate::types::XmlTypeCode;
-        use crate::xpath::functions::qname::parse_lexical_qname;
+        use crate::types::value::{XmlValue, XmlValueKind};
 
-        if !matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation) {
+        if !holds_lexical_qname(&value) {
             return value;
         }
-        let lexical: &str = match &value.value {
-            XmlValueKind::Atomic(XmlAtomicValue::String(s)) => s.as_str(),
-            _ => return value,
-        };
-        let (prefix, local_name) = match parse_lexical_qname(lexical) {
-            Ok(parts) => parts,
-            Err(_) => return value,
-        };
-
-        let ns_id = match prefix.as_deref() {
-            Some(p) => match self.resolve_prefix_in_scope(Some(p)) {
-                Some(uri_id) => Some(uri_id),
-                None => return value,
+        let XmlValue {
+            type_code,
+            schema_type,
+            value: kind,
+        } = value;
+        let kind = match kind {
+            XmlValueKind::Union(inner) => {
+                XmlValueKind::Union(Box::new(self.resolve_qname_typed_value(*inner)))
+            }
+            XmlValueKind::List { item_type, items } => XmlValueKind::List {
+                item_type,
+                items: items
+                    .into_iter()
+                    .map(|member| self.resolve_qname_typed_value(member))
+                    .collect(),
             },
+            XmlValueKind::Atomic(crate::types::value::XmlAtomicValue::String(lexical)) => {
+                match self.resolve_lexical_qname(&lexical, type_code) {
+                    Some(atom) => XmlValueKind::Atomic(atom),
+                    None => {
+                        XmlValueKind::Atomic(crate::types::value::XmlAtomicValue::String(lexical))
+                    }
+                }
+            }
+            other => other,
+        };
+        XmlValue {
+            type_code,
+            schema_type,
+            value: kind,
+        }
+    }
+
+    /// The `xs:QName` (or, for `type_code` `xs:NOTATION`, `xs:NOTATION`)
+    /// value `lexical` denotes in the navigator's in-scope namespaces; `None`
+    /// when it is not a QName or its prefix is not in scope.
+    fn resolve_lexical_qname(
+        &self,
+        lexical: &str,
+        type_code: crate::types::XmlTypeCode,
+    ) -> Option<crate::types::value::XmlAtomicValue> {
+        use crate::namespace::qname::QualifiedName;
+        use crate::types::value::{QNameValue, XmlAtomicValue};
+        use crate::xpath::functions::qname::parse_lexical_qname;
+
+        let (prefix, local_name) = parse_lexical_qname(lexical).ok()?;
+        let ns_id = match prefix.as_deref() {
+            Some(p) => Some(self.resolve_prefix_in_scope(Some(p))?),
             None => self.resolve_prefix_in_scope(None),
         };
-
         let names = self.doc.names;
         let local_id = names.add(&local_name);
         let prefix_id = prefix.as_deref().map(|p| names.add(p));
-        let qn = QualifiedName::new(ns_id, local_id, prefix_id);
-
-        let mut new_value = XmlValue::new(
-            value.type_code,
-            XmlValueKind::Atomic(XmlAtomicValue::QName(qn)),
-        );
-        new_value.schema_type = value.schema_type;
-        new_value
+        let qn = QNameValue::new(QualifiedName::new(ns_id, local_id, prefix_id), names);
+        Some(if type_code == crate::types::XmlTypeCode::Notation {
+            XmlAtomicValue::Notation(qn)
+        } else {
+            XmlAtomicValue::QName(qn)
+        })
     }
 
     /// Resolve a prefix to its in-scope namespace URI's `NameId`.
@@ -1223,6 +1254,22 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
+
+/// Whether `value` holds an `xs:QName` or `xs:NOTATION` still in lexical form
+/// (an `xs:string` atom under the QName or NOTATION type code) — itself, as a
+/// union's member value, or as a list member.
+fn holds_lexical_qname(value: &crate::types::value::XmlValue) -> bool {
+    use crate::types::value::{XmlAtomicValue, XmlValueKind};
+    use crate::types::XmlTypeCode;
+    match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::String(_)) => {
+            matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation)
+        }
+        XmlValueKind::Union(inner) => holds_lexical_qname(inner),
+        XmlValueKind::List { items, .. } => items.iter().any(holds_lexical_qname),
+        _ => false,
+    }
+}
 
 #[cfg(test)]
 mod tests {

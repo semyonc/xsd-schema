@@ -1039,14 +1039,44 @@ functions.register(sig, |_ctx, args| {
     })?;
 
     if val < 0.0 {
-        return Err(XPathError::FOAR0002 {
-            message: "Value must be non-negative".to_string(),
-        });
+        return Err(XPathError::FOAR0002);
     }
 
     Ok(XPathValue::double(val.sqrt()))
 });
 ```
+
+An error with a code of the host's own — or one that must carry more than a
+code and a message — is an `XPathError::Raised`, identified by an error QName.
+`XPathError::raised(namespace, local, description)` builds one;
+`XPathError::host(namespace, local, description, payload)` also attaches a value
+of the host's own error type, which the engine propagates untouched and the host
+gets back with `downcast_host_payload` once the evaluation has failed:
+
+```rust
+use xsd_schema::xpath::error::{XPathError, XQT_ERRORS_NAMESPACE};
+
+#[derive(Debug, Clone)]
+struct HostError { code: String, line: u32 }
+impl std::fmt::Display for HostError { /* … */ }
+impl std::error::Error for HostError {}
+
+functions.register(sig, |_ctx, _args| {
+    let mine = HostError { code: "HOST0001".into(), line: 7 };
+    Err(XPathError::host(XQT_ERRORS_NAMESPACE, "HOST0001", Some("not found"), mine))
+});
+
+// … after `run_with` returned `Err(err)`:
+if let Some(mine) = err.downcast_host_payload::<HostError>() {
+    // the host's own error, with everything it carried
+}
+// Any raised error also reads back as a QName:
+let raised = err.raised_error();
+```
+
+`XPathError` is `#[non_exhaustive]`: match it with a wildcard arm, and prefer
+`error_code()` / `raised_error()` to matching variants when only the code
+matters.
 
 ### 4.7 Overriding Built-in Functions
 
@@ -1091,7 +1121,7 @@ The global `FUNCTION_REGISTRY` (`src/xpath/functions/registry.rs`) contains all
 - QName (resolve-QName, QName, prefix-from-QName, etc.)
 - URI (resolve-uri, static-base-uri)
 - Regex (matches, replace, tokenize)
-- Special (trace, data, default-collation)
+- Special (trace, data, default-collation, error)
 - Conversion (string, number)
 
 The registry supports lookup by namespace alias (`FN_2010_NAMESPACE` falls back
