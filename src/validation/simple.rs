@@ -46,6 +46,21 @@ pub fn validate_simple_type(
 /// Fast-path lexical match; otherwise parses both strings against `type_key`
 /// and compares their typed values. Returns `false` when `type_key` is `None`
 /// or when either parse fails.
+///
+/// The comparison is Structures 1.1's "equal or identical" in **both** XSD
+/// modes: `NaN` matches `NaN`, `0` matches `-0`, two date/time spellings of
+/// one instant in different time zones match, durations compare by months and
+/// seconds (`PT60S` matches `PT1M`), decimals by value, and a union value
+/// whichever member type each spelling chose; values of different primitive
+/// types never match. In XSD 1.0 mode this deliberately departs from the
+/// letter of two XSD 1.0 clauses that compare strings — Attribute Locally
+/// Valid (Use), "its ·normalized value· must match the canonical lexical
+/// representation of the attribute use's {value constraint} value", and
+/// derivation-ok-restriction 2.1.3.2, "R's ·effective value constraint· is
+/// fixed with the same string as B's" — so values equal in value space but
+/// spelled differently are accepted there too; no W3C XSD 1.0 test tells the
+/// two readings apart. (The attribute-use-versus-declaration check of the
+/// schema compiler compares by identity in XSD 1.1 and by equality in 1.0.)
 pub fn fixed_values_equal(
     a: &str,
     b: &str,
@@ -67,20 +82,49 @@ pub fn fixed_values_equal(
     typed_values_equal(&a_result.typed_value, &b_result.typed_value)
 }
 
-/// Value equality of two typed values of the same type, as the fixed/default
-/// checks need it: structural, except that `xs:decimal`-family values compare
-/// by exact value, so a decimal carried in lexical form (beyond
-/// `rust_decimal`'s capacity) equals every other spelling of the same number
-/// (Datatypes 1.1 §3.3.3: "the number 2.0 is not distinct from the number
-/// 2.00"), and that a list compares member for member by value
-/// ([`values_equal_or_identical`](super::identity::values_equal_or_identical)):
-/// each member carries the type that validated it, and which member type of a
-/// union (or which restriction) that was does not matter — Datatypes §2.2.1:
-/// restrictions do not create new values.
+/// Whether two lexical forms of `type_key` denote **identical** values — the
+/// comparison Structures 1.1 Attribute Use Correct clause 3 makes between an
+/// attribute use's `fixed` value and its declaration's ("is identical to").
+/// XSD 1.0 had no separate identity (Datatypes 1.1 §2.2.2: "In the prior
+/// version of this specification (1.0), equality was always identity"), so a
+/// 1.0 schema set compares them with [`typed_values_equal`]. `None` when
+/// either form does not validate against the type (another constraint reports
+/// that).
+pub(crate) fn fixed_values_identical(
+    a: &str,
+    b: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<bool> {
+    if a == b {
+        return Some(true);
+    }
+    let a = validate_simple_type(a, type_key, schema_set).ok()?;
+    let b = validate_simple_type(b, type_key, schema_set).ok()?;
+    Some(if schema_set.is_xsd10() {
+        typed_values_equal(&a.typed_value, &b.typed_value)
+    } else {
+        super::identity::values_identical(&a.typed_value, &b.typed_value)
+    })
+}
+
+/// Whether two typed values are "equal or identical" — the comparison every
+/// value constraint makes: Structures §3.3.4.3 clause 5.2.2.2.2 ("the
+/// ·actual value· of E is equal or identical to D.{value constraint}.{value}"),
+/// Attribute Locally Valid (Use) ("its ·actual value· must be equal or
+/// identical to the {value} of the attribute use's {value constraint}"), and
+/// the schema-time checks that compare two fixed values. It is
+/// [`values_equal_or_identical`](super::identity::values_equal_or_identical):
+/// within one primitive datatype by value (`xs:decimal`-family values exactly,
+/// so a decimal carried in lexical form equals every other spelling of the
+/// same number; NaN identical to NaN and 0 equal to −0 for `xs:float` /
+/// `xs:double`; date/time values by time on the time line; durations by months
+/// and seconds), values of different primitive datatypes distinct, lists
+/// member for member, and which restriction or union member type validated a
+/// value never matters (Datatypes §2.2.1: restrictions "do not create new
+/// values"). A structurally equal pair is decided without that walk.
 pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
-    a == b
-        || crate::types::exact_decimal::decimal_values_equal(a, b) == Some(true)
-        || ((holds_list(a) || holds_list(b)) && super::identity::values_equal_or_identical(a, b))
+    a == b || super::identity::values_equal_or_identical(a, b)
 }
 
 /// The first `xs:decimal` inside a valid typed value that is carried as a
@@ -100,6 +144,8 @@ pub(crate) fn capacity_decimal(value: &XmlValue) -> Option<String> {
 ///
 /// Avoids re-parsing `instance_raw`; only parses `fixed` on lexical mismatch.
 /// Returns `false` when `type_key` is `None` or when parsing `fixed` fails.
+/// The comparison, and its deliberate departure from the string-based XSD 1.0
+/// clauses in XSD 1.0 mode, is that of [`fixed_values_equal`].
 pub fn fixed_matches_typed(
     instance_raw: &str,
     instance_typed: &XmlValue,

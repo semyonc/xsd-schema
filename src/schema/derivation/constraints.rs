@@ -208,21 +208,31 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                     })
                 });
 
-            // au-props-correct.2 (§3.5.6): if the referenced attribute
+            // au-props-correct (§3.5.6 clause 3): if the referenced attribute
             // declaration has `fixed`, then a `fixed` on the attribute use
-            // must denote the same value (the use's `default` is forbidden
-            // when the declaration is fixed). Literal comparison after
-            // whitespace collapse — sufficient for the `xs:string`-flavoured
-            // fixed-value cases the test suite exercises (addB108, attO025).
+            // "is identical to" the declaration's value (the use's `default`
+            // is forbidden when the declaration is fixed) — values, compared
+            // in the declaration's type; a form the type rejects (another
+            // constraint reports it), or an unresolved type, falls back to
+            // the literals after whitespace collapse.
             if let (Some(use_fixed), Some(decl_fixed)) = (
                 attr_use.attribute.fixed_value.as_deref(),
                 ref_decl.and_then(|d| d.fixed_value.as_deref()),
             ) {
                 use crate::types::facets::normalize_whitespace;
                 use crate::types::WhitespaceMode;
-                let use_norm = normalize_whitespace(use_fixed, WhitespaceMode::Collapse);
-                let decl_norm = normalize_whitespace(decl_fixed, WhitespaceMode::Collapse);
-                if use_norm != decl_norm {
+                let identical = ref_decl
+                    .and_then(|d| d.resolved_type)
+                    .and_then(|tk| {
+                        crate::validation::simple::fixed_values_identical(
+                            use_fixed, decl_fixed, tk, schema_set,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        normalize_whitespace(use_fixed, WhitespaceMode::Collapse)
+                            == normalize_whitespace(decl_fixed, WhitespaceMode::Collapse)
+                    });
+                if !identical {
                     let attr_name = ref_decl
                         .and_then(|d| d.name)
                         .map(|n| schema_set.name_table.resolve(n).to_string())

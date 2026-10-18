@@ -112,6 +112,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fails with `cvc-assertion`, as other static errors in assertions already
   did.
 
+- XSD 1.0 mode compares `fixed` values by value too (see *Fixed*). That
+  departs from the letter of two XSD 1.0 clauses that compare strings —
+  Attribute Locally Valid (Use), "its normalized value must match the
+  canonical lexical representation of the attribute use's {value constraint}
+  value", and derivation-ok-restriction 2.1.3.2, "fixed with the same string"
+  — so in 1.0 mode values that are equal but spelled differently are accepted
+  there (`13:00:00+01:00` against `fixed="12:00:00Z"`). See
+  [Overview](doc/OVERVIEW.md).
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
@@ -177,6 +186,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   2.0 §3.10.4); they were XPST0051 and a dynamic `XPTY0004`.
 - A failed `treat as` says which sequence type was expected and what the
   operand was.
+
+- `fixed` values compare "equal or identical" (Structures 1.1 cvc-elt
+  5.2.2.2.2, Attribute Locally Valid (Use)) instead of structurally: `NaN`
+  matches `NaN`, `0` matches `-0`, an `xs:dateTime` or `xs:time` on the same
+  instant in another time zone matches, `PT60S` matches `PT1M`, and a union
+  value matches whichever member type each spelling chose. A value with a time
+  zone never matches one without, and values of different primitive types
+  (`xs:float` against `xs:double`) never match. The restriction checks of a
+  `fixed` element particle or attribute use compare the same way.
+- The schema check of an attribute use against its declaration
+  (`au-props-correct`) compares values instead of whitespace-collapsed
+  strings: `1.0` against `1` is accepted, and `a  b` against `a b` for
+  `xs:string` (which keeps whitespace) is an error. With XSD 1.1, whose
+  clause 3 requires identity, `-0` against `0` and one instant in two time
+  zones are errors.
+- Identity constraints compare durations exactly, by months and seconds:
+  `P1M` and `P30DT10H29M6S` are different keys (they compared equal through
+  30.436875-day months), and a value of a type derived from `xs:duration`
+  matches an `xs:duration` key with the same value.
 
 ### Performance
 

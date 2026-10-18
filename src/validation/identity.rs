@@ -80,9 +80,9 @@ fn atomic_ic_eq(a: &XmlValue, b: &XmlValue) -> Option<bool> {
 
 /// Whether two typed values are "equal or identical" in the sense of
 /// Datatypes §2.2.1 / §2.2.2 — the comparison identity constraints
-/// (Structures §3.11.4) and the `enumeration` facet of a list type
-/// (Datatypes §4.3.5.4, §2.4.1.2: "enumerated values are compared to the
-/// entire ·list·") both rely on. A list compares member for member, each
+/// (Structures §3.11.4), value constraints (`fixed`, §3.3.4.3, §3.5.4) and
+/// the `enumeration` facet of a list type (Datatypes §4.3.5.4, §2.4.1.2:
+/// "enumerated values are compared to the entire ·list·") rely on. A list compares member for member, each
 /// member in the value space of the type that validated it; values of
 /// different primitive datatypes are distinct; a value without a primitive
 /// datatype (`xs:untypedAtomic`) compares by its string. `schema_type` never
@@ -93,6 +93,53 @@ pub(crate) fn values_equal_or_identical(a: &XmlValue, b: &XmlValue) -> bool {
         return list_ic_eq(a, b);
     }
     atomic_ic_eq(a, b).unwrap_or_else(|| a.to_string_value() == b.to_string_value())
+}
+
+/// Whether two typed values are **identical** (Datatypes 1.1 §2.2.1: "Two
+/// things are identical if and only if they are actually the same thing") —
+/// stricter than [`values_equal_or_identical`] in exactly the places 1.1
+/// equality is not identity: `0` and `−0` (`xs:float`, `xs:double`) are equal
+/// but not identical, NaN is identical to itself, and two date/time values on
+/// one instant with different time zone offsets are "equal but not identical"
+/// (§3.3.7). Decimals compare by value (precision is not part of it), durations
+/// by months and seconds ("two duration values are equal if and only if they
+/// are identical"), lists pairwise; values of different primitive datatypes are
+/// distinct, and restrictions do not create new values.
+pub(crate) fn values_identical(a: &XmlValue, b: &XmlValue) -> bool {
+    use crate::types::value::{XmlAtomicValue as V, XmlValueKind as K};
+    let (a, b) = (unwrap_union(a), unwrap_union(b));
+    if list_members(a).is_some() || list_members(b).is_some() {
+        let a_members = list_members(a).unwrap_or(std::slice::from_ref(a));
+        let b_members = list_members(b).unwrap_or(std::slice::from_ref(b));
+        return a_members.len() == b_members.len()
+            && a_members
+                .iter()
+                .zip(b_members)
+                .all(|(x, y)| values_identical(x, y));
+    }
+    match (a.primitive_type(), b.primitive_type()) {
+        (Some(pa), Some(pb)) if pa == pb => {}
+        (Some(_), Some(_)) => return false,
+        _ => return a.to_string_value() == b.to_string_value(),
+    }
+    if a.primitive_type() == Some(PrimitiveTypeCode::Decimal) {
+        return decimal_family_ic_eq(a, b);
+    }
+    match (&a.value, &b.value) {
+        (K::Atomic(V::Double(x)), K::Atomic(V::Double(y))) => {
+            (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative())
+        }
+        (K::Atomic(V::Float(x)), K::Atomic(V::Float(y))) => {
+            (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative())
+        }
+        (K::Atomic(x), K::Atomic(y)) => match (duration_parts(x), duration_parts(y)) {
+            (Some(dx), Some(dy)) => dx == dy,
+            // Every other value is its fields: a date/time keeps its time zone
+            // offset, a string its characters.
+            _ => x == y,
+        },
+        _ => a.value == b.value,
+    }
 }
 
 /// IC equality when at least one of the two values is a list: §3.11.4 clause
@@ -200,13 +247,21 @@ fn xml_value_nan_eq(a: &XmlValue, b: &XmlValue) -> bool {
     }
 }
 
-/// Value-space equality for date/time/duration atomic kinds using their
-/// `PartialOrd` implementations (which compare in value-space).
+/// Value-space equality for date/time/duration atomic kinds.
 ///
-/// XSD Part 2 §3.3.8.2 "Order relation on dateTime" treats date/time/dateTime
-/// values with a timezone and those without as incomparable (neither equal
-/// nor ordered) for identity-constraint purposes. Duration kinds always
-/// compare by total magnitude.
+/// Date/time values compare by their `PartialOrd` implementations, i.e. by
+/// time on the time line (Datatypes §D.2.1: values "are ordered the same as
+/// their ·timeOnTimeline· values"), so one instant written in two time zones is
+/// equal; a value with a time zone and one without are incomparable, never
+/// equal.
+///
+/// Durations compare exactly: two durations are equal when their months and
+/// their seconds are (Datatypes §3.3.7: equality "is determined by adding each
+/// duration in the pair to each of" four dateTime values, which separates any
+/// two different (months, seconds) pairs) — `PT60S` equals `PT1M`, `P1M` equals
+/// no number of days. `xs:yearMonthDuration` and `xs:dayTimeDuration` are
+/// restrictions of `xs:duration`, so a value of one equals the same value of
+/// another.
 fn xml_atomic_datetime_eq(
     a: &crate::types::value::XmlAtomicValue,
     b: &crate::types::value::XmlAtomicValue,
@@ -225,14 +280,50 @@ fn xml_atomic_datetime_eq(
             x.timezone.is_some() == y.timezone.is_some()
                 && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
         }
-        (V::Duration(x), V::Duration(y)) => x.partial_cmp(y) == Some(std::cmp::Ordering::Equal),
-        (V::YearMonthDuration(x), V::YearMonthDuration(y)) => {
-            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
+        _ => match (duration_parts(a), duration_parts(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        },
+    }
+}
+
+/// A duration value as the (months, seconds) pair its value space consists of
+/// (Datatypes §3.3.7.1), signed; `None` for any other value.
+fn duration_parts(
+    atom: &crate::types::value::XmlAtomicValue,
+) -> Option<(i64, rust_decimal::Decimal)> {
+    use crate::types::value::XmlAtomicValue as V;
+    use rust_decimal::Decimal;
+    let signed = |negative: bool, months: i64, seconds: Decimal| {
+        if negative {
+            (-months, -seconds)
+        } else {
+            (months, seconds)
         }
-        (V::DayTimeDuration(x), V::DayTimeDuration(y)) => {
-            x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
-        }
-        _ => false,
+    };
+    let day_seconds = |days: u32, hours: u32, minutes: u32, seconds: Decimal| {
+        Decimal::from(days) * Decimal::from(86_400)
+            + Decimal::from(hours) * Decimal::from(3_600)
+            + Decimal::from(minutes) * Decimal::from(60)
+            + seconds
+    };
+    match atom {
+        V::Duration(d) => Some(signed(
+            d.negative,
+            i64::from(d.years) * 12 + i64::from(d.months),
+            day_seconds(d.days, d.hours, d.minutes, d.seconds),
+        )),
+        V::YearMonthDuration(d) => Some(signed(
+            d.negative,
+            i64::from(d.years) * 12 + i64::from(d.months),
+            Decimal::ZERO,
+        )),
+        V::DayTimeDuration(d) => Some(signed(
+            d.negative,
+            0,
+            day_seconds(d.days, d.hours, d.minutes, d.seconds),
+        )),
+        _ => None,
     }
 }
 

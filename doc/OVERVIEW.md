@@ -51,6 +51,23 @@ versions because the feature enables the conformance-grade regex backend. The
 runtime version is still selected by the test harness through `SchemaSet::new()`
 or `SchemaSet::xsd11()`.
 
+**`fixed` values in XSD 1.0 mode.** In both modes a `fixed` value constraint
+compares values as Structures 1.1 says — "equal or identical" (element and
+attribute `fixed`, and the `fixed` checks of a restriction), and "identical"
+for an attribute use against its declaration in XSD 1.1 (equal in 1.0 mode):
+`NaN` matches `NaN`, `0` matches `-0`, two date/time spellings of one instant
+in different time zones match, durations compare by months and seconds, and
+values of different primitive types never match. In XSD 1.0 mode this departs
+from the letter of two XSD 1.0 clauses that compare strings — Attribute Locally
+Valid (Use): "its ·normalized value· must match the canonical lexical
+representation of the attribute use's {value constraint} value"; and
+derivation-ok-restriction 2.1.3.2: "R's ·effective value constraint· is fixed
+with the same string as B's" — so values equal in value space but spelled
+differently (`13:00:00+01:00` against `fixed="12:00:00Z"`, `PT60S` against
+`fixed="PT1M"`) are accepted there too. No W3C XSD 1.0 test tells the two
+readings apart. `xs:QName` / `xs:NOTATION` `fixed` values still compare
+lexically.
+
 ---
 
 ## Processing Pipeline
