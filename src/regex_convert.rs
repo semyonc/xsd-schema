@@ -880,8 +880,9 @@ mod tests {
 
     #[test]
     fn lenient_ms_keeps_anchors_for_engine() {
-        // Anchors are handled natively by both backends after the
-        // `^(?:...)$` wrapping; preprocess no longer strips them.
+        // Anchors are handled natively by both backends (Rust `regex`, and
+        // regexml's XPath dialect matched against the whole value);
+        // preprocess no longer strips them.
         assert_eq!(lenient_ms_preprocess("^abc$"), "^abc$");
         assert_eq!(lenient_ms_preprocess("[^abc]"), "[^abc]");
     }

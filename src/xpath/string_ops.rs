@@ -277,26 +277,47 @@ pub fn lower_case(value: &str) -> String {
     value.to_lowercase()
 }
 
+/// Up to this many characters in `map-from`, [`translate`] finds a character's
+/// position by scanning `map-from`; above it, through a hash map built once per
+/// call. A scan is cheaper than hashing for the short maps nearly every call
+/// uses, but it costs `|value| × |map-from|`, which for a map of a whole Unicode
+/// category (a million characters) is hours, not milliseconds.
+const TRANSLATE_SCAN_MAX: usize = 32;
+
 /// Translate characters in a string.
 ///
-/// Implements XPath `translate(string, map-from, map-to)`.
+/// Implements XPath `translate(string, map-from, map-to)`: a character of
+/// `value` found in `map-from` is replaced by the character at the same position
+/// in `map-to`, or removed when `map-to` is shorter; when a character occurs
+/// more than once in `map-from`, its first occurrence decides. Linear in
+/// `|value| + |map-from|`.
 pub fn translate(value: &str, map_from: &str, map_to: &str) -> String {
     let from_chars: Vec<char> = map_from.chars().collect();
     let to_chars: Vec<char> = map_to.chars().collect();
+    // What the character at `pos` of `map-from` becomes: `None` removes it.
+    let replacement = |pos: usize| to_chars.get(pos).copied();
 
+    if from_chars.len() <= TRANSLATE_SCAN_MAX {
+        return value
+            .chars()
+            .filter_map(|ch| match from_chars.iter().position(|&c| c == ch) {
+                Some(pos) => replacement(pos),
+                None => Some(ch),
+            })
+            .collect();
+    }
+
+    let mut map: std::collections::HashMap<char, Option<char>> =
+        std::collections::HashMap::with_capacity(from_chars.len());
+    for (pos, &c) in from_chars.iter().enumerate() {
+        // The first occurrence decides: a later one never overwrites it.
+        map.entry(c).or_insert_with(|| replacement(pos));
+    }
     value
         .chars()
-        .filter_map(|ch| {
-            match from_chars.iter().position(|&c| c == ch) {
-                Some(pos) => {
-                    if pos < to_chars.len() {
-                        Some(to_chars[pos])
-                    } else {
-                        None // Remove character if no replacement
-                    }
-                }
-                None => Some(ch),
-            }
+        .filter_map(|ch| match map.get(&ch) {
+            Some(&replaced) => replaced,
+            None => Some(ch),
         })
         .collect()
 }
@@ -598,6 +619,66 @@ mod tests {
     fn test_translate() {
         assert_eq!(translate("bar", "abc", "ABC"), "BAr");
         assert_eq!(translate("--aaa--", "abc-", "ABC"), "AAA");
+    }
+
+    /// The scan the short-map path does, for any map length: the reference
+    /// the hash-map path must agree with.
+    fn translate_by_scan(value: &str, map_from: &str, map_to: &str) -> String {
+        let from: Vec<char> = map_from.chars().collect();
+        let to: Vec<char> = map_to.chars().collect();
+        value
+            .chars()
+            .filter_map(|ch| match from.iter().position(|&c| c == ch) {
+                Some(pos) => to.get(pos).copied(),
+                None => Some(ch),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_translate_with_a_long_map_agrees_with_the_scan() {
+        // Longer than TRANSLATE_SCAN_MAX, with repeated characters (the first
+        // occurrence decides), characters to remove (map-to is shorter), and
+        // characters outside the map.
+        let map_from: String = ('a'..='z').chain('a'..='m').chain('A'..='Z').collect();
+        let map_to: String = ('A'..='Z').chain("0123456789".chars()).collect();
+        assert!(map_from.chars().count() > TRANSLATE_SCAN_MAX);
+        for value in [
+            "",
+            "hello, World",
+            "abcxyzABCXYZ",
+            "zzz \u{10FFEE} 123",
+            "ÄÖÜ mixed Z",
+        ] {
+            assert_eq!(
+                translate(value, &map_from, &map_to),
+                translate_by_scan(value, &map_from, &map_to),
+                "{value:?}"
+            );
+        }
+        // `a` maps by its first occurrence (to `A`), not its second (to `0`).
+        assert_eq!(translate("a", &map_from, &map_to), "A");
+        // `Z` is position 64 of map-from, past the end of map-to: removed.
+        assert_eq!(translate("xZy", &map_from, &map_to), "XY");
+    }
+
+    #[test]
+    fn test_translate_of_a_large_map_is_linear() {
+        // The fn-translate shape of the W3C `unicode-90` set: a string of a
+        // hundred thousand distinct characters translated by itself into its
+        // reverse. Quadratic, this is 10^10 comparisons.
+        let chars: Vec<char> = (0x4E00u32..0x4E00 + 100_000)
+            .filter_map(char::from_u32)
+            .collect();
+        let forward: String = chars.iter().collect();
+        let reverse: String = chars.iter().rev().collect();
+        let started = std::time::Instant::now();
+        assert_eq!(translate(&forward, &forward, &reverse), reverse);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

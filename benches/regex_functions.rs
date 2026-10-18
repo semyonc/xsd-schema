@@ -20,8 +20,9 @@
 //! ```
 //!
 //! — that pattern is a literal that cannot change, while the predicate is
-//! evaluated once per item. A pattern that names a Unicode category also has to
-//! rebuild that category's code-point set, which dwarfs the match itself on a
+//! evaluated once per item. A pattern that names a Unicode category also copies
+//! that category's code-point set into its program (the engine builds each set
+//! once per process), which makes the compile dearer than the match itself on a
 //! short string. The rows:
 //!
 //! * `(a)` a constant pattern through a predicate over 10⁴ and 10⁵ items, for a

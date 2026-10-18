@@ -1190,10 +1190,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
-name = "regexml"
-version = "0.2.2"
+name = "regexml-fork"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a039e64026e31b6d80d295dd4107a18c1344f2059f09d62ce1cdb8c2cad55fa"
+checksum = "bf9672a27564f61c5f6021a739ed406e3d972ac54c80f9a39a2c5b8b72c0eb0f"
 dependencies = [
  "ahash 0.8.12",
  "enum_dispatch",
@@ -1781,7 +1781,7 @@ dependencies = [
  "pretty_assertions",
  "quick-xml",
  "regex",
- "regexml",
+ "regexml-fork",
  "roxmltree",
  "rust_decimal",
  "slotmap",

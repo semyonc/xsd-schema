@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
+  `fn:replace` and `fn:tokenize` that a host keeps across evaluation runs.
+  Lend it to a run with `XPathEvaluator::with_regex_cache`, or
+  `DynamicContext::with_regex_cache` / `set_regex_cache` (inside a `run_with`
+  callback). A host that evaluates the same expressions once per item — for
+  example an XSLT processor's `xsl:if` inside `xsl:for-each` — then compiles
+  each pattern once instead of once per evaluation. Bounded (64 entries by
+  default, `RegexCache::with_capacity`, least recently used dropped), `Send`
+  but not `Sync`, no global state. Without one, each run keeps its own cache as
+  before.
+- `compose::Composer` keeps one such cache for all its evaluations.
+
+### Changed
+
+- The regular-expression engine of the `xsd11` feature is now `regexml-fork`
+  0.3, the maintained fork of `regexml` (the code keeps the name `regexml`; no
+  public item exposes an engine type). It brings fixes that change results:
+  captured groups are restored when the matcher backtracks (`fn:replace`'s
+  `$N`); a counted repetition keeps its bounds when its operand can match the
+  empty string — an `xs:pattern` such as `(\d|){2}` accepted any number of
+  digits; a repetition tries every way of matching before it fails —
+  `([a-z]*)+x` rejected valid values; and an expression nested more than 64
+  levels deep is an error instead of a stack overflow.
+- `xs:pattern` (`xsd11` feature, `RegexCompat::Strict`): `^` and `$` are
+  ordinary characters, as XSD 1.0 Appendix F and XSD 1.1 Part 2 §G.3 define
+  them; they were compiled as anchors, so `^abc$` matched `abc` instead of
+  `^abc$`. W3C `reZ001.v` now passes. Under `RegexCompat::LenientMs` they stay
+  anchors.
+- XSD 1.1 patterns: a block escape with an unrecognized name denotes every
+  character only when the name matches `IsBlock` (`'Is' [a-zA-Z0-9-]+`, Part 2
+  §G.4.2.4); `\p{IsFoo_Bar}` is now an invalid pattern.
+- `RegexCompat::LenientMs` with XSD 1.1 no longer applies the strict XSD
+  grammar check, so back-references, `(?:…)` and reluctant quantifiers are
+  accepted as with XSD 1.0, as documented.
+- `fn:matches`, `fn:replace`, `fn:tokenize` use the engine's XPath 2.0 dialect:
+  without the `s` flag `.` matches a carriage return (#xD) — F&O 1.0 §7.6.1.1
+  excludes only the newline; the `x` flag removes exactly #x9, #xA, #xD and
+  #x20 (a form feed now stays); a pattern that nests groups and character
+  classes more than 64 levels deep raises `FORX0002`. See
+  [Implementation Limits](doc/IMPLEMENTATION_LIMITS.md).
+- `FacetError::InvalidPattern` messages are the engine's `Display` text
+  (`invalid regular expression: …`) instead of its `Debug` form.
+
+### Performance
+
+- Each `xs:pattern` is compiled once: XSD 1.1 patterns were compiled two to
+  eighteen times (a retry per unknown block name, then a second, anchored
+  program), XSD 1.0 patterns twice. A first compile of a pattern-heavy XSD 1.1
+  schema takes about a third less time.
+- With the new engine each Unicode category set is built once per process
+  instead of at every compile: compiling 400 distinct XSD 1.1 patterns took
+  163 ms and takes 4.4 ms.
+- `fn:translate` with a long `$mapString` is linear instead of
+  `|$arg| × |$mapString|` (a map of a whole Unicode category took minutes).
+
 ## [0.2.3] - 2026-10-15
 
 ### Behaviour changes

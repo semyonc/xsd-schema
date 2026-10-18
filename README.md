@@ -11,7 +11,7 @@
 | [Extensibility Guide](doc/EXTENSIBILITY.md) | Extension points for annotations/appinfo, schema loaders, DOM navigation, and custom XPath functions. |
 | [Unsafe Code](doc/UNSAFE.md) | Inventory of unsafe blocks, safety invariants, and Miri verification commands. |
 | [Composing XML from Rust](doc/COMPOSE.md) | XPath 2.0 with Rust values bound as `$variables`, the Lisp-style `form!` constructor, iterator pipelines for the FLWOR clauses, and serialization. |
-| [Implementation Limits](doc/IMPLEMENTATION_LIMITS.md) | Where values are bounded and what happens at the bound: `xs:decimal` beyond `rust_decimal` — exact validation, the typed value, the `xs-decimal-capacity` warning, XPath behaviour. |
+| [Implementation Limits](doc/IMPLEMENTATION_LIMITS.md) | Where values are bounded and what happens at the bound: `xs:decimal` beyond `rust_decimal` — exact validation, the typed value, the `xs-decimal-capacity` warning, XPath behaviour; regular expressions nested more than 64 levels deep. |
 | [Changelog](CHANGELOG.md) | Release notes for every version, with upgrade notes for breaking releases. |
 
 To see exactly what the validator compiled for a complex type — the authored
@@ -28,14 +28,29 @@ constructor — use the composition layer:
 
 | Suite | Command | Total | Passed | Failed | Skipped | Errors | Pass rate |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,458 | 18 | 34 | 0 | 99.95% |
+| W3C XSD 1.0  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.0` | 39,510 | 39,459 | 17 | 34 | 0 | 99.96% |
 | W3C XSD 1.1  | `cargo test --test conformance --features xsd11 --release -- --test-suite ../../xsdtests --version 1.1` | 2,319 | 2,313 | 6 | 0 | 0 | 99.7% |
 | XQTS XPath 2.0 | `cargo test --test xqts_xpath --features xsd11 --release -- -s ../../XQTS_1_0_2 --all -v -f` | 8,047 | 8,047 | 0 | 0 | 0 | 100.0% |
 
-All 18 remaining XSD 1.0 failures and all 6 XSD 1.1 failures are documented
+All 17 remaining XSD 1.0 failures and all 6 XSD 1.1 failures are documented
 disputes: W3C-queried tests (Bugzilla 4146/4680/4957/6901/29085), tests that
 contradict other accepted tests in the same suite (the `elemM002` /
 `xsd015.e` family vs. Saxon's `Missing` group), or documented waivers.
+
+## Regular-expression engine
+
+With the `xsd11` feature, `xs:pattern` facets and the XPath functions `fn:matches`,
+`fn:replace` and `fn:tokenize` use [`regexml-fork`](https://crates.io/crates/regexml-fork),
+a maintained fork of [`regexml`](https://crates.io/crates/regexml) published as its own
+crate under the same licenses (`Apache-2.0 OR MPL-2.0`); its
+[README](https://github.com/semyonc/regexml#readme) explains why. The fork fixes engine
+defects found while testing against the W3C suites — captured groups after backtracking,
+counted repetitions of expressions that can match the empty string, searches that hung or
+took exponential time — and adds whole-string matching, the XPath 2.0 dialect and
+structured error kinds, so each pattern is compiled once and `^` and `$` are ordinary
+characters as XML Schema defines them. The dependency is renamed in `Cargo.toml`
+(`regexml = { package = "regexml-fork", … }`); nothing changes for code that uses
+`xsd-schema`. Without the `xsd11` feature, patterns are translated for the `regex` crate.
 
 ## Benchmark
 

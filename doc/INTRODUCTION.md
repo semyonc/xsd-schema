@@ -695,17 +695,21 @@ Concretely, `LenientMs` does three things:
 
 1. **Skips** `validate_xml_pattern_syntax` — the XSD 1.0 §F hyphen rule
    gate (rejects forms like `[a-c-1]`).
-2. **Skips** `regexml::Regex::xsd(...)` — the strict §F/§G grammar gate
-   (rejects XPath-only constructs).
+2. **Skips** the XSD dialect of the `xsd11` engine — in `Strict` mode a
+   pattern is compiled with regexml's `Regex::xsd(...)`, which rejects
+   XPath-only constructs and reads `^` and `$` as ordinary characters,
+   as XSD Part 2 §F/§G define them; under `LenientMs` it is compiled with
+   regexml's XPath dialect, `Regex::xpath(...)`, where `^` and `$` anchor.
 3. **Strips** `(?#...)` comments textually before compilation, because
    neither Rust `regex` nor regexml's `xpath()` recognise that .NET
    syntax. Comments inside character classes are left alone.
 
-After those three changes, the pattern is compiled with the same
-runtime engine used in `Strict` mode (Rust `regex` for default features,
-regexml `xpath()` for `xsd11`). The Unicode-3.0 `\p{X}` pinning for
-XSD 1.0 schemas applies in both modes — that is a versioning rule, not
-a grammar choice.
+Either way the pattern is compiled once and matched against the whole
+value (default features: Rust `regex`, in both modes). The Unicode-3.0
+`\p{X}` pinning for XSD 1.0 schemas applies in both modes, and so does
+the XSD 1.1 rule that a block escape with an unrecognized block name
+denotes every character (XSD 1.1 Part 2 §G.4.2.4) — those are versioning
+rules, not grammar choices.
 
 ### Constructs unlocked under `LenientMs`
 
@@ -715,7 +719,7 @@ a grammar choice.
 | `(?:non-capturing)` groups | works | works |
 | Reluctant quantifiers `*?`, `+?`, `??`, `{n,m}?` | works | works |
 | Backreferences `\1`, `\2`… | engine gap — still rejects | **works** |
-| Named groups `(?<name>…)` | works | works |
+| Named groups `(?<name>…)` | works | engine gap — still rejects |
 | `(?#…)` inline comments | stripped before compilation | stripped before compilation |
 
 ### When to use it

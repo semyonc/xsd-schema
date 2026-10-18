@@ -18,7 +18,7 @@ use crate::document::{
 use crate::namespace::{NameTable, NamespaceContextSnapshot, XSI_NAMESPACE, XS_NAMESPACE};
 use crate::navigator::{DomNavigator, DomNodeType};
 use crate::xpath::functions::FN_NAMESPACE;
-use crate::xpath::{XPathContext, XPathExpr, XPathValue};
+use crate::xpath::{RegexCache, XPathContext, XPathExpr, XPathValue};
 use crate::SchemaSet;
 
 use super::emit::Emitter;
@@ -328,6 +328,11 @@ pub struct Composer<'a> {
     base_uri: Option<String>,
     ctx: XPathContext<'a>,
     exprs: RefCell<HashMap<ExprKey, Rc<XPathExpr>>>,
+    /// The regular expressions `fn:matches`, `fn:replace` and `fn:tokenize`
+    /// compiled by any evaluation of this composer, lent to every evaluation —
+    /// so an `xpath!` in a loop compiles its pattern once, not once per call.
+    /// Independent of the static context, so `rebuild_context` keeps it.
+    regexes: RegexCache,
     docs: RefCell<Vec<&'a BufferDocument<'a>>>,
     copy: CopyOptions,
 }
@@ -388,6 +393,7 @@ impl<'a> Composer<'a> {
             base_uri: None,
             ctx: XPathContext::new(names),
             exprs: RefCell::new(HashMap::new()),
+            regexes: RegexCache::new(),
             docs: RefCell::new(Vec::new()),
             copy: CopyOptions::default(),
         };
@@ -725,6 +731,7 @@ impl<'a> Composer<'a> {
         let mut binding_error = None;
         let outcome = expr
             .evaluator(&self.ctx)
+            .with_regex_cache(&self.regexes)
             .run_with_node_and_setup(ctx, |typed| {
                 for (name, value) in bind {
                     if let Err(error) = typed.set_variable_by_name(name, value) {
@@ -887,6 +894,26 @@ mod tests {
 
     fn arena_and_names() -> (Bump, NameTable) {
         (Bump::new(), NameTable::new())
+    }
+
+    #[test]
+    fn compiled_regular_expressions_outlive_one_evaluation() {
+        let (arena, names) = arena_and_names();
+        let c = Composer::new(&arena, &names);
+        for (word, capitalised) in [("Kite", "true"), ("bike", "false"), ("Sail", "true")] {
+            let value = c
+                .eval(
+                    r"matches($w, '^\p{Lu}')",
+                    &["w"],
+                    None,
+                    vec![("w", XPathValue::string(word))],
+                )
+                .unwrap();
+            assert_eq!(value.string().unwrap(), capitalised);
+        }
+        // Three evaluations, one compilation.
+        assert_eq!(c.regexes.compiles(), 1);
+        assert_eq!(c.regexes.hits(), 2);
     }
 
     // ── The expression cache ──────────────────────────────────────────

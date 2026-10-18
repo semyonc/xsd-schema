@@ -63,3 +63,14 @@ Casting a string to `xs:decimal`, or writing a decimal literal, follows F&O
 ## 2. `xs:integer`
 
 `xs:integer` values have no size limit (`BigInt`).
+
+## 3. Regular expressions
+
+Groups and character classes may be nested 64 levels deep (`(`…`)` and
+`[`…`]`, a subtracted class `[a-z-[aeiou]]` included, counted together). The
+regular-expression engine compiles and matches by recursion, one level of the
+stack per level of nesting, so a deeper expression is refused rather than
+allowed to overflow the stack: an `xs:pattern` facet is an invalid pattern
+(the message names the limit), and `fn:matches`, `fn:replace` and
+`fn:tokenize` raise `FORX0002`. Real expressions nest a few levels; the
+deepest in the W3C XML Schema test suite nests 15.

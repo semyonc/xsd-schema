@@ -5,17 +5,24 @@
 //! - fn:replace($input, $pattern, $replacement, $flags?) - replace matches
 //! - fn:tokenize($input, $pattern, $flags?) - split string by pattern
 //!
-//! Uses the `regexml` crate for native XML Schema 1.1 regex with full Unicode support.
+//! Uses the `regexml` engine (the `regexml-fork` crate) in its XPath 2.0
+//! dialect, `Regex::xpath20`: the regular expressions of F&O 1.0 Second
+//! Edition §7.6.1, with full Unicode support.
 //!
 //! All three compile their `$pattern` and `$flags` arguments through one private
 //! helper, which reuses the program of a `(pattern, flags)` pair it has already
-//! compiled during the current evaluation run. A pattern that does not change —
-//! a literal in a predicate, say — is therefore compiled once, however many
-//! items the predicate is evaluated for. The reuse is invisible: a compiled
-//! `regexml::Regex` is immutable and builds a fresh matcher for every call, and
-//! a compile that fails yields the same error every time.
+//! compiled during the current evaluation run — or, when the host lent the run a
+//! [`RegexCache`](crate::xpath::RegexCache), during any run that used that
+//! cache. A pattern that does not change — a literal in a predicate, say — is
+//! therefore compiled once, however many items the predicate is evaluated for.
+//! The reuse is invisible: a compiled `regexml::Regex` is immutable and builds a
+//! fresh matcher for every call, and a compile that fails yields the same error
+//! every time.
 
-use regexml::Regex;
+use std::ops::Deref;
+use std::sync::Arc;
+
+use regexml::{ErrorKind, Regex};
 
 use crate::xpath::context::DynamicContext;
 use crate::xpath::error::XPathError;
@@ -109,7 +116,7 @@ pub fn replace<N: DomNavigator>(
 
     // FORX0003, before anything is matched: the rule is about `$pattern`
     // alone, so it applies whatever `$input` is — an empty one included.
-    if matches_zero_length_string(regex) {
+    if matches_zero_length_string(&regex) {
         return Err(XPathError::regex_matches_zero_length(&pattern));
     }
 
@@ -122,11 +129,9 @@ pub fn replace<N: DomNavigator>(
 
     let result = regex
         .replace_all(&input, &replacement)
-        .map_err(|e| match e {
-            regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
-            regexml::Error::InvalidReplacementString(_) => {
-                XPathError::invalid_replacement_string(&replacement)
-            }
+        .map_err(|e| match e.kind() {
+            ErrorKind::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
+            ErrorKind::InvalidReplacement => XPathError::invalid_replacement_string(&replacement),
             _ => XPathError::invalid_regex_pattern(&pattern),
         })?;
 
@@ -169,9 +174,9 @@ pub fn tokenize<N: DomNavigator>(
     // shortcut. F&O §7.6.4 states the three errors with no exemption for any
     // input, and states separately that the result is the empty sequence when
     // `$input` is the empty sequence or the zero-length string. Compiling
-    // first costs nothing: the program is cached per evaluation run.
+    // first costs nothing: the program is cached (see `build_regex`).
     let regex = build_regex(context, &pattern, flags.as_deref().unwrap_or(""))?;
-    if matches_zero_length_string(regex) {
+    if matches_zero_length_string(&regex) {
         return Err(XPathError::regex_matches_zero_length(&pattern));
     }
 
@@ -179,8 +184,8 @@ pub fn tokenize<N: DomNavigator>(
         return Ok(XPathValue::Empty);
     }
 
-    let token_iter = regex.tokenize(&input).map_err(|e| match e {
-        regexml::Error::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
+    let token_iter = regex.tokenize(&input).map_err(|e| match e.kind() {
+        ErrorKind::MatchesEmptyString => XPathError::regex_matches_zero_length(&pattern),
         _ => XPathError::invalid_regex_pattern(&pattern),
     })?;
 
@@ -197,81 +202,6 @@ pub fn tokenize<N: DomNavigator>(
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// The regular-expression flags XPath 2.0 defines: `s`, `m`, `i` and `x`.
-const XPATH20_REGEX_FLAGS: &str = "smix";
-
-/// Reject regular-expression syntax that the XPath 2.0 dialect does not have.
-///
-/// The `regexml` backend implements the later XPath dialect, which added the
-/// non-capturing group `(?:…)` (and the other `(?…)` forms) together with the
-/// `q` flag. In the XPath 2.0 grammar a `(` always opens a capturing group and
-/// is followed by a branch; `?` is a quantifier and a quantifier needs an atom
-/// in front of it, so an unescaped `(` can never be followed by `?`. The only
-/// defined flags are `s`, `m`, `i` and `x`.
-///
-/// This is deliberately a pre-pass over the *source* pattern rather than a
-/// change to the backend: only the three XPath regular-expression functions go
-/// through here, so `xs:pattern` facets — which compile the same backend
-/// directly and wrap their own value in `^(?:…)$` — keep working unchanged.
-///
-/// Returns FORX0001 for an undefined flag and FORX0002 for a `(?` occurrence
-/// outside a character class.
-fn check_xpath20_regex_dialect(pattern: &str, flags: &str) -> Result<(), XPathError> {
-    for f in flags.chars() {
-        if !XPATH20_REGEX_FLAGS.contains(f) {
-            return Err(XPathError::invalid_regex_flags(flags));
-        }
-    }
-
-    // F&O §7.6.1.1, the `x` flag: "whitespace characters (#x9, #xA, #xD and
-    // #x20) in the regular expression are removed prior to matching with one
-    // exception: whitespace characters within character class expressions
-    // (charClassExpr) are not removed". So the pattern is checked as it reads
-    // *after* that removal: `( ?:a)` is `(?:a)`, and `\ (?` is `\(?` — the
-    // backslash escapes the next character that survives the removal (F&O's
-    // own example: `hello\ sworld` with `x` matches "hello world").
-    let ignore_whitespace = flags.contains('x');
-    let is_removed = |c: char| matches!(c, '\u{9}' | '\u{A}' | '\u{D}' | ' ');
-
-    let chars: Vec<char> = pattern.chars().collect();
-    // `[` opens a character class and, after `-`, a nested subtracted class;
-    // inside a class an unescaped `[` or `]` is not allowed otherwise, so a
-    // plain depth counter tracks `[a-z-[(?]]` correctly.
-    let mut class_depth: usize = 0;
-    // The last character kept outside a class was an unescaped `(`.
-    let mut after_open_paren = false;
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        i += 1;
-        if ignore_whitespace && class_depth == 0 && is_removed(c) {
-            continue;
-        }
-        let opened = after_open_paren;
-        after_open_paren = false;
-        match c {
-            // A backslash escapes the character that follows it — under `x`
-            // and outside a class, the next one that is not removed — so `\(?`
-            // is a literal `(` with a `?` quantifier on it.
-            '\\' => {
-                if ignore_whitespace && class_depth == 0 {
-                    while chars.get(i).is_some_and(|&next| is_removed(next)) {
-                        i += 1;
-                    }
-                }
-                i += 1;
-            }
-            '[' => class_depth += 1,
-            ']' => class_depth = class_depth.saturating_sub(1),
-            '(' if class_depth == 0 => after_open_paren = true,
-            '?' if opened => return Err(XPathError::invalid_regex_pattern(pattern)),
-            _ => {}
-        }
-    }
-
-    Ok(())
-}
 
 /// Whether a compiled pattern matches the zero-length string — the FORX0003
 /// condition of `fn:replace` (F&O §7.6.3) and `fn:tokenize` (F&O §7.6.4).
@@ -321,14 +251,34 @@ fn check_replacement_string(replacement: &str) -> Result<(), XPathError> {
     Ok(())
 }
 
+/// A compiled program, borrowed from the run's own cache or shared out of the
+/// host's [`RegexCache`](crate::xpath::RegexCache).
+enum CachedRegex<'run> {
+    Run(&'run Regex),
+    Host(Arc<Regex>),
+}
+
+impl Deref for CachedRegex<'_> {
+    type Target = Regex;
+
+    fn deref(&self) -> &Regex {
+        match self {
+            CachedRegex::Run(regex) => regex,
+            CachedRegex::Host(regex) => regex,
+        }
+    }
+}
+
 /// The Regex for an XPath pattern and flags, compiled at most once per
-/// `(pattern, flags)` pair per evaluation run.
+/// `(pattern, flags)` pair per evaluation run — or per host cache.
 ///
-/// The program is compiled by [`compile_regex`] the first time this run asks for
-/// the pair and is kept in the run's
-/// [`regex_cache`](crate::xpath::regex_cache) afterwards, so a pattern that does
-/// not change — a literal in a predicate, say — is compiled once however many
-/// items the predicate is evaluated for. Reuse is invisible: a compiled
+/// The program is compiled by [`compile_regex`] the first time it is asked for
+/// and is kept afterwards: in the host's
+/// [`RegexCache`](crate::xpath::RegexCache) when the host lent this run one, and
+/// otherwise in the run's own [`regex_cache`](crate::xpath::regex_cache). So a
+/// pattern that does not change — a literal in a predicate, say — is compiled
+/// once however many items the predicate is evaluated for, and, with a host
+/// cache, however many runs evaluate it. Reuse is invisible: a compiled
 /// `regexml::Regex` is immutable and builds a fresh matcher for each call, and a
 /// compile that fails yields the same error every time because that error is
 /// built from the pattern and the flags alone.
@@ -336,25 +286,37 @@ fn build_regex<'run, N: DomNavigator>(
     context: &'run mut DynamicContext<'_, N>,
     pattern: &str,
     flags: &str,
-) -> Result<&'run Regex, XPathError> {
-    context
-        .regex_cache_mut()
-        .get_or_compile(pattern, flags, || compile_regex(pattern, flags))
+) -> Result<CachedRegex<'run>, XPathError> {
+    match context.host_regex_cache() {
+        Some(cache) => cache
+            .get_or_compile(pattern, flags, || compile_regex(pattern, flags))
+            .map(CachedRegex::Host),
+        None => context
+            .regex_cache_mut()
+            .get_or_compile(pattern, flags, || compile_regex(pattern, flags))
+            .map(CachedRegex::Run),
+    }
 }
 
-/// Build a Regex from an XPath pattern and flags using regexml.
+/// Build a Regex from an XPath pattern and flags, in the XPath 2.0 dialect.
 ///
-/// regexml natively handles XML Schema regex syntax including:
-/// - Character class subtraction `[A-Z-[OI]]`
-/// - XSD-specific escapes `\i`, `\c`, `\I`, `\C`
-/// - Unicode categories `\p{Lu}`, `\P{Lu}`
-/// - Flag handling (s, m, i, x)
+/// `Regex::xpath20` is the regular-expression language of F&O 1.0 Second
+/// Edition §7.6.1: XML Schema's syntax (character class subtraction, `\i`,
+/// `\c`, `\p{…}`) with `^`, `$`, back-references and reluctant quantifiers,
+/// but without what F&O 3.0 added — the flags are exactly `s`, `m`, `i` and
+/// `x` (§7.6.1.1: "If there are characters present that are not defined here
+/// as flags, then an error is raised \[err:FORX0001\]"), there is no `(?…)`
+/// group, and without `s` the meta-character `.` "matches any character
+/// except a newline (#x0A) character" (the later rule also excludes #xD).
+///
+/// FORX0001 for invalid flags (checked first); FORX0002 for everything else
+/// the engine refuses — a syntax error, an unknown block name (F&O 1.0 takes
+/// XML Schema 1.0's list of block names), and a pattern that nests groups and
+/// character classes more than 64 levels deep (`ErrorKind::NestingTooDeep`:
+/// the engine's limit, which keeps compiling and matching inside the stack).
 fn compile_regex(pattern: &str, flags: &str) -> Result<Regex, XPathError> {
-    check_xpath20_regex_dialect(pattern, flags)?;
-
-    Regex::xpath(pattern, flags).map_err(|e| match e {
-        regexml::Error::InvalidFlags(_) => XPathError::invalid_regex_flags(flags),
-        regexml::Error::Syntax(_) => XPathError::invalid_regex_pattern(pattern),
+    Regex::xpath20(pattern, flags).map_err(|e| match e.kind() {
+        ErrorKind::InvalidFlags => XPathError::invalid_regex_flags(flags),
         _ => XPathError::invalid_regex_pattern(pattern),
     })
 }
@@ -972,6 +934,101 @@ mod tests {
         assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
     }
 
+    /// `matches()` as a plain `bool`, or `None` for FORX0002.
+    fn is(input: &str, pattern: &str, flags: Option<&str>) -> Option<bool> {
+        match matches_result(input, pattern, flags) {
+            Ok(value) => Some(boolean_of(value)),
+            Err(XPathError::FORX0002 { .. }) => None,
+            Err(e) => panic!("{pattern:?} {flags:?}: {e}"),
+        }
+    }
+
+    /// F&O 1.0 §7.6.1.1: "If the s flag is not specified, the meta-character
+    /// . matches any character except a newline (#x0A) character." The
+    /// carriage return #xD is matched; F&O 3.1 later excluded it too.
+    #[test]
+    fn test_dot_matches_a_carriage_return_but_not_a_newline() {
+        assert_eq!(is("a\rb", "^a.b$", None), Some(true));
+        assert_eq!(is("a\nb", "^a.b$", None), Some(false));
+        assert_eq!(is("a\nb", "^a.b$", Some("s")), Some(true));
+        assert_eq!(is("\r", "^.$", None), Some(true));
+        assert_eq!(is("\r\n", "^.+$", None), Some(false));
+        assert_eq!(is("\r\n", "^.+$", Some("s")), Some(true));
+        // A class expression is unaffected.
+        assert_eq!(is("\r", "^[^\n]$", None), Some(true));
+    }
+
+    /// F&O 1.0 §7.6.1.1, `x`: "whitespace characters (#x9, #xA, #xD and
+    /// #x20) in the regular expression are removed" — those four only, so a
+    /// form feed (#xC) stays a character of the pattern.
+    #[test]
+    fn test_x_flag_keeps_a_form_feed() {
+        assert_eq!(is("\u{C}", "^\u{C}$", Some("x")), Some(true));
+        assert_eq!(is("", "^\u{C}$", Some("x")), Some(false));
+        // A form feed between `(` and `?` is a character with a quantifier,
+        // not the start of a `(?…)` group.
+        assert_eq!(is(":a", "^(\u{C}?:a)$", Some("x")), Some(true));
+        assert_eq!(is("ab", "^a \t\r\n b$", Some("x")), Some(true));
+    }
+
+    /// The flags after a `;` belong to the engine, not to XPath 2.0: FORX0001.
+    /// An unknown block name is FORX0002 (F&O 1.0 takes the block names XML
+    /// Schema 1.0 lists).
+    #[test]
+    fn test_engine_flags_and_unknown_blocks_are_errors() {
+        for flags in [";k", "i;k", ";"] {
+            assert!(
+                matches!(
+                    matches_result("a", "a", Some(flags)),
+                    Err(XPathError::FORX0001 { .. })
+                ),
+                "{flags:?}"
+            );
+        }
+        assert_eq!(is("a", r"\p{IsNoSuchBlock}", None), None);
+        assert_eq!(is("a", r"\p{IsBasicLatin}", None), Some(true));
+    }
+
+    /// Groups and character classes nested more than 64 levels deep are
+    /// FORX0002 — the engine's limit, which keeps compiling and matching
+    /// inside the stack — in all three functions; a pattern of 100,000 open
+    /// groups is an error, not an abort. 64 levels work.
+    #[test]
+    fn test_nesting_beyond_the_engine_limit_is_forx0002() {
+        let nested = |depth: usize| format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+        let classes =
+            |depth: usize| format!("{}[a]{}", "[a-z-".repeat(depth - 1), "]".repeat(depth - 1));
+        assert_eq!(is("xay", &nested(64), None), Some(true));
+        // `[a-z-[a-z-[…[a]…]]]` alternates: an even depth is `b`–`z`.
+        assert_eq!(is("b", &classes(64), None), Some(true));
+        assert_eq!(is("a", &classes(64), None), Some(false));
+        assert_eq!(is("xay", &nested(65), None), None);
+        assert_eq!(is("a", &classes(65), None), None);
+        assert_eq!(is("a", &"(".repeat(100_000), None), None);
+
+        let names = NameTable::new();
+        let mut ctx = create_context(&names);
+        let result = replace(
+            &mut ctx,
+            vec![
+                XPathValue::string("a"),
+                XPathValue::string(nested(65)),
+                XPathValue::string("x"),
+            ],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+        let result = tokenize(
+            &mut ctx,
+            vec![XPathValue::string("a"), XPathValue::string(nested(65))],
+        );
+        assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+        // Invalid flags are still reported first.
+        assert!(matches!(
+            matches_result("a", &nested(65), Some("q")),
+            Err(XPathError::FORX0001 { .. })
+        ));
+    }
+
     // =========================================================================
     // One compilation per (pattern, flags) pair per run
     //
@@ -1566,5 +1623,86 @@ mod tests {
         // A pattern that matches the zero-length string is fine for matches().
         let result = matches(&mut ctx, vec![XPathValue::Empty, XPathValue::string("a*")]).unwrap();
         assert!(boolean_of(result));
+    }
+
+    #[test]
+    fn test_a_host_cache_compiles_once_across_runs() {
+        let regexes = crate::xpath::RegexCache::new();
+        let names = NameTable::new();
+        for _ in 0..5 {
+            let mut ctx = create_context(&names).with_regex_cache(&regexes);
+            for i in 0..10 {
+                let result = matches(
+                    &mut ctx,
+                    vec![
+                        XPathValue::string(format!("item-{i}")),
+                        XPathValue::string(r"\p{Ll}"),
+                    ],
+                )
+                .unwrap();
+                assert!(boolean_of(result));
+            }
+            // The run's own cache is not used while a host cache is lent.
+            assert_eq!(ctx.regex_cache().len(), 0);
+        }
+        assert_eq!(regexes.compiles(), 1);
+        assert_eq!(regexes.hits(), 49);
+    }
+
+    #[test]
+    fn test_a_host_cache_serves_the_three_functions_and_replays_errors() {
+        let regexes = crate::xpath::RegexCache::new();
+        let names = NameTable::new();
+        for _ in 0..3 {
+            let mut ctx = create_context(&names).with_regex_cache(&regexes);
+            let hit = matches(
+                &mut ctx,
+                vec![XPathValue::string("a,b"), XPathValue::string(",")],
+            )
+            .unwrap();
+            assert!(boolean_of(hit));
+            let replaced = replace(
+                &mut ctx,
+                vec![
+                    XPathValue::string("a,b"),
+                    XPathValue::string(","),
+                    XPathValue::string(";"),
+                ],
+            )
+            .unwrap();
+            assert!(
+                matches!(replaced, XPathValue::Item(XmlItem::Atomic(ref v)) if v.as_string() == Some("a;b"))
+            );
+            let tokens = tokenize(
+                &mut ctx,
+                vec![XPathValue::string("a,b"), XPathValue::string(",")],
+            )
+            .unwrap();
+            assert_eq!(token_strings(tokens), vec!["a", "b"]);
+
+            // FORX0003 from a reused program, FORX0002 and FORX0001 replayed.
+            let result = tokenize(
+                &mut ctx,
+                vec![XPathValue::string("test"), XPathValue::string("a?")],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0003 { .. })));
+            let result = matches(
+                &mut ctx,
+                vec![XPathValue::string("test"), XPathValue::string("[")],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0002 { .. })));
+            let result = matches(
+                &mut ctx,
+                vec![
+                    XPathValue::string("test"),
+                    XPathValue::string("t"),
+                    XPathValue::string("z"),
+                ],
+            );
+            assert!(matches!(result, Err(XPathError::FORX0001 { .. })));
+        }
+        // `,`, `a?`, `[` and (`t`, `z`): four keys, each compiled once.
+        assert_eq!(regexes.compiles(), 4);
+        assert_eq!(regexes.len(), 4);
     }
 }
