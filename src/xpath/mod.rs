@@ -115,6 +115,7 @@ pub use self::node_test::{matches_name_test, matches_sequence_type, NodeTest};
 pub use self::parser::{
     parse, parse_with_options, parse_xpath10, parse_xpath20, ParseError, ParsedXPath,
 };
+pub use self::regex_cache::RegexCache;
 pub use self::timsort::{
     timsort, timsort_by, timsort_slice, timsort_slice_by, timsort_slice_with_comparer,
     timsort_with_comparer, FnComparer, IComparer, OrdComparer, ReverseComparer,

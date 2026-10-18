@@ -709,8 +709,12 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     /// Compiled regular expressions reused across the `fn:matches`,
     /// `fn:replace` and `fn:tokenize` calls of this run; see
     /// [`regex_cache`](crate::xpath::regex_cache). Empty and allocation-free
-    /// until the first such call, and dropped with the context.
-    regex_cache: crate::xpath::regex_cache::RegexCache,
+    /// until the first such call, and dropped with the context. Not used while
+    /// `host_regex_cache` is set.
+    regex_cache: crate::xpath::regex_cache::RunCache,
+    /// A cache of compiled regular expressions the host keeps across runs and
+    /// lends to this one; see [`set_regex_cache`](Self::set_regex_cache).
+    host_regex_cache: Option<&'a crate::xpath::regex_cache::RegexCache>,
     /// Collations resolved through the host's
     /// [`CollationResolver`](crate::xpath::collation::CollationResolver) during
     /// this run; see [`collation`](crate::xpath::collation). Empty and
@@ -737,6 +741,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             extension: None,
             compare_cache: Default::default(),
             regex_cache: Default::default(),
+            host_regex_cache: None,
             collation_cache: Default::default(),
         }
     }
@@ -813,7 +818,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
 
     /// The compiled regular expressions of this run.
     #[inline]
-    pub(crate) fn regex_cache_mut(&mut self) -> &mut crate::xpath::regex_cache::RegexCache {
+    pub(crate) fn regex_cache_mut(&mut self) -> &mut crate::xpath::regex_cache::RunCache {
         &mut self.regex_cache
     }
 
@@ -821,8 +826,69 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     /// path never reads the cache without also being allowed to fill it.
     #[cfg(test)]
     #[inline]
-    pub(crate) fn regex_cache(&self) -> &crate::xpath::regex_cache::RegexCache {
+    pub(crate) fn regex_cache(&self) -> &crate::xpath::regex_cache::RunCache {
         &self.regex_cache
+    }
+
+    /// The cache of compiled regular expressions the host lent this run, if any.
+    #[inline]
+    pub(crate) fn host_regex_cache(&self) -> Option<&'a crate::xpath::regex_cache::RegexCache> {
+        self.host_regex_cache
+    }
+
+    /// Lend this run a cache of compiled regular expressions that the host keeps
+    /// across runs (builder form).
+    ///
+    /// The builder counterpart of [`set_regex_cache`](Self::set_regex_cache), for
+    /// code that constructs its own `DynamicContext`; see there.
+    pub fn with_regex_cache(mut self, cache: &'a crate::xpath::RegexCache) -> Self {
+        self.host_regex_cache = Some(cache);
+        self
+    }
+
+    /// Lend this run a cache of compiled regular expressions that the host keeps
+    /// across runs, or — with `None` — go back to the run's own cache.
+    ///
+    /// Without one, a run keeps the programs `fn:matches`, `fn:replace` and
+    /// `fn:tokenize` compile for as long as the run lasts, so a host that runs an
+    /// expression once per item compiles its patterns once per item. With one,
+    /// the run takes its programs from the host's
+    /// [`RegexCache`](crate::xpath::RegexCache) and leaves the ones it compiles
+    /// there for the next run; its own cache stays empty. This is the
+    /// mutable-reference form, for the
+    /// [`run_with`](crate::xpath::XPathEvaluator::run_with) setup callback;
+    /// outside one,
+    /// [`XPathEvaluator::with_regex_cache`](crate::xpath::XPathEvaluator::with_regex_cache)
+    /// does the same.
+    ///
+    /// The reference is `&'a`, like [`set_extension`](Self::set_extension)'s: the
+    /// cache has to outlive this context, which a cache the host keeps across
+    /// runs does by definition.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::xpath::{RegexCache, RoXmlNavigator, XPathContext, XPathExpr};
+    ///
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let expr = XPathExpr::compile("tokenize('a, b,c', ',\\s*')", &ctx).unwrap();
+    ///
+    /// let regexes = RegexCache::new();
+    /// for _ in 0..3 {
+    ///     let tokens = expr
+    ///         .evaluator(&ctx)
+    ///         .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+    ///             eval.context().set_regex_cache(Some(&regexes));
+    ///         })
+    ///         .unwrap();
+    ///     assert_eq!(tokens.into_vec().len(), 3);
+    /// }
+    /// assert_eq!(regexes.len(), 1);
+    /// ```
+    pub fn set_regex_cache(&mut self, cache: Option<&'a crate::xpath::RegexCache>) {
+        self.host_regex_cache = cache;
     }
 
     /// The collations resolved during this run.

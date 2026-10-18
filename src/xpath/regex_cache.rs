@@ -1,13 +1,16 @@
-//! Reuse of compiled regular expressions across the calls of one evaluation run.
+//! Reuse of compiled regular expressions: within one evaluation run, and — when
+//! the host asks for it — across runs.
 //!
 //! [`matches`](crate::xpath::functions::regex::matches),
 //! [`replace`](crate::xpath::functions::regex::replace) and
 //! [`tokenize`](crate::xpath::functions::regex::tokenize) each turn their
 //! `$pattern` and `$flags` arguments into a compiled program before they do any
-//! work. Compiling is not cheap: the backend parses the pattern, builds the
-//! program, and for a pattern that names a Unicode category or a shorthand that
-//! stands for one (`\p{…}`, `\d`, `\w`, `\s`) expands that category's code-point
-//! set. On a short input string the compilation costs far more than the match.
+//! work. Compiling is not cheap: the backend parses the pattern and builds the
+//! program, which for a pattern that names a Unicode category or a shorthand
+//! that stands for one (`\p{…}`, `\d`, `\w`) holds its own copy of that class's
+//! code-point set — and of its complement for `\P{…}` — although the engine
+//! builds each category set only once per process. On a short input string the
+//! compilation still costs more than the match.
 //!
 //! That would not matter if a pattern were compiled once per expression, but the
 //! shape that matters most is
@@ -22,10 +25,10 @@
 //! every item.
 //!
 //! This module keeps the compiled program of each distinct `(pattern, flags)`
-//! pair for the duration of one **run**, so that every later call with that pair
-//! costs a key comparison and nothing else.
+//! pair, so that every later call with that pair costs a key comparison and
+//! nothing else. It has two tiers.
 //!
-//! # Where the cache lives, and how long
+//! # The run's own cache (the default)
 //!
 //! In [`DynamicContext`](crate::xpath::context::DynamicContext), which is created
 //! by [`XPathEvaluator::run`](crate::xpath::XPathEvaluator::run) and dropped when
@@ -33,8 +36,32 @@
 //! is shared and immutable) and never global — so there is no lock on the path of
 //! a per-item predicate, nothing outlives the run, and two runs cannot observe
 //! each other. It is an empty `Vec` until the run's first regular-expression
-//! call, so an expression that uses none pays one pointer-sized field and no
+//! call, so an expression that uses none pays a few words of context and no
 //! allocation.
+//!
+//! # A cache the host keeps: [`RegexCache`]
+//!
+//! One cache per run is the right lifetime for a host that evaluates an
+//! expression once over many items. It is the wrong one for a host that
+//! evaluates the same expression *many times*, once per item — an XSLT
+//! processor evaluating the `test` of an `xsl:if` inside an `xsl:for-each`, or a
+//! validator evaluating an assertion per element: every run starts empty, so
+//! every run compiles the pattern again. Such a host creates a [`RegexCache`],
+//! keeps it for as long as it likes (one transformation, say) and lends it to
+//! each run with
+//! [`XPathEvaluator::with_regex_cache`](crate::xpath::XPathEvaluator::with_regex_cache)
+//! or [`DynamicContext::set_regex_cache`](crate::xpath::DynamicContext::set_regex_cache).
+//! A run that has one uses it *instead of* its own cache, so a pattern is
+//! compiled once for the life of the host's cache rather than once per run.
+//!
+//! The host's cache is the host's state, not the process's: it is `Send` but not
+//! `Sync`, so it can move to another thread but is never shared by two threads
+//! at once, and two hosts — or two transformations of one host — only share one
+//! if they are handed the same value. It uses interior mutability so that runs
+//! can borrow it by shared reference, and holds its inner borrow only while it
+//! looks a key up or stores one, never while a pattern is matched — so a run
+//! nested inside another run (an extension function that evaluates an
+//! expression) can use the same cache.
 //!
 //! # Why one compiled program can serve every later call
 //!
@@ -44,17 +71,29 @@
 //! one `Regex` therefore produces exactly what a freshly compiled one produces,
 //! for any of the three functions in any order.
 //!
-//! It is handed out as a plain `&Regex`, not as an `Rc`: `Regex` is not `Clone`,
-//! so it has to be shared one way or the other, and a reference costs no
-//! allocation at all — which matters because the *first* call for a key is the
-//! one the cache can only make slower, and every allocation it adds there shows
-//! up in an expression that calls `matches` exactly once. The price is that the
-//! borrow of the context lasts as long as the regex is in use; the three
-//! functions want nothing else from the context by then.
+//! The run's own cache hands it out as a plain `&Regex`, not as an `Rc`: `Regex`
+//! is not `Clone`, so it has to be shared one way or the other, and a reference
+//! costs no allocation at all — which matters because the *first* call for a key
+//! is the one the cache can only make slower, and every allocation it adds there
+//! shows up in an expression that calls `matches` exactly once. The price is that
+//! the borrow of the context lasts as long as the regex is in use; the three
+//! functions want nothing else from the context by then. The host's cache cannot
+//! lend a reference past its inner borrow, so it holds each program in an `Arc`
+//! and hands out a clone: one allocation per key for the life of the cache, and
+//! a reference-count increment per call.
 //!
 //! The "does this pattern match the zero-length string" answer that `fn:replace`
 //! and `fn:tokenize` raise FORX0003 from is a field of the compiled `Regex`,
 //! computed once when it is built; reusing the program reuses that answer too.
+//!
+//! # The key
+//!
+//! `(pattern, flags)`, compared as strings. Nothing else enters the compilation:
+//! the three functions compile through one private function that reads those two
+//! strings and nothing from the static or the dynamic context — no mode, no base
+//! URI, no collation, and one regular-expression dialect (XPath 2.0's). That is
+//! also what makes one host cache safe to lend to runs of *different* expressions
+//! under *different* static contexts.
 //!
 //! # Failures are cached as well
 //!
@@ -73,10 +112,16 @@
 //! ```
 //!
 //! computes a new one per item, and an unbounded cache would then hold every
-//! pattern the input contains. [`MAX_ENTRIES`] caps the table and the least
-//! recently used entry is dropped to make room, so such a run keeps at most
-//! [`MAX_ENTRIES`] programs alive and a run that walks through many patterns
-//! before settling on one still ends up with the one it uses resident.
+//! pattern the input contains. Both tiers therefore have a fixed number of
+//! entries — [`MAX_ENTRIES`] for a run, [`RegexCache::DEFAULT_CAPACITY`] (or
+//! what the host chose) for a host cache — and the least recently used entry is
+//! dropped to make room, so such a run keeps at most that many programs alive and
+//! a run that walks through many patterns before settling on one still ends up
+//! with the one it uses resident.
+
+use std::cell::RefCell;
+use std::fmt;
+use std::sync::Arc;
 
 use regexml::Regex;
 
@@ -90,43 +135,39 @@ use crate::xpath::error::XPathError;
 /// number, as [`compare_cache::MAX_TRACKED_NODES`](crate::xpath::compare_cache).
 /// It is chosen against the memory a compiled program costs: measured with a
 /// counting allocator, 32 plain patterns hold ~26 KB and 32 patterns each
-/// carrying a Unicode category class ~0.4 MB, which is the worst case this bound
+/// carrying a Unicode category class ~0.5 MB, which is the worst case this bound
 /// admits, per run, for the run's lifetime.
 pub(crate) const MAX_ENTRIES: usize = 32;
 
-/// What one `(pattern, flags)` pair compiled to: a program, or the error
-/// compiling it raised — which is the same error every time (see the module
-/// documentation).
-type Compiled = Result<Regex, XPathError>;
-
-/// One cached compilation, with the key it was compiled from.
-struct Entry {
+/// One cached compilation, with the key it was compiled from. `T` is what the
+/// tier holds a program as: the program itself for a run, an `Arc` of it for a
+/// host cache.
+struct Entry<T> {
     pattern: String,
     flags: String,
-    compiled: Compiled,
-    /// The reading of [`RegexCache::clock`] at this entry's last use, which is
-    /// what makes "least recently used" answerable without moving entries about.
+    /// A program, or the error compiling it raised — which is the same error
+    /// every time (see the module documentation).
+    compiled: Result<T, XPathError>,
+    /// The reading of [`Table::clock`] at this entry's last use, which is what
+    /// makes "least recently used" answerable without moving entries about.
     used: u64,
 }
 
-/// The compiled regular expressions of one evaluation run.
-///
-/// Lives in [`DynamicContext`](crate::xpath::context::DynamicContext) and dies
-/// with it. Empty and allocation-free until the run's first regular-expression
-/// call.
-#[derive(Default)]
-pub(crate) struct RegexCache {
+/// The least-recently-used table both tiers are made of.
+pub(crate) struct Table<T> {
     /// In the order the keys were first seen. Recency is a number on the entry
     /// rather than its position, so a hit writes one `u64` and an eviction
     /// overwrites one slot: entries are never shifted, which matters because a
     /// compiled program is a large value to move and the run that evicts most is
     /// the one that can least afford the work.
-    entries: Vec<Entry>,
+    entries: Vec<Entry<T>>,
+    /// The most entries the table holds; at least 1.
+    capacity: usize,
     /// Ticks once per call, so that a larger `used` means "more recently".
-    /// A `u64` cannot wrap within a run: one tick per regular-expression call.
+    /// A `u64` cannot wrap: one tick per regular-expression call.
     clock: u64,
-    /// How many calls of this run were answered from the cache, and how many had
-    /// to compile. Test-only, so that a test can tell "the behaviour is still
+    /// How many calls were answered from the table, and how many had to
+    /// compile. Test-only, so that a test can tell "the behaviour is still
     /// right" from "the cache silently stopped engaging"; the shipped path pays
     /// nothing for them.
     #[cfg(test)]
@@ -135,19 +176,45 @@ pub(crate) struct RegexCache {
     compiles: u32,
 }
 
-impl RegexCache {
+/// The compiled regular expressions of one evaluation run.
+///
+/// Lives in [`DynamicContext`](crate::xpath::context::DynamicContext) and dies
+/// with it. Empty and allocation-free until the run's first regular-expression
+/// call.
+pub(crate) type RunCache = Table<Regex>;
+
+impl Default for Table<Regex> {
+    fn default() -> Self {
+        Table::with_capacity(MAX_ENTRIES)
+    }
+}
+
+impl<T> Table<T> {
+    /// An empty table of at most `capacity` entries (at least one). Allocates
+    /// nothing until the first entry is stored.
+    fn with_capacity(capacity: usize) -> Self {
+        Table {
+            entries: Vec::new(),
+            capacity: capacity.max(1),
+            clock: 0,
+            #[cfg(test)]
+            hits: 0,
+            #[cfg(test)]
+            compiles: 0,
+        }
+    }
+
     /// The program for `(pattern, flags)`, compiling it with `compile` the first
-    /// time this run asks for it.
+    /// time this table is asked for it — or the first time since it was evicted.
     ///
-    /// `compile` is called at most once per distinct key per run. Whatever it
-    /// produces — a program or an error — is what every later call with that key
-    /// gets back.
+    /// `compile` is called at most once per resident key. Whatever it produces —
+    /// a program or an error — is what every later call with that key gets back.
     pub(crate) fn get_or_compile(
         &mut self,
         pattern: &str,
         flags: &str,
-        compile: impl FnOnce() -> Result<Regex, XPathError>,
-    ) -> Result<&Regex, XPathError> {
+        compile: impl FnOnce() -> Result<T, XPathError>,
+    ) -> Result<&T, XPathError> {
         let now = self.clock;
         self.clock += 1;
 
@@ -184,7 +251,7 @@ impl RegexCache {
                     self.compiles += 1;
                 }
                 let compiled = compile();
-                if self.entries.len() < MAX_ENTRIES {
+                if self.entries.len() < self.capacity {
                     self.entries.push(Entry {
                         pattern: pattern.to_owned(),
                         flags: flags.to_owned(),
@@ -193,12 +260,12 @@ impl RegexCache {
                     });
                     self.entries.len() - 1
                 } else {
-                    // The least recently used key makes room. A run that keeps
-                    // computing fresh patterns therefore holds at most
-                    // MAX_ENTRIES programs, whatever its input — and, once the
-                    // table is full, stops allocating key strings altogether,
-                    // because the evicted entry's buffers are written over
-                    // instead of dropped and replaced.
+                    // The least recently used key makes room. A table that keeps
+                    // being asked for fresh patterns therefore holds at most
+                    // `capacity` programs, whatever its input — and, once it is
+                    // full, stops allocating key strings altogether, because the
+                    // evicted entry's buffers are written over instead of dropped
+                    // and replaced.
                     let slot = &mut self.entries[victim];
                     slot.pattern.clear();
                     slot.pattern.push_str(pattern);
@@ -220,22 +287,21 @@ impl RegexCache {
         }
     }
 
-    /// How many calls of this run were answered from the cache.
+    /// How many entries are resident. Never more than the capacity.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// How many calls were answered from the table.
     #[cfg(test)]
     pub(crate) fn hits(&self) -> u32 {
         self.hits
     }
 
-    /// How many distinct keys this run compiled.
+    /// How many calls had to compile.
     #[cfg(test)]
     pub(crate) fn compiles(&self) -> u32 {
         self.compiles
-    }
-
-    /// How many entries are resident. Never more than [`MAX_ENTRIES`].
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
     }
 
     /// The resident keys, in the order the entries are stored.
@@ -245,6 +311,184 @@ impl RegexCache {
             .iter()
             .map(|entry| (entry.pattern.as_str(), entry.flags.as_str()))
             .collect()
+    }
+}
+
+/// Compiled regular expressions that a host keeps across evaluation runs.
+///
+/// Every [`XPathEvaluator::run`](crate::xpath::XPathEvaluator::run) already
+/// compiles each distinct `(pattern, flags)` pair of `fn:matches`,
+/// `fn:replace` and `fn:tokenize` only once, but it forgets them when it
+/// returns. A host that evaluates the same expressions over and over — once per
+/// item or per node, as an XSLT processor evaluates an `xsl:if` test inside an
+/// `xsl:for-each` — would then compile the same pattern in every run. Keeping a
+/// `RegexCache` and lending it to every run makes each pattern compile once for
+/// the life of the cache:
+///
+/// ```
+/// use xsd_schema::namespace::table::NameTable;
+/// use xsd_schema::xpath::{RegexCache, RoXmlNavigator, XPathContext, XPathExpr};
+///
+/// let names = NameTable::new();
+/// let ctx = XPathContext::new(&names);
+/// let expr = XPathExpr::compile_with_vars(r"matches($s, '^\p{Lu}\p{Ll}+$')", &ctx, &["s"])
+///     .unwrap();
+///
+/// // Kept by the host for as long as it likes — here, across 1,000 runs.
+/// let regexes = RegexCache::new();
+/// let mut capitalised = 0;
+/// for i in 0..1_000 {
+///     let word = if i % 2 == 0 { "Hello" } else { "hello" };
+///     if expr
+///         .evaluator(&ctx)
+///         .with_regex_cache(&regexes)
+///         .with_variable("s", word)
+///         .unwrap()
+///         .run_bool::<RoXmlNavigator<'static>>()
+///         .unwrap()
+///     {
+///         capitalised += 1;
+///     }
+/// }
+/// assert_eq!(capitalised, 500);
+/// // One pattern, compiled once, resident for the next run.
+/// assert_eq!(regexes.len(), 1);
+/// ```
+///
+/// Inside a [`run_with`](crate::xpath::XPathEvaluator::run_with) setup callback,
+/// where the dynamic context is at hand, the same is
+/// [`DynamicContext::set_regex_cache`](crate::xpath::DynamicContext::set_regex_cache).
+///
+/// # What it holds, and for how long
+///
+/// The program of each `(pattern, flags)` pair — or the error compiling it
+/// raised, which is a function of the two strings alone and is replayed
+/// unchanged. Nothing from the expression, the static context or the dynamic
+/// context enters a compilation, so one cache can serve runs of different
+/// expressions under different static contexts. It holds at most
+/// [`capacity`](Self::capacity) entries, dropping the least recently used one to
+/// make room, and keeps them until it is dropped or [`clear`](Self::clear)ed.
+///
+/// # Threads
+///
+/// `RegexCache` is `Send` but not `Sync`: it can be handed to another thread, but
+/// two threads never use one at the same time. There is no lock and no
+/// process-global state; a host that evaluates on several threads gives each its
+/// own cache.
+///
+/// # Memory
+///
+/// Measured with a counting allocator, a compiled program holds about 1 KB for a
+/// pattern of plain characters and classes, about 16 KB for one Unicode category
+/// (`\p{Ll}`, `\P{Ll}`) and about 40 KB for a pattern with several (`\w+@\w+`,
+/// or four `\P{Ll}`); a pattern's program grows with the pattern. At the default
+/// capacity of 64 entries that is a few megabytes at most for ordinary patterns.
+pub struct RegexCache {
+    table: RefCell<Table<Arc<Regex>>>,
+}
+
+impl RegexCache {
+    /// The capacity of [`new`](Self::new) and [`Default`]: 64 entries.
+    ///
+    /// Twice the bound of a single run's own cache, because a host cache serves
+    /// every expression of the host — all the regular-expression literals of a
+    /// stylesheet, say — rather than the few of one expression; and small enough
+    /// that its worst case for ordinary patterns (64 programs of a few category
+    /// classes each, see [Memory](#memory)) stays at a few megabytes. A host that
+    /// cycles through more distinct patterns than this pays one compilation per
+    /// call for the ones that do not fit, which is what it pays without a cache.
+    pub const DEFAULT_CAPACITY: usize = 64;
+
+    /// An empty cache of [`DEFAULT_CAPACITY`](Self::DEFAULT_CAPACITY) entries.
+    /// Allocates nothing until the first program is stored.
+    pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_CAPACITY)
+    }
+
+    /// An empty cache that holds at most `capacity` programs; a capacity of 0
+    /// is taken as 1. Allocates nothing until the first program is stored.
+    pub fn with_capacity(capacity: usize) -> Self {
+        RegexCache {
+            table: RefCell::new(Table::with_capacity(capacity)),
+        }
+    }
+
+    /// The most programs this cache holds.
+    pub fn capacity(&self) -> usize {
+        self.table.borrow().capacity
+    }
+
+    /// How many `(pattern, flags)` pairs are resident — compiled programs and
+    /// cached compile errors alike.
+    pub fn len(&self) -> usize {
+        self.table.borrow().len()
+    }
+
+    /// Whether nothing is resident.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Drop every resident program.
+    ///
+    /// Takes `&self`, like everything else here, because a host that lends the
+    /// cache to its runs holds it by shared reference. A run still using a
+    /// program it took from the cache keeps that program alive until it is done
+    /// with it.
+    pub fn clear(&self) {
+        self.table.borrow_mut().entries.clear();
+    }
+
+    /// The program for `(pattern, flags)`, compiling it with `compile` when it is
+    /// not resident.
+    ///
+    /// The inner borrow lasts for the lookup — and, on a miss, the compilation,
+    /// which runs no host code — and ends before the caller matches anything.
+    /// Should the table be borrowed already all the same, the program is
+    /// compiled and not stored: slower, never wrong, never a panic.
+    pub(crate) fn get_or_compile(
+        &self,
+        pattern: &str,
+        flags: &str,
+        compile: impl FnOnce() -> Result<Regex, XPathError>,
+    ) -> Result<Arc<Regex>, XPathError> {
+        match self.table.try_borrow_mut() {
+            Ok(mut table) => table
+                .get_or_compile(pattern, flags, || compile().map(Arc::new))
+                .cloned(),
+            Err(_) => compile().map(Arc::new),
+        }
+    }
+
+    /// How many calls were answered from the cache.
+    #[cfg(test)]
+    pub(crate) fn hits(&self) -> u32 {
+        self.table.borrow().hits()
+    }
+
+    /// How many calls had to compile.
+    #[cfg(test)]
+    pub(crate) fn compiles(&self) -> u32 {
+        self.table.borrow().compiles()
+    }
+}
+
+impl Default for RegexCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for RegexCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("RegexCache");
+        match self.table.try_borrow() {
+            Ok(table) => out
+                .field("len", &table.len())
+                .field("capacity", &table.capacity),
+            Err(_) => out.field("len", &format_args!("<in use>")),
+        };
+        out.finish()
     }
 }
 
@@ -261,7 +505,7 @@ mod tests {
 
     #[test]
     fn a_repeated_key_compiles_once() {
-        let mut cache = RegexCache::default();
+        let mut cache = RunCache::default();
         let mut compiles = 0;
         for _ in 0..50 {
             let result = cache.get_or_compile("a+", "", || {
@@ -278,7 +522,7 @@ mod tests {
 
     #[test]
     fn flags_are_part_of_the_key() {
-        let mut cache = RegexCache::default();
+        let mut cache = RunCache::default();
         let mut compiles = 0;
         for flags in ["", "i", "", "i"] {
             let _ = cache.get_or_compile("a", flags, || {
@@ -292,7 +536,7 @@ mod tests {
 
     #[test]
     fn a_failure_is_replayed_unchanged() {
-        let mut cache = RegexCache::default();
+        let mut cache = RunCache::default();
         let mut compiles = 0;
         let mut seen = Vec::new();
         for _ in 0..5 {
@@ -308,7 +552,7 @@ mod tests {
 
     #[test]
     fn the_table_never_grows_past_the_cap() {
-        let mut cache = RegexCache::default();
+        let mut cache = RunCache::default();
         let mut compiles = 0;
         for i in 0..MAX_ENTRIES * 4 {
             let pattern = format!("x{i}y");
@@ -327,7 +571,7 @@ mod tests {
 
     #[test]
     fn the_least_recently_used_key_is_the_one_dropped() {
-        let mut cache = RegexCache::default();
+        let mut cache = RunCache::default();
         let keys: Vec<String> = (0..MAX_ENTRIES).map(|i| format!("k{i}")).collect();
         for key in &keys {
             let _ = cache.get_or_compile(key, "", || ok(key));
@@ -347,5 +591,93 @@ mod tests {
         assert!(resident.contains(&("fresh", "")));
         assert!(resident.contains(&(keys[0].as_str(), "")));
         assert!(!resident.contains(&(keys[1].as_str(), "")));
+    }
+
+    #[test]
+    fn a_host_cache_compiles_once_across_calls() {
+        let cache = RegexCache::new();
+        let mut compiles = 0;
+        for _ in 0..50 {
+            let regex = cache
+                .get_or_compile("a+", "", || {
+                    compiles += 1;
+                    ok("a+")
+                })
+                .unwrap();
+            assert!(regex.is_match("aaa"));
+        }
+        assert_eq!(compiles, 1);
+        assert_eq!(cache.compiles(), 1);
+        assert_eq!(cache.hits(), 49);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn a_host_cache_keeps_its_bound_and_replays_failures() {
+        let cache = RegexCache::with_capacity(4);
+        assert_eq!(cache.capacity(), 4);
+        for i in 0..20 {
+            let pattern = format!("p{i}");
+            let _ = cache.get_or_compile(&pattern, "", || ok(&pattern));
+            assert!(cache.len() <= 4);
+        }
+        assert_eq!(cache.len(), 4);
+
+        let mut compiles = 0;
+        for _ in 0..3 {
+            let err = cache
+                .get_or_compile("[", "", || {
+                    compiles += 1;
+                    Err(XPathError::invalid_regex_pattern("["))
+                })
+                .unwrap_err();
+            assert!(matches!(err, XPathError::FORX0002 { .. }));
+        }
+        assert_eq!(compiles, 1);
+    }
+
+    #[test]
+    fn a_zero_capacity_is_taken_as_one() {
+        let cache = RegexCache::with_capacity(0);
+        assert_eq!(cache.capacity(), 1);
+        for pattern in ["a", "b", "a"] {
+            assert!(cache
+                .get_or_compile(pattern, "", || ok(pattern))
+                .unwrap()
+                .is_match(pattern));
+        }
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.compiles(), 3);
+    }
+
+    #[test]
+    fn clearing_a_host_cache_keeps_programs_in_use_alive() {
+        let cache = RegexCache::new();
+        let held = cache.get_or_compile("x+", "", || ok("x+")).unwrap();
+        cache.clear();
+        assert!(cache.is_empty());
+        assert!(held.is_match("xx"));
+        let again = cache.get_or_compile("x+", "", || ok("x+")).unwrap();
+        assert!(again.is_match("x"));
+        assert_eq!(cache.compiles(), 2);
+    }
+
+    #[test]
+    fn a_borrowed_host_cache_compiles_without_storing() {
+        let cache = RegexCache::new();
+        let _busy = cache.table.borrow_mut();
+        let regex = cache.get_or_compile("y", "", || ok("y")).unwrap();
+        assert!(regex.is_match("y"));
+        drop(_busy);
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn a_host_cache_is_send_and_debug() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RegexCache>();
+        let cache = RegexCache::with_capacity(8);
+        let _ = cache.get_or_compile("z", "", || ok("z"));
+        assert_eq!(format!("{cache:?}"), "RegexCache { len: 1, capacity: 8 }");
     }
 }

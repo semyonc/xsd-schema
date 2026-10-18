@@ -42,14 +42,15 @@ use super::XmlTypeCode;
 /// Process-global cache of compiled XSD pattern regexes (`xsd11` / `regexml`
 /// backend only).
 ///
-/// `regexml` 0.2 rebuilds the Unicode category sets behind `\d`, `\w`, and
-/// `\p{…}` from the ICU code-point trie on **every** `Regex::new` — it memoizes
-/// nothing — which is the dominant cost when compiling pattern-heavy schemas
-/// (see `validation-bench/PERF_PROFILE_CONFORMANCE.md`). The same pattern
-/// strings recur constantly: built-in datatype facets are re-compiled for every
-/// `SchemaSet`, the conformance harness re-compiles per test, and the two-pass
-/// `xsi:schemaLocation` enrichment flow re-compiles a whole schema's patterns.
-/// Caching the compiled program turns those repeats into an `Arc` clone.
+/// The engine builds each Unicode category set behind `\d`, `\w` and `\p{…}`
+/// once per process, but parsing a pattern and building its program still
+/// costs microseconds to hundreds of microseconds — most for an XSD 1.0
+/// pattern, whose category escapes [`rewrite_xsd10_category_escapes`] writes
+/// out as Unicode 3.0 range text that the engine then parses range by range.
+/// The same pattern strings recur constantly: the conformance harness
+/// re-compiles per test, and the two-pass `xsi:schemaLocation` enrichment flow
+/// re-compiles a whole schema's patterns. Caching the compiled program turns
+/// those repeats into an `Arc` clone.
 ///
 /// ## Design — direct-mapped, like a CPU cache
 ///
@@ -71,8 +72,7 @@ use super::XmlTypeCode;
 /// Keyed by everything that determines the compiled program —
 /// `(pattern, xsd_version, regex_compat)`. Only **successful** compiles are
 /// stored (an invalid pattern must keep reporting its error). *Distinct*
-/// patterns still pay full price; removing that needs an upstream `regexml`
-/// category memoization, which this cache deliberately does not require.
+/// patterns still pay full price.
 #[cfg(feature = "xsd11")]
 mod pattern_cache {
     use std::sync::{Arc, OnceLock, RwLock};
@@ -234,18 +234,22 @@ impl PatternFacet {
     /// Create a new pattern facet from an XSD pattern string.
     ///
     /// The pattern is validated and compiled using the appropriate backend
-    /// (XSD 1.0: `regex` via `convert_xml_pattern`; XSD 1.1: `regexml` after
-    /// a `\p{X}` rewrite if `xsd_version == V1_0`). Returns an error if the
-    /// pattern is invalid.
+    /// (without the `xsd11` feature: `regex` via `convert_xml_pattern`; with
+    /// it: `regexml`, compiled once, after a `\p{X}` rewrite if
+    /// `xsd_version == V1_0`). Returns an error if the pattern is invalid.
     ///
     /// `xsd_version` controls the `\p{X}` category escape semantics: under
     /// `V1_0` recognized general-category names are expanded to Unicode 3.0
-    /// ranges; `V1_1` passes them through to the backend unchanged.
+    /// ranges; `V1_1` passes them through to the backend unchanged, and (with
+    /// the `xsd11` feature) a block escape with an unrecognized block name
+    /// denotes every character (XSD 1.1 Part 2 §G.4.2.4).
     ///
     /// `regex_compat` controls grammar leniency: `Strict` enforces XSD
     /// Part 2 §F/§G; `LenientMs` first applies [`lenient_ms_preprocess`]
-    /// to drop start/end anchors and `(?#…)` comments common in
-    /// .NET-authored schemas.
+    /// to drop `(?#…)` comments common in .NET-authored schemas and skips the
+    /// strict grammar checks. With the `xsd11` feature, `^` and `$` are
+    /// ordinary characters under `Strict`, as §F/§G define them, and anchors
+    /// under `LenientMs`, whose patterns the engine reads in its XPath dialect.
     pub fn new(
         value: String,
         source: Option<SourceRef>,
@@ -311,74 +315,17 @@ impl PatternFacet {
     ) -> FacetResult<()> {
         if self.compiled.is_none() {
             // Content-addressed fast path: identical (pattern, version, compat)
-            // reuses the already-compiled program instead of rebuilding the ICU
-            // category sets via regexml. See [`pattern_cache`].
+            // reuses the already-compiled program. See [`pattern_cache`].
             let cache_key: pattern_cache::Key = (self.value.clone(), xsd_version, regex_compat);
             if let Some(cached) = pattern_cache::get(&cache_key) {
                 self.compiled = Some(cached);
                 return Ok(());
             }
-
-            let strict = regex_compat == RegexCompat::Strict;
-            // Apply MS dialect preprocess (closed list) before grammar
-            // validation when LenientMs is on. Owned to keep one stable
-            // backing string across the two-step validate+rewrite below.
-            let effective: String = if strict {
-                self.value.clone()
-            } else {
-                lenient_ms_preprocess(&self.value).into_owned()
-            };
-            // Strict XSD 1.0 hyphen-rule grammar gate. Skipped under
-            // LenientMs so the engine alone decides what is well-formed.
-            if xsd_version == XsdVersion::V1_0 && strict {
-                validate_xml_pattern_syntax(&effective).map_err(|message| {
-                    FacetError::InvalidPattern {
-                        pattern: self.value.clone(),
-                        message,
-                    }
-                })?;
-            }
-            // Strict XSD §F/§G grammar gate via regexml `xsd()`. Skipped
-            // under LenientMs — the runtime matcher uses regexml `xpath()`
-            // (next step), which natively accepts XPath-only constructs
-            // like `^`/`$` outside char class, backrefs `\1`, non-capturing
-            // `(?:...)`, and reluctant quantifiers `*?` that are valid
-            // .NET regex idioms. For XSD 1.1, an unrecognized `\p{IsX}`
-            // block name is treated as matching every character (W3C bug
-            // 13670 / XSD 1.1 Datatypes §G.4.2.3); the rewrite remains in
-            // place under both modes because it is a spec rule, not a
-            // grammar choice (regexml 0.2 does not yet honour
-            // `allow_unknown_block_names`).
-            let xsd_validated: std::borrow::Cow<'_, str> = match xsd_version {
-                XsdVersion::V1_0 => {
-                    if strict {
-                        regexml::Regex::xsd(&effective, "").map_err(|e| {
-                            FacetError::InvalidPattern {
-                                pattern: self.value.clone(),
-                                message: format!("{:?}", e),
-                            }
-                        })?;
-                    }
-                    std::borrow::Cow::Borrowed(effective.as_str())
-                }
-                XsdVersion::V1_1 => validate_xsd11_pattern_with_block_fallback(&effective)?,
-            };
-            // Under XSD 1.0 the \p{X} rewrite produces a new String; under 1.1
-            // we use the (possibly block-rewritten) validated value.
-            let pinned: std::borrow::Cow<'_, str> = match xsd_version {
-                XsdVersion::V1_0 => {
-                    std::borrow::Cow::Owned(rewrite_xsd10_category_escapes(&effective))
-                }
-                XsdVersion::V1_1 => xsd_validated,
-            };
-            // Compile with explicit anchoring for full-string matching
-            let anchored = format!("^(?:{})$", pinned);
-            let compiled =
-                regexml::Regex::xpath(&anchored, "").map_err(|e| FacetError::InvalidPattern {
-                    pattern: self.value.clone(),
-                    message: format!("{:?}", e),
-                })?;
-            let arc = Arc::new(compiled);
+            let arc = Arc::new(compile_pattern_program(
+                &self.value,
+                xsd_version,
+                regex_compat,
+            )?);
             pattern_cache::store(cache_key, Arc::clone(&arc));
             self.compiled = Some(arc);
         }
@@ -406,148 +353,111 @@ impl PatternFacet {
     }
 
     /// Test if a value matches this pattern
+    ///
+    /// The whole value must match: XSD "implicitly anchors all regular
+    /// expressions at the head and tail" (XSD 1.1 Part 2, Appendix G), which
+    /// is the engine's `is_full_match`.
     #[cfg(feature = "xsd11")]
     pub fn matches(&self, value: &str) -> bool {
         match &self.compiled {
-            Some(regex) => regex.is_match(value),
+            Some(regex) => regex.is_full_match(value),
             None => {
-                // Defensive fallback: validate and compile on-the-fly with XSD 1.1
+                // Defensive fallback: compile on-the-fly with the XSD 1.1
                 // defaults. Reached only if a facet was never compiled via
                 // `compile_patterns`.
-                if let Ok(rewritten) = validate_xsd11_pattern_with_block_fallback(&self.value) {
-                    let anchored = format!("^(?:{})$", rewritten);
-                    if let Ok(regex) = regexml::Regex::xpath(&anchored, "") {
-                        return regex.is_match(value);
+                compile_pattern_program(&self.value, XsdVersion::V1_1, RegexCompat::Strict)
+                    .is_ok_and(|regex| regex.is_full_match(value))
+            }
+        }
+    }
+}
+
+/// The flags of an XSD 1.1 pattern: none of `s`, `m`, `i`, `x` (a facet has
+/// no flags), and `;k`, which makes a block escape with an unrecognized block
+/// name denote every character. XSD 1.1 Part 2 §G.4.2.4: "If a string "IsX"
+/// matches the non-terminal IsBlock but X is not a recognized block name, then
+/// the expressions "\p{IsX}" and "\P{IsX}" each denote the set of all
+/// characters." A name that does not match IsBlock (`'Is' [a-zA-Z0-9#x2D]+`)
+/// stays a syntax error. XSD 1.0 has no such rule — its Appendix F lists "the
+/// recognized block names" — so 1.0 patterns are compiled without the flag and
+/// an unknown block stays an error.
+#[cfg(feature = "xsd11")]
+const XSD11_PATTERN_FLAGS: &str = ";k";
+
+/// Compile the program of an `xs:pattern` value, once.
+///
+/// The program is matched against whole values with `is_full_match`, so it is
+/// compiled as written — not wrapped in `^(?:…)$`:
+///
+/// - **`Strict`**: the XSD dialect (`Regex::xsd`). `^` and `$` are ordinary
+///   characters there, as both versions of the language say: XSD 1.1 Part 2
+///   §G.3, "A metacharacter is either '.', '\', '?', '*', '+', '{', '}', '(',
+///   ')', '|', '[', or ']'. … A normal character is any XML character that is
+///   not a ·metacharacter·", and XSD 1.0 Second Edition Appendix F, "\[10\]
+///   Char ::= \[^.\\?*+()|#x5B#x5D\]". The program is also the grammar check:
+///   what it rejects is not an XSD regular expression.
+/// - **`LenientMs`**: the XPath dialect (`Regex::xpath`), which is what makes
+///   the .NET idioms of `RegexCompat::LenientMs` work — `^` and `$` as
+///   anchors, back-references, `(?:…)`, reluctant quantifiers — after
+///   [`lenient_ms_preprocess`] has removed `(?#…)` comments. No XSD grammar
+///   check runs.
+///
+/// XSD 1.0 patterns first go through the strict hyphen-rule check
+/// (`validate_xml_pattern_syntax`, `Strict` only) and then through
+/// [`rewrite_xsd10_category_escapes`], which pins `\p{X}`, `\d` and `\w` to
+/// Unicode 3.0 by writing them out as character-class text; the rewritten text
+/// is what is compiled. XSD 1.1 patterns carry [`XSD11_PATTERN_FLAGS`].
+///
+/// The engine's errors are reported with their `Display` text. When the
+/// rewritten text of a strict XSD 1.0 pattern fails, the error of the pattern
+/// as written is reported instead (the rewrite only changes category escapes,
+/// so the written pattern holds the mistake; that second compile happens on
+/// the error path only).
+#[cfg(feature = "xsd11")]
+fn compile_pattern_program(
+    value: &str,
+    xsd_version: XsdVersion,
+    regex_compat: RegexCompat,
+) -> FacetResult<regexml::Regex> {
+    let invalid = |error: regexml::Error| FacetError::InvalidPattern {
+        pattern: value.to_string(),
+        message: error.to_string(),
+    };
+    let strict = regex_compat == RegexCompat::Strict;
+    let effective: Cow<'_, str> = if strict {
+        Cow::Borrowed(value)
+    } else {
+        lenient_ms_preprocess(value)
+    };
+    match xsd_version {
+        XsdVersion::V1_0 => {
+            if strict {
+                validate_xml_pattern_syntax(&effective).map_err(|message| {
+                    FacetError::InvalidPattern {
+                        pattern: value.to_string(),
+                        message,
+                    }
+                })?;
+            }
+            let pinned = rewrite_xsd10_category_escapes(&effective);
+            if !strict {
+                return regexml::Regex::xpath(&pinned, "").map_err(invalid);
+            }
+            regexml::Regex::xsd(&pinned, "").map_err(|error| {
+                if pinned != *effective {
+                    if let Err(written) = regexml::Regex::xsd(&effective, "") {
+                        return invalid(written);
                     }
                 }
-                false
-            }
+                invalid(error)
+            })
         }
-    }
-}
-
-/// Validate an XSD 1.1 pattern with regexml's strict XSD parser, rewriting any
-/// unknown `\p{IsX}` / `\P{IsX}` block names to a match-everything expression
-/// per W3C bug 13670 / XSD 1.1 Datatypes §G.4.2.3 (unrecognized block names are
-/// allowed and match every character). Returns the (possibly rewritten) pattern
-/// or a `FacetError` if a non-block-name error remains after up to 16 rewrites.
-#[cfg(feature = "xsd11")]
-fn validate_xsd11_pattern_with_block_fallback(
-    value: &str,
-) -> FacetResult<std::borrow::Cow<'_, str>> {
-    let mut current: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(value);
-    for _ in 0..16 {
-        let err = match regexml::Regex::xsd(&current, "") {
-            Ok(_) => return Ok(current),
-            Err(e) => format!("{:?}", e),
-        };
-        const PREFIX: &str = "Unknown Unicode block: ";
-        let Some(start) = err.find(PREFIX) else {
-            return Err(FacetError::InvalidPattern {
-                pattern: value.to_string(),
-                message: err,
-            });
-        };
-        let after = &err[start + PREFIX.len()..];
-        let end = after
-            .find(|c: char| !c.is_alphanumeric() && c != '-' && c != '_' && c != ' ')
-            .unwrap_or(after.len());
-        let block = after[..end].trim();
-        if block.is_empty() {
-            return Err(FacetError::InvalidPattern {
-                pattern: value.to_string(),
-                message: err,
-            });
+        XsdVersion::V1_1 => if strict {
+            regexml::Regex::xsd(&effective, XSD11_PATTERN_FLAGS)
+        } else {
+            regexml::Regex::xpath(&effective, XSD11_PATTERN_FLAGS)
         }
-        match rewrite_pattern_isblock_token(&current, block) {
-            Some(rewritten) => current = std::borrow::Cow::Owned(rewritten),
-            None => {
-                return Err(FacetError::InvalidPattern {
-                    pattern: value.to_string(),
-                    message: err,
-                });
-            }
-        }
-    }
-    // Loop bound exceeded; surface the final error if any.
-    if let Err(e) = regexml::Regex::xsd(&current, "") {
-        return Err(FacetError::InvalidPattern {
-            pattern: value.to_string(),
-            message: format!("{:?}", e),
-        });
-    }
-    Ok(current)
-}
-
-/// Rewrite every `\p{Is<block>}` / `\P{Is<block>}` token in `pattern` to a
-/// match-everything expression. Uses `[\s\S]` at atom position and `\s\S`
-/// inside a character class so the rewritten token is structurally valid in
-/// either context. Returns `None` if no rewrite happened.
-#[cfg(feature = "xsd11")]
-fn rewrite_pattern_isblock_token(pattern: &str, block_name: &str) -> Option<String> {
-    let inner_p = format!("p{{Is{}}}", block_name);
-    let inner_cap = format!("P{{Is{}}}", block_name);
-    let token_len = 1 + inner_p.len();
-    if !pattern.contains(&format!("\\{}", inner_p))
-        && !pattern.contains(&format!("\\{}", inner_cap))
-    {
-        return None;
-    }
-    let bytes = pattern.as_bytes();
-    let mut result = String::with_capacity(pattern.len());
-    let mut i = 0;
-    let mut in_class = false;
-    let mut found = false;
-    while i < bytes.len() {
-        if bytes[i] == b'\\' && i + token_len <= bytes.len() {
-            // Tokens are pure ASCII, so byte-slice comparison is safe here.
-            let candidate = &pattern[i + 1..i + token_len];
-            if candidate == inner_p || candidate == inner_cap {
-                if in_class {
-                    result.push_str("\\s\\S");
-                } else {
-                    result.push_str("[\\s\\S]");
-                }
-                i += token_len;
-                found = true;
-                continue;
-            }
-        }
-        let c = bytes[i];
-        if c == b'\\' && i + 1 < bytes.len() {
-            let next_len = pattern[i + 1..]
-                .chars()
-                .next()
-                .map(|ch| ch.len_utf8())
-                .unwrap_or(1);
-            result.push_str(&pattern[i..i + 1 + next_len]);
-            i += 1 + next_len;
-            continue;
-        }
-        if c == b'[' {
-            in_class = true;
-            result.push('[');
-            i += 1;
-            continue;
-        }
-        if c == b']' {
-            in_class = false;
-            result.push(']');
-            i += 1;
-            continue;
-        }
-        let next_len = pattern[i..]
-            .chars()
-            .next()
-            .map(|ch| ch.len_utf8())
-            .unwrap_or(1);
-        result.push_str(&pattern[i..i + next_len]);
-        i += next_len;
-    }
-    if found {
-        Some(result)
-    } else {
-        None
+        .map_err(invalid),
     }
 }
 
@@ -2622,12 +2532,13 @@ mod tests {
 
     #[test]
     fn test_pattern_compiles_independently_of_xpath_dialect_gate() {
-        // Pattern facets compile through the regex backend directly and wrap
-        // their own value in `^(?:…)$`. The XPath function layer rejects a
-        // pattern containing `(?` (its grammar has no such atom), which must
-        // not leak into facet compilation. A facet whose own value contains a
-        // group with an alternation exercises exactly the wrapper that would
-        // be rejected there.
+        // Pattern facets compile through the regex backend directly, in its
+        // XSD dialect (or, under `LenientMs`, its XPath dialect), and match
+        // whole values with `is_full_match`. The XPath functions compile in
+        // the XPath 2.0 dialect, which rejects `(?`; nothing of that dialect
+        // may leak into facet compilation. A facet whose own value contains a
+        // group with an alternation is the shape that once went through a
+        // `^(?:…)$` wrapper.
         let pattern = PatternFacet::new(
             "(abc|def)+".to_string(),
             None,
@@ -2648,6 +2559,189 @@ mod tests {
         .unwrap();
         assert!(pattern.matches("abba"));
         assert!(!pattern.matches("abc"));
+    }
+
+    #[cfg(feature = "xsd11")]
+    fn facet(value: &str, version: XsdVersion, compat: RegexCompat) -> FacetResult<PatternFacet> {
+        PatternFacet::new(value.to_string(), None, version, compat)
+    }
+
+    /// XSD 1.1 Part 2 §G.3: "A metacharacter is either '.', '\', '?', '*',
+    /// '+', '{', '}', '(', ')', '|', '[', or ']'" and "A normal character is
+    /// any XML character that is not a ·metacharacter·"; XSD 1.0 Second
+    /// Edition Appendix F: "\[10\] Char ::= \[^.\\?*+()|#x5B#x5D\]". So `^`
+    /// and `$` outside a character class stand for themselves, in both
+    /// versions; they used to be compiled as anchors.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_caret_and_dollar_are_ordinary_characters() {
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            let p = facet("a$", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("a$"), "{version:?}");
+            assert!(!p.matches("a"), "{version:?}");
+            let p = facet("^abc", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("^abc"), "{version:?}");
+            assert!(!p.matches("abc"), "{version:?}");
+            let p = facet(r"\d+\$?", version, RegexCompat::Strict);
+            // `\$` is not an XSD escape: `$` needs none.
+            assert!(p.is_err(), "{version:?}");
+            let p = facet("x^*y$+", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("x^^y$$"), "{version:?}");
+            assert!(p.matches("xy$"), "{version:?}");
+            assert!(!p.matches("xy"), "{version:?}");
+            // `^` keeps its meaning at the start of a class.
+            let p = facet("[^a]b", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("cb"), "{version:?}");
+            assert!(!p.matches("ab"), "{version:?}");
+            let p = facet("[a^]", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("^"), "{version:?}");
+        }
+    }
+
+    /// `LenientMs` reads a pattern the way .NET does: `^` and `$` anchor, and
+    /// the XPath-only idioms are accepted, in both versions.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_lenient_patterns_keep_anchors_and_xpath_idioms() {
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            let p = facet("^abc$", version, RegexCompat::LenientMs).unwrap();
+            assert!(p.matches("abc"), "{version:?}");
+            assert!(!p.matches("^abc$"), "{version:?}");
+            let p = facet(
+                r"(?:a|b)+?(c)\1(?#comment)",
+                version,
+                RegexCompat::LenientMs,
+            )
+            .unwrap();
+            assert!(p.matches("abcc"), "{version:?}");
+            assert!(!p.matches("abc"), "{version:?}");
+            // The same pattern is not an XSD regular expression.
+            assert!(facet(r"(?:a|b)+?(c)\1", version, RegexCompat::Strict).is_err());
+        }
+    }
+
+    /// XSD 1.1 Part 2 §G.4.2.4: "If a string "IsX" matches the non-terminal
+    /// IsBlock but X is not a recognized block name, then the expressions
+    /// "\p{IsX}" and "\P{IsX}" each denote the set of all characters." IsBlock
+    /// is `'Is' [a-zA-Z0-9#x2D]+`; a name outside it is still an error, and
+    /// XSD 1.0, which lists "the recognized block names", keeps every unknown
+    /// block an error.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_unknown_block_names_denote_every_character_in_xsd11() {
+        let v11 = |value: &str| facet(value, XsdVersion::V1_1, RegexCompat::Strict);
+        for value in [
+            r"\p{IsNoSuchBlock}",
+            r"\P{IsNoSuchBlock}",
+            r"[\p{IsNo-Such-9}]",
+        ] {
+            let p = v11(value).unwrap_or_else(|e| panic!("{value}: {e}"));
+            for input in ["a", "\u{10FFFF}", "\n"] {
+                assert!(p.matches(input), "{value} on {input:?}");
+            }
+            assert!(!p.matches("ab"), "{value}");
+        }
+        // Several unknown blocks, in and outside classes, with known ones.
+        let p = v11(r"\p{IsFooBar}+[\P{IsBazQux}\p{IsBasicLatin}]\p{IsGreek}").unwrap();
+        assert!(p.matches("xyzα"));
+        assert!(!p.matches("xyzq"));
+        // The complement of every character is no character.
+        let p = v11(r"[^\p{IsNoSuchBlock}]?").unwrap();
+        assert!(p.matches(""));
+        assert!(!p.matches("a"));
+        // Not an IsBlock name, or not a block escape at all: errors.
+        for value in [r"\p{IsNo_Such}", r"\p{IsNo Such}", r"\p{NoSuchCategory}"] {
+            assert!(v11(value).is_err(), "{value}");
+        }
+        // XSD 1.0: an unknown block is an error, under both compatibility modes.
+        for compat in [RegexCompat::Strict, RegexCompat::LenientMs] {
+            assert!(facet(r"\p{IsNoSuchBlock}", XsdVersion::V1_0, compat).is_err());
+        }
+        // A known block keeps its meaning.
+        let p = v11(r"\p{IsBasicLatin}+").unwrap();
+        assert!(p.matches("abc"));
+        assert!(!p.matches("abγ"));
+    }
+
+    /// The facet program is matched against the whole value: every way of
+    /// matching is tried, not only the one a search finds first, and a counted
+    /// repetition keeps its bounds even when its operand can match the empty
+    /// string (XSD 1.1 Part 2 §G.2: S{n,m} denotes "All strings in L(S)^k for
+    /// all k such that n <= k <= m").
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_whole_value_matching() {
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            let p = facet("a|ab", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("ab") && p.matches("a") && !p.matches("abc"));
+            let p = facet(r"(\d|){2}", version, RegexCompat::Strict).unwrap();
+            for ok in ["", "1", "12"] {
+                assert!(p.matches(ok), "{version:?} {ok:?}");
+            }
+            for bad in ["123", "1234"] {
+                assert!(!p.matches(bad), "{version:?} {bad:?}");
+            }
+            let p = facet("([a-z]*)+x", version, RegexCompat::Strict).unwrap();
+            assert!(p.matches("abx") && p.matches("x") && !p.matches("abxy"));
+        }
+    }
+
+    /// A pattern that nests groups and classes more than 64 levels deep is
+    /// refused (the engine's limit, a stack guard) instead of aborting the
+    /// process; 64 levels compile.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_nesting_limit_is_an_invalid_pattern() {
+        let nested = |depth: usize| format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+        for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+            assert!(facet(&nested(64), version, RegexCompat::Strict)
+                .unwrap()
+                .matches("a"));
+            match facet(&nested(65), version, RegexCompat::Strict) {
+                Err(FacetError::InvalidPattern { pattern, message }) => {
+                    assert_eq!(pattern, nested(65));
+                    assert!(message.contains("64 levels"), "{message}");
+                }
+                other => panic!("{version:?}: {other:?}"),
+            }
+        }
+        assert!(facet(&"(".repeat(100_000), XsdVersion::V1_1, RegexCompat::Strict).is_err());
+    }
+
+    /// A pattern error names the pattern as written, also for an XSD 1.0
+    /// pattern whose category escapes were rewritten before it was compiled.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_pattern_errors_name_the_written_pattern() {
+        for (value, version) in [
+            (r"\p{Lu}(", XsdVersion::V1_0),
+            (r"\d+\1", XsdVersion::V1_0),
+            (r"\p{Lu}(", XsdVersion::V1_1),
+        ] {
+            match facet(value, version, RegexCompat::Strict) {
+                Err(FacetError::InvalidPattern { pattern, message }) => {
+                    assert_eq!(pattern, value);
+                    assert!(
+                        message.starts_with("invalid regular expression"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{value}: {other:?}"),
+            }
+        }
+    }
+
+    /// A facet that was never compiled still matches, with the XSD 1.1
+    /// defaults.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn test_uncompiled_facet_matches_with_xsd11_defaults() {
+        let p = PatternFacet::new_unchecked(r"\p{IsNoSuchBlock}b\$?".to_string(), None);
+        // `\$` is not an XSD escape: an invalid pattern matches nothing.
+        assert!(!p.matches("ab"));
+        let p = PatternFacet::new_unchecked(r"\p{IsNoSuchBlock}b$".to_string(), None);
+        assert!(p.matches("ab$"));
+        assert!(!p.matches("ab"));
     }
 
     // =========================================================================

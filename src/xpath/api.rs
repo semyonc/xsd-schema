@@ -49,6 +49,7 @@ use super::eval::eval_node;
 use super::functions::{effective_boolean_value, XPathValue};
 use super::iterator::XmlItem;
 use super::parser::{parse, parse_with_mode};
+use super::regex_cache::RegexCache;
 use super::DomNavigator;
 
 // ============================================================================
@@ -629,6 +630,8 @@ pub struct XPathEvaluator<'expr, 'ctx> {
     static_ctx: &'ctx XPathContext<'ctx>,
     /// Variables to set before evaluation (slot -> value)
     pending_vars: Vec<(VarSlotId, PendingValue)>,
+    /// The host's cache of compiled regular expressions, lent to the run.
+    regex_cache: Option<&'ctx RegexCache>,
 }
 
 impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
@@ -638,6 +641,7 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
             expr,
             static_ctx,
             pending_vars: Vec::new(),
+            regex_cache: None,
         }
     }
 
@@ -672,6 +676,22 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
         let slot = find_external_var(name, &self.expr.external_vars, self.static_ctx)?;
         self.pending_vars.push((slot, value.into().into()));
         Ok(self)
+    }
+
+    /// Lend the run a cache of compiled regular expressions that the host keeps
+    /// across runs.
+    ///
+    /// A run compiles each distinct pattern of `fn:matches`, `fn:replace` and
+    /// `fn:tokenize` once and keeps it for as long as the run lasts. A host that
+    /// runs the same expression many times — once per item, once per node —
+    /// keeps a [`RegexCache`] instead and passes it to every run, so that each
+    /// pattern is compiled once for the life of the cache. See [`RegexCache`]
+    /// for an example; inside a [`run_with`](Self::run_with) callback,
+    /// [`DynamicContext::set_regex_cache`] does the same (and, being applied
+    /// later, wins).
+    pub fn with_regex_cache(mut self, cache: &'ctx RegexCache) -> Self {
+        self.regex_cache = Some(cache);
+        self
     }
 
     /// Evaluate the expression and return the full result.
@@ -724,6 +744,7 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
     ) -> Result<XPathValue<N>, XPathError> {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);
+        dyn_ctx.set_regex_cache(self.regex_cache);
 
         // Set context node if provided
         if let Some(node) = context_node {
@@ -871,6 +892,7 @@ impl<'expr, 'ctx> XPathEvaluator<'expr, 'ctx> {
     {
         // Create dynamic context
         let mut dyn_ctx = DynamicContext::new(self.static_ctx, self.expr.var_slots);
+        dyn_ctx.set_regex_cache(self.regex_cache);
 
         // Set context node if provided
         if let Some(node) = context_node {
@@ -1390,5 +1412,113 @@ mod tests {
 
         // empty() should return true for empty sequence
         assert_eq!(result.as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_a_lent_regex_cache_outlives_the_run() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let expr = XPathExpr::compile_with_vars(r"matches($s, '^\p{Lu}')", &ctx, &["s"]).unwrap();
+
+        let regexes = RegexCache::new();
+        for i in 0..100 {
+            let word = if i % 2 == 0 { "Upper" } else { "lower" };
+            let result = expr
+                .evaluator(&ctx)
+                .with_regex_cache(&regexes)
+                .with_variable("s", word)
+                .unwrap()
+                .run_bool::<RoXmlNavigator<'static>>()
+                .unwrap();
+            assert_eq!(result, i % 2 == 0);
+        }
+        // One compilation for a hundred runs.
+        assert_eq!(regexes.compiles(), 1);
+        assert_eq!(regexes.hits(), 99);
+        assert_eq!(regexes.len(), 1);
+    }
+
+    #[test]
+    fn test_the_setup_callback_has_the_last_word_on_the_regex_cache() {
+        let names = NameTable::new();
+        let ctx = XPathContext::new(&names);
+        let expr = XPathExpr::compile("matches('abc', 'b')", &ctx).unwrap();
+
+        let builder_cache = RegexCache::new();
+        let callback_cache = RegexCache::new();
+        let result = expr
+            .evaluator(&ctx)
+            .with_regex_cache(&builder_cache)
+            .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+                eval.context().set_regex_cache(Some(&callback_cache));
+            })
+            .unwrap();
+        assert_eq!(result.as_bool(), Some(true));
+        assert!(builder_cache.is_empty());
+        assert_eq!(callback_cache.len(), 1);
+
+        // `None` goes back to the run's own cache: neither host cache is touched.
+        let result = expr
+            .evaluator(&ctx)
+            .with_regex_cache(&builder_cache)
+            .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+                eval.context().set_regex_cache(None);
+            })
+            .unwrap();
+        assert_eq!(result.as_bool(), Some(true));
+        assert!(builder_cache.is_empty());
+        assert_eq!(callback_cache.compiles(), 1);
+        assert_eq!(callback_cache.hits(), 0);
+    }
+
+    #[test]
+    fn test_a_nested_run_shares_the_lent_regex_cache() {
+        use crate::namespace::context::NamespaceContextSnapshot;
+        use crate::types::sequence::SequenceType;
+        use crate::xpath::functions::{DynamicFunctionSignature, FunctionSet};
+
+        // `ext:inner()` evaluates another expression, with the cache its own
+        // run was lent, while the outer run is still in progress.
+        let mut functions: FunctionSet<RoXmlNavigator<'static>> = FunctionSet::with_builtins();
+        functions.register(
+            DynamicFunctionSignature::new(
+                "http://example.com/ext",
+                "inner",
+                vec![],
+                SequenceType::boolean(),
+            ),
+            |ctx, _args| {
+                let cache = ctx.host_regex_cache().expect("the outer run has a cache");
+                let inner = XPathExpr::compile("matches('xbx', 'b')", ctx.static_context)?;
+                let found = inner
+                    .evaluator(ctx.static_context)
+                    .with_regex_cache(cache)
+                    .run_bool::<RoXmlNavigator<'static>>()?;
+                Ok(XPathValue::boolean(found))
+            },
+        );
+
+        let names = NameTable::new();
+        let mut namespaces = NamespaceContextSnapshot::default();
+        namespaces
+            .bindings
+            .push((names.add("ext"), names.add("http://example.com/ext")));
+        let ctx = XPathContext::new(&names)
+            .with_namespaces(namespaces)
+            .with_function_catalog(&functions);
+        let expr = XPathExpr::compile("matches('abc', 'b') and ext:inner()", &ctx).unwrap();
+
+        let regexes = RegexCache::new();
+        let result = expr
+            .evaluator(&ctx)
+            .with_regex_cache(&regexes)
+            .run_with::<RoXmlNavigator<'static>, _>(|eval| {
+                eval.context().set_function_evaluator(Some(&functions));
+            })
+            .unwrap();
+        assert_eq!(result.as_bool(), Some(true));
+        // The inner run found the outer run's program.
+        assert_eq!(regexes.compiles(), 1);
+        assert_eq!(regexes.hits(), 1);
     }
 }

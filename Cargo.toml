@@ -57,8 +57,10 @@ bumpalo = { version = "3", features = ["collections"], optional = true }
 # Unicode normalization (for fn:normalize-unicode)
 unicode-normalization = { version = "0.1", optional = true }
 
-# XML Schema 1.1 regex engine (native XSD/XPath regex with ICU4X Unicode)
-regexml = { version = "0.2", optional = true }
+# XML Schema 1.1 regex engine (native XSD/XPath regex with ICU4X Unicode).
+# The maintained fork of `regexml`, published as `regexml-fork`; renamed back
+# so the code keeps the name `regexml`.
+regexml = { package = "regexml-fork", version = "0.3", optional = true }
 
 [build-dependencies]
 lalrpop = { version = "0.22.2", optional = true }
