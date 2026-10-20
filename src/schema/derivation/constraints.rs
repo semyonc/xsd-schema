@@ -404,14 +404,19 @@ pub fn validate_element_value_constraints(schema_set: &SchemaSet) -> SchemaResul
             }
         }
 
-        // e-props-correct.2: value must be valid for the declared type
+        // e-props-correct.2: value must be valid for the declared type — for
+        // a complex type with simple content, its {content type}'s simple type
+        // with the facets of its restrictions (Structures §3.4.2.2), which
+        // `validate_simple_type` applies to a complex type key.
         let effective_type = match type_key {
             TypeKey::Simple(_) => Some(type_key),
-            TypeKey::Complex(ck) => schema_set
-                .arenas
-                .complex_types
-                .get(ck)
-                .and_then(|ct| effective_simple_content_type_key(schema_set, ct)),
+            TypeKey::Complex(ck) => schema_set.arenas.complex_types.get(ck).and_then(|ct| {
+                if matches!(ct.content, ComplexContentResult::Simple(_)) {
+                    Some(type_key)
+                } else {
+                    effective_simple_content_type_key(schema_set, ct)
+                }
+            }),
         };
 
         if let Some(st_key) = effective_type {

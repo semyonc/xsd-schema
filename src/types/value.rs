@@ -702,7 +702,10 @@ pub struct DateTimeValue {
 
 impl DateTimeValue {
     /// Convert to total seconds from a reference epoch for comparison.
-    /// Uses implicit UTC for timezone-unaware values (XSD 1.0 facet semantics).
+    /// A value without a time zone offset is placed as if it had offset 0.
+    /// Against a value with an offset that is not the order of the facets,
+    /// the partial order of Datatypes 1.1 §D.2.1 (`FacetOrder` in
+    /// `validators.rs`, built on this one).
     fn to_comparable_instant(&self) -> Decimal {
         let tz_minutes = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let days = date_to_days(self.year, self.month as i32, self.day as i32);
@@ -1138,12 +1141,18 @@ pub struct GMonthValue {
     pub timezone: Option<TimezoneOffset>,
 }
 
+/// A gMonth is a month of 1972 on the time line (Datatypes 1.1 §E.3.4: "Let yr
+/// be 1971 when dt's ·year· is absent", "mo be 12 or dt's ·month·"; XSD 1.0
+/// §3.2.14: "the order relation on gMonth is the order relation on their
+/// starting instants"), in minutes. Two months are at least 28 days apart, so
+/// no pair of time zone offsets (at most 28 hours apart) reorders them. 1.1
+/// places a month at its last day, 1.0 at its first: the order is the same.
 impl PartialOrd for GMonthValue {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         let tz1 = self.timezone.map_or(0i64, |tz| tz.0 as i64);
         let tz2 = other.timezone.map_or(0i64, |tz| tz.0 as i64);
-        let d1 = (self.month as i64) * 1440 - tz1;
-        let d2 = (other.month as i64) * 1440 - tz2;
+        let d1 = date_to_days(1972, self.month as i32, 1) * 1440 - tz1;
+        let d2 = date_to_days(1972, other.month as i32, 1) * 1440 - tz2;
         d1.partial_cmp(&d2)
     }
 }

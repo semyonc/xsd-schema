@@ -123,16 +123,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not satisfied): a string or `xs:untypedAtomic` source as given, after the
   type's whitespace normalization, any other value through its `xs:string`
   cast; when the conversion of a string changes its value (an `xs:decimal`
-  below 10^-28 becomes 0), the type's digits, bounds and enumeration are
-  checked again on the result. A cast up the hierarchy only changes the
-  annotation. The result carries the type as `XmlValue::schema_type`, so
-  `instance of` and `treat as` see it. Types derived from `xs:QName` and
-  `xs:NOTATION` cast as `xs:QName` does. A function the host registers under a
-  user type's constructor name and arity takes precedence. A type in no
-  namespace has a constructor when the default function namespace is none.
-  Lists and unions have neither (`XPST0051`, `XPST0017`). XSD 1.1 assertions do
-  not see these casts and constructors (Structures §3.13.6.2 clause 2.2.5):
-  there they behave as before.
+  below 10^-28 becomes 0), the type's digits, bounds, enumeration and XSD 1.1
+  assertions are checked again on the result. A cast up the hierarchy only
+  changes the annotation. The result carries the type as
+  `XmlValue::schema_type`, so `instance of` and `treat as` see it. Types
+  derived from `xs:QName` and `xs:NOTATION` cast as `xs:QName` does. A
+  function the host registers under a user type's constructor name and arity
+  takes precedence. A type in no namespace has a constructor when the default
+  function namespace is none. Lists and unions have neither (`XPST0051`,
+  `XPST0017`). XSD 1.1 assertions do not see these casts and constructors
+  (Structures §3.13.6.2 clause 2.2.5): there they behave as before.
 
 ### Changed
 
@@ -183,6 +183,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   user-defined atomic type is rejected with `src-ct-alternative`, as one with
   `cast as` such a type already was (Type Alternative Properties Correct, XPath
   Valid). Before, the test was accepted and never matched.
+- An enumeration value is normalized with the base type's whiteSpace: its
+  values are values of the base type (Datatypes 1.1 §4.3.5), so
+  `<xs:enumeration value=" red "/>` restricting `xs:token` — or `xs:language`,
+  `xs:Name`, `xs:NCName`, `xs:NMTOKEN`, `xs:ID`, `xs:anyURI`, `xs:QName`,
+  `xs:NOTATION`, a `normalizedString` value with a tab, a list, a union member
+  with its own `whiteSpace`, a simple content restriction — now admits `red`
+  (it admitted no value before), and so do the restrictions inheriting it,
+  their defaults, fixed values, casts and further enumerations. An enumeration
+  value of an `xs:string` type keeps its white space, also under a restriction
+  that collapses.
+- `<xs:whiteSpace value=" preserve "/>` and
+  `<xs:explicitTimezone value=" required "/>` are read after whitespace
+  collapse, as their `xs:NMTOKEN` type prescribes (the first was taken as
+  `collapse`, the second was a schema error).
 
 ### Fixed
 
@@ -281,6 +295,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them) raise `XPTY0004`, as the casting table of F&O §17.1 requires.
 - XPath: `fn:ceiling`, `fn:floor`, `fn:round` and `fn:round-half-to-even` of a
   value of a type derived from `xs:integer` return an `xs:integer` (F&O §6.4).
+- A restriction of an enumerated simple type that adds no `enumeration` of its
+  own (`<xs:restriction base="t:color"/>`, or one adding only `maxLength`,
+  `pattern`, a bound, …) keeps its base type's enumeration (Structures 1.1
+  §3.16.6.4): instance validation, `cast as` / `castable as` and the
+  constructor functions accepted any value of the primitive type before, in
+  both XSD versions. A further restriction enumerating values outside the
+  inherited enumeration, and a default or fixed value outside it, are now
+  schema errors (QName and NOTATION enumeration values are compared by their
+  lexical form).
+- `NaN` no longer satisfies `minInclusive`, `maxInclusive`, `minExclusive` or
+  `maxExclusive` of a simple type derived from `xs:float` or `xs:double` (it
+  is incomparable with every other value). A `NaN` bound admits no value in
+  XSD 1.1; in XSD 1.0 mode an inclusive `NaN` bound admits `NaN` alone (XSD
+  1.0 §3.2.4). A bound written with surrounding whitespace is no longer
+  ignored.
+- A date/time value without a time zone offset no longer equals an enumerated
+  value with one, or the reverse (`2000-01-01` against `2000-01-01Z`), and it
+  satisfies a bound with an offset — or a value with an offset a bound without
+  one — only when it does so with both +14:00 and −14:00 imputed (Datatypes
+  1.1 §D.2.1). This tightens bounds: `2000-01-01T00:00:00` no longer satisfies
+  `minInclusive="2000-01-01T00:00:00Z"`, `2000-01-01Z` no longer satisfies
+  `minInclusive="2000-01-01"`, and `12:00:00` no longer satisfies
+  `minInclusive="00:30:00Z"`.
+- `xs:gMonth` values are ordered as months on the 1972 time line (Datatypes
+  1.1 §E.3.4): with offsets of ten hours and more, bounds accepted values
+  outside them (`--07+14:00` under `maxInclusive="--06-14:00"`) and rejected
+  values inside them (`--07+14:00` under `minInclusive="--06-14:00"`).
+- `enumeration` of `xs:hexBinary` and `xs:base64Binary` types compares octet
+  sequences (`0A` is `0a`), and of the `xs:gYearMonth`, `xs:gYear`,
+  `xs:gMonthDay`, `xs:gDay` and `xs:gMonth` types values (`--02Z` is
+  `--02+00:00`, `---16+13:00` is `---15-11:00`).
+- A complex type with simple content checks the facets of its `xs:restriction`
+  as a simple type's: bounds and digits were ignored (a 0–100 `xs:double`
+  content accepted `101` and `NaN`), enumerations compared strings, a list's
+  `length` counted characters, and XSD 1.1 `xs:assertion` facets were not
+  evaluated. A `whiteSpace` facet of the restriction now normalizes the value
+  before every facet of the type — the base type's length, pattern and
+  enumeration included — and before its assertions (`$value`, `xs:assert`
+  too), and the `[schema normalized value]` and the typed value are the
+  normalized string. An element's `default` or `fixed` value must satisfy
+  these facets as well.
 
 ### Performance
 

@@ -1122,3 +1122,239 @@ fn binding_a_constructor_node_again_keeps_its_type() {
         assert_eq!(render(Ok(value)), "true");
     }
 }
+
+/// Facets a cast's result must satisfy (F&O §17.4: "If the value does not
+/// conform to the facets defined for the target type, then an error is raised
+/// \[err:FORG0001\]") and that the validator used to let through: the
+/// `enumeration` a restriction keeps from its base type (Structures 1.1
+/// §3.16.6.4 clause 3, "The {facets} of R are the {facets} of B ·overlaid·
+/// with S"), `NaN` against a bound (Datatypes 1.1 §3.3.5.1: "If any other
+/// value is used for a bounding facet, NaN will be excluded from the resulting
+/// restricted ·value space·"), and a date without a time zone offset against
+/// an enumerated date with one, or a bound with one, with which it is
+/// incomparable (Datatypes 1.1 §D.2.1).
+#[test]
+fn inherited_enumerations_nan_and_time_zones_constrain_casts() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c37" xmlns:my="urn:c37">
+  <xs:simpleType name="color">
+    <xs:restriction base="xs:string">
+      <xs:enumeration value="red"/><xs:enumeration value="green"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="plainColor"><xs:restriction base="my:color"/></xs:simpleType>
+  <xs:simpleType name="shortColor">
+    <xs:restriction base="my:color"><xs:maxLength value="4"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="sizes">
+    <xs:restriction base="xs:integer">
+      <xs:enumeration value="1"/><xs:enumeration value="5"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="smallSizes">
+    <xs:restriction base="my:sizes"><xs:maxInclusive value="1"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="percent">
+    <xs:restriction base="xs:double">
+      <xs:minInclusive value="0"/><xs:maxInclusive value="100"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="posFloat">
+    <xs:restriction base="xs:float"><xs:minExclusive value="0"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="dZ">
+    <xs:restriction base="xs:date"><xs:enumeration value="2000-01-01Z"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="dtMin">
+    <xs:restriction base="xs:dateTime"><xs:minInclusive value="2000-01-01T00:00:00Z"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="fromJuneLocal">
+    <xs:restriction base="xs:gMonth"><xs:minInclusive value="--06"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="untilJuneNeg14">
+    <xs:restriction base="xs:gMonth"><xs:maxInclusive value="--06-14:00"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let cases = [
+        ("my:plainColor('blue')", "error:FORG0001"),
+        ("'blue' castable as my:plainColor", "false"),
+        ("my:plainColor('red')", "red"),
+        ("my:plainColor('red') instance of my:color", "true"),
+        ("my:shortColor('blue')", "error:FORG0001"),
+        ("my:smallSizes('0')", "error:FORG0001"),
+        ("my:smallSizes(1)", "1"),
+        ("xs:double('NaN') cast as my:percent", "error:FORG0001"),
+        ("'NaN' castable as my:percent", "false"),
+        ("xs:float('NaN') cast as my:posFloat", "error:FORG0001"),
+        ("my:percent('50')", "50"),
+        ("'2000-01-01' cast as my:dZ", "error:FORG0001"),
+        ("xs:date('2000-01-01') cast as my:dZ", "error:FORG0001"),
+        ("'2000-01-01Z' cast as my:dZ", "2000-01-01Z"),
+        ("xs:date('2000-01-01+00:00') cast as my:dZ", "2000-01-01Z"),
+        ("'2000-01-01T00:00:00' castable as my:dtMin", "false"),
+        ("'2000-01-01T15:00:00' castable as my:dtMin", "true"),
+        (
+            "'1999-12-31T23:00:00-05:00' cast as my:dtMin",
+            "1999-12-31T23:00:00-05:00",
+        ),
+        // A gMonth is a day of 1972 (Datatypes 1.1 §E.3.4): July is after
+        // June whatever the offsets.
+        (
+            "xs:gMonth('--07+10:00') cast as my:fromJuneLocal",
+            "--07+10:00",
+        ),
+        ("'--07+10:00' castable as my:fromJuneLocal", "true"),
+        ("'--05' castable as my:fromJuneLocal", "false"),
+        ("'--07+14:00' castable as my:untilJuneNeg14", "false"),
+        ("'--06+14:00' cast as my:untilJuneNeg14", "--06+14:00"),
+    ];
+    let mut failures = Vec::new();
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let set = compile_set(version, XSD);
+        let ctx = context(&set);
+        for (expr, expected) in cases {
+            let got = eval(&ctx, expr);
+            if got != expected {
+                failures.push(format!(
+                    "{version:?}: {expr}  =>  {got}  (expected {expected})"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// The assertion facets of the target constrain the value the cast returns as
+/// well: a string whose `xs:decimal` cast underflows to 0 (F&O §6.2) is no
+/// value of a type asserting `$value ne 0` (Datatypes 1.1 §4.3.13.3
+/// Assertions Valid: "A value V is facet-valid with respect to an assertions
+/// facet belonging to a simple type T if and only if the {test} property of
+/// each Assertion in its {value} evaluates to true"), nor of a restriction
+/// inheriting the assertion. A value the cast does not change is checked
+/// once, as before.
+#[test]
+fn an_assertion_facet_holds_for_the_value_a_cast_returns() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c37" xmlns:my="urn:c37">
+  <xs:simpleType name="nonZero">
+    <xs:restriction base="xs:decimal"><xs:assertion test="$value ne 0"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="smallNonZero">
+    <xs:restriction base="my:nonZero"><xs:maxInclusive value="1"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let tiny = "'0.000000000000000000000000000001'";
+    let set = compile_set(XsdVersion::V1_1, XSD);
+    let ctx = context(&set);
+    let cases = [
+        (format!("xs:decimal({tiny})"), "0"),
+        (format!("my:nonZero({tiny})"), "error:FORG0001"),
+        (format!("{tiny} castable as my:nonZero"), "false"),
+        (
+            format!("xs:untypedAtomic({tiny}) cast as my:nonZero"),
+            "error:FORG0001",
+        ),
+        (format!("my:smallNonZero({tiny})"), "error:FORG0001"),
+        ("my:nonZero('0')".to_string(), "error:FORG0001"),
+        ("my:nonZero('0.5')".to_string(), "0.5"),
+        ("my:smallNonZero('0.5')".to_string(), "0.5"),
+    ];
+    let mut failures = Vec::new();
+    for (expr, expected) in &cases {
+        let got = eval(&ctx, expr);
+        if got != *expected {
+            failures.push(format!("{expr}  =>  {got}  (expected {expected})"));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A NaN bound through the cast path: XSD 1.0 §3.2.5 gives an inclusive NaN
+/// bound the value space {NaN} ("NaN equals itself"), Datatypes 1.1
+/// §3.3.5.1 the empty one ("NaN is ·incomparable· with any value in the
+/// ·value space· including itself").
+#[test]
+fn a_nan_bound_follows_the_target_types_xsd_version() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c37" xmlns:my="urn:c37">
+  <xs:simpleType name="nanMin">
+    <xs:restriction base="xs:double"><xs:minInclusive value="NaN"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let v10 = compile_set(XsdVersion::V1_0, XSD);
+    let v11 = compile_set(XsdVersion::V1_1, XSD);
+    for (expr, in_10, in_11) in [
+        (
+            "xs:double('NaN') cast as my:nanMin",
+            "NaN",
+            "error:FORG0001",
+        ),
+        ("'NaN' castable as my:nanMin", "true", "false"),
+        ("'0' castable as my:nanMin", "false", "false"),
+    ] {
+        assert_eq!(eval(&context(&v10), expr), in_10, "1.0: {expr}");
+        assert_eq!(eval(&context(&v11), expr), in_11, "1.1: {expr}");
+    }
+}
+
+/// An enumeration value is a value of the base type (Datatypes 1.1
+/// §4.3.5.2: "interpreted as instances of the {base type definition}", by
+/// "the ·lexical mapping· of the {base type definition}"), so `" red "`
+/// enumerated for an `xs:token` type is `red`, the value a cast to it, or to
+/// a restriction inheriting the enumeration, accepts; `" red "` of an
+/// `xs:string` type keeps its spaces.
+#[test]
+fn casts_compare_enumeration_values_of_the_base_type() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c37" xmlns:my="urn:c37">
+  <xs:simpleType name="color">
+    <xs:restriction base="xs:token">
+      <xs:enumeration value=" red "/><xs:enumeration value="blue"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="color2"><xs:restriction base="my:color"/></xs:simpleType>
+  <xs:simpleType name="color3">
+    <xs:restriction base="my:color"><xs:maxLength value="10"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="padded">
+    <xs:restriction base="xs:string"><xs:enumeration value=" red "/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="lang">
+    <xs:restriction base="xs:language"><xs:enumeration value=" en "/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="site">
+    <xs:restriction base="xs:anyURI"><xs:enumeration value=" http://example.com/ "/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let cases = [
+        ("'red' cast as my:color", "red"),
+        ("' red ' cast as my:color", "red"),
+        ("xs:token('red') cast as my:color", "red"),
+        ("'red' cast as my:color2", "red"),
+        ("my:color2('red')", "red"),
+        ("'red' castable as my:color3", "true"),
+        ("'green' castable as my:color2", "false"),
+        ("my:color2('green')", "error:FORG0001"),
+        ("' red ' castable as my:padded", "true"),
+        ("'red' castable as my:padded", "false"),
+        ("'en' cast as my:lang", "en"),
+        (
+            "'http://example.com/' cast as my:site",
+            "http://example.com/",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let set = compile_set(version, XSD);
+        let ctx = context(&set);
+        for (expr, expected) in cases {
+            let got = eval(&ctx, expr);
+            if got != expected {
+                failures.push(format!(
+                    "{version:?}: {expr}  =>  {got}  (expected {expected})"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

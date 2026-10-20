@@ -31,9 +31,9 @@
 //!   representation of the value" instead; the two differ for `xs:float` and
 //!   `xs:double` between 10^-6 and 10^6 — `100` against `1.0E2`.) When the
 //!   conversion of a string changed the value — an `xs:decimal` below 10^-28
-//!   underflows to 0 — the value facets are checked again on the result
-//!   (`converted_decimal_conforms`). The facets are those the validator
-//!   applies to an instance, gaps included.
+//!   underflows to 0 — the value facets and the assertions are checked again
+//!   on the result (`converted_decimal_conforms`). The facets are those the
+//!   validator applies to an instance, gaps included.
 //!
 //! The result keeps the nearest built-in type as its
 //! [`type_code`](XmlValue::type_code) and the target as its
@@ -281,7 +281,8 @@ fn cast_to_schema_type(
 /// returned"; `doc/IMPLEMENTATION_LIMITS.md`) — a larger or more precise one
 /// is an error instead (FOAR0002, FOCA0006). So `'0.000000000000000000000000000001'`
 /// passes `minExclusive 0` and casts to 0, which does not. Then the digits,
-/// the bounds and the enumeration are checked again, by value, on the result.
+/// the bounds and the enumeration are checked again, by value, on the result,
+/// and the XSD 1.1 assertions are evaluated on it (Datatypes 1.1 §4.3.13.3).
 /// The patterns are not: they constrain the input string, which matched them
 /// (XPath 2.0 §3.10.2 checks a string source in the lexical space of the
 /// target type). The other built-in conversions a string goes through return
@@ -306,9 +307,17 @@ fn converted_decimal_conforms(
     }
     let mut value_facets = (*schema_set.effective_facets(key)).clone();
     value_facets.patterns.clear();
-    value_facets
+    if value_facets
         .validate_decimal_family(result, &result.to_string_value())
-        .is_ok()
+        .is_err()
+    {
+        return false;
+    }
+    // The assertions see the result as the validator gives an instance's
+    // value to them: annotated with the type.
+    let mut typed = result.clone();
+    typed.schema_type = Some(key);
+    crate::validation::simple::evaluate_assertion_facets(&typed, &value_facets, schema_set).is_ok()
 }
 
 /// F&O §17.5: "If SV is an instance of xs:string or xs:untypedAtomic".

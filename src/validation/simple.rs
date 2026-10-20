@@ -7,9 +7,7 @@
 use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
 use crate::schema::SchemaSet;
-#[cfg(feature = "xsd11")]
-use crate::types::facets::FacetSet;
-use crate::types::facets::{normalize_whitespace, WhitespaceMode};
+use crate::types::facets::{normalize_whitespace, FacetSet, WhitespaceMode};
 use crate::types::validators::VALIDATOR_REGISTRY;
 use crate::types::value::{XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
@@ -368,7 +366,30 @@ fn validate_simple_type_inner(
                     ));
                 }
             };
-            let result = if let Some(inline_st) = ct_data.resolved_simple_content_type {
+            let restriction = match &ct_data.content {
+                ComplexContentResult::Simple(sc)
+                    if sc.derivation == DerivationMethod::Restriction =>
+                {
+                    Some(sc)
+                }
+                _ => None,
+            };
+            // String Valid (§3.16.4) clause 1: the ·normalized value· is
+            // calculated "using the whiteSpace facet … associated with T", the
+            // content type's simple type definition — the most derived
+            // whiteSpace, so a restriction's own one comes first, and the base
+            // content type and every facet of the chain see the normalized
+            // string (a base's whiteSpace is never stronger: whiteSpace valid
+            // restriction, Datatypes §4.3.6.4).
+            let own_whitespace = restriction
+                .and_then(|sc| sc.facets.whitespace.as_ref())
+                .map(|w| w.value);
+            let value = match own_whitespace {
+                Some(mode) => normalize_whitespace(value, mode),
+                None => std::borrow::Cow::Borrowed(value),
+            };
+            let value = value.as_ref();
+            let mut result = if let Some(inline_st) = ct_data.resolved_simple_content_type {
                 validate_simple_type_inner(value, inline_st, schema_set)?
             } else if let Some(base_key) = ct_data.resolved_base_type {
                 validate_simple_type_inner(value, base_key, schema_set)?
@@ -380,19 +401,19 @@ fn validate_simple_type_inner(
                     normalized_value: None,
                 }
             };
+            if own_whitespace.is_some() && result.normalized_value.is_none() {
+                result.normalized_value = Some(value.to_owned());
+            }
             // §3.4.2.2 clause 1.2: a simpleContent restriction may declare
-            // local string-applicable facets (length / pattern / enumeration)
-            // that further constrain the recursively validated value. The
-            // base/inline call already applied the base type's facets; here we
-            // apply only the restriction's local set. Extension cannot add
-            // facets, so it is excluded.
-            if let ComplexContentResult::Simple(sc) = &ct_data.content {
-                if sc.derivation == DerivationMethod::Restriction && !sc.facets.is_empty() {
+            // local facets that further constrain the recursively validated
+            // value. The base/inline call already applied the base type's
+            // facets; here we apply only the restriction's local set, as the
+            // facets of a simple type. Extension cannot add facets, so it is
+            // excluded.
+            if let Some(sc) = restriction {
+                if !sc.facets.is_empty() {
                     let lex = result.normalized_value.as_deref().unwrap_or(value);
-                    sc.facets.validate_string(lex).map_err(|e| {
-                        let code = errors::facet_constraint_code(&e);
-                        errors::from_facet_error(code, e, None)
-                    })?;
+                    check_simple_content_facets(lex, &result.typed_value, &sc.facets, schema_set)?;
                 }
             }
             Ok(result)
@@ -403,6 +424,199 @@ fn validate_simple_type_inner(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// A facet error as the instance validation error of its constraint.
+fn facet_error(error: crate::error::FacetError) -> ValidationError {
+    let code = errors::facet_constraint_code(&error);
+    errors::from_facet_error(code, error, None)
+}
+
+/// The whiteSpace of an atomic simple type: its effective `whiteSpace` facet,
+/// otherwise its datatype's (Datatypes §4.3.6: `collapse` for every atomic
+/// datatype but `string`), and `preserve` without a datatype (Structures
+/// §3.1.4: for `xs:anySimpleType` "the ·normalized value· must be determined
+/// as in the preserve case").
+fn atomic_whitespace(sk: SimpleTypeKey, schema_set: &SchemaSet) -> WhitespaceMode {
+    schema_set
+        .effective_facets(sk)
+        .whitespace
+        .as_ref()
+        .map(|w| w.value)
+        .or_else(|| {
+            resolve_type_code(sk, schema_set)
+                .and_then(|code| VALIDATOR_REGISTRY.get_by_code(code))
+                .map(|validator| validator.whitespace())
+        })
+        .unwrap_or(WhitespaceMode::Preserve)
+}
+
+/// The ·normalized value· of `literal` as a lexical form of `type_key`
+/// (Structures §3.1.4: normalized "according to the value of the whiteSpace
+/// facet … associated with" the type) — the string its lexical mapping maps:
+/// for an atomic type with the type's whiteSpace, for a list collapsed (each
+/// item is then free of white space), for a union with the whiteSpace of the
+/// member type that accepts it (Datatypes §4.3.6: "the normalization
+/// behavior of ·union· types is controlled by the value of whiteSpace on that
+/// one of the ·basic members· against which the ·union· is successfully
+/// validated"), and for a complex type with simple content as for its
+/// {content type}'s simple type definition, whose whiteSpace is the most
+/// derived one along its restrictions. `None` when no member of a union
+/// accepts the literal.
+pub(crate) fn normalized_literal<'a>(
+    literal: &'a str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<std::borrow::Cow<'a, str>> {
+    let mut current = type_key;
+    for _ in 0..100 {
+        match current {
+            TypeKey::Simple(sk) => {
+                let st = schema_set.arenas.simple_types.get(sk)?;
+                return match st.variety {
+                    SimpleTypeVariety::Atomic => Some(normalize_whitespace(
+                        literal,
+                        atomic_whitespace(sk, schema_set),
+                    )),
+                    SimpleTypeVariety::List => {
+                        Some(normalize_whitespace(literal, WhitespaceMode::Collapse))
+                    }
+                    SimpleTypeVariety::Union => {
+                        st.resolved_member_types.iter().find_map(|&member| {
+                            let result =
+                                validate_simple_type_inner(literal, member, schema_set).ok()?;
+                            Some(match result.normalized_value {
+                                Some(normalized) if normalized != literal => {
+                                    std::borrow::Cow::Owned(normalized)
+                                }
+                                _ => std::borrow::Cow::Borrowed(literal),
+                            })
+                        })
+                    }
+                };
+            }
+            TypeKey::Complex(ck) => {
+                let ct = schema_set.arenas.complex_types.get(ck)?;
+                if let ComplexContentResult::Simple(sc) = &ct.content {
+                    if sc.derivation == DerivationMethod::Restriction {
+                        if let Some(whitespace) = &sc.facets.whitespace {
+                            return Some(normalize_whitespace(literal, whitespace.value));
+                        }
+                    }
+                }
+                current = match ct.resolved_simple_content_type.or(ct.resolved_base_type) {
+                    Some(next) => next,
+                    None => return Some(std::borrow::Cow::Borrowed(literal)),
+                };
+            }
+        }
+    }
+    Some(std::borrow::Cow::Borrowed(literal))
+}
+
+/// The facets of a complex type's simple content restriction, checked on the
+/// value its base content type gave (`typed`, from `lex`, the string
+/// normalized with the restriction's whiteSpace — see
+/// [`validate_simple_type_inner`]). Structures 1.1 §3.4.2.2: the {content type}'s simple type
+/// definition has "{facets} a set of facet components corresponding to the
+/// appropriate element information items among the <restriction>'s [children]
+/// …, as defined in Simple Type Restriction (Facets) (§3.16.6.4)" — so they
+/// are checked as a simple type's are: an atomic value by its datatype's
+/// validator (bounds and enumeration in its order and equality, digits,
+/// patterns on the lexical form), a list value by its items, a union value by
+/// the member type that validated it, and the XSD 1.1 assertions on the
+/// value. A value without a datatype (`xs:anySimpleType` content) is checked
+/// as a string.
+fn check_simple_content_facets(
+    lex: &str,
+    typed: &XmlValue,
+    facets: &FacetSet,
+    schema_set: &SchemaSet,
+) -> Result<(), ValidationError> {
+    let base_type = typed
+        .schema_type
+        .and_then(|sk| schema_set.arenas.simple_types.get(sk));
+    match &typed.value {
+        XmlValueKind::List { items, .. } => match base_type.and_then(|st| st.resolved_item_type) {
+            Some(item_type) => check_list_facets(
+                facets,
+                &normalize_whitespace(lex, WhitespaceMode::Collapse),
+                items,
+                item_type,
+                schema_set,
+            )?,
+            None => facets.validate_string(lex).map_err(facet_error)?,
+        },
+        XmlValueKind::Union(member) => match base_type {
+            Some(st) => {
+                check_union_facets(facets, lex, member, &st.resolved_member_types, schema_set)?
+            }
+            None => facets.validate_string(lex).map_err(facet_error)?,
+        },
+        XmlValueKind::Atomic(_) => match VALIDATOR_REGISTRY.get_by_code(typed.type_code) {
+            Some(validator) => {
+                let normalized = normalize_whitespace(
+                    lex,
+                    facets
+                        .whitespace
+                        .as_ref()
+                        .map(|w| w.value)
+                        .unwrap_or_else(|| validator.whitespace()),
+                );
+                let xsd10 = schema_set
+                    .is_xsd10()
+                    .then(|| xsd10_nan_bound_facets(facets, typed.type_code, &normalized))
+                    .flatten();
+                validator
+                    .validate_with_facets(lex, xsd10.as_ref().unwrap_or(facets))
+                    .map_err(|e| errors::from_value_error_default(e, None))?;
+            }
+            None => facets.validate_string(lex).map_err(facet_error)?,
+        },
+        _ => facets.validate_string(lex).map_err(facet_error)?,
+    }
+    #[cfg(feature = "xsd11")]
+    evaluate_assertion_facets(typed, facets, schema_set)?;
+    Ok(())
+}
+
+/// XSD 1.0 §3.2.4 (float; §3.2.5 double): "NaN equals itself but is
+/// ·incomparable· with (neither greater than nor less than) any other value",
+/// so with "NaN" as the value of an inclusive bound "the result is a ·value
+/// space· … having NaN as its only member". [`FacetSet::validate_float`] /
+/// [`FacetSet::validate_double`] implement Datatypes 1.1, where NaN is
+/// incomparable with itself too. For the NaN value (`normalized`) of an
+/// `xs:float` / `xs:double` type in XSD 1.0 mode, the facets without the
+/// inclusive bounds whose value is NaN, which it satisfies; `None` when there
+/// is nothing to take out.
+fn xsd10_nan_bound_facets(
+    facets: &FacetSet,
+    type_code: XmlTypeCode,
+    normalized: &str,
+) -> Option<FacetSet> {
+    if !matches!(type_code, XmlTypeCode::Float | XmlTypeCode::Double) || normalized != "NaN" {
+        return None;
+    }
+    let is_nan = |literal: &str| normalize_whitespace(literal, WhitespaceMode::Collapse) == "NaN";
+    let min = facets
+        .min_inclusive
+        .as_ref()
+        .is_some_and(|f| is_nan(&f.value));
+    let max = facets
+        .max_inclusive
+        .as_ref()
+        .is_some_and(|f| is_nan(&f.value));
+    if !min && !max {
+        return None;
+    }
+    let mut admitted = facets.clone();
+    if min {
+        admitted.min_inclusive = None;
+    }
+    if max {
+        admitted.max_inclusive = None;
+    }
+    Some(admitted)
+}
 
 /// Walk the resolved_base_type chain from `sk` until we find a built-in type code.
 /// Returns `None` if no built-in ancestor is found (cycle guard at depth 100).
@@ -419,27 +633,6 @@ fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTyp
         }
     }
     None
-}
-
-/// Walk the simple-type derivation chain and return `true` if any
-/// ancestor (including `sk` itself) declares an `enumeration` facet.
-/// `FacetSet::inherit_from` does not propagate enumeration through base
-/// types, so the merged effective facet set alone cannot answer this question.
-fn has_enumeration_in_chain(sk: SimpleTypeKey, schema_set: &SchemaSet) -> bool {
-    let mut current = sk;
-    for _ in 0..100 {
-        let Some(st_data) = schema_set.arenas.simple_types.get(current) else {
-            return false;
-        };
-        if st_data.facets.enumeration.is_some() {
-            return true;
-        }
-        match st_data.resolved_base_type {
-            Some(TypeKey::Simple(base)) => current = base,
-            _ => return false,
-        }
-    }
-    false
 }
 
 // Effective (base-chain-merged) facet sets are memoized by
@@ -488,7 +681,7 @@ fn validate_atomic_type(
     // declared notation. The schema may legally reference `xs:NOTATION`
     // directly, but any instance value must fail because there is no
     // enumeration to match against.
-    if type_code == XmlTypeCode::Notation && !has_enumeration_in_chain(sk, schema_set) {
+    if type_code == XmlTypeCode::Notation && facets.enumeration.is_none() {
         return Err(errors::error(
             "cvc-datatype-valid",
             "xs:NOTATION cannot be used directly for instance validation; \
@@ -506,10 +699,14 @@ fn validate_atomic_type(
         .unwrap_or_else(|| validator.whitespace());
     let normalized = normalize_whitespace(value, effective_ws);
 
+    let xsd10 = schema_set
+        .is_xsd10()
+        .then(|| xsd10_nan_bound_facets(&facets, type_code, &normalized))
+        .flatten();
     let typed_value = if facets.is_empty() {
         validator.validate(value)
     } else {
-        validator.validate_with_facets(value, &facets)
+        validator.validate_with_facets(value, xsd10.as_ref().unwrap_or(&facets))
     };
 
     match typed_value {
@@ -660,38 +857,7 @@ fn validate_list_type(
     // Check list-level facets (length, minLength, maxLength, pattern, enumeration)
     let facets = schema_set.effective_facets(sk);
     if !facets.is_empty() {
-        // Length constraints on list are item count
-        facets
-            .validate_list_length(items_str.len() as u64)
-            .map_err(|e| {
-                let code = errors::facet_constraint_code(&e);
-                errors::from_facet_error(code, e, None)
-            })?;
-
-        // Datatypes §4.3.4: a pattern constrains the lexical space — the
-        // normalized string.
-        facets.validate_patterns_only(&normalized).map_err(|e| {
-            let code = errors::facet_constraint_code(&e);
-            errors::from_facet_error(code, e, None)
-        })?;
-
-        // Datatypes §4.3.5.4 / §2.4.1.2: an enumeration value is a whole list,
-        // compared with the instance's value — same length, members pairwise
-        // equal in the value space of the type that validated each. A
-        // lexically identical enumeration value is a match without parsing.
-        if let Some(enumeration) = &facets.enumeration {
-            if !enumeration.values.contains(normalized.as_ref()) {
-                facets
-                    .validate_enum_value_space(
-                        |literal| list_literal_matches(literal, &items, item_type_key, schema_set),
-                        &normalized,
-                    )
-                    .map_err(|e| {
-                        let code = errors::facet_constraint_code(&e);
-                        errors::from_facet_error(code, e, None)
-                    })?;
-            }
-        }
+        check_list_facets(&facets, &normalized, &items, item_type_key, schema_set)?;
     }
 
     // Use the list type's own code (e.g. IdRefs, NmTokens, Entities) when it
@@ -721,6 +887,44 @@ fn validate_list_type(
     })
 }
 
+/// The facets of a list type on a list value: its whitespace-collapsed form
+/// `normalized`, its members `items` (as [`list_member`] gives them) and its
+/// item type.
+fn check_list_facets(
+    facets: &FacetSet,
+    normalized: &str,
+    items: &[XmlValue],
+    item_type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Result<(), ValidationError> {
+    // Length constraints on list are item count
+    facets
+        .validate_list_length(items.len() as u64)
+        .map_err(facet_error)?;
+
+    // Datatypes §4.3.4: a pattern constrains the lexical space — the
+    // normalized string.
+    facets
+        .validate_patterns_only(normalized)
+        .map_err(facet_error)?;
+
+    // Datatypes §4.3.5.4 / §2.4.1.2: an enumeration value is a whole list,
+    // compared with the instance's value — same length, members pairwise
+    // equal in the value space of the type that validated each. A
+    // lexically identical enumeration value is a match without parsing.
+    if let Some(enumeration) = &facets.enumeration {
+        if !enumeration.values.contains(normalized) {
+            facets
+                .validate_enum_value_space(
+                    |literal| list_literal_matches(literal, items, item_type_key, schema_set),
+                    normalized,
+                )
+                .map_err(facet_error)?;
+        }
+    }
+    Ok(())
+}
+
 /// Whether the list value `literal` — an enumeration value of a list type —
 /// is the list whose members are `members`: same length, and each item of the
 /// literal, validated against the item type, equal or identical to the member
@@ -744,6 +948,61 @@ fn list_literal_matches(
                 super::identity::values_equal_or_identical(&list_member(item.typed_value), member)
             })
         })
+}
+
+/// The facets of a union type on a value of it: its lexical form `value`, the
+/// value `member` the member type that accepted it gave, and the union's
+/// member types.
+fn check_union_facets(
+    facets: &FacetSet,
+    value: &str,
+    member: &XmlValue,
+    member_types: &[TypeKey],
+    schema_set: &SchemaSet,
+) -> Result<(), ValidationError> {
+    let check_value = member.to_string_value();
+    // §cvc-pattern-valid: patterns apply to the LEXICAL form (original value),
+    // not the canonical/parsed form (e.g. "-.5" must match "\-\.\d+" not "-0.5")
+    let lex_value = normalize_whitespace(value, WhitespaceMode::Collapse);
+    facets
+        .validate_patterns_only(&lex_value)
+        .map_err(facet_error)?;
+    // Enumeration checked in value space: re-parse each enum value as the
+    // matched primitive type and compare canonical forms (handles float/
+    // double rounding and duration leading-zero differences)
+    let type_code = member.type_code;
+    // A member type that is a list has no single primitive type to
+    // re-parse with: map the enumeration value through the member
+    // types, as the union's own lexical mapping does, and compare
+    // the two lists (Datatypes §2.4.1.2).
+    let member_is_list = holds_list(member);
+    facets
+        .validate_enum_value_space(
+            |s| {
+                if member_is_list {
+                    return member_types
+                        .iter()
+                        .find_map(|&m| validate_simple_type_inner(s, m, schema_set).ok())
+                        .is_some_and(|literal| {
+                            super::identity::values_equal_or_identical(&literal.typed_value, member)
+                        });
+                }
+                VALIDATOR_REGISTRY
+                    .validate(type_code, s)
+                    .map(|v| {
+                        // Decimals compare by exact value: a
+                        // value carried in lexical form has no
+                        // canonical string to compare.
+                        match crate::types::exact_decimal::decimal_values_equal(&v, member) {
+                            Some(equal) => equal,
+                            None => v.to_string_value() == check_value,
+                        }
+                    })
+                    .unwrap_or(false)
+            },
+            &check_value,
+        )
+        .map_err(facet_error)
 }
 
 /// Whether `value` is a list value, possibly inside union wrappers.
@@ -794,62 +1053,13 @@ fn validate_union_type(
             // Match found — check union-level facets (pattern, enumeration)
             let facets = schema_set.effective_facets(sk);
             if !facets.is_empty() {
-                let check_value = result.typed_value.to_string_value();
-                // §cvc-pattern-valid: patterns apply to the LEXICAL form (original value),
-                // not the canonical/parsed form (e.g. "-.5" must match "\-\.\d+" not "-0.5")
-                let lex_value = normalize_whitespace(value, WhitespaceMode::Collapse);
-                facets.validate_patterns_only(&lex_value).map_err(|e| {
-                    let code = errors::facet_constraint_code(&e);
-                    errors::from_facet_error(code, e, None)
-                })?;
-                // Enumeration checked in value space: re-parse each enum value as the
-                // matched primitive type and compare canonical forms (handles float/
-                // double rounding and duration leading-zero differences)
-                let type_code = result.typed_value.type_code;
-                // A member type that is a list has no single primitive type to
-                // re-parse with: map the enumeration value through the member
-                // types, as the union's own lexical mapping does, and compare
-                // the two lists (Datatypes §2.4.1.2).
-                let member_is_list = holds_list(&result.typed_value);
-                facets
-                    .validate_enum_value_space(
-                        |s| {
-                            if member_is_list {
-                                return st_data
-                                    .resolved_member_types
-                                    .iter()
-                                    .find_map(|&m| {
-                                        validate_simple_type_inner(s, m, schema_set).ok()
-                                    })
-                                    .is_some_and(|literal| {
-                                        super::identity::values_equal_or_identical(
-                                            &literal.typed_value,
-                                            &result.typed_value,
-                                        )
-                                    });
-                            }
-                            VALIDATOR_REGISTRY
-                                .validate(type_code, s)
-                                .map(|v| {
-                                    // Decimals compare by exact value: a
-                                    // value carried in lexical form has no
-                                    // canonical string to compare.
-                                    match crate::types::exact_decimal::decimal_values_equal(
-                                        &v,
-                                        &result.typed_value,
-                                    ) {
-                                        Some(equal) => equal,
-                                        None => v.to_string_value() == check_value,
-                                    }
-                                })
-                                .unwrap_or(false)
-                        },
-                        &check_value,
-                    )
-                    .map_err(|e| {
-                        let code = errors::facet_constraint_code(&e);
-                        errors::from_facet_error(code, e, None)
-                    })?;
+                check_union_facets(
+                    &facets,
+                    value,
+                    &result.typed_value,
+                    &st_data.resolved_member_types,
+                    schema_set,
+                )?;
             }
 
             // Propagate schema type on inner value from the matched member type
@@ -921,7 +1131,7 @@ fn resolve_assertion_default_ns(
 /// variable (the typed value being validated). No context node or DOM
 /// access is needed, so this evaluates inline during streaming validation.
 #[cfg(feature = "xsd11")]
-fn evaluate_assertion_facets(
+pub(crate) fn evaluate_assertion_facets(
     typed_value: &XmlValue,
     facets: &FacetSet,
     schema_set: &SchemaSet,

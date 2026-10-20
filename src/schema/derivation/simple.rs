@@ -655,7 +655,11 @@ fn is_notation_or_qname_base(schema_set: &SchemaSet, key: TypeKey) -> bool {
 /// lexical form) without hitting the string-equality enumeration comparison
 /// in `validate_simple_type` (which can false-reject when canonical forms
 /// differ — e.g. `12:00:00.990` vs `12:00:00.99`).  The enumeration-subset
-/// rule is already enforced by `merge_with_base`.
+/// rule is already enforced by `merge_with_base`. Only the ancestors' own
+/// facets count here: the ancestor found still has the `enumeration` it
+/// inherits from further up (`FacetSet::inherit_from`), so a restriction of a
+/// restriction of an enumerated type enumerates values of that enumeration
+/// (Datatypes §4.3.5.5 enumeration valid restriction).
 fn base_without_enumeration(schema_set: &SchemaSet, key: TypeKey) -> TypeKey {
     let mut current = key;
     for _ in 0..100 {
@@ -710,6 +714,29 @@ fn validate_facet_values_against_base_type(
                         ),
                         location.clone(),
                     ));
+                }
+            }
+            // Datatypes §4.3.5.5: the base's value space is its enumeration,
+            // the one it inherits through restrictions without their own too
+            // (`merge_with_base` sees only the immediate base's own facets).
+            // Compared by lexical form, as the facet check compares QName and
+            // NOTATION enumerations.
+            if let TypeKey::Simple(base_sk) = base_key {
+                if let Some(base_enum) = schema_set.effective_facets(base_sk).enumeration.as_ref() {
+                    if let Some(value) = enum_facet
+                        .values
+                        .iter()
+                        .find(|value| !base_enum.values.contains(*value))
+                    {
+                        return Err(SchemaError::structural(
+                            "enumeration-valid-restriction",
+                            format!(
+                                "Enumeration value '{}' in type '{}' is not in the base type's enumeration",
+                                value, type_name
+                            ),
+                            location.clone(),
+                        ));
+                    }
                 }
             }
         }

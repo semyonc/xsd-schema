@@ -464,7 +464,11 @@ fn compile_pattern_program(
 /// Enumeration facet (allowed values)
 #[derive(Debug, Clone)]
 pub struct EnumerationFacet {
-    /// Set of allowed values (as strings)
+    /// Set of allowed values (as strings). In a compiled schema set each is
+    /// the ·normalized value· of its literal with respect to the facet's base
+    /// type — white space normalized as that type prescribes (Datatypes 1.1
+    /// §4.3.5.2: the values are "interpreted as instances of the {base type
+    /// definition}") — so `" red "` of an `xs:token` base is stored as `red`.
     pub values: HashSet<String>,
     /// Per-value namespace bindings captured at parse time, for values that
     /// are QNames (NOTATION/QName bases). Parallel to `values`; only
@@ -869,8 +873,13 @@ impl FacetSet {
 
     /// Merge facets from a base type (for type derivation by restriction)
     ///
-    /// Inherited facets are only set if not already defined in this facet set.
-    /// The `fixed` attribute is preserved from the base type.
+    /// Inherited facets are only set if not already defined in this facet set
+    /// (Structures 1.1 §3.16.6.4 clause 3: "The {facets} of R are the {facets}
+    /// of B ·overlaid· with S"); patterns and assertions accumulate. An
+    /// `enumeration` of this set replaces the base's, whose values it must be
+    /// drawn from; without one, the base's is kept, with the namespace
+    /// bindings of its QName values. The `fixed` attribute is preserved from
+    /// the base type.
     ///
     /// Note: This method does not validate that derived facets are more restrictive.
     /// Use `merge_with_base()` for full validation.
@@ -896,6 +905,10 @@ impl FacetSet {
             if !base_step.is_empty() {
                 self.patterns.push(base_step.clone());
             }
+        }
+
+        if self.enumeration.is_none() {
+            self.enumeration = base.enumeration.clone();
         }
 
         // Whitespace
@@ -1664,109 +1677,96 @@ impl FacetSet {
     }
 
     /// Validate a float value against numeric bounds facets
+    ///
+    /// Datatypes 1.1 §3.3.4.1: "NaN is ·incomparable· with any value in the
+    /// ·value space· including itself", and a bound holds only for a value
+    /// ordered as it requires "according to the datatype's order relation"
+    /// (§4.3.7.3 – §4.3.10.3) — so NaN satisfies no bound, and a NaN bound no
+    /// value. (In XSD 1.0 NaN equals itself and satisfies an inclusive NaN
+    /// bound; the instance validator applies that rule in XSD 1.0 mode.) The
+    /// bound is read with the `xs:float` lexical mapping, after the whitespace
+    /// collapse its datatype prescribes.
     pub fn validate_float(&self, value: f32) -> FacetResult<()> {
-        // NaN doesn't compare normally, so skip bounds checking for NaN
-        if value.is_nan() {
-            return Ok(());
-        }
-
-        // Check numeric bounds
-        if let Some(ref min) = self.min_inclusive {
-            if let Ok(bound) = min.value.parse::<f32>() {
-                if !bound.is_nan() && value < bound {
-                    return Err(FacetError::MinInclusiveViolation {
-                        value: format_float_for_error(value),
-                        min: min.value.clone(),
-                    });
-                }
-            }
-        }
-
-        if let Some(ref max) = self.max_inclusive {
-            if let Ok(bound) = max.value.parse::<f32>() {
-                if !bound.is_nan() && value > bound {
-                    return Err(FacetError::MaxInclusiveViolation {
-                        value: format_float_for_error(value),
-                        max: max.value.clone(),
-                    });
-                }
-            }
-        }
-
-        if let Some(ref min) = self.min_exclusive {
-            if let Ok(bound) = min.value.parse::<f32>() {
-                if !bound.is_nan() && value <= bound {
-                    return Err(FacetError::MinExclusiveViolation {
-                        value: format_float_for_error(value),
-                        min: min.value.clone(),
-                    });
-                }
-            }
-        }
-
-        if let Some(ref max) = self.max_exclusive {
-            if let Ok(bound) = max.value.parse::<f32>() {
-                if !bound.is_nan() && value >= bound {
-                    return Err(FacetError::MaxExclusiveViolation {
-                        value: format_float_for_error(value),
-                        max: max.value.clone(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
+        self.check_ordered_bounds(
+            |bound| {
+                let bound = super::validators::parse_float(&normalize_whitespace(
+                    bound,
+                    WhitespaceMode::Collapse,
+                ))
+                .ok()?;
+                Some(value.partial_cmp(&bound))
+            },
+            || format_float_for_error(value),
+        )
     }
 
     /// Validate a double value against numeric bounds facets
+    ///
+    /// As [`FacetSet::validate_float`], with the `xs:double` order (Datatypes
+    /// 1.1 §3.3.5.1).
     pub fn validate_double(&self, value: f64) -> FacetResult<()> {
-        // NaN doesn't compare normally, so skip bounds checking for NaN
-        if value.is_nan() {
-            return Ok(());
-        }
+        self.check_ordered_bounds(
+            |bound| {
+                let bound = super::validators::parse_double(&normalize_whitespace(
+                    bound,
+                    WhitespaceMode::Collapse,
+                ))
+                .ok()?;
+                Some(value.partial_cmp(&bound))
+            },
+            || format_double_for_error(value),
+        )
+    }
 
-        // Check numeric bounds
+    /// The four bounding facets of a datatype with a partial order, given the
+    /// order of the value relative to a bound literal — `None` when the
+    /// literal does not parse (such a bound was rejected when the schema
+    /// compiled), `Some(None)` when the two are ·incomparable·, which no bound
+    /// admits — and the value's display form for messages.
+    fn check_ordered_bounds(
+        &self,
+        compare_with: impl Fn(&str) -> Option<Option<std::cmp::Ordering>>,
+        display: impl Fn() -> String,
+    ) -> FacetResult<()> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let holds = |bound: &str, admitted: &[std::cmp::Ordering]| match compare_with(bound) {
+            None => true,
+            Some(order) => order.is_some_and(|order| admitted.contains(&order)),
+        };
+
         if let Some(ref min) = self.min_inclusive {
-            if let Ok(bound) = min.value.parse::<f64>() {
-                if !bound.is_nan() && value < bound {
-                    return Err(FacetError::MinInclusiveViolation {
-                        value: format_double_for_error(value),
-                        min: min.value.clone(),
-                    });
-                }
+            if !holds(&min.value, &[Greater, Equal]) {
+                return Err(FacetError::MinInclusiveViolation {
+                    value: display(),
+                    min: min.value.clone(),
+                });
             }
         }
 
         if let Some(ref max) = self.max_inclusive {
-            if let Ok(bound) = max.value.parse::<f64>() {
-                if !bound.is_nan() && value > bound {
-                    return Err(FacetError::MaxInclusiveViolation {
-                        value: format_double_for_error(value),
-                        max: max.value.clone(),
-                    });
-                }
+            if !holds(&max.value, &[Less, Equal]) {
+                return Err(FacetError::MaxInclusiveViolation {
+                    value: display(),
+                    max: max.value.clone(),
+                });
             }
         }
 
         if let Some(ref min) = self.min_exclusive {
-            if let Ok(bound) = min.value.parse::<f64>() {
-                if !bound.is_nan() && value <= bound {
-                    return Err(FacetError::MinExclusiveViolation {
-                        value: format_double_for_error(value),
-                        min: min.value.clone(),
-                    });
-                }
+            if !holds(&min.value, &[Greater]) {
+                return Err(FacetError::MinExclusiveViolation {
+                    value: display(),
+                    min: min.value.clone(),
+                });
             }
         }
 
         if let Some(ref max) = self.max_exclusive {
-            if let Ok(bound) = max.value.parse::<f64>() {
-                if !bound.is_nan() && value >= bound {
-                    return Err(FacetError::MaxExclusiveViolation {
-                        value: format_double_for_error(value),
-                        max: max.value.clone(),
-                    });
-                }
+            if !holds(&max.value, &[Less]) {
+                return Err(FacetError::MaxExclusiveViolation {
+                    value: display(),
+                    max: max.value.clone(),
+                });
             }
         }
 
@@ -1936,7 +1936,7 @@ impl BoundOrder {
 ///
 /// Returns [`Cow::Borrowed`] when the input is already in the target form (the
 /// common case for clean instance values) — no allocation — and
-/// [`Cow::Owned`] only when a transformation is actually required. The produced
+/// [`Cow::Owned`] only when a change is actually required. The produced
 /// string is byte-identical to the previous always-allocating implementation.
 pub fn normalize_whitespace(s: &str, mode: WhitespaceMode) -> Cow<'_, str> {
     match mode {
@@ -2392,6 +2392,108 @@ mod tests {
         assert_eq!(derived.patterns[0].len(), 1);
     }
 
+    /// Structures 1.1 §3.16.6.4 clause 3: "The {facets} of R are the {facets}
+    /// of B ·overlaid· with S" — a restriction without its own `enumeration`
+    /// keeps the base's (with the namespace bindings of its QName values);
+    /// one with its own replaces it.
+    #[test]
+    fn test_inherit_from_keeps_the_base_enumeration() {
+        let mut base = FacetSet::new();
+        base.add_enumeration("red".to_string(), None);
+        base.add_enumeration_with_ns(
+            "my:a".to_string(),
+            Some(NamespaceContextSnapshot::default()),
+            None,
+        );
+
+        let mut plain = FacetSet::new();
+        plain.set_max_length(4, FacetFixed::Default, None);
+        plain.inherit_from(&base);
+        let inherited = plain.enumeration.as_ref().unwrap();
+        assert_eq!(inherited.values.len(), 2);
+        assert!(inherited.values.contains("red"));
+        assert_eq!(inherited.qname_contexts.len(), 1);
+        assert!(plain.validate_string("blue").is_err());
+        assert!(plain.validate_string("red").is_ok());
+
+        let mut own = FacetSet::new();
+        own.add_enumeration("red".to_string(), None);
+        own.inherit_from(&base);
+        let own_values = &own.enumeration.as_ref().unwrap().values;
+        assert_eq!(own_values.len(), 1);
+        assert!(own.validate_string("my:a").is_err());
+    }
+
+    /// Datatypes 1.1 §3.3.4.1 / §3.3.5.1: "NaN is ·incomparable· with any
+    /// value in the ·value space· including itself", and "If any other value
+    /// is used for a bounding facet, NaN will be excluded from the resulting
+    /// restricted ·value space·"; "when NaN is used as a facet value for a
+    /// bounding facet, since no float values are ·comparable· with it, the
+    /// result is a ·value space· that is empty". (The facet set implements
+    /// Datatypes 1.1; XSD 1.0's NaN, equal to itself, satisfies an inclusive
+    /// NaN bound — `validate_atomic_type` takes care of that, tested in
+    /// `tests/facet_soundness.rs`.)
+    #[test]
+    fn test_nan_is_outside_every_bound() {
+        type Setter = fn(&mut FacetSet, String);
+        let setters: [(&str, Setter); 4] = [
+            ("minInclusive", |f, v| {
+                f.set_min_inclusive(v, FacetFixed::Default, None)
+            }),
+            ("maxInclusive", |f, v| {
+                f.set_max_inclusive(v, FacetFixed::Default, None)
+            }),
+            ("minExclusive", |f, v| {
+                f.set_min_exclusive(v, FacetFixed::Default, None)
+            }),
+            ("maxExclusive", |f, v| {
+                f.set_max_exclusive(v, FacetFixed::Default, None)
+            }),
+        ];
+        for (name, set) in setters {
+            for bound in ["0", "INF", "-INF", "1.5E3"] {
+                let mut facets = FacetSet::new();
+                set(&mut facets, bound.to_string());
+                assert!(
+                    facets.validate_double(f64::NAN).is_err(),
+                    "double NaN vs {name} {bound}"
+                );
+                assert!(
+                    facets.validate_float(f32::NAN).is_err(),
+                    "float NaN vs {name} {bound}"
+                );
+            }
+            let mut facets = FacetSet::new();
+            set(&mut facets, "NaN".to_string());
+            for value in [0.0, -1.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                assert!(
+                    facets.validate_double(value).is_err(),
+                    "double {value} vs {name} NaN"
+                );
+                assert!(
+                    facets.validate_float(value as f32).is_err(),
+                    "float {value} vs {name} NaN"
+                );
+            }
+        }
+        // Comparable values keep their verdicts.
+        let mut pct = FacetSet::new();
+        pct.set_min_inclusive("0".to_string(), FacetFixed::Default, None);
+        pct.set_max_inclusive("100".to_string(), FacetFixed::Default, None);
+        for ok in [0.0, -0.0, 50.0, 100.0] {
+            assert!(pct.validate_double(ok).is_ok(), "{ok}");
+            assert!(pct.validate_float(ok as f32).is_ok(), "{ok}");
+        }
+        for bad in [-1.0, 100.5, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(pct.validate_double(bad).is_err(), "{bad}");
+            assert!(pct.validate_float(bad as f32).is_err(), "{bad}");
+        }
+        let mut unbounded_above = FacetSet::new();
+        unbounded_above.set_max_inclusive("INF".to_string(), FacetFixed::Default, None);
+        assert!(unbounded_above.validate_double(f64::INFINITY).is_ok());
+        assert!(unbounded_above.validate_float(f32::INFINITY).is_ok());
+    }
+
     // =========================================================================
     // Facet applicability tests
     // =========================================================================
@@ -2824,7 +2926,7 @@ mod tests {
     }
 
     #[test]
-    fn test_whitespace_owns_when_transformation_needed() {
+    fn test_whitespace_owns_when_normalization_needed() {
         // Replace owns when a tab/CR/LF must become a space.
         assert!(matches!(
             normalize_whitespace("has\ttab", WhitespaceMode::Replace),

@@ -450,7 +450,7 @@ fn parse_nonneg_integer<T: std::str::FromStr>(value: &str, facet_name: &str) -> 
 
 /// Apply a facet to a facet set
 fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
-    use crate::types::facets::{FacetFixed, WhitespaceMode};
+    use crate::types::facets::{normalize_whitespace, FacetFixed, WhitespaceMode};
 
     let fixed = if facet.fixed {
         FacetFixed::Fixed
@@ -520,7 +520,9 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::WhiteSpace => {
             if facets.whitespace.is_some() { return Err(dup("whiteSpace")); }
-            let mode = match facet.value.as_str() {
+            // The `value` is an `xs:NMTOKEN` in the schema for schemas
+            // (Datatypes Appendix A), so it is read after whitespace collapse.
+            let mode = match normalize_whitespace(&facet.value, WhitespaceMode::Collapse).as_ref() {
                 "preserve" => WhitespaceMode::Preserve,
                 "replace" => WhitespaceMode::Replace,
                 "collapse" => WhitespaceMode::Collapse,
@@ -539,8 +541,9 @@ fn apply_facet(facets: &mut FacetSet, facet: FacetResult) -> SchemaResult<()> {
         }
         FacetKind::ExplicitTimezone => {
             if facets.explicit_timezone.is_some() { return Err(dup("explicitTimezone")); }
-            // XSD 1.1 §4.3.16: explicitTimezone value must be one of required/prohibited/optional.
-            let mode = match facet.value.as_str() {
+            // XSD 1.1 §4.3.16: explicitTimezone value must be one of required/prohibited/optional
+            // (an `xs:NMTOKEN`, read after whitespace collapse, as for whiteSpace).
+            let mode = match normalize_whitespace(&facet.value, WhitespaceMode::Collapse).as_ref() {
                 "required" => ExplicitTimezone::Required,
                 "prohibited" => ExplicitTimezone::Prohibited,
                 "optional" => ExplicitTimezone::Optional,

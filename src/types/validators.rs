@@ -1160,21 +1160,31 @@ pub(crate) fn parse_double(s: &str) -> Result<f64, String> {
 
 use crate::types::equality::{double_eq, float_eq};
 
-/// Value-space equality for xs:duration per §3.3.6.
-/// Two durations are equal iff their signed total-months components are equal
-/// AND their signed total day-time seconds components are equal.
+/// Value-space equality of two date/time values for `enumeration`: equal in
+/// the order the facets use ([`FacetOrder`]), so one instant written with two
+/// time zone offsets is one value, and a value without a time zone offset
+/// equals no value with one.
 fn datetime_value_eq(a: &DateTimeValue, b: &DateTimeValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
 fn date_value_eq(a: &DateValue, b: &DateValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
 fn time_value_eq(a: &TimeValue, b: &TimeValue) -> bool {
-    a.partial_cmp(b) == Some(std::cmp::Ordering::Equal)
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
 }
 
+/// Value-space equality of two values of a g* datatype for `enumeration`, in
+/// the same order (Datatypes 1.1 §3.3.13.1: "---15−11:00 = ---16+13:00").
+fn g_value_eq<T: FacetOrder>(a: &T, b: &T) -> bool {
+    a.facet_cmp(b) == Some(std::cmp::Ordering::Equal)
+}
+
+/// Value-space equality for xs:duration per §3.3.6.
+/// Two durations are equal iff their signed total-months components are equal
+/// AND their signed total day-time seconds components are equal.
 fn duration_eq(a: &DurationValue, b: &DurationValue) -> bool {
     let sign = |d: &DurationValue| if d.negative { -1i64 } else { 1 };
     let total_months = |d: &DurationValue| d.years as i64 * 12 + d.months as i64;
@@ -1208,9 +1218,84 @@ fn day_time_duration_value_eq(a: &DayTimeDurationValue, b: &DayTimeDurationValue
 // Date/time bound checking helper
 // ---------------------------------------------------------------------------
 
-/// Validate min/max inclusive/exclusive bounds for types that implement PartialOrd.
+/// The order relation the bounding facets and `enumeration` compare the
+/// values of a datatype in — `None` for two ·incomparable· values, which no
+/// bound admits and which are not equal.
+trait FacetOrder {
+    fn facet_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>;
+}
+
+/// The durations keep their `PartialOrd` order.
+macro_rules! partial_ord_facet_order {
+    ($($ty:ty),*) => {$(
+        impl FacetOrder for $ty {
+            fn facet_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                self.partial_cmp(other)
+            }
+        }
+    )*};
+}
+partial_ord_facet_order!(DurationValue, YearMonthDurationValue, DayTimeDurationValue);
+
+/// The date/time datatypes of the seven-property model (Datatypes 1.1
+/// §D.2.1): values "are ordered the same as their ·timeOnTimeline· values,
+/// except that if one value's ·timezoneOffset· is absent and the other's is
+/// not, and using maximum and minimum ·timezoneOffset· values for the one
+/// whose ·timezoneOffset· is actually absent changes the resulting (strict)
+/// inequality, the original two values are incomparable" (XSD 1.0 §3.2.7.4
+/// alike: "P < Q if P < (Q with time zone +14:00)", "P > Q if P > (Q with
+/// time zone -14:00)", "P <> Q otherwise"). Two values that both have an
+/// offset, or both have none, keep their `PartialOrd` order: on the time
+/// line, and by their local times, respectively.
+macro_rules! seven_property_facet_order {
+    ($($ty:ty),*) => {$(
+        impl FacetOrder for $ty {
+            fn facet_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                let impute = |value: &Self, minutes: i16| Self {
+                    timezone: Some(TimezoneOffset(minutes)),
+                    ..value.clone()
+                };
+                match (self.timezone.is_some(), other.timezone.is_some()) {
+                    (true, false) => same_order_at_both_extreme_offsets(|minutes| {
+                        self.partial_cmp(&impute(other, minutes))
+                    }),
+                    (false, true) => same_order_at_both_extreme_offsets(|minutes| {
+                        impute(self, minutes).partial_cmp(other)
+                    }),
+                    _ => self.partial_cmp(other),
+                }
+            }
+        }
+    )*};
+}
+seven_property_facet_order!(
+    DateTimeValue,
+    DateValue,
+    TimeValue,
+    GYearMonthValue,
+    GYearValue,
+    GMonthDayValue,
+    GDayValue,
+    GMonthValue
+);
+
+/// The strict order `order_at(offset)` gives when the value without a time
+/// zone offset is given +14:00 and when it is given −14:00 (in minutes), if
+/// both give the same one; otherwise the two values are ·incomparable·.
+fn same_order_at_both_extreme_offsets(
+    order_at: impl Fn(i16) -> Option<std::cmp::Ordering>,
+) -> Option<std::cmp::Ordering> {
+    const MAX_OFFSET: i16 = 14 * 60;
+    match (order_at(MAX_OFFSET), order_at(-MAX_OFFSET)) {
+        (Some(a), Some(b)) if a == b && a != std::cmp::Ordering::Equal => Some(a),
+        _ => None,
+    }
+}
+
+/// Validate the min/max inclusive/exclusive bounds in the datatype's
+/// [`FacetOrder`]; a value ·incomparable· with a bound violates it.
 /// The `parse_fn` parses the bound value string using the same parser as the main value.
-fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
+fn validate_bounds<T: FacetOrder, F: Fn(&str) -> Option<T>>(
     value: &T,
     facets: &FacetSet,
     _type_name: &str,
@@ -1219,9 +1304,10 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
 ) -> ValidationResult<()> {
     if let Some(ref min) = facets.min_inclusive {
         if let Some(bound) = parse_fn(&min.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater)
-                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
-            {
+            if !matches!(
+                value.facet_cmp(&bound),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MinInclusiveViolation {
                         value: value_str.to_string(),
@@ -1233,9 +1319,10 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref max) = facets.max_inclusive {
         if let Some(bound) = parse_fn(&max.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less)
-                && value.partial_cmp(&bound) != Some(std::cmp::Ordering::Equal)
-            {
+            if !matches!(
+                value.facet_cmp(&bound),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MaxInclusiveViolation {
                         value: value_str.to_string(),
@@ -1247,7 +1334,7 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref min) = facets.min_exclusive {
         if let Some(bound) = parse_fn(&min.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Greater) {
+            if value.facet_cmp(&bound) != Some(std::cmp::Ordering::Greater) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MinExclusiveViolation {
                         value: value_str.to_string(),
@@ -1259,7 +1346,7 @@ fn validate_bounds<T: PartialOrd, F: Fn(&str) -> Option<T>>(
     }
     if let Some(ref max) = facets.max_exclusive {
         if let Some(bound) = parse_fn(&max.value) {
-            if value.partial_cmp(&bound) != Some(std::cmp::Ordering::Less) {
+            if value.facet_cmp(&bound) != Some(std::cmp::Ordering::Less) {
                 return Err(ValidationError::FacetViolation(
                     FacetError::MaxExclusiveViolation {
                         value: value_str.to_string(),
@@ -1531,13 +1618,18 @@ impl TypeValidator for GYearMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gYearMonth", value, |s| {
                 parse_gyearmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_patterns_only(&canonical)?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gyearmonth, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1584,13 +1676,18 @@ impl TypeValidator for GYearValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GYear(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gYear", value, |s| {
                 parse_gyear(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_patterns_only(&canonical)?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gyear, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1637,13 +1734,18 @@ impl TypeValidator for GMonthDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gMonthDay", value, |s| {
                 parse_gmonthday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_patterns_only(&canonical)?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gmonthday, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1690,13 +1792,18 @@ impl TypeValidator for GDayValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GDay(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gDay", value, |s| {
                 parse_gday(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_patterns_only(&canonical)?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gday, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1743,13 +1850,18 @@ impl TypeValidator for GMonthValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let canonical = result.to_string_value();
         if let XmlValueKind::Atomic(XmlAtomicValue::GMonth(ref v)) = result.value {
             facets.validate_explicit_timezone(v.timezone.is_some())?;
             validate_bounds(v, facets, "gMonth", value, |s| {
                 parse_gmonth(&normalize_whitespace(s, WhitespaceMode::Collapse)).ok()
             })?;
+            facets.validate_patterns_only(&canonical)?;
+            facets.validate_enum_value_space(
+                enum_matches_value_space!(v, parse_gmonth, |a, b| g_value_eq(a, &b)),
+                &canonical,
+            )?;
         }
-        facets.validate_string(&result.to_string_value())?;
         Ok(result)
     }
 
@@ -1806,11 +1918,20 @@ impl TypeValidator for HexBinaryValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         if let XmlValueKind::Atomic(XmlAtomicValue::HexBinary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
+            facets.validate_patterns_only(&normalized)?;
+            // §cvc-enumeration-valid: a value is a sequence of octets
+            // (Datatypes §3.3.15.1), so `0A` is the value of `0a`.
+            facets.validate_enum_value_space(
+                |s| {
+                    hex::decode(normalize_whitespace(s, WhitespaceMode::Collapse).as_bytes())
+                        .is_ok_and(|octets| &octets == bytes)
+                },
+                &normalized,
+            )?;
         }
-        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 
@@ -1859,11 +1980,22 @@ impl TypeValidator for Base64BinaryValidator {
 
     fn validate_with_facets(&self, value: &str, facets: &FacetSet) -> ValidationResult<XmlValue> {
         let result = self.validate(value)?;
+        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
         if let XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(bytes)) = &result.value {
             facets.validate_binary_length(bytes.len() as u64)?;
+            facets.validate_patterns_only(&normalized)?;
+            // §cvc-enumeration-valid: a value is a sequence of octets
+            // (Datatypes §3.3.16.1), compared as such.
+            facets.validate_enum_value_space(
+                |s| {
+                    self.validate(s).is_ok_and(|literal| {
+                        matches!(&literal.value,
+                            XmlValueKind::Atomic(XmlAtomicValue::Base64Binary(octets)) if octets == bytes)
+                    })
+                },
+                &normalized,
+            )?;
         }
-        let normalized = normalize_whitespace(value, WhitespaceMode::Collapse);
-        facets.validate_string_patterns_enums(&normalized)?;
         Ok(result)
     }
 

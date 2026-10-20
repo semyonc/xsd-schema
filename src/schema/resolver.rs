@@ -735,7 +735,120 @@ pub fn resolve_all_references(schema_set: &mut SchemaSet) -> SchemaResult<Resolu
     // now, so an extension's empty explicit content can be dropped.
     drop_empty_explicit_extension_content(schema_set);
 
+    // Every base type is resolved, so an enumeration's values can be read as
+    // values of its base type.
+    normalize_enumeration_values(schema_set);
+
     Ok(stats)
+}
+
+/// Store every enumeration value as a value of its {base type definition}.
+///
+/// Datatypes 1.1 §4.3.5.1: an enumeration's "{value} A set of values from the
+/// ·value space· of the {base type definition}"; §4.3.5.2: the members are
+/// "the actual values of all the <enumeration> [children]'s value
+/// [attributes], interpreted as instances of the {base type definition}" —
+/// "the actual value is identified by using the ·lexical mapping· of the
+/// {base type definition}", which normalizes white space first (Structures
+/// §3.1.4). The facet checks compare the stored literals with an instance's
+/// normalized value — as strings for the string types, `xs:anyURI`, `xs:QName`
+/// and `xs:NOTATION`, through the datatype's lexical mapping for the others —
+/// so each literal is stored as its ·normalized value· with respect to the
+/// base type ([`normalized_literal`](crate::validation::simple::normalized_literal)):
+/// `" red "` enumerated for an `xs:token` base is `red`, for an `xs:string`
+/// base ` red `. A restriction inherits the stored values (Structures
+/// §3.16.6.4), so a later restriction's stronger whiteSpace never applies to
+/// them. The enumerations of complex types' simple content restrictions are
+/// values of the base's content type (§3.4.2.2).
+///
+/// A literal of a union base is normalized as the member type that accepts it
+/// prescribes, so the pass repeats until the member types' own enumerations
+/// are stored normalized as well; a round changes a literal only by removing
+/// or replacing white space, so the rounds end.
+fn normalize_enumeration_values(schema_set: &mut SchemaSet) {
+    use crate::parser::frames::{ComplexContentResult, DerivationMethod};
+    for _ in 0..16 {
+        let simple: Vec<_> = schema_set
+            .arenas
+            .simple_types
+            .iter()
+            .filter_map(|(key, st)| {
+                let enumeration = st.facets.enumeration.as_ref()?;
+                let base = st.resolved_base_type?;
+                Some((key, normalized_enumeration(schema_set, enumeration, base)?))
+            })
+            .collect();
+        let complex: Vec<_> = schema_set
+            .arenas
+            .complex_types
+            .iter()
+            .filter_map(|(key, ct)| {
+                let ComplexContentResult::Simple(sc) = &ct.content else {
+                    return None;
+                };
+                if sc.derivation != DerivationMethod::Restriction {
+                    return None;
+                }
+                let enumeration = sc.facets.enumeration.as_ref()?;
+                let base = ct.resolved_simple_content_type.or(ct.resolved_base_type)?;
+                Some((key, normalized_enumeration(schema_set, enumeration, base)?))
+            })
+            .collect();
+        if simple.is_empty() && complex.is_empty() {
+            return;
+        }
+        let arenas = schema_set.arenas.entries_mut();
+        for (key, enumeration) in simple {
+            if let Some(st) = arenas.simple_types.get_mut(key) {
+                st.facets.enumeration = Some(enumeration);
+            }
+        }
+        for (key, enumeration) in complex {
+            if let Some(ComplexContentResult::Simple(sc)) =
+                arenas.complex_types.get_mut(key).map(|ct| &mut ct.content)
+            {
+                sc.facets.enumeration = Some(enumeration);
+            }
+        }
+    }
+}
+
+/// `enumeration` with each value replaced by its normalized value as a
+/// lexical form of `base` (and the namespace bindings of QName values kept
+/// with it), or `None` when no value changes. A value no member of a union
+/// base accepts is kept as written; the schema checks report it.
+fn normalized_enumeration(
+    schema_set: &SchemaSet,
+    enumeration: &crate::types::facets::EnumerationFacet,
+    base: TypeKey,
+) -> Option<crate::types::facets::EnumerationFacet> {
+    let renamed: std::collections::HashMap<&str, String> = enumeration
+        .values
+        .iter()
+        .filter_map(|value| {
+            let normalized =
+                crate::validation::simple::normalized_literal(value, base, schema_set)?;
+            (normalized != value.as_str()).then(|| (value.as_str(), normalized.into_owned()))
+        })
+        .collect();
+    if renamed.is_empty() {
+        return None;
+    }
+    let rename = |value: &String| {
+        renamed
+            .get(value.as_str())
+            .cloned()
+            .unwrap_or_else(|| value.clone())
+    };
+    Some(crate::types::facets::EnumerationFacet {
+        values: enumeration.values.iter().map(rename).collect(),
+        qname_contexts: enumeration
+            .qname_contexts
+            .iter()
+            .map(|(value, snapshot)| (rename(value), snapshot.clone()))
+            .collect(),
+        source: enumeration.source.clone(),
+    })
 }
 
 /// Give a `<complexContent><extension>` whose *explicit content* is empty
