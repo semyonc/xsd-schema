@@ -76,6 +76,10 @@ pub struct XPathContext<'a> {
     /// default collation the codepoint one" with a discriminant test and never
     /// a string comparison.
     default_collation: Option<String>,
+    /// Whether the atomic types of the schema set are targets of `cast as` /
+    /// `castable as` and have constructor functions, set off by
+    /// [`without_schema_casts`](Self::without_schema_casts).
+    schema_casts: bool,
 }
 
 impl<'a> XPathContext<'a> {
@@ -96,10 +100,83 @@ impl<'a> XPathContext<'a> {
             xpath10_compatibility: false,
             collation_resolver: None,
             default_collation: None,
+            schema_casts: true,
         }
     }
 
-    /// Set the schema set
+    /// Set the schema set: its named types join the *in-scope schema types* of
+    /// the static context, and its top-level element and attribute declarations
+    /// the in-scope element and attribute declarations (XPath 2.0 §2.1.1).
+    ///
+    /// Names are looked up in the schema set by the ids of this context's
+    /// [`names`](Self::names), so that should be the schema set's own
+    /// [`name_table`](SchemaSet::name_table). An expression compiled with the
+    /// schema set keeps its types as keys of that set, so evaluate it with a
+    /// context carrying the same set.
+    ///
+    /// With a schema set attached, an atomic simple type of the set
+    ///
+    /// * is an `AtomicType` of `instance of` and `treat as`, matched by
+    ///   derivation (§2.5.4.2);
+    /// * is a target of `cast as` and `castable as` (§3.10.2, §3.10.3): the
+    ///   value is cast to the type's nearest built-in type and then checked
+    ///   against the type's facets by the schema validator — on the string of
+    ///   a string or `xs:untypedAtomic` source, otherwise on the value's
+    ///   `xs:string` cast — `FORG0001` when one is not satisfied, and the
+    ///   result carries the type as its
+    ///   [`schema_type`](crate::types::XmlValue::schema_type);
+    /// * has a constructor function of its own name (§3.10.4) — `my:t($arg)` is
+    ///   `$arg cast as my:t?` — unless the function catalog has a function of
+    ///   that name and arity, which takes precedence. A type in no namespace
+    ///   is reached by its constructor only when the default function
+    ///   namespace is none.
+    ///
+    /// A list or union type is not an atomic type: it is neither a target of
+    /// `cast as` (`XPST0051`) nor a constructor (`XPST0017`). The XPath of an
+    /// XSD 1.1 assertion is evaluated without the casts and constructors of
+    /// the schema's own types (Structures §3.13.6.2 clause 2.2.5 puts only the
+    /// built-in types in its static context).
+    ///
+    /// ```
+    /// use xsd_schema::namespace::context::NamespaceContextSnapshot;
+    /// use xsd_schema::xpath::{RoXmlNavigator, XPathContext, XPathExpr};
+    /// use xsd_schema::{SchemaSetBuilder, XsdVersion};
+    ///
+    /// let set = SchemaSetBuilder::with_version(XsdVersion::V1_1)
+    ///     .add_source(
+    ///         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+    ///                       targetNamespace="urn:hats">
+    ///              <xs:simpleType name="size">
+    ///                <xs:restriction base="xs:integer">
+    ///                  <xs:minInclusive value="1"/><xs:maxInclusive value="20"/>
+    ///                </xs:restriction>
+    ///              </xs:simpleType>
+    ///            </xs:schema>"#,
+    ///         "file:///hats.xsd",
+    ///     )
+    ///     .unwrap()
+    ///     .compile()
+    ///     .unwrap()
+    ///     .into_schema_set();
+    ///
+    /// let mut namespaces = NamespaceContextSnapshot::default();
+    /// namespaces
+    ///     .bindings
+    ///     .push((set.name_table.add("h"), set.name_table.add("urn:hats")));
+    /// let ctx = XPathContext::new(&set.name_table)
+    ///     .with_namespaces(namespaces)
+    ///     .with_schema_set(&set);
+    ///
+    /// let run = |expr: &str| {
+    ///     XPathExpr::compile(expr, &ctx)?
+    ///         .evaluator(&ctx)
+    ///         .run_string::<RoXmlNavigator<'static>>()
+    /// };
+    /// assert_eq!(run("h:size('7') instance of h:size").unwrap(), "true");
+    /// assert_eq!(run("'12' castable as h:size").unwrap(), "true");
+    /// assert_eq!(run("h:size('7') + 1").unwrap(), "8");
+    /// assert_eq!(run("'21' cast as h:size").unwrap_err().error_code(), Some("FORG0001"));
+    /// ```
     pub fn with_schema_set(mut self, schema_set: &'a SchemaSet) -> Self {
         self.schema_set = Some(schema_set);
         self
@@ -249,6 +326,27 @@ impl<'a> XPathContext<'a> {
     /// Get the XPath language mode.
     pub fn mode(&self) -> XPathMode {
         self.mode
+    }
+
+    /// Keep the atomic types of the schema set out of `cast as`, `castable
+    /// as` and the constructor functions, as before they were added: a cast
+    /// to such a type raises XPST0051 when it is evaluated, `castable as` is
+    /// false, and a call of its constructor is XPST0017. `instance of` and
+    /// `treat as` still see the types.
+    ///
+    /// The static context of an XSD 1.1 assertion, whose in-scope schema
+    /// definitions are only the built-in ones (Structures §3.13.6.2 clause
+    /// 2.2.5: "those components that are present in every schema by
+    /// definition").
+    pub(crate) fn without_schema_casts(mut self) -> Self {
+        self.schema_casts = false;
+        self
+    }
+
+    /// Whether the atomic types of the schema set are cast targets and have
+    /// constructor functions (see [`without_schema_casts`](Self::without_schema_casts)).
+    pub(crate) fn schema_casts(&self) -> bool {
+        self.schema_casts
     }
 
     /// Set the function catalog for custom function support.

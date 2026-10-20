@@ -220,7 +220,8 @@ pub(crate) fn evaluate_complex_type_assertions(
         // Build XPath static context with schema-time namespace snapshot
         let ctx = XPathContext::new(&schema_set.name_table)
             .with_namespaces(assertion.ns_snapshot.clone())
-            .with_schema_set(schema_set);
+            .with_schema_set(schema_set)
+            .without_schema_casts();
 
         // Apply xpathDefaultNamespace cascade
         let ctx = if let Some(default_ns) =

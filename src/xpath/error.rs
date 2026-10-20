@@ -206,10 +206,15 @@ pub enum XPathError {
     // ========================================================================
     // Casting Errors (FOCA)
     // ========================================================================
-    /// FOCA0002: invalid lexical value where an `xs:QName` is required —
-    /// either the wrong lexical form, or a prefix with no namespace.
-    #[error("[FOCA0002] Invalid lexical value for xs:QName: '{qname}'")]
-    FOCA0002 { qname: String },
+    /// FOCA0002: invalid lexical value — where an `xs:QName` is required,
+    /// either the wrong lexical form or a prefix with no namespace; or a
+    /// special `xs:float` / `xs:double` value (`NaN`, `INF`, `-INF`) cast to
+    /// `xs:decimal`, `xs:integer` or a type derived from them (F&O §17.1.3.3,
+    /// §17.1.3.4: "If SV is one of the special xs:float or xs:double values
+    /// NaN, INF, or -INF, an error is raised \[err:FOCA0002\]"). `value` holds
+    /// the offending lexical form.
+    #[error("[FOCA0002] Invalid lexical value: '{value}'")]
+    FOCA0002 { value: String },
 
     /// FOCA0003: Input value too large for integer.
     #[error("[FOCA0003] {message}")]

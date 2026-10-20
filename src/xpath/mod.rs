@@ -52,6 +52,8 @@ pub mod cast;
 pub mod iter_adapters;
 pub mod node_ops;
 pub mod quantified;
+// Casts and constructor functions for the atomic types of a schema set.
+pub(crate) mod schema_cast;
 pub mod sequence_ops;
 pub mod string_ops;
 pub mod type_info;
@@ -74,6 +76,9 @@ pub mod api;
 // `xs:decimal` values beyond `rust_decimal`'s capacity, end to end.
 #[cfg(test)]
 mod decimal_capacity_tests;
+
+#[cfg(test)]
+mod schema_cast_tests;
 
 // Re-export navigator types for backward compatibility
 pub use crate::navigator::{

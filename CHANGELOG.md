@@ -58,6 +58,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `build_typed_document`: input that ends inside an element is reported as the
   XML error `BufferDocumentError::Parse(IllFormed(MissingEndTag(..)))` instead
   of an internal error.
+- `XPathError::FOCA0002 { qname }` is `XPathError::FOCA0002 { value }`: the
+  error is also raised for the special float / double values cast to
+  `xs:decimal` / `xs:integer` (see *Fixed*), so the field holds the offending
+  lexical form, not only a QName. Its message is "[FOCA0002] Invalid lexical
+  value: '…'".
 
 ### Added
 
@@ -110,6 +115,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ValidationRuntime::skip_attribute[_by_id]`. Honoured by the quick-xml
   drivers and the typed build; the tree-walking drivers validate every
   attribute.
+- XPath: `cast as`, `castable as` and constructor functions for the atomic
+  simple types of the schema set attached to the static context
+  (`XPathContext::with_schema_set`), XPath 2.0 §3.10.2 – §3.10.4. The value is
+  cast to the type's nearest built-in type and checked against the type's
+  facets with the schema validator (`FORG0001`, naming the type, when one is
+  not satisfied): a string or `xs:untypedAtomic` source as given, after the
+  type's whitespace normalization, any other value through its `xs:string`
+  cast; when the conversion of a string changes its value (an `xs:decimal`
+  below 10^-28 becomes 0), the type's digits, bounds and enumeration are
+  checked again on the result. A cast up the hierarchy only changes the
+  annotation. The result carries the type as `XmlValue::schema_type`, so
+  `instance of` and `treat as` see it. Types derived from `xs:QName` and
+  `xs:NOTATION` cast as `xs:QName` does. A function the host registers under a
+  user type's constructor name and arity takes precedence. A type in no
+  namespace has a constructor when the default function namespace is none.
+  Lists and unions have neither (`XPST0051`, `XPST0017`). XSD 1.1 assertions do
+  not see these casts and constructors (Structures §3.13.6.2 clause 2.2.5):
+  there they behave as before.
 
 ### Changed
 
@@ -156,6 +179,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — so in 1.0 mode values that are equal but spelled differently are accepted
   there (`13:00:00+01:00` against `fixed="12:00:00Z"`). See
   [Overview](doc/OVERVIEW.md).
+- XSD 1.1: a type alternative whose test calls the constructor of a
+  user-defined atomic type is rejected with `src-ct-alternative`, as one with
+  `cast as` such a type already was (Type Alternative Properties Correct, XPath
+  Valid). Before, the test was accepted and never matched.
 
 ### Fixed
 
@@ -241,6 +268,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P1M` and `P30DT10H29M6S` are different keys (they compared equal through
   30.436875-day months), and a value of a type derived from `xs:duration`
   matches an `xs:duration` key with the same value.
+- XPath: a cast to a built-in type no longer keeps the user-defined
+  `schema_type` of a value whose type code already matches (F&O §17.3: the
+  result has a new type annotation).
+- XPath: an unprefixed constructor function call is expanded with the default
+  function namespace, not the default element/type namespace (`integer('1')`
+  with the XML Schema namespace as default function namespace was `XPST0051`).
+- XPath: casting `NaN`, `INF` or `-INF` to `xs:decimal`, `xs:integer` or a type
+  derived from them raises `FOCA0002` (F&O §17.1.3.3, §17.1.3.4), not
+  `FORG0001`.
+- XPath: casts between `xs:QName` and `xs:NOTATION` (and types derived from
+  them) raise `XPTY0004`, as the casting table of F&O §17.1 requires.
+- XPath: `fn:ceiling`, `fn:floor`, `fn:round` and `fn:round-half-to-even` of a
+  value of a type derived from `xs:integer` return an `xs:integer` (F&O §6.4).
 
 ### Performance
 

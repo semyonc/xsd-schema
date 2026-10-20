@@ -50,7 +50,7 @@ pub fn resolve_qname<N: DomNavigator>(
         None => return Ok(XPathValue::Empty),
         Some(s) if s.is_empty() => {
             return Err(XPathError::FOCA0002 {
-                qname: String::new(),
+                value: String::new(),
             });
         }
         Some(s) => s,
@@ -59,7 +59,7 @@ pub fn resolve_qname<N: DomNavigator>(
     // Parse the lexical QName
     let (prefix, local_name) =
         parse_lexical_qname(&qname_str).map_err(|_| XPathError::FOCA0002 {
-            qname: qname_str.clone(),
+            value: qname_str.clone(),
         })?;
 
     // Lookup namespace for prefix using element's in-scope namespaces
@@ -113,7 +113,7 @@ pub fn qname_constructor<N: DomNavigator>(
 
     // Check constraint: if prefix is present, namespace must be non-empty
     if prefix.is_some() && namespace_uri.is_none() {
-        return Err(XPathError::FOCA0002 { qname: param_qname });
+        return Err(XPathError::FOCA0002 { value: param_qname });
     }
 
     // Create the QName value

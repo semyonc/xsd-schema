@@ -331,7 +331,7 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
             .map_err(|_| XPathError::FOAR0002)?,
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
+                return Err(special_float_value(string_val));
             }
             if *f == 0.0 {
                 Decimal::ZERO
@@ -344,7 +344,7 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
             if d.is_nan() || d.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:decimal"));
+                return Err(special_float_value(string_val));
             }
             if *d == 0.0 {
                 Decimal::ZERO
@@ -365,6 +365,15 @@ fn cast_to_decimal(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         _ => decimal_from_lexical(string_val)?,
     };
     Ok(XmlValue::decimal(result))
+}
+
+/// F&O §17.1.3.3 (casting to `xs:decimal`) and §17.1.3.4 (to `xs:integer`):
+/// "If SV is one of the special xs:float or xs:double values NaN, INF, or
+/// -INF, an error is raised \[err:FOCA0002\]."
+fn special_float_value(lexical: &str) -> XPathError {
+    XPathError::FOCA0002 {
+        value: lexical.to_string(),
+    }
 }
 
 /// The `xs:decimal` a string or `xs:untypedAtomic` value casts to, and the
@@ -420,7 +429,7 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         }
         XmlValueKind::Atomic(XmlAtomicValue::Float(f)) => {
             if f.is_nan() || f.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:integer"));
+                return Err(special_float_value(string_val));
             }
             let truncated = f.trunc() as f64;
             // Use string round-trip to handle values outside i64 range
@@ -431,7 +440,7 @@ fn cast_to_integer(value: &XmlValue, string_val: &str) -> Result<XmlValue, XPath
         }
         XmlValueKind::Atomic(XmlAtomicValue::Double(d)) => {
             if d.is_nan() || d.is_infinite() {
-                return Err(XPathError::invalid_cast_value(string_val, "xs:integer"));
+                return Err(special_float_value(string_val));
             }
             // Use string round-trip to handle values outside i64 range
             let s = format!("{:.0}", d.trunc());

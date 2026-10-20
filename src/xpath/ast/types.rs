@@ -46,6 +46,17 @@ pub struct TypeExprNode {
     /// unbound; after editing `target_type` of a bound node, bind it again
     /// (as for `resolved_atomic_type`), which recomputes it.
     pub(crate) resolved_item_type: Option<crate::types::sequence::ItemType>,
+    /// The target of a `cast as` / `castable as` resolved against the static
+    /// context — a built-in type, or an atomic type of the schema set —
+    /// populated during binding (the binder's cache, like
+    /// `resolved_item_type`); evaluation resolves `resolved_atomic_type` itself
+    /// when it is `None`.
+    pub(crate) resolved_cast_target: Option<crate::xpath::schema_cast::CastTarget>,
+    /// Whether the binder made this node from a constructor function call
+    /// (XPath 2.0 §3.10.4), whose type name is expanded with the default
+    /// *function* namespace rather than the default element/type namespace —
+    /// so that binding the node again resolves the same type.
+    pub(crate) from_constructor: bool,
 }
 
 impl TypeExprNode {
@@ -62,6 +73,8 @@ impl TypeExprNode {
             span,
             resolved_atomic_type: None,
             resolved_item_type: None,
+            resolved_cast_target: None,
+            from_constructor: false,
         }
     }
 }

@@ -31,7 +31,7 @@ use crate::xpath::axis_iterators::{
     FollowingSiblingAxis, NamespaceAxis, ParentAxis, PrecedingNodeIterator, PrecedingSiblingAxis,
     SelfAxis, SequentialAxisNodeIterator,
 };
-use crate::xpath::cast::{cast_to, castable, occurrence_allows_count, resolved_type_to_type_code};
+use crate::xpath::cast::occurrence_allows_count;
 use crate::xpath::context::{DynamicContext, XPathContext};
 use crate::xpath::error::XPathError;
 use crate::xpath::functions::{
@@ -45,12 +45,12 @@ use crate::xpath::node_ops::{following_node, get_root, preceding_node, same_node
 use crate::xpath::node_test::{
     matches_item_type_node, name_test_for_principal_kind, principal_node_kind, NodeTest,
 };
-use crate::xpath::operators::cast_to_qname_with_context;
 use crate::xpath::operators::{
     eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter_collated,
     general_ge_iter_collated, general_gt_iter_collated, general_le_iter_collated,
     general_lt_iter_collated, general_ne_iter_collated,
 };
+use crate::xpath::schema_cast::{cast_value, resolve_cast_target, CastTarget};
 use crate::xpath::sequence_ops::{except_nodes, intersect_nodes, union_nodes};
 use crate::xpath::DomNodeType;
 use crate::xpath::{DomNavigator, XPathMode};
@@ -802,22 +802,29 @@ fn eval_cast_as<N: DomNavigator>(
             }
         }
         Some(value) => {
-            // Get target type code from resolved QName
-            let qname = type_expr
-                .resolved_atomic_type
-                .as_ref()
-                .ok_or_else(|| XPathError::Internal("Cast target type not resolved".to_string()))?;
-            let target_type = resolved_type_to_type_code(qname, ctx.static_context.names)?;
-
-            // QName/NOTATION require namespace resolution from static context
-            let result = if matches!(target_type, XmlTypeCode::QName | XmlTypeCode::Notation) {
-                cast_to_qname_with_context(ctx.static_context, &value, target_type)?
-            } else {
-                cast_to(&value, target_type)?
+            let target = cast_target(type_expr, ctx.static_context)?;
+            let type_name = || match &type_expr.target_type.item_type {
+                Some(ItemTypeNode::Atomic(name)) => name.to_string(),
+                _ => type_expr.target_type.to_string(),
             };
+            let result = cast_value(ctx.static_context, &value, target, &type_name)?;
             Ok(XPathValue::from_atomic(result))
         }
     }
+}
+
+/// The target type of a bound `cast as` / `castable as`: the binder's
+/// resolution, or — for a node bound before it cached one — the resolution of
+/// its expanded name now.
+fn cast_target(type_expr: &TypeExprNode, ctx: &XPathContext<'_>) -> Result<CastTarget, XPathError> {
+    if let Some(target) = type_expr.resolved_cast_target {
+        return Ok(target);
+    }
+    let qname = type_expr
+        .resolved_atomic_type
+        .as_ref()
+        .ok_or_else(|| XPathError::Internal("Cast target type not resolved".to_string()))?;
+    resolve_cast_target(qname, ctx)
 }
 
 /// Evaluate `expr castable as type`.
@@ -852,22 +859,10 @@ fn eval_castable_as<N: DomNavigator>(
             Ok(XPathValue::boolean(allows_empty))
         }
         Some(value) => {
-            // Get target type code from resolved QName
-            let qname = match type_expr.resolved_atomic_type.as_ref() {
-                Some(q) => q,
-                None => return Ok(XPathValue::boolean(false)),
+            let Ok(target) = cast_target(type_expr, ctx.static_context) else {
+                return Ok(XPathValue::boolean(false));
             };
-            let target_type = match resolved_type_to_type_code(qname, ctx.static_context.names) {
-                Ok(tc) => tc,
-                Err(_) => return Ok(XPathValue::boolean(false)),
-            };
-
-            // QName/NOTATION require namespace resolution from static context
-            let is_castable = if matches!(target_type, XmlTypeCode::QName | XmlTypeCode::Notation) {
-                cast_to_qname_with_context(ctx.static_context, &value, target_type).is_ok()
-            } else {
-                castable(&value, target_type)
-            };
+            let is_castable = cast_value(ctx.static_context, &value, target, &String::new).is_ok();
             Ok(XPathValue::boolean(is_castable))
         }
     }

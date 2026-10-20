@@ -11,6 +11,7 @@
 //!
 //! Binding must complete successfully before evaluation can proceed.
 
+use crate::ids::NameId;
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::XS_NAMESPACE;
 use crate::types::{NameTest as ResolvedNameTest, XmlTypeCode};
@@ -166,12 +167,23 @@ pub fn bind_node(
 
             // Look up the function via the catalog (supports custom functions)
             let arity = func_call.args.len();
-            let handle = ctx
-                .function_catalog()
-                .lookup(&namespace, &func_call.local_name, arity)
-                .ok_or_else(|| {
-                    XPathError::function_not_found(&func_call.local_name, arity, &namespace)
-                })?;
+            let Some(handle) =
+                ctx.function_catalog()
+                    .lookup(&namespace, &func_call.local_name, arity)
+            else {
+                // The constructor function of an atomic type of the schema set
+                // (§3.10.4). A function of the same name and arity in the
+                // catalog — one a host registered — has taken precedence above.
+                if let Some(type_expr) = try_bind_schema_constructor(&func_call, &namespace, ctx) {
+                    *arena.get_mut(id) = AstNode::TypeExpr(type_expr);
+                    return Ok(());
+                }
+                return Err(XPathError::function_not_found(
+                    &func_call.local_name,
+                    arity,
+                    &namespace,
+                ));
+            };
 
             // Store the resolved function handle
             if let AstNode::FunctionCall(ref mut node) = arena.get_mut(id) {
@@ -241,16 +253,27 @@ pub fn bind_node(
             // Resolve atomic type QName if present
             match type_expr.target_type.item_type {
                 Some(ItemTypeNode::Atomic(ref qname)) => {
-                    let resolved = resolve_atomic_type_qname(qname, ctx)?;
+                    let resolved = if type_expr.from_constructor {
+                        resolve_constructor_type_qname(qname, ctx)?
+                    } else {
+                        resolve_atomic_type_qname(qname, ctx)?
+                    };
                     check_atomic_type_name(&resolved, qname, ctx)?;
-                    if matches!(
+                    let cast_target = if matches!(
                         type_expr.kind,
                         TypeExprKind::CastAs | TypeExprKind::CastableAs
                     ) {
                         check_cast_target(&resolved, qname, ctx)?;
-                    }
+                        // A target that does not resolve — a user type in a
+                        // context that keeps them out of casts — is resolved,
+                        // and rejected with XPST0051, when it is evaluated.
+                        crate::xpath::schema_cast::resolve_cast_target(&resolved, ctx).ok()
+                    } else {
+                        None
+                    };
                     if let AstNode::TypeExpr(ref mut node) = arena.get_mut(id) {
                         node.resolved_atomic_type = Some(resolved);
+                        node.resolved_cast_target = cast_target;
                     }
                 }
                 // A kind test used as an ItemType spells the same QNames a step
@@ -732,10 +755,14 @@ fn check_cast_target(
 /// to be used as single-argument function calls for type casting. For example,
 /// `xs:unsignedShort(42)` is equivalent to `42 cast as xs:unsignedShort`.
 ///
-/// Returns `Ok(Some(type_expr))` if this is a valid constructor function,
+/// Returns `Ok(Some(type_expr))` if this is a valid constructor function, or
 /// `Ok(None)` if it's not a constructor (fall through to normal lookup, which
-/// makes `xs:NOTATION(...)` and `xs:anyAtomicType(...)` XPST0017), or `Err`
-/// when the type name cannot be resolved.
+/// makes `xs:NOTATION(...)` and `xs:anyAtomicType(...)` XPST0017).
+///
+/// The type name is the call's expanded name — in the XML Schema namespace,
+/// whether through a prefix or through the default function namespace — not
+/// the expansion a `cast as` gives an unprefixed name (the default
+/// element/type namespace).
 fn try_bind_constructor_function(
     func_call: &FunctionCallNode,
     namespace: &str,
@@ -774,15 +801,75 @@ fn try_bind_constructor_function(
         return Ok(None);
     }
 
-    // Build a CastAs type expression
-    // Per XPath 2.0 spec B.1, constructor functions are xs:TYPE($arg as xs:anyAtomicType?) as xs:TYPE?
-    // so they use ZeroOrOne occurrence (equivalent to "cast as xs:TYPE?")
+    let resolved = QualifiedName::new(
+        Some(crate::namespace::table::well_known::XS_NAMESPACE),
+        ctx.names.add(&func_call.local_name),
+        constructor_prefix(func_call, ctx),
+    );
+    Ok(Some(constructor_type_expr(
+        func_call,
+        resolved,
+        crate::xpath::schema_cast::CastTarget::BuiltIn(type_code),
+    )))
+}
+
+/// Try to bind a function call as the constructor function of an atomic type
+/// of the schema set in the static context.
+///
+/// XPath 2.0 §3.10.4: "For every atomic type in the in-scope schema types
+/// (except xs:NOTATION and xs:anyAtomicType, which are not instantiable), a
+/// constructor function is implicitly defined. In each case, the name of the
+/// constructor function is the same as the name of its target type (including
+/// namespace)." So the call's expanded name — through the function namespace
+/// rules: a prefix, or the default function namespace, which must be none
+/// for a type in no namespace — names the type, and the call takes one
+/// argument. F&O §5.3 adds that types derived from `xs:NOTATION` have
+/// constructors too; `xs:NOTATION` itself is in the `xs` namespace and has
+/// none ([`try_bind_constructor_function`]).
+///
+/// Called after the function catalog found no function of that name and
+/// arity, so a function a host registered under the same name keeps
+/// precedence. `None` when the name is no atomic type of the schema set
+/// (a list, union or complex type has no constructor: XPST0017).
+fn try_bind_schema_constructor(
+    func_call: &FunctionCallNode,
+    namespace: &str,
+    ctx: &XPathContext<'_>,
+) -> Option<TypeExprNode> {
+    if ctx.mode() != XPathMode::XPath20 || func_call.args.len() != 1 || namespace == XS_NAMESPACE {
+        return None;
+    }
+    if !ctx.schema_casts() {
+        return None;
+    }
+    let schema_set = ctx.schema_set?;
+    let namespace_id = (!namespace.is_empty()).then(|| ctx.names.add(namespace));
+    let local_id = ctx.names.add(&func_call.local_name);
+    let target = crate::xpath::schema_cast::schema_atomic_type(schema_set, namespace_id, local_id)?;
+    let resolved = QualifiedName::new(namespace_id, local_id, constructor_prefix(func_call, ctx));
+    Some(constructor_type_expr(func_call, resolved, target))
+}
+
+/// The interned prefix of a constructor function call, if it has one.
+fn constructor_prefix(func_call: &FunctionCallNode, ctx: &XPathContext<'_>) -> Option<NameId> {
+    (!func_call.prefix.is_empty()).then(|| ctx.names.add(&func_call.prefix))
+}
+
+/// The `($arg) cast as T?` a constructor function call `T($arg)` stands for
+/// (§3.10.4: "The semantics of the constructor function call T($arg) are
+/// defined to be equivalent to the expression (($arg) cast as T?)"), with its
+/// target already resolved.
+fn constructor_type_expr(
+    func_call: &FunctionCallNode,
+    resolved: QualifiedName,
+    target: crate::xpath::schema_cast::CastTarget,
+) -> TypeExprNode {
     let qname = QName {
         prefix: func_call.prefix.clone(),
         local: func_call.local_name.clone(),
     };
     let target_type = SequenceTypeNode::single(
-        ItemTypeNode::Atomic(qname.clone()),
+        ItemTypeNode::Atomic(qname),
         OccurrenceIndicator::ZeroOrOne,
         func_call.span,
     );
@@ -792,12 +879,31 @@ fn try_bind_constructor_function(
         target_type,
         func_call.span,
     );
-
-    // Eagerly resolve the atomic type QName
-    let resolved = resolve_atomic_type_qname(&qname, ctx)?;
     type_expr.resolved_atomic_type = Some(resolved);
+    type_expr.resolved_cast_target = Some(target);
+    type_expr.from_constructor = true;
+    type_expr
+}
 
-    Ok(Some(type_expr))
+/// Expand the type name of a node made from a constructor function call when
+/// it is bound again: with the function namespace rules the call's name was
+/// expanded with — a prefix through the statically known namespaces, no
+/// prefix through the default function namespace (none: no namespace) — not
+/// with the default element/type namespace of a `cast as`.
+fn resolve_constructor_type_qname(
+    qname: &QName,
+    ctx: &XPathContext<'_>,
+) -> Result<QualifiedName, XPathError> {
+    if !qname.prefix.is_empty() {
+        return resolve_atomic_type_qname(qname, ctx);
+    }
+    let namespace = ctx.default_function_namespace();
+    let namespace_id = (!namespace.is_empty()).then(|| ctx.names.add(namespace));
+    Ok(QualifiedName::new(
+        namespace_id,
+        ctx.names.add(&qname.local),
+        None,
+    ))
 }
 
 #[cfg(test)]

@@ -453,6 +453,12 @@ impl XPathExpr {
     /// The evaluator uses a builder pattern to set variables and other options
     /// before running the expression.
     ///
+    /// `ctx` should be the static context the expression was compiled with, or
+    /// one with the same name table and schema set: binding resolved the
+    /// expression's names and schema types against those (a cast target or an
+    /// `instance of` type is kept as a key of that schema set), and evaluation
+    /// reads them against the schema set of `ctx`.
+    ///
     /// # Example
     ///
     /// ```no_run

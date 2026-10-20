@@ -948,7 +948,8 @@ fn evaluate_assertion_facets(
         // Build XPath static context
         let ctx = XPathContext::new(&schema_set.name_table)
             .with_namespaces(assertion.ns_snapshot.clone())
-            .with_schema_set(schema_set);
+            .with_schema_set(schema_set)
+            .without_schema_casts();
 
         // Set default element namespace from xpathDefaultNamespace cascade
         let ctx = if let Some(default_ns) = resolve_assertion_default_ns(
