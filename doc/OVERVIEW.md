@@ -226,8 +226,9 @@ Important runtime modules:
 
 `ValidationFlags` controls optional runtime behavior. Identity constraints are
 parsed unconditionally but enforced only when `PROCESS_IDENTITY_CONSTRAINTS` is
-set. XSD 1.1 assertions require an assertion-capable validator constructor such
-as `SchemaValidator::new_fragment_buffer`.
+set. XSD 1.1 assertions are evaluated when `PROCESS_ASSERTIONS` is set —
+`SchemaValidator::new` honours it, and `SchemaValidator::new_fragment_buffer`
+sets it.
 
 ### Streaming Driver — The Mid-Layer Between `quick-xml` And The Runtime
 
@@ -272,9 +273,12 @@ In-tree consumers:
 - `tests/conformance/driver.rs::validate_instance_pass` — layer 2 with a
   small handler that only records root validity. Hint collection and
   `end_validation` ordering stay in the caller.
-- `src/document/typed_builder.rs::build_typed_document` — layer 2 with a
-  handler that drives a `BufferDocumentBuilder`, preserving comments,
-  PIs, source spans, and CTA-deferred attribute bindings.
+- `src/document/typed_builder.rs` — layer 2 with a handler
+  (`TypedBuilderHandler`, public) that drives a `BufferDocumentBuilder`,
+  preserving comments, PIs, source spans, and CTA-deferred attribute
+  bindings, and forwards every event to a caller's handler;
+  `build_typed_document_with` runs it with the caller's validator and sink,
+  `build_typed_document` with defaults.
 - `doc/INTRODUCTION.md` — layer 1 example for the public-facing common
   case.
 

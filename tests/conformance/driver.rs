@@ -1327,9 +1327,9 @@ fn validate_instance_pass(
         flags &= !xsd_schema::validation::ValidationFlags::BUILD_PSVI_TYPED_VALUES;
     }
 
-    // XSD 1.1 `xs:assert` evaluation requires the fragment-buffer validator;
-    // `SchemaValidator::new` silently strips PROCESS_ASSERTIONS and disables
-    // assertion evaluation. XSD 1.0 schemas have no assertions, so the
+    // XSD 1.1 `xs:assert` evaluation requires the fragment-buffer mode, which
+    // `new_fragment_buffer` selects (as does `SchemaValidator::new` with
+    // PROCESS_ASSERTIONS in the flags). XSD 1.0 schemas have no assertions, so the
     // fragment-buffer mode is a no-op for them (has_inherited_assertions
     // returns false everywhere → zero buffering, zero XPath compiles).
     #[cfg(feature = "xsd11")]

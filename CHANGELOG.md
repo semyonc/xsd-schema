@@ -46,6 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of the last member. `XmlValue::to_xpath_value` takes no argument.
 - `SequenceType`'s `Display` prints element, attribute, document and schema
   tests in SequenceType syntax.
+- `SchemaValidator::new` (and `with_substitution_groups`) honour
+  `ValidationFlags::PROCESS_ASSERTIONS`: with the flag set, XSD 1.1 `xs:assert`
+  is evaluated inline while streaming, as with `new_fragment_buffer`. The flag
+  used to be removed silently, so assertions never ran. `new_main_document`
+  still removes it; that mode evaluates no assertion at all (now documented).
+- `ValidationError` and `ValidationWarning` are `#[non_exhaustive]`.
+  `ValidationError::element_path` is a method (`element_path() ->
+  Option<&str>`, the same local-name path as before) instead of a field.
+  `Display` is unchanged. Build warnings with `ValidationWarning::new`.
+- `build_typed_document`: input that ends inside an element is reported as the
+  XML error `BufferDocumentError::Parse(IllFormed(MissingEndTag(..)))` instead
+  of an internal error.
 
 ### Added
 
@@ -74,6 +86,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Display` is the lexical form, and its equality ignores the prefix.
 - `TypeTest`, `ItemType::element`, `ItemType::attribute`, and `Display` for
   `ItemType`, `NameTest`, `TypeTest` and the AST sequence types.
+- Errors and warnings name the item they are about: `subject()`
+  (`ValidationSubject::Element` / `Attribute` with an `ExpandedName`) and
+  `instance_path()` — a namespace-aware, positional path in XPath 3.0 form,
+  `/Q{urn:po}order[1]/Q{}item[3]/@Q{}qty` (`InstancePath`, `PathStep`),
+  including for errors reported later (unresolved IDREFs, nested assertions,
+  deferred keyrefs). Paths share their ancestor steps, so a diagnostic costs
+  the same at any depth; the positions cost no measurable validation time.
+  `with_subject` / `with_instance_path` for errors a host builds itself.
+- `document::build_typed_document_with`: validate and type a document in one
+  pass with your own `SchemaValidator` (e.g. with assertions), your own
+  `ValidationSink` (errors reported, not dropped) and your own
+  `ValidationEventHandler` (also `&mut dyn`) alongside the builder; options in
+  `TypedBuildOptions`. `document::TypedBuilderHandler` (public) composes the
+  builder with a handler for hosts that drive `drive_quick_xml_with`
+  themselves; `TypedBuild`, `TypedBuildError`. `build_typed_document` is built
+  on it.
+- `ValidationEventHandler::skip_attribute` (defaulted to `false`) lets a
+  handler have an attribute that the element's type does not declare recorded
+  but not validated, as if a `processContents="skip"` wildcard matched it (no
+  PSVI, no error, the element's `[validation attempted]` partial); a declared
+  attribute is always validated. Also
+  `ValidationRuntime::skip_attribute[_by_id]`. Honoured by the quick-xml
+  drivers and the typed build; the tree-walking drivers validate every
+  attribute.
 
 ### Changed
 

@@ -161,8 +161,11 @@ pub enum TextKind {
 /// 4. `after_element`
 /// 5. For each non-xmlns attribute, in document order:
 ///    1. `before_attribute`
-///    2. (internal) `runtime.validate_attribute`
-///    3. `after_attribute`
+///    2. `skip_attribute` (not for attributes in the XML Schema instance
+///       namespace)
+///    3. (internal) `runtime.validate_attribute`, or `runtime.skip_attribute`
+///       when the handler asked to skip it
+///    4. `after_attribute`
 /// 6. (internal) `runtime.validate_end_of_attributes`
 /// 7. (internal, xsd11) `runtime.take_deferred_attribute_results`
 /// 8. `after_end_of_attributes`
@@ -198,6 +201,33 @@ pub trait ValidationEventHandler {
         _info: &SchemaInfo,
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Whether the driver should skip validating this attribute, if the
+    /// element's governing type does not declare it. The default is `false`:
+    /// every attribute is validated.
+    ///
+    /// When it returns `true`, the driver calls
+    /// [`ValidationRuntime::skip_attribute`]: an attribute that no attribute
+    /// use of the governing type matches is recorded without being assessed —
+    /// treated as if a `processContents="skip"` attribute wildcard had matched
+    /// it (that method documents what this means for the PSVI, identity
+    /// constraints and ID/IDREF checks) — while a **declared** attribute is
+    /// validated as usual, whatever the handler answered (a wildcard never
+    /// governs an attribute an attribute use matches, Structures §3.4.4.2
+    /// clause 2.1). `after_attribute` receives the resulting [`SchemaInfo`]:
+    /// no type and `[validity]` notKnown for a skipped attribute.
+    ///
+    /// Called after `before_attribute`, for every attribute except
+    /// namespace declarations and attributes in the XML Schema instance
+    /// namespace (`xsi:type` and `xsi:nil` take effect at the element start,
+    /// before any attribute event). The quick-xml drivers
+    /// ([`drive_quick_xml_with`], and the typed build over it) honour it;
+    /// [`drive_quick_xml`] runs no handler, and the tree-walking drivers
+    /// (`drive_navigator`, `drive_buffer_document`) take none — they validate
+    /// every attribute.
+    fn skip_attribute(&mut self, _view: AttributeView<'_>) -> Result<bool, Self::Error> {
+        Ok(false)
     }
 
     fn after_end_of_attributes(
@@ -630,7 +660,13 @@ where
             value: value.as_ref(),
         };
         handler.before_attribute(av).map_err(DriveWithError::Hook)?;
-        let attr_info = runtime.validate_attribute(attr_local, &attr_ns, value.as_ref());
+        let skip =
+            attr_ns != XSI_NAMESPACE && handler.skip_attribute(av).map_err(DriveWithError::Hook)?;
+        let attr_info = if skip {
+            runtime.skip_attribute(attr_local, &attr_ns, value.as_ref())
+        } else {
+            runtime.validate_attribute(attr_local, &attr_ns, value.as_ref())
+        };
         handler
             .after_attribute(av, &attr_info)
             .map_err(DriveWithError::Hook)?;

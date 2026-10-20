@@ -43,7 +43,10 @@ pub use serialize::{SerializeError, SerializeOptions};
 pub use source_spans::NodeSourceSpans;
 pub use strings::StringStore;
 pub use type_remap::{BindingRemapTable, NodeSchemaBinding};
-pub use typed_builder::{build_typed_document, SilentValidationSink};
+pub use typed_builder::{
+    build_typed_document, build_typed_document_with, SilentValidationSink, TypedBuild,
+    TypedBuildError, TypedBuildOptions, TypedBuilderHandler,
+};
 
 /// Whether the document is a complete XML document or a validation fragment.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

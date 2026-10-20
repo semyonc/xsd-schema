@@ -114,6 +114,11 @@ bitflags! {
         /// Strict mode: treat all warnings as errors.
         const STRICT_MODE = 0x0008;
         /// Enable XSD 1.1 assertion processing (fragment buffering).
+        ///
+        /// Honoured by `SchemaValidator::new`, which then evaluates
+        /// assertions inline while streaming, as
+        /// `SchemaValidator::new_fragment_buffer` does (that constructor sets
+        /// the bit itself); `SchemaValidator::new_main_document` removes it.
         #[cfg(feature = "xsd11")]
         const PROCESS_ASSERTIONS = 0x0010;
         /// Retain the typed value (`SchemaInfo::typed_value`) and the schema

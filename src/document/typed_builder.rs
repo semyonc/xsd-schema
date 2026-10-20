@@ -1,8 +1,20 @@
 //! Schema-aware document builder.
 //!
-//! [`build_typed_document`] constructs a [`BufferDocument`] while interleaving
-//! validation calls so that each element and attribute node carries a
-//! [`NodeSchemaBinding`] (type key, declaration keys, content type).
+//! A typed build reads an XML document once, validating it and building a
+//! [`BufferDocument`] in the same pass, so that each element and attribute
+//! node carries a [`NodeSchemaBinding`] (type key, declaration keys, content
+//! type) from the validation:
+//!
+//! * [`build_typed_document_with`] — the composable build: the caller chooses
+//!   the [`SchemaValidator`] (for example with XSD 1.1 assertions), supplies
+//!   the [`ValidationSink`] that receives the diagnostics, and can run its own
+//!   [`ValidationEventHandler`] alongside the builder in the same pass.
+//! * [`TypedBuilderHandler`] — the building block underneath: the event
+//!   handler that mirrors validator events into a [`BufferDocumentBuilder`],
+//!   composed with an inner handler, for callers that drive
+//!   [`drive_quick_xml_with`] themselves.
+//! * [`build_typed_document`] — the turn-key build: default flags, no
+//!   diagnostics ([`SilentValidationSink`]), no handler.
 
 use std::io::BufRead;
 
@@ -13,9 +25,10 @@ use crate::schema::SchemaSet;
 use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, ValidationFlags};
 use crate::validation::quick_xml_driver::{
-    drive_quick_xml_with, AttributeView, DriveWithError, ElementStartView, EndElementInfo,
-    EndOfAttributesView, TextKind, ValidationEventHandler,
+    drive_quick_xml_with, AttributeView, DriveOutcome, DriveWithError, ElementStartView,
+    EndElementInfo, EndOfAttributesView, NoopHandler, TextKind, ValidationEventHandler,
 };
+use crate::validation::runtime::ValidationRuntime;
 use crate::validation::validator::{ValidationSink, ValidationWarning};
 use crate::validation::SchemaValidator;
 
@@ -38,17 +51,90 @@ impl ValidationSink for SilentValidationSink {
     fn on_warning(&mut self, _warning: ValidationWarning) {}
 }
 
+// ── TypedBuildError ───────────────────────────────────────────────────
+
+/// Why a typed build stopped: the document could not be read or built, the
+/// caller's [`ValidationEventHandler`] returned an error, or the runtime was
+/// for another schema set.
+///
+/// Validation diagnostics are not errors of the build: they go to the
+/// runtime's [`ValidationSink`], and the build completes.
+///
+/// `Display` shows the document error, or `handler error: ` and the
+/// handler's error. It is a [`std::error::Error`] when `E` is one; its
+/// `source()` is then the handler's error (for `Document`, the document
+/// error's own source).
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TypedBuildError<E> {
+    /// The XML could not be read, or the document could not be built (a
+    /// parse error — input that ends inside an element is quick-xml's
+    /// missing-end-tag error —, an unbound prefix, a duplicate `xml:id`, a
+    /// node-count limit).
+    Document(BufferDocumentError),
+    /// The caller's handler returned this error; the build stopped there.
+    Handler(E),
+    /// The runtime does not validate against the schema set the document is
+    /// built for (`build_typed_document_with`'s `schema_set`): its bindings
+    /// would point into another set's components. Nothing was read.
+    SchemaSetMismatch,
+}
+
+impl<E> From<BufferDocumentError> for TypedBuildError<E> {
+    fn from(e: BufferDocumentError) -> Self {
+        TypedBuildError::Document(e)
+    }
+}
+
+impl<E: std::fmt::Display> std::fmt::Display for TypedBuildError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TypedBuildError::Document(e) => write!(f, "{e}"),
+            TypedBuildError::Handler(e) => write!(f, "handler error: {e}"),
+            TypedBuildError::SchemaSetMismatch => {
+                f.write_str("the validation runtime is for another schema set than the document's")
+            }
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            TypedBuildError::Document(e) => e.source(),
+            TypedBuildError::Handler(e) => Some(e),
+            TypedBuildError::SchemaSetMismatch => None,
+        }
+    }
+}
+
 // ── Handler ───────────────────────────────────────────────────────────
 
-/// Handler that mirrors validator events into a [`BufferDocumentBuilder`].
+/// The typed-document builder as a [`ValidationEventHandler`]: it mirrors
+/// the validator events of one pass into a [`BufferDocumentBuilder`], and
+/// forwards every event to an inner handler `H` (by default the no-op
+/// [`NoopHandler`]).
 ///
-/// Holds the per-element bookkeeping the design doc separates out: the
-/// element-ref stack (so text/end events can correlate to the open element),
-/// the single-slot scratch for the current attribute being processed, the
-/// per-element queue of CTA-deferred attribute refs, and the source-span
-/// tracking pieces.
-struct TypedBuilderHandler<'b, 'a> {
+/// Every hook first does the builder's work, then calls the same hook of the
+/// inner handler with the same arguments — so the inner handler sees each
+/// element's [`SchemaInfo`] after the node has its binding, and an error it
+/// returns stops the pass as [`TypedBuildError::Handler`]. Builder failures
+/// come back as [`TypedBuildError::Document`].
+///
+/// Drive it with [`drive_quick_xml_with`] over a runtime from the caller's
+/// [`SchemaValidator`], then [`finalize`](BufferDocumentBuilder::finalize)
+/// the builder — or let [`build_typed_document_with`] do both. The builder
+/// must have been created for the same [`SchemaSet`] as the validator
+/// (`BufferDocumentBuilder::new(arena, &set.name_table, Some(&set), options)`).
+///
+/// Internally it keeps the per-element bookkeeping of the build: the
+/// element-ref stack (so text/end events correlate to the open element), the
+/// slot for the attribute being processed, the per-element queue of
+/// attributes whose binding waits for type-alternative selection, and the
+/// source-span tracking.
+pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     builder: &'b mut BufferDocumentBuilder<'a>,
+    inner: H,
     track: bool,
     pending_start_offset: Option<usize>,
     /// Currently open elements' refs. Pushed at `before_element`, popped at
@@ -62,41 +148,65 @@ struct TypedBuilderHandler<'b, 'a> {
     current_attr_ref: Option<u32>,
     /// Per-element queue of attribute refs whose binding is deferred until
     /// CTA reselection. Drained in `after_end_of_attributes`.
-    #[cfg(feature = "xsd11")]
     deferred_attr_refs: Vec<u32>,
     /// Element-decl key for the currently open element (used so we can
     /// preserve `element_decl` when refreshing the binding after CTA).
     element_decl_stack: Vec<Option<crate::ids::ElementKey>>,
 }
 
-impl<'b, 'a> TypedBuilderHandler<'b, 'a> {
-    fn new(builder: &'b mut BufferDocumentBuilder<'a>) -> Self {
+impl<'b, 'a> TypedBuilderHandler<'b, 'a, NoopHandler> {
+    /// A handler that builds into `builder` and forwards nothing.
+    pub fn new(builder: &'b mut BufferDocumentBuilder<'a>) -> Self {
+        Self::with_handler(builder, NoopHandler)
+    }
+}
+
+impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
+    /// A handler that builds into `builder` and forwards every event to
+    /// `inner`, in the same pass.
+    pub fn with_handler(builder: &'b mut BufferDocumentBuilder<'a>, inner: H) -> Self {
         let track = builder.track_source_locations();
         Self {
             builder,
+            inner,
             track,
             pending_start_offset: None,
             elem_ref_stack: Vec::new(),
             pending_spans: Vec::new(),
             current_attr_ref: None,
-            #[cfg(feature = "xsd11")]
             deferred_attr_refs: Vec::new(),
             element_decl_stack: Vec::new(),
         }
     }
-}
 
-impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
-    type Error = BufferDocumentError;
+    /// The inner handler.
+    pub fn handler(&self) -> &H {
+        &self.inner
+    }
 
-    fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+    /// The inner handler, mutably.
+    pub fn handler_mut(&mut self) -> &mut H {
+        &mut self.inner
+    }
+
+    /// Give the inner handler back (the builder stays borrowed until the
+    /// handler is dropped; finalize it afterwards).
+    pub fn into_handler(self) -> H {
+        self.inner
+    }
+
+    // The builder's part of each event.
+
+    fn build_element_start_offset(&mut self, byte_pos: usize) {
         if self.track {
             self.pending_start_offset = Some(byte_pos);
         }
-        Ok(())
     }
 
-    fn before_element(&mut self, view: ElementStartView<'_>) -> Result<(), Self::Error> {
+    fn build_before_element(
+        &mut self,
+        view: ElementStartView<'_>,
+    ) -> Result<(), BufferDocumentError> {
         let elem_ref = self.builder.start_element(
             view.local_name,
             view.namespace_uri,
@@ -112,11 +222,7 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         Ok(())
     }
 
-    fn after_element(
-        &mut self,
-        _view: ElementStartView<'_>,
-        info: &SchemaInfo,
-    ) -> Result<(), Self::Error> {
+    fn build_after_element(&mut self, info: &SchemaInfo) -> Result<(), BufferDocumentError> {
         let elem_ref = *self
             .elem_ref_stack
             .last()
@@ -137,7 +243,10 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         Ok(())
     }
 
-    fn before_attribute(&mut self, view: AttributeView<'_>) -> Result<(), Self::Error> {
+    fn build_before_attribute(
+        &mut self,
+        view: AttributeView<'_>,
+    ) -> Result<(), BufferDocumentError> {
         let attr_ref =
             self.builder
                 .attribute(view.local_name, view.namespace_uri, view.prefix, view.value)?;
@@ -150,11 +259,7 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         Ok(())
     }
 
-    fn after_attribute(
-        &mut self,
-        _view: AttributeView<'_>,
-        info: &SchemaInfo,
-    ) -> Result<(), Self::Error> {
+    fn build_after_attribute(&mut self, info: &SchemaInfo) -> Result<(), BufferDocumentError> {
         let attr_ref = self
             .current_attr_ref
             .take()
@@ -162,7 +267,6 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         // An attribute of an element with type alternatives is bound once, in
         // `after_end_of_attributes`, with the type the selected alternative
         // gives it: whatever this event carries is not final.
-        #[cfg(feature = "xsd11")]
         if info.deferred_by_cta {
             self.deferred_attr_refs.push(attr_ref);
             return Ok(());
@@ -182,10 +286,10 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
         Ok(())
     }
 
-    fn after_end_of_attributes(
+    fn build_after_end_of_attributes(
         &mut self,
-        view: EndOfAttributesView<'_>,
-    ) -> Result<(), Self::Error> {
+        view: &EndOfAttributesView<'_>,
+    ) -> Result<(), BufferDocumentError> {
         self.builder.end_of_attributes();
         let elem_ref = *self
             .elem_ref_stack
@@ -206,72 +310,374 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
             self.builder.set_node_binding(elem_ref, binding)?;
         }
 
-        #[cfg(feature = "xsd11")]
+        let deferred_refs = std::mem::take(&mut self.deferred_attr_refs);
+        if deferred_refs.len() != view.deferred_attribute_results.len() {
+            return Err(BufferDocumentError::InternalError(
+                "deferred attribute count mismatch".into(),
+            ));
+        }
+        // The final bindings of the attributes `after_attribute` deferred —
+        // and, through `set_node_binding`, their entries in the id index.
+        for (attr_ref, attr_info) in deferred_refs
+            .iter()
+            .zip(view.deferred_attribute_results.iter())
         {
-            let deferred_refs = std::mem::take(&mut self.deferred_attr_refs);
-            if deferred_refs.len() != view.deferred_attribute_results.len() {
-                return Err(BufferDocumentError::InternalError(
-                    "deferred attribute count mismatch".into(),
-                ));
-            }
-            // The final bindings of the attributes `after_attribute` deferred —
-            // and, through `set_node_binding`, their entries in the id index.
-            for (attr_ref, attr_info) in deferred_refs
-                .iter()
-                .zip(view.deferred_attribute_results.iter())
-            {
-                if let Some(tk) = attr_info.schema_type {
-                    let binding = NodeSchemaBinding {
-                        type_key: tk,
-                        element_decl: None,
-                        attribute_decl: attr_info.attribute_decl,
-                        content_type: None,
-                    };
-                    self.builder.set_node_binding(*attr_ref, binding)?;
-                }
+            if let Some(tk) = attr_info.schema_type {
+                let binding = NodeSchemaBinding {
+                    type_key: tk,
+                    element_decl: None,
+                    attribute_decl: attr_info.attribute_decl,
+                    content_type: None,
+                };
+                self.builder.set_node_binding(*attr_ref, binding)?;
             }
         }
-
         Ok(())
     }
 
-    fn after_end_element(
-        &mut self,
-        _info: &EndElementInfo,
-        _depth: usize,
-    ) -> Result<(), Self::Error> {
+    fn build_after_end_element(&mut self) -> Result<(), BufferDocumentError> {
         self.builder.end_element()?;
         self.elem_ref_stack.pop();
         self.element_decl_stack.pop();
         Ok(())
     }
 
-    fn on_element_end_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+    fn build_element_end_offset(&mut self, byte_pos: usize) {
         if self.track {
             if let Some((elem_ref, start)) = self.pending_spans.pop() {
                 self.builder
                     .set_source_span(elem_ref, SourceSpan::new(start, byte_pos));
             }
         }
-        Ok(())
     }
 
-    fn on_text(&mut self, _kind: TextKind, text: &str) -> Result<(), Self::Error> {
+    fn build_text(&mut self, text: &str) {
         if !self.elem_ref_stack.is_empty() {
             self.builder.text(text);
         }
-        Ok(())
+    }
+}
+
+impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'_, '_, H> {
+    type Error = TypedBuildError<H::Error>;
+
+    fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+        self.build_element_start_offset(byte_pos);
+        self.inner
+            .on_element_start_offset(byte_pos)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn before_element(&mut self, view: ElementStartView<'_>) -> Result<(), Self::Error> {
+        self.build_before_element(view)?;
+        self.inner
+            .before_element(view)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn after_element(
+        &mut self,
+        view: ElementStartView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), Self::Error> {
+        self.build_after_element(info)?;
+        self.inner
+            .after_element(view, info)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn before_attribute(&mut self, view: AttributeView<'_>) -> Result<(), Self::Error> {
+        self.build_before_attribute(view)?;
+        self.inner
+            .before_attribute(view)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn after_attribute(
+        &mut self,
+        view: AttributeView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), Self::Error> {
+        self.build_after_attribute(info)?;
+        self.inner
+            .after_attribute(view, info)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    /// The inner handler decides; the attribute is built either way (a
+    /// skipped attribute stays untyped).
+    fn skip_attribute(&mut self, view: AttributeView<'_>) -> Result<bool, Self::Error> {
+        self.inner
+            .skip_attribute(view)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn after_end_of_attributes(
+        &mut self,
+        view: EndOfAttributesView<'_>,
+    ) -> Result<(), Self::Error> {
+        self.build_after_end_of_attributes(&view)?;
+        self.inner
+            .after_end_of_attributes(view)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn after_end_element(
+        &mut self,
+        info: &EndElementInfo,
+        depth: usize,
+    ) -> Result<(), Self::Error> {
+        self.build_after_end_element()?;
+        self.inner
+            .after_end_element(info, depth)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn on_element_end_offset(&mut self, byte_pos: usize) -> Result<(), Self::Error> {
+        self.build_element_end_offset(byte_pos);
+        self.inner
+            .on_element_end_offset(byte_pos)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    fn on_text(&mut self, kind: TextKind, text: &str) -> Result<(), Self::Error> {
+        self.build_text(text);
+        self.inner
+            .on_text(kind, text)
+            .map_err(TypedBuildError::Handler)
     }
 
     fn on_comment(&mut self, text: &str) -> Result<(), Self::Error> {
         self.builder.comment(text)?;
-        Ok(())
+        self.inner
+            .on_comment(text)
+            .map_err(TypedBuildError::Handler)
     }
 
     fn on_processing_instruction(&mut self, target: &str, data: &str) -> Result<(), Self::Error> {
         self.builder.processing_instruction(target, data)?;
-        Ok(())
+        self.inner
+            .on_processing_instruction(target, data)
+            .map_err(TypedBuildError::Handler)
     }
+}
+
+/// Lends a caller's handler to a [`TypedBuilderHandler`] for one pass.
+struct LentHandler<'h, H: ?Sized>(&'h mut H);
+
+impl<H: ValidationEventHandler + ?Sized> ValidationEventHandler for LentHandler<'_, H> {
+    type Error = H::Error;
+
+    fn before_element(&mut self, view: ElementStartView<'_>) -> Result<(), H::Error> {
+        self.0.before_element(view)
+    }
+    fn after_element(
+        &mut self,
+        view: ElementStartView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), H::Error> {
+        self.0.after_element(view, info)
+    }
+    fn before_attribute(&mut self, view: AttributeView<'_>) -> Result<(), H::Error> {
+        self.0.before_attribute(view)
+    }
+    fn after_attribute(
+        &mut self,
+        view: AttributeView<'_>,
+        info: &SchemaInfo,
+    ) -> Result<(), H::Error> {
+        self.0.after_attribute(view, info)
+    }
+    fn skip_attribute(&mut self, view: AttributeView<'_>) -> Result<bool, H::Error> {
+        self.0.skip_attribute(view)
+    }
+    fn after_end_of_attributes(&mut self, view: EndOfAttributesView<'_>) -> Result<(), H::Error> {
+        self.0.after_end_of_attributes(view)
+    }
+    fn after_end_element(&mut self, info: &EndElementInfo, depth: usize) -> Result<(), H::Error> {
+        self.0.after_end_element(info, depth)
+    }
+    fn on_text(&mut self, kind: TextKind, text: &str) -> Result<(), H::Error> {
+        self.0.on_text(kind, text)
+    }
+    fn on_comment(&mut self, text: &str) -> Result<(), H::Error> {
+        self.0.on_comment(text)
+    }
+    fn on_processing_instruction(&mut self, target: &str, data: &str) -> Result<(), H::Error> {
+        self.0.on_processing_instruction(target, data)
+    }
+    fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), H::Error> {
+        self.0.on_element_start_offset(byte_pos)
+    }
+    fn on_element_end_offset(&mut self, byte_pos: usize) -> Result<(), H::Error> {
+        self.0.on_element_end_offset(byte_pos)
+    }
+}
+
+// ── build_typed_document_with ─────────────────────────────────────────
+
+/// Options of a [`build_typed_document_with`] pass.
+///
+/// `#[non_exhaustive]`, so options can be added later: start from
+/// [`TypedBuildOptions::default`] and set what you need.
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct TypedBuildOptions {
+    /// Options of the document built (its kind, source-span tracking).
+    pub document: BufferDocumentOptions,
+}
+
+impl TypedBuildOptions {
+    /// These options with `document` as the document options.
+    pub fn with_document_options(mut self, document: BufferDocumentOptions) -> Self {
+        self.document = document;
+        self
+    }
+}
+
+/// What a [`build_typed_document_with`] pass produced.
+#[non_exhaustive]
+pub struct TypedBuild<'a> {
+    /// The document, with a [`NodeSchemaBinding`] on every element and
+    /// attribute the validation typed.
+    pub document: BufferDocument<'a>,
+    /// The drive outcome: the root element's `[validity]` and the depth.
+    pub outcome: DriveOutcome,
+}
+
+/// Validate a document and build it, typed, in one pass over `reader`, with
+/// the caller's validator, sink and event handler.
+///
+/// * `runtime` comes from the caller's [`SchemaValidator`] for `schema_set`
+///   (`validator.start_run(sink)`): the validator decides the flags — for
+///   example `ValidationFlags::PROCESS_ASSERTIONS` to evaluate XSD 1.1
+///   assertions — and the sink receives every error and warning, each with
+///   its subject and positional path.
+/// * `handler` sees every event of the pass, after the builder has handled
+///   it (see [`TypedBuilderHandler`]); pass [`NoopHandler`] for none. An
+///   error it returns stops the build as [`TypedBuildError::Handler`].
+/// * `schema_set` must be the set the runtime's validator was made for
+///   ([`TypedBuildError::SchemaSetMismatch`] otherwise); the document borrows
+///   it (and `arena`) for `'a`.
+/// * `handler` may be a trait object (`&mut dyn ValidationEventHandler<Error
+///   = E>`).
+/// * `options` carry the document options ([`TypedBuildOptions`]).
+///
+/// Like [`drive_quick_xml_with`], this does **not** call
+/// [`ValidationRuntime::end_validation`]: call it afterwards — it reports
+/// the checks that need the whole document (an IDREF without its ID,
+/// `cvc-id.1`) to the sink, and returns an operational failure, if any. The
+/// runtime also still answers
+/// [`schema_location_hints`](ValidationRuntime::schema_location_hints) and
+/// the identity-constraint tables.
+///
+/// Validation diagnostics never stop the build: an invalid document is
+/// built and typed as far as the validation typed it.
+///
+/// # Example
+///
+/// Validate and type a document in one pass, and get the errors:
+///
+/// ```
+/// use bumpalo::Bump;
+/// use xsd_schema::document::{build_typed_document_with, TypedBuildOptions};
+/// use xsd_schema::navigator::{DomNavigator, TypedValue};
+/// use xsd_schema::validation::{
+///     CollectingValidationSink, NoopHandler, SchemaValidator, SchemaValidity, ValidationFlags,
+/// };
+/// use xsd_schema::SchemaSetBuilder;
+///
+/// let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+///   <xs:element name="order">
+///     <xs:complexType><xs:sequence>
+///       <xs:element name="qty" type="xs:positiveInteger" maxOccurs="unbounded"/>
+///     </xs:sequence></xs:complexType>
+///   </xs:element>
+/// </xs:schema>"#;
+/// let schema_set = SchemaSetBuilder::new()
+///     .add_source(xsd, "file:///order.xsd")?
+///     .compile()?
+///     .into_schema_set();
+/// let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+///
+/// let arena = Bump::new();
+/// let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+/// let mut runtime = validator.start_run(CollectingValidationSink {
+///     errors: &mut errors,
+///     warnings: &mut warnings,
+/// });
+/// let built = build_typed_document_with(
+///     "<order><qty>2</qty><qty>0</qty></order>".as_bytes(),
+///     &arena,
+///     &schema_set,
+///     &mut runtime,
+///     &mut NoopHandler,
+///     TypedBuildOptions::default(),
+/// )?;
+/// runtime.end_validation()?; // the end-of-document checks report here
+/// drop(runtime); // releases the sink's borrow of `errors`
+///
+/// // The errors, each with the item it is about…
+/// assert_eq!(built.outcome.root_validity, Some(SchemaValidity::Invalid));
+/// assert_eq!(errors.len(), 1);
+/// assert_eq!(
+///     errors[0].instance_path().unwrap().to_string(),
+///     "/Q{}order[1]/Q{}qty[2]"
+/// );
+///
+/// // …and the typed document, from the same pass.
+/// let mut nav = built.document.create_navigator();
+/// assert!(nav.move_to_first_child() && nav.move_to_first_child()); // order/qty[1]
+/// assert!(matches!(nav.typed_value(), TypedValue::Value(_)));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub fn build_typed_document_with<'a, R, S, H>(
+    reader: R,
+    arena: &'a Bump,
+    schema_set: &'a SchemaSet,
+    runtime: &mut ValidationRuntime<'_, S>,
+    handler: &mut H,
+    options: TypedBuildOptions,
+) -> Result<TypedBuild<'a>, TypedBuildError<H::Error>>
+where
+    R: BufRead,
+    S: ValidationSink,
+    H: ValidationEventHandler + ?Sized,
+{
+    if !std::ptr::eq(runtime.schema_set, schema_set) {
+        return Err(TypedBuildError::SchemaSetMismatch);
+    }
+    let mut builder = BufferDocumentBuilder::new(
+        arena,
+        &schema_set.name_table,
+        Some(schema_set),
+        options.document,
+    )?;
+    let driven = {
+        let mut typed = TypedBuilderHandler::with_handler(&mut builder, LentHandler(handler));
+        drive_quick_xml_with(reader, runtime, schema_set, &mut typed)
+    };
+    let outcome = driven.map_err(|e| match e {
+        DriveWithError::Parse(e) => TypedBuildError::Document(BufferDocumentError::Parse(e)),
+        DriveWithError::Utf8(e) => TypedBuildError::Document(BufferDocumentError::Utf8(e)),
+        DriveWithError::UnboundPrefix(p) => {
+            TypedBuildError::Document(BufferDocumentError::UnboundPrefix(p))
+        }
+        // The XML error quick-xml itself gives for an element whose end tag
+        // never comes (it reports a plain end of input to an event loop).
+        DriveWithError::UnexpectedEof { .. } => {
+            TypedBuildError::Document(BufferDocumentError::Parse(quick_xml::Error::IllFormed(
+                quick_xml::errors::IllFormedError::MissingEndTag(
+                    runtime.innermost_open_element_name().unwrap_or_default(),
+                ),
+            )))
+        }
+        DriveWithError::Hook(e) => e,
+    })?;
+    Ok(TypedBuild {
+        document: builder.finalize()?,
+        outcome,
+    })
 }
 
 // ── build_typed_document ──────────────────────────────────────────────
@@ -282,38 +688,36 @@ impl<'b, 'a> ValidationEventHandler for TypedBuilderHandler<'b, 'a> {
 /// [`SchemaValidator`] calls so that the resulting document carries
 /// [`NodeSchemaBinding`] entries for typed-value and schema-type queries.
 ///
-/// Validation errors are silently discarded via [`SilentValidationSink`].
-/// If you need to collect validation errors, use the lower-level push API
-/// with a custom sink instead.
+/// The validator is `SchemaValidator::new(schema_set, ValidationFlags::default())`
+/// — XSD 1.1 assertions are not evaluated — and validation errors are
+/// silently discarded via [`SilentValidationSink`]. To choose the validator,
+/// receive the errors or run a handler of your own in the same pass, use
+/// [`build_typed_document_with`], on which this function is built.
 pub fn build_typed_document<'a, R: BufRead>(
     reader: R,
     arena: &'a Bump,
     schema_set: &'a SchemaSet,
     options: BufferDocumentOptions,
 ) -> Result<BufferDocument<'a>, BufferDocumentError> {
-    let mut builder =
-        BufferDocumentBuilder::new(arena, &schema_set.name_table, Some(schema_set), options)?;
-
     let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
     let mut runtime = validator.start_run(SilentValidationSink);
-
-    {
-        let mut handler = TypedBuilderHandler::new(&mut builder);
-        drive_quick_xml_with(reader, &mut runtime, schema_set, &mut handler).map_err(
-            |e| match e {
-                DriveWithError::Parse(e) => BufferDocumentError::Parse(e),
-                DriveWithError::Utf8(e) => BufferDocumentError::Utf8(e),
-                DriveWithError::UnboundPrefix(p) => BufferDocumentError::UnboundPrefix(p),
-                DriveWithError::UnexpectedEof { depth } => BufferDocumentError::InternalError(
-                    format!("unexpected EOF: {} element(s) still open", depth),
-                ),
-                DriveWithError::Hook(e) => e,
-            },
-        )?;
-    }
-
+    let built = build_typed_document_with(
+        reader,
+        arena,
+        schema_set,
+        &mut runtime,
+        &mut NoopHandler,
+        TypedBuildOptions::default().with_document_options(options),
+    )
+    .map_err(|e| match e {
+        TypedBuildError::Document(e) => e,
+        TypedBuildError::Handler(never) => match never {},
+        TypedBuildError::SchemaSetMismatch => {
+            unreachable!("the runtime is made from `schema_set` above")
+        }
+    })?;
     let _ = runtime.end_validation();
-    builder.finalize()
+    Ok(built.document)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

@@ -25,7 +25,8 @@ pub mod validator;
 
 pub use errors::{
     error, error_with_path, facet_constraint_code, from_facet_error, from_value_error,
-    value_error_constraint_code, ValidationError, ValidationResult,
+    value_error_constraint_code, ExpandedName, InstancePath, PathStep, ValidationError,
+    ValidationResult, ValidationSubject,
 };
 
 #[cfg(feature = "xsd11")]

@@ -179,7 +179,7 @@ with `-`, and test with `.contains(...)`.
 | `PROCESS_IDENTITY_CONSTRAINTS` | off | Evaluate `xs:key`, `xs:unique`, and `xs:keyref` during instance validation. Declarations are always *parsed*; this bit controls whether their constraints are *enforced*. Leave off when you only need type-level validation — saves the per-element key/keyref bookkeeping. |
 | `ALLOW_XML_ATTRIBUTES` | off | Accept every attribute in the reserved `http://www.w3.org/XML/1998/namespace` namespace (`xml:lang`, `xml:space`, `xml:base`, `xml:id`) **without** checking the element's complex type for an allowing declaration or wildcard. This is a lenient-parser convenience and is **not** XSD-conformant: the spec requires every attribute (including those in the xml namespace) to be matched by a declared `{attribute use}` or an `{attribute wildcard}` whose namespace constraint admits the xml namespace. Set this bit when you want `xml:lang` to "just work" against schemas that don't explicitly import the xml namespace; leave it clear for strict conformance (e.g. when running the W3C XSD test suite). `xml:base` base-URI tracking for `xsi:schemaLocation` hint resolution happens **regardless** of this flag — the flag only affects whether the attribute itself participates in type-level attribute validation. |
 | `STRICT_MODE` | off | Promote warnings to errors. Combine with `REPORT_WARNINGS`. |
-| `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. **Must** be paired with a fragment-buffering validator constructed via `SchemaValidator::new_fragment_buffer(...)` — that constructor sets the bit for you. Passing `PROCESS_ASSERTIONS` to plain `SchemaValidator::new(...)` does **not** error; the flag is silently stripped (the constructor ensures the flag and `AssertionSource::Disabled` agree), so assertions will not run. If you build XSD 1.1 instance validation by hand and forget to use `new_fragment_buffer`, every `xs:assert` is skipped — negative instances will appear valid. |
+| `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. `SchemaValidator::new(...)` honours the bit: with it set, assertions are evaluated inline while streaming (the subtree of each asserted element is buffered) — the mode `SchemaValidator::new_fragment_buffer(...)` selects, which sets the bit for you. Without the bit, `xs:assert` is not evaluated and an asserted element reports `AssertionOutcome::NotEvaluated`. (The `assertion` facet of simple types is part of simple-type validation and runs either way.) |
 
 The default — `ValidationFlags::default()` — enables `REPORT_WARNINGS` and
 `BUILD_PSVI_TYPED_VALUES`. This matches the strict-conformance posture:
@@ -207,31 +207,31 @@ let lean = ValidationFlags::default()
     & !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
 ```
 
-For XSD 1.1 assertion-backed types, use the fragment-buffering validator
-constructor. `new_fragment_buffer` sets `PROCESS_ASSERTIONS` for you:
+For XSD 1.1 assertion-backed types, request assertion processing — either
+with the flag on `SchemaValidator::new`, or with the fragment-buffering
+constructor, which sets the flag for you:
 
 ```rust
 use xsd_schema::validation::{SchemaValidator, ValidationFlags};
 
 let flags = ValidationFlags::default()
     | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
-// new_fragment_buffer adds PROCESS_ASSERTIONS internally; pass-through
-// works equally well, but the plain `SchemaValidator::new(...)`
-// constructor silently strips it — assertions would then never run.
+// Both evaluate xs:assert inline while streaming:
+let validator = SchemaValidator::new(&schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS);
 let validator = SchemaValidator::new_fragment_buffer(&schema_set, flags);
 ```
 
-The trap to know about: `SchemaValidator::new(&schema_set, flags)` removes
-`PROCESS_ASSERTIONS` without erroring. A schema with `<xs:assert>` will then
-load and validate every instance as if the assertion did not exist —
-negative instances appear valid. Always pick a constructor explicitly when
-you ship XSD 1.1 validation:
+Without `PROCESS_ASSERTIONS`, `SchemaValidator::new(&schema_set, flags)` does
+not evaluate `<xs:assert>`: a schema with assertions then validates every
+instance as if the assertion did not exist, and the asserted element's
+`SchemaInfo::assertion_outcome` says `NotEvaluated`. Pick the flags
+explicitly when you ship XSD 1.1 validation:
 
 | Goal | Constructor |
 | --- | --- |
 | XSD 1.0, or XSD 1.1 without `xs:assert` | `SchemaValidator::new(...)` |
-| XSD 1.1 with `xs:assert` evaluation, streaming | `SchemaValidator::new_fragment_buffer(...)` |
-| XSD 1.1 with `xs:assert` against an external `BufferDocument` | `SchemaValidator::new_main_document(...)` |
+| XSD 1.1 with `xs:assert` evaluation, streaming | `SchemaValidator::new(...)` with `PROCESS_ASSERTIONS`, or `SchemaValidator::new_fragment_buffer(...)` |
+| — | `SchemaValidator::new_main_document(...)` selects the `MainDocument` assertion mode, in which **no assertion is evaluated** (an instance that violates an `xs:assert` validates; the asserted element reports `AssertionOutcome::NotEvaluated`). Do not use it to check assertions. |
 
 ### Driving validation from a `quick-xml` stream
 
@@ -295,6 +295,7 @@ hooks are:
 | `before_element(view)` | After the new element's xmlns scope is pushed and the namespace-context snapshot is built, but **before** `runtime.validate_element` is called. |
 | `after_element(view, info)` | After `validate_element` returns. `info.schema_type`, `info.is_nil`, `info.element_decl`, and `info.content_type` are stable here. |
 | `before_attribute(view)` / `after_attribute(view, info)` | Per-attribute, in document order. |
+| `skip_attribute(view) -> bool` | Between the two, for every attribute outside the `xsi` namespace: return `true` to have the attribute recorded but not validated **if the element's type does not declare it** (as if a `processContents="skip"` wildcard matched it — see `ValidationRuntime::skip_attribute`); a declared attribute is validated regardless. Default `false`. |
 | `after_end_of_attributes(view)` | After `validate_end_of_attributes`. `view.info` is the EOA `SchemaInfo` (CTA-selected type lives here); under `xsd11`, `view.deferred_attribute_results` carries any CTA-revalidated per-attribute results, in original encounter order. |
 | `after_end_element(end_info, depth)` | After `validate_end_element`, with the depth of the element that just closed (1 = root close). |
 | `on_text(kind, text)` / `on_comment(text)` / `on_processing_instruction(target, data)` | Body events. `kind` distinguishes whitespace text, character text, and CDATA. |
@@ -357,8 +358,11 @@ Useful runtime helpers for editor or tooling scenarios:
 - `get_default_attributes()` for schema-supplied defaults
 - `set_location()` if you want validation errors tied to stream positions
 
-If you need a full namespace-aware `quick-xml` integration that also builds a
-typed in-memory document, `src/document/typed_builder.rs` is a good reference.
+To validate a document and build a typed in-memory copy of it in the same
+pass, use `document::build_typed_document_with` (your validator, your sink,
+your handler alongside the builder) or compose `document::TypedBuilderHandler`
+with your own handler and drive it yourself; `src/document/typed_builder.rs`
+is also a good reference for a namespace-aware `quick-xml` integration.
 
 ### XSI attributes
 

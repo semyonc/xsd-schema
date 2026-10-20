@@ -2490,24 +2490,62 @@ mod assertion_runtime_tests {
     }
 
     #[test]
-    fn test_new_strips_process_assertions_flag() {
-        // SchemaValidator::new() silently strips PROCESS_ASSERTIONS,
-        // preventing the flag/source mismatch that would panic at runtime.
-        let schema_set = load_schema(
+    fn test_new_honours_process_assertions_flag() {
+        // SchemaValidator::new() keeps PROCESS_ASSERTIONS and switches to the
+        // inline (fragment-buffer) assertion mode, so a `false()` assertion
+        // fails instead of being silently skipped.
+        let schema_set = load_schema_xsd11(
             r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
-                <xs:element name="root" type="xs:string"/>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:simpleContent>
+                            <xs:extension base="xs:string">
+                                <xs:assert test="false()"/>
+                            </xs:extension>
+                        </xs:simpleContent>
+                    </xs:complexType>
+                </xs:element>
             </xs:schema>"#,
         );
         let flags = ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS;
         let validator = SchemaValidator::new(&schema_set, flags);
-        assert!(!validator
+        assert!(validator
             .flags
             .contains(ValidationFlags::PROCESS_ASSERTIONS));
-        // Validation proceeds without panic
         let mut v = validator.start_run(TestSink::new());
+        assert_eq!(v.assertion_source, AssertionSource::FragmentBuffer);
         let ns = empty_ns_context();
-        let info = v.validate_element("root", "", None, None, &ns);
-        assert_eq!(info.validity, SchemaValidity::Valid);
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Invalid);
+        assert_eq!(end_info.assertion_outcome, Some(AssertionOutcome::Failed));
+        v.end_validation().ok();
+        assert!(
+            v.sink
+                .errors
+                .iter()
+                .any(|e| e.constraint == "cvc-assertion"),
+            "expected a cvc-assertion error, got: {:?}",
+            v.sink.errors
+        );
+
+        // Without the flag the same assertion is not evaluated.
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        assert_eq!(v.assertion_source, AssertionSource::Disabled);
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_text("hello");
+        let end_info = v.validate_end_element();
+        assert_eq!(end_info.validity, SchemaValidity::Valid);
+        assert_eq!(
+            end_info.assertion_outcome,
+            Some(AssertionOutcome::NotEvaluated)
+        );
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "{:?}", v.sink.errors);
     }
 
     #[test]
@@ -9902,5 +9940,604 @@ fn test_psvi_optout_numeric_diagnostics_match_psvi_on() {
             on, off,
             "diagnostics for <root>{value}</root> ({ty}) must match on/off: on={on:?} off={off:?}"
         );
+    }
+}
+
+// ── B8: the subject and the positional path of diagnostics ───────────────
+
+mod diagnostic_context_tests {
+    use super::*;
+
+    fn path_of(err: &ValidationError) -> Option<String> {
+        err.instance_path().map(ToString::to_string)
+    }
+
+    #[test]
+    fn sibling_counter_counts_per_name_and_resets() {
+        let mut c = SiblingCounter::default();
+        let (a, b) = (NameId(1), NameId(2));
+        assert_eq!(c.next(None, a), 1);
+        assert_eq!(c.next(None, b), 1);
+        assert_eq!(c.next(None, a), 2);
+        assert_eq!(
+            c.next(Some(NameId(9)), a),
+            1,
+            "another namespace, another name"
+        );
+        // Many more names than slots: names collide, and past the threshold
+        // the collided ones are found by hash; every count is kept.
+        for round in 1..=3 {
+            for i in 0..300u32 {
+                assert_eq!(c.next(None, NameId(100 + i)), round, "name {i}");
+            }
+        }
+        {
+            let table = c.table.as_deref().expect("a table past the linear stage");
+            assert!(c.table_active);
+            assert!(table.collided.len() > SIBLING_COLLIDED_INDEX);
+            assert_eq!(table.collided_index.len(), table.collided.len());
+        }
+        assert_eq!(c.next(None, a), 3);
+        assert_eq!(c.next(None, NameId(120)), 4);
+        assert_eq!(c.next(Some(NameId(9)), a), 2);
+        c.clear();
+        assert!(!c.table_active && c.head.is_none() && c.rest.is_empty());
+        {
+            let table = c.table.as_deref().expect("kept for reuse");
+            assert!(table.slots.iter().all(|&s| s == 0));
+            assert!(table.collided.is_empty() && table.collided_index.is_empty());
+        }
+        assert_eq!(c.next(None, a), 1);
+        assert_eq!(c.next(None, NameId(120)), 1);
+        assert_eq!(c.next(None, a), 2);
+        // A level that only ever has one name allocates nothing.
+        let mut single = SiblingCounter::default();
+        for n in 1..=5 {
+            assert_eq!(single.next(None, a), n);
+        }
+        assert!(single.table.is_none() && single.rest.capacity() == 0);
+        // Re-filling past the linear stage reuses the table.
+        for round in 1..=2 {
+            for i in 0..20u32 {
+                assert_eq!(c.next(None, NameId(500 + i)), round, "name {i}");
+            }
+        }
+        assert!(c.table_active);
+    }
+
+    /// The counter against a naive per-name count, over random sibling
+    /// sequences with clears (a differential check).
+    #[test]
+    fn sibling_counter_matches_a_naive_count() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut c = SiblingCounter::default();
+        for pool in [1u64, 3, 8, 9, 40, 300, 3_000] {
+            for _parent in 0..4 {
+                let mut naive: HashMap<(Option<NameId>, NameId), usize> = HashMap::new();
+                for _ in 0..4_000 {
+                    let k = rand(pool);
+                    let ns = (k % 3 == 0).then_some(NameId(7));
+                    let local = NameId(1_000 + (k / 2) as u32);
+                    let expected = {
+                        let n = naive.entry((ns, local)).or_default();
+                        *n += 1;
+                        *n
+                    };
+                    assert_eq!(c.next(ns, local), expected, "pool {pool}");
+                }
+                c.clear();
+            }
+        }
+    }
+
+    /// A keyref whose referenced key is out of scope when its element closes
+    /// is retried at the ancestors; a failure reported there still names the
+    /// keyref's element.
+    #[test]
+    fn deferred_keyref_error_names_the_keyref_element() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="item" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="id" type="xs:string"/>
+                                </xs:complexType>
+                            </xs:element>
+                            <xs:element name="group" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:sequence>
+                                        <xs:element name="ref" maxOccurs="unbounded">
+                                            <xs:complexType>
+                                                <xs:attribute name="to" type="xs:string"/>
+                                            </xs:complexType>
+                                        </xs:element>
+                                    </xs:sequence>
+                                </xs:complexType>
+                                <xs:keyref name="toItem" refer="itemKey">
+                                    <xs:selector xpath="ref"/>
+                                    <xs:field xpath="@to"/>
+                                </xs:keyref>
+                            </xs:element>
+                        </xs:sequence>
+                    </xs:complexType>
+                    <xs:key name="itemKey">
+                        <xs:selector xpath="item"/>
+                        <xs:field xpath="@id"/>
+                    </xs:key>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(
+            &schema_set,
+            ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS,
+        );
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("item", "", None, None, &ns);
+        v.validate_attribute("id", "", "A");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        for _ in 0..2 {
+            v.validate_element("group", "", None, None, &ns);
+            v.validate_end_of_attributes();
+            v.validate_element("ref", "", None, None, &ns);
+            v.validate_attribute("to", "", "A");
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+            v.validate_end_element();
+        }
+        // A third group, referring to a missing key value.
+        v.validate_element("group", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("ref", "", None, None, &ns);
+        v.validate_attribute("to", "", "Z");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.validate_end_element();
+        v.validate_end_element(); // </root>
+        v.end_validation().ok();
+
+        let keyref: Vec<_> = v
+            .sink
+            .errors
+            .iter()
+            .filter(|e| e.constraint.starts_with("cvc-identity-constraint.4.3"))
+            .collect();
+        // The key is declared on an ancestor, so it is never in a `group`'s
+        // table: every keyref is deferred, and fails when the root closes.
+        let paths: Vec<_> = keyref.iter().map(|e| path_of(e)).collect();
+        assert_eq!(
+            paths,
+            [1, 2, 3].map(|n| Some(format!("/Q{{}}root[1]/Q{{}}group[{n}]"))),
+            "{:?}",
+            v.sink.errors
+        );
+        for e in keyref {
+            assert_eq!(
+                e.subject(),
+                Some(&ValidationSubject::Element(ExpandedName::new(
+                    None, "group"
+                )))
+            );
+        }
+    }
+
+    /// A nested asserted element's assertions are evaluated when the
+    /// outermost asserted element closes; the error still names the nested
+    /// element, with its own path.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn deferred_assertion_error_names_the_nested_element() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="parent">
+                    <xs:complexType>
+                        <xs:sequence>
+                            <xs:element name="child" maxOccurs="unbounded">
+                                <xs:complexType>
+                                    <xs:attribute name="x" type="xs:integer"/>
+                                    <xs:assert test="@x > 0"/>
+                                </xs:complexType>
+                            </xs:element>
+                        </xs:sequence>
+                        <xs:assert test="true()"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("parent", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        for x in ["1", "-1"] {
+            v.validate_element("child", "", None, None, &ns);
+            v.validate_attribute("x", "", x);
+            v.validate_end_of_attributes();
+            v.validate_end_element();
+        }
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert_eq!(v.sink.errors.len(), 1, "{:?}", v.sink.errors);
+        let e = &v.sink.errors[0];
+        assert_eq!(e.constraint, "cvc-assertion");
+        assert_eq!(
+            e.subject(),
+            Some(&ValidationSubject::Element(ExpandedName::new(
+                None, "child"
+            )))
+        );
+        assert_eq!(path_of(e).as_deref(), Some("/Q{}parent[1]/Q{}child[2]"));
+        assert_eq!(e.element_path(), Some("/parent/child"));
+    }
+
+    /// An attribute validated after type-alternative selection is still the
+    /// subject of its error.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn cta_deferred_attribute_error_names_the_attribute() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="numType">
+                    <xs:attribute name="kind" type="xs:string"/>
+                    <xs:attribute name="val" type="xs:integer"/>
+                </xs:complexType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="kind" type="xs:string"/>
+                        <xs:attribute name="val" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@kind='num'" type="numType"/>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("kind", "", "num");
+        v.validate_attribute("val", "", "abc");
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        v.end_validation().ok();
+
+        assert!(!v.sink.errors.is_empty());
+        for e in &v.sink.errors {
+            assert_eq!(
+                e.subject(),
+                Some(&ValidationSubject::Attribute(ExpandedName::new(
+                    None, "val"
+                ))),
+                "{e:?}"
+            );
+            assert_eq!(path_of(e).as_deref(), Some("/Q{}root[1]/@Q{}val"));
+            assert_eq!(e.element_path(), Some("/root"));
+        }
+    }
+
+    /// An element-level error names its element; a run-level error that
+    /// `end_validation` returns names none.
+    #[test]
+    fn errors_outside_any_element_have_no_subject() {
+        let schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root" type="xs:string"/>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("undeclared", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_end_element();
+        let err = v.end_validation();
+        assert!(err.is_ok());
+        let e = &v.sink.errors[0];
+        assert_eq!(e.constraint, "cvc-elt.1");
+        assert_eq!(path_of(e).as_deref(), Some("/Q{}undeclared[1]"));
+        // A run-level error returned by end_validation has none.
+        let mut v = validator.start_run(TestSink::new());
+        v.validate_element("root", "", None, None, &ns);
+        let err = v.end_validation().unwrap_err();
+        assert!(err.subject().is_none() && err.instance_path().is_none());
+    }
+}
+
+// ── C18: skipping an attribute ───────────────────────────────────────────
+
+mod skip_attribute_tests {
+    use super::*;
+
+    /// `item` declares `id`, `ref`, `need` (required), `fix` (fixed) and `u`
+    /// (unique); `{urn:wsu}Id` and `w` are declared nowhere.
+    const PAYLOAD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:element name="root">
+            <xs:complexType>
+                <xs:sequence>
+                    <xs:element name="item" minOccurs="0" maxOccurs="unbounded">
+                        <xs:complexType>
+                            <xs:attribute name="id" type="xs:ID"/>
+                            <xs:attribute name="ref" type="xs:IDREF"/>
+                            <xs:attribute name="need" type="xs:int" use="required"/>
+                            <xs:attribute name="fix" type="xs:string" fixed="x"/>
+                            <xs:attribute name="u" type="xs:string"/>
+                        </xs:complexType>
+                    </xs:element>
+                </xs:sequence>
+            </xs:complexType>
+            <xs:unique name="uniqueU">
+                <xs:selector xpath="item"/>
+                <xs:field xpath="@u"/>
+            </xs:unique>
+        </xs:element>
+    </xs:schema>"#;
+
+    const WSU: &str = "urn:wsu";
+
+    type Attr<'a> = (&'a str, &'a str, &'a str, bool);
+
+    /// Validate `<root>` with one `<item>` per entry of `items`; each attribute
+    /// is (local, ns, value, skip).
+    fn run(
+        items: &[&[Attr<'_>]],
+    ) -> (
+        Vec<SchemaInfo>,
+        Vec<Vec<SchemaInfo>>,
+        Vec<ValidationError>,
+        SchemaInfo,
+    ) {
+        run_with(PAYLOAD, items)
+    }
+
+    fn run_with(
+        xsd: &str,
+        items: &[&[Attr<'_>]],
+    ) -> (
+        Vec<SchemaInfo>,
+        Vec<Vec<SchemaInfo>>,
+        Vec<ValidationError>,
+        SchemaInfo,
+    ) {
+        let schema_set = load_schema(xsd);
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        let (mut ends, mut infos) = (Vec::new(), Vec::new());
+        for attrs in items {
+            v.validate_element("item", "", None, None, &ns);
+            let mut these = Vec::new();
+            for (local, uri, value, skip) in attrs.iter() {
+                these.push(if *skip {
+                    v.skip_attribute(local, uri, value)
+                } else {
+                    v.validate_attribute(local, uri, value)
+                });
+            }
+            v.validate_end_of_attributes();
+            ends.push(v.validate_end_element());
+            infos.push(these);
+        }
+        let root = v.validate_end_element();
+        v.end_validation().ok();
+        (ends, infos, std::mem::take(&mut v.sink.errors), root)
+    }
+
+    fn codes(errors: &[ValidationError]) -> Vec<&'static str> {
+        errors.iter().map(|e| e.constraint).collect()
+    }
+
+    /// An attribute no attribute use matches is not an error once skipped;
+    /// the element stays valid, but was not fully assessed (§3.3.5.1
+    /// `[validation attempted]` clause 3: partial).
+    #[test]
+    fn a_skipped_undeclared_attribute_is_not_assessed() {
+        let (ends, infos, errors, root) = run(&[&[
+            ("need", "", "1", false),
+            ("w", "", "k1", false),
+            ("Id", WSU, "x", true),
+        ]]);
+        // `w` validated (not skipped) is not allowed either.
+        assert_eq!(codes(&errors), ["cvc-complex-type.3.2.2"], "{errors:?}");
+        let skipped = &infos[0][2];
+        assert_eq!(skipped.validity, SchemaValidity::NotKnown);
+        assert_eq!(skipped.validation_attempted, ValidationAttempted::None);
+        assert!(skipped.schema_type.is_none() && skipped.attribute_decl.is_none());
+
+        let _ = (ends, root);
+        let (ends, _, errors, root) = run(&[&[
+            ("need", "", "1", false),
+            ("w", "", "k1", true),
+            ("Id", WSU, "x", true),
+        ]]);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(ends[0].validity, SchemaValidity::Valid);
+        assert_eq!(ends[0].validation_attempted, ValidationAttempted::Partial);
+        assert_eq!(root.validity, SchemaValidity::Valid);
+    }
+
+    /// Structures §3.4.4.2 clause 2.1 comes before 2.2: an attribute an
+    /// attribute use matches is validated by that use, never by a wildcard —
+    /// so asking to skip a declared attribute validates it as usual. The five
+    /// verdicts a skip must not change.
+    #[test]
+    fn a_declared_attribute_is_validated_even_if_asked_to_skip() {
+        // 1. a bad xs:int
+        let (ends, infos, errors, _) = run(&[&[("need", "", "bad", true)]]);
+        assert_eq!(codes(&errors), ["cvc-datatype-valid"], "{errors:?}");
+        assert_eq!(ends[0].validity, SchemaValidity::Invalid);
+        assert_eq!(
+            infos[0][0].validity,
+            SchemaValidity::Invalid,
+            "the real PSVI"
+        );
+        assert!(infos[0][0].schema_type.is_some());
+        // 2. a fixed mismatch
+        let (_, _, errors, _) = run(&[&[("need", "", "1", false), ("fix", "", "y", true)]]);
+        assert_eq!(codes(&errors), ["cvc-attribute.4"], "{errors:?}");
+        // 3. a duplicate xs:ID
+        let (_, _, errors, _) = run(&[
+            &[("need", "", "1", false), ("id", "", "a", true)],
+            &[("need", "", "1", false), ("id", "", "a", true)],
+        ]);
+        assert!(codes(&errors).contains(&"cvc-id.2"), "{errors:?}");
+        // 4. a dangling xs:IDREF
+        let (_, _, errors, _) = run(&[&[("need", "", "1", false), ("ref", "", "zz", true)]]);
+        assert_eq!(codes(&errors), ["cvc-id.1"], "{errors:?}");
+        // 5. an xs:unique duplicate
+        let (_, _, errors, _) = run(&[
+            &[("need", "", "1", false), ("u", "", "same", true)],
+            &[("need", "", "1", false), ("u", "", "same", true)],
+        ]);
+        assert!(
+            codes(&errors).contains(&"cvc-identity-constraint.4.2.2"),
+            "{errors:?}"
+        );
+    }
+
+    /// A skipped attribute is still present: a second one of the same name is
+    /// a duplicate, and the duplicate is about the attribute.
+    #[test]
+    fn a_skipped_attribute_is_present() {
+        let (_, _, errors, _) = run(&[&[
+            ("need", "", "1", false),
+            ("Id", WSU, "a", true),
+            ("Id", WSU, "b", true),
+        ]]);
+        assert_eq!(
+            codes(&errors),
+            ["cvc-complex-type.3"],
+            "a duplicate: {errors:?}"
+        );
+        assert_eq!(
+            errors[0]
+                .instance_path()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("/Q{}root[1]/Q{}item[1]/@Q{urn:wsu}Id")
+        );
+    }
+
+    /// A skipped attribute has no type, so it is not in the eligible item set
+    /// of the ID/IDREF table (§3.17.5.2), and an identity-constraint field
+    /// that selects it gets no value (as for an attribute matched by a skip
+    /// wildcard): `keyW`'s field is then missing.
+    #[test]
+    fn a_skipped_attribute_gives_no_key_value() {
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence>
+                        <xs:element name="item" maxOccurs="unbounded">
+                            <xs:complexType>
+                                <xs:anyAttribute processContents="lax"/>
+                            </xs:complexType>
+                        </xs:element>
+                    </xs:sequence>
+                </xs:complexType>
+                <xs:key name="keyW">
+                    <xs:selector xpath="item"/>
+                    <xs:field xpath="@w"/>
+                </xs:key>
+            </xs:element>
+        </xs:schema>"#;
+        // Laxly validated by the wildcard, `@w` is a key value.
+        let (_, _, errors, _) = run_with(xsd, &[&[("w", "", "k", false)]]);
+        assert!(errors.is_empty(), "{errors:?}");
+        // Skipped, it is selected but has no value.
+        let (_, _, errors, _) = run_with(xsd, &[&[("w", "", "k", true)]]);
+        assert_eq!(
+            codes(&errors),
+            ["cvc-identity-constraint.4.2.1"],
+            "{errors:?}"
+        );
+    }
+
+    /// With type alternatives the decision waits for the selected type: an
+    /// attribute it declares is validated against it, one it does not is
+    /// skipped; type alternatives see both (they are in E.[attributes],
+    /// §3.12.4), and there is one deferred result per attribute.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn with_type_alternatives_the_selected_type_decides() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:complexType name="numType">
+                    <xs:attribute name="val" type="xs:integer"/>
+                </xs:complexType>
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:attribute name="val" type="xs:string"/>
+                    </xs:complexType>
+                    <xs:alternative test="@w='num'" type="numType"/>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let ns = empty_ns_context();
+        for (val, invalid) in [("abc", true), ("42", false)] {
+            let mut v = validator.start_run(TestSink::new());
+            v.validate_element("root", "", None, None, &ns);
+            let w = v.skip_attribute("w", "", "num");
+            let val_info = v.skip_attribute("val", "", val);
+            assert!(w.deferred_by_cta && val_info.deferred_by_cta);
+            let eoa = v.validate_end_of_attributes();
+            assert!(eoa.cta_selected, "the skipped @w selected numType");
+            let deferred = v.take_deferred_attribute_results();
+            assert_eq!(deferred.len(), 2, "one result per attribute");
+            assert_eq!(deferred[0].validity, SchemaValidity::NotKnown, "@w skipped");
+            let expected = if invalid {
+                SchemaValidity::Invalid
+            } else {
+                SchemaValidity::Valid
+            };
+            assert_eq!(
+                deferred[1].validity, expected,
+                "@val validated as xs:integer"
+            );
+            let end = v.validate_end_element();
+            v.end_validation().ok();
+            assert_eq!(end.validity, expected, "{:?}", v.sink.errors);
+        }
+    }
+
+    /// Assertions see a skipped attribute, untyped.
+    #[cfg(feature = "xsd11")]
+    #[test]
+    fn assertions_see_a_skipped_attribute() {
+        let schema_set = load_schema_xsd11(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+                <xs:element name="root">
+                    <xs:complexType>
+                        <xs:assert test="@note = 'x'"/>
+                    </xs:complexType>
+                </xs:element>
+            </xs:schema>"#,
+        );
+        let validator =
+            SchemaValidator::new_fragment_buffer(&schema_set, ValidationFlags::default());
+        for (value, valid) in [("x", SchemaValidity::Valid), ("y", SchemaValidity::Invalid)] {
+            let mut v = validator.start_run(TestSink::new());
+            let ns = empty_ns_context();
+            v.validate_element("root", "", None, None, &ns);
+            v.skip_attribute("note", "", value); // declared nowhere: skipped
+            v.validate_end_of_attributes();
+            let end = v.validate_end_element();
+            v.end_validation().ok();
+            assert_eq!(end.validity, valid, "{value}: {:?}", v.sink.errors);
+        }
     }
 }

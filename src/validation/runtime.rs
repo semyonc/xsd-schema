@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::BuildHasherDefault;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use ahash::AHasher;
 
@@ -31,7 +32,9 @@ use bumpalo::Bump;
 
 use super::content::{CompiledContentModel, ContentValidatorState};
 use super::context::{AttrNameSet, ElementValidationState, ValidatorState};
-use super::errors::{self, ValidationError};
+use super::errors::{
+    self, ExpandedName, InstancePath, PathStep, ValidationError, ValidationSubject,
+};
 use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
 #[cfg(feature = "xsd11")]
 use super::info::{AssertionOutcome, InheritedAttribute};
@@ -110,6 +113,288 @@ struct DeferredKeyref {
     /// own element and the run of strictly assessed ancestors above it, as of
     /// the deferral (see `ValidationRuntime::invalidity_reach`).
     reach: Vec<u64>,
+    /// The keyref's element, which a later failure is reported about.
+    context: ErrorContext,
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostic context — the subject and positional path of an error (B8)
+// ---------------------------------------------------------------------------
+
+/// One step of the path to the current element: its interned expanded name
+/// and its 1-based position among the same-named siblings opened so far.
+#[derive(Clone, Copy, Debug)]
+struct RawPathStep {
+    namespace: Option<NameId>,
+    local_name: NameId,
+    position: usize,
+}
+
+/// The item a diagnostic is about, captured for a report made later — an
+/// IDREF checked by `end_validation`, a nested assertion evaluated when the
+/// outermost asserted element closes, a keyref retried at an ancestor. The
+/// path shares its ancestor steps with the runtime's other diagnostics.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ErrorContext {
+    item: Option<(ValidationSubject, InstancePath)>,
+}
+
+impl ErrorContext {
+    /// `err` about the recorded item, unless it names one already; with
+    /// `element_path`, its local-name element path is the recorded element's.
+    fn attach(&self, err: ValidationError, element_path: bool) -> ValidationError {
+        let Some((subject, path)) = &self.item else {
+            return err;
+        };
+        let mut err = if err.subject().is_none() && err.instance_path().is_none() {
+            err.with_subject(subject.clone())
+                .with_instance_path(path.clone())
+        } else {
+            err
+        };
+        if element_path {
+            err.derive_element_path();
+        }
+        err
+    }
+}
+
+/// Distinct names per parent that [`SiblingCounter`] finds by a linear scan
+/// before it builds its direct-mapped table.
+const SIBLING_LINEAR: usize = 4;
+
+/// Slots of [`SiblingCounter`]'s direct-mapped name table (a power of two).
+const SIBLING_SLOTS: usize = 64;
+
+/// Names that lost their slot to another name, per parent, past which
+/// [`SiblingCounter`] finds them by hash instead of by a scan — so a parent
+/// with very many differently named children stays linear overall.
+const SIBLING_COLLIDED_INDEX: usize = 32;
+
+/// One name counted by a [`SiblingCounter`].
+#[derive(Clone, Copy)]
+struct SiblingEntry {
+    namespace: Option<NameId>,
+    local_name: NameId,
+    count: usize,
+    /// The table slot the name hashes to.
+    slot: u8,
+}
+
+impl SiblingEntry {
+    fn is(&self, namespace: Option<NameId>, local_name: NameId) -> bool {
+        self.local_name == local_name && self.namespace == namespace
+    }
+}
+
+/// The lookup structure of a [`SiblingCounter`] with many names.
+struct SiblingTable {
+    /// Entry index + 1 of the first name that hashed to each slot; 0 = empty.
+    /// A name whose slot is empty has not been counted yet.
+    slots: [u32; SIBLING_SLOTS],
+    /// Entries whose slot was already taken by another name.
+    collided: Vec<u32>,
+    /// `collided` by name, kept while it holds more than
+    /// [`SIBLING_COLLIDED_INDEX`] entries.
+    collided_index: HashMap<(Option<NameId>, NameId), u32, BuildHasherDefault<AHasher>>,
+}
+
+/// The elements opened so far under one parent, counted per expanded name:
+/// the source of the `[n]` of a path step.
+///
+/// Built for the common shapes at a few nanoseconds per element and a few
+/// dozen bytes per depth level: the first name is held inline (a deep chain
+/// of single children allocates nothing), runs of one repeated name hit
+/// `last`, up to [`SIBLING_LINEAR`] names are scanned, and past that a
+/// direct-mapped table (allocated once per level, kept for reuse) answers
+/// "new name" in one probe. A hash map per parent, or a linear scan of every
+/// name, measured 7–10 % of pure validation time on records of twenty
+/// distinct children; this, under 2 %.
+#[derive(Default)]
+struct SiblingCounter {
+    /// The first name counted (index 0).
+    head: Option<SiblingEntry>,
+    /// The further names, in first-seen order (index `1 + i`).
+    rest: Vec<SiblingEntry>,
+    /// Index of the entry counted last — siblings usually repeat.
+    last: usize,
+    /// The table, once this level has had more than [`SIBLING_LINEAR`] names
+    /// under one parent; in use while `table_active`.
+    table: Option<Box<SiblingTable>>,
+    table_active: bool,
+}
+
+/// Where [`SiblingCounter::find`] found a name, or the slot of a new one.
+enum SiblingLookup {
+    Found(usize),
+    New(u8),
+}
+
+impl SiblingCounter {
+    /// Fibonacci hashing of the interned name onto [`SIBLING_SLOTS`] slots.
+    fn slot_of(namespace: Option<NameId>, local_name: NameId) -> u8 {
+        let key = u64::from(local_name.0) | (u64::from(namespace.map_or(u32::MAX, |n| n.0)) << 32);
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SIBLING_SLOTS.trailing_zeros())) as u8
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.head.is_some()) + self.rest.len()
+    }
+
+    fn entry(&self, i: usize) -> &SiblingEntry {
+        if i == 0 {
+            self.head.as_ref().expect("counted entry")
+        } else {
+            &self.rest[i - 1]
+        }
+    }
+
+    fn entry_mut(&mut self, i: usize) -> &mut SiblingEntry {
+        if i == 0 {
+            self.head.as_mut().expect("counted entry")
+        } else {
+            &mut self.rest[i - 1]
+        }
+    }
+
+    /// Count one more sibling named (`namespace`, `local_name`); its position.
+    fn next(&mut self, namespace: Option<NameId>, local_name: NameId) -> usize {
+        if self.head.is_some() {
+            let last = self.entry_mut(self.last);
+            if last.is(namespace, local_name) {
+                last.count += 1;
+                return last.count;
+            }
+        }
+        let i = match self.find(namespace, local_name) {
+            SiblingLookup::Found(i) => {
+                self.entry_mut(i).count += 1;
+                i
+            }
+            SiblingLookup::New(slot) => self.insert(namespace, local_name, slot),
+        };
+        self.last = i;
+        self.entry(i).count
+    }
+
+    fn find(&self, namespace: Option<NameId>, local_name: NameId) -> SiblingLookup {
+        if !self.table_active {
+            if let Some(i) = (0..self.len()).find(|&i| self.entry(i).is(namespace, local_name)) {
+                return SiblingLookup::Found(i);
+            }
+            return SiblingLookup::New(Self::slot_of(namespace, local_name));
+        }
+        let table = self.table.as_deref().expect("active table");
+        let slot = Self::slot_of(namespace, local_name);
+        let taken = table.slots[slot as usize];
+        if taken == 0 {
+            return SiblingLookup::New(slot);
+        }
+        let first = (taken - 1) as usize;
+        if self.entry(first).is(namespace, local_name) {
+            return SiblingLookup::Found(first);
+        }
+        let found = if table.collided.len() > SIBLING_COLLIDED_INDEX {
+            table
+                .collided_index
+                .get(&(namespace, local_name))
+                .map(|&i| i as usize)
+        } else {
+            table
+                .collided
+                .iter()
+                .map(|&i| i as usize)
+                .find(|&i| self.entry(i).is(namespace, local_name))
+        };
+        match found {
+            Some(i) => SiblingLookup::Found(i),
+            None => SiblingLookup::New(slot),
+        }
+    }
+
+    /// Add a new name, counted once; its index.
+    fn insert(&mut self, namespace: Option<NameId>, local_name: NameId, slot: u8) -> usize {
+        let entry = SiblingEntry {
+            namespace,
+            local_name,
+            count: 1,
+            slot,
+        };
+        let i = self.len();
+        if self.head.is_none() {
+            self.head = Some(entry);
+        } else {
+            self.rest.push(entry);
+        }
+        if self.table_active {
+            self.index_entry(i);
+        } else if self.len() > SIBLING_LINEAR {
+            if self.table.is_none() {
+                self.table = Some(Box::new(SiblingTable {
+                    slots: [0; SIBLING_SLOTS],
+                    collided: Vec::new(),
+                    collided_index: HashMap::default(),
+                }));
+            }
+            self.table_active = true;
+            for j in 0..self.len() {
+                self.index_entry(j);
+            }
+        }
+        i
+    }
+
+    /// File entry `i` in the active table.
+    fn index_entry(&mut self, i: usize) {
+        let entry = *self.entry(i);
+        let table = self.table.as_deref_mut().expect("active table");
+        let slot = &mut table.slots[entry.slot as usize];
+        if *slot == 0 {
+            *slot = i as u32 + 1;
+            return;
+        }
+        table.collided.push(i as u32);
+        if table.collided.len() > SIBLING_COLLIDED_INDEX {
+            if table.collided_index.is_empty() {
+                let collided = std::mem::take(&mut table.collided);
+                let keys: Vec<_> = collided
+                    .iter()
+                    .map(|&c| {
+                        let e = self.entry(c as usize);
+                        ((e.namespace, e.local_name), c)
+                    })
+                    .collect();
+                let table = self.table.as_deref_mut().expect("active table");
+                table.collided_index.extend(keys);
+                table.collided = collided;
+            } else {
+                table
+                    .collided_index
+                    .insert((entry.namespace, entry.local_name), i as u32);
+            }
+        }
+    }
+
+    /// Forget every count (the parent closed); the allocations are kept.
+    fn clear(&mut self) {
+        let Some(head) = self.head.take() else {
+            return;
+        };
+        if self.table_active {
+            let table = self.table.as_deref_mut().expect("active table");
+            table.slots[head.slot as usize] = 0;
+            for entry in &self.rest {
+                table.slots[entry.slot as usize] = 0;
+            }
+            table.collided.clear();
+            if !table.collided_index.is_empty() {
+                table.collided_index.clear();
+            }
+            self.table_active = false;
+        }
+        self.rest.clear();
+        self.last = 0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -156,8 +441,27 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     current_state: ValidatorState,
     /// Current source location (updated by caller)
     current_location: Option<SourceLocation>,
-    /// XPath-like element path (e.g., "/root/child[1]")
-    element_path: String,
+    /// The path to the current element: each step's expanded name and its
+    /// position among its same-named siblings. The local-name path reported
+    /// as [`ValidationError::element_path`] (`/root/child`) and the
+    /// positional [`ValidationError::instance_path`] are both derived from it
+    /// when a diagnostic is reported.
+    path_steps: Vec<RawPathStep>,
+    /// `sibling_counts[d]` counts the elements opened so far at path depth
+    /// `d` under the current parent (cleared when that parent closes).
+    sibling_counts: Vec<SiblingCounter>,
+    /// The attribute being validated, for the duration of an attribute event:
+    /// the subject of the diagnostics raised meanwhile.
+    current_attribute: Option<(Option<NameId>, NameId)>,
+    /// `path_nodes[d]` is the shared [`InstancePath`] of `path_steps[..=d]`,
+    /// built on the first diagnostic that needs it (never for a valid
+    /// document) and dropped when its element closes: every diagnostic under
+    /// an element shares that element's path, so reporting one costs the same
+    /// at any depth.
+    path_nodes: Vec<InstancePath>,
+    /// Names resolved for diagnostics, shared by every path and subject of
+    /// the run.
+    name_cache: HashMap<NameId, Arc<str>, BuildHasherDefault<AHasher>>,
     /// Pre-compiled identity constraints (lazy cache; None = compilation failed)
     compiled_constraints: HashMap<IdentityConstraintKey, Option<CompiledIdentityConstraint>>,
     /// Per-complex-type compiled content models, built once by
@@ -181,8 +485,8 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     id_values: HashMap<String, u64>,
     /// Monotonically increasing element serial counter for ID binding.
     next_element_serial: u64,
-    /// Pending IDREF values: (value, location, element_path)
-    pending_idrefs: Vec<(String, Option<SourceLocation>, String)>,
+    /// Pending IDREF values: (value, location, the item that carried it)
+    pending_idrefs: Vec<(String, Option<SourceLocation>, ErrorContext)>,
     /// Declared unparsed entity names from the document's DTD.
     /// When set, ENTITY/ENTITIES values are checked against this set (§3.16.4).
     unparsed_entities: Option<HashSet<String>>,
@@ -220,6 +524,11 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// Deferred attribute PSVI results from CTA processing (XSD 1.1).
     #[cfg(feature = "xsd11")]
     deferred_attribute_results: Vec<SchemaInfo>,
+    /// Indices into the current element's `collected_attributes` of the
+    /// attributes the caller skipped (`skip_attribute`): visible to type
+    /// alternatives, not validated after them (XSD 1.1).
+    #[cfg(feature = "xsd11")]
+    skipped_collected: Vec<usize>,
     /// Final identity constraint tables after root element close (PSVI exposure).
     final_ic_tables: Option<HashMap<IdentityConstraintKey, KeyTable>>,
     /// Accumulated `xsi:schemaLocation` hints with base URI context.
@@ -697,7 +1006,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             state_pool: Vec::new(),
             current_state: ValidatorState::None,
             current_location: None,
-            element_path: String::new(),
+            path_steps: Vec::new(),
+            sibling_counts: Vec::new(),
+            current_attribute: None,
+            path_nodes: Vec::new(),
+            name_cache: HashMap::default(),
             compiled_constraints: HashMap::new(),
             active_constraints: Vec::new(),
             operational_failure: None,
@@ -726,6 +1039,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             pending_assertion_frames: Vec::new(),
             #[cfg(feature = "xsd11")]
             deferred_attribute_results: Vec::new(),
+            #[cfg(feature = "xsd11")]
+            skipped_collected: Vec::new(),
             cached_xsd10_id_key,
             #[cfg(feature = "xsd11")]
             has_inheritable_attributes,
@@ -1019,9 +1334,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.assertion_buffer_stack.push(AssertionBufferFrame {
                 element_ref,
                 complex_type_key: ct_key,
-                element_path: String::new(), // populated at end-element
-                location: None,              // populated at end-element
-                propagates_to_outer: false,  // populated at deferral
+                context: ErrorContext::default(), // populated at end-element
+                location: None,                   // populated at end-element
+                propagates_to_outer: false,       // populated at deferral
             });
             if let Some(ev) = self.validation_stack.last_mut() {
                 ev.owns_assertion_buffer = true;
@@ -1095,7 +1410,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.assertion_buffer_stack.push(AssertionBufferFrame {
             element_ref,
             complex_type_key: new_ct_key,
-            element_path: String::new(),
+            context: ErrorContext::default(),
             location: None,
             propagates_to_outer: false,
         });
@@ -1150,15 +1465,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn report_assertion_errors_deferred(
         &mut self,
         assertion_errors: Vec<ValidationError>,
-        element_path: &str,
+        context: &ErrorContext,
         location: &Option<SourceLocation>,
     ) {
         for err in assertion_errors {
-            let err = if !element_path.is_empty() {
-                err.with_path(element_path.to_string())
-            } else {
-                err
-            };
+            let err = context.attach(err, true);
             let err = match location {
                 Some(loc) => err.with_location(loc.clone()),
                 None => err,
@@ -2265,6 +2576,212 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Validate an attribute (NameId fast-path)
     pub fn validate_attribute_by_id(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        // The attribute is the subject of whatever is reported meanwhile.
+        let outer = self.current_attribute.replace((namespace, local_name));
+        let info = self.validate_attribute_event(local_name, namespace, value);
+        self.current_attribute = outer;
+        info
+    }
+
+    /// Record an attribute of the current element **without validating it**,
+    /// if no attribute use of the element's governing type matches it: the
+    /// attribute is then present but not assessed — as if the type's
+    /// attribute wildcard had matched it with `{process contents}` `skip`, of
+    /// which Structures §3.10.1 says: "No constraints at all: the item must
+    /// simply be well-formed XML". For a host that must not have some
+    /// undeclared attributes checked against the schema — for example
+    /// `wsu:Id`, which a signature layer adds to signed payload elements whose
+    /// schemas do not declare it. The drivers call this when
+    /// [`ValidationEventHandler::skip_attribute`](super::ValidationEventHandler::skip_attribute)
+    /// asks them to.
+    ///
+    /// **A declared attribute is never skipped.** A wildcard governs only
+    /// the attributes no attribute use matches (§3.4.4.2 Element Locally
+    /// Valid (Complex Type), clause 2.1 "If there is among the {attribute
+    /// uses} an attribute use U whose {attribute declaration} has the same
+    /// expanded name as A …" before 2.2 "otherwise … There is an {attribute
+    /// wildcard}"), so an attribute that an attribute use matches is validated
+    /// as by [`validate_attribute`](Self::validate_attribute) — its type, its
+    /// `fixed` value, its part in ID/IDREF and identity constraints — and the
+    /// returned [`SchemaInfo`] is that validation's. For an element with type
+    /// alternatives (XSD 1.1) the decision is made against the selected type,
+    /// after all attributes: the returned `SchemaInfo` is then marked
+    /// `deferred_by_cta`, and the final one comes with the other deferred
+    /// results (`take_deferred_attribute_results`).
+    ///
+    /// What a skipped attribute is:
+    ///
+    /// - **Its PSVI**: none — the returned [`SchemaInfo`] has no type and no
+    ///   declaration, `[validity]` *notKnown* and `[validation attempted]`
+    ///   *none* (§3.2.5.1 applies only to an attribute whose validity "has
+    ///   been assessed"). The typed document builder leaves it untyped.
+    /// - **Its element**: an attribute the type does not allow is no error,
+    ///   so it does not make the element invalid; but the element is no
+    ///   longer fully assessed — its `[validation attempted]` is at most
+    ///   *partial* (§3.3.5.1, "3 otherwise partial").
+    /// - **Presence**: it is one of E.\[attributes\]: a second attribute of
+    ///   the same name is a duplicate, and type alternatives (§3.12.4) and
+    ///   assertions (§3.13.4.1) see it, untyped.
+    /// - **ID/IDREF**: it has no type and no `[schema actual value]`, so it is
+    ///   not in the ·eligible item set· of the ID/IDREF table (§3.17.5.2).
+    /// - **Identity constraints**: like an attribute matched by a skip
+    ///   wildcard, a field that selects it gets no value (so an `xs:key`
+    ///   reports the field missing), and it counts when the field selects
+    ///   more than one node.
+    ///
+    /// `xml:base` is still applied (base-URI tracking is not validation).
+    /// Attributes in the XML Schema instance namespace are best left to
+    /// [`validate_attribute`](Self::validate_attribute): `xsi:type` and
+    /// `xsi:nil` have already taken effect at the element start, and a
+    /// skipped `xsi:schemaLocation` records no hint; the drivers never offer
+    /// them to the hook.
+    pub fn skip_attribute(
+        &mut self,
+        local_name: &str,
+        namespace_uri: &str,
+        value: &str,
+    ) -> SchemaInfo {
+        let name_id = self.schema_set.name_table.add(local_name);
+        let ns_id = if namespace_uri.is_empty() {
+            None
+        } else {
+            Some(self.schema_set.name_table.add(namespace_uri))
+        };
+        self.skip_attribute_by_id(name_id, ns_id, value)
+    }
+
+    /// [`skip_attribute`](Self::skip_attribute) by interned name.
+    pub fn skip_attribute_by_id(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        let outer = self.current_attribute.replace((namespace, local_name));
+        let info = self.skip_attribute_event(local_name, namespace, value);
+        self.current_attribute = outer;
+        info
+    }
+
+    fn skip_attribute_event(
+        &mut self,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        value: &str,
+    ) -> SchemaInfo {
+        if self.operational_failure.is_some() {
+            return SchemaInfo::invalid();
+        }
+        if !self.current_state.can_validate_attribute() {
+            self.report_error(
+                "cvc-complex-type",
+                format!(
+                    "Attribute validation not allowed in current state {:?}",
+                    self.current_state
+                ),
+            );
+            return SchemaInfo::invalid();
+        }
+        let Some(ev_state) = self.validation_stack.last() else {
+            self.report_error("cvc-complex-type", "No element context for attribute");
+            return SchemaInfo::invalid();
+        };
+        #[cfg(feature = "xsd11")]
+        let deferred = ev_state.has_type_alternatives;
+        #[cfg(not(feature = "xsd11"))]
+        let deferred = false;
+        // Structures §3.4.4.2 clause 2.1 comes before 2.2: an attribute an
+        // attribute use matches is validated by it, never by a wildcard. With
+        // type alternatives the governing type is known only after the
+        // selection; the decision waits until then.
+        if !deferred
+            && self.attribute_use_matches(
+                ev_state.schema_type,
+                ev_state.process_contents,
+                local_name,
+                namespace,
+            )
+        {
+            return self.validate_attribute_event(local_name, namespace, value);
+        }
+        // Visible, untyped, to the assertions of the element.
+        #[cfg(feature = "xsd11")]
+        let _ = self.buffer_fragment_attribute(local_name, namespace, value);
+        if namespace == Some(well_known::XML_NAMESPACE)
+            && local_name == self.schema_set.name_table.add("base")
+        {
+            self.apply_xml_base_attribute(value);
+        }
+        let Some(ev_state) = self.validation_stack.last_mut() else {
+            return SchemaInfo::invalid();
+        };
+        if !ev_state.seen_attributes.insert((namespace, local_name)) {
+            return self.reject_duplicate_attribute(local_name);
+        }
+        self.current_state = ValidatorState::Attribute;
+        // Collected with the others, so type alternatives see it; validated
+        // or skipped after the selection (`validate_deferred_attributes`).
+        #[cfg(feature = "xsd11")]
+        if deferred {
+            self.skipped_collected
+                .push(ev_state.collected_attributes.len());
+            ev_state
+                .collected_attributes
+                .push((namespace, local_name, value.to_string()));
+            return SchemaInfo {
+                deferred_by_cta: true,
+                ..SchemaInfo::empty()
+            };
+        }
+        self.record_skipped_attribute(local_name, namespace);
+        SchemaInfo::empty()
+    }
+
+    /// Whether an attribute use of the governing type `schema_type` matches
+    /// the attribute (Structures §3.4.4.2 clause 2.1). A skip-processed
+    /// element validates no attribute.
+    fn attribute_use_matches(
+        &self,
+        schema_type: Option<TypeKey>,
+        process_contents: ContentProcessing,
+        local_name: NameId,
+        namespace: Option<NameId>,
+    ) -> bool {
+        if process_contents == ContentProcessing::Skip {
+            return false;
+        }
+        match schema_type {
+            Some(TypeKey::Complex(ct_key)) => matches!(
+                self.find_attribute_in_type(
+                    &self.schema_set.arenas.complex_types[ct_key],
+                    local_name,
+                    namespace
+                ),
+                AttributeLookup::Found(..)
+            ),
+            _ => false,
+        }
+    }
+
+    /// The effects of a skipped attribute on its element: `[validation
+    /// attempted]` none for the attribute (§3.3.5.1), so the element is at
+    /// most partial; and a field that selects it counts as a match with no
+    /// value, as for an attribute a skip wildcard matched.
+    fn record_skipped_attribute(&mut self, local_name: NameId, namespace: Option<NameId>) {
+        if let Some(ev_state) = self.validation_stack.last_mut() {
+            ev_state.any_attr_not_full = true;
+        }
+        self.count_skipped_attribute_ic_matches(local_name, namespace);
+    }
+
+    /// [`validate_attribute_by_id`](Self::validate_attribute_by_id) once the
+    /// attribute is the current diagnostic subject.
+    fn validate_attribute_event(
         &mut self,
         local_name: NameId,
         namespace: Option<NameId>,
@@ -3807,11 +4324,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 }
                                 self.report_assertion_errors_deferred(
                                     errs,
-                                    &pf.element_path,
+                                    &pf.context,
                                     &pf.location,
                                 );
                             }
-                            // Evaluate outermost frame (current element_path is valid)
+                            // Evaluate outermost frame (the current path is its own)
                             let errs = evaluate_complex_type_assertions(
                                 &doc,
                                 frame.element_ref,
@@ -3847,7 +4364,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 } else {
                     // Nested asserted element — defer to outermost close
                     let mut deferred = frame;
-                    deferred.element_path = self.element_path.clone();
+                    deferred.context = self.capture_context();
                     deferred.location = self.current_location.clone();
                     deferred.propagates_to_outer = self.nested_failure_reaches_outer();
                     self.pending_assertion_frames.push(deferred);
@@ -3933,6 +4450,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     table: keyref_table,
                     refer_key,
                     reach,
+                    context,
                 } = deferred;
                 let target = refer_key.and_then(|rk| {
                     self.ic_scope_tables
@@ -3946,7 +4464,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         if !errs.is_empty() {
                             failed_reaches.push(reach);
                         }
-                        deferred_errors.extend(errs);
+                        deferred_errors
+                            .extend(errs.into_iter().map(|err| context.attach(err, false)));
                     }
                     None => {
                         if scope_empty {
@@ -3968,20 +4487,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                     })
                                 })
                                 .unwrap_or_else(|| "<unknown>".to_string());
-                            deferred_errors.push(errors::error(
+                            let err = errors::error(
                                 "cvc-identity-constraint.4.3",
                                 format!(
                                     "Keyref '{}' references unknown constraint '{}'",
                                     keyref_name, refer_display
                                 ),
                                 None,
-                            ));
+                            );
+                            deferred_errors.push(context.attach(err, false));
                             failed_reaches.push(reach);
                         } else {
                             still_deferred.push(DeferredKeyref {
                                 table: keyref_table,
                                 refer_key,
                                 reach,
+                                context,
                             });
                         }
                     }
@@ -4179,17 +4700,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
 
         // IDREF validation (cvc-id.1): check all pending IDREFs resolve
-        for (idref_value, location, element_path) in &self.pending_idrefs {
+        for (idref_value, location, context) in &self.pending_idrefs {
             if !self.id_values.contains_key(idref_value) {
-                self.sink.on_error(errors::error_with_path(
+                let err = errors::error(
                     "cvc-id.1",
                     format!(
                         "IDREF '{}' does not match any ID in the document",
                         idref_value
                     ),
                     location.clone(),
-                    element_path,
-                ));
+                );
+                self.sink.on_error(context.attach(err, true));
             }
         }
 
@@ -4460,15 +4981,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 .or_insert(ev_state.element_serial);
         }
 
-        // Copy the `&'a SchemaSet` reference out first so the borrow of the
-        // interned name (`resolve_ref`, zero-alloc) is tied to `'a` and does
-        // not conflict with the `&mut self.element_path` push below.
-        let schema_set = self.schema_set;
-        let local_name = schema_set.name_table.resolve_ref(ev_state.local_name);
-        if !self.element_path.is_empty() || self.validation_stack.is_empty() {
-            self.element_path.push('/');
+        // The path step: count the element among the same-named siblings
+        // opened so far under its parent (path depth `depth`).
+        let depth = self.path_steps.len();
+        if self.sibling_counts.len() <= depth {
+            self.sibling_counts.push(SiblingCounter::default());
         }
-        self.element_path.push_str(local_name);
+        let position = self.sibling_counts[depth].next(ev_state.namespace, ev_state.local_name);
+        self.path_steps.push(RawPathStep {
+            namespace: ev_state.namespace,
+            local_name: ev_state.local_name,
+            position,
+        });
 
         // Inherit base URI from parent element, or from the document-level
         // base URI for the root element.
@@ -4522,16 +5046,118 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Pop the last element from the element path
     fn pop_element_path(&mut self) {
-        if let Some(pos) = self.element_path.rfind('/') {
-            self.element_path.truncate(pos);
-        } else {
-            self.element_path.clear();
+        if self.path_steps.pop().is_some() {
+            // The closed element's children were counted one level down; its
+            // next same-level sibling starts that level afresh.
+            if let Some(children) = self.sibling_counts.get_mut(self.path_steps.len() + 1) {
+                children.clear();
+            }
+            if self.path_nodes.len() > self.path_steps.len() {
+                self.path_nodes.truncate(self.path_steps.len());
+            }
+        }
+    }
+
+    /// The name `id` as a string shared by all diagnostics of the run.
+    fn shared_name(&mut self, id: NameId) -> Arc<str> {
+        let schema_set = self.schema_set;
+        self.name_cache
+            .entry(id)
+            .or_insert_with(|| Arc::from(schema_set.name_table.resolve_ref(id)))
+            .clone()
+    }
+
+    fn shared_expanded_name(
+        &mut self,
+        namespace: Option<NameId>,
+        local_name: NameId,
+    ) -> ExpandedName {
+        let namespace = namespace.map(|ns| self.shared_name(ns));
+        ExpandedName::from_shared(namespace, self.shared_name(local_name))
+    }
+
+    /// The path to the current element, sharing its steps with every
+    /// diagnostic made under it (built for the levels not built yet); `None`
+    /// outside any element.
+    fn current_element_path(&mut self) -> Option<InstancePath> {
+        while self.path_nodes.len() < self.path_steps.len() {
+            let step = self.path_steps[self.path_nodes.len()];
+            let name = self.shared_expanded_name(step.namespace, step.local_name);
+            let parent = self.path_nodes.last().cloned().unwrap_or_default();
+            self.path_nodes
+                .push(parent.child(PathStep::element(name, step.position)));
+        }
+        self.path_nodes.last().cloned()
+    }
+
+    /// The subject and the path of the current item — the attribute being
+    /// validated, else the current element; `None` outside any element.
+    fn current_item(&mut self) -> Option<(ValidationSubject, InstancePath)> {
+        let element = self.current_element_path()?;
+        Some(match self.current_attribute {
+            Some((namespace, local_name)) => {
+                let name = self.shared_expanded_name(namespace, local_name);
+                let path = element.child(PathStep::attribute(name.clone()));
+                (ValidationSubject::Attribute(name), path)
+            }
+            None => {
+                let name = element.last()?.name().clone();
+                (ValidationSubject::Element(name), element)
+            }
+        })
+    }
+
+    /// The local name of the innermost element opened and not yet closed.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn innermost_open_element_name(&self) -> Option<String> {
+        self.path_steps
+            .last()
+            .map(|step| self.schema_set.name_table.resolve(step.local_name))
+    }
+
+    /// The current item as an [`ErrorContext`], for a report made later.
+    fn capture_context(&mut self) -> ErrorContext {
+        ErrorContext {
+            item: self.current_item(),
+        }
+    }
+
+    /// Give `err` the subject and path of the current item, unless it names
+    /// one already.
+    fn with_current_context(&mut self, err: ValidationError) -> ValidationError {
+        if err.subject().is_some() || err.instance_path().is_some() {
+            return err;
+        }
+        match self.current_item() {
+            Some((subject, path)) => err.with_subject(subject).with_instance_path(path),
+            None => err,
+        }
+    }
+
+    /// [`with_current_context`](Self::with_current_context), and inside an
+    /// element its local-name path as the error's `element_path` (written
+    /// only if asked for), replacing any it had.
+    fn with_current_context_and_path(&mut self, err: ValidationError) -> ValidationError {
+        let mut err = self.with_current_context(err);
+        if !self.path_steps.is_empty() {
+            err.derive_element_path();
+        }
+        err
+    }
+
+    /// A warning about the current item.
+    fn warning_here(&mut self, code: &'static str, message: String) -> ValidationWarning {
+        let warning = ValidationWarning::new(code, message, self.current_location.clone());
+        match self.current_item() {
+            Some((subject, path)) => warning.with_subject(subject).with_instance_path(path),
+            None => warning,
         }
     }
 
     /// Emit a validation error: record its constraint code on the current
     /// element's `error_codes` list and dispatch to the sink.
     fn emit_error(&mut self, err: ValidationError) {
+        let err = self.with_current_context(err);
         if let Some(ev) = self.validation_stack.last_mut() {
             ev.error_codes.push(err.constraint);
         }
@@ -4542,6 +5168,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// instead of the stack top. Used during `validate_end_element` where
     /// the element has already been popped.
     fn emit_error_to(&mut self, err: ValidationError, codes: &mut Vec<&'static str>) {
+        let err = self.with_current_context(err);
         codes.push(err.constraint);
         self.sink.on_error(err);
     }
@@ -4608,27 +5235,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     fn report_error(&mut self, constraint: &'static str, message: impl Into<String>) {
         let err = errors::error(constraint, message, self.current_location.clone());
-        let err = if self.element_path.is_empty() {
-            err
-        } else {
-            err.with_path(self.element_path.clone())
-        };
+        let err = self.with_current_context_and_path(err);
         self.emit_error(err);
     }
 
-    /// Enrich `err` with `current_location` and `element_path` (if either is set).
-    /// `with_location` / `with_path` overwrite so this is safe to call even when
-    /// the error already carries them.
-    fn enrich(&self, err: ValidationError) -> ValidationError {
+    /// Enrich `err` with `current_location` and the local-name element path
+    /// (if either is set). `with_location` / `with_path` overwrite so this is
+    /// safe to call even when the error already carries them.
+    fn enrich(&mut self, err: ValidationError) -> ValidationError {
         let err = match &self.current_location {
             Some(loc) => err.with_location(loc.clone()),
             None => err,
         };
-        if self.element_path.is_empty() {
-            err
-        } else {
-            err.with_path(self.element_path.clone())
-        }
+        self.with_current_context_and_path(err)
     }
 
     /// Enrich `err` with current location/path and report it to an explicit
@@ -4663,10 +5282,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let Some(lexical) = super::simple::capacity_decimal(typed_value) else {
             return;
         };
-        let at = if self.element_path.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", self.element_path)
+        let at = match self.current_element_path() {
+            Some(path) => format!(" ({})", path.local_name_path()),
+            None => String::new(),
         };
         let message = format!(
             "xs:decimal value '{lexical}'{at} is valid but exceeds the decimal capacity of \
@@ -4674,11 +5292,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
              facets were checked on the exact value, and the typed value is carried as \
              its canonical string, so arithmetic on it raises FOAR0002"
         );
-        self.sink.on_warning(ValidationWarning {
-            code: crate::types::exact_decimal::DECIMAL_CAPACITY_WARNING,
+        let warning = self.warning_here(
+            crate::types::exact_decimal::DECIMAL_CAPACITY_WARNING,
             message,
-            location: self.current_location.clone(),
-        });
+        );
+        self.sink.on_warning(warning);
     }
 
     /// Mark the current element as invalid.
@@ -5043,14 +5661,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 refer_ns,
                                 refer.local_name,
                             );
-                            self.sink.on_warning(ValidationWarning {
-                                code: "cvc-identity-constraint",
-                                message: format!(
+                            // About the schema, not an instance item: no
+                            // location, subject or path.
+                            self.sink.on_warning(ValidationWarning::new(
+                                "cvc-identity-constraint",
+                                format!(
                                     "Keyref '{}': could not resolve refer target '{}'",
                                     name, refer_display
                                 ),
-                                location: None,
-                            });
+                                None,
+                            ));
                         }
                     }
                 }
@@ -5059,14 +5679,16 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             Err(e) => {
                 let name = self.schema_set.name_table.resolve(ic_name);
-                self.sink.on_warning(ValidationWarning {
-                    code: "cvc-identity-constraint",
-                    message: format!(
+                // About the schema, not an instance item: no location,
+                // subject or path.
+                self.sink.on_warning(ValidationWarning::new(
+                    "cvc-identity-constraint",
+                    format!(
                         "Identity constraint '{}': XPath compilation failed: {}",
                         name, e
                     ),
-                    location: None,
-                });
+                    None,
+                ));
                 self.compiled_constraints.insert(ic_key, None);
                 false
             }
@@ -5165,25 +5787,34 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         //    are already no-ops when nothing deactivated.
         if !self.active_constraints.is_empty() {
             let name_table = &self.schema_set.name_table;
-            let element_path: &str = &self.element_path;
             let location = self.current_location.clone();
             let mut ic_errors = Vec::new();
             for cs in &mut self.active_constraints {
+                // The element path is attached below, only to the errors
+                // there are — not built for every element end.
                 let errs = cs.end_element_with_text(
                     text_content,
                     typed_value,
                     is_nil,
                     is_complex_content,
                     name_table,
-                    element_path,
+                    "",
                     location.clone(),
                 );
                 let owner_depth = cs.owner_depth;
                 ic_errors.extend(errs.into_iter().map(|err| (err, owner_depth)));
             }
-            for (err, owner_depth) in ic_errors {
-                self.emit_error_to(err, error_codes);
-                self.invalidate_ic_owner(owner_depth, validity);
+            if !ic_errors.is_empty() {
+                for (err, owner_depth) in ic_errors {
+                    // The placeholder `""` becomes the current element's path.
+                    let err = if err.element_path() == Some("") {
+                        self.with_current_context_and_path(err)
+                    } else {
+                        err
+                    };
+                    self.emit_error_to(err, error_codes);
+                    self.invalidate_ic_owner(owner_depth, validity);
+                }
             }
         }
 
@@ -5257,10 +5888,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // open ancestors its verdict reaches.
                         let mut reach = self.invalidity_reach();
                         reach.push(serial);
+                        let context = self.capture_context();
                         self.deferred_keyrefs.push(DeferredKeyref {
                             table: keyref_table,
                             refer_key,
                             reach,
+                            context,
                         });
                     }
                 }
@@ -5435,10 +6068,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         self.register_id_value(item.to_string_value(), owner_serial);
                     }
                     XmlTypeCode::IdRef => {
+                        let context = self.capture_context();
                         self.pending_idrefs.push((
                             item.to_string_value(),
                             self.current_location.clone(),
-                            self.element_path.clone(),
+                            context,
                         ));
                     }
                     _ => {} // e.g. integer — not ID/IDREF
@@ -5458,18 +6092,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 if effective.type_code == XmlTypeCode::IdRefs {
                     // Fallback for IdRefs without parsed list: split lexical text
                     for token in value_str.split_whitespace() {
+                        let context = self.capture_context();
                         self.pending_idrefs.push((
                             token.to_string(),
                             self.current_location.clone(),
-                            self.element_path.clone(),
+                            context,
                         ));
                     }
                 } else {
                     // Single IdRef value
+                    let context = self.capture_context();
                     self.pending_idrefs.push((
                         effective.to_string_value(),
                         self.current_location.clone(),
-                        self.element_path.clone(),
+                        context,
                     ));
                 }
             }
@@ -5839,6 +6475,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             Some(ev) => std::mem::take(&mut ev.collected_attributes),
             None => return,
         };
+        // The attributes the caller asked to skip: skipped now unless an
+        // attribute use of the selected type matches them (§3.4.4.2 clause
+        // 2.1), in which case they are validated like the others.
+        let skip_requested = std::mem::take(&mut self.skipped_collected);
+        let process_contents = self
+            .validation_stack
+            .last()
+            .map_or(ContentProcessing::Strict, |ev| ev.process_contents);
 
         let ct_key = match schema_type {
             Some(TypeKey::Complex(k)) => k,
@@ -5847,19 +6491,42 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // no attribute declarations exist, but we must produce one
                 // result per collected attribute to keep the 1:1 invariant
                 // with the typed builder's deferred_attr_refs.
+                for &i in &skip_requested {
+                    if let Some((namespace, local_name, _)) = collected.get(i) {
+                        self.current_attribute = Some((*namespace, *local_name));
+                        self.record_skipped_attribute(*local_name, *namespace);
+                        self.current_attribute = None;
+                    }
+                }
                 self.deferred_attribute_results
                     .resize_with(collected.len(), SchemaInfo::empty);
                 return;
             }
         };
 
-        for (namespace, local_name, value) in &collected {
+        for (i, (namespace, local_name, value)) in collected.iter().enumerate() {
+            if skip_requested.contains(&i)
+                && !self.attribute_use_matches(
+                    schema_type,
+                    process_contents,
+                    *local_name,
+                    *namespace,
+                )
+            {
+                self.current_attribute = Some((*namespace, *local_name));
+                self.record_skipped_attribute(*local_name, *namespace);
+                self.current_attribute = None;
+                self.deferred_attribute_results.push(SchemaInfo::empty());
+                continue;
+            }
             let ec_snapshot = self
                 .validation_stack
                 .last()
                 .map_or(0, |ev| ev.error_codes.len());
+            self.current_attribute = Some((*namespace, *local_name));
             let mut info =
                 self.validate_attribute_against_type(ct_key, *local_name, *namespace, value);
+            self.current_attribute = None;
             self.fold_attribute_validity(&info);
             if let Some(ev) = self.validation_stack.last_mut() {
                 if ev.error_codes.len() > ec_snapshot {

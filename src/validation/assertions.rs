@@ -38,9 +38,9 @@ pub(crate) struct AssertionBufferFrame {
     pub element_ref: u32,
     /// ComplexType key whose assertions triggered this frame.
     pub complex_type_key: ComplexTypeKey,
-    /// Element path at the time this frame's element closed (for error reporting).
+    /// This frame's element as a diagnostic subject (error reporting).
     /// Populated when the frame is popped at its own end-element (before deferral).
-    pub element_path: String,
+    pub context: crate::validation::runtime::ErrorContext,
     /// Source location at the time this frame's element closed.
     pub location: Option<SourceLocation>,
     /// Whether a failure of this (deferred, nested) frame makes the outermost
