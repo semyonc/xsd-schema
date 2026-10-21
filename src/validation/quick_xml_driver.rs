@@ -12,9 +12,16 @@
 //!   responsible for `end_validation` on this path; see the
 //!   [`ValidationEventHandler`] trait for hook ordering.
 //!
-//! DTD-related events ([`Event::DocType`], [`Event::Decl`]) are silently
-//! dropped. Comments and processing instructions flow through the layer-2
-//! hooks; layer 1 ignores them via [`NoopHandler`].
+//! The text is read through the crate's well-formedness layer
+//! ([`crate::xml`]): a document that is not well-formed is refused with
+//! [`DriveWithError::NotWellFormed`], and the runtime's
+//! [`ParseLimits`](crate::xml::ParseLimits) are checked before anything of
+//! the markup that breaks one is interned
+//! ([`ValidationRuntime::set_parse_limits`]). A document type declaration in
+//! the prolog is reported to [`ValidationEventHandler::on_doctype`] and not
+//! processed; the XML declaration is checked and dropped. Comments and
+//! processing instructions flow through the layer-2 hooks; layer 1 ignores
+//! them via [`NoopHandler`].
 //!
 //! Namespace scoping (xmlns push/pop), `xsi:type`/`xsi:nil` discovery, and
 //! [`NamespaceContextSnapshot`] construction are handled internally so the
@@ -25,8 +32,6 @@ use std::convert::Infallible;
 use std::io::BufRead;
 
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
-use quick_xml::XmlVersion;
 use thiserror::Error;
 
 use crate::namespace::context::NamespaceContextSnapshot;
@@ -36,6 +41,8 @@ use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, SchemaValidity};
 use crate::validation::runtime::ValidationRuntime;
 use crate::validation::validator::ValidationSink;
+use crate::xml::reader::{AttrKind, AttrSpan, Recheck, WfError, WfReader};
+use crate::xml::{LimitExceeded, NotWellFormed};
 use crate::xml_entity::resolve_general_ref;
 
 // ── Public types ──────────────────────────────────────────────────────────
@@ -55,16 +62,23 @@ pub struct DriveOutcome {
 
 /// Errors raised by the layer-1 helpers.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DriveError {
-    #[error("xml parse error: {0}")]
-    Parse(#[from] quick_xml::Error),
-    #[error("utf-8 error: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-    #[error("unbound prefix '{0}'")]
-    UnboundPrefix(String),
-    /// Stream ended with `depth > 0` (open elements not closed).
-    #[error("unexpected eof: {depth} element(s) still open")]
-    UnexpectedEof { depth: usize },
+    /// An I/O error of the source (its own `std::io::Error`, also as
+    /// [`source`](std::error::Error::source)).
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The document is not well-formed or not namespace-well-formed (XML
+    /// 1.0 / 1.1 and Namespaces in XML; see [`crate::xml`]): every
+    /// refusal of the text — bytes that are not UTF-8, an unbound prefix,
+    /// input that ends inside an element included — with its rule and byte
+    /// position.
+    #[error("{0}")]
+    NotWellFormed(NotWellFormed),
+    /// The document broke one of the run's
+    /// [`ParseLimits`](crate::xml::ParseLimits).
+    #[error("{0}")]
+    LimitExceeded(LimitExceeded),
     /// `runtime.end_validation()` returned `Err` after the stream was driven.
     #[error("end_validation failed: {0}")]
     Validation(ValidationError),
@@ -72,15 +86,19 @@ pub enum DriveError {
 
 /// Errors raised by the layer-2 helpers.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum DriveWithError<E> {
-    #[error("xml parse error: {0}")]
-    Parse(quick_xml::Error),
-    #[error("utf-8 error: {0}")]
-    Utf8(std::str::Utf8Error),
-    #[error("unbound prefix '{0}'")]
-    UnboundPrefix(String),
-    #[error("unexpected eof: {depth} element(s) still open")]
-    UnexpectedEof { depth: usize },
+    /// An I/O error of the source (see [`DriveError::Io`]).
+    #[error("I/O error: {0}")]
+    Io(#[source] std::io::Error),
+    /// The document is not well-formed or not namespace-well-formed (see
+    /// [`DriveError::NotWellFormed`]).
+    #[error("{0}")]
+    NotWellFormed(NotWellFormed),
+    /// The document broke one of the run's
+    /// [`ParseLimits`](crate::xml::ParseLimits).
+    #[error("{0}")]
+    LimitExceeded(LimitExceeded),
     /// A handler hook returned an error.
     #[error("hook error")]
     Hook(E),
@@ -127,6 +145,32 @@ pub struct EndOfAttributesView<'a> {
     pub deferred_attribute_results: &'a [SchemaInfo],
 }
 
+/// A document type declaration in the prolog, passed to
+/// [`ValidationEventHandler::on_doctype`].
+///
+/// Reported only once it is known to be well-formed: in the prolog, written
+/// `<!DOCTYPE` S Name, with a well-formed external identifier and an internal
+/// subset whose markup is balanced (literals, comments, processing
+/// instructions, markup declarations, parameter-entity references). The
+/// driver does not process it: it reads no external subset, and an entity the
+/// internal subset declares is still undeclared when the document refers to
+/// it (`EntityDeclared`).
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub struct DoctypeView<'a> {
+    /// The declared root element name (\[28\] `doctypedecl ::= '<!DOCTYPE' S
+    /// Name ...`).
+    pub name: &'a str,
+    /// Everything between `<!DOCTYPE` and the closing `>`, leading white
+    /// space removed: the name, the external identifier and the internal
+    /// subset as written.
+    pub text: &'a str,
+    /// Byte offset of the declaration's `<` in the input (a leading
+    /// byte-order mark included), in the same system as
+    /// [`ValidationEventHandler::on_element_start_offset`].
+    pub byte_pos: usize,
+}
+
 /// What the runtime returned from `validate_end_element`.
 #[derive(Debug, Clone, Copy)]
 pub struct EndElementInfo {
@@ -153,6 +197,9 @@ pub enum TextKind {
 /// Every method has a default implementation that does nothing, so a
 /// handler that only cares about (say) end-of-element fires exactly that
 /// one method.
+///
+/// Before the root element, a document type declaration in the prolog is
+/// reported to `on_doctype` (comments and PIs there to their hooks).
 ///
 /// Hook ordering for one element:
 /// 1. `on_element_start_offset`
@@ -258,15 +305,41 @@ pub trait ValidationEventHandler {
         Ok(())
     }
 
-    /// Buffer offset of the `<` for the element about to be reported to
-    /// `before_element`. Default impl is a no-op; override only when
-    /// building a span-aware DOM.
+    /// A document type declaration in the prolog. The default accepts it and
+    /// does nothing — the declaration is not processed (see
+    /// [`DoctypeView`]); return an error to refuse documents that carry one.
+    ///
+    /// A document type declaration anywhere but in the prolog — after or
+    /// inside the root element, or a second one — is not well-formed and is
+    /// refused by the driver ([`DriveWithError::NotWellFormed`]) without
+    /// calling this hook.
+    fn on_doctype(&mut self, _doctype: DoctypeView<'_>) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// The document's XML declaration, before anything else of the document
+    /// (see [`XmlDeclaration`](crate::xml::XmlDeclaration)). The default
+    /// accepts it; return an error to refuse, for example, an `encoding` the
+    /// host did not decode the text from. Not called for a document without
+    /// one.
+    fn on_xml_declaration(
+        &mut self,
+        _declaration: &crate::xml::XmlDeclaration,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Byte offset into the input (a leading byte-order mark included) of
+    /// the `<` of the element about to be reported to `before_element`.
+    /// Default impl is a no-op; override only when building a span-aware
+    /// DOM.
     fn on_element_start_offset(&mut self, _byte_pos: usize) -> Result<(), Self::Error> {
         Ok(())
     }
 
-    /// Buffer offset just past the `>` of the closing tag. Default impl is a
-    /// no-op; override only when building a span-aware DOM.
+    /// Byte offset into the input (a leading byte-order mark included) just
+    /// past the `>` of the closing tag. Default impl is a no-op; override
+    /// only when building a span-aware DOM.
     fn on_element_end_offset(&mut self, _byte_pos: usize) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -286,7 +359,10 @@ impl ValidationEventHandler for NoopHandler {
 /// `runtime.end_validation()`.
 ///
 /// Validation diagnostics arrive through the sink the runtime was built with.
-/// DTD events are silently dropped. Comments and PIs are dropped.
+/// A document that is not well-formed, or breaks the runtime's parse limits,
+/// is refused ([`DriveError::NotWellFormed`], [`DriveError::LimitExceeded`]).
+/// A document type declaration in the prolog is accepted and not processed;
+/// comments and PIs are dropped.
 pub fn drive_quick_xml<R, S>(
     reader: R,
     runtime: &mut ValidationRuntime<'_, S>,
@@ -314,10 +390,9 @@ where
     let mut handler = NoopHandler;
     let outcome = drive_quick_xml_with_in(reader, runtime, schema_set, &mut handler, buf).map_err(
         |e| match e {
-            DriveWithError::Parse(e) => DriveError::Parse(e),
-            DriveWithError::Utf8(e) => DriveError::Utf8(e),
-            DriveWithError::UnboundPrefix(p) => DriveError::UnboundPrefix(p),
-            DriveWithError::UnexpectedEof { depth } => DriveError::UnexpectedEof { depth },
+            DriveWithError::Io(e) => DriveError::Io(e),
+            DriveWithError::NotWellFormed(e) => DriveError::NotWellFormed(e),
+            DriveWithError::LimitExceeded(e) => DriveError::LimitExceeded(e),
             DriveWithError::Hook(_) => unreachable!("NoopHandler is infallible"),
         },
     )?;
@@ -360,8 +435,9 @@ where
     S: ValidationSink,
     H: ValidationEventHandler,
 {
-    let mut xml_reader = Reader::from_reader(reader);
-    xml_reader.config_mut().trim_text(false);
+    // Every check of the shared well-formedness layer, and the run's parse
+    // limits, hold for an event before it reaches this loop.
+    let mut xml_reader = WfReader::new(reader, runtime.parse_limits(), false);
 
     // prefix bytes -> stack of URI strings (top-of-stack = current binding)
     let mut prefix_map: HashMap<Vec<u8>, Vec<String>> = HashMap::new();
@@ -387,11 +463,12 @@ where
     // validated as one chunk, the way a single unsplit text event would be.
     let mut pending_text = String::new();
 
+    // The reader clears the buffer itself before each read.
     buf.clear();
 
     loop {
-        let event_start = xml_reader.buffer_position() as usize;
         let event = xml_reader.read_event_into(buf);
+        let event_start = xml_reader.event_start() as usize;
 
         // A run of character data containing `&amp;` or `&#65;` is reported as
         // Text / GeneralRef / Text, so gather the whole run before validating
@@ -399,16 +476,18 @@ where
         // single ill-placed run more than once.
         match &event {
             Ok(Event::Text(e)) if depth > 0 => {
+                // XML 1.0 / 1.1 line-end normalization (§2.11).
                 pending_text.push_str(
-                    &e.xml10_content()
-                        .map_err(|err| DriveWithError::Parse(quick_xml::Error::Encoding(err)))?,
+                    &e.xml_content(xml_reader.quick_xml_version())
+                        .map_err(|_| drive_error(xml_reader.recheck().utf8()))?,
                 );
-                buf.clear();
                 continue;
             }
             Ok(Event::GeneralRef(e)) if depth > 0 => {
-                pending_text.push_str(&resolve_general_ref(e).map_err(DriveWithError::Parse)?);
-                buf.clear();
+                pending_text.push_str(
+                    &resolve_general_ref(e)
+                        .map_err(|e| drive_error(xml_reader.recheck().decoding(e)))?,
+                );
                 continue;
             }
             _ => flush_text_run(&mut pending_text, runtime, handler)?,
@@ -420,7 +499,7 @@ where
                     e,
                     false,
                     event_start,
-                    &mut xml_reader,
+                    &xml_reader,
                     runtime,
                     schema_set,
                     handler,
@@ -436,7 +515,7 @@ where
                     e,
                     true,
                     event_start,
-                    &mut xml_reader,
+                    &xml_reader,
                     runtime,
                     schema_set,
                     handler,
@@ -468,36 +547,66 @@ where
                 depth = depth.saturating_sub(1);
             }
             Ok(Event::CData(ref e)) if depth > 0 => {
-                let s = std::str::from_utf8(e.as_ref()).map_err(DriveWithError::Utf8)?;
+                let s = std::str::from_utf8(e.as_ref())
+                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
                 runtime.validate_text(s);
                 handler
                     .on_text(TextKind::CData, s)
                     .map_err(DriveWithError::Hook)?;
             }
             Ok(Event::Text(_) | Event::GeneralRef(_) | Event::CData(_)) => {
-                // Outside any element — significant for neither validator nor handler.
+                // Outside any element: white space (the reader refuses
+                // anything else there) — significant for neither validator
+                // nor handler.
             }
             Ok(Event::Comment(ref e)) => {
-                let s = std::str::from_utf8(e.as_ref()).map_err(DriveWithError::Utf8)?;
+                let s = std::str::from_utf8(e.as_ref())
+                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
                 handler.on_comment(s).map_err(DriveWithError::Hook)?;
             }
             Ok(Event::PI(ref e)) => {
-                let raw = std::str::from_utf8(e.as_ref()).map_err(DriveWithError::Utf8)?;
+                let raw = std::str::from_utf8(e.as_ref())
+                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?;
                 let (target, data) = parse_pi_content(raw);
                 handler
                     .on_processing_instruction(target, data)
                     .map_err(DriveWithError::Hook)?;
             }
-            Ok(Event::Decl(_) | Event::DocType(_)) => {}
+            Ok(Event::DocType(ref e)) => {
+                // In the prolog (the reader refuses one anywhere else). The
+                // keyword is checked on the markup before the hook sees it.
+                let text = std::str::from_utf8(e.as_ref())
+                    .map_err(|_| drive_error(xml_reader.recheck().utf8()))?
+                    .to_string();
+                xml_reader.confirm_doctype(buf).map_err(drive_error)?;
+                let name_end = text
+                    .find([' ', '\t', '\n', '\r', '['])
+                    .unwrap_or(text.len());
+                handler
+                    .on_doctype(DoctypeView {
+                        name: &text[..name_end],
+                        text: &text,
+                        byte_pos: event_start,
+                    })
+                    .map_err(DriveWithError::Hook)?;
+            }
+            Ok(Event::Decl(_)) => {
+                if let Some(declaration) = xml_reader.declaration() {
+                    handler
+                        .on_xml_declaration(declaration)
+                        .map_err(DriveWithError::Hook)?;
+                }
+            }
             Ok(Event::Eof) => {
                 if depth != 0 {
-                    return Err(DriveWithError::UnexpectedEof { depth });
+                    // The reader refuses input that ends inside an element
+                    // before it returns `Eof`.
+                    return Err(drive_error(xml_reader.recheck().truncated(depth)));
                 }
                 break;
             }
-            Err(e) => return Err(DriveWithError::Parse(e)),
+            Err(e) => return Err(drive_error(e)),
         }
-        buf.clear();
     }
 
     Ok(DriveOutcome {
@@ -507,6 +616,15 @@ where
 }
 
 // ── Internals ─────────────────────────────────────────────────────────────
+
+/// The driver's error for an error of the well-formedness layer.
+fn drive_error<E>(e: WfError) -> DriveWithError<E> {
+    match e {
+        WfError::Io(e) => DriveWithError::Io(e),
+        WfError::NotWellFormed(e) => DriveWithError::NotWellFormed(e),
+        WfError::Limit(e) => DriveWithError::LimitExceeded(e),
+    }
+}
 
 /// Validate and forward an accumulated run of character data, then reset it.
 ///
@@ -542,7 +660,7 @@ fn handle_start_or_empty<R, S, H>(
     e: &BytesStart<'_>,
     is_empty: bool,
     event_start: usize,
-    xml_reader: &mut Reader<R>,
+    xml_reader: &WfReader<R>,
     runtime: &mut ValidationRuntime<'_, S>,
     schema_set: &SchemaSet,
     handler: &mut H,
@@ -563,7 +681,15 @@ where
     }
 
     // 1. Push xmlns scope, collect declarations as (prefix_string, uri_string).
-    let ns_decls_owned = match push_xmlns_scope(e, prefix_map, scope_stack) {
+    // The tag's attributes, as the reader found them while checking it.
+    let tag: &[u8] = e;
+    let spans = xml_reader.attributes();
+    let version = xml_reader.quick_xml_version();
+    // The reader checked the tag (UTF-8, bound prefixes, references): `at`
+    // reports what still fails as the refusal it is (see `Recheck`).
+    let at = xml_reader.recheck();
+
+    let ns_decls_owned = match push_xmlns_scope(tag, spans, version, at, prefix_map, scope_stack) {
         Ok(v) => v,
         Err(err) => {
             // Scope was not pushed, so just unwind depth.
@@ -577,7 +703,7 @@ where
         .collect();
 
     // 2. Resolve element name + scan xsi:type / xsi:nil.
-    let (local_name, namespace_uri, elem_prefix) = match resolve_element_qname(e, prefix_map) {
+    let (local_name, namespace_uri, elem_prefix) = match resolve_element_qname(e, at, prefix_map) {
         Ok(v) => v,
         Err(err) => {
             pop_xmlns_scope(prefix_map, scope_stack);
@@ -585,7 +711,7 @@ where
             return Err(err);
         }
     };
-    let (xsi_type, xsi_nil) = match scan_xsi_attributes(e, prefix_map) {
+    let (xsi_type, xsi_nil) = match scan_xsi_attributes(tag, spans, version, at, prefix_map) {
         Ok(v) => v,
         Err(err) => {
             pop_xmlns_scope(prefix_map, scope_stack);
@@ -632,26 +758,25 @@ where
         .map_err(DriveWithError::Hook)?;
 
     // 5. Attributes.
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| DriveWithError::Parse(err.into()))?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+    for span in spans {
+        if span.kind != AttrKind::Attribute {
             continue;
         }
-        let (prefix_bytes, local_bytes) = split_prefix_local(key);
-        let attr_local = std::str::from_utf8(local_bytes).map_err(DriveWithError::Utf8)?;
-        let attr_prefix = std::str::from_utf8(prefix_bytes).map_err(DriveWithError::Utf8)?;
+        let prefix_bytes = span.prefix(tag);
+        let utf8 = |_| drive_error(at.utf8());
+        let attr_local = std::str::from_utf8(span.local(tag)).map_err(utf8)?;
+        let attr_prefix = std::str::from_utf8(prefix_bytes).map_err(utf8)?;
         let attr_ns = if prefix_bytes.is_empty() {
             String::new()
         } else {
             match prefix_map.get(prefix_bytes).and_then(|stack| stack.last()) {
-                Some(uri) => uri.clone(),
-                None => return Err(DriveWithError::UnboundPrefix(attr_prefix.to_string())),
+                Some(uri) if !uri.is_empty() => uri.clone(),
+                _ => return Err(drive_error(at.unbound(prefix_bytes))),
             }
         };
-        let value = attr
-            .normalized_value(XmlVersion::Implicit1_0)
-            .map_err(DriveWithError::Parse)?;
+        let value = span
+            .value(tag, version)
+            .map_err(|e| drive_error(at.decoding(e)))?;
 
         let av = AttributeView {
             local_name: attr_local,
@@ -710,38 +835,36 @@ where
     Ok(())
 }
 
-/// Collect xmlns / xmlns:* declarations on `e` into `prefix_map`. Returns
-/// the (prefix, uri) declarations so they can be exposed to handlers.
+/// Collect xmlns / xmlns:* declarations of the tag into `prefix_map`.
+/// Returns the (prefix, uri) declarations so they can be exposed to handlers.
 fn push_xmlns_scope<E>(
-    e: &BytesStart<'_>,
+    tag: &[u8],
+    spans: &[AttrSpan],
+    version: quick_xml::XmlVersion,
+    at: Recheck,
     prefix_map: &mut HashMap<Vec<u8>, Vec<String>>,
     scope_stack: &mut Vec<Vec<Vec<u8>>>,
 ) -> Result<Vec<(String, String)>, DriveWithError<E>> {
     let mut declared: Vec<Vec<u8>> = Vec::new();
     let mut decls_owned: Vec<(String, String)> = Vec::new();
 
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| DriveWithError::Parse(err.into()))?;
-        let key = attr.key.as_ref();
-        let (prefix_bytes, prefix_str) = if key == b"xmlns" {
-            (Vec::new(), String::new())
-        } else if let Some(rest) = key.strip_prefix(b"xmlns:") {
-            let prefix_str = std::str::from_utf8(rest)
-                .map_err(DriveWithError::Utf8)?
-                .to_string();
-            (rest.to_vec(), prefix_str)
-        } else {
+    for span in spans {
+        if span.kind == AttrKind::Attribute {
             continue;
-        };
-        let value = attr
-            .normalized_value(XmlVersion::Implicit1_0)
-            .map_err(DriveWithError::Parse)?;
-        let uri = value.into_owned();
+        }
+        let prefix_bytes = span.prefix(tag);
+        let prefix_str = std::str::from_utf8(prefix_bytes)
+            .map_err(|_| drive_error(at.utf8()))?
+            .to_string();
+        let uri = span
+            .value(tag, version)
+            .map_err(|e| drive_error(at.decoding(e)))?
+            .into_owned();
         prefix_map
-            .entry(prefix_bytes.clone())
+            .entry(prefix_bytes.to_vec())
             .or_default()
             .push(uri.clone());
-        declared.push(prefix_bytes);
+        declared.push(prefix_bytes.to_vec());
         decls_owned.push((prefix_str, uri));
     }
 
@@ -767,15 +890,16 @@ fn pop_xmlns_scope(
 
 fn resolve_element_qname<E>(
     e: &BytesStart<'_>,
+    at: Recheck,
     prefix_map: &HashMap<Vec<u8>, Vec<String>>,
 ) -> Result<(String, String, String), DriveWithError<E>> {
     let name = e.name();
     let (prefix_bytes, local_bytes) = split_prefix_local(name.as_ref());
     let local = std::str::from_utf8(local_bytes)
-        .map_err(DriveWithError::Utf8)?
+        .map_err(|_| drive_error(at.utf8()))?
         .to_string();
     let prefix = std::str::from_utf8(prefix_bytes)
-        .map_err(DriveWithError::Utf8)?
+        .map_err(|_| drive_error(at.utf8()))?
         .to_string();
     let namespace = if prefix_bytes.is_empty() {
         prefix_map
@@ -785,26 +909,27 @@ fn resolve_element_qname<E>(
             .unwrap_or_default()
     } else {
         match prefix_map.get(prefix_bytes).and_then(|stack| stack.last()) {
-            Some(uri) => uri.clone(),
-            None => return Err(DriveWithError::UnboundPrefix(prefix)),
+            Some(uri) if !uri.is_empty() => uri.clone(),
+            _ => return Err(drive_error(at.unbound(prefix_bytes))),
         }
     };
     Ok((local, namespace, prefix))
 }
 
 fn scan_xsi_attributes<E>(
-    e: &BytesStart<'_>,
+    tag: &[u8],
+    spans: &[AttrSpan],
+    version: quick_xml::XmlVersion,
+    at: Recheck,
     prefix_map: &HashMap<Vec<u8>, Vec<String>>,
 ) -> Result<(Option<String>, Option<String>), DriveWithError<E>> {
     let mut xsi_type: Option<String> = None;
     let mut xsi_nil: Option<String> = None;
-    for attr_result in e.attributes() {
-        let attr = attr_result.map_err(|err| DriveWithError::Parse(err.into()))?;
-        let key = attr.key.as_ref();
-        if key == b"xmlns" || key.starts_with(b"xmlns:") {
+    for span in spans {
+        if span.kind != AttrKind::Attribute {
             continue;
         }
-        let (prefix_bytes, local_bytes) = split_prefix_local(key);
+        let prefix_bytes = span.prefix(tag);
         if prefix_bytes.is_empty() {
             continue;
         }
@@ -815,13 +940,22 @@ fn scan_xsi_attributes<E>(
         if ns_uri != XSI_NAMESPACE {
             continue;
         }
-        let local = std::str::from_utf8(local_bytes).map_err(DriveWithError::Utf8)?;
-        let value = attr
-            .normalized_value(XmlVersion::Implicit1_0)
-            .map_err(DriveWithError::Parse)?;
+        let local = std::str::from_utf8(span.local(tag)).map_err(|_| drive_error(at.utf8()))?;
         match local {
-            "type" => xsi_type = Some(value.into_owned()),
-            "nil" => xsi_nil = Some(value.into_owned()),
+            "type" => {
+                xsi_type = Some(
+                    span.value(tag, version)
+                        .map_err(|e| drive_error(at.decoding(e)))?
+                        .into_owned(),
+                )
+            }
+            "nil" => {
+                xsi_nil = Some(
+                    span.value(tag, version)
+                        .map_err(|e| drive_error(at.decoding(e)))?
+                        .into_owned(),
+                )
+            }
             _ => {}
         }
     }
@@ -954,8 +1088,11 @@ mod tests {
         // Truncated stream: open tag with no close.
         let res = drive_quick_xml("<root>".as_bytes(), &mut runtime, &schema_set);
         match res {
-            Err(DriveError::UnexpectedEof { depth }) => assert_eq!(depth, 1),
-            other => panic!("expected UnexpectedEof, got {other:?}"),
+            Err(DriveError::NotWellFormed(e)) => {
+                assert_eq!(e.rule(), crate::xml::WellFormednessRule::Truncated);
+                assert!(e.message().contains("1 element"), "{e}");
+            }
+            other => panic!("expected NotWellFormed(Truncated), got {other:?}"),
         }
     }
 
@@ -984,8 +1121,11 @@ mod tests {
             &schema_set,
         );
         match res {
-            Err(DriveError::UnboundPrefix(p)) => assert_eq!(p, "nope"),
-            other => panic!("expected UnboundPrefix, got {other:?}"),
+            Err(DriveError::NotWellFormed(e)) => {
+                assert_eq!(e.rule(), crate::xml::WellFormednessRule::PrefixDeclared);
+                assert!(e.message().contains("'nope'"), "{e}");
+            }
+            other => panic!("expected NotWellFormed(PrefixDeclared), got {other:?}"),
         }
     }
 
@@ -1122,7 +1262,11 @@ mod tests {
         };
         let mut runtime = validator.start_run(sink);
         let res = drive_quick_xml("<root>&nope;</root>".as_bytes(), &mut runtime, &schema_set);
-        assert!(matches!(res, Err(DriveError::Parse(_))), "got {res:?}");
+        assert!(
+            matches!(&res, Err(DriveError::NotWellFormed(e))
+                if e.rule() == crate::xml::WellFormednessRule::EntityDeclared),
+            "got {res:?}"
+        );
     }
 
     #[test]

@@ -83,6 +83,10 @@ type alternatives, identity helpers, and standalone XPath use.
 schema bytes / locations
         |
         v
+well-formedness layer over quick-xml (see below)
+src/xml/
+        |
+        v
 parse + assemble
 src/parser/parse.rs
 src/parser/frames/
@@ -119,8 +123,16 @@ src/validation/validator.rs
 src/validation/runtime.rs
         ^
         |
-quick-xml streaming driver
+streaming driver (namespaces, xsi: attributes, text runs, hooks)
 src/validation/quick_xml_driver.rs
+        ^
+        |
+well-formedness layer over quick-xml (XML 1.0 / 1.1, Namespaces,
+declarations, parse limits) — shared with the document builder
+src/xml/
+        ^
+        |
+instance bytes
 ```
 
 ### Phase Ownership
@@ -215,7 +227,8 @@ Important runtime modules:
 | --- | --- |
 | `src/validation/validator.rs` | Public push-event API and validator configuration. |
 | `src/validation/runtime.rs` | Main per-run validation engine. |
-| `src/validation/quick_xml_driver.rs` | Reusable mid-layer between `quick-xml` and the runtime push API. |
+| `src/xml/` | The well-formedness layer over `quick-xml` that every text reader sits on: XML 1.0 / 1.1 and Namespaces rules, the XML and document type declarations, `ParseLimits`, the `NotWellFormed` / `LimitExceeded` errors. |
+| `src/validation/quick_xml_driver.rs` | The streaming driver on that layer: turns its checked events into the runtime push API (namespace scope, `xsi:` attributes, namespace snapshots, text runs) and calls the `ValidationEventHandler` hooks. |
 | `src/validation/content.rs` | Content-model state transitions. |
 | `src/validation/simple.rs` | Simple type, list/union, atomic value, and facet validation. |
 | `src/validation/identity.rs` | Streaming `key`, `unique`, and `keyref` evaluation. |
@@ -230,43 +243,72 @@ set. XSD 1.1 assertions are evaluated when `PROCESS_ASSERTIONS` is set —
 `SchemaValidator::new` honours it, and `SchemaValidator::new_fragment_buffer`
 sets it.
 
-### Streaming Driver — The Mid-Layer Between `quick-xml` And The Runtime
+### Reading XML: The Well-Formedness Layer And The Streaming Driver
 
 The push-event API on `ValidationRuntime` (`validate_element`,
 `validate_attribute`, `validate_end_of_attributes`, `validate_text`,
 `validate_whitespace`, `validate_end_element`, `end_validation`) is
-deliberately XML-source-agnostic. Driving it from a real `quick-xml`
-stream needs non-trivial plumbing: maintaining the xmlns prefix scope,
-resolving element/attribute namespaces, scanning for `xsi:type` and
-`xsi:nil`, building a `NamespaceContextSnapshot`, separating whitespace
-from character text, and tracking depth for stream-end consistency.
-
-`src/validation/quick_xml_driver.rs` is the shared mid-layer that owns
-that plumbing once. It sits between `quick-xml` and the push API:
+deliberately XML-source-agnostic. Reading XML text into it takes two layers,
+each owning its part once:
 
 ```text
-quick_xml::Reader  -->  quick_xml_driver  -->  ValidationRuntime push API
-                          (xmlns scope,         (validate_element, etc.)
-                           xsi scan,
-                           ns context,
-                           depth tracking)
+bytes --> quick_xml::Reader --> xml layer -----------> quick_xml_driver ----------> ValidationRuntime
+          (tokenizes)            (src/xml/)              (src/validation/)            push API
+                                 well-formedness,        xmlns scope -> URIs,         (validate_element,
+                                 XML 1.0 / 1.1,          xsi:type / xsi:nil,          validate_attribute,
+                                 Namespaces,             namespace snapshots,         ...)
+                                 declarations,           text runs joined,
+                                 parse limits,           ValidationEventHandler hooks
+                                 attribute spans
+                                     |
+                                     +--> BufferDocumentBuilder::build  (BufferDocument::from_reader)
+                                     +--> TrackedReader                 (schema documents)
 ```
 
-Two layers are exposed:
+`src/xml/` is the one place where the crate reads XML text: the driver, the
+document builder and the schema-document parser all sit on it. It checks each
+event before any of them sees it, so nothing of a refused construct reaches
+code that interns names or builds nodes:
+
+| Where | What |
+| --- | --- |
+| `quick-xml` | Finds the markup boundaries; matches end tags to start tags. |
+| `src/xml/` | Document structure (one root, nothing but white space, comments and PIs outside it, truncated input); names and qualified names; tag syntax; attribute uniqueness, also by expanded name; references (characters of any length, the five predefined entities); characters (`Char`, UTF-8); the XML declaration (its grammar; it selects XML 1.0 or 1.1 rules) and the document type declaration (placement and grammar, not processed); the namespace constraints (every prefix bound, reserved prefixes and names, undeclaring); `ParseLimits`. Every refusal is `xml::NotWellFormed` (rule, byte position, version), every limit `xml::LimitExceeded`. |
+| `quick_xml_driver` | Namespace resolution to URIs, `NamespaceContextSnapshot`s, `xsi:type` / `xsi:nil`, joining and classifying text runs, the hook order. |
+| `ValidationRuntime` | Validation. |
+
+The rules follow the XML declaration: XML 1.1 and Namespaces in XML 1.1 for
+`version="1.1"`, XML 1.0 and Namespaces in XML 1.0 otherwise. The checks are
+always on (XML 1.0 §1.2 makes a well-formedness violation a fatal error); the
+limits are opt-in — `ValidationRuntime::set_parse_limits` for the driver and
+the typed build, `BufferDocumentBuilder::with_parse_limits` for the builder.
+
+The driver exposes two layers:
 
 - **Layer 1 (turn-key):** `drive_quick_xml` / `drive_quick_xml_in`.
   Streams a reader into the runtime, then calls
   `runtime.end_validation()`. Diagnostics arrive through the runtime's
-  `ValidationSink`. Comments, processing instructions, and DTD events
-  are dropped. Use this when all you want is validation diagnostics.
+  `ValidationSink`. The XML declaration and a document type declaration in
+  the prolog are accepted, comments and processing instructions dropped.
+  Use this when all you want is validation diagnostics.
 - **Layer 2 (handler-driven):** `drive_quick_xml_with` /
   `drive_quick_xml_with_in` plus a caller-supplied
   `ValidationEventHandler`. Every method on the trait has a no-op default,
   so a handler that only cares about (say) end-of-element fires exactly
-  that one method. Comments, PIs, and optional source-span offsets flow
-  through dedicated hooks. Layer 2 does **not** call `end_validation`;
-  the caller does so after collecting any post-stream runtime state
-  (e.g. `schema_location_hints`, `no_namespace_schema_location_hints`).
+  that one method. The XML declaration (`on_xml_declaration`), a document
+  type declaration in the prolog (`on_doctype`, once its grammar has been
+  checked), comments, PIs and source-span offsets flow through dedicated
+  hooks; a hook that returns an error refuses the document. Layer 2 does
+  **not** call `end_validation`; the caller does so after collecting any
+  post-stream runtime state (e.g. `schema_location_hints`,
+  `no_namespace_schema_location_hints`).
+
+Errors are `DriveError` / `DriveWithError`: `NotWellFormed` for every
+refusal of the text, `LimitExceeded` for a limit, `Io` for an I/O error of
+the source (its `std::io::Error`), `Hook` for a handler's error; the document builder and
+the typed build report the same through `BufferDocumentError`. Offsets — the
+span hooks, `DoctypeView::byte_pos`, source spans and error positions — are
+byte offsets into the input, a leading byte-order mark included.
 
 In-tree consumers:
 
@@ -475,6 +517,7 @@ DOM implementation, and they should not reimplement type machinery — see the
 | `src/embedded.rs` | Embedded catalog schemas such as XML and XLink. |
 | `src/regex_convert.rs` | XSD regex translation for the Rust `regex` backend. |
 | `src/regex_xsd_unicode.rs` | Unicode 3.0 tables for XSD 1.0 regex compatibility. |
+| `src/xml/` | The well-formedness layer over `quick-xml` shared by every text reader; `ParseLimits`. |
 | `src/parser/` | Schema XML parsing, frame state machine, assembly, loaders, source maps. |
 | `src/schema/` | Schema model, composition, inline allocation, reference resolution, derivation, EDC. |
 | `src/types/` | Built-in type registry, XSD atomic values, facets, conversions, equality. |
@@ -538,6 +581,7 @@ DOM implementation, and they should not reimplement type machinery — see the
 | Type derivation or value constraints | `src/schema/derivation.rs` | `src/types/`, `src/validation/simple.rs` |
 | Content model or UPA failures | `src/compiler/` | `src/validation/content.rs`, `src/pipeline.rs` |
 | Instance validation behavior | `src/validation/runtime.rs` | `src/validation/simple.rs`, `src/validation/info.rs` |
+| Well-formedness or parse limits | `src/xml/reader.rs` | `src/xml/chars.rs`, `src/validation/quick_xml_driver.rs`, `tests/well_formedness.rs` |
 | Identity constraints | `src/validation/identity.rs` | `src/validation/active_axis.rs`, `src/validation/identity_parser.rs` |
 | XSD 1.1 assertions | `src/validation/assertions.rs` | `src/document/`, `src/xpath/` |
 | XPath engine work | `src/xpath/` | `src/navigator/`, `src/document/` |

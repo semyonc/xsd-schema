@@ -1393,13 +1393,14 @@ fn validate_instance_pass(
         root_validity: None,
     };
     drive_quick_xml_with(content, &mut runtime, schema_set, &mut handler).map_err(|e| match e {
-        DriveWithError::Parse(e) => format!("XML parse error: {}", e),
-        DriveWithError::Utf8(e) => format!("UTF-8 error: {}", e),
-        DriveWithError::UnboundPrefix(p) => format!("Unbound prefix: {}", p),
-        DriveWithError::UnexpectedEof { depth } => {
-            format!("Unexpected EOF: {} element(s) still open", depth)
-        }
+        // The content is in memory: no I/O error can come; not a
+        // well-formedness verdict either way.
+        DriveWithError::Io(e) => format!("I/O error: {}", e),
         DriveWithError::Hook(_) => unreachable!("DriverHandler is infallible"),
+        // Every well-formedness refusal of the reader: the instance is not
+        // even well-formed XML.
+        DriveWithError::NotWellFormed(e) => format!("XML parse error: {}", e),
+        other => format!("{}", other),
     })?;
 
     // Collect hints before end_validation consumes the runtime

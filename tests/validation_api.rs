@@ -740,18 +740,18 @@ mod typed_build {
         assert!(std::error::Error::source(&e).is_some());
     }
 
-    /// Input that ends inside an element is the XML error quick-xml gives
-    /// for a missing end tag, not an internal error — also from the
-    /// turn-key build.
+    /// Input that ends inside an element is a well-formedness error
+    /// (`Truncated`, naming the open element), not an internal error — also
+    /// from the turn-key build.
     #[test]
     fn truncated_input_is_an_xml_error() {
         let ss = schema(XsdVersion::V1_1, SCHEMA);
         let validator = SchemaValidator::new(&ss, ValidationFlags::default());
         let arena = Bump::new();
         let missing_end_tag = |e: &BufferDocumentError| {
-            matches!(e, BufferDocumentError::Parse(quick_xml::Error::IllFormed(
-                quick_xml::errors::IllFormedError::MissingEndTag(name),
-            )) if name == "order")
+            matches!(e, BufferDocumentError::NotWellFormed(e)
+                if e.rule() == xsd_schema::xml::WellFormednessRule::Truncated
+                    && e.message().contains("1 element"))
         };
         let mut runtime = validator.start_run(xsd_schema::document::SilentValidationSink);
         let result = build_typed_document_with(

@@ -285,9 +285,18 @@ pub struct BufferDocument<'a> {
     /// [`BufferDocument::set_document_base_uri`] for a host that knows where
     /// the document came from.
     pub(crate) fragment_base_uri: Option<&'a str>,
+    /// The XML declaration of a document read from text.
+    pub(crate) xml_declaration: Option<crate::xml::XmlDeclaration>,
 }
 
 impl<'a> BufferDocument<'a> {
+    /// The XML declaration of a document read from text (by
+    /// `BufferDocument::from_reader`, `BufferDocumentBuilder::build` or the
+    /// typed build), if it had one.
+    pub fn xml_declaration(&self) -> Option<&crate::xml::XmlDeclaration> {
+        self.xml_declaration.as_ref()
+    }
+
     // ── Accessors ──────────────────────────────────────────────────────
 
     /// Returns the document kind (full or fragment).
@@ -737,6 +746,7 @@ mod tests {
             id_elements: HashMap::new(),
             schema_set: None,
             fragment_base_uri: None,
+            xml_declaration: None,
         }
     }
 

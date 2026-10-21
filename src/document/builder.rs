@@ -12,8 +12,6 @@ use std::io::BufRead;
 
 use bumpalo::Bump;
 use quick_xml::events::Event;
-use quick_xml::Reader;
-use quick_xml::XmlVersion;
 
 use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::namespace::table::XML_NAMESPACE;
@@ -24,6 +22,7 @@ use crate::schema::SchemaSet;
 use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use crate::validation::info::ContentType;
+use crate::xml::reader::{AttrKind, WfError, WfReader};
 use crate::xml_entity::resolve_general_ref;
 
 use super::buffer::{
@@ -42,7 +41,6 @@ use super::{
 /// Tracks per-element state during document construction.
 #[derive(Clone, Copy, Debug)]
 struct ElementBuildState {
-    #[allow(dead_code)] // used by navigator in Step 7
     node_ref: u32,
     #[allow(dead_code)] // used by navigator in Step 7
     has_attrs: bool,
@@ -110,6 +108,8 @@ pub struct BufferDocumentBuilder<'a> {
     /// How many element and attribute nodes carry a binding, so that
     /// `has_type_annotations` stays exact when a binding is taken away again.
     annotated_nodes: usize,
+    /// Limits on the text [`build`](Self::build) reads.
+    parse_limits: crate::xml::ParseLimits,
 }
 
 impl<'a> BufferDocumentBuilder<'a> {
@@ -169,6 +169,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             id_elements: HashMap::new(),
             schema_set,
             fragment_base_uri: None,
+            xml_declaration: None,
         };
 
         Ok(Self {
@@ -188,7 +189,23 @@ impl<'a> BufferDocumentBuilder<'a> {
             dropped_duplicate_id: None,
             id_classes: Vec::new(),
             annotated_nodes: 0,
+            parse_limits: crate::xml::ParseLimits::none(),
         })
+    }
+
+    /// This builder with limits on the XML text [`build`](Self::build)
+    /// reads (see [`ParseLimits`](crate::xml::ParseLimits)): each is checked
+    /// on the raw markup before anything of it is interned or built, and a
+    /// document that breaks one is refused with
+    /// [`BufferDocumentError::LimitExceeded`]. The default is no limits. The
+    /// push API is not limited.
+    ///
+    /// A typed build reads through the validation driver, which takes its
+    /// limits from the validation runtime instead
+    /// ([`ValidationRuntime::set_parse_limits`](crate::validation::ValidationRuntime::set_parse_limits)).
+    pub fn with_parse_limits(mut self, limits: crate::xml::ParseLimits) -> Self {
+        self.parse_limits = limits;
+        self
     }
 
     // ── Core push API ─────────────────────────────────────────────────
@@ -1088,13 +1105,23 @@ impl<'a> BufferDocumentBuilder<'a> {
 
     // ── quick-xml adapter ─────────────────────────────────────────────
 
-    /// Builds the document from a quick-xml event stream.
+    /// Builds the document from XML text.
+    ///
+    /// The text is read through the crate's well-formedness layer
+    /// ([`crate::xml`]), with the rules of the version its XML declaration
+    /// names: a document that is not well-formed is refused with
+    /// [`BufferDocumentError::NotWellFormed`] (input that ends inside an
+    /// element included), and the limits set with
+    /// [`with_parse_limits`](Self::with_parse_limits) are checked before
+    /// anything of the markup that breaks one is interned
+    /// ([`BufferDocumentError::LimitExceeded`]). The XML declaration is kept
+    /// ([`BufferDocument::xml_declaration`]); a document type declaration in
+    /// the prolog is checked and not kept.
     pub fn build<R: BufRead>(
         mut self,
         reader: R,
     ) -> Result<BufferDocument<'a>, BufferDocumentError> {
-        let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.config_mut().trim_text(false);
+        let mut xml_reader = WfReader::new(reader, &self.parse_limits, false);
 
         // Transient prefix → URI mapping for namespace resolution
         let mut prefix_map: HashMap<Box<[u8]>, Vec<String>> = HashMap::new();
@@ -1114,23 +1141,34 @@ impl<'a> BufferDocumentBuilder<'a> {
         let mut buf = Vec::with_capacity(1024);
 
         loop {
+            let event = xml_reader.read_event_into(&mut buf);
             let event_start = if track {
-                xml_reader.buffer_position() as usize
+                xml_reader.event_start() as usize
             } else {
                 0
             };
 
-            match xml_reader.read_event_into(&mut buf) {
+            match event {
                 Ok(Event::Start(ref e)) => {
-                    let elem_ref =
-                        self.handle_start_or_empty(e, false, &mut prefix_map, &mut scope_decls)?;
+                    let elem_ref = self.handle_start_or_empty(
+                        e,
+                        &xml_reader,
+                        false,
+                        &mut prefix_map,
+                        &mut scope_decls,
+                    )?;
                     if track {
                         self.pending_spans.push((elem_ref, event_start));
                     }
                 }
                 Ok(Event::Empty(ref e)) => {
-                    let elem_ref =
-                        self.handle_start_or_empty(e, true, &mut prefix_map, &mut scope_decls)?;
+                    let elem_ref = self.handle_start_or_empty(
+                        e,
+                        &xml_reader,
+                        true,
+                        &mut prefix_map,
+                        &mut scope_decls,
+                    )?;
                     if track {
                         self.doc.source_spans.set(
                             elem_ref,
@@ -1157,86 +1195,99 @@ impl<'a> BufferDocumentBuilder<'a> {
                     }
                     self.end_element()?;
                 }
+                // Outside the root element only white space reaches here
+                // (the reader refuses other character data there).
                 Ok(Event::Text(ref e)) => {
                     if !self.element_stack.is_empty() {
-                        let text = e.xml10_content().map_err(quick_xml::Error::from)?;
+                        // XML 1.0 / 1.1 line-end normalization (§2.11).
+                        let text = e
+                            .xml_content(xml_reader.quick_xml_version())
+                            .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                         self.text(&text);
                     }
                 }
                 // References are reported apart from the surrounding text; the
                 // builder merges consecutive text anyway, so the run is rejoined.
                 Ok(Event::GeneralRef(ref e)) => {
-                    if !self.element_stack.is_empty() {
-                        let text = resolve_general_ref(e)?;
-                        self.text(&text);
-                    }
+                    let text = resolve_general_ref(e)
+                        .map_err(|e| document_error(xml_reader.recheck().decoding(e)))?;
+                    self.text(&text);
                 }
                 Ok(Event::CData(ref e)) => {
-                    if !self.element_stack.is_empty() {
-                        let text = std::str::from_utf8(e)?;
-                        self.text(text);
-                    }
+                    let text = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
+                    self.text(text);
                 }
                 Ok(Event::Comment(ref e)) => {
-                    let text = std::str::from_utf8(e)?;
+                    let text = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                     self.comment(text)?;
                 }
                 Ok(Event::PI(ref e)) => {
-                    let raw = std::str::from_utf8(e)?;
+                    let raw = std::str::from_utf8(e)
+                        .map_err(|_| document_error(xml_reader.recheck().utf8()))?;
                     let (target, data) = parse_pi_content(raw);
                     self.processing_instruction(target, data)?;
                 }
-                Ok(Event::Decl(_) | Event::DocType(_)) => {}
+                Ok(Event::Decl(_)) => {
+                    if let Some(declaration) = xml_reader.declaration() {
+                        self.set_xml_declaration(declaration.clone());
+                    }
+                }
+                // Not kept; its keyword is checked at the next read.
+                Ok(Event::DocType(_)) => {}
                 Ok(Event::Eof) => break,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(document_error(e)),
             }
-            buf.clear();
         }
 
         self.finalize()
     }
 
-    /// Handles `Event::Start` and `Event::Empty` elements.
-    fn handle_start_or_empty(
+    /// Records the XML declaration of the document being read.
+    pub(crate) fn set_xml_declaration(&mut self, declaration: crate::xml::XmlDeclaration) {
+        self.doc.xml_declaration = Some(declaration);
+    }
+
+    /// Handles `Event::Start` and `Event::Empty` elements; `spans` are the
+    /// tag's attributes, as the reader found them while checking it.
+    fn handle_start_or_empty<R: BufRead>(
         &mut self,
         e: &quick_xml::events::BytesStart<'_>,
+        xml_reader: &WfReader<R>,
         is_empty: bool,
         prefix_map: &mut HashMap<Box<[u8]>, Vec<String>>,
         scope_decls: &mut Vec<Vec<Box<[u8]>>>,
     ) -> Result<u32, BufferDocumentError> {
+        // The tag's attributes, as the reader found them while checking it.
+        let spans = xml_reader.attributes();
+        let version = xml_reader.quick_xml_version();
+        // The reader checked the tag (UTF-8, bound prefixes, references):
+        // `at` reports what still fails as the refusal it is (see `Recheck`).
+        let at = xml_reader.recheck();
+        let utf8 = |_| document_error(at.utf8());
+        let tag: &[u8] = e;
         let mut local_decls: Vec<Box<[u8]>> = Vec::new();
         let mut ns_decls_str: Vec<(String, String)> = Vec::new();
 
         // First pass: collect xmlns declarations
-        for attr_result in e.attributes() {
-            let attr = attr_result?;
-            let key = attr.key.as_ref();
-
-            if key == b"xmlns" {
-                // Default namespace declaration
-                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                let uri = value.to_string();
-                let prefix_key: Box<[u8]> = b"".to_vec().into_boxed_slice();
-                prefix_map
-                    .entry(prefix_key.clone())
-                    .or_default()
-                    .push(uri.clone());
-                local_decls.push(prefix_key);
-                ns_decls_str.push((String::new(), uri));
-            } else if key.starts_with(b"xmlns:") {
-                let prefix_bytes = &key[6..];
-                let value = attr.normalized_value(XmlVersion::Implicit1_0)?;
-                let uri = value.to_string();
-                let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
-                prefix_map
-                    .entry(prefix_key.clone())
-                    .or_default()
-                    .push(uri.clone());
-                local_decls.push(prefix_key);
-                let prefix_str =
-                    std::str::from_utf8(prefix_bytes).map_err(BufferDocumentError::Utf8)?;
-                ns_decls_str.push((prefix_str.to_string(), uri));
+        for span in spans {
+            if span.kind == AttrKind::Attribute {
+                continue;
             }
+            let prefix_bytes = span.prefix(tag);
+            let uri = span
+                .value(tag, version)
+                .map_err(|e| document_error(at.decoding(e)))?
+                .into_owned();
+            let prefix_key: Box<[u8]> = prefix_bytes.to_vec().into_boxed_slice();
+            prefix_map
+                .entry(prefix_key.clone())
+                .or_default()
+                .push(uri.clone());
+            local_decls.push(prefix_key);
+            let prefix_str = std::str::from_utf8(prefix_bytes).map_err(utf8)?;
+            ns_decls_str.push((prefix_str.to_string(), uri));
         }
 
         scope_decls.push(local_decls);
@@ -1252,56 +1303,50 @@ impl<'a> BufferDocumentBuilder<'a> {
         let full_name_bytes = full_name.as_ref();
         let (elem_prefix_bytes, elem_local_bytes) = split_prefix_local(full_name_bytes);
 
-        let elem_local =
-            std::str::from_utf8(elem_local_bytes).map_err(BufferDocumentError::Utf8)?;
-        let elem_prefix_str =
-            std::str::from_utf8(elem_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
+        let elem_local = std::str::from_utf8(elem_local_bytes).map_err(utf8)?;
+        let elem_prefix_str = std::str::from_utf8(elem_prefix_bytes).map_err(utf8)?;
 
         // Resolve element namespace
         let elem_ns_uri = match prefix_map.get(elem_prefix_bytes) {
-            Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-            _ if elem_prefix_bytes.is_empty() => String::new(),
-            _ => {
-                return Err(BufferDocumentError::UnboundPrefix(
-                    elem_prefix_str.to_string(),
-                ))
+            // An empty binding of a prefix is an XML 1.1 undeclaration: not
+            // bound (the reader refuses that before; this is a safeguard).
+            Some(stack)
+                if !stack.is_empty()
+                    && (elem_prefix_bytes.is_empty() || !stack.last().unwrap().is_empty()) =>
+            {
+                stack.last().unwrap().as_str().to_string()
             }
+            _ if elem_prefix_bytes.is_empty() => String::new(),
+            _ => return Err(document_error(at.unbound(elem_prefix_bytes))),
         };
 
         let elem_ref =
             self.start_element(elem_local, &elem_ns_uri, elem_prefix_str, &ns_decl_refs)?;
 
         // Second pass: non-xmlns attributes
-        for attr_result in e.attributes() {
-            let attr = attr_result?;
-            let key = attr.key.as_ref();
-
-            // Skip xmlns declarations
-            if key == b"xmlns" || key.starts_with(b"xmlns:") {
+        for span in spans {
+            if span.kind != AttrKind::Attribute {
                 continue;
             }
-
-            let (attr_prefix_bytes, attr_local_bytes) = split_prefix_local(key);
-            let attr_local =
-                std::str::from_utf8(attr_local_bytes).map_err(BufferDocumentError::Utf8)?;
-            let attr_prefix_str =
-                std::str::from_utf8(attr_prefix_bytes).map_err(BufferDocumentError::Utf8)?;
+            let attr_prefix_bytes = span.prefix(tag);
+            let attr_local = std::str::from_utf8(span.local(tag)).map_err(utf8)?;
+            let attr_prefix_str = std::str::from_utf8(attr_prefix_bytes).map_err(utf8)?;
 
             // Resolve attr namespace: unprefixed → empty, prefixed → lookup
             let attr_ns_uri = if attr_prefix_bytes.is_empty() {
                 String::new()
             } else {
                 match prefix_map.get(attr_prefix_bytes) {
-                    Some(stack) if !stack.is_empty() => stack.last().unwrap().as_str().to_string(),
-                    _ => {
-                        return Err(BufferDocumentError::UnboundPrefix(
-                            attr_prefix_str.to_string(),
-                        ))
+                    Some(stack) if !stack.is_empty() && !stack.last().unwrap().is_empty() => {
+                        stack.last().unwrap().as_str().to_string()
                     }
+                    _ => return Err(document_error(at.unbound(attr_prefix_bytes))),
                 }
             };
 
-            let unescaped = attr.normalized_value(XmlVersion::Implicit1_0)?;
+            let unescaped = span
+                .value(tag, version)
+                .map_err(|e| document_error(at.decoding(e)))?;
             self.attribute(attr_local, &attr_ns_uri, attr_prefix_str, &unescaped)?;
 
             // A duplicate `xml:id` is a defect of the *document*, and a driver
@@ -1484,10 +1529,12 @@ pub(crate) fn parse_pi_content(raw: &str) -> (&str, &str) {
     }
 }
 
-// Convert AttrError → quick_xml::Error (already has From impl in quick-xml 0.31)
-impl From<quick_xml::events::attributes::AttrError> for BufferDocumentError {
-    fn from(e: quick_xml::events::attributes::AttrError) -> Self {
-        BufferDocumentError::Parse(quick_xml::Error::from(e))
+/// The document error for an error of the well-formedness layer.
+fn document_error(e: WfError) -> BufferDocumentError {
+    match e {
+        WfError::Io(e) => BufferDocumentError::Io(e),
+        WfError::NotWellFormed(e) => BufferDocumentError::NotWellFormed(e),
+        WfError::Limit(e) => BufferDocumentError::LimitExceeded(e),
     }
 }
 
@@ -1912,7 +1959,8 @@ mod tests {
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
                 .unwrap();
         let result = builder.build("<a>&nope;</a>".as_bytes());
-        assert!(matches!(result, Err(BufferDocumentError::Parse(_))));
+        assert!(matches!(result, Err(BufferDocumentError::NotWellFormed(e))
+            if e.rule() == crate::xml::WellFormednessRule::EntityDeclared));
     }
 
     #[test]
@@ -2049,7 +2097,8 @@ mod tests {
             BufferDocumentBuilder::new(arena, names, None, BufferDocumentOptions::default())
                 .unwrap();
         let result = builder.build(r#"<ns:root/>"#.as_bytes());
-        assert!(matches!(result, Err(BufferDocumentError::UnboundPrefix(_))));
+        assert!(matches!(result, Err(BufferDocumentError::NotWellFormed(e))
+            if e.rule() == crate::xml::WellFormednessRule::PrefixDeclared));
     }
 
     #[test]

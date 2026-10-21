@@ -490,6 +490,8 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// Declared unparsed entity names from the document's DTD.
     /// When set, ENTITY/ENTITIES values are checked against this set (§3.16.4).
     unparsed_entities: Option<HashSet<String>>,
+    /// Limits on the document a quick-xml driver reads in this run.
+    parse_limits: crate::xml::ParseLimits,
     /// Per-element scope stack of key/unique tables
     ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
     /// Keyrefs whose refer target was not yet available when they deactivated.
@@ -1018,6 +1020,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             next_element_serial: 0,
             pending_idrefs: Vec::new(),
             unparsed_entities: None,
+            parse_limits: crate::xml::ParseLimits::none(),
             ic_scope_tables: Vec::new(),
             deferred_keyrefs: Vec::new(),
             root_id_conflict: false,
@@ -1073,6 +1076,30 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// entity name."
     pub fn set_unparsed_entities(&mut self, entities: HashSet<String>) {
         self.unparsed_entities = Some(entities);
+    }
+
+    /// Set the limits on the document read in this run.
+    ///
+    /// Honoured by the quick-xml drivers ([`drive_quick_xml`] and its
+    /// variants) and by the typed build over them
+    /// (`document::build_typed_document_with`): each limit is checked on the
+    /// raw markup before the driver interns or validates anything of it, and
+    /// a document that breaks one is refused with
+    /// [`DriveWithError::LimitExceeded`] / [`DriveError::LimitExceeded`]
+    /// (see [`ParseLimits`](crate::xml::ParseLimits)). The tree-walking
+    /// drivers read no text and ignore them. The default is no limits.
+    ///
+    /// [`drive_quick_xml`]: crate::validation::drive_quick_xml
+    /// [`DriveWithError::LimitExceeded`]: crate::validation::DriveWithError::LimitExceeded
+    /// [`DriveError::LimitExceeded`]: crate::validation::DriveError::LimitExceeded
+    pub fn set_parse_limits(&mut self, limits: crate::xml::ParseLimits) {
+        self.parse_limits = limits;
+    }
+
+    /// The limits on the document read in this run (see
+    /// [`set_parse_limits`](Self::set_parse_limits)).
+    pub fn parse_limits(&self) -> &crate::xml::ParseLimits {
+        &self.parse_limits
     }
 
     /// Set the base URI of the instance document being validated.
@@ -5105,14 +5132,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 (ValidationSubject::Element(name), element)
             }
         })
-    }
-
-    /// The local name of the innermost element opened and not yet closed.
-    #[cfg(feature = "xsd11")]
-    pub(crate) fn innermost_open_element_name(&self) -> Option<String> {
-        self.path_steps
-            .last()
-            .map(|step| self.schema_set.name_table.resolve(step.local_name))
     }
 
     /// The current item as an [`ErrorContext`], for a report made later.

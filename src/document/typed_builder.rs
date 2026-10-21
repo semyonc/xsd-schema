@@ -25,8 +25,9 @@ use crate::schema::SchemaSet;
 use crate::validation::errors::ValidationError;
 use crate::validation::info::{SchemaInfo, ValidationFlags};
 use crate::validation::quick_xml_driver::{
-    drive_quick_xml_with, AttributeView, DriveOutcome, DriveWithError, ElementStartView,
-    EndElementInfo, EndOfAttributesView, NoopHandler, TextKind, ValidationEventHandler,
+    drive_quick_xml_with, AttributeView, DoctypeView, DriveOutcome, DriveWithError,
+    ElementStartView, EndElementInfo, EndOfAttributesView, NoopHandler, TextKind,
+    ValidationEventHandler,
 };
 use crate::validation::runtime::ValidationRuntime;
 use crate::validation::validator::{ValidationSink, ValidationWarning};
@@ -67,10 +68,10 @@ impl ValidationSink for SilentValidationSink {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum TypedBuildError<E> {
-    /// The XML could not be read, or the document could not be built (a
-    /// parse error — input that ends inside an element is quick-xml's
-    /// missing-end-tag error —, an unbound prefix, a duplicate `xml:id`, a
-    /// node-count limit).
+    /// The XML could not be read, or the document could not be built: text
+    /// that is not well-formed (input that ends inside an element included),
+    /// a parse limit of the runtime broken, an I/O error, a duplicate
+    /// `xml:id`, a node-count limit.
     Document(BufferDocumentError),
     /// The caller's handler returned this error; the build stopped there.
     Handler(E),
@@ -460,6 +461,26 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
             .on_processing_instruction(target, data)
             .map_err(TypedBuildError::Handler)
     }
+
+    /// The document keeps no document type declaration; the inner handler
+    /// sees it (and may refuse it).
+    fn on_doctype(&mut self, doctype: DoctypeView<'_>) -> Result<(), Self::Error> {
+        self.inner
+            .on_doctype(doctype)
+            .map_err(TypedBuildError::Handler)
+    }
+
+    /// The document keeps the declaration; the inner handler sees it (and
+    /// may refuse it).
+    fn on_xml_declaration(
+        &mut self,
+        declaration: &crate::xml::XmlDeclaration,
+    ) -> Result<(), Self::Error> {
+        self.builder.set_xml_declaration(declaration.clone());
+        self.inner
+            .on_xml_declaration(declaration)
+            .map_err(TypedBuildError::Handler)
+    }
 }
 
 /// Lends a caller's handler to a [`TypedBuilderHandler`] for one pass.
@@ -505,6 +526,15 @@ impl<H: ValidationEventHandler + ?Sized> ValidationEventHandler for LentHandler<
     }
     fn on_processing_instruction(&mut self, target: &str, data: &str) -> Result<(), H::Error> {
         self.0.on_processing_instruction(target, data)
+    }
+    fn on_doctype(&mut self, doctype: DoctypeView<'_>) -> Result<(), H::Error> {
+        self.0.on_doctype(doctype)
+    }
+    fn on_xml_declaration(
+        &mut self,
+        declaration: &crate::xml::XmlDeclaration,
+    ) -> Result<(), H::Error> {
+        self.0.on_xml_declaration(declaration)
     }
     fn on_element_start_offset(&mut self, byte_pos: usize) -> Result<(), H::Error> {
         self.0.on_element_start_offset(byte_pos)
@@ -658,19 +688,12 @@ where
         drive_quick_xml_with(reader, runtime, schema_set, &mut typed)
     };
     let outcome = driven.map_err(|e| match e {
-        DriveWithError::Parse(e) => TypedBuildError::Document(BufferDocumentError::Parse(e)),
-        DriveWithError::Utf8(e) => TypedBuildError::Document(BufferDocumentError::Utf8(e)),
-        DriveWithError::UnboundPrefix(p) => {
-            TypedBuildError::Document(BufferDocumentError::UnboundPrefix(p))
+        DriveWithError::Io(e) => TypedBuildError::Document(BufferDocumentError::Io(e)),
+        DriveWithError::NotWellFormed(e) => {
+            TypedBuildError::Document(BufferDocumentError::NotWellFormed(e))
         }
-        // The XML error quick-xml itself gives for an element whose end tag
-        // never comes (it reports a plain end of input to an event loop).
-        DriveWithError::UnexpectedEof { .. } => {
-            TypedBuildError::Document(BufferDocumentError::Parse(quick_xml::Error::IllFormed(
-                quick_xml::errors::IllFormedError::MissingEndTag(
-                    runtime.innermost_open_element_name().unwrap_or_default(),
-                ),
-            )))
+        DriveWithError::LimitExceeded(e) => {
+            TypedBuildError::Document(BufferDocumentError::LimitExceeded(e))
         }
         DriveWithError::Hook(e) => e,
     })?;

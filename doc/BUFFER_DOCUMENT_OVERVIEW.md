@@ -171,7 +171,14 @@ The shared `NameTable` (from `src/namespace/`) and a per-document
 ## Construction
 
 `BufferDocumentBuilder` exposes both a low-level push API and a
-`quick-xml`-driven adapter (`from_reader`). The arena (`bumpalo::Bump`) is
+`quick-xml`-driven adapter (`build`, which `BufferDocument::from_reader`
+runs). The adapter reads through the crate's well-formedness layer
+(`xsd_schema::xml`): a document that is not well-formed — input that ends
+inside an element included — is `BufferDocumentError::NotWellFormed`, the
+rules follow the XML declaration (XML 1.0 or 1.1), and the declaration is kept
+(`BufferDocument::xml_declaration`). `BufferDocumentBuilder::with_parse_limits`
+sets parse limits (`ParseLimits`), checked before anything of the markup that
+breaks one is interned; the push API is not limited. The arena (`bumpalo::Bump`) is
 **caller-owned**: the builder borrows it. This is what lets
 `ValidationRuntime` reuse a single builder across nested asserted elements
 without allocating per-element arenas, and what makes the second
@@ -182,6 +189,11 @@ let arena = Bump::new();
 let names = NameTable::new();
 let doc = BufferDocument::from_reader_default(reader, &arena, &names)?;
 let nav = doc.create_navigator();
+
+// With limits:
+let doc = BufferDocumentBuilder::new(&arena, &names, None, BufferDocumentOptions::default())?
+    .with_parse_limits(ParseLimits::none().with_max_depth(256).with_max_nodes(1_000_000))
+    .build(other_reader)?;
 ```
 
 Schema binding assignment is performed by an external driver

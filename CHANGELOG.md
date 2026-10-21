@@ -63,6 +63,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `xs:decimal` / `xs:integer` (see *Fixed*), so the field holds the offending
   lexical form, not only a QName. Its message is "[FOCA0002] Invalid lexical
   value: '…'".
+- Every reader of XML text — the quick-xml validation drivers, the typed
+  build, `BufferDocument::from_reader` / `BufferDocumentBuilder::build` and
+  the schema-document parser — goes through one well-formedness layer
+  (`xsd_schema::xml`) and refuses a document that is not well-formed or not
+  namespace-well-formed with `xml::NotWellFormed`, naming the rule
+  (`xml::WellFormednessRule`) and the byte position. Newly refused: content,
+  CDATA or references outside the root element; a second or missing root
+  element; a misplaced or malformed XML declaration; a document type
+  declaration outside the prolog or not following its grammar; `--` in a
+  comment; a reserved PI target; names that are not XML names or qualified
+  names; attributes not separated by white space; `<` in an attribute value;
+  characters that are not XML characters, raw or as character references of
+  any length; `]]>` in character data; reserved prefixes and namespace names;
+  `xmlns:p=""` in XML 1.0; two attributes with the same expanded name; bytes
+  that are not UTF-8 anywhere in a schema document. Namespace names are
+  compared after the attribute-value normalization of the document's XML
+  version, by the well-formedness checks and the validators alike.
+- What was refused before is now refused as `xml::NotWellFormed` too:
+  duplicate attributes, unbound prefixes, undeclared entities, bytes that are
+  not UTF-8, mismatched end tags, unclosed markup and input that ends inside
+  an element (which names the innermost open element and how many are open).
+- `BufferDocument::from_reader` / `BufferDocumentBuilder::build` refuse input
+  that ends inside an element and input without a root element (both were
+  accepted).
+- A document declared `version="1.1"` — an instance or a schema document — is
+  read with XML 1.1 and Namespaces in XML 1.1: character references to the
+  restricted control characters are allowed and the raw characters refused,
+  NEL and U+2028 are line ends in text and attribute values, and `xmlns:p=""`
+  undeclares `p` (in a schema document, QName-valued attributes and the XPath
+  expressions of selectors, fields, type alternatives and assertions then
+  treat it as unbound). Every other document is read with XML 1.0. A NEL or
+  U+2028 used as white space inside markup is not supported.
+  `NamespaceContext::add_namespace` with an empty URI undeclares a prefix.
+- Byte offsets — `on_element_start_offset` / `on_element_end_offset`,
+  `BufferDocument` source spans, `TrackedReader` spans — count a leading
+  byte-order mark (they were offsets after it), and `TrackedReader` spans
+  start where their event starts.
+- `DriveError`, `DriveWithError` and `BufferDocumentError` are
+  `#[non_exhaustive]`, have `NotWellFormed` and `LimitExceeded` variants, and
+  report an I/O error of the source as `Io(std::io::Error)`. The variants
+  `Parse(quick_xml::Error)`, `Utf8`, `UnboundPrefix` and (`DriveError`,
+  `DriveWithError`) `UnexpectedEof` are removed, with their `From`
+  conversions; no quick-xml type is left in these error types.
 
 ### Added
 
@@ -133,6 +176,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   function namespace is none. Lists and unions have neither (`XPST0051`,
   `XPST0017`). XSD 1.1 assertions do not see these casts and constructors
   (Structures §3.13.6.2 clause 2.2.5): there they behave as before.
+- Parse limits (`xml::ParseLimits`): depth, name and namespace-URI length,
+  attributes and namespace declarations per element, namespaces in scope
+  (bound prefixes; undeclarations are not counted), attribute-value and text
+  size, and nodes. Checked on the raw markup before anything of it is
+  interned; a violation is `xml::LimitExceeded` naming the limit.
+  `ValidationRuntime::set_parse_limits` for the drivers and the typed build,
+  `BufferDocumentBuilder::with_parse_limits`. No limits by default; they do
+  not bound the reader's memory.
+- `ValidationEventHandler::on_doctype` (`DoctypeView`) and
+  `ValidationEventHandler::on_xml_declaration` (`xml::XmlDeclaration`), both
+  defaulted to accept: return an error to refuse documents with a document
+  type declaration, or an encoding the host did not decode.
+  `BufferDocument::xml_declaration`.
+- `TrackedReader::error_position` and `TrackedReader::xml_version`; a schema
+  document that is not well-formed gets a source location.
 
 ### Changed
 
@@ -197,6 +255,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<xs:explicitTimezone value=" required "/>` are read after whitespace
   collapse, as their `xs:NMTOKEN` type prescribes (the first was taken as
   `collapse`, the second was a schema error).
+- Schema-document errors raised from an element's attributes (an undeclared
+  prefix in a QName, say) carry the element's location; with error recovery,
+  the first error inside an element is reported rather than a consequence of
+  skipping the refused child.
 
 ### Fixed
 

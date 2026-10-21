@@ -246,6 +246,36 @@ vs character data correctly. Almost no caller wants to write that twice. The
 | 1 — turn-key | `drive_quick_xml`, `drive_quick_xml_in` | All you want is for the runtime's sink to receive every diagnostic. The helper calls `runtime.end_validation()` for you. |
 | 2 — hooks | `drive_quick_xml_with`, `drive_quick_xml_with_in` | You need to interleave work between validator events — building a typed DOM, tracking source spans, mirroring events into a custom store. The caller is responsible for calling `end_validation` after collecting any post-stream runtime state (e.g. `schema_location_hints`). |
 
+Both layers read the text through the crate's well-formedness layer
+(`xsd_schema::xml`), which the document builder and the schema parser share.
+The checks are always on — XML 1.0 §1.2 makes a well-formedness violation a
+fatal error — and follow the XML declaration: XML 1.1 and Namespaces in XML 1.1
+for `version="1.1"`, XML 1.0 and Namespaces in XML 1.0 otherwise. A refusal is
+`DriveError::NotWellFormed`, naming the rule and the byte position. Parse
+limits are opt-in and set on the runtime; each is checked on the raw markup
+before anything of it is interned:
+
+```rust
+use xsd_schema::validation::{drive_quick_xml, DriveError};
+use xsd_schema::xml::{ParseLimit, ParseLimits};
+
+runtime.set_parse_limits(
+    ParseLimits::none()
+        .with_max_depth(256)
+        .with_max_name_bytes(1024)
+        .with_max_nodes(1_000_000),
+);
+match drive_quick_xml(instance_xml.as_bytes(), &mut runtime, &schema_set) {
+    Err(DriveError::LimitExceeded(e)) if e.limit() == ParseLimit::Depth => { /* too deep */ }
+    Err(DriveError::NotWellFormed(e)) => eprintln!("{e}"), // rule, position
+    other => { other?; }
+}
+```
+
+The limits bound what is interned and built, not the reader's memory (a
+whole tag or text run is read before it is checked): bound the input size
+too.
+
 Layer 1 in full:
 
 ```rust
@@ -278,8 +308,9 @@ fn validate(schema_xml: &str, instance_xml: &str) -> Result<(), Box<dyn std::err
 }
 ```
 
-Layer 1 returns a `DriveOutcome { root_validity, max_depth }` and reports
-parse / UTF-8 / unbound-prefix / unexpected-EOF as `DriveError` variants;
+Layer 1 returns a `DriveOutcome { root_validity, max_depth }`. A document
+that is not well-formed is `DriveError::NotWellFormed`, a broken limit
+`DriveError::LimitExceeded`, an I/O error of the source `DriveError::Io`;
 validation diagnostics flow through the sink, not the return type.
 
 #### Layer 2 — handler-driven (advanced)
@@ -299,6 +330,8 @@ hooks are:
 | `after_end_of_attributes(view)` | After `validate_end_of_attributes`. `view.info` is the EOA `SchemaInfo` (CTA-selected type lives here); under `xsd11`, `view.deferred_attribute_results` carries any CTA-revalidated per-attribute results, in original encounter order. |
 | `after_end_element(end_info, depth)` | After `validate_end_element`, with the depth of the element that just closed (1 = root close). |
 | `on_text(kind, text)` / `on_comment(text)` / `on_processing_instruction(target, data)` | Body events. `kind` distinguishes whitespace text, character text, and CDATA. |
+| `on_xml_declaration(declaration)` | The document's XML declaration (version, encoding, standalone), before anything else. The readers read UTF-8 whatever `encoding` says; return an error to refuse an encoding you did not decode. |
+| `on_doctype(view)` | A document type declaration in the prolog, once its grammar has been checked (one anywhere else is refused as not well-formed). Return an error to refuse documents that carry one. |
 
 Layer 2 does **not** call `runtime.end_validation()`; you do, after
 draining whatever runtime state your caller cares about (e.g.
@@ -306,7 +339,8 @@ draining whatever runtime state your caller cares about (e.g.
 
 #### Source-span tracking (advanced)
 
-Two further hooks carry byte offsets from the reader's buffer:
+Two further hooks carry byte offsets into the input (a leading byte-order
+mark included, as in every position the readers report):
 
 - `on_element_start_offset(byte_pos)` — fires immediately before
   `before_element`; `byte_pos` is the `<` of the element being reported.
@@ -325,7 +359,12 @@ XSD §3.16.4 requires that every `xs:ENTITY` or `xs:ENTITIES` value names a
 declared unparsed entity from the document's DTD. Modern streaming XML parsers
 like `quick-xml` deliberately omit DTD processing — DTDs are widely considered
 a legacy attack surface (billion-laughs, external entity injection, etc.) and
-most contemporary XML workflows avoid them entirely.
+most contemporary XML workflows avoid them entirely. `xsd-schema` processes no
+DTD either: a document type declaration in the prolog is checked (its name,
+external identifier and the balance of its internal subset) and reported
+through `ValidationEventHandler::on_doctype`, one anywhere else is refused as
+not well-formed, and the declarations of an internal subset are not yet
+supported (a reference to an entity it declares is refused).
 
 However, a conformant XSD validator must still enforce the entity-name constraint
 when DTD information is available. To bridge this gap without coupling the
@@ -421,6 +460,11 @@ there is a tree-walk driver that re-validates an already-parsed document:
 | `drive_quick_xml` | `validation::quick_xml_driver` | Streaming from bytes/reader. For two-pass enrichment, call it again over the same bytes — simple, but parses the instance twice. |
 | `drive_navigator` | `validation::navigator_driver` | Re-validate any `DomNavigator` tree (works with `RoXmlNavigator` without `xsd11`). Emits the *same* push-API sequence as the streaming driver. |
 | `drive_buffer_document` | `validation::navigator_driver` (`xsd11`) | Convenience wrapper of `drive_navigator` for a `BufferDocument`. |
+
+The tree-walk drivers read no text: well-formedness is the business of the
+parser that built the tree — `BufferDocument::from_reader` goes through the
+same well-formedness layer as the streaming driver, `RoXmlNavigator` relies on
+`roxmltree`'s own checks.
 
 **Buffer once, validate many times.** Parse the instance a single time into a
 `BufferDocument`, then validate it against the original *and* enriched schema

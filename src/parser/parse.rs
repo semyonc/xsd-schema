@@ -31,13 +31,12 @@
 use std::collections::HashSet;
 
 use quick_xml::events::Event;
-use quick_xml::XmlVersion;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{DocumentId, NameId};
 use crate::namespace::{is_ncname, NameTable, NamespaceContext, XS_NAMESPACE};
 use crate::parser::assemble::assemble_schema;
-use crate::parser::attrs::{categorize_attributes, parse_attributes, AttributeMap};
+use crate::parser::attrs::{categorize_attributes, parse_attributes_in, AttributeMap};
 use crate::parser::frames::{
     create_frame, create_frame_recovering, xsd_names, Frame, FrameResult, SchemaFrameResult,
     SkipFrame,
@@ -91,6 +90,8 @@ struct ParserState<'a, 'b, 'c> {
     doc_id: DocumentId,
     /// Errors collected during parsing
     errors: Vec<SchemaError>,
+    /// Per frame on `frame_stack`: `errors.len()` when it was pushed
+    error_marks: Vec<usize>,
     /// Parser configuration
     config: &'b ParserConfig,
     /// XSD namespace ID (cached)
@@ -111,6 +112,8 @@ struct ParserState<'a, 'b, 'c> {
     /// references inside the included document resolve to the includer's
     /// target namespace (matching how top-level definitions are re-namespaced).
     chameleon_namespace: Option<NameId>,
+    /// The version of XML the document is read with (its declaration).
+    xml_version: crate::xml::XmlVersion,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -127,6 +130,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             frame_stack: Vec::new(),
             doc_id,
             errors: Vec::new(),
+            error_marks: Vec::new(),
             config,
             xsd_ns_id: None,
             source_map,
@@ -134,6 +138,15 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             id_values: HashSet::new(),
             vc_schema_excluded: false,
             chameleon_namespace,
+            xml_version: crate::xml::XmlVersion::V1_0,
+        }
+    }
+
+    /// The document's XML version, as quick-xml's normalization takes it.
+    fn quick_xml_version(&self) -> quick_xml::XmlVersion {
+        match self.xml_version {
+            crate::xml::XmlVersion::V1_1 => quick_xml::XmlVersion::Explicit1_1,
+            _ => quick_xml::XmlVersion::Implicit1_0,
         }
     }
 
@@ -299,11 +312,20 @@ pub fn parse_schema_with_chameleon(
     // Track if we've seen the root schema element
     let mut seen_root = false;
 
-    // Main event loop
+    // Main event loop. The reader clears `buf` itself.
     loop {
-        buf.clear();
-        let tracked_event = reader.read_event(&mut buf)?;
+        let tracked_event = match reader.read_event(&mut buf) {
+            Ok(event) => event,
+            // A well-formedness error names its byte position: locate it.
+            Err(e) => {
+                return Err(match reader.error_position() {
+                    Some(pos) => e.with_location(source_map.locate(pos)),
+                    None => e,
+                })
+            }
+        };
         let span = tracked_event.span;
+        state.xml_version = reader.xml_version();
 
         match tracked_event.event {
             Event::Start(ref e) => {
@@ -511,8 +533,9 @@ fn handle_start_element(
             attr_result.map_err(|e| SchemaError::xml(format!("Attribute error: {}", e), None))?;
 
         let attr_name = attr.key.as_ref();
+        // Normalized as the reader normalized it for its namespace checks.
         let attr_value = attr
-            .normalized_value(XmlVersion::Implicit1_0)
+            .normalized_value(state.quick_xml_version())
             .map_err(|e| SchemaError::xml(format!("Attribute value error: {}", e), None))?;
 
         // Check for xmlns declarations
@@ -550,10 +573,12 @@ fn handle_start_element(
 
     // Parse and categorize attributes
     let source_ref = Some(state.source_ref(span));
-    let parsed_attrs = parse_attributes(
+    let version = state.quick_xml_version();
+    let parsed_attrs = parse_attributes_in(
         element.attributes(),
         &mut state.ns_context,
         source_ref.clone(),
+        version,
     )?;
     // sch-props-correct: attributes on XSD-namespace elements must be
     // unqualified — an explicit `xsd:`/`xs:` prefix on an XSD attribute
@@ -822,8 +847,14 @@ fn handle_start_element(
     // Create namespace snapshot for QName resolution during frame construction
     let ns_snapshot = state.ns_context.snapshot();
 
-    // Create the new frame
+    // Create the new frame. An error from reading the element's attributes
+    // (an unresolvable QName, say) is located at the element.
+    let locate = |e: SchemaError, state: &ParserState| match &source_ref {
+        Some(src) => e.with_location(state.source_map.locate(src.span.start)),
+        None => e,
+    };
     let frame = if state.config.error_recovery {
+        let reported = state.errors.len();
         let mut frame = create_frame_recovering(
             local_name,
             &attr_map,
@@ -832,6 +863,11 @@ fn handle_start_element(
             &ns_snapshot,
             &mut state.errors,
         );
+        let new: Vec<SchemaError> = state.errors.drain(reported..).collect();
+        for e in new {
+            let e = locate(e, state);
+            state.errors.push(e);
+        }
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
@@ -845,7 +881,8 @@ fn handle_start_element(
             state.ns_context.name_table(),
             source_ref.clone(),
             &ns_snapshot,
-        )?;
+        )
+        .map_err(|e| locate(e, state))?;
         frame.set_foreign_attributes(foreign_attrs);
         // Set namespace context for annotation content frames
         if matches!(local_name, xsd_names::APPINFO | xsd_names::DOCUMENTATION) {
@@ -855,6 +892,7 @@ fn handle_start_element(
     };
 
     // Push frame onto stack
+    state.error_marks.push(state.errors.len());
     state.frame_stack.push(frame);
 
     Ok(())
@@ -887,12 +925,17 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
             return Err(SchemaError::internal("End element with no frame on stack"));
         }
     };
+    let mark = state.error_marks.pop().unwrap_or(state.errors.len());
 
     // Save source ref before finish() consumes the frame
     let source_ref = frame.source().cloned();
 
     let result = match frame.finish() {
         Ok(r) => r,
+        // In error-recovery mode an element whose child was refused (and
+        // skipped) may then fail for lacking that child: report the cause —
+        // the first error collected inside the element, as without recovery.
+        Err(_) if state.errors.len() > mark => return Err(state.errors.remove(mark)),
         Err(e) => {
             // Add source location to error if available
             let e = if let Some(ref src) = source_ref {
@@ -938,8 +981,9 @@ fn handle_text(
     text: &quick_xml::events::BytesText,
     span: SourceSpan,
 ) -> SchemaResult<()> {
+    let version = state.quick_xml_version();
     let text_content = text
-        .xml10_content()
+        .xml_content(version)
         .map_err(|e| SchemaError::xml(format!("Text content error: {}", e), None))?;
 
     apply_text(state, &text_content, span)
@@ -1202,6 +1246,7 @@ fn push_skip_frame(
 ) -> SchemaResult<()> {
     let mut frame: Box<dyn Frame> = Box::new(SkipFrame::new(source));
     frame.set_foreign_attributes(foreign_attrs);
+    state.error_marks.push(state.errors.len());
     state.frame_stack.push(frame);
     Ok(())
 }

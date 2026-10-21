@@ -133,6 +133,9 @@ pub(crate) mod regex_xsd_unicode;
 /// Resolution of XML general references (`&amp;`, `&#65;`) from the event stream.
 pub(crate) mod xml_entity;
 
+// Reading XML text: well-formedness checks and parse limits for every reader
+pub mod xml;
+
 // NFA compiler for content models
 pub mod compiler;
 

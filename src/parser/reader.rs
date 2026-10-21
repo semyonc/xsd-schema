@@ -8,6 +8,8 @@ use std::io::BufRead;
 
 use crate::error::{SchemaError, SchemaResult};
 use crate::parser::location::SourceSpan;
+use crate::xml::reader::{WfError, WfReader};
+use crate::xml::ParseLimits;
 
 /// XML event with source span
 #[derive(Debug)]
@@ -54,74 +56,89 @@ impl<'a> TrackedEvent<'a> {
 ///
 /// This reader provides byte spans for all XML events, enabling accurate
 /// source location tracking for error messages.
+///
+/// The text is read through the crate's well-formedness layer
+/// ([`crate::xml`]): a document that is not well-formed is an
+/// [`SchemaError::XmlError`] naming the rule and the byte position (also
+/// available from [`error_position`](Self::error_position)) — input that ends
+/// inside an element included. The rules are XML 1.1's for a document
+/// declared `version="1.1"` ([`xml_version`](Self::xml_version)). White space
+/// before character data and markup is skipped and text is trimmed at both
+/// ends, as before. Spans are byte offsets into the input, a leading BOM
+/// included.
+///
+/// Pass the same buffer to every [`read_event`](Self::read_event): the case
+/// of a document type declaration's keyword is checked on its markup, still
+/// in the buffer, at the next read (a caller that clears the buffer in
+/// between skips that one check).
 pub struct TrackedReader<R> {
-    /// The underlying quick-xml reader
-    reader: Reader<R>,
-    /// Current buffer position (before event)
+    /// The underlying quick-xml reader, behind the well-formedness layer
+    reader: WfReader<R>,
+    /// Start of the last event returned (see [`read_event`](Self::read_event))
     last_position: usize,
+    /// Input offset of the last well-formedness error
+    error_position: Option<usize>,
 }
 
 impl<'a> TrackedReader<&'a [u8]> {
     /// Create a new reader from a byte slice
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
-        let mut reader = Reader::from_reader(bytes);
-        reader.config_mut().trim_text(true);
-
-        Self {
-            reader,
-            last_position: 0,
-        }
+        TrackedReader::from_reader(bytes)
     }
 }
 
 impl<R: BufRead> TrackedReader<R> {
     /// Create a new reader from a BufRead source
     pub fn from_reader(reader: R) -> Self {
-        let mut xml_reader = Reader::from_reader(reader);
-        xml_reader.config_mut().trim_text(true);
-
+        // quick-xml skips the white space before text and markup; the end of
+        // a text event is trimmed in `read_event`.
         Self {
-            reader: xml_reader,
+            reader: WfReader::new(reader, &ParseLimits::none(), true),
             last_position: 0,
+            error_position: None,
         }
     }
 
     /// Read the next XML event with its source span
     ///
-    /// For element events the span starts at the tag's `<`. quick-xml's
-    /// `buffer_position()` only reports where the *last* event ended, and the
-    /// read that produces an element also consumes the whitespace in front of
-    /// it (`trim_text`), so the position taken before the read is the end of
-    /// the previous event, not the start of this tag — it would place a
-    /// declaration on the line of whatever preceded it. The tag's own length
-    /// recovers the real start: `emit_start` hands back the tag with `<` and
-    /// `>` stripped, or `<` and `/>` for a self-closed one.
+    /// Offsets are input offsets, a leading byte-order mark counted. The span
+    /// starts where the event starts: the `<` of a start or empty-element
+    /// tag, an XML declaration, comment, processing instruction or CDATA
+    /// section, the first character of a text run (after the white space
+    /// `trim_text` skips), the `&` of a reference. An end tag's or a
+    /// document type declaration's span starts where the previous event
+    /// ended — before white space the read skipped — as their length does
+    /// not tell where their `<` is.
     pub fn read_event<'b>(&mut self, buf: &'b mut Vec<u8>) -> SchemaResult<TrackedEvent<'b>> {
-        let prev_end = self.reader.buffer_position() as usize;
-        self.last_position = prev_end;
-
-        let event = self.reader.read_event_into(buf).map_err(|e| {
-            SchemaError::XmlError {
-                message: e.to_string(),
-                location: None, // Will be filled in by caller with proper source mapping
+        let mut event = match self.reader.read_event_into(buf) {
+            Ok(event) => event,
+            Err(WfError::Io(e)) => {
+                return Err(SchemaError::XmlError {
+                    message: format!("I/O error: {e}"),
+                    location: None, // Will be filled in by caller with proper source mapping
+                });
             }
-        })?;
+            Err(WfError::NotWellFormed(e)) => {
+                self.error_position = Some(e.position() as usize);
+                return Err(SchemaError::xml(e.to_string(), None));
+            }
+            Err(WfError::Limit(e)) => {
+                self.error_position = Some(e.position() as usize);
+                return Err(SchemaError::xml(e.to_string(), None));
+            }
+        };
+        // `trim_text`: white space at the end of a text run (the start was
+        // skipped by the reader; a run of white space only never comes).
+        if let Event::Text(t) = &mut event {
+            t.inplace_trim_end();
+        }
 
         let end = self.reader.buffer_position() as usize;
-        // `expand_empty_elements` would report `<a/>` as a Start whose length
-        // is three bytes short of the markup, so the adjustment is skipped
-        // when it is on; this reader never enables it.
-        let markup_start = match &event {
-            Event::Start(e) if !self.reader.config().expand_empty_elements => {
-                end.checked_sub(e.len() + 2)
-            }
-            Event::Empty(e) => end.checked_sub(e.len() + 3),
-            _ => None,
-        };
-        let start = match markup_start {
-            Some(s) if s >= prev_end => s,
-            _ => prev_end,
-        };
+        // The layer records where it found the event (this reader never
+        // enables `expand_empty_elements`, which would report `<a/>` as a
+        // Start).
+        let start = self.reader.event_start() as usize;
+        self.last_position = start;
         let span = SourceSpan { start, end };
 
         Ok(TrackedEvent::new(event, span))
@@ -132,14 +149,27 @@ impl<R: BufRead> TrackedReader<R> {
         self.reader.buffer_position() as usize
     }
 
-    /// Get the last event's start position
+    /// The start of the last event returned: its span's `start`
     pub fn last_position(&self) -> usize {
         self.last_position
     }
 
+    /// The input offset (a leading byte-order mark included) of the
+    /// violation behind the last well-formedness error
+    /// [`read_event`](Self::read_event) returned, if any.
+    pub fn error_position(&self) -> Option<usize> {
+        self.error_position
+    }
+
+    /// The version of XML whose rules the document is read with (known once
+    /// its XML declaration has been read).
+    pub fn xml_version(&self) -> crate::xml::XmlVersion {
+        self.reader.xml_version()
+    }
+
     /// Get a reference to the underlying reader for decoding
     pub fn inner(&self) -> &Reader<R> {
-        &self.reader
+        self.reader.inner()
     }
 }
 
