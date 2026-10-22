@@ -173,6 +173,16 @@ pub struct SchemaSet {
     /// These are structural errors that make the schema invalid but
     /// were deferred so parsing could continue for better diagnostics.
     pub parsing_errors: Vec<crate::error::SchemaError>,
+
+    /// The namespace bindings in scope at each `<xs:element>` /
+    /// `<xs:attribute>` with a `default` or `fixed` value, keyed by its
+    /// document and start offset (its `SourceRef`): the {value constraint}
+    /// {value} is "the ·actual value· … of the [attribute]" (Structures
+    /// §3.3.2.1, §3.2.2.1 – §3.2.2.3), and an `xs:QName` / `xs:NOTATION` value's actual
+    /// value depends on "the namespace bindings in scope where the literal
+    /// occurs" (Datatypes §3.3.18).
+    value_constraint_namespaces:
+        HashMap<(DocumentId, usize), crate::namespace::context::NamespaceContextSnapshot>,
 }
 
 impl SchemaSet {
@@ -207,6 +217,7 @@ impl SchemaSet {
             effective_components: HashMap::new(),
             builtin_types: None,
             parsing_errors: Vec::new(),
+            value_constraint_namespaces: HashMap::new(),
         };
 
         // Initialize built-in types
@@ -249,6 +260,61 @@ impl SchemaSet {
     /// Get the regex compatibility mode for this schema set.
     pub fn regex_compatibility(&self) -> RegexCompat {
         self.regex_compatibility
+    }
+
+    /// The prepared effective `enumeration` of the simple type `sk`
+    /// ([`EnumerationIndex`](crate::types::facets::EnumerationIndex): the
+    /// expanded names of its QName / NOTATION values and, for a union, every
+    /// literal's value as the union decides it), cached with its effective
+    /// facets; `None` without an enumeration.
+    pub(crate) fn enumeration_index(
+        &self,
+        sk: SimpleTypeKey,
+    ) -> Option<Arc<crate::types::facets::EnumerationIndex>> {
+        let facets = self.effective_facets(sk);
+        let enumeration = facets.enumeration.as_ref()?;
+        let st = self.arenas.simple_types.get(sk)?;
+        Some(self.arenas.enumeration_index(sk, || {
+            if st.variety == crate::parser::frames::SimpleTypeVariety::Union {
+                crate::validation::simple::union_enumeration_index(
+                    enumeration,
+                    &st.resolved_member_types,
+                    self,
+                )
+            } else {
+                crate::types::facets::EnumerationIndex::for_qnames(
+                    enumeration,
+                    &self.name_table,
+                    self.derives_from(sk, self.builtin_types().notation),
+                )
+            }
+        }))
+    }
+
+    /// The namespace bindings in scope at the declaration at `source` when it
+    /// carries a `default` or `fixed` value — the bindings its value is read
+    /// with.
+    pub(crate) fn value_constraint_namespaces(
+        &self,
+        source: Option<&SourceRef>,
+    ) -> Option<&crate::namespace::context::NamespaceContextSnapshot> {
+        let source = source?;
+        self.value_constraint_namespaces
+            .get(&(source.doc_id, source.span.start))
+    }
+
+    /// Record the bindings of the declarations of document `doc_id` that
+    /// carry a `default` or `fixed` value, by start offset.
+    pub(crate) fn record_value_constraint_namespaces(
+        &mut self,
+        doc_id: DocumentId,
+        entries: Vec<(usize, crate::namespace::context::NamespaceContextSnapshot)>,
+    ) {
+        self.value_constraint_namespaces.extend(
+            entries
+                .into_iter()
+                .map(|(start, snapshot)| ((doc_id, start), snapshot)),
+        );
     }
 
     /// Resolve an optional `SourceRef` to its line/column location.

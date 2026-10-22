@@ -18,7 +18,7 @@ use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, TypedValue, XmlNodeOrder,
 };
 use crate::validation::info::ContentType;
-use crate::validation::simple::validate_simple_type;
+use crate::validation::simple::validate_simple_type_in;
 
 use super::buffer::BufferDocument;
 use super::node::{Node, NodeType};
@@ -546,7 +546,7 @@ impl<'a> BufferDocNavigator<'a> {
     ) -> crate::types::value::XmlValue {
         use crate::types::value::{XmlValue, XmlValueKind};
 
-        if !holds_lexical_qname(&value) {
+        if !crate::validation::simple::holds_lexical_qname(&value) {
             return value;
         }
         let XmlValue {
@@ -608,6 +608,18 @@ impl<'a> BufferDocNavigator<'a> {
         } else {
             XmlAtomicValue::QName(qn)
         })
+    }
+
+    /// The namespace an `xs:QName` / `xs:NOTATION` lexical form's prefix is
+    /// bound to at this node, as simple-type validation asks it
+    /// (`validation::simple::PrefixResolver`): for a prefix, `Some` of its
+    /// namespace or `None` when it is bound nowhere; for no prefix, `Some` of
+    /// the default namespace (`Some(None)` without one).
+    pub(crate) fn prefix_binding(&self, prefix: Option<&str>) -> Option<Option<NameId>> {
+        match prefix {
+            Some(p) if !p.is_empty() => self.resolve_prefix_in_scope(Some(p)).map(Some),
+            _ => Some(self.resolve_prefix_in_scope(None)),
+        }
     }
 
     /// Resolve a prefix to its in-scope namespace URI's `NameId`.
@@ -1213,7 +1225,17 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             value_str
         };
 
-        match validate_simple_type(&effective_value, binding.type_key, schema_set) {
+        // QName / NOTATION values resolve their prefixes with the node's
+        // in-scope namespaces (Datatypes §3.3.18), as the validation runtime
+        // does with the element's, so that the typed value and the verdict
+        // agree (enumeration by expanded name, `$value` of an assertion).
+        let resolver = |prefix: Option<&str>| self.prefix_binding(prefix);
+        match validate_simple_type_in(
+            &effective_value,
+            binding.type_key,
+            schema_set,
+            Some(&resolver),
+        ) {
             Ok(r) => TypedValue::Value(self.resolve_qname_typed_value(r.typed_value)),
             Err(_) => TypedValue::Untyped,
         }
@@ -1254,22 +1276,6 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────
-
-/// Whether `value` holds an `xs:QName` or `xs:NOTATION` still in lexical form
-/// (an `xs:string` atom under the QName or NOTATION type code) — itself, as a
-/// union's member value, or as a list member.
-fn holds_lexical_qname(value: &crate::types::value::XmlValue) -> bool {
-    use crate::types::value::{XmlAtomicValue, XmlValueKind};
-    use crate::types::XmlTypeCode;
-    match &value.value {
-        XmlValueKind::Atomic(XmlAtomicValue::String(_)) => {
-            matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation)
-        }
-        XmlValueKind::Union(inner) => holds_lexical_qname(inner),
-        XmlValueKind::List { items, .. } => items.iter().any(holds_lexical_qname),
-        _ => false,
-    }
-}
 
 #[cfg(test)]
 mod tests {

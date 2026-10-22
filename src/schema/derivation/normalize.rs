@@ -1,5 +1,5 @@
 //! §3.8 / §3.9.6 particle normalization: the `NormalizedParticle` model
-//! and the transformations (pointless-particle removal, same-compositor
+//! and the rewrites (pointless-particle removal, same-compositor
 //! flattening, single-child-group collapsing) applied before a particle
 //! restriction check.
 
@@ -46,6 +46,9 @@ pub(super) struct NormalizedElement {
     pub(super) block: DerivationSet,
     pub(super) nillable: bool,
     pub(super) fixed_value: Option<String>,
+    /// The declaration the fixed value was written on (its namespace
+    /// bindings read a QName value).
+    pub(super) fixed_source: Option<SourceRef>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,7 +135,7 @@ impl<'a> ParticleNormalizer<'a> {
             let elem_key = self
                 .schema_set
                 .lookup_element(ref_name.namespace, ref_name.local_name);
-            let (type_key, block, nillable, fixed_value) = elem_key
+            let (type_key, block, nillable, fixed_value, fixed_source) = elem_key
                 .and_then(|key| self.schema_set.arenas.elements.get(key))
                 .map(|decl| {
                     let (eff_block, _) =
@@ -143,13 +146,20 @@ impl<'a> ParticleNormalizer<'a> {
                     let tk = decl
                         .resolved_type
                         .unwrap_or_else(|| TypeKey::Complex(self.schema_set.any_type_key()));
-                    (tk, eff_block, decl.nillable, decl.fixed_value.clone())
+                    (
+                        tk,
+                        eff_block,
+                        decl.nillable,
+                        decl.fixed_value.clone(),
+                        decl.source.clone(),
+                    )
                 })
                 .unwrap_or_else(|| {
                     (
                         TypeKey::Complex(self.schema_set.any_type_key()),
                         DerivationSet::empty(),
                         false,
+                        None,
                         None,
                     )
                 });
@@ -161,6 +171,7 @@ impl<'a> ParticleNormalizer<'a> {
                 block,
                 nillable,
                 fixed_value,
+                fixed_source,
             });
         }
 
@@ -207,6 +218,7 @@ impl<'a> ParticleNormalizer<'a> {
             block,
             nillable: elem.nillable,
             fixed_value: elem.fixed_value.clone(),
+            fixed_source: elem.source.clone().or_else(|| source.cloned()),
         })
     }
 

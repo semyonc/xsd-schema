@@ -114,6 +114,10 @@ struct ParserState<'a, 'b, 'c> {
     chameleon_namespace: Option<NameId>,
     /// The version of XML the document is read with (its declaration).
     xml_version: crate::xml::XmlVersion,
+    /// The namespace bindings at each `<xs:element>` / `<xs:attribute>` that
+    /// carries a `default` or `fixed` value, by start offset (see
+    /// `SchemaSet::value_constraint_namespaces`).
+    value_constraint_namespaces: Vec<(usize, crate::namespace::NamespaceContextSnapshot)>,
 }
 
 impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
@@ -139,6 +143,7 @@ impl<'a, 'b, 'c> ParserState<'a, 'b, 'c> {
             vc_schema_excluded: false,
             chameleon_namespace,
             xml_version: crate::xml::XmlVersion::V1_0,
+            value_constraint_namespaces: Vec::new(),
         }
     }
 
@@ -381,6 +386,7 @@ pub fn parse_schema_with_chameleon(
         .root_schema
         .take()
         .ok_or_else(|| SchemaError::internal("No schema result produced during parsing"))?;
+    let value_constraint_namespaces = std::mem::take(&mut state.value_constraint_namespaces);
     drop(state);
 
     // Record the declared targetNamespace before chameleon adoption.
@@ -438,6 +444,7 @@ pub fn parse_schema_with_chameleon(
     };
     doc.declared_target_namespace = declared_target_namespace;
     schema_set.documents.push(doc);
+    schema_set.record_value_constraint_namespaces(doc_id, value_constraint_namespaces);
     // Deferred (error-recovery) parsing errors are kept only for a document
     // that made it into the set.
     schema_set.parsing_errors.extend(parsing_errors);
@@ -846,6 +853,19 @@ fn handle_start_element(
 
     // Create namespace snapshot for QName resolution during frame construction
     let ns_snapshot = state.ns_context.snapshot();
+
+    // The bindings a `default` / `fixed` value of a declaration is read with
+    // (an `xs:QName` value resolves its prefix with them).
+    if is_in_xsd_ns && matches!(local_name, xsd_names::ELEMENT | xsd_names::ATTRIBUTE) {
+        let names = state.ns_context.name_table();
+        let has_value_constraint = attr_map.get_value_by_name(names, "default").is_some()
+            || attr_map.get_value_by_name(names, "fixed").is_some();
+        if let (true, Some(source)) = (has_value_constraint, source_ref.as_ref()) {
+            state
+                .value_constraint_namespaces
+                .push((source.span.start, ns_snapshot.clone()));
+        }
+    }
 
     // Create the new frame. An error from reading the element's attributes
     // (an unresolvable QName, say) is located at the element.

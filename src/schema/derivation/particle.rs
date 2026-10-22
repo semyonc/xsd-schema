@@ -411,9 +411,11 @@ fn particle_restricts_unfolded(
                 (None, _) => true,
                 (Some(_), None) => false,
                 (Some(base_fixed), Some(derived_fixed)) => {
-                    crate::validation::simple::fixed_values_equal(
+                    crate::validation::simple::fixed_values_equal_in(
                         derived_fixed,
+                        schema_set.value_constraint_namespaces(derived_element.fixed_source.as_ref()),
                         base_fixed,
+                        schema_set.value_constraint_namespaces(base_element.fixed_source.as_ref()),
                         Some(derived_element.type_key),
                         schema_set,
                     )
@@ -1270,9 +1272,11 @@ fn name_and_type_ok_no_occurs(
         (None, _) => {}
         (Some(_), None) => return false,
         (Some(base_fixed), Some(derived_fixed)) => {
-            if !crate::validation::simple::fixed_values_equal(
+            if !crate::validation::simple::fixed_values_equal_in(
                 derived_fixed,
+                schema_set.value_constraint_namespaces(derived.fixed_source.as_ref()),
                 base_fixed,
+                schema_set.value_constraint_namespaces(base.fixed_source.as_ref()),
                 Some(derived.type_key),
                 schema_set,
             ) {

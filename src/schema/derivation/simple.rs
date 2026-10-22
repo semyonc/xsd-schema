@@ -412,6 +412,16 @@ fn validate_simple_restriction(
     // Get base type facets
     let base_facets = get_type_facets(schema_set, base_key)?;
 
+    // An `xs:QName` / `xs:NOTATION` enumeration is a subset of its base's in
+    // value space, by expanded name — `validate_facet_values_against_base_type`
+    // checks it; `merge_with_base` compares lexical forms.
+    let base_facets = base_facets.map(|mut facets| {
+        if is_notation_or_qname_base(schema_set, base_key) {
+            facets.enumeration = None;
+        }
+        facets
+    });
+
     // Validate that derived facets are more restrictive
     if let Some(ref base_facets) = base_facets {
         // FacetSet.merge_with_base validates derivation rules; the bounds are
@@ -719,15 +729,25 @@ fn validate_facet_values_against_base_type(
             // Datatypes §4.3.5.5: the base's value space is its enumeration,
             // the one it inherits through restrictions without their own too
             // (`merge_with_base` sees only the immediate base's own facets).
-            // Compared by lexical form, as the facet check compares QName and
-            // NOTATION enumerations.
+            // Compared by expanded name — each literal read with the namespace
+            // bindings it was written with — as the facet check compares QName
+            // and NOTATION values (Datatypes §3.3.18).
             if let TypeKey::Simple(base_sk) = base_key {
-                if let Some(base_enum) = schema_set.effective_facets(base_sk).enumeration.as_ref() {
-                    if let Some(value) = enum_facet
-                        .values
-                        .iter()
-                        .find(|value| !base_enum.values.contains(*value))
-                    {
+                let base_facets = schema_set.effective_facets(base_sk);
+                if let (Some(base_enum), Some(base_index)) = (
+                    base_facets.enumeration.as_ref(),
+                    schema_set.enumeration_index(base_sk),
+                ) {
+                    if let Some(value) = enum_facet.values.iter().find(|value| {
+                        !crate::validation::simple::qname_literal_enumerated(
+                            enum_facet,
+                            value,
+                            base_enum,
+                            &base_index,
+                            schema_set.derives_from(base_sk, schema_set.builtin_types().notation),
+                            &schema_set.name_table,
+                        )
+                    }) {
                         return Err(SchemaError::structural(
                             "enumeration-valid-restriction",
                             format!(

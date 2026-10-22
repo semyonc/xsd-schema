@@ -259,6 +259,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix in a QName, say) carry the element's location; with error recovery,
   the first error inside an element is reported rather than a consequence of
   skipping the refused child.
+- The attribute wildcard of an extension that declares one of its own takes
+  that wildcard's {process contents} (Structures §3.4.2.5; it took the weaker
+  of the two), so some attributes the combined wildcard admitted laxly or
+  skipped before are validated strictly now.
+- An empty element that takes a QName `default` (or `fixed`) value reads its
+  prefix with the element's own namespace bindings (Structures §3.3.4.3 clause
+  5.1.2): under a QName enumeration it is invalid when the instance binds that
+  prefix elsewhere, and its typed value names the instance's namespace.
+- In a typed document (`build_typed_document`, `build_typed_document_with`), a
+  valid attribute and a valid element of a simple type or with simple content
+  have their [schema normalized value] as their string value (XDM 1.0 §6.2.4,
+  §6.3.4): an `xs:token` value read as `"  a   b "` is `"a b"`. Such an
+  element keeps one text node, none for an empty value, beside its comments
+  and processing instructions; invalid nodes and mixed or element-only content
+  keep their text as read. XSD 1.1 assertions see the same string values.
 
 ### Fixed
 
@@ -398,6 +413,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   too), and the `[schema normalized value]` and the typed value are the
   normalized string. An element's `default` or `fixed` value must satisfy
   these facets as well.
+- A restriction of a complex type that got its attribute wildcard by extension
+  is no longer rejected as adding a wildcard (derivation-ok-restriction): the
+  base's {attribute wildcard} is the one it has through extension (Structures
+  §3.4.2.5), the one its instances are validated with.
+- An explicit restriction of `xs:anyType`
+  (`<xs:restriction base="xs:anyType">`) may declare an attribute wildcard
+  with any `processContents`, as the shorthand `<xs:complexType>` can; it was
+  rejected as adding a wildcard. An extension of `xs:anyType` has anyType's
+  attribute wildcard (any namespace, `lax`, Structures §3.4.7): attributes it
+  does not declare are validated laxly instead of rejected, and a restriction
+  of it may keep a wildcard.
+- `xs:QName` and `xs:NOTATION` values are validated in their value space
+  (Datatypes §3.3.18): `enumeration` compares expanded names — each enumerated
+  value read with the namespace bindings in scope where it is written, an
+  instance value with its element's — so `e:Sender` with `e` bound to the
+  right namespace matches `tns:Sender`, and `tns:Sender` with `tns` bound
+  elsewhere does not; `pattern` still constrains the lexical form. The same
+  holds for lists and unions of them, `fixed` values, the typed values of a
+  typed document, simple-content restrictions of complex types (which rejected
+  every value), and casts and constructor functions for types derived from
+  them. An XSD 1.1 assertion's `$value` is the QName value, and an element's
+  typed value (`SchemaInfo::typed_value`) is the QName value too. Schema
+  checks compare QName and NOTATION enumeration and fixed values by expanded
+  name: a restriction may write its base's values with another prefix.
+- A union type's `enumeration` compares values as the union defines them: each
+  enumerated literal is the value of the first member type that accepts it,
+  and values of different primitive types never match (Datatypes §4.3.5,
+  §2.4.1.3). A QName no longer matches a literal that an earlier string member
+  reads as a string, nor an integer a literal that an earlier token member
+  reads as a token.
 
 ### Performance
 

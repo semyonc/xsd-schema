@@ -131,8 +131,10 @@ impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
 /// Internally it keeps the per-element bookkeeping of the build: the
 /// element-ref stack (so text/end events correlate to the open element), the
 /// slot for the attribute being processed, the per-element queue of
-/// attributes whose binding waits for type-alternative selection, and the
-/// source-span tracking.
+/// attributes whose binding waits for type-alternative selection, the
+/// source-span tracking, and the content of simple-content elements, whose
+/// text becomes the [schema normalized value] once the element is known to be
+/// valid (XDM 1.0 §6.2.4; an attribute's value likewise, §6.3.4).
 pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     builder: &'b mut BufferDocumentBuilder<'a>,
     inner: H,
@@ -153,6 +155,62 @@ pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     /// Element-decl key for the currently open element (used so we can
     /// preserve `element_decl` when refreshing the binding after CTA).
     element_decl_stack: Vec<Option<crate::ids::ElementKey>>,
+    /// Per open element: whether its content is a simple type's, and what is
+    /// held back of it (see [`SimpleContent`]).
+    simple_stack: Vec<SimpleContent>,
+    /// The whiteSpace of the types met so far (`None`: a union's, which
+    /// depends on the member type) — a few per document, looked up linearly.
+    whitespace_of: Vec<(
+        crate::ids::TypeKey,
+        Option<crate::types::facets::WhitespaceMode>,
+    )>,
+}
+
+/// The content of an open element whose governing type is a simple type or a
+/// complex type with simple content. XDM 1.0 §6.2.4: "its string-value is the
+/// [schema normalized value] of the node", which exists when the element is
+/// valid (Structures §3.3.5.4); the children may be its comments and
+/// processing instructions "plus an optional single Text Node whose string
+/// value is the [schema normalized value]", absent when that is empty. An
+/// invalid element has no such value (its type is `xs:anyType`, XDM §3.3.1.1)
+/// and keeps its content as read.
+enum SimpleContent {
+    /// Not simple content (or not assessed): built as read.
+    No,
+    /// Nilled (`xsi:nil="true"`): no content to normalize.
+    Nilled,
+    /// Simple content of `type_key`. Until a comment or processing
+    /// instruction comes, its text waits in the builder's pending text;
+    /// after one, the content is held here, in order, until the element ends.
+    Yes {
+        type_key: crate::ids::TypeKey,
+        held: Option<Vec<HeldContent>>,
+    },
+}
+
+impl SimpleContent {
+    /// The slot of an element governed by `schema_type` with `content_type`.
+    fn of(
+        schema_type: Option<crate::ids::TypeKey>,
+        content_type: Option<crate::validation::info::ContentType>,
+    ) -> Self {
+        match (schema_type, content_type) {
+            (Some(type_key), Some(crate::validation::info::ContentType::TextOnly)) => {
+                SimpleContent::Yes {
+                    type_key,
+                    held: None,
+                }
+            }
+            _ => SimpleContent::No,
+        }
+    }
+}
+
+/// Content of a simple-content element held until its validity is known.
+enum HeldContent {
+    Text(String),
+    Comment(String),
+    ProcessingInstruction(String, String),
 }
 
 impl<'b, 'a> TypedBuilderHandler<'b, 'a, NoopHandler> {
@@ -177,6 +235,8 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             current_attr_ref: None,
             deferred_attr_refs: Vec::new(),
             element_decl_stack: Vec::new(),
+            simple_stack: Vec::new(),
+            whitespace_of: Vec::new(),
         }
     }
 
@@ -208,6 +268,16 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         &mut self,
         view: ElementStartView<'_>,
     ) -> Result<(), BufferDocumentError> {
+        // A child element in simple content (the parent is not valid): the
+        // parent's content goes in as read.
+        if let Some(parent @ SimpleContent::Yes { .. }) = self.simple_stack.last_mut() {
+            if let SimpleContent::Yes {
+                held: Some(held), ..
+            } = std::mem::replace(parent, SimpleContent::No)
+            {
+                self.replay(held)?;
+            }
+        }
         let elem_ref = self.builder.start_element(
             view.local_name,
             view.namespace_uri,
@@ -229,6 +299,11 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             .last()
             .expect("after_element with empty stack");
         self.element_decl_stack.push(info.element_decl);
+        self.simple_stack.push(if info.is_nil {
+            SimpleContent::Nilled
+        } else {
+            SimpleContent::of(info.schema_type, info.content_type)
+        });
         if let Some(tk) = info.schema_type {
             let binding = NodeSchemaBinding {
                 type_key: tk,
@@ -242,6 +317,98 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             self.builder.set_nil(elem_ref);
         }
         Ok(())
+    }
+
+    /// Give an attribute its [schema normalized value] (XDM 1.0 §6.3.4: "The
+    /// [schema normalized value] PSVI property if that exists. Otherwise, the
+    /// [normalized value] property") — it exists when the attribute is valid.
+    fn normalize_attribute(
+        &mut self,
+        attr_ref: u32,
+        info: &SchemaInfo,
+    ) -> Result<(), BufferDocumentError> {
+        let (Some(type_key), crate::validation::info::SchemaValidity::Valid) =
+            (info.schema_type, info.validity)
+        else {
+            return Ok(());
+        };
+        let mode = self.whitespace(type_key);
+        if let Some(normalized) =
+            self.normalized(self.builder.attribute_value(attr_ref), type_key, mode)
+        {
+            self.builder.set_attribute_value(attr_ref, &normalized);
+        }
+        Ok(())
+    }
+
+    /// The whiteSpace of `type_key` ([`content_whitespace`]), remembered.
+    ///
+    /// [`content_whitespace`]: crate::validation::simple::content_whitespace
+    fn whitespace(
+        &mut self,
+        type_key: crate::ids::TypeKey,
+    ) -> Option<crate::types::facets::WhitespaceMode> {
+        if let Some((_, mode)) = self.whitespace_of.iter().find(|(key, _)| *key == type_key) {
+            return *mode;
+        }
+        let mode = self.builder.schema_set().and_then(|schema_set| {
+            crate::validation::simple::content_whitespace(type_key, schema_set)
+        });
+        if self.whitespace_of.len() < 32 {
+            self.whitespace_of.push((type_key, mode));
+        }
+        mode
+    }
+
+    /// `text`'s [schema normalized value] as a lexical form of `type_key`
+    /// (whose whiteSpace is `mode`, `None` for a union), when it differs from
+    /// `text`.
+    fn normalized(
+        &self,
+        text: &str,
+        type_key: crate::ids::TypeKey,
+        mode: Option<crate::types::facets::WhitespaceMode>,
+    ) -> Option<String> {
+        match mode {
+            Some(mode) => crate::validation::simple::whitespace_changes(text, mode),
+            None => crate::validation::simple::schema_normalized(
+                text,
+                type_key,
+                self.builder.schema_set()?,
+            ),
+        }
+    }
+
+    /// Put held content into the document, in order, as read.
+    fn replay(&mut self, held: Vec<HeldContent>) -> Result<(), BufferDocumentError> {
+        for content in held {
+            match content {
+                HeldContent::Text(text) => self.builder.text(&text),
+                HeldContent::Comment(text) => self.builder.comment(&text)?,
+                HeldContent::ProcessingInstruction(target, data) => {
+                    self.builder.processing_instruction(&target, &data)?
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Hold a comment or processing instruction of a simple-content element;
+    /// `false` when the open element has no simple content (build it).
+    fn hold(&mut self, content: HeldContent) -> bool {
+        let Some(SimpleContent::Yes { held, .. }) = self.simple_stack.last_mut() else {
+            return false;
+        };
+        let held = held.get_or_insert_with(|| {
+            let pending = self.builder.take_pending_text();
+            if pending.is_empty() {
+                Vec::new()
+            } else {
+                vec![HeldContent::Text(pending)]
+            }
+        });
+        held.push(content);
+        true
     }
 
     fn build_before_attribute(
@@ -272,6 +439,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             self.deferred_attr_refs.push(attr_ref);
             return Ok(());
         }
+        self.normalize_attribute(attr_ref, info)?;
         // Binding the attribute is also what files it in the id index when
         // its typed value is an `xs:ID` (`set_node_binding`); an `xml:id` was
         // filed by `attribute()` already.
@@ -309,6 +477,12 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 content_type: view.info.content_type,
             };
             self.builder.set_node_binding(elem_ref, binding)?;
+            // A type alternative selected the governing type: it decides.
+            if let Some(slot) = self.simple_stack.last_mut() {
+                if !matches!(slot, SimpleContent::Nilled) {
+                    *slot = SimpleContent::of(Some(tk), view.info.content_type);
+                }
+            }
         }
 
         let deferred_refs = std::mem::take(&mut self.deferred_attr_refs);
@@ -323,6 +497,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             .iter()
             .zip(view.deferred_attribute_results.iter())
         {
+            self.normalize_attribute(*attr_ref, attr_info)?;
             if let Some(tk) = attr_info.schema_type {
                 let binding = NodeSchemaBinding {
                     type_key: tk,
@@ -336,7 +511,60 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         Ok(())
     }
 
-    fn build_after_end_element(&mut self) -> Result<(), BufferDocumentError> {
+    fn build_after_end_element(
+        &mut self,
+        validity: crate::validation::info::SchemaValidity,
+    ) -> Result<(), BufferDocumentError> {
+        let valid = validity == crate::validation::info::SchemaValidity::Valid;
+        match self.simple_stack.pop() {
+            Some(SimpleContent::Yes {
+                type_key,
+                held: None,
+            }) => {
+                if valid && self.builder.has_only_pending_text() {
+                    let mode = self.whitespace(type_key);
+                    if let Some(normalized) =
+                        self.normalized(self.builder.pending_text(), type_key, mode)
+                    {
+                        self.builder.replace_pending_text(&normalized);
+                    }
+                }
+            }
+            Some(SimpleContent::Yes {
+                type_key,
+                held: Some(held),
+            }) => {
+                if valid {
+                    // One text node with the normalized value, where the first
+                    // text was; the comments and instructions in their order.
+                    let text: String = held
+                        .iter()
+                        .filter_map(|content| match content {
+                            HeldContent::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let mode = self.whitespace(type_key);
+                    let normalized = self.normalized(&text, type_key, mode).unwrap_or(text);
+                    let mut text = Some(normalized);
+                    let mut kept = Vec::with_capacity(held.len());
+                    for content in held {
+                        match content {
+                            HeldContent::Text(_) => {
+                                if let Some(text) = text.take().filter(|t| !t.is_empty()) {
+                                    kept.push(HeldContent::Text(text));
+                                }
+                            }
+                            other => kept.push(other),
+                        }
+                    }
+                    self.replay(kept)?;
+                } else {
+                    self.replay(held)?;
+                }
+            }
+            _ => {}
+        }
         self.builder.end_element()?;
         self.elem_ref_stack.pop();
         self.element_decl_stack.pop();
@@ -353,9 +581,20 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
     }
 
     fn build_text(&mut self, text: &str) {
-        if !self.elem_ref_stack.is_empty() {
-            self.builder.text(text);
+        if self.elem_ref_stack.is_empty() {
+            return;
         }
+        if let Some(SimpleContent::Yes {
+            held: Some(held), ..
+        }) = self.simple_stack.last_mut()
+        {
+            match held.last_mut() {
+                Some(HeldContent::Text(last)) => last.push_str(text),
+                _ => held.push(HeldContent::Text(text.to_string())),
+            }
+            return;
+        }
+        self.builder.text(text);
     }
 }
 
@@ -428,7 +667,7 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
         info: &EndElementInfo,
         depth: usize,
     ) -> Result<(), Self::Error> {
-        self.build_after_end_element()?;
+        self.build_after_end_element(info.validity)?;
         self.inner
             .after_end_element(info, depth)
             .map_err(TypedBuildError::Handler)
@@ -449,14 +688,21 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
     }
 
     fn on_comment(&mut self, text: &str) -> Result<(), Self::Error> {
-        self.builder.comment(text)?;
+        if !self.hold(HeldContent::Comment(text.to_string())) {
+            self.builder.comment(text)?;
+        }
         self.inner
             .on_comment(text)
             .map_err(TypedBuildError::Handler)
     }
 
     fn on_processing_instruction(&mut self, target: &str, data: &str) -> Result<(), Self::Error> {
-        self.builder.processing_instruction(target, data)?;
+        if !self.hold(HeldContent::ProcessingInstruction(
+            target.to_string(),
+            data.to_string(),
+        )) {
+            self.builder.processing_instruction(target, data)?;
+        }
         self.inner
             .on_processing_instruction(target, data)
             .map_err(TypedBuildError::Handler)
@@ -603,6 +849,14 @@ pub struct TypedBuild<'a> {
 ///
 /// Validation diagnostics never stop the build: an invalid document is
 /// built and typed as far as the validation typed it.
+///
+/// A valid attribute, and a valid element of a simple type or a complex type
+/// with simple content, has its [schema normalized value] as its string value
+/// — its white space normalized as its type prescribes (XDM 1.0 §6.2.4,
+/// §6.3.4) — whatever the validator's flags; such an element keeps a single
+/// text node (none for an empty value) beside its comments and processing
+/// instructions. Other content, and a node that is not valid, keeps its text as
+/// read; source spans still point at the text as read.
 ///
 /// # Example
 ///
@@ -1744,11 +1998,13 @@ mod tests {
         assert!(nav.move_to_first_attribute());
         assert_eq!(nav.value(), "a");
 
-        // The key is whitespace-normalized; the attribute value is not.
+        // The key is whitespace-normalized, and so is the attribute's string
+        // value: a valid attribute's is its [schema normalized value] (XDM 1.0
+        // §6.3.4).
         let padded = doc.get_element_by_id("b").expect("a padded xs:ID too");
         let mut nav = doc.create_navigator_at(padded);
         assert!(nav.move_to_first_attribute());
-        assert_eq!(nav.value(), " b ", "the visible value is untouched");
+        assert_eq!(nav.value(), "b", "the schema normalized value");
     }
 
     /// An attribute of an ordinary type is not an is-id node.

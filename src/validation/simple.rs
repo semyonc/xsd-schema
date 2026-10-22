@@ -4,12 +4,15 @@
 //! Reuses `VALIDATOR_REGISTRY` for lexical validation and `FacetSet` for
 //! facet constraint checking.
 
-use crate::ids::{SimpleTypeKey, TypeKey};
+use crate::ids::{NameId, SimpleTypeKey, TypeKey};
+use crate::namespace::context::NamespaceContextSnapshot;
+use crate::namespace::qname::QualifiedName;
+use crate::namespace::table::NameTable;
 use crate::parser::frames::{ComplexContentResult, DerivationMethod, SimpleTypeVariety};
 use crate::schema::SchemaSet;
-use crate::types::facets::{normalize_whitespace, FacetSet, WhitespaceMode};
-use crate::types::validators::VALIDATOR_REGISTRY;
-use crate::types::value::{XmlValue, XmlValueKind};
+use crate::types::facets::{normalize_whitespace, EnumerationFacet, FacetSet, WhitespaceMode};
+use crate::types::validators::{ValidationError as TypeValidationError, VALIDATOR_REGISTRY};
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
 use rust_decimal::Decimal;
 
@@ -31,12 +34,391 @@ pub struct SimpleTypeResult {
 /// Dispatches to atomic, list, or union validation depending on the type's variety.
 /// For complex types with simpleContent, walks the base type chain to find the
 /// underlying simple type.
+///
+/// Without a namespace context an `xs:QName` / `xs:NOTATION` value stays in
+/// its lexical form: its typed value is the whitespace-collapsed string under
+/// the QName / NOTATION type code, and `enumeration` compares lexical forms.
+/// The validation runtime, the typed document's navigator and the casts of
+/// the XPath engine resolve such values against the namespace bindings in
+/// scope where they occur.
 pub fn validate_simple_type(
     value: &str,
     type_key: TypeKey,
     schema_set: &SchemaSet,
 ) -> Result<SimpleTypeResult, ValidationError> {
-    validate_simple_type_inner(value, type_key, schema_set)
+    validate_simple_type_inner(value, type_key, schema_set, None)
+}
+
+/// How simple-type validation resolves the prefix of an `xs:QName` /
+/// `xs:NOTATION` lexical form — Datatypes §3.3.18: "The mapping from lexical
+/// space to value space for a particular QName ·literal· depends on the
+/// namespace bindings in scope where the literal occurs". Called with the
+/// prefix, or `None` for an unprefixed name; returns the namespace bound to
+/// it — for `None` the default namespace, itself `None` when there is none
+/// ("If the host language does not specify otherwise, unqualified names are
+/// bound to the default namespace") — or `None` when the prefix is bound
+/// nowhere.
+pub(crate) type PrefixResolver<'r> = &'r dyn Fn(Option<&str>) -> Option<Option<NameId>>;
+
+/// A [`PrefixResolver`] over the bindings of a namespace snapshot.
+pub(crate) fn snapshot_prefixes<'s>(
+    snapshot: &'s NamespaceContextSnapshot,
+    names: &'s NameTable,
+) -> impl Fn(Option<&str>) -> Option<Option<NameId>> + 's {
+    move |prefix| match prefix {
+        None | Some("") => Some(snapshot.default_ns),
+        Some(prefix) => names
+            .get(prefix)
+            .and_then(|id| snapshot.resolve_prefix(id))
+            .map(Some),
+    }
+}
+
+/// [`validate_simple_type`] with the namespace bindings in scope where the
+/// value occurs: an `xs:QName` / `xs:NOTATION` value — atomic, a member of a
+/// list, the value a union's member type gave — whose prefix `resolver` binds
+/// is validated in the value space (Datatypes §3.3.18: "The ·value space· of
+/// QName is the set of tuples {namespace name, local part}"): its typed value
+/// is the QName (NOTATION) value, `enumeration` compares expanded names — each
+/// enumerated literal resolved with the bindings of the schema element it was
+/// written on — `pattern` constrains the lexical form, and an assertion's
+/// `$value` is the QName value. A value whose prefix `resolver` binds nowhere
+/// is validated as without a resolver (the caller reports the unbound prefix,
+/// `cvc-datatype-valid.1.2.1`).
+pub(crate) fn validate_simple_type_in(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
+) -> Result<SimpleTypeResult, ValidationError> {
+    validate_simple_type_inner(value, type_key, schema_set, resolver)
+}
+
+/// Whether `value` holds an `xs:QName` / `xs:NOTATION` value in the value
+/// space (not a lexical form) — itself, as a union's member value, or as a
+/// list member.
+pub(crate) fn holds_qname_value(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::QName(_) | XmlAtomicValue::Notation(_)) => true,
+        XmlValueKind::Union(inner) => holds_qname_value(inner),
+        XmlValueKind::List { items, .. } => items.iter().any(holds_qname_value),
+        _ => false,
+    }
+}
+
+/// Whether `value` holds an `xs:QName` or `xs:NOTATION` still in lexical form
+/// (an `xs:string` atom under the QName or NOTATION type code) — itself, as a
+/// union's member value, or as a list member.
+pub(crate) fn holds_lexical_qname(value: &XmlValue) -> bool {
+    match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::String(_)) => {
+            matches!(value.type_code, XmlTypeCode::QName | XmlTypeCode::Notation)
+        }
+        XmlValueKind::Union(inner) => holds_lexical_qname(inner),
+        XmlValueKind::List { items, .. } => items.iter().any(holds_lexical_qname),
+        _ => false,
+    }
+}
+
+/// Whether values of `type_key` can be (or contain) `xs:QName` /
+/// `xs:NOTATION` values: an atomic type derived from either, a list whose item
+/// type can, a union with such a member type, a complex type whose simple
+/// content can.
+pub(crate) fn type_has_qname_values(type_key: TypeKey, schema_set: &SchemaSet) -> bool {
+    fn walk(type_key: TypeKey, schema_set: &SchemaSet, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match type_key {
+            TypeKey::Simple(sk) => {
+                let Some(st) = schema_set.arenas.simple_types.get(sk) else {
+                    return false;
+                };
+                match st.variety {
+                    SimpleTypeVariety::Atomic => matches!(
+                        resolve_type_code(sk, schema_set),
+                        Some(XmlTypeCode::QName | XmlTypeCode::Notation)
+                    ),
+                    SimpleTypeVariety::List => st
+                        .resolved_item_type
+                        .is_some_and(|item| walk(item, schema_set, depth + 1)),
+                    SimpleTypeVariety::Union => st
+                        .resolved_member_types
+                        .iter()
+                        .any(|&member| walk(member, schema_set, depth + 1)),
+                }
+            }
+            TypeKey::Complex(ck) => schema_set
+                .arenas
+                .complex_types
+                .get(ck)
+                .and_then(|ct| ct.resolved_simple_content_type.or(ct.resolved_base_type))
+                .is_some_and(|next| {
+                    next != TypeKey::Complex(ck) && walk(next, schema_set, depth + 1)
+                }),
+        }
+    }
+    walk(type_key, schema_set, 0)
+}
+
+/// [`fixed_values_equal`] for two literals each read with the namespace
+/// bindings in scope where it was written (`a_ns`, `b_ns`): two
+/// `xs:QName` / `xs:NOTATION` values (or lists, unions holding them) are
+/// equal when their expanded names are (Datatypes §3.3.18). Without both
+/// snapshots, for any other type, or when a literal does not resolve, as
+/// [`fixed_values_equal`].
+pub(crate) fn fixed_values_equal_in(
+    a: &str,
+    a_ns: Option<&NamespaceContextSnapshot>,
+    b: &str,
+    b_ns: Option<&NamespaceContextSnapshot>,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> bool {
+    match resolved_pair(a, a_ns, b, b_ns, type_key, schema_set) {
+        Some((a, b)) => typed_values_equal(&a, &b),
+        None => fixed_values_equal(a, b, type_key, schema_set),
+    }
+}
+
+/// [`fixed_values_identical`] for two literals each read with its own
+/// namespace bindings, as [`fixed_values_equal_in`] does.
+pub(crate) fn fixed_values_identical_in(
+    a: &str,
+    a_ns: Option<&NamespaceContextSnapshot>,
+    b: &str,
+    b_ns: Option<&NamespaceContextSnapshot>,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<bool> {
+    match resolved_pair(a, a_ns, b, b_ns, Some(type_key), schema_set) {
+        Some((a, b)) => Some(if schema_set.is_xsd10() {
+            typed_values_equal(&a, &b)
+        } else {
+            super::identity::values_identical(&a, &b)
+        }),
+        None => fixed_values_identical(a, b, type_key, schema_set),
+    }
+}
+
+/// The typed values of two QName-valued literals, each validated with the
+/// bindings it was written with; `None` unless the type has QName values,
+/// both snapshots are known and both literals resolve.
+fn resolved_pair(
+    a: &str,
+    a_ns: Option<&NamespaceContextSnapshot>,
+    b: &str,
+    b_ns: Option<&NamespaceContextSnapshot>,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> Option<(XmlValue, XmlValue)> {
+    let (a_ns, b_ns, type_key) = (a_ns?, b_ns?, type_key?);
+    if !type_has_qname_values(type_key, schema_set) {
+        return None;
+    }
+    let names = &schema_set.name_table;
+    let (ra, rb) = (
+        snapshot_prefixes(a_ns, names),
+        snapshot_prefixes(b_ns, names),
+    );
+    let a = validate_simple_type_in(a, type_key, schema_set, Some(&ra)).ok()?;
+    let b = validate_simple_type_in(b, type_key, schema_set, Some(&rb)).ok()?;
+    (holds_qname_value(&a.typed_value) && holds_qname_value(&b.typed_value))
+        .then_some((a.typed_value, b.typed_value))
+}
+
+/// [`fixed_matches_typed`] for a fixed literal read with the namespace
+/// bindings `fixed_ns` of the declaration it was written on: when the
+/// instance's typed value holds `xs:QName` / `xs:NOTATION` values (resolved
+/// with the instance's bindings), the fixed literal is resolved with the
+/// schema's and the two are compared by expanded name — Structures §3.3.4.3
+/// clause 5.2.2.2.2, "the ·actual value· of E is equal or identical to
+/// D.{value constraint}.{value}", the {value} being "the ·actual value· …
+/// of the [attribute]" on the declaration. Otherwise (or when the literal does
+/// not resolve) as [`fixed_matches_typed`].
+pub(crate) fn fixed_matches_typed_in(
+    instance_raw: &str,
+    instance_typed: &XmlValue,
+    fixed: &str,
+    fixed_ns: Option<&NamespaceContextSnapshot>,
+    type_key: Option<TypeKey>,
+    schema_set: &SchemaSet,
+) -> bool {
+    if let (Some(fixed_ns), Some(tk)) = (fixed_ns, type_key) {
+        if holds_qname_value(instance_typed) {
+            let resolver = snapshot_prefixes(fixed_ns, &schema_set.name_table);
+            if let Ok(fixed) = validate_simple_type_in(fixed, tk, schema_set, Some(&resolver)) {
+                if holds_qname_value(&fixed.typed_value) {
+                    return typed_values_equal(instance_typed, &fixed.typed_value);
+                }
+            }
+        }
+    }
+    fixed_matches_typed(instance_raw, instance_typed, fixed, type_key, schema_set)
+}
+
+/// Whether the enumeration literal `literal` (an `xs:QName` / `xs:NOTATION`
+/// lexical form), read with the bindings `snapshot` of the schema element it
+/// was written on, denotes the expanded name `{namespace}local`.
+fn qname_literal_denotes(
+    literal: &str,
+    snapshot: &NamespaceContextSnapshot,
+    namespace: Option<NameId>,
+    local: &str,
+    names: &NameTable,
+) -> bool {
+    let literal = literal.trim();
+    let (prefix, literal_local) = match literal.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, literal),
+    };
+    literal_local == local && snapshot_prefixes(snapshot, names)(prefix) == Some(namespace)
+}
+
+/// Whether an `enumeration` of a type with QName values admits the QName
+/// value `{namespace}local` whose lexical form is `normalized` (Datatypes
+/// §4.3.5.4: "equal or identical to one of the values specified in
+/// {value}"): a literal with the namespace bindings it was written with
+/// (`qname_contexts`) by expanded name, a literal without them (a facet set
+/// built by hand) by lexical form.
+pub(crate) fn enumeration_admits_qname(
+    enumeration: &EnumerationFacet,
+    normalized: &str,
+    namespace: Option<NameId>,
+    local: &str,
+    names: &NameTable,
+) -> bool {
+    enumeration
+        .qname_contexts
+        .iter()
+        .any(|(literal, snapshot)| {
+            qname_literal_denotes(literal, snapshot, namespace, local, names)
+        })
+        || (enumeration.values.contains(normalized)
+            && !enumeration
+                .qname_contexts
+                .iter()
+                .any(|(literal, _)| literal == normalized))
+}
+
+/// Whether the QName value `name` (lexical form `normalized`) is a value of
+/// `enumeration` — through the cached expanded-name index of the simple type
+/// `key` whose effective facets hold it, or, for a facet set of no simple type
+/// (a complex type's simple-content restriction), by scanning it
+/// ([`enumeration_admits_qname`]).
+fn qname_enumerated(
+    enumeration: &EnumerationFacet,
+    key: Option<SimpleTypeKey>,
+    normalized: &str,
+    name: &QNameValue,
+    notation: bool,
+    schema_set: &SchemaSet,
+) -> bool {
+    let qualified = name.name();
+    match key.and_then(|sk| schema_set.enumeration_index(sk)) {
+        Some(index) => index.admits(
+            normalized,
+            notation,
+            qualified.namespace_uri,
+            qualified.local_name,
+        ),
+        None => enumeration_admits_qname(
+            enumeration,
+            normalized,
+            qualified.namespace_uri,
+            name.local_name(),
+            &schema_set.name_table,
+        ),
+    }
+}
+
+/// Whether the enumeration literal `literal` of `from` — an `xs:QName` /
+/// `xs:NOTATION` lexical form, read with each namespace snapshot recorded for
+/// it — is a value of the enumeration `target`, whose expanded names are
+/// `target_index` (Datatypes §4.3.5.5 enumeration valid restriction: a
+/// restriction's enumeration values are values of its base). A literal
+/// without a snapshot, or whose prefix its bindings do not bind, is looked up
+/// by lexical form.
+pub(crate) fn qname_literal_enumerated(
+    from: &EnumerationFacet,
+    literal: &str,
+    target: &EnumerationFacet,
+    target_index: &crate::types::facets::EnumerationIndex,
+    notation: bool,
+    names: &NameTable,
+) -> bool {
+    let mut contexts = from
+        .qname_contexts
+        .iter()
+        .filter(|(value, _)| value == literal)
+        .peekable();
+    if contexts.peek().is_none() {
+        return target.values.contains(literal);
+    }
+    let lexical = literal.trim();
+    let (prefix, local) = match lexical.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, lexical),
+    };
+    contexts.all(
+        |(_, snapshot)| match snapshot_prefixes(snapshot, names)(prefix) {
+            Some(namespace) => names
+                .get(local)
+                .is_some_and(|local| target_index.has_name(notation, namespace, local)),
+            None => target.values.contains(literal),
+        },
+    )
+}
+
+/// Whether some reading of the enumeration literal `literal` satisfies
+/// `matches`: one per namespace snapshot recorded for it (`qname_contexts`,
+/// each given as a [`PrefixResolver`]), or — without any — a single reading
+/// without one.
+fn literal_readings(
+    enumeration: &EnumerationFacet,
+    literal: &str,
+    names: &NameTable,
+    matches: &dyn Fn(Option<PrefixResolver<'_>>) -> bool,
+) -> bool {
+    let mut contexts = enumeration
+        .qname_contexts
+        .iter()
+        .filter(|(value, _)| value == literal)
+        .peekable();
+    if contexts.peek().is_none() {
+        return matches(None);
+    }
+    contexts.any(|(_, snapshot)| {
+        let resolver = snapshot_prefixes(snapshot, names);
+        matches(Some(&resolver))
+    })
+}
+
+/// The facets of a type derived from `xs:QName` / `xs:NOTATION` on the QName
+/// value `name` of the lexical form `normalized` (whitespace collapsed):
+/// `pattern` on the lexical form (Datatypes §4.3.4), `enumeration` by expanded
+/// name ([`qname_enumerated`]; `key` is the simple type whose effective facets
+/// `facets` are, `None` for a simple-content restriction's own); the length
+/// facets admit every value (Datatypes §4.3.1.3, as for a lexical QName). The
+/// errors are those of the lexical check.
+fn check_qname_facets(
+    normalized: &str,
+    name: &QNameValue,
+    notation: bool,
+    facets: &FacetSet,
+    key: Option<SimpleTypeKey>,
+    schema_set: &SchemaSet,
+) -> Result<(), ValidationError> {
+    let error = |e: crate::error::FacetError| {
+        errors::from_value_error_default(TypeValidationError::FacetViolation(e), None)
+    };
+    facets.validate_patterns_only(normalized).map_err(error)?;
+    if let Some(enumeration) = &facets.enumeration {
+        if !qname_enumerated(enumeration, key, normalized, name, notation, schema_set) {
+            return Err(error(crate::error::FacetError::enumeration(normalized)));
+        }
+    }
+    Ok(())
 }
 
 /// Value-space equality for fixed/default values (§3.3.4.3 clause 5.2.2.2.2, §3.2.4.4).
@@ -333,6 +715,7 @@ fn validate_simple_type_inner(
     value: &str,
     type_key: TypeKey,
     schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     match type_key {
         TypeKey::Simple(sk) => {
@@ -347,9 +730,9 @@ fn validate_simple_type_inner(
                 }
             };
             match st_data.variety {
-                SimpleTypeVariety::Atomic => validate_atomic_type(value, sk, schema_set),
-                SimpleTypeVariety::List => validate_list_type(value, sk, schema_set),
-                SimpleTypeVariety::Union => validate_union_type(value, sk, schema_set),
+                SimpleTypeVariety::Atomic => validate_atomic_type(value, sk, schema_set, resolver),
+                SimpleTypeVariety::List => validate_list_type(value, sk, schema_set, resolver),
+                SimpleTypeVariety::Union => validate_union_type(value, sk, schema_set, resolver),
             }
         }
         TypeKey::Complex(ck) => {
@@ -390,9 +773,9 @@ fn validate_simple_type_inner(
             };
             let value = value.as_ref();
             let mut result = if let Some(inline_st) = ct_data.resolved_simple_content_type {
-                validate_simple_type_inner(value, inline_st, schema_set)?
+                validate_simple_type_inner(value, inline_st, schema_set, resolver)?
             } else if let Some(base_key) = ct_data.resolved_base_type {
-                validate_simple_type_inner(value, base_key, schema_set)?
+                validate_simple_type_inner(value, base_key, schema_set, resolver)?
             } else {
                 // No base type — treat as anySimpleType (accept any value)
                 SimpleTypeResult {
@@ -483,7 +866,8 @@ pub(crate) fn normalized_literal<'a>(
                     SimpleTypeVariety::Union => {
                         st.resolved_member_types.iter().find_map(|&member| {
                             let result =
-                                validate_simple_type_inner(literal, member, schema_set).ok()?;
+                                validate_simple_type_inner(literal, member, schema_set, None)
+                                    .ok()?;
                             Some(match result.normalized_value {
                                 Some(normalized) if normalized != literal => {
                                     std::borrow::Cow::Owned(normalized)
@@ -511,6 +895,73 @@ pub(crate) fn normalized_literal<'a>(
         }
     }
     Some(std::borrow::Cow::Borrowed(literal))
+}
+
+/// The whiteSpace that normalizes every lexical form of `type_key`, as
+/// [`normalized_literal`] applies it: an atomic type's, `collapse` for a list,
+/// a complex type's simple content's (its restriction's own facet, or its
+/// content type's) — `None` for a union, whose normalization is that of the
+/// member type that accepts the literal, and for a type that is not found.
+#[cfg(feature = "xsd11")]
+pub(crate) fn content_whitespace(
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<WhitespaceMode> {
+    let mut current = type_key;
+    for _ in 0..100 {
+        match current {
+            TypeKey::Simple(sk) => {
+                return match schema_set.arenas.simple_types.get(sk)?.variety {
+                    SimpleTypeVariety::Atomic => Some(atomic_whitespace(sk, schema_set)),
+                    SimpleTypeVariety::List => Some(WhitespaceMode::Collapse),
+                    SimpleTypeVariety::Union => None,
+                };
+            }
+            TypeKey::Complex(ck) => {
+                let ct = schema_set.arenas.complex_types.get(ck)?;
+                if let ComplexContentResult::Simple(sc) = &ct.content {
+                    if sc.derivation == DerivationMethod::Restriction {
+                        if let Some(whitespace) = &sc.facets.whitespace {
+                            return Some(whitespace.value);
+                        }
+                    }
+                }
+                current = match ct.resolved_simple_content_type.or(ct.resolved_base_type) {
+                    Some(next) => next,
+                    None => return Some(WhitespaceMode::Preserve),
+                };
+            }
+        }
+    }
+    Some(WhitespaceMode::Preserve)
+}
+
+/// `text` normalized with `mode` when that changes it.
+#[cfg(feature = "xsd11")]
+pub(crate) fn whitespace_changes(text: &str, mode: WhitespaceMode) -> Option<String> {
+    match normalize_whitespace(text, mode) {
+        std::borrow::Cow::Borrowed(same) if same.len() == text.len() => None,
+        normalized => Some(normalized.into_owned()),
+    }
+}
+
+/// The [schema normalized value] of a valid value `text` of `type_key` — its
+/// ·normalized value· with respect to the type's whiteSpace (as
+/// [`normalized_literal`] gives it) — when it differs from `text`; `None` when
+/// `text` is already normalized.
+#[cfg(feature = "xsd11")]
+pub(crate) fn schema_normalized(
+    text: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+) -> Option<String> {
+    match content_whitespace(type_key, schema_set) {
+        Some(mode) => whitespace_changes(text, mode),
+        None => {
+            let normalized = normalized_literal(text, type_key, schema_set)?;
+            (normalized != text).then(|| normalized.into_owned())
+        }
+    }
 }
 
 /// The facets of a complex type's simple content restriction, checked on the
@@ -547,11 +998,29 @@ fn check_simple_content_facets(
             None => facets.validate_string(lex).map_err(facet_error)?,
         },
         XmlValueKind::Union(member) => match base_type {
-            Some(st) => {
-                check_union_facets(facets, lex, member, &st.resolved_member_types, schema_set)?
-            }
+            Some(st) => check_union_facets(
+                facets,
+                None,
+                lex,
+                member,
+                &st.resolved_member_types,
+                schema_set,
+            )?,
             None => facets.validate_string(lex).map_err(facet_error)?,
         },
+        XmlValueKind::Atomic(XmlAtomicValue::QName(name) | XmlAtomicValue::Notation(name)) => {
+            check_qname_facets(
+                &normalize_whitespace(lex, WhitespaceMode::Collapse),
+                name,
+                matches!(
+                    typed.value,
+                    XmlValueKind::Atomic(XmlAtomicValue::Notation(_))
+                ),
+                facets,
+                None,
+                schema_set,
+            )?
+        }
         XmlValueKind::Atomic(_) => match VALIDATOR_REGISTRY.get_by_code(typed.type_code) {
             Some(validator) => {
                 let normalized = normalize_whitespace(
@@ -647,6 +1116,7 @@ fn validate_atomic_type(
     value: &str,
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let type_code = resolve_type_code(sk, schema_set);
 
@@ -689,6 +1159,16 @@ fn validate_atomic_type(
              enumeration facet are permitted (§3.2)",
             None,
         ));
+    }
+
+    // An `xs:QName` / `xs:NOTATION` value whose prefix the caller's bindings
+    // resolve is validated in the value space.
+    if let (Some(resolver), XmlTypeCode::QName | XmlTypeCode::Notation) = (resolver, type_code) {
+        if let Some(result) = validate_resolved_qname(
+            value, sk, type_code, validator, &facets, resolver, schema_set,
+        )? {
+            return Ok(result);
+        }
     }
 
     // Compute normalized value (PSVI [schema normalized value])
@@ -735,6 +1215,61 @@ fn validate_atomic_type(
         }
         Err(type_err) => Err(errors::from_value_error_default(type_err, None)),
     }
+}
+
+/// An `xs:QName` / `xs:NOTATION` value of the atomic type `sk` (whose
+/// built-in type is `type_code`) in the value space: the lexical form is
+/// checked as without a namespace context (the same errors), the prefix is
+/// resolved with `resolver`, then the facets see the expanded name
+/// ([`check_qname_facets`]) and the assertions the QName (NOTATION) value.
+/// `Ok(None)` when `resolver` binds the prefix nowhere: the value is then
+/// validated in its lexical form, as without bindings.
+fn validate_resolved_qname(
+    value: &str,
+    sk: SimpleTypeKey,
+    type_code: XmlTypeCode,
+    validator: &dyn crate::types::validators::TypeValidator,
+    facets: &FacetSet,
+    resolver: PrefixResolver<'_>,
+    schema_set: &SchemaSet,
+) -> Result<Option<SimpleTypeResult>, ValidationError> {
+    let lexical = validator
+        .validate(value)
+        .map_err(|e| errors::from_value_error_default(e, None))?
+        .to_string_value();
+    let (prefix, local) = match lexical.split_once(':') {
+        Some((prefix, local)) => (Some(prefix), local),
+        None => (None, lexical.as_str()),
+    };
+    let Some(namespace) = resolver(prefix) else {
+        return Ok(None);
+    };
+    let names = &schema_set.name_table;
+    let name = QNameValue::new(
+        QualifiedName::new(namespace, names.add(local), prefix.map(|p| names.add(p))),
+        names,
+    );
+    check_qname_facets(
+        &lexical,
+        &name,
+        type_code == XmlTypeCode::Notation,
+        facets,
+        Some(sk),
+        schema_set,
+    )?;
+    let atom = if type_code == XmlTypeCode::Notation {
+        XmlAtomicValue::Notation(name)
+    } else {
+        XmlAtomicValue::QName(name)
+    };
+    let typed_value = XmlValue::with_schema_type(type_code, sk, XmlValueKind::Atomic(atom));
+    #[cfg(feature = "xsd11")]
+    evaluate_assertion_facets(&typed_value, facets, schema_set)?;
+    Ok(Some(SimpleTypeResult {
+        typed_value,
+        member_type: None,
+        normalized_value: Some(lexical),
+    }))
 }
 
 /// XSD 1.0 §3.2.4 / §3.2.5: `+INF` is not in the lexical space (added in
@@ -801,6 +1336,7 @@ fn validate_list_type(
     value: &str,
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let st_data = match schema_set.arenas.simple_types.get(sk) {
         Some(d) => d,
@@ -843,7 +1379,7 @@ fn validate_list_type(
     // the node will be an instance of one of the member types of the union").
     let mut items = Vec::with_capacity(items_str.len());
     for item_str in &items_str {
-        let result = validate_simple_type_inner(item_str, item_type_key, schema_set)?;
+        let result = validate_simple_type_inner(item_str, item_type_key, schema_set, resolver)?;
         items.push(list_member(result.typed_value));
     }
     // The declared item type's code; a union's is that of its base type,
@@ -911,12 +1447,23 @@ fn check_list_facets(
     // Datatypes §4.3.5.4 / §2.4.1.2: an enumeration value is a whole list,
     // compared with the instance's value — same length, members pairwise
     // equal in the value space of the type that validated each. A
-    // lexically identical enumeration value is a match without parsing.
+    // lexically identical enumeration value is a match without parsing —
+    // unless the members are QName values: the same spelling can name
+    // other names under other bindings. Each literal is read with the
+    // namespace bindings of the schema element it was written on. (A member
+    // whose prefix is bound nowhere stays lexical; the list is then compared
+    // as without bindings, and the caller reports the prefix.)
     if let Some(enumeration) = &facets.enumeration {
-        if !enumeration.values.contains(normalized) {
+        let qname_members =
+            items.iter().any(holds_qname_value) && !items.iter().any(holds_lexical_qname);
+        if qname_members || !enumeration.values.contains(normalized) {
             facets
                 .validate_enum_value_space(
-                    |literal| list_literal_matches(literal, items, item_type_key, schema_set),
+                    |literal| {
+                        literal_readings(enumeration, literal, &schema_set.name_table, &|reading| {
+                            list_literal_matches(literal, items, item_type_key, schema_set, reading)
+                        })
+                    },
                     normalized,
                 )
                 .map_err(facet_error)?;
@@ -935,6 +1482,7 @@ fn list_literal_matches(
     members: &[XmlValue],
     item_type_key: TypeKey,
     schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
 ) -> bool {
     let collapsed = normalize_whitespace(literal, WhitespaceMode::Collapse);
     let tokens: Vec<&str> = if collapsed.is_empty() {
@@ -944,17 +1492,35 @@ fn list_literal_matches(
     };
     tokens.len() == members.len()
         && tokens.iter().zip(members).all(|(token, member)| {
-            validate_simple_type_inner(token, item_type_key, schema_set).is_ok_and(|item| {
-                super::identity::values_equal_or_identical(&list_member(item.typed_value), member)
-            })
+            validate_simple_type_inner(token, item_type_key, schema_set, resolver).is_ok_and(
+                |item| {
+                    super::identity::values_equal_or_identical(
+                        &list_member(item.typed_value),
+                        member,
+                    )
+                },
+            )
         })
 }
 
 /// The facets of a union type on a value of it: its lexical form `value`, the
 /// value `member` the member type that accepted it gave, and the union's
-/// member types.
+/// member types. `key` is the union type whose effective facets `facets` are
+/// (`None` for a simple-content restriction's own facets).
+///
+/// `pattern` constrains the lexical form. `enumeration` compares values
+/// (Datatypes §4.3.5.4): each literal is the value the union's ordered member
+/// types give it — "validated against the ·member types· in the order in
+/// which they appear in the definition until a match is found" (§2.4.1.3),
+/// read with the namespace bindings it was written with — and the instance's
+/// value is the one its own member type gave; "no two values from different
+/// ·primitive· ·value spaces· are equal" (§2.2.3). A QName / NOTATION value
+/// is looked up by expanded name among the literals whose value is one; a
+/// value whose prefix is bound nowhere is compared by lexical form, as
+/// before (the caller reports the prefix).
 fn check_union_facets(
     facets: &FacetSet,
+    key: Option<SimpleTypeKey>,
     value: &str,
     member: &XmlValue,
     member_types: &[TypeKey],
@@ -967,42 +1533,135 @@ fn check_union_facets(
     facets
         .validate_patterns_only(&lex_value)
         .map_err(facet_error)?;
-    // Enumeration checked in value space: re-parse each enum value as the
-    // matched primitive type and compare canonical forms (handles float/
-    // double rounding and duration leading-zero differences)
-    let type_code = member.type_code;
-    // A member type that is a list has no single primitive type to
-    // re-parse with: map the enumeration value through the member
-    // types, as the union's own lexical mapping does, and compare
-    // the two lists (Datatypes §2.4.1.2).
-    let member_is_list = holds_list(member);
-    facets
-        .validate_enum_value_space(
-            |s| {
-                if member_is_list {
-                    return member_types
-                        .iter()
-                        .find_map(|&m| validate_simple_type_inner(s, m, schema_set).ok())
-                        .is_some_and(|literal| {
-                            super::identity::values_equal_or_identical(&literal.typed_value, member)
-                        });
-                }
-                VALIDATOR_REGISTRY
-                    .validate(type_code, s)
-                    .map(|v| {
-                        // Decimals compare by exact value: a
-                        // value carried in lexical form has no
-                        // canonical string to compare.
-                        match crate::types::exact_decimal::decimal_values_equal(&v, member) {
-                            Some(equal) => equal,
-                            None => v.to_string_value() == check_value,
-                        }
-                    })
-                    .unwrap_or(false)
-            },
+    let Some(enumeration) = &facets.enumeration else {
+        return Ok(());
+    };
+    if !holds_list(member) && holds_lexical_qname(member) {
+        let type_code = member.type_code;
+        return facets
+            .validate_enum_value_space(
+                |s| {
+                    VALIDATOR_REGISTRY
+                        .validate(type_code, s)
+                        .is_ok_and(|v| v.to_string_value() == check_value)
+                },
+                &check_value,
+            )
+            .map_err(facet_error);
+    }
+    let index = match key.and_then(|sk| schema_set.enumeration_index(sk)) {
+        Some(index) => index,
+        None => std::sync::Arc::new(union_enumeration_index(
+            enumeration,
+            member_types,
+            schema_set,
+        )),
+    };
+    let admitted = match &unwrap_unions(member).value {
+        XmlValueKind::Atomic(XmlAtomicValue::QName(name)) => {
+            let name = name.name();
+            index.admits(&check_value, false, name.namespace_uri, name.local_name)
+        }
+        XmlValueKind::Atomic(XmlAtomicValue::Notation(name)) => {
+            let name = name.name();
+            index.admits(&check_value, true, name.namespace_uri, name.local_name)
+        }
+        _ => index
+            .values()
+            .iter()
+            .any(|literal| union_literal_equals(literal, member)),
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(facet_error(crate::error::FacetError::enumeration(
             &check_value,
-        )
-        .map_err(facet_error)
+        )))
+    }
+}
+
+/// The enumeration index of a union type: every literal's value as the
+/// union's ordered member types `member_types` give it (the first that
+/// accepts it decides, Datatypes §2.4.1.3), once per namespace snapshot
+/// recorded for the literal (a QName member reads its prefix with it); a
+/// literal no member accepts has no value.
+pub(crate) fn union_enumeration_index(
+    enumeration: &EnumerationFacet,
+    member_types: &[TypeKey],
+    schema_set: &SchemaSet,
+) -> crate::types::facets::EnumerationIndex {
+    let names = &schema_set.name_table;
+    let mut readings: std::collections::HashMap<&str, Vec<&NamespaceContextSnapshot>> =
+        std::collections::HashMap::new();
+    for (literal, snapshot) in &enumeration.qname_contexts {
+        readings.entry(literal.as_str()).or_default().push(snapshot);
+    }
+    let value_of = |literal: &str, resolver: Option<PrefixResolver<'_>>| {
+        member_types.iter().find_map(|&member| {
+            validate_simple_type_inner(literal, member, schema_set, resolver)
+                .ok()
+                .map(|result| result.typed_value)
+        })
+    };
+    let mut index = crate::types::facets::EnumerationIndex::default();
+    for literal in &enumeration.values {
+        match readings.get(literal.as_str()) {
+            Some(snapshots) => {
+                for snapshot in snapshots {
+                    let resolver = snapshot_prefixes(snapshot, names);
+                    if let Some(value) = value_of(literal, Some(&resolver)) {
+                        index.push_value(value);
+                    }
+                }
+            }
+            None => {
+                if let Some(value) = value_of(literal, None) {
+                    if !holds_list(&value) && holds_lexical_qname(&value) {
+                        index.push_lexical(literal);
+                    }
+                    index.push_value(value);
+                }
+            }
+        }
+    }
+    index
+}
+
+/// Whether the union literal value `literal` equals the instance value
+/// `value` (Datatypes §4.3.5.4, "equal or identical"): lists member for
+/// member; atomic values only within one primitive datatype (§2.2.3: "no two
+/// values from different ·primitive· ·value spaces· are equal") — decimals by
+/// exact value, QName / NOTATION values by expanded name, other values by
+/// their canonical form, as the union check compared them before.
+fn union_literal_equals(literal: &XmlValue, value: &XmlValue) -> bool {
+    if holds_list(literal) || holds_list(value) {
+        return super::identity::values_equal_or_identical(literal, value);
+    }
+    let (literal, value) = (unwrap_unions(literal), unwrap_unions(value));
+    if let (Some(a), Some(b)) = (literal.primitive_type(), value.primitive_type()) {
+        if a != b {
+            return false;
+        }
+    }
+    if let (
+        XmlValueKind::Atomic(XmlAtomicValue::QName(a) | XmlAtomicValue::Notation(a)),
+        XmlValueKind::Atomic(XmlAtomicValue::QName(b) | XmlAtomicValue::Notation(b)),
+    ) = (&literal.value, &value.value)
+    {
+        return a == b;
+    }
+    match crate::types::exact_decimal::decimal_values_equal(literal, value) {
+        Some(equal) => equal,
+        None => literal.to_string_value() == value.to_string_value(),
+    }
+}
+
+/// `value` with its union wrappers taken off (nested unions included).
+fn unwrap_unions(mut value: &XmlValue) -> &XmlValue {
+    while let XmlValueKind::Union(inner) = &value.value {
+        value = inner;
+    }
+    value
 }
 
 /// Whether `value` is a list value, possibly inside union wrappers.
@@ -1035,6 +1694,7 @@ fn validate_union_type(
     value: &str,
     sk: SimpleTypeKey,
     schema_set: &SchemaSet,
+    resolver: Option<PrefixResolver<'_>>,
 ) -> Result<SimpleTypeResult, ValidationError> {
     let st_data = match schema_set.arenas.simple_types.get(sk) {
         Some(d) => d,
@@ -1049,12 +1709,13 @@ fn validate_union_type(
 
     // Try each member type in order
     for &member_key in &st_data.resolved_member_types {
-        if let Ok(result) = validate_simple_type_inner(value, member_key, schema_set) {
+        if let Ok(result) = validate_simple_type_inner(value, member_key, schema_set, resolver) {
             // Match found — check union-level facets (pattern, enumeration)
             let facets = schema_set.effective_facets(sk);
             if !facets.is_empty() {
                 check_union_facets(
                     &facets,
+                    Some(sk),
                     value,
                     &result.typed_value,
                     &st_data.resolved_member_types,
@@ -1274,6 +1935,45 @@ mod tests {
         schema_set.arenas.elements[elem_key]
             .resolved_type
             .expect("element has no resolved type")
+    }
+
+    /// The expanded-name index of a QName enumeration is built once, shared
+    /// while the arenas are unchanged, and rebuilt after they are mutated
+    /// (`ArenasGuard::entries_mut` clears it with the effective facets).
+    #[test]
+    fn test_qname_enumeration_index_is_cached_and_invalidated() {
+        let mut schema_set = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:t="urn:t">
+                 <xs:simpleType name="code"><xs:restriction base="xs:QName">
+                   <xs:enumeration value="t:a"/>
+                 </xs:restriction></xs:simpleType>
+                 <xs:element name="e" type="code"/>
+               </xs:schema>"#,
+        );
+        let TypeKey::Simple(sk) = element_type(&schema_set, "e") else {
+            panic!("a simple type");
+        };
+        let names = &schema_set.name_table;
+        let (t, a, b) = (names.add("urn:t"), names.add("a"), names.add("b"));
+        let first = schema_set.enumeration_index(sk).expect("an index");
+        assert!(first.admits("t:a", false, Some(t), a));
+        assert!(!first.admits("t:b", false, Some(t), b));
+        let second = schema_set.enumeration_index(sk).expect("an index");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+
+        // Replace the literal through the mutation gate.
+        {
+            let arenas = schema_set.arenas.entries_mut();
+            let enumeration = arenas.simple_types[sk].facets.enumeration.as_mut().unwrap();
+            enumeration.values = ["t:b".to_string()].into_iter().collect();
+            for (literal, _) in &mut enumeration.qname_contexts {
+                *literal = "t:b".to_string();
+            }
+        }
+        let rebuilt = schema_set.enumeration_index(sk).expect("an index");
+        assert!(!std::sync::Arc::ptr_eq(&first, &rebuilt));
+        assert!(rebuilt.admits("t:b", false, Some(t), b));
+        assert!(!rebuilt.admits("t:a", false, Some(t), a));
     }
 
     #[test]

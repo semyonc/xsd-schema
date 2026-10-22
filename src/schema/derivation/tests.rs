@@ -920,6 +920,7 @@ fn test_particle_restricts_all_required_over_empty_all_rejects() {
             block: DerivationSet::empty(),
             nillable: false,
             fixed_value: None,
+            fixed_source: None,
         }),
         min_occurs,
         max_occurs,
@@ -1175,7 +1176,7 @@ fn test_effective_wildcard_restricts_defined_covers_declared_qname() {
     };
 
     assert!(
-        effective_attribute_wildcard_restricts(&schema_set, &derived, &base).is_ok(),
+        effective_attribute_wildcard_restricts(&schema_set, &derived, &base, true).is_ok(),
         "derived ##defined must cover a base literal QName exclusion \
          when the attribute is globally declared"
     );
@@ -1191,7 +1192,8 @@ fn test_effective_wildcard_restricts_defined_covers_declared_qname() {
         process_contents: ProcessContents::Strict,
     };
     assert!(
-        effective_attribute_wildcard_restricts(&schema_set, &derived, &base_undeclared).is_err(),
+        effective_attribute_wildcard_restricts(&schema_set, &derived, &base_undeclared, true)
+            .is_err(),
         "derived ##defined must NOT cover a base QName exclusion \
          when the attribute is not globally declared"
     );
@@ -1545,10 +1547,12 @@ fn test_effective_wildcard_restricts_enforces_subset() {
     };
 
     assert!(
-        effective_attribute_wildcard_restricts(&schema_set, &derived_narrow, &base_wide).is_ok()
+        effective_attribute_wildcard_restricts(&schema_set, &derived_narrow, &base_wide, true)
+            .is_ok()
     );
     assert!(
-        effective_attribute_wildcard_restricts(&schema_set, &base_wide, &derived_narrow).is_err()
+        effective_attribute_wildcard_restricts(&schema_set, &base_wide, &derived_narrow, true)
+            .is_err()
     );
 }
 
@@ -1566,9 +1570,13 @@ fn test_effective_wildcard_restricts_enforces_process_contents() {
         process_contents: ProcessContents::Strict,
     };
     // Strict restricts Skip (tightening).
-    assert!(effective_attribute_wildcard_restricts(&schema_set, &strict_eff, &skip_eff).is_ok());
+    assert!(
+        effective_attribute_wildcard_restricts(&schema_set, &strict_eff, &skip_eff, true).is_ok()
+    );
     // Skip cannot restrict Strict (loosening).
-    assert!(effective_attribute_wildcard_restricts(&schema_set, &skip_eff, &strict_eff).is_err());
+    assert!(
+        effective_attribute_wildcard_restricts(&schema_set, &skip_eff, &strict_eff, true).is_err()
+    );
 }
 
 #[test]

@@ -363,6 +363,7 @@ pub(super) fn validate_all_redefine_attribute_group_restrictions(
             schema_set,
             derived_effective_wc.as_ref(),
             base_effective_wc.as_ref(),
+            true,
         ) {
             WildcardRestrictionOutcome::DerivedAbsent | WildcardRestrictionOutcome::Valid => {}
             WildcardRestrictionOutcome::AddedInDerived => {

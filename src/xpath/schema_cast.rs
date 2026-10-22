@@ -20,7 +20,8 @@
 //!   the lexical mappings (`FORG0001`, `FOCA0002` for `NaN` / `INF` to an
 //!   integer or decimal type, …) and, for `xs:QName` and `xs:NOTATION`, the
 //!   static context's namespaces — and then the target type's facets are
-//!   checked with the schema validator ([`validate_simple_type`]); a failure
+//!   checked with the schema validator
+//!   ([`validate_simple_type`](crate::validation::validate_simple_type)); a failure
 //!   is `FORG0001` naming the target. The facets see the source's string for
 //!   an `xs:string` (or derived) or `xs:untypedAtomic` source — §17.5 checks
 //!   "its value against the pattern facet of TT", and XPath §3.10.2 first
@@ -50,9 +51,9 @@ use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::well_known;
 use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
-use crate::types::value::XmlValue;
+use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
-use crate::validation::validate_simple_type;
+use crate::validation::simple::{validate_simple_type_in, PrefixResolver};
 use crate::xpath::cast::{cast_to, resolved_type_to_type_code};
 use crate::xpath::context::XPathContext;
 use crate::xpath::error::XPathError;
@@ -233,7 +234,16 @@ fn cast_to_schema_type(
     } else {
         result.to_string_value()
     };
-    let normalized = check_facets(&lexical, key, schema_set).map_err(|reason| {
+    // An `xs:QName` / `xs:NOTATION` result is checked in its value space:
+    // its prefix stands for the namespace the cast resolved it to (the
+    // static context's, or the source value's own).
+    let name = match &result.value {
+        XmlValueKind::Atomic(XmlAtomicValue::QName(name) | XmlAtomicValue::Notation(name)) => {
+            Some(name.clone())
+        }
+        _ => None,
+    };
+    let normalized = check_facets(&lexical, key, schema_set, name.as_ref()).map_err(|reason| {
         XPathError::invalid_cast_value(
             &lexical,
             match reason {
@@ -346,11 +356,14 @@ thread_local! {
 }
 
 /// Check `lexical` against the facets of `key` with the schema validator,
-/// returning the whitespace-normalized form.
+/// returning the whitespace-normalized form. With `name`, the QName value the
+/// cast made of `lexical`, the facets see that value: `enumeration` by
+/// expanded name, `pattern` on the lexical form.
 fn check_facets(
     lexical: &str,
     key: SimpleTypeKey,
     schema_set: &SchemaSet,
+    name: Option<&QNameValue>,
 ) -> Result<Option<String>, FacetFailure> {
     let entry = (std::ptr::from_ref(schema_set) as usize, key);
     if CHECKING.with(|stack| stack.borrow().contains(&entry)) {
@@ -366,7 +379,12 @@ fn check_facets(
         }
     }
     let _pop = Pop;
-    validate_simple_type(lexical, TypeKey::Simple(key), schema_set)
+    let resolver = |prefix: Option<&str>| {
+        let name = name?;
+        (prefix.filter(|p| !p.is_empty()) == name.prefix()).then_some(name.name().namespace_uri)
+    };
+    let resolver: Option<PrefixResolver<'_>> = name.map(|_| &resolver as PrefixResolver<'_>);
+    validate_simple_type_in(lexical, TypeKey::Simple(key), schema_set, resolver)
         .map(|result| result.normalized_value)
         .map_err(|_| FacetFailure::Invalid)
 }
@@ -403,14 +421,14 @@ mod tests {
 
         CHECKING.with(|stack| stack.borrow_mut().push(entry));
         assert!(matches!(
-            check_facets("4", key, &set),
+            check_facets("4", key, &set, None),
             Err(FacetFailure::Circular)
         ));
         CHECKING.with(|stack| stack.borrow_mut().pop());
 
-        assert!(matches!(check_facets("4", key, &set), Ok(Some(_))));
+        assert!(matches!(check_facets("4", key, &set, None), Ok(Some(_))));
         assert!(matches!(
-            check_facets("40", key, &set),
+            check_facets("40", key, &set, None),
             Err(FacetFailure::Invalid)
         ));
         assert!(CHECKING.with(|stack| stack.borrow().is_empty()));

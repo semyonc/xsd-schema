@@ -21,7 +21,7 @@ use crate::parser::frames::{
 use crate::parser::location::SourceRef;
 use crate::schema::annotation::Annotation;
 use crate::schema::model::DerivationSet;
-use crate::types::facets::FacetSet;
+use crate::types::facets::{EnumerationIndex, FacetSet};
 
 // Forward declarations for types that will be defined later
 // These are placeholders until we define the actual types
@@ -473,6 +473,10 @@ pub struct ArenasGuard {
     /// is an array index with a generation check, **no hashing** (the key is a
     /// dense generational index, so SipHashing it was the worst possible choice).
     effective_facets_cache: RwLock<SecondaryMap<SimpleTypeKey, Arc<FacetSet>>>,
+    /// Per-simple-type index of the effective `enumeration` as expanded names
+    /// (QName / NOTATION types), built on first use from the effective facets
+    /// and invalidated with them by [`entries_mut`](Self::entries_mut).
+    enumeration_index_cache: RwLock<SecondaryMap<SimpleTypeKey, Arc<EnumerationIndex>>>,
 }
 
 impl ArenasGuard {
@@ -489,6 +493,7 @@ impl ArenasGuard {
     pub fn entries_mut(&mut self) -> &mut SchemaArenas {
         // `&mut self` already guarantees exclusivity, so `get_mut` needs no lock.
         self.effective_facets_cache.get_mut().unwrap().clear();
+        self.enumeration_index_cache.get_mut().unwrap().clear();
         &mut self.inner
     }
 
@@ -550,6 +555,25 @@ impl ArenasGuard {
             .unwrap()
             .insert(sk, Arc::clone(&computed));
         computed
+    }
+
+    /// The expanded-name index of a QName / NOTATION type's effective
+    /// enumeration, memoized like [`effective_facets`](Self::effective_facets)
+    /// (miss → `build` → insert; wiped by [`entries_mut`](Self::entries_mut)).
+    pub(crate) fn enumeration_index(
+        &self,
+        sk: SimpleTypeKey,
+        build: impl FnOnce() -> EnumerationIndex,
+    ) -> Arc<EnumerationIndex> {
+        if let Some(index) = self.enumeration_index_cache.read().unwrap().get(sk) {
+            return Arc::clone(index);
+        }
+        let built = Arc::new(build());
+        self.enumeration_index_cache
+            .write()
+            .unwrap()
+            .insert(sk, Arc::clone(&built));
+        built
     }
 
     /// Compute the effective (base-chain-merged) facet set for one simple type.

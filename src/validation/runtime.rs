@@ -21,7 +21,7 @@ use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::{parse_qname_with_snapshot, QNameError};
 use crate::namespace::table::well_known;
 use crate::parser::frames::{AttributeUseKind, AttributeUseResult, IdentityKind, ProcessContents};
-use crate::parser::location::SourceLocation;
+use crate::parser::location::{SourceLocation, SourceRef};
 use crate::schema::model::DerivationSet;
 use crate::schema::resolver::format_resolved_qname;
 use crate::schema::SchemaSet;
@@ -70,6 +70,9 @@ struct GroupAttribute {
     type_key: Option<TypeKey>,
     attr_key: Option<AttributeKey>,
     fixed_value: Option<String>,
+    /// The declaration the fixed value was written on (its namespace
+    /// bindings read a QName value).
+    fixed_source: Option<SourceRef>,
     default_value: Option<String>,
     #[cfg(feature = "xsd11")]
     inheritable: bool,
@@ -82,8 +85,15 @@ struct GroupAttribute {
 /// Result of looking up an attribute in a complex type's attribute list.
 enum AttributeLookup {
     /// Found a matching attribute declaration
-    /// (attr_key, type_key, fixed_value, inheritable)
-    Found(Option<AttributeKey>, Option<TypeKey>, Option<String>, bool),
+    /// (attr_key, type_key, fixed_value, the declaration the fixed value was
+    /// written on, inheritable)
+    Found(
+        Option<AttributeKey>,
+        Option<TypeKey>,
+        Option<String>,
+        Option<SourceRef>,
+        bool,
+    ),
     /// The attribute is explicitly prohibited
     Prohibited,
     /// No matching attribute found
@@ -3217,6 +3227,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let Some(type_key) = info.schema_type else {
             return;
         };
+        // The assertion's data model is built from the PSVI: a valid
+        // attribute's string value is its [schema normalized value] (XDM 1.0
+        // §6.3.4).
+        if info.validity == SchemaValidity::Valid {
+            let schema_set = self.schema_set;
+            if let Some(builder) = self.fragment_builder.as_mut() {
+                let normalized = super::simple::schema_normalized(
+                    builder.attribute_value(attr_ref),
+                    type_key,
+                    schema_set,
+                );
+                if let Some(normalized) = normalized {
+                    builder.set_attribute_value(attr_ref, &normalized);
+                }
+            }
+        }
         let binding = crate::document::type_remap::NodeSchemaBinding {
             type_key,
             element_decl: None,
@@ -4053,6 +4079,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn finish_simple_content(&mut self, ev_state: &mut ElementValidationState) {
         // 2. For TextOnly: validate text content against simple type
         if ev_state.content_type == Some(ContentType::TextOnly) && !ev_state.is_nil {
+            // Clause 5.1: an empty element takes its value constraint; the
+            // fixed-value comparison of clause 5.2.2 is then not made.
+            let mut substituted_fixed = false;
             // Handle default value before validation: if the element has no text
             // content and has a default, substitute the default value so that
             // simple-type validation runs against it (not the empty string).
@@ -4067,16 +4096,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         // element's content must either be empty, in which case
                         // fixed behaves as default, or match fixed."
                         ev_state.text_content = fixed_value.clone();
+                        substituted_fixed = true;
                     }
                 }
             }
 
             if let Some(schema_type) = ev_state.schema_type {
                 if !self.try_fast_simple_content(ev_state, schema_type) {
-                    match super::simple::validate_simple_type(
+                    // QName / NOTATION values resolve their prefixes with the
+                    // element's in-scope namespaces (Datatypes §3.3.18).
+                    let names = &self.schema_set.name_table;
+                    let resolver = ev_state
+                        .ns_context
+                        .as_ref()
+                        .map(|ns| super::simple::snapshot_prefixes(ns, names));
+                    match super::simple::validate_simple_type_in(
                         &ev_state.text_content,
                         schema_type,
                         self.schema_set,
+                        resolver
+                            .as_ref()
+                            .map(|r| r as super::simple::PrefixResolver<'_>),
                     ) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
@@ -4184,11 +4224,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if let Some(elem_key) = ev_state.element_decl {
                 let elem_data = &self.schema_set.arenas.elements[elem_key];
                 if let Some(fixed) = &elem_data.fixed_value {
-                    let matches = if let Some(ref typed) = ev_state.typed_value {
-                        super::simple::fixed_matches_typed(
+                    let matches = if substituted_fixed {
+                        true
+                    } else if let Some(ref typed) = ev_state.typed_value {
+                        // The fixed literal is read with the declaration's
+                        // namespace bindings (an `xs:QName` value by
+                        // expanded name).
+                        super::simple::fixed_matches_typed_in(
                             &ev_state.text_content,
                             typed,
                             fixed,
+                            self.schema_set
+                                .value_constraint_namespaces(elem_data.source.as_ref()),
                             ev_state.schema_type,
                             self.schema_set,
                         )
@@ -4294,8 +4341,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 break 'assertion_eval;
             }
 
-            // Forward end_element to builder
+            // Forward end_element to builder. A valid element with simple
+            // content has its [schema normalized value] as its text (XDM 1.0
+            // §6.2.4), as in a typed document.
             if let Some(builder) = self.fragment_builder.as_mut() {
+                if let (SchemaValidity::Valid, Some(ContentType::TextOnly), Some(type_key), false) = (
+                    ev_state.validity,
+                    ev_state.content_type,
+                    ev_state.schema_type,
+                    ev_state.is_nil,
+                ) {
+                    if builder.has_only_pending_text() {
+                        let normalized = super::simple::schema_normalized(
+                            builder.pending_text(),
+                            type_key,
+                            self.schema_set,
+                        );
+                        if let Some(normalized) = normalized {
+                            builder.replace_pending_text(&normalized);
+                        }
+                    }
+                }
                 if let Err(e) = builder.end_element() {
                     self.abort_assertion_buffer_op("end_element", e);
                     ev_state.validity = SchemaValidity::Invalid;
@@ -5410,7 +5476,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         type_key: TypeKey,
         attr_key: AttributeKey,
     ) -> SchemaInfo {
-        match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+        match self.validate_attribute_value(value, type_key) {
             Ok(result) => SchemaInfo {
                 element_decl: None,
                 attribute_decl: Some(attr_key),
@@ -6147,16 +6213,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.resolve_attribute_lookup(ct_key, local_name, namespace, &mut wildcard_cache);
 
         match found {
-            AttributeLookup::Found(attr_key, attr_type, fixed_value, inheritable) => self
-                .validate_declared_attribute(
+            AttributeLookup::Found(attr_key, attr_type, fixed_value, fixed_source, inheritable) => {
+                self.validate_declared_attribute(
                     attr_key,
                     attr_type,
                     fixed_value,
+                    fixed_source,
                     inheritable,
                     local_name,
                     namespace,
                     value,
-                ),
+                )
+            }
             AttributeLookup::Prohibited => {
                 let attr_name = self.schema_set.name_table.resolve(local_name);
                 self.report_error(
@@ -6234,6 +6302,32 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Validate an attribute's value against its type — an `xs:QName` /
+    /// `xs:NOTATION` value with the owner element's in-scope namespaces
+    /// (Datatypes §3.3.18: "the bindings to be used in the ·lexical mapping·
+    /// are those in the [in-scope namespaces] property of the relevant
+    /// element").
+    fn validate_attribute_value(
+        &self,
+        value: &str,
+        type_key: TypeKey,
+    ) -> Result<super::simple::SimpleTypeResult, ValidationError> {
+        let names = &self.schema_set.name_table;
+        let resolver = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref())
+            .map(|ns| super::simple::snapshot_prefixes(ns, names));
+        super::simple::validate_simple_type_in(
+            value,
+            type_key,
+            self.schema_set,
+            resolver
+                .as_ref()
+                .map(|r| r as super::simple::PrefixResolver<'_>),
+        )
+    }
+
     /// Validate an attribute against the attribute declaration that matched it
     /// (§3.4.4.2 clause 2.1): value validation, the QName/NOTATION prefix
     /// binding check, the fixed-value constraint (cvc-attribute.4), and the
@@ -6244,6 +6338,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         attr_key: Option<AttributeKey>,
         attr_type: Option<TypeKey>,
         fixed_value: Option<String>,
+        fixed_source: Option<SourceRef>,
         inheritable: bool,
         local_name: NameId,
         namespace: Option<NameId>,
@@ -6273,7 +6368,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
             if !used_fast_path {
-                match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+                match self.validate_attribute_value(value, type_key) {
                     Ok(result) => {
                         self.note_decimal_capacity(&result.typed_value);
                         member_type = result.member_type;
@@ -6313,7 +6408,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         if let Some(fixed) = fixed_value {
             let matches = if let Some(ref tv) = typed_value {
-                super::simple::fixed_matches_typed(value, tv, &fixed, attr_type, self.schema_set)
+                super::simple::fixed_matches_typed_in(
+                    value,
+                    tv,
+                    &fixed,
+                    self.schema_set
+                        .value_constraint_namespaces(fixed_source.as_ref()),
+                    attr_type,
+                    self.schema_set,
+                )
             } else {
                 super::simple::fixed_values_equal(value, &fixed, attr_type, self.schema_set)
             };
@@ -6704,6 +6807,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let Some(tv) = typed_value else {
             return Ok(None);
         };
+        // Validation resolved it already with these bindings: only a value
+        // whose prefix they bind nowhere is still in lexical form.
+        if !super::simple::holds_lexical_qname(tv) {
+            return Ok(None);
+        }
         let is_list = super::simple::holds_list(tv);
         // A list carries the code of its item type, which for a list of a
         // union is `xs:anySimpleType` whatever its members are: a list is
@@ -6959,6 +7067,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let attr_data = self.schema_set.arenas.attributes.get(attr_key);
                 let attr_type = attr_data.and_then(|d| d.resolved_type);
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
+                let fixed_ns = self
+                    .schema_set
+                    .value_constraint_namespaces(attr_data.and_then(|d| d.source.as_ref()));
 
                 // Parse value once; reused for the fixed-value check and SchemaInfo.
                 let mut member_type = None;
@@ -6966,7 +7077,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+                    match self.validate_attribute_value(value, type_key) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
                             member_type = result.member_type;
@@ -6985,10 +7096,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(fixed_val) = fixed {
                     let matches = if let Some(ref tv) = typed_value {
-                        super::simple::fixed_matches_typed(
+                        super::simple::fixed_matches_typed_in(
                             value,
                             tv,
                             &fixed_val,
+                            fixed_ns,
                             attr_type,
                             self.schema_set,
                         )
@@ -7069,6 +7181,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let attr_data = self.schema_set.arenas.attributes.get(attr_key);
                 let attr_type = attr_data.and_then(|d| d.resolved_type);
                 let fixed = attr_data.and_then(|d| d.fixed_value.clone());
+                let fixed_ns = self
+                    .schema_set
+                    .value_constraint_namespaces(attr_data.and_then(|d| d.source.as_ref()));
 
                 // Parse value once; reused for the fixed-value check and SchemaInfo.
                 let mut member_type = None;
@@ -7076,7 +7191,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match super::simple::validate_simple_type(value, type_key, self.schema_set) {
+                    match self.validate_attribute_value(value, type_key) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
                             member_type = result.member_type;
@@ -7095,10 +7210,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 if let Some(fixed_val) = fixed {
                     let matches = if let Some(ref tv) = typed_value {
-                        super::simple::fixed_matches_typed(
+                        super::simple::fixed_matches_typed_in(
                             value,
                             tv,
                             &fixed_val,
+                            fixed_ns,
                             attr_type,
                             self.schema_set,
                         )
@@ -7194,11 +7310,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             });
             let (name, namespace) =
                 self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
-            let fixed_value = attr_use.attribute.fixed_value.clone().or_else(|| {
-                attr_key
-                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                    .and_then(|d| d.fixed_value.clone())
-            });
+            let (fixed_value, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
             let default_value = attr_use.attribute.default_value.clone().or_else(|| {
                 attr_key
                     .and_then(|k| self.schema_set.arenas.attributes.get(k))
@@ -7211,6 +7323,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 type_key: attr_type,
                 attr_key,
                 fixed_value,
+                fixed_source,
                 default_value,
                 #[cfg(feature = "xsd11")]
                 inheritable: attr_use.attribute.inheritable,
@@ -7263,6 +7376,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     // which implements full §3.6.2.2 (own + groups intersection) plus
     // §3.4.2.5 (extension union over the base chain) in canonical form.
 
+    /// An attribute use's fixed value — its own, otherwise its declaration's —
+    /// with the source of the element it was written on.
+    fn attribute_use_fixed(
+        &self,
+        attr_use: &crate::parser::frames::AttributeUseResult,
+        attr_key: Option<AttributeKey>,
+    ) -> (Option<String>, Option<SourceRef>) {
+        if let Some(fixed) = &attr_use.attribute.fixed_value {
+            return (Some(fixed.clone()), attr_use.attribute.source.clone());
+        }
+        match attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k)) {
+            Some(decl) => (decl.fixed_value.clone(), decl.source.clone()),
+            None => (None, None),
+        }
+    }
+
     /// Find an attribute declaration in a complex type's attribute list
     fn find_attribute_in_type(
         &self,
@@ -7284,11 +7413,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 });
 
                 // Get fixed value from the attribute use or from the attribute declaration
-                let fixed = attr_use.attribute.fixed_value.clone().or_else(|| {
-                    attr_key
-                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                        .and_then(|d| d.fixed_value.clone())
-                });
+                let (fixed, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
 
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
                     // In XSD 1.0, use="prohibited" combined with fixed=X is a valid
@@ -7297,13 +7422,25 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // (W3C test attP031: schema valid in 1.0, instance with fixed value valid.)
                     if fixed.is_some() && self.schema_set.is_xsd10() {
                         let inheritable = attr_use.attribute.inheritable;
-                        return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
+                        return AttributeLookup::Found(
+                            attr_key,
+                            attr_type,
+                            fixed,
+                            fixed_source,
+                            inheritable,
+                        );
                     }
                     return AttributeLookup::Prohibited;
                 }
 
                 let inheritable = attr_use.attribute.inheritable;
-                return AttributeLookup::Found(attr_key, attr_type, fixed, inheritable);
+                return AttributeLookup::Found(
+                    attr_key,
+                    attr_type,
+                    fixed,
+                    fixed_source,
+                    inheritable,
+                );
             }
         }
 
@@ -7325,6 +7462,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ga.attr_key,
                     ga.type_key,
                     ga.fixed_value,
+                    ga.fixed_source,
                     inheritable,
                 );
             }

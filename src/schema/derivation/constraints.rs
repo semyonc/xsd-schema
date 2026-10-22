@@ -224,8 +224,18 @@ pub fn validate_attribute_value_constraints(schema_set: &SchemaSet) -> SchemaRes
                 let identical = ref_decl
                     .and_then(|d| d.resolved_type)
                     .and_then(|tk| {
-                        crate::validation::simple::fixed_values_identical(
-                            use_fixed, decl_fixed, tk, schema_set,
+                        // Each literal is read with the namespace bindings
+                        // of the element it is written on (QName values).
+                        crate::validation::simple::fixed_values_identical_in(
+                            use_fixed,
+                            schema_set
+                                .value_constraint_namespaces(attr_use.attribute.source.as_ref()),
+                            decl_fixed,
+                            schema_set.value_constraint_namespaces(
+                                ref_decl.and_then(|d| d.source.as_ref()),
+                            ),
+                            tk,
+                            schema_set,
                         )
                     })
                     .unwrap_or_else(|| {

@@ -17,7 +17,7 @@ use crate::parser::frames::{AssertResult, ComplexContentResult};
 use crate::parser::location::SourceLocation;
 use crate::schema::SchemaSet;
 use crate::validation::errors::{self, ValidationError};
-use crate::validation::simple::validate_simple_type;
+use crate::validation::simple::validate_simple_type_in;
 use crate::xpath::api::XPathExpr;
 use crate::xpath::functions::{effective_boolean_value, XPathValue};
 use crate::xpath::XPathContext;
@@ -178,7 +178,15 @@ fn compute_dollar_value<'doc>(
         return XPathValue::empty();
     }
 
-    match validate_simple_type(&nav.value(), TypeKey::Complex(governing_ct_key), schema_set) {
+    // An `xs:QName` / `xs:NOTATION` value is resolved with the element's
+    // in-scope namespaces, as the validation runtime resolves it.
+    let resolver = |prefix: Option<&str>| nav.prefix_binding(prefix);
+    match validate_simple_type_in(
+        &nav.value(),
+        TypeKey::Complex(governing_ct_key),
+        schema_set,
+        Some(&resolver),
+    ) {
         // §3.13.4.1 clause 2.3.1: "the XDM representation of
         // E.[schema actual value]". When the governing simple-content type's
         // {variety} = list (also as the member a union chose), `$value` is a

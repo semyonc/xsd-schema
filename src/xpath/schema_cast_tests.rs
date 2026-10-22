@@ -1358,3 +1358,71 @@ fn casts_compare_enumeration_values_of_the_base_type() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// The facets of a type derived from `xs:QName` or `xs:NOTATION` see the value
+/// a cast gives — its expanded name (Datatypes §3.3.18: "The ·value space· of
+/// QName is the set of tuples {namespace name, local part}"; §3.3.19) — and
+/// each enumeration literal is resolved with the bindings of the schema
+/// element it is written on (§3.3.18: the lexical mapping "depends on the
+/// namespace bindings in scope where the literal occurs"). So `'z:en'` casts
+/// to a NOTATION type that enumerates `t:en` when `z` and `t` are bound to the
+/// same namespace, and `'t:en'` does not when the static context binds `t`
+/// elsewhere; `pattern` still constrains the lexical form, for a value made
+/// with the static context's prefixes and for an `xs:QName` value cast with
+/// its own.
+#[test]
+fn casts_to_qname_and_notation_types_compare_expanded_names() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c33" xmlns:t="urn:c33">
+  <xs:notation name="en" public="pub"/>
+  <xs:notation name="de" public="pub"/>
+  <xs:simpleType name="notat">
+    <xs:restriction base="xs:NOTATION"><xs:enumeration value="t:en"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="code">
+    <xs:restriction base="xs:QName">
+      <xs:enumeration value="t:a"/><xs:enumeration value="t:b"/>
+    </xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="tcode">
+    <xs:restriction base="t:code"><xs:pattern value="t:.*"/></xs:restriction>
+  </xs:simpleType>
+</xs:schema>"#;
+    let cases = [
+        ("z:notat('z:en')", "z:en"),
+        ("'z:en' cast as z:notat", "z:en"),
+        ("'z:en' castable as z:notat", "true"),
+        ("'z:de' castable as z:notat", "false"),
+        ("'t:en' castable as z:notat", "false"),
+        ("z:code('z:a')", "z:a"),
+        ("namespace-uri-from-QName(z:code('z:b'))", "urn:c33"),
+        ("'z:c' castable as z:code", "false"),
+        ("'t:a' castable as z:code", "false"),
+        ("xs:QName('z:a') cast as z:code", "z:a"),
+        ("xs:QName('t:a') castable as z:code", "false"),
+        ("'z:a' castable as z:tcode", "false"),
+        ("xs:QName('z:a') castable as z:tcode", "false"),
+    ];
+    let mut failures = Vec::new();
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let set = compile_set(version, XSD);
+        let mut namespaces = NamespaceContextSnapshot::default();
+        for (prefix, uri) in [("xs", XS_NAMESPACE), ("z", "urn:c33"), ("t", "urn:other")] {
+            namespaces
+                .bindings
+                .push((set.name_table.add(prefix), set.name_table.add(uri)));
+        }
+        let ctx = XPathContext::new(&set.name_table)
+            .with_namespaces(namespaces)
+            .with_schema_set(&set);
+        for (expr, expected) in cases {
+            let got = eval(&ctx, expr);
+            if got != expected {
+                failures.push(format!(
+                    "{version:?}: {expr}  =>  {got}  (expected {expected})"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

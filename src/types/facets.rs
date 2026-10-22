@@ -477,6 +477,126 @@ pub struct EnumerationFacet {
     pub source: Option<SourceRef>,
 }
 
+/// An `enumeration`'s values prepared for matching: the expanded names of the
+/// `xs:QName` / `xs:NOTATION` values among them (Datatypes §3.3.18 — each
+/// literal read with the namespace bindings of the element it was written on,
+/// [`EnumerationFacet::qname_contexts`]), and, for a union type, every
+/// literal's value as the union's ordered member types give it (Datatypes
+/// §4.3.5.2: the values are the literals "interpreted as instances of the
+/// {base type definition}"; §2.4.1.3: a value "is validated against the
+/// ·member types· in the order in which they appear in the definition until a
+/// match is found"). A QName literal without recorded bindings (a facet set
+/// built by hand) is kept by lexical form; one whose prefix its bindings do
+/// not bind names nothing. Built once per type and cached with its effective
+/// facets (`ArenasGuard::enumeration_index`), so a QName value is matched with
+/// one hash lookup however long the enumeration is.
+#[derive(Debug, Default)]
+pub(crate) struct EnumerationIndex {
+    /// `(is NOTATION, namespace, local name)` of the QName / NOTATION values.
+    names: HashSet<(bool, Option<crate::ids::NameId>, crate::ids::NameId)>,
+    lexical: HashSet<String>,
+    /// A union type's literal values, one per reading of each literal.
+    values: Vec<super::value::XmlValue>,
+}
+
+impl EnumerationIndex {
+    /// The index of an atomic `xs:QName` (or, with `notation`, `xs:NOTATION`)
+    /// type's enumeration: its literals' expanded names; their local names are
+    /// interned in `names`, the table the values' ids come from.
+    pub(crate) fn for_qnames(
+        enumeration: &EnumerationFacet,
+        names: &crate::namespace::table::NameTable,
+        notation: bool,
+    ) -> Self {
+        let mut index = Self::default();
+        for (literal, snapshot) in &enumeration.qname_contexts {
+            let lexical = literal.trim();
+            let (prefix, local) = match lexical.split_once(':') {
+                Some((prefix, local)) => (Some(prefix), local),
+                None => (None, lexical),
+            };
+            let namespace = match prefix {
+                None | Some("") => Some(snapshot.default_ns),
+                Some(prefix) => names
+                    .get(prefix)
+                    .and_then(|id| snapshot.resolve_prefix(id))
+                    .map(Some),
+            };
+            if let Some(namespace) = namespace {
+                index.names.insert((notation, namespace, names.add(local)));
+            }
+        }
+        let with_bindings: HashSet<&str> = enumeration
+            .qname_contexts
+            .iter()
+            .map(|(literal, _)| literal.as_str())
+            .collect();
+        for literal in &enumeration.values {
+            if !with_bindings.contains(literal.as_str()) {
+                index.lexical.insert(literal.clone());
+            }
+        }
+        index
+    }
+
+    /// Add a union literal's value (as the member type that accepted it gave
+    /// it): kept for comparison, and, when it is a resolved QName / NOTATION
+    /// value, its expanded name.
+    pub(crate) fn push_value(&mut self, value: super::value::XmlValue) {
+        use super::value::{XmlAtomicValue, XmlValueKind};
+        let mut atom = &value;
+        while let XmlValueKind::Union(inner) = &atom.value {
+            atom = inner;
+        }
+        match &atom.value {
+            XmlValueKind::Atomic(XmlAtomicValue::QName(name)) => {
+                let name = name.name();
+                self.names
+                    .insert((false, name.namespace_uri, name.local_name));
+            }
+            XmlValueKind::Atomic(XmlAtomicValue::Notation(name)) => {
+                let name = name.name();
+                self.names
+                    .insert((true, name.namespace_uri, name.local_name));
+            }
+            _ => {}
+        }
+        self.values.push(value);
+    }
+
+    /// Add a QName / NOTATION literal kept by lexical form.
+    pub(crate) fn push_lexical(&mut self, literal: &str) {
+        self.lexical.insert(literal.to_string());
+    }
+
+    /// Whether the QName (`notation`: NOTATION) value `{namespace}local` (its
+    /// local name's id), of lexical form `normalized`, is enumerated.
+    pub(crate) fn admits(
+        &self,
+        normalized: &str,
+        notation: bool,
+        namespace: Option<crate::ids::NameId>,
+        local: crate::ids::NameId,
+    ) -> bool {
+        self.names.contains(&(notation, namespace, local)) || self.lexical.contains(normalized)
+    }
+
+    /// Whether the expanded name `{namespace}local` is enumerated, by name only.
+    pub(crate) fn has_name(
+        &self,
+        notation: bool,
+        namespace: Option<crate::ids::NameId>,
+        local: crate::ids::NameId,
+    ) -> bool {
+        self.names.contains(&(notation, namespace, local))
+    }
+
+    /// A union type's literal values (empty for an atomic type).
+    pub(crate) fn values(&self) -> &[super::value::XmlValue] {
+        &self.values
+    }
+}
+
 /// Whitespace facet
 #[derive(Debug, Clone)]
 pub struct WhitespaceFacet {

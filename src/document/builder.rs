@@ -438,6 +438,47 @@ impl<'a> BufferDocumentBuilder<'a> {
         self.note_child_appended();
     }
 
+    /// Whether the open element has no content node yet, so that all its
+    /// content so far is the text still pending (not yet a node).
+    pub(crate) fn has_only_pending_text(&self) -> bool {
+        self.last_sibling == NULL
+    }
+
+    /// The text accumulated since the last structural event, not yet a node.
+    pub(crate) fn pending_text(&self) -> &str {
+        if self.text_type.is_some() {
+            &self.text_buffer
+        } else {
+            ""
+        }
+    }
+
+    /// Replaces the pending text; an empty `text` leaves no text node.
+    pub(crate) fn replace_pending_text(&mut self, text: &str) {
+        self.text_buffer.clear();
+        if text.is_empty() {
+            self.text_type = None;
+        } else {
+            self.text_buffer.push_str(text);
+            self.text_type.get_or_insert(NodeType::Text);
+        }
+    }
+
+    /// Takes the pending text away (it becomes no node).
+    pub(crate) fn take_pending_text(&mut self) -> String {
+        self.text_type = None;
+        std::mem::take(&mut self.text_buffer)
+    }
+
+    /// The value of the attribute node `attr_ref`.
+    pub(crate) fn attribute_value(&self, attr_ref: u32) -> &str {
+        debug_assert_eq!(
+            self.doc.nodes.get(attr_ref).node_type(),
+            NodeType::Attribute
+        );
+        self.doc.strings.get(self.doc.nodes.get(attr_ref + 1).value)
+    }
+
     /// Adds a comment node.
     pub fn comment(&mut self, value: &str) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
