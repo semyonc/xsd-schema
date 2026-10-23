@@ -108,7 +108,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversions; no quick-xml type is left in these error types.
 - `DefaultAttribute::attribute_key` is an `Option<AttributeKey>` (`None` for a
   local attribute declaration), and `DefaultAttribute` has a new field
-  `type_key: Option<TypeKey>`, the declaration's type.
+  `type_key: Option<TypeKey>`, the declaration's type; `DefaultAttribute` is
+  `#[non_exhaustive]`.
 
 ### Added
 

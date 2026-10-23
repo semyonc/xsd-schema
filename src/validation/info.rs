@@ -347,6 +347,7 @@ pub struct ExpectedAttribute {
 /// attribute group, or inherited from its base type — with a `default` or
 /// `fixed` value constraint, which the element does not carry.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DefaultAttribute {
     /// Local name of the attribute
     pub local_name: NameId,
