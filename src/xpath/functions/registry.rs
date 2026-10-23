@@ -988,7 +988,9 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
             FN_NAMESPACE,
             "prefix-from-QName",
             vec![qname_opt()],
-            string_opt(),
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::NCName,
+            )),
         ),
     ));
     registry.register(FunctionEntry::new(
@@ -997,7 +999,9 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
             FN_NAMESPACE,
             "local-name-from-QName",
             vec![qname_opt()],
-            string_opt(),
+            SequenceType::optional(crate::types::sequence::ItemType::AtomicType(
+                crate::types::XmlTypeCode::NCName,
+            )),
         ),
     ));
     registry.register(FunctionEntry::new(

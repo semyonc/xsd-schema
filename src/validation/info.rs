@@ -341,16 +341,25 @@ pub struct ExpectedAttribute {
     pub required: bool,
 }
 
-/// A default attribute that should be added to the element
+/// A defaulted attribute of the current element (Structures §3.4.4.2, added to
+/// the element's \[attributes\] by §3.4.5.1 *Attribute Default Value*): an
+/// optional attribute use of the element's complex type — its own, from an
+/// attribute group, or inherited from its base type — with a `default` or
+/// `fixed` value constraint, which the element does not carry.
 #[derive(Debug, Clone)]
 pub struct DefaultAttribute {
     /// Local name of the attribute
     pub local_name: NameId,
     /// Namespace of the attribute
     pub namespace: Option<NameId>,
-    /// The attribute declaration key
-    pub attribute_key: AttributeKey,
-    /// The default value
+    /// The global attribute declaration, `None` for a local one (an
+    /// `<xs:attribute name="…">` inside a complex type or an attribute group)
+    pub attribute_key: Option<AttributeKey>,
+    /// The declaration's type definition; `None` when it names none
+    /// (`xs:anySimpleType`)
+    pub type_key: Option<TypeKey>,
+    /// The ·effective value constraint·'s lexical form: the use's `default` /
+    /// `fixed` value, otherwise the declaration's
     pub value: String,
 }
 

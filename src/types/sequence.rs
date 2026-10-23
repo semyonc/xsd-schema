@@ -10,7 +10,6 @@ use std::fmt;
 use super::XmlTypeCode;
 use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::namespace::qname::QualifiedName;
-use crate::schema::model::DerivationSet;
 use crate::types::value::XmlValue;
 use crate::xpath::cast::type_matches;
 use crate::xpath::context::XPathContext;
@@ -300,11 +299,8 @@ impl ItemType {
                 // Check if value's schema type derives from the expected type
                 if let Some(value_key) = value.schema_type {
                     if let Some(schema_set) = ctx.schema_set {
-                        return schema_set.is_type_derived_from(
-                            TypeKey::Simple(value_key),
-                            TypeKey::Simple(*key),
-                            DerivationSet::empty(),
-                        );
+                        return schema_set
+                            .xpath_derives_from(TypeKey::Simple(value_key), TypeKey::Simple(*key));
                     }
                     // Fallback: exact match
                     return value_key == *key;

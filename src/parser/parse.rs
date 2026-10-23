@@ -986,6 +986,13 @@ fn handle_end_element(state: &mut ParserState, _span: SourceSpan) -> SchemaResul
     // If no parent, store the root schema result
     else if let FrameResult::Schema(schema_result) = result {
         state.root_schema = Some(schema_result);
+    }
+    // In error-recovery mode a root `xs:schema` whose attributes were refused
+    // (an attribute it does not allow, an invalid value) was skipped like any
+    // other element: report that cause. It was collected when the root
+    // started, before anything else, so it is the document's first error.
+    else if !state.errors.is_empty() {
+        return Err(state.errors.remove(0));
     } else {
         return Err(SchemaError::internal(
             "Root frame did not produce a schema result",
@@ -1504,6 +1511,60 @@ mod tests {
 
         let result = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set);
         assert!(result.is_err());
+    }
+
+    /// C57: an attribute the schema for schemas does not allow on `xs:schema`
+    /// (or an invalid value of one it does) is reported with its own message,
+    /// code and location — as on any other XSD element — not as an internal
+    /// error about the root frame.
+    #[test]
+    fn test_bad_attribute_on_schema_root_reports_the_attribute() {
+        let cases = [
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" bogus=\"1\">\n  <xs:element name=\"a\"/>\n</xs:schema>",
+                "Attribute 'bogus' is not allowed here",
+            ),
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" bogus=\"1\"/>",
+                "Attribute 'bogus' is not allowed here",
+            ),
+            (
+                "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" elementFormDefault=\"bogus\"/>",
+                "bogus",
+            ),
+        ];
+        for (xsd, expected) in cases {
+            let mut schema_set = SchemaSet::new();
+            let error = parse_schema(xsd.as_bytes(), "test.xsd", &mut schema_set)
+                .expect_err("schema refused");
+            let text = error.to_string();
+            assert!(
+                text.contains(expected) && !text.contains("Internal error"),
+                "{xsd}: {text}"
+            );
+            assert!(
+                text.contains("test.xsd:1:1"),
+                "{xsd}: located at the root: {text}"
+            );
+        }
+        // The same attribute on another XSD element, for comparison.
+        let mut schema_set = SchemaSet::new();
+        let text = match parse_schema(
+            b"<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"a\" bogus=\"1\"/></xs:schema>",
+            "test.xsd",
+            &mut schema_set,
+        ) {
+            Err(error) => error.to_string(),
+            Ok(_) => schema_set
+                .parsing_errors
+                .first()
+                .map(|e| e.to_string())
+                .unwrap_or_default(),
+        };
+        assert!(
+            text.contains("Attribute 'bogus' is not allowed here"),
+            "{text}"
+        );
     }
 
     #[test]

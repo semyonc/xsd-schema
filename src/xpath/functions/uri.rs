@@ -226,16 +226,6 @@ pub(crate) fn is_absolute_uri(uri: &str) -> bool {
     false
 }
 
-/// Characters that appear in no RFC 3986 production, not even percent-encoded
-/// (they must be escaped before they reach a URI).
-fn is_never_allowed_in_uri(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            ' ' | '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`'
-        )
-}
-
 /// URI components tuple: (scheme, authority, path, query)
 type UriComponents<'a> = (
     Option<String>,
@@ -344,15 +334,24 @@ fn remove_dot_segments(path: &str) -> String {
 /// A relative reference must not start with a colon (which would be an empty scheme).
 /// Per RFC 3986, a relative-reference starts with either a relative-part or is empty.
 /// A path-noscheme segment-nz-nc must not contain ':' before first '/'.
+///
+/// F&O §8.1 judges `$relative` and `$base` by "the rules of the xs:anyURI data
+/// type", whose lexical space admits any sequence of XML characters (Datatypes
+/// §3.3.17.2: "Spaces are, in principle, allowed in the ·lexical space· of
+/// anyURI"); XSD 1.0 maps such a value to a URI by escaping the characters a URI
+/// may not hold (a space, `<`, `>`, `"`, `{`, `}`, `|`, `\`, `^`, `` ` ``, the
+/// controls and non-ASCII characters). So those characters are accepted here,
+/// and the reference is resolved and returned unescaped (W3C bug 20672: no
+/// percent-encoding by `fn:resolve-uri`). The escaping leaves `#` alone, so a
+/// reference with two `#` stays malformed.
 fn is_valid_uri_reference(uri: &str) -> bool {
     if uri.is_empty() {
         return true;
     }
 
     // RFC 3986 §3: a URI reference has at most one fragment, introduced by a
-    // single "#", and the fragment itself may not contain one. Characters that
-    // no production allows are rejected too.
-    if uri.matches('#').count() > 1 || uri.chars().any(is_never_allowed_in_uri) {
+    // single "#", and the fragment itself may not contain one.
+    if uri.matches('#').count() > 1 {
         return false;
     }
 
@@ -623,17 +622,16 @@ mod tests {
             resolve_code("index.html", Some("/html/base/")),
             Some("FORG0002")
         );
-        // Characters no production allows.
+        // An empty scheme is not a suitable relative reference.
         assert_eq!(
-            resolve_code("a b", Some("http://localhost/base/")),
-            Some("FORG0002")
-        );
-        assert_eq!(
-            resolve_code("a<b", Some("http://localhost/base/")),
+            resolve_code(":", Some("http://localhost/base/")),
             Some("FORG0002")
         );
 
-        // Valid arguments still resolve.
+        // Valid arguments still resolve, also with characters a URI holds
+        // only escaped (C63: xs:anyURI admits them).
+        assert_eq!(resolve_code("a b", Some("http://localhost/base/")), None);
+        assert_eq!(resolve_code("a<b", Some("http://localhost/base/")), None);
         assert_eq!(
             resolve_code("index.html", Some("http://localhost/base/")),
             None

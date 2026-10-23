@@ -210,8 +210,13 @@ impl ParseLimit {
         }
     }
 
-    /// What the limit counts, for a message.
-    fn what(self) -> &'static str {
+    /// What the limit counts, with its unit, for a message — e.g. `"element
+    /// depth"`, `"name length in bytes"`. [`LimitExceeded`]'s `Display` is
+    /// built from it; a host that reports a limit in its own words can use it
+    /// with [`field_name`](Self::field_name) and [`unit`](Self::unit) instead
+    /// of repeating them. The [`ParseLimits`] field documentation says exactly
+    /// what is counted.
+    pub fn description(self) -> &'static str {
         match self {
             ParseLimit::Depth => "element depth",
             ParseLimit::NameLength => "name length in bytes",
@@ -222,6 +227,24 @@ impl ParseLimit {
             ParseLimit::AttributeValueSize => "attribute value size in bytes",
             ParseLimit::TextSize => "text size in bytes",
             ParseLimit::Nodes => "nodes in the document",
+        }
+    }
+
+    /// The unit of the limit's maximum and of the count found, plural:
+    /// `"bytes"` for the lengths and sizes, `"levels"` for the depth,
+    /// otherwise what is counted (`"attributes"`, `"declarations"`,
+    /// `"prefixes"`, `"nodes"`).
+    pub fn unit(self) -> &'static str {
+        match self {
+            ParseLimit::Depth => "levels",
+            ParseLimit::NameLength
+            | ParseLimit::NamespaceUriLength
+            | ParseLimit::AttributeValueSize
+            | ParseLimit::TextSize => "bytes",
+            ParseLimit::Attributes => "attributes",
+            ParseLimit::NamespaceDeclarations => "declarations",
+            ParseLimit::NamespacesInScope => "prefixes",
+            ParseLimit::Nodes => "nodes",
         }
     }
 }
@@ -284,7 +307,7 @@ impl fmt::Display for LimitExceeded {
             "parse limit {} exceeded at byte {}: {} {}, the limit is {}",
             self.limit,
             self.position,
-            self.limit.what(),
+            self.limit.description(),
             self.found,
             self.max
         )
@@ -292,3 +315,67 @@ impl fmt::Display for LimitExceeded {
 }
 
 impl std::error::Error for LimitExceeded {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL: [ParseLimit; 9] = [
+        ParseLimit::Depth,
+        ParseLimit::NameLength,
+        ParseLimit::NamespaceUriLength,
+        ParseLimit::Attributes,
+        ParseLimit::NamespaceDeclarations,
+        ParseLimit::NamespacesInScope,
+        ParseLimit::AttributeValueSize,
+        ParseLimit::TextSize,
+        ParseLimit::Nodes,
+    ];
+
+    /// C68: each limit has a public name, unit and description, so a host
+    /// reports it in the crate's words.
+    #[test]
+    fn every_limit_has_a_name_a_unit_and_a_description() {
+        let rows: Vec<_> = ALL
+            .iter()
+            .map(|limit| (limit.field_name(), limit.unit(), limit.description()))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("max_depth", "levels", "element depth"),
+                ("max_name_bytes", "bytes", "name length in bytes"),
+                (
+                    "max_namespace_uri_bytes",
+                    "bytes",
+                    "namespace URI length in bytes"
+                ),
+                ("max_attributes", "attributes", "attributes on one element"),
+                (
+                    "max_namespace_declarations",
+                    "declarations",
+                    "namespace declarations on one element"
+                ),
+                (
+                    "max_namespaces_in_scope",
+                    "prefixes",
+                    "namespace prefixes in scope"
+                ),
+                (
+                    "max_attribute_value_bytes",
+                    "bytes",
+                    "attribute value size in bytes"
+                ),
+                ("max_text_bytes", "bytes", "text size in bytes"),
+                ("max_nodes", "nodes", "nodes in the document"),
+            ]
+        );
+        // The error message is built from the same words.
+        let error = LimitExceeded::new(ParseLimit::Depth, 256, 257, 1234);
+        assert_eq!(
+            error.to_string(),
+            "parse limit max_depth exceeded at byte 1234: element depth 257, the limit is 256"
+        );
+        assert_eq!(ParseLimit::TextSize.to_string(), "max_text_bytes");
+    }
+}

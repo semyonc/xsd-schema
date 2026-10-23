@@ -5,7 +5,6 @@
 
 use crate::ids::{NameId, TypeKey};
 use crate::namespace::qname::QualifiedName;
-use crate::schema::model::DerivationSet;
 use crate::types::sequence::TypeTest;
 use crate::types::{ItemType, NameTest, SequenceType, XmlTypeCode};
 use crate::xpath::ast::{Axis, ItemTypeNode, KindTest};
@@ -281,9 +280,7 @@ fn derives_from_type_test<N: DomNavigator>(
     match type_test {
         TypeTest::Untyped => false,
         TypeTest::Schema(expected) => match ctx.schema_set {
-            Some(schema_set) => {
-                schema_set.is_type_derived_from(actual, *expected, DerivationSet::empty())
-            }
+            Some(schema_set) => schema_set.xpath_derives_from(actual, *expected),
             // The key and the annotation come from the same schema set, which
             // the static context does not name: only the same type matches.
             None => actual == *expected,
@@ -293,9 +290,7 @@ fn derives_from_type_test<N: DomNavigator>(
                 return false;
             };
             match built_in_key(schema_set, *code) {
-                Some(expected) => {
-                    schema_set.is_type_derived_from(actual, expected, DerivationSet::empty())
-                }
+                Some(expected) => schema_set.xpath_derives_from(actual, expected),
                 // An XSD 1.0 schema set has no `xs:anyAtomicType` component,
                 // but §2.5.4's derives-from still holds for every atomic type
                 // ("xs:anyAtomicType is an atomic type that includes all atomic
@@ -703,7 +698,7 @@ fn derives_from_declared_type<N: DomNavigator>(
     let Some(actual) = nav.type_annotation() else {
         return false;
     };
-    schema_set.is_type_derived_from(actual, expected, DerivationSet::empty())
+    schema_set.xpath_derives_from(actual, expected)
 }
 
 // ============================================================================

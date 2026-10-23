@@ -106,6 +106,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Parse(quick_xml::Error)`, `Utf8`, `UnboundPrefix` and (`DriveError`,
   `DriveWithError`) `UnexpectedEof` are removed, with their `From`
   conversions; no quick-xml type is left in these error types.
+- `DefaultAttribute::attribute_key` is an `Option<AttributeKey>` (`None` for a
+  local attribute declaration), and `DefaultAttribute` has a new field
+  `type_key: Option<TypeKey>`, the declaration's type.
 
 ### Added
 
@@ -191,6 +194,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BufferDocument::xml_declaration`.
 - `TrackedReader::error_position` and `TrackedReader::xml_version`; a schema
   document that is not well-formed gets a source location.
+- `ParseLimit::description()` and `ParseLimit::unit()`: what a parse limit
+  counts and its unit, the words `LimitExceeded` uses.
 
 ### Changed
 
@@ -443,6 +448,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   §2.4.1.3). A QName no longer matches a literal that an earlier string member
   reads as a string, nor an integer a literal that an earlier token member
   reads as a token.
+- `ValidationRuntime::get_default_attributes` reports every defaulted
+  attribute (Structures §3.4.4.2): uses of local declarations, `fixed` as well
+  as `default` value constraints, attribute-group uses, and uses inherited
+  from base types — a restriction's redeclared or prohibited attributes
+  excepted. It used to report only `default` values of global declarations
+  used directly or through a group.
+- XPath SequenceType matching (`instance of`, `treat as`, `element(N, T)`,
+  `attribute(N, T)`, `schema-element`, `schema-attribute`,
+  `ItemType::matches_item`) no longer treats a member type of a union as
+  derived from the union; XPath 2.0's derives-from is restriction and
+  extension only. Validation is unchanged.
+- `fn:resolve-uri` resolves a reference that contains characters `xs:anyURI`
+  allows but a URI holds only escaped (a space, for example) instead of
+  raising FORG0002, and returns it unescaped.
+- `fn:local-name-from-QName` and `fn:prefix-from-QName` return `xs:NCName`,
+  and `fn:in-scope-prefixes` returns its prefixes as `xs:NCName`, as F&O
+  specifies.
+- The embedded schema for the XML namespace is the current W3C edition: it
+  declares `xml:id` and allows an empty `xml:lang`. `assets/NOTICE.md` records
+  its source and the W3C licence that applies to it.
+- An attribute that `xs:schema` does not allow (or an invalid value of one it
+  does) is reported with its name and location instead of the internal error
+  "Root frame did not produce a schema result".
 
 ### Performance
 

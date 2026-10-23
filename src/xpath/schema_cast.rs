@@ -49,7 +49,6 @@ use std::cell::RefCell;
 use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::table::well_known;
-use crate::schema::model::DerivationSet;
 use crate::schema::SchemaSet;
 use crate::types::value::{QNameValue, XmlAtomicValue, XmlValue, XmlValueKind};
 use crate::types::XmlTypeCode;
@@ -214,8 +213,7 @@ fn cast_to_schema_type(
     // §17.2 case 4 and §17.3: identity, or up the hierarchy — always
     // possible, the same value with a new annotation.
     if let Some(source) = value.schema_type {
-        if schema_set.is_type_derived_from(TypeKey::Simple(source), target, DerivationSet::empty())
-        {
+        if schema_set.xpath_derives_from(TypeKey::Simple(source), target) {
             let mut result = cast_to_built_in(ctx, value, builtin)?;
             result.schema_type = Some(key);
             return Ok(result);

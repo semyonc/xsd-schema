@@ -4924,7 +4924,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         result
     }
 
-    /// Get default attributes that should be added to the current element
+    /// The defaulted attributes of the current element — Structures §3.4.4.2:
+    /// every attribute use U of the element's complex type T with
+    /// "U.{required} = false", a non-·absent· ·effective value constraint·
+    /// (`default` or `fixed`; the use's own, otherwise its declaration's), and
+    /// no attribute of the element matching it. §3.4.5.1 adds each to the
+    /// element's \[attributes\] with that constraint's lexical form.
+    ///
+    /// T.{attribute uses} (§3.4.2.4) are T's own `<attribute>` uses — local
+    /// and global declarations alike —, those of its attribute groups
+    /// (including an XSD 1.1 `defaultAttributes` group), and the uses
+    /// inherited from its base types, except, in a restriction, those whose
+    /// names the restriction includes itself or prohibits. A prohibition only
+    /// stops inheritance: it never hides a use of the type itself. Empty when
+    /// the element has no complex type (simple type, skipped, or not yet
+    /// validated).
     pub fn get_default_attributes(&self) -> Vec<DefaultAttribute> {
         let ev_state = match self.validation_stack.last() {
             Some(s) => s,
@@ -4936,60 +4950,109 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             _ => return Vec::new(),
         };
 
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
+        let any_type = self.schema_set.any_type_key();
         let mut result = Vec::new();
-
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            if attr_use.use_kind == AttributeUseKind::Prohibited {
-                continue;
+        // Names a more derived restriction keeps out of what its base types
+        // contribute: the names it includes itself (§3.4.2.4 clause 3.2.1)
+        // and the ones it prohibits (clause 3.2.2).
+        let mut not_inherited = AttrNameSet::default();
+        let push = |result: &mut Vec<DefaultAttribute>,
+                    name: NameId,
+                    namespace: Option<NameId>,
+                    attribute_key: Option<AttributeKey>,
+                    type_key: Option<TypeKey>,
+                    value: &str| {
+            if !ev_state.seen_attributes.contains(&(namespace, name)) {
+                result.push(DefaultAttribute {
+                    local_name: name,
+                    namespace,
+                    attribute_key,
+                    type_key,
+                    value: value.to_string(),
+                });
             }
+        };
 
-            let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-            let attr_key = resolved.and_then(|r| r.resolved_ref);
+        let mut current = Some(ct_key);
+        while let Some(key) = current.filter(|&key| key != any_type) {
+            let ct_data = &self.schema_set.arenas.complex_types[key];
+            // This type's own uses (clauses 1 and 2). A prohibited
+            // `<attribute>` is no use: it only keeps a restriction's base use
+            // of that name from being inherited, so it never hides a use of
+            // the type itself, from a group or not.
+            let mut own = AttrNameSet::default();
+            let mut prohibited = AttrNameSet::default();
 
-            // Skip if already provided
-            if ev_state.seen_attributes.contains(&(attr_ns, attr_name)) {
-                continue;
-            }
-
-            // Check for default value — first on the use, then on the global decl
-            let default = attr_use.attribute.default_value.as_deref().or_else(|| {
-                attr_key
-                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                    .and_then(|d| d.default_value.as_deref())
-            });
-            if let Some(value) = default {
-                if let Some(attr_key) = attr_key {
-                    result.push(DefaultAttribute {
-                        local_name: attr_name,
-                        namespace: attr_ns,
-                        attribute_key: attr_key,
-                        value: value.to_string(),
+            for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+                let resolved = ct_data.resolved_attributes.get(i);
+                let (attr_name, attr_ns) =
+                    self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+                if attr_use.use_kind == AttributeUseKind::Prohibited {
+                    prohibited.insert((attr_ns, attr_name));
+                    continue;
+                }
+                if not_inherited.contains(&(attr_ns, attr_name))
+                    || !own.insert((attr_ns, attr_name))
+                    || attr_use.use_kind != AttributeUseKind::Optional
+                {
+                    continue;
+                }
+                let attr_key = resolved.and_then(|r| r.resolved_ref);
+                let decl = attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k));
+                let value = attr_use
+                    .attribute
+                    .default_value
+                    .as_deref()
+                    .or(attr_use.attribute.fixed_value.as_deref())
+                    .or_else(|| {
+                        decl.and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
                     });
+                if let Some(value) = value {
+                    let type_key = resolved
+                        .and_then(|r| r.resolved_type)
+                        .or_else(|| decl.and_then(|d| d.resolved_type));
+                    push(&mut result, attr_name, attr_ns, attr_key, type_key, value);
                 }
             }
-        }
 
-        // Include defaults from attribute groups
-        for ga in self.collect_group_attributes(ct_data) {
-            if ga.use_kind == AttributeUseKind::Prohibited {
-                continue;
-            }
-            if ev_state.seen_attributes.contains(&(ga.namespace, ga.name)) {
-                continue;
-            }
-            if let Some(value) = ga.default_value {
-                if let Some(attr_key) = ga.attr_key {
-                    result.push(DefaultAttribute {
-                        local_name: ga.name,
-                        namespace: ga.namespace,
-                        attribute_key: attr_key,
+            for ga in self.collect_group_attributes(ct_data) {
+                // A prohibited use in an attribute group is no attribute use
+                // either (W3C Bugzilla #4043).
+                if ga.use_kind == AttributeUseKind::Prohibited
+                    || not_inherited.contains(&(ga.namespace, ga.name))
+                    || !own.insert((ga.namespace, ga.name))
+                    || ga.use_kind == AttributeUseKind::Required
+                {
+                    continue;
+                }
+                if let Some(value) = ga.default_value.as_deref().or(ga.fixed_value.as_deref()) {
+                    push(
+                        &mut result,
+                        ga.name,
+                        ga.namespace,
+                        ga.attr_key,
+                        ga.type_key,
                         value,
-                    });
+                    );
                 }
             }
+
+            // Clause 3: an extension inherits every use of its base (3.1; its
+            // own names cannot repeat them, and a prohibition there is
+            // ignored); a restriction none of the names it includes or
+            // prohibits (3.2).
+            not_inherited.extend(own);
+            if !matches!(
+                ct_data.derivation_method,
+                Some(crate::parser::frames::DerivationMethod::Extension)
+            ) {
+                not_inherited.extend(prohibited);
+            }
+
+            current = match ct_data.resolved_base_type {
+                Some(TypeKey::Complex(base)) => Some(base),
+                _ => None,
+            };
         }
 
         result

@@ -6474,6 +6474,119 @@ mod release_review_tests {
             ("resolve-uri('http://y/z', '')", "http://y/z"),
         ]);
     }
+
+    /// C63. F&O §8.1 raises FORG0002 when `$relative` "is not a valid URI
+    /// according to the rules of the xs:anyURI data type, or if it is not a
+    /// suitable relative reference"; Datatypes §3.3.17.2: "Spaces are, in
+    /// principle, allowed in the ·lexical space· of anyURI". A character the
+    /// IRI-to-URI escaping takes care of (a space, `<`, `{`, a non-ASCII
+    /// letter) resolves, and the result is not percent-encoded (W3C bug 20672);
+    /// a reference that stays malformed after escaping (two `#`, an empty
+    /// scheme) is still FORG0002.
+    #[test]
+    fn resolve_uri_resolves_references_with_characters_any_uri_allows() {
+        let base = "http://base.example.org/ns/";
+        let resolve = |relative: &str| format!("resolve-uri('{relative}', '{base}')");
+        check(&[
+            (
+                &resolve("two organizations"),
+                "http://base.example.org/ns/two organizations",
+            ),
+            (
+                &resolve("Hello There"),
+                "http://base.example.org/ns/Hello There",
+            ),
+            (
+                &resolve("Az Az , AA 13121-1314"),
+                "http://base.example.org/ns/Az Az , AA 13121-1314",
+            ),
+            (
+                &resolve("a<b>{c}|d^e`f\\g"),
+                "http://base.example.org/ns/a<b>{c}|d^e`f\\g",
+            ),
+            (
+                &resolve("caf\u{e9} x/../y z"),
+                "http://base.example.org/ns/y z",
+            ),
+            (
+                &resolve("a b?q r#f g"),
+                "http://base.example.org/ns/a b?q r#f g",
+            ),
+            // Absolute references are returned unchanged.
+            (&resolve("a:_underscore_"), "a:_underscore_"),
+            (&resolve("DOM:co"), "DOM:co"),
+            // A base with a space is a valid xs:anyURI too.
+            ("resolve-uri('c d', 'http://x/a b/')", "http://x/a b/c d"),
+            // Still FORG0002: malformed after escaping, or no suitable base.
+            (&resolve("##some.uri"), "error:FORG0002"),
+            (&resolve(":"), "error:FORG0002"),
+            (
+                "resolve-uri('a', 'http://localhost/base/##frag')",
+                "error:FORG0002",
+            ),
+            ("resolve-uri('a', 'http://x/a b/#f')", "error:FORG0002"),
+            ("resolve-uri('a', 'a b/')", "error:FORG0002"),
+        ]);
+    }
+
+    /// C64. F&O §11.2.2 `fn:prefix-from-QName($arg as xs:QName?) as
+    /// xs:NCName?`, §11.2.3 `fn:local-name-from-QName($arg as xs:QName?) as
+    /// xs:NCName?`, §11.2.4 `fn:namespace-uri-from-QName(…) as xs:anyURI?`;
+    /// §11.2.6 `fn:in-scope-prefixes`: "For namespaces that have a prefix, it
+    /// returns the prefix as an xs:NCName. For the default namespace, which has
+    /// no prefix, it returns the zero-length string." `fn:local-name` and
+    /// `fn:name` (§14.1, §14.2) return an `xs:string`.
+    #[test]
+    fn qname_accessors_return_the_types_f_and_o_names() {
+        let q = "QName('http://e/', 'p:person')";
+        let xml = r#"<a xmlns="urn:d" xmlns:p="urn:p"/>"#;
+        check_on(
+            Some(xml),
+            &[
+                (
+                    &format!("local-name-from-QName({q}) instance of xs:NCName"),
+                    "true",
+                ),
+                (&format!("local-name-from-QName({q})"), "person"),
+                (
+                    &format!("prefix-from-QName({q}) instance of xs:NCName"),
+                    "true",
+                ),
+                (&format!("prefix-from-QName({q})"), "p"),
+                ("prefix-from-QName(QName('http://e/', 'person'))", "()"),
+                ("local-name-from-QName(())", "()"),
+                (
+                    &format!("namespace-uri-from-QName({q}) instance of xs:anyURI"),
+                    "true",
+                ),
+                (
+                    "namespace-uri-for-prefix('p', /*) instance of xs:anyURI",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = 'p'] instance of xs:NCName",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = 'xml'] instance of xs:NCName",
+                    "true",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = ''] instance of xs:NCName",
+                    "false",
+                ),
+                (
+                    "in-scope-prefixes(/*)[. = ''] instance of xs:string",
+                    "true",
+                ),
+                ("count(in-scope-prefixes(/*))", "3"),
+                // The node accessors stay xs:string.
+                ("local-name(/*) instance of xs:NCName", "false"),
+                ("local-name(/*) instance of xs:string", "true"),
+                ("name(/*) instance of xs:NCName", "false"),
+            ],
+        );
+    }
 }
 
 /// Wave B (B2, B3): `fn:error` as a built-in, the XPDY0050 audit and its

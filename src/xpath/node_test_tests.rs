@@ -2,6 +2,7 @@ use super::*;
 
 use crate::namespace::table::NameTable;
 use crate::navigator::RoXmlNavigator;
+use crate::schema::model::DerivationSet;
 use crate::types::XmlTypeCode;
 use crate::xpath::context::XPathContext;
 
@@ -2101,6 +2102,90 @@ fn a_union_or_list_type_is_not_an_atomic_type() {
                 xsd11,
                 &exprs
             ),
+            expected,
+            "xsd11={xsd11}"
+        );
+    }
+}
+
+// ── C69: derives-from does not count union membership ──────────────────────
+
+#[cfg(test)]
+const UNION_MEMBER_SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:simpleType name="small">
+    <xs:restriction base="xs:integer"><xs:maxInclusive value="9"/></xs:restriction>
+  </xs:simpleType>
+  <xs:simpleType name="ints"><xs:list itemType="xs:integer"/></xs:simpleType>
+  <xs:simpleType name="decOrString"><xs:union memberTypes="xs:decimal xs:string"/></xs:simpleType>
+  <xs:simpleType name="smallOrInts"><xs:union memberTypes="small ints"/></xs:simpleType>
+  <xs:simpleType name="narrow">
+    <xs:restriction base="decOrString"><xs:pattern value="\d+"/></xs:restriction>
+  </xs:simpleType>
+  <xs:complexType name="decWithUnit">
+    <xs:simpleContent>
+      <xs:extension base="xs:decimal"><xs:attribute name="unit" type="xs:string"/></xs:extension>
+    </xs:simpleContent>
+  </xs:complexType>
+  <xs:element name="e" type="decOrString"/>
+  <xs:element name="doc">
+    <xs:complexType>
+      <xs:sequence>
+        <xs:element name="d" type="xs:decimal"/>
+        <xs:element name="s" type="small"/>
+        <xs:element name="l" type="ints"/>
+        <xs:element name="u" type="decOrString"/>
+        <xs:element name="n" type="narrow"/>
+        <xs:element name="c" type="decWithUnit"/>
+        <xs:element ref="e"/>
+        <xs:element ref="e"/>
+      </xs:sequence>
+      <xs:attribute name="a" type="xs:decimal"/>
+      <xs:attribute name="b" type="decOrString"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+
+/// C69: XPath 2.0 §2.5.4: "derives-from(AT, ET) returns true if ET is a known
+/// type and any of the following three conditions is true: AT is a schema type
+/// found in the in-scope schema definitions, and is the same as ET or is derived
+/// by restriction or extension from ET …; There exists some schema type IT such
+/// that derives-from(IT, ET) and derives-from(AT, IT) are true." A member type
+/// of a union is neither — the validation-time rule that accepts it (Structures
+/// §3.16.6.3 clause 2.2.4, `xsi:type` substitutability) is not derives-from. A
+/// restriction of the union still derives from it.
+#[test]
+fn a_member_type_does_not_derive_from_its_union() {
+    let exprs = [
+        "/doc/d instance of element(*, decOrString)",
+        "/doc/s instance of element(*, smallOrInts)",
+        "/doc/l instance of element(*, smallOrInts)",
+        "/doc/c instance of element(*, decOrString)",
+        "/doc/@a instance of attribute(*, decOrString)",
+        "count(/doc/element(*, decOrString))",
+        "count(/doc/attribute(*, decOrString))",
+        "/doc/d treat as element(*, decOrString)",
+        // `e` declares `decOrString`; the second one is `xsi:type="xs:decimal"`,
+        // a member type: valid (cvc-elt.4.3), but not derived from the union.
+        "count(/doc/schema-element(e))",
+        "count(/doc/e[. instance of element(e, decOrString)])",
+        // Same type and a restriction of the union still match.
+        "/doc/u instance of element(*, decOrString)",
+        "/doc/n instance of element(*, decOrString)",
+        "/doc/@b instance of attribute(*, decOrString)",
+        "/doc/d instance of element(*, xs:decimal)",
+        "/doc/s instance of element(*, xs:integer)",
+        "/doc/c instance of element(*, xs:decimal)",
+        "/doc/l instance of element(*, xs:anySimpleType)",
+    ];
+    let mut expected = vec!["false", "false", "false", "false", "false", "3", "1"];
+    expected.extend(["error:XPDY0050", "1", "1"]);
+    expected.extend(["true"; 7]);
+    let xml = r#"<doc xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+        xmlns:xs="http://www.w3.org/2001/XMLSchema" a="1.5" b="x"><d>1.5</d><s>3</s><l>1 2</l
+        ><u>x</u><n>12</n><c unit="m">2.5</c><e>y</e><e xsi:type="xs:decimal">4.5</e></doc>"#;
+    for xsd11 in [false, true] {
+        assert_eq!(
+            typed_fixture(UNION_MEMBER_SCHEMA, xml, xsd11, &exprs),
             expected,
             "xsd11={xsd11}"
         );

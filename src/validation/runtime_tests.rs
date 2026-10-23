@@ -1370,6 +1370,293 @@ fn test_default_from_global_declaration_in_group() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
 
+/// C74. Structures §3.4.4.2: "A defaulted attribute belonging to an element
+/// information item E ·governed by· a complex type T is any Attribute Use U for
+/// which all of the following are true: 1 U is a member of T.{attribute uses}.
+/// 2 U.{required} = false. 3 U's ·effective value constraint· is not ·absent·.
+/// … 5 U.{attribute declaration} does not match any of the attribute
+/// information items in E.[attributes]"; §3.4.5.1 adds one attribute per
+/// defaulted attribute, with "The ·effective value constraint·'s {lexical
+/// form}" — a `default` or a `fixed` one, of a local or a global declaration.
+/// T.{attribute uses} (§3.4.2.2) holds the uses of T's own `<attribute>`
+/// children and attribute groups and those "inherited" from its base type —
+/// minus, in a restriction, the ones T redeclares or prohibits.
+const DEFAULTED_ATTRIBUTES_SCHEMA: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="g" type="xs:string" default="G"/>
+    <xs:attribute name="gf" type="xs:int" fixed="7"/>
+    <xs:attributeGroup name="grp">
+        <xs:attribute name="inGroup" type="xs:string" default="IG"/>
+        <xs:attribute ref="t:g"/>
+    </xs:attributeGroup>
+    <xs:complexType name="base">
+        <xs:attribute name="fromBase" type="xs:string" default="B"/>
+        <xs:attribute name="baseFixed" type="xs:decimal" fixed="1.5"/>
+        <xs:attribute name="overridden" type="xs:string" default="base"/>
+        <xs:attribute name="dropped" type="xs:string" default="D"/>
+        <xs:attributeGroup ref="t:grp"/>
+    </xs:complexType>
+    <xs:complexType name="restricted">
+        <xs:complexContent>
+            <xs:restriction base="t:base">
+                <xs:attribute name="overridden" type="xs:string" default="restricted"/>
+                <xs:attribute name="dropped" use="prohibited"/>
+            </xs:restriction>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="extended">
+        <xs:complexContent>
+            <xs:extension base="t:restricted">
+                <xs:attribute name="local" type="xs:string" default="L"/>
+                <xs:attribute name="localFixed" fixed="F"/>
+                <xs:attribute name="requiredFixed" type="xs:string" use="required" fixed="R"/>
+                <xs:attribute name="noDefault" type="xs:string"/>
+                <xs:attribute ref="t:gf"/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:extended"/>
+</xs:schema>"#;
+
+/// Run `root` with `attributes` (local name, namespace, value) and return the
+/// defaulted attributes as sorted `(local name, namespace, value)` triples.
+fn defaulted_attributes_of(
+    schema_set: &SchemaSet,
+    attributes: &[(&str, &str, &str)],
+) -> Vec<(String, String, String)> {
+    let validator = SchemaValidator::new(schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "urn:t", None, None, &ns);
+    for (local, namespace, value) in attributes {
+        v.validate_attribute(local, namespace, value);
+    }
+    v.validate_end_of_attributes();
+    let mut defaults: Vec<(String, String, String)> = v
+        .get_default_attributes()
+        .iter()
+        .map(|d| {
+            (
+                schema_set.name_table.resolve(d.local_name).to_string(),
+                d.namespace
+                    .map(|n| schema_set.name_table.resolve(n).to_string())
+                    .unwrap_or_default(),
+                d.value.clone(),
+            )
+        })
+        .collect();
+    defaults.sort();
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    defaults
+}
+
+#[test]
+fn defaulted_attributes_include_local_group_inherited_and_fixed_uses() {
+    let owned = |rows: &[(&str, &str, &str)]| {
+        rows.iter()
+            .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+            .collect::<Vec<_>>()
+    };
+    #[allow(unused_mut)]
+    let mut sets = vec![("1.0", load_schema(DEFAULTED_ATTRIBUTES_SCHEMA))];
+    #[cfg(feature = "xsd11")]
+    sets.push(("1.1", load_schema_xsd11(DEFAULTED_ATTRIBUTES_SCHEMA)));
+    for (version, schema_set) in sets {
+        assert_eq!(
+            defaulted_attributes_of(
+                &schema_set,
+                &[("requiredFixed", "", "R"), ("g", "urn:t", "supplied")]
+            ),
+            owned(&[
+                ("baseFixed", "", "1.5"),
+                ("fromBase", "", "B"),
+                ("gf", "urn:t", "7"),
+                ("inGroup", "", "IG"),
+                ("local", "", "L"),
+                ("localFixed", "", "F"),
+                ("overridden", "", "restricted"),
+            ]),
+            "XSD {version}"
+        );
+        // Supplied attributes are not defaulted.
+        assert_eq!(
+            defaulted_attributes_of(
+                &schema_set,
+                &[
+                    ("requiredFixed", "", "R"),
+                    ("local", "", "x"),
+                    ("gf", "urn:t", "7"),
+                    ("inGroup", "", "y"),
+                    ("fromBase", "", "z"),
+                ]
+            ),
+            owned(&[
+                ("baseFixed", "", "1.5"),
+                ("g", "urn:t", "G"),
+                ("localFixed", "", "F"),
+                ("overridden", "", "restricted"),
+            ]),
+            "XSD {version}"
+        );
+    }
+}
+
+/// C74 fix round. Structures §3.4.2.4: the {attribute uses} of a type are
+/// "1 The set of attribute uses corresponding to the <attribute> [children]",
+/// "2 The {attribute uses} of the attribute groups", and "3 The attribute uses
+/// "inherited" from the {base type definition}" — for a restriction minus the
+/// names of clause 3.2.1 (uses already included by clause 1 or 2) and 3.2.2
+/// (an `<attribute>` child with `use="prohibited"`). Its note: `prohibited`
+/// "serves to prevent inheritance of an identically named attribute use from
+/// the {base type definition}", and is "simply ignored" elsewhere (an
+/// extension, an attribute group). So a prohibited `<attribute>` beside an
+/// attribute group never hides the group's use of the same name.
+fn defaulted_attributes_in_both_versions(
+    xsd: &str,
+    attributes: &[(&str, &str, &str)],
+    expected: &[(&str, &str, &str)],
+) {
+    let expected: Vec<(String, String, String)> = expected
+        .iter()
+        .map(|(a, b, c)| (a.to_string(), b.to_string(), c.to_string()))
+        .collect();
+    #[allow(unused_mut)]
+    let mut sets = vec![("1.0", load_schema(xsd))];
+    #[cfg(feature = "xsd11")]
+    sets.push(("1.1", load_schema_xsd11(xsd)));
+    for (version, schema_set) in sets {
+        assert_eq!(
+            defaulted_attributes_of(&schema_set, attributes),
+            expected,
+            "XSD {version}"
+        );
+    }
+}
+
+/// The declarations the fix-round schemas share: a global `a` with a default,
+/// and a group that references it.
+const PROHIBITION_PROLOGUE: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="a" type="xs:string" default="A"/>
+    <xs:attributeGroup name="g">
+        <xs:attribute ref="t:a"/>
+    </xs:attributeGroup>"#;
+
+#[test]
+fn a_prohibited_attribute_beside_a_group_keeps_the_group_default() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="T">
+        <xs:attribute ref="t:a" use="prohibited"/>
+        <xs:attributeGroup ref="t:g"/>
+    </xs:complexType>
+    <xs:element name="root" type="t:T"/>
+</xs:schema>"#
+    );
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A")]);
+}
+
+#[test]
+fn a_restriction_prohibition_drops_only_the_inherited_default() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="B">
+        <xs:attribute name="x" type="xs:string" default="X"/>
+        <xs:attribute name="y" type="xs:string" default="Y"/>
+        <xs:attribute ref="t:a"/>
+    </xs:complexType>
+    <xs:complexType name="R">
+        <xs:complexContent>
+            <xs:restriction base="t:B">
+                <xs:attribute name="x" use="prohibited"/>
+                <xs:attribute ref="t:a" use="prohibited"/>
+                <xs:attributeGroup ref="t:g"/>
+            </xs:restriction>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:R"/>
+</xs:schema>"#
+    );
+    // `x` is not inherited; `a` is R's own use (through the group); `y` is
+    // inherited.
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("y", "", "Y")]);
+}
+
+#[test]
+fn a_prohibition_in_an_extension_is_ignored() {
+    let xsd = format!(
+        r#"{PROHIBITION_PROLOGUE}
+    <xs:complexType name="B">
+        <xs:attribute name="b" type="xs:string" default="B"/>
+    </xs:complexType>
+    <xs:complexType name="E">
+        <xs:complexContent>
+            <xs:extension base="t:B">
+                <xs:attribute ref="t:a" use="prohibited"/>
+                <xs:attributeGroup ref="t:g"/>
+            </xs:extension>
+        </xs:complexContent>
+    </xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#
+    );
+    defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("b", "", "B")]);
+}
+
+/// C74: a defaulted attribute names its global declaration when it has one
+/// (`None` for a local declaration) and carries the declaration's type.
+#[test]
+fn defaulted_attributes_carry_the_declaration_and_its_type() {
+    let schema_set = load_schema(DEFAULTED_ATTRIBUTES_SCHEMA);
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "urn:t", None, None, &ns);
+    v.validate_attribute("requiredFixed", "", "R");
+    v.validate_end_of_attributes();
+    let defaults = v.get_default_attributes();
+    let find = |name: &str| {
+        defaults
+            .iter()
+            .find(|d| schema_set.name_table.resolve(d.local_name) == name)
+            .unwrap_or_else(|| panic!("{name} defaulted"))
+    };
+    let builtin = schema_set.builtin_types();
+    let gf = find("gf");
+    let gf_key = gf.attribute_key.expect("global declaration");
+    assert_eq!(
+        schema_set.name_table.resolve(
+            schema_set.arenas.attributes[gf_key]
+                .name
+                .expect("named declaration")
+        ),
+        "gf"
+    );
+    assert_eq!(gf.type_key, Some(TypeKey::Simple(builtin.int)));
+    let g = find("g");
+    assert!(g.attribute_key.is_some());
+    assert_eq!(g.type_key, Some(TypeKey::Simple(builtin.string)));
+    for (name, type_key) in [
+        ("local", Some(TypeKey::Simple(builtin.string))),
+        ("inGroup", Some(TypeKey::Simple(builtin.string))),
+        ("baseFixed", Some(TypeKey::Simple(builtin.decimal))),
+    ] {
+        let d = find(name);
+        assert_eq!(d.attribute_key, None, "{name}");
+        assert_eq!(d.type_key, type_key, "{name}");
+    }
+    // A local declaration without a type: no type key, or xs:anySimpleType.
+    let local_fixed = find("localFixed");
+    assert_eq!(local_fixed.attribute_key, None);
+    assert!(local_fixed
+        .type_key
+        .is_none_or(|t| t == TypeKey::Simple(builtin.any_simple_type)));
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+}
+
 // ── Mixed content tests ─────────────────────────────────────────────
 
 #[test]

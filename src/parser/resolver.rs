@@ -425,7 +425,7 @@ impl SchemaCatalog {
     /// Maps standard XML namespaces to `embedded://` URIs that are resolved
     /// by the [`EmbeddedLoader`].
     pub fn add_xml_catalog(&mut self) {
-        // XML namespace (xml:lang, xml:space, xml:base) - uses embedded schema
+        // XML namespace (xml:lang, xml:space, xml:base, xml:id) - uses embedded schema
         self.add("http://www.w3.org/XML/1998/namespace", "embedded://xml.xsd");
 
         // XLink namespace (xlink:type, xlink:href, etc.) - uses embedded schema

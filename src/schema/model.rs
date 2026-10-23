@@ -577,11 +577,44 @@ impl SchemaSet {
     /// - `true` if `derived == base`
     /// - `true` if `derived` derives from `base` via a non-excluded derivation method
     /// - `false` otherwise
+    ///
+    /// This is the validation-time relation (Structures §3.4.6.5 / §3.16.6.3
+    /// *Type Derivation OK*): a member type of a union `base` counts as derived
+    /// from it (§3.16.6.3 clause 2.2.4), which is what `xsi:type` and
+    /// substitution groups need. XPath 2.0's derives-from (§2.5.4) admits only
+    /// restriction and extension, so a union member does not derive from its
+    /// union there.
     pub fn is_type_derived_from(
         &self,
         derived: TypeKey,
         base: TypeKey,
         exclude_methods: DerivationSet,
+    ) -> bool {
+        self.type_derived_from(derived, base, exclude_methods, true)
+    }
+
+    /// XPath 2.0 §2.5.4 `derives-from(AT, ET)` for two types of this set:
+    /// "AT … is the same as ET or is derived by restriction or extension from
+    /// ET", directly or through an intermediate type — the {base type
+    /// definition} chain only (the built-in hierarchy included; a list or
+    /// union type derives from `xs:anySimpleType`). Unlike
+    /// [`is_type_derived_from`](Self::is_type_derived_from), a member type of a
+    /// union is **not** derived from the union. SequenceType matching
+    /// (`instance of`, `treat as`, element / attribute / schema-element /
+    /// schema-attribute tests and the casts up the hierarchy) uses this one.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn xpath_derives_from(&self, derived: TypeKey, base: TypeKey) -> bool {
+        self.type_derived_from(derived, base, DerivationSet::empty(), false)
+    }
+
+    /// [`is_type_derived_from`](Self::is_type_derived_from) with the union
+    /// member clause (§3.16.6.3 clause 2.2.4) on or off.
+    fn type_derived_from(
+        &self,
+        derived: TypeKey,
+        base: TypeKey,
+        exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         // Same type derives from itself
         if derived == base {
@@ -609,7 +642,7 @@ impl SchemaSet {
         match (derived, base) {
             // Case 1: Both are simple types
             (TypeKey::Simple(d), TypeKey::Simple(b)) => {
-                self.is_simple_type_derived_from(d, b, exclude_methods)
+                self.is_simple_type_derived_from(d, b, exclude_methods, union_members)
             }
 
             // Case 2: Both are complex types
@@ -624,7 +657,7 @@ impl SchemaSet {
             // Case 4: Complex derives from Simple
             // Complex types with simpleContent can derive from simple types
             (TypeKey::Complex(d), TypeKey::Simple(b)) => {
-                self.is_complex_derived_from_simple(d, b, exclude_methods)
+                self.is_complex_derived_from_simple(d, b, exclude_methods, union_members)
             }
         }
     }
@@ -671,11 +704,13 @@ impl SchemaSet {
     /// Implements XSD spec §3.16.6.3 "Type Derivation OK (Simple)":
     /// - Clause 2.2.1/2.2.2: walks the `resolved_base_type` chain
     /// - Clause 2.2.4: if `base` is a union, checks transitive member types
+    ///   (only with `union_members`; XPath's derives-from leaves it out)
     fn is_simple_type_derived_from(
         &self,
         derived: SimpleTypeKey,
         base: SimpleTypeKey,
         exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         use crate::parser::frames::SimpleTypeVariety;
 
@@ -734,11 +769,19 @@ impl SchemaSet {
 
         // Clause 2.2.4: If base is a union with no facets, check whether
         // derived is derived from a transitive member type.
+        if !union_members {
+            return false;
+        }
         if let Some(base_def) = self.arenas.simple_types.get(base) {
             if base_def.variety == SimpleTypeVariety::Union && base_def.facets.is_empty() {
                 for &member_type_key in &base_def.resolved_member_types {
                     if let TypeKey::Simple(member_key) = member_type_key {
-                        if self.is_simple_type_derived_from(derived, member_key, exclude_methods) {
+                        if self.is_simple_type_derived_from(
+                            derived,
+                            member_key,
+                            exclude_methods,
+                            union_members,
+                        ) {
                             return true;
                         }
                     }
@@ -805,6 +848,7 @@ impl SchemaSet {
         derived: ComplexTypeKey,
         base: SimpleTypeKey,
         exclude_methods: DerivationSet,
+        union_members: bool,
     ) -> bool {
         use crate::parser::frames::DerivationMethod;
 
@@ -834,7 +878,12 @@ impl SchemaSet {
                         return true;
                     }
                     // Walk further up the simple type chain.
-                    return self.is_simple_type_derived_from(simple_base, base, exclude_methods);
+                    return self.is_simple_type_derived_from(
+                        simple_base,
+                        base,
+                        exclude_methods,
+                        union_members,
+                    );
                 }
                 Some(TypeKey::Complex(complex_base)) => {
                     // Base is another complex type; keep walking.
@@ -1600,6 +1649,21 @@ mod tests {
             !set.is_type_derived_from(string_key, union_key, DerivationSet::empty()),
             "xs:string should NOT be derived from union(float, integer)"
         );
+
+        // XPath 2.0 §2.5.4 derives-from: restriction / extension only, so a
+        // member type does not derive from its union (C69); the union itself
+        // derives from xs:anySimpleType and from itself.
+        #[cfg(feature = "xsd11")]
+        {
+            assert!(!set.xpath_derives_from(integer_key, union_key));
+            assert!(!set.xpath_derives_from(float_key, union_key));
+            assert!(set.xpath_derives_from(union_key, union_key));
+            let any_simple = TypeKey::Simple(set.builtin_types().any_simple_type);
+            assert!(set.xpath_derives_from(union_key, any_simple));
+            assert!(
+                set.xpath_derives_from(integer_key, TypeKey::Simple(set.builtin_types().decimal))
+            );
+        }
     }
 
     /// Clause 2.2.4 with nested unions: D derived from a member of
