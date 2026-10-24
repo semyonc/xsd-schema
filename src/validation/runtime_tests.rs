@@ -734,6 +734,51 @@ fn test_xsi_type_on_local_element() {
     assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
 }
 
+/// Structures §3.3.5.5: an element for which clause 5.1 of Element Locally
+/// Valid (Element) applied — no element or character [children], a `default`
+/// *or* `fixed` value constraint — has [schema specified] "schema"; the
+/// end-element `SchemaInfo` reports it as `is_default`, for a fixed value as
+/// for a default (a typed build gives both a text node with the value). An
+/// element with character children takes no value constraint.
+#[test]
+fn an_empty_element_that_takes_its_fixed_value_is_defaulted() {
+    let schema_set = load_schema(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:element name="root"><xs:complexType><xs:sequence>
+                <xs:element name="f" type="xs:string" fixed="LOCKED" maxOccurs="2"/>
+                <xs:element name="d" type="xs:string" default="fallback"/>
+            </xs:sequence></xs:complexType></xs:element>
+        </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_element("f", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let empty_fixed = v.validate_end_element();
+    v.validate_element("f", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_text("LOCKED");
+    let written_fixed = v.validate_end_element();
+    v.validate_element("d", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let empty_default = v.validate_end_element();
+    v.validate_end_element();
+    assert!(v.end_validation().is_ok());
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+    assert!(
+        empty_fixed.is_default,
+        "an empty element takes its fixed value"
+    );
+    assert!(
+        !written_fixed.is_default,
+        "character children: no value constraint"
+    );
+    assert!(empty_default.is_default);
+}
+
 #[test]
 fn test_group_ref_with_nillable_fixed_default() {
     let schema_set = load_schema(

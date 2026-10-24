@@ -628,6 +628,10 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// Deferred attribute PSVI results from CTA processing (XSD 1.1).
     #[cfg(feature = "xsd11")]
     deferred_attribute_results: Vec<SchemaInfo>,
+    /// The defaulted attributes the last
+    /// [`validate_end_of_attributes`](Self::validate_end_of_attributes) found
+    /// (see [`take_default_attributes`](Self::take_default_attributes)).
+    default_attributes: Vec<DefaultAttribute>,
     /// Indices into the current element's `collected_attributes` of the
     /// attributes the caller skipped (`skip_attribute`): visible to type
     /// alternatives, not validated after them (XSD 1.1).
@@ -1151,6 +1155,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             pending_assertion_frames: Vec::new(),
             #[cfg(feature = "xsd11")]
             deferred_attribute_results: Vec::new(),
+            default_attributes: Vec::new(),
             #[cfg(feature = "xsd11")]
             skipped_collected: Vec::new(),
             cached_xsd10_id_key,
@@ -3635,8 +3640,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// Signal end of attributes; checks for missing required attributes and
     /// returns the (possibly CTA-updated) type info as a [`SchemaInfo`].
+    ///
+    /// The defaulted attributes of the element (Structures §3.4.4.2, added to
+    /// its \[attributes\] by §3.4.5.1) are found in the same walk of the
+    /// governing type's {attribute uses} that checks the required ones; take
+    /// them with [`take_default_attributes`](Self::take_default_attributes).
     pub fn validate_end_of_attributes(&mut self) -> SchemaInfo {
-        match self.end_of_attributes_inner() {
+        self.default_attributes.clear();
+        match self.end_of_attributes_inner(true) {
             EndOfAttributesOutcome::Invalid => SchemaInfo::invalid(),
             EndOfAttributesOutcome::Done => SchemaInfo::empty(),
             // CTA selected (and possibly switched) the governing type: rebuild
@@ -3666,12 +3677,27 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// checks, default/fixed processing) without constructing it.
     /// See `PERF_P1_PLAN` §Step 4.
     pub fn validate_end_of_attributes_novalue(&mut self) {
-        let _ = self.end_of_attributes_inner();
+        let _ = self.end_of_attributes_inner(false);
+    }
+
+    /// The defaulted attributes of the current element that the last
+    /// [`validate_end_of_attributes`](Self::validate_end_of_attributes) found
+    /// — the set [`get_default_attributes`](Self::get_default_attributes)
+    /// computes, from the walk the end of the attributes makes anyway — in
+    /// the order of the governing type's {attribute uses} (its own uses, its
+    /// attribute groups', then its base types'). The buffer is emptied; the
+    /// next `validate_end_of_attributes` refills it.
+    /// [`validate_end_of_attributes_novalue`](Self::validate_end_of_attributes_novalue)
+    /// collects none.
+    pub fn take_default_attributes(&mut self) -> Vec<DefaultAttribute> {
+        std::mem::take(&mut self.default_attributes)
     }
 
     /// The end-of-attributes step shared by both entry points above:
-    /// everything except assembling the returned `SchemaInfo`.
-    fn end_of_attributes_inner(&mut self) -> EndOfAttributesOutcome {
+    /// everything except assembling the returned `SchemaInfo`; with
+    /// `collect_defaults`, the defaulted attributes go to
+    /// `self.default_attributes`.
+    fn end_of_attributes_inner(&mut self, collect_defaults: bool) -> EndOfAttributesOutcome {
         if self.operational_failure.is_some() {
             return EndOfAttributesOutcome::Invalid;
         }
@@ -3743,7 +3769,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // (cvc-complex-type.4); the defaulted ones take part in identity
         // constraints and ID/IDREF.
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
-            self.process_absent_attribute_uses(ct_key);
+            self.process_absent_attribute_uses(ct_key, collect_defaults);
         }
 
         // Forward to assertion fragment builder (XSD 1.1)
@@ -3883,16 +3909,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// value constraints may play a part in ·key sequence·s") and, for an
     /// ID / IDREF / ENTITY type, in the ID/IDREF table (§3.17.5.2) and the
     /// entity check.
-    fn process_absent_attribute_uses(&mut self, ct_key: ComplexTypeKey) {
+    fn process_absent_attribute_uses(&mut self, ct_key: ComplexTypeKey, collect_defaults: bool) {
         let mut missing: Vec<(Option<NameId>, NameId)> = Vec::new();
         let mut ic_defaults: Vec<IcDefault> = Vec::new();
         let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
+        let mut defaults = std::mem::take(&mut self.default_attributes);
         self.collect_absent_attribute_uses(
             ct_key,
             &mut missing,
             &mut ic_defaults,
             &mut id_defaults,
+            collect_defaults.then_some(&mut defaults),
         );
+        self.default_attributes = defaults;
         if !missing.is_empty() {
             for (_ns, name) in missing {
                 let name_str = self.schema_set.name_table.resolve(name);
@@ -3962,16 +3991,30 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// the mapping "depends on the namespace bindings in scope where the
     /// literal occurs"). `None` when the value is not valid for the type (the
     /// schema is then in error) — the caller compares the lexical form.
+    ///
+    /// The literal is validated with those bindings, so that a union decides
+    /// its member as it would where the literal was written: a QName member
+    /// whose facets need the expanded name (an `enumeration` of QNames) is
+    /// not passed over for a later `xs:ID` or `xs:string` member.
     fn value_constraint_typed_value(
         &self,
         value: &str,
         type_key: TypeKey,
         source: Option<&SourceRef>,
     ) -> Option<XmlValue> {
-        let typed = super::simple::validate_simple_type(value, type_key, self.schema_set)
-            .ok()?
-            .typed_value;
         let ctx = self.schema_set.value_constraint_namespaces(source);
+        let names = &self.schema_set.name_table;
+        let resolver = ctx.map(|ns| super::simple::snapshot_prefixes(ns, names));
+        let typed = super::simple::validate_simple_type_in(
+            value,
+            type_key,
+            self.schema_set,
+            resolver
+                .as_ref()
+                .map(|r| r as super::simple::PrefixResolver<'_>),
+        )
+        .ok()?
+        .typed_value;
         match self.resolve_qname_typed_value_in(Some(&typed), value, ctx) {
             Ok(Some(resolved)) => Some(resolved),
             Ok(None) if !super::simple::holds_lexical_qname(&typed) => Some(typed),
@@ -3981,12 +4024,24 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
+    /// Whether a defaulted attribute of type `type_key` is handed out with its
+    /// typed value ([`DefaultAttribute::typed_value`]): when the run retains
+    /// PSVI typed values, and always for a type whose values can be (or hold)
+    /// `xs:QName` / `xs:NOTATION` values — which the lexical form alone does
+    /// not give, since it was written with the schema document's bindings.
+    fn default_typed_value_wanted(&self, type_key: TypeKey) -> bool {
+        self.flags
+            .contains(ValidationFlags::BUILD_PSVI_TYPED_VALUES)
+            || super::simple::type_has_qname_values(type_key, self.schema_set)
+    }
+
     /// The `&self` scan behind
     /// [`process_absent_attribute_uses`](Self::process_absent_attribute_uses),
     /// borrowing the element's seen attributes straight from the validation
     /// stack (no per-element clone): the missing required uses, the defaulted
     /// values an active identity constraint may select, and the
-    /// ID/IDREF/ENTITY-typed defaulted values that still need validating.
+    /// ID/IDREF/ENTITY-typed defaulted values that still need validating —
+    /// and, when `defaults` is given, every defaulted attribute.
     ///
     /// A defaulted value goes to the identity constraints as its typed value
     /// under the use's type, as an attribute the instance carries does
@@ -4002,6 +4057,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         missing: &mut Vec<(Option<NameId>, NameId)>,
         ic_defaults: &mut Vec<IcDefault>,
         id_defaults: &mut Vec<(String, TypeKey)>,
+        mut defaults: Option<&mut Vec<DefaultAttribute>>,
     ) {
         let empty_seen = AttrNameSet::default();
         let seen = self
@@ -4027,10 +4083,25 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 return;
             }
             let Some(v) = u.value else { return };
+            let typed_value = || {
+                u.type_key
+                    .and_then(|tk| self.value_constraint_typed_value(v, tk, u.value_source))
+            };
+            if let Some(defaults) = defaults.as_deref_mut() {
+                defaults.push(DefaultAttribute {
+                    local_name: u.name,
+                    namespace: u.namespace,
+                    attribute_key: u.attr_key,
+                    type_key: u.type_key,
+                    value: v.to_string(),
+                    typed_value: u
+                        .type_key
+                        .filter(|&tk| self.default_typed_value_wanted(tk))
+                        .and_then(|_| typed_value()),
+                });
+            }
             if has_ic {
-                let typed_value = u
-                    .type_key
-                    .and_then(|tk| self.value_constraint_typed_value(v, tk, u.value_source));
+                let typed_value = typed_value();
                 ic_defaults.push((
                     u.name,
                     u.namespace.unwrap_or(NameId(0)),
@@ -4490,7 +4561,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     } else if let Some(fixed_value) = &elem_data.fixed_value {
                         // XSD spec §3.3.4.3: "If fixed is specified, then the
                         // element's content must either be empty, in which case
-                        // fixed behaves as default, or match fixed."
+                        // fixed behaves as default, or match fixed." Clause 5.1
+                        // applied: [schema specified] is "schema" (§3.3.5.5).
+                        ev_state.is_default = true;
                         ev_state.text_content = fixed_value.clone();
                         substituted_fixed = true;
                     }
@@ -4500,12 +4573,29 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             if let Some(schema_type) = ev_state.schema_type {
                 if !self.try_fast_simple_content(ev_state, schema_type) {
                     // QName / NOTATION values resolve their prefixes with the
-                    // element's in-scope namespaces (Datatypes §3.3.18).
+                    // element's in-scope namespaces (Datatypes §3.3.18) — the
+                    // bindings where the literal occurs. A value constraint
+                    // the element took (clause 5.1) was written on its
+                    // declaration: its literal is read with the schema
+                    // document's bindings there, and its value is the
+                    // constraint's {value} (Structures §3.3.2: "the ·actual
+                    // value· … of the [attribute]"; §3.3.5.4 Note: without
+                    // ·namespace fixup· "the prefix used in the lexical
+                    // representation … will not necessarily map to the
+                    // namespace name of the value").
+                    let schema_set: &'a SchemaSet = self.schema_set;
+                    let declaration_ctx = ev_state
+                        .element_decl
+                        .filter(|_| ev_state.is_default)
+                        .and_then(|k| schema_set.arenas.elements.get(k))
+                        .and_then(|d| schema_set.value_constraint_namespaces(d.source.as_ref()));
+                    let qname_ctx = if ev_state.is_default {
+                        declaration_ctx
+                    } else {
+                        ev_state.ns_context.as_ref()
+                    };
                     let names = &self.schema_set.name_table;
-                    let resolver = ev_state
-                        .ns_context
-                        .as_ref()
-                        .map(|ns| super::simple::snapshot_prefixes(ns, names));
+                    let resolver = qname_ctx.map(|ns| super::simple::snapshot_prefixes(ns, names));
                     match super::simple::validate_simple_type_in(
                         &ev_state.text_content,
                         schema_type,
@@ -4534,7 +4624,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                             || v.type_code == XmlTypeCode::Notation)
                                 });
                             if needs_qname_check && ev_state.validity == SchemaValidity::Valid {
-                                if let Some(ctx) = ev_state.ns_context.as_ref() {
+                                if let Some(ctx) = qname_ctx {
                                     let raw = ev_state.text_content.trim();
                                     if let Some(colon_pos) = raw.find(':') {
                                         let prefix = &raw[..colon_pos];
@@ -4570,7 +4660,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 .as_ref()
                                 .filter(|v| super::simple::holds_list(v));
                             if let (Some(value), Some(ctx), SchemaValidity::Valid) =
-                                (list_value, ev_state.ns_context.as_ref(), ev_state.validity)
+                                (list_value, qname_ctx, ev_state.validity)
                             {
                                 match resolve_list_qname_members(
                                     value,
@@ -5360,6 +5450,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     attribute_key: u.attr_key,
                     type_key: u.type_key,
                     value: value.to_string(),
+                    typed_value: u
+                        .type_key
+                        .filter(|&tk| self.default_typed_value_wanted(tk))
+                        .and_then(|tk| {
+                            self.value_constraint_typed_value(value, tk, u.value_source)
+                        }),
                 });
             }
         });

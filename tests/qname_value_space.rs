@@ -767,16 +767,20 @@ fn simple_content_restrictions_enumerate_qnames_by_expanded_name() {
     }
 }
 
-/// Structures §3.3.4.3 clause 5.1.2: an empty element with a value constraint
-/// is validated as "The element information item with
-/// D.{value constraint}.{lexical form} used as its ·normalized value·" — the
-/// element's own in-scope namespaces read a QName default (decision D3). So a
-/// default `t:Sender` under an enumeration of `{urn:e}Sender` is invalid on an
-/// element that binds `t` elsewhere, and a fixed value taken by an empty
-/// element is not compared with the declared one (clause 5.2.2 applies only
-/// when 5.1 does not).
+/// An empty element that takes its value constraint (Structures §3.3.4.3
+/// clause 5.1) takes the constraint's {value}: "the ·actual value· … of the
+/// [attribute]" on the declaration (§3.3.2), a QName read with the schema
+/// element's bindings (Datatypes §3.3.18). The typed build writes it again
+/// with a prefix the instance binds (·namespace fixup·, which §3.3.5.4's Note
+/// leaves to the processor), so the element is validated as that value
+/// (clause 5.1.2) — batch (t) fix round 1, which reverses C33's decision D3
+/// (the element's own bindings read the literal). So a default `t:Sender`
+/// under an enumeration of `{urn:e}Sender` is valid also on an element that
+/// binds `t` elsewhere, and a fixed value taken by an empty element is not
+/// compared with the declared one (clause 5.2.2 applies only when 5.1 does
+/// not).
 #[test]
-fn defaults_of_empty_elements_are_read_with_the_elements_bindings() {
+fn defaults_of_empty_elements_are_read_with_the_schemas_bindings() {
     let body = r#"
       <xs:simpleType name="code"><xs:restriction base="xs:QName">
         <xs:enumeration value="t:Sender"/><xs:enumeration value="t:Receiver"/>
@@ -794,9 +798,11 @@ fn defaults_of_empty_elements_are_read_with_the_elements_bindings() {
                 (r#"<t:r xmlns:t="urn:e"><t:d/><t:f/></t:r>"#, Valid, None),
                 (
                     r#"<p:r xmlns:p="urn:e" xmlns:t="urn:x"><p:d/></p:r>"#,
-                    Invalid,
-                    Some("cvc-enumeration-valid"),
+                    Valid,
+                    None,
                 ),
+                // The instance binds no `t`: the value is still `{urn:e}Sender`.
+                (r#"<p:r xmlns:p="urn:e"><p:d/><p:f/></p:r>"#, Valid, None),
                 (
                     r#"<p:r xmlns:p="urn:e" xmlns:t="urn:x"><p:f/></p:r>"#,
                     Valid,

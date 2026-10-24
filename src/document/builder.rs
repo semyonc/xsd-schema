@@ -105,6 +105,9 @@ pub struct BufferDocumentBuilder<'a> {
     /// [`IdClass`]. Nearly every annotation an attribute carries is
     /// [`IdClass::Never`], and this makes that answer one vector read.
     id_classes: Vec<IdClass>,
+    /// The is-idrefs class of each binding index, filled on first use — see
+    /// [`IdrefsClass`].
+    idrefs_classes: Vec<IdrefsClass>,
     /// How many element and attribute nodes carry a binding, so that
     /// `has_type_annotations` stays exact when a binding is taken away again.
     annotated_nodes: usize,
@@ -167,6 +170,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             element_index: ElementIndex::new(),
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
+            idrefs: HashMap::new(),
             schema_set,
             fragment_base_uri: None,
             xml_declaration: None,
@@ -188,6 +192,7 @@ impl<'a> BufferDocumentBuilder<'a> {
             xml_id_name: (effective_names.add("id"), xml_uri_id),
             dropped_duplicate_id: None,
             id_classes: Vec::new(),
+            idrefs_classes: Vec::new(),
             annotated_nodes: 0,
             parse_limits: crate::xml::ParseLimits::none(),
         })
@@ -464,10 +469,98 @@ impl<'a> BufferDocumentBuilder<'a> {
         }
     }
 
+    /// Discards the pending text (it becomes no node), keeping the buffer.
+    pub(crate) fn discard_pending_text(&mut self) {
+        self.text_type = None;
+        self.text_buffer.clear();
+    }
+
     /// Takes the pending text away (it becomes no node).
     pub(crate) fn take_pending_text(&mut self) -> String {
         self.text_type = None;
         std::mem::take(&mut self.text_buffer)
+    }
+
+    /// A prefix bound to the namespace `uri` in the scope of the open element
+    /// — `xml` for the XML namespace, otherwise the nearest declaration of a
+    /// non-empty prefix to `uri` that no nearer declaration of the same prefix
+    /// hides — or `None` when there is none.
+    pub(crate) fn prefix_in_scope(&self, uri: &str) -> Option<&'a str> {
+        if uri == XML_NAMESPACE {
+            return Some("xml");
+        }
+        let names = self.doc.names;
+        let uri_id = names.get(uri)?;
+        let mut seen: Vec<NameId> = Vec::new();
+        let mut ns_ref = self.current_namespace;
+        while !ns_ref.is_null() {
+            let ns = self.doc.namespace_pages.get(ns_ref);
+            let prefix = names.resolve_ref(ns.prefix);
+            if !prefix.is_empty() && !seen.contains(&ns.prefix) {
+                if ns.namespace_uri == uri_id {
+                    return Some(prefix);
+                }
+                seen.push(ns.prefix);
+            }
+            ns_ref = ns.next;
+        }
+        None
+    }
+
+    /// The namespace the non-empty `prefix` is bound to in the scope of the
+    /// open element (`xml` to the XML namespace), or `None` when it is bound
+    /// nowhere (or undeclared).
+    pub(crate) fn namespace_of_prefix(&self, prefix: &str) -> Option<&'a str> {
+        if prefix == "xml" {
+            return Some(XML_NAMESPACE);
+        }
+        let names = self.doc.names;
+        let mut ns_ref = self.current_namespace;
+        while !ns_ref.is_null() {
+            let ns = self.doc.namespace_pages.get(ns_ref);
+            if names.resolve_ref(ns.prefix) == prefix {
+                let uri = names.resolve_ref(ns.namespace_uri);
+                return (!uri.is_empty()).then_some(uri);
+            }
+            ns_ref = ns.next;
+        }
+        None
+    }
+
+    /// The default namespace in the scope of the open element, or `None`
+    /// when there is none (or it is undeclared).
+    pub(crate) fn default_namespace_in_scope(&self) -> Option<&'a str> {
+        let names = self.doc.names;
+        let mut ns_ref = self.current_namespace;
+        while !ns_ref.is_null() {
+            let ns = self.doc.namespace_pages.get(ns_ref);
+            if names.resolve_ref(ns.prefix).is_empty() {
+                let uri = names.resolve_ref(ns.namespace_uri);
+                return (!uri.is_empty()).then_some(uri);
+            }
+            ns_ref = ns.next;
+        }
+        None
+    }
+
+    /// Whether `prefix` is bound (to anything, an undeclaration included) in
+    /// the scope of the open element.
+    pub(crate) fn prefix_is_declared(&self, prefix: &str) -> bool {
+        if prefix == "xml" || prefix == "xmlns" {
+            return true;
+        }
+        let Some(prefix_id) = self.doc.names.get(prefix) else {
+            return false;
+        };
+        let mut ns_ref = self.current_namespace;
+        while !ns_ref.is_null() {
+            let ns = self.doc.namespace_pages.get(ns_ref);
+            if ns.prefix == prefix_id {
+                return true;
+            }
+            ns_ref = ns.next;
+        }
+        false
     }
 
     /// The value of the attribute node `attr_ref`.
@@ -531,8 +624,19 @@ impl<'a> BufferDocumentBuilder<'a> {
     }
 
     /// Closes the current element.
+    ///
+    /// This is where an element that is an id or has the is-idrefs property
+    /// by its annotation is filed (its typed value depends on its content,
+    /// complete only now) — see
+    /// [`set_node_binding`](Self::set_node_binding) — and where an element a
+    /// host marked with [`register_idrefs`](Self::register_idrefs) while it
+    /// was open is filed in the idrefs index.
     pub fn end_element(&mut self) -> Result<(), BufferDocumentError> {
         self.flush_text()?;
+        if let Some(state) = self.element_stack.last() {
+            let elem = state.node_ref;
+            self.file_element(elem);
+        }
 
         let _state = self
             .element_stack
@@ -595,6 +699,24 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// withdraws what the previous binding filed. An `xml:id` is an id by its
     /// name whatever its type, and is filed by [`attribute`](Self::attribute).
     ///
+    /// An *element* is an id by the same rule (XDM 1.0 §6.2.4: unless its
+    /// content is element-only, "if the typed-value of the element consists of
+    /// exactly one atomic value and that value is of type xs:ID, or a type
+    /// derived from xs:ID, the is-id property is true") — a simple type or a
+    /// complex type with simple content; a nilled element has no typed value.
+    /// Its typed value depends on its content, so it is filed when the element
+    /// ends ([`end_element`](Self::end_element)), or at once when a closed
+    /// element is bound. `fn:id` then selects the element itself (F&O 1.0
+    /// §15.5.2).
+    ///
+    /// The is-idrefs property (XDM 1.0 §6.2.4, §6.3.4: "if any of the atomic
+    /// values in the typed-value … is of type xs:IDREF or xs:IDREFS, or a type
+    /// derived from one of those types") is set here for an attribute and at
+    /// the end for an element, from the same typed value, and its string
+    /// value's tokens are filed for `fn:idref` (F&O 1.0 §15.5.3); see
+    /// [`register_idrefs`](Self::register_idrefs) for a node that keeps the
+    /// property without an annotation.
+    ///
     /// Returns [`BufferDocumentError::Overflow`] if the binding table is full.
     pub fn set_node_binding(
         &mut self,
@@ -608,6 +730,11 @@ impl<'a> BufferDocumentBuilder<'a> {
         let previous = node.binding_index();
         if kind == NodeType::Attribute && previous != 0 {
             self.withdraw_typed_id(node_ref, previous);
+            self.withdraw_idrefs(node_ref);
+        }
+        let closed_element = kind == NodeType::Element && !self.is_open(node_ref);
+        if closed_element {
+            self.withdraw_element(node_ref, previous);
         }
         if matches!(kind, NodeType::Element | NodeType::Attribute) && previous == 0 {
             self.annotated_nodes += 1;
@@ -623,6 +750,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         });
         if kind == NodeType::Attribute {
             self.file_typed_id(node_ref, idx);
+            self.file_typed_idrefs(node_ref, idx);
+        }
+        if closed_element {
+            self.file_element(node_ref);
         }
         Ok(is_complex)
     }
@@ -642,6 +773,10 @@ impl<'a> BufferDocumentBuilder<'a> {
         let kind = node.node_type();
         if kind == NodeType::Attribute {
             self.withdraw_typed_id(node_ref, previous);
+            self.withdraw_idrefs(node_ref);
+        }
+        if kind == NodeType::Element && !self.is_open(node_ref) {
+            self.withdraw_element(node_ref, previous);
         }
         if matches!(kind, NodeType::Element | NodeType::Attribute) {
             self.annotated_nodes -= 1;
@@ -663,9 +798,10 @@ impl<'a> BufferDocumentBuilder<'a> {
     /// Registers an id value for the given element.
     ///
     /// [`attribute`](Self::attribute) already does this for an `xml:id`, and
-    /// [`set_node_binding`](Self::set_node_binding) for an attribute whose
-    /// typed value is an `xs:ID`, so this is for an id that comes from
-    /// somewhere else. It is **not** restricted to `Full` documents: the scope
+    /// [`set_node_binding`](Self::set_node_binding) for an attribute or
+    /// element whose typed value is an `xs:ID`, so this is for an id that
+    /// comes from somewhere else — an untyped copy that keeps its source's
+    /// ids, for example. It is **not** restricted to `Full` documents: the scope
     /// of an id is one tree, and the index is keyed by tree, so a `Fragment`
     /// buffer holding several top-level trees is served correctly. A value
     /// registered here stays registered: no attribute stands behind it, so
@@ -726,6 +862,44 @@ impl<'a> BufferDocumentBuilder<'a> {
                 self.doc.id_elements.insert(key.into(), IdSlot::One(claim));
                 Ok(())
             }
+        }
+    }
+
+    /// Gives the element or attribute node `node_ref` the is-idrefs property
+    /// (XDM 1.0 §5.6), so that `fn:idref` finds it by the tokens of its
+    /// string value (F&O 1.0 §15.5.3).
+    ///
+    /// A node whose annotation has an `xs:IDREF` / `xs:IDREFS` typed value
+    /// gets the property from its binding
+    /// ([`set_node_binding`](Self::set_node_binding)); this is for a node that
+    /// keeps it without one — an untyped copy of such a node, as
+    /// [`register_xml_id`](Self::register_xml_id) is for an id. An attribute is
+    /// filed under its value as it stands (refiled when the builder replaces
+    /// the value); an element when it ends, or at once if it has ended
+    /// already. A node of another kind is ignored, and marking a node twice
+    /// changes nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `node_ref` is not a node of the document being built.
+    pub fn register_idrefs(&mut self, node_ref: u32) {
+        assert!(
+            self.doc.has_node(node_ref),
+            "register_idrefs: {node_ref} is not a node of this document"
+        );
+        let node = self.doc.nodes.get(node_ref);
+        if node.has_flag(Node::IS_IDREFS) {
+            return;
+        }
+        match node.node_type() {
+            NodeType::Attribute => self.mark_and_file_idrefs(node_ref),
+            NodeType::Element if self.is_open(node_ref) => {
+                self.doc
+                    .nodes
+                    .update(node_ref, |n| n.set_flag(Node::IS_IDREFS));
+            }
+            NodeType::Element => self.mark_and_file_idrefs(node_ref),
+            _ => {}
         }
     }
 
@@ -940,6 +1114,7 @@ impl<'a> BufferDocumentBuilder<'a> {
         );
         let binding = self.doc.nodes.get(attr_ref).binding_index();
         let is_xml_id = self.is_xml_id_attribute(attr_ref);
+        let was_idrefs = self.withdraw_idrefs(attr_ref);
         if is_xml_id {
             let doc = &mut self.doc;
             let old = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
@@ -966,6 +1141,11 @@ impl<'a> BufferDocumentBuilder<'a> {
             }
         } else if binding != 0 {
             self.file_typed_id(attr_ref, binding);
+        }
+        if binding != 0 {
+            self.file_typed_idrefs(attr_ref, binding);
+        } else if was_idrefs {
+            self.mark_and_file_idrefs(attr_ref);
         }
     }
 
@@ -1058,7 +1238,9 @@ impl<'a> BufferDocumentBuilder<'a> {
         };
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
-        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+        let scope = InScope::at(doc, attr_ref);
+        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        if let Some(key) = key {
             file_id_claim(&mut doc.id_elements, &key, claim);
         }
     }
@@ -1074,9 +1256,213 @@ impl<'a> BufferDocumentBuilder<'a> {
         };
         let doc = &mut self.doc;
         let value = doc.strings.get(doc.nodes.get(attr_ref + 1).value);
-        if let Some(key) = typed_id_key(class, value, type_key, schema_set) {
+        let scope = InScope::at(doc, attr_ref);
+        let key = typed_id_key(class, value, type_key, schema_set, &scope);
+        if let Some(key) = key {
             withdraw_id_claim(&mut doc.id_elements, &key, attr_ref);
         }
+    }
+
+    // ── The is-id rule for annotated elements; is-idrefs ──────────────
+
+    /// Whether `elem` is an element still open (being built).
+    fn is_open(&self, elem: u32) -> bool {
+        self.element_stack.iter().rev().any(|s| s.node_ref == elem)
+    }
+
+    /// The string value of the element `elem` as it stands — its text
+    /// descendants, concatenated — and whether it has element children.
+    fn element_content(&self, elem: u32) -> (Cow<'_, str>, bool) {
+        let end = self.doc.subtree_end(elem);
+        let mut text: Option<Cow<'_, str>> = None;
+        let mut has_elements = false;
+        for i in elem + 1..end {
+            let node = self.doc.nodes.get(i);
+            match node.node_type() {
+                NodeType::Text | NodeType::Whitespace | NodeType::SignificantWhitespace => {
+                    let s = self.doc.strings.get(node.value);
+                    text = Some(match text {
+                        None => Cow::Borrowed(s),
+                        Some(t) => Cow::Owned(t.into_owned() + s),
+                    });
+                }
+                NodeType::Element => has_elements = true,
+                _ => {}
+            }
+        }
+        (text.unwrap_or(Cow::Borrowed("")), has_elements)
+    }
+
+    /// The value the typed value of the bound element `elem` is computed
+    /// from, exactly as `BufferDocNavigator::typed_value` takes it: its string
+    /// value, or its declaration's default when it is empty and has no element
+    /// children. `None` for a nilled element (no typed value) or a binding
+    /// that is gone.
+    fn element_typed_lexical(
+        &self,
+        elem: u32,
+        binding_idx: u32,
+    ) -> Option<(String, NodeSchemaBinding, &'a SchemaSet)> {
+        if self.doc.nodes.get(elem).has_flag(Node::IS_NIL) {
+            return None;
+        }
+        let binding = *self.doc.binding_remap.get(binding_idx)?;
+        let schema_set = self.doc.schema_set?;
+        let (value, has_elements) = self.element_content(elem);
+        let value =
+            super::navigator::element_value_or_default(value, has_elements, &binding, schema_set);
+        Some((value.into_owned(), binding, schema_set))
+    }
+
+    /// The id index key the element `elem`, bound at `binding_idx`, answers
+    /// to — XDM 1.0 §6.2.4: "If the element has a complex type with
+    /// element-only content, the is-id property is false. Otherwise, if the
+    /// typed-value of the element consists of exactly one atomic value and
+    /// that value is of type xs:ID, or a type derived from xs:ID, the is-id
+    /// property is true".
+    fn element_id_key(&mut self, elem: u32, binding_idx: u32) -> Option<String> {
+        let class = self.id_class(binding_idx);
+        if class == IdClass::Never {
+            return None;
+        }
+        let (value, binding, schema_set) = self.element_typed_lexical(elem, binding_idx)?;
+        let scope = InScope::at(&self.doc, elem);
+        typed_id_key(class, &value, binding.type_key, schema_set, &scope).map(Cow::into_owned)
+    }
+
+    /// Files the element `elem` as it stands: in the id index when its typed
+    /// value is a single `xs:ID`, and in the idrefs index when it has the
+    /// is-idrefs property — by its annotation, or because a host marked it.
+    /// Called when the element ends, and when a closed element is bound
+    /// again.
+    fn file_element(&mut self, elem: u32) {
+        let node = self.doc.nodes.get(elem);
+        let binding_idx = node.binding_index();
+        let marked = node.has_flag(Node::IS_IDREFS);
+        if binding_idx == 0 && !marked {
+            return;
+        }
+        if binding_idx != 0 {
+            if let Some(key) = self.element_id_key(elem, binding_idx) {
+                let claim = IdClaim {
+                    tree: self.tree_of(elem),
+                    elem,
+                    attr: elem,
+                };
+                file_id_claim(&mut self.doc.id_elements, &key, claim);
+            }
+        }
+        let idrefs = marked
+            || (self.idrefs_class(binding_idx) == IdrefsClass::ByValue
+                && self.element_typed_lexical(elem, binding_idx).is_some_and(
+                    |(value, binding, schema_set)| {
+                        let scope = InScope::at(&self.doc, elem);
+                        typed_is_idrefs(&value, binding.type_key, schema_set, &scope)
+                    },
+                ));
+        if idrefs {
+            self.doc.nodes.update(elem, |n| n.set_flag(Node::IS_IDREFS));
+            let (value, _) = self.element_content(elem);
+            let value = value.into_owned();
+            file_idrefs(&mut self.doc.idrefs, elem, &value);
+        }
+    }
+
+    /// Withdraws what [`file_element`](Self::file_element) filed for the
+    /// closed element `elem` while it was bound at `binding_idx`. Called
+    /// before its binding changes. An unbound element filed nothing by an
+    /// annotation (its is-idrefs flag, if any, a host's mark, stays).
+    fn withdraw_element(&mut self, elem: u32, binding_idx: u32) {
+        if binding_idx == 0 {
+            return;
+        }
+        if let Some(key) = self.element_id_key(elem, binding_idx) {
+            withdraw_id_claim(&mut self.doc.id_elements, &key, elem);
+        }
+        self.withdraw_idrefs(elem);
+    }
+
+    /// The is-idrefs class of the binding at `binding_idx`, computed once per
+    /// binding and remembered.
+    fn idrefs_class(&mut self, binding_idx: u32) -> IdrefsClass {
+        if binding_idx == 0 {
+            return IdrefsClass::Never;
+        }
+        let slot = binding_idx as usize;
+        if let Some(&class) = self.idrefs_classes.get(slot) {
+            if class != IdrefsClass::Unknown {
+                return class;
+            }
+        }
+        let class = match (self.doc.schema_set, self.doc.binding_remap.get(binding_idx)) {
+            (Some(schema_set), Some(binding)) => IdrefsClass::of(binding, schema_set),
+            _ => IdrefsClass::Never,
+        };
+        if self.idrefs_classes.len() <= slot {
+            self.idrefs_classes.resize(slot + 1, IdrefsClass::Unknown);
+        }
+        self.idrefs_classes[slot] = class;
+        class
+    }
+
+    /// Files the attribute `attr_ref`, bound at `binding_idx`, in the idrefs
+    /// index when its typed value makes it is-idrefs — XDM 1.0 §6.3.4: "If any
+    /// of the atomic values in the typed-value of the attribute is of type
+    /// xs:IDREF or xs:IDREFS, or a type derived from one of those types, the
+    /// is-idrefs property is true". The typed value is the one
+    /// `BufferDocNavigator::typed_value` computes.
+    fn file_typed_idrefs(&mut self, attr_ref: u32, binding_idx: u32) {
+        if self.idrefs_class(binding_idx) == IdrefsClass::Never || self.id_owner(attr_ref).is_none()
+        {
+            return;
+        }
+        let (Some(schema_set), Some(binding)) = (
+            self.doc.schema_set,
+            self.doc.binding_remap.get(binding_idx).copied(),
+        ) else {
+            return;
+        };
+        let value = self.attribute_value(attr_ref);
+        let scope = InScope::at(&self.doc, attr_ref);
+        if typed_is_idrefs(value, binding.type_key, schema_set, &scope) {
+            self.mark_and_file_idrefs(attr_ref);
+        }
+    }
+
+    /// Gives `node` the is-idrefs flag and files the tokens of its string
+    /// value as it stands.
+    fn mark_and_file_idrefs(&mut self, node: u32) {
+        self.doc.nodes.update(node, |n| n.set_flag(Node::IS_IDREFS));
+        let value = match self.doc.nodes.get(node).node_type() {
+            NodeType::Attribute => self.attribute_value(node).to_string(),
+            _ => self.element_content(node).0.into_owned(),
+        };
+        file_idrefs(&mut self.doc.idrefs, node, &value);
+    }
+
+    /// Takes the is-idrefs flag of `node` away again and withdraws the
+    /// entries it made, recomputed from its string value as it stands (it is
+    /// called before that changes). Answers whether the node had the flag.
+    fn withdraw_idrefs(&mut self, node: u32) -> bool {
+        if !self.doc.nodes.get(node).has_flag(Node::IS_IDREFS) {
+            return false;
+        }
+        let value = match self.doc.nodes.get(node).node_type() {
+            NodeType::Attribute => self.attribute_value(node).to_string(),
+            _ => self.element_content(node).0.into_owned(),
+        };
+        for token in idref_tokens(&value) {
+            if let Some(nodes) = self.doc.idrefs.get_mut(token) {
+                nodes.retain(|&n| n != node);
+                if nodes.is_empty() {
+                    self.doc.idrefs.remove(token);
+                }
+            }
+        }
+        self.doc
+            .nodes
+            .update(node, |n| n.clear_flag(Node::IS_IDREFS));
+        true
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -1511,15 +1897,21 @@ fn typed_id_key<'v>(
     value: &'v str,
     type_key: TypeKey,
     schema_set: &SchemaSet,
+    scope: &InScope<'_, '_>,
 ) -> Option<Cow<'v, str>> {
     match class {
         IdClass::Never | IdClass::Unknown => None,
         IdClass::PlainId => id_index_key(value),
         IdClass::ByValue => {
-            let typed =
-                crate::validation::simple::validate_simple_type(value, type_key, schema_set)
-                    .ok()?
-                    .typed_value;
+            let resolver = |prefix: Option<&str>| scope.binding(prefix);
+            let typed = crate::validation::simple::validate_simple_type_in(
+                value,
+                type_key,
+                schema_set,
+                Some(&resolver),
+            )
+            .ok()?
+            .typed_value;
             let id = single_id(&typed)?;
             id_index_key(id).map(|key| Cow::Owned(key.into_owned()))
         }
@@ -1544,6 +1936,191 @@ fn single_id(value: &XmlValue) -> Option<&str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Whether the values of an annotation can have the is-idrefs property — the
+/// one test most annotations need, kept per binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IdrefsClass {
+    /// Not classified yet.
+    Unknown,
+    /// No value of this type holds an `xs:IDREF`: none is reachable through
+    /// its derivation, its list item type or its union member types.
+    Never,
+    /// It depends on the value (and on its validity): the typed value is
+    /// computed.
+    ByValue,
+}
+
+impl IdrefsClass {
+    fn of(binding: &NodeSchemaBinding, schema_set: &SchemaSet) -> Self {
+        let builtins = schema_set.builtin_types();
+        let targets = [
+            builtins.get_by_type_code(XmlTypeCode::IdRef),
+            builtins.get_by_type_code(XmlTypeCode::IdRefs),
+        ];
+        let reaches = match binding.type_key {
+            TypeKey::Simple(sk) => Self::reaches(sk, &targets, schema_set, 0),
+            // The navigator gives a complex annotation a typed value only for
+            // text-only content.
+            TypeKey::Complex(_) => binding.content_type == Some(ContentType::TextOnly),
+        };
+        if reaches {
+            IdrefsClass::ByValue
+        } else {
+            IdrefsClass::Never
+        }
+    }
+
+    fn reaches(
+        sk: SimpleTypeKey,
+        targets: &[Option<SimpleTypeKey>; 2],
+        schema_set: &SchemaSet,
+        depth: u32,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if targets
+            .iter()
+            .flatten()
+            .any(|&target| schema_set.derives_from(sk, target))
+        {
+            return true;
+        }
+        let Some(data) = schema_set.arenas.simple_types.get(sk) else {
+            return false;
+        };
+        let reaches = |member: &TypeKey| match member {
+            TypeKey::Simple(member) => Self::reaches(*member, targets, schema_set, depth + 1),
+            TypeKey::Complex(_) => false,
+        };
+        match data.variety {
+            SimpleTypeVariety::List => data.resolved_item_type.as_ref().is_some_and(reaches),
+            SimpleTypeVariety::Union => data.resolved_member_types.iter().any(reaches),
+            SimpleTypeVariety::Atomic => false,
+        }
+    }
+}
+
+/// Whether the typed value of `value` under `type_key` holds an atomic value
+/// of type `xs:IDREF` or a type derived from it (the members of an
+/// `xs:IDREFS` value are) — the same `validate_simple_type` call
+/// [`typed_id_key`] makes, so that a value the type rejects has none.
+fn typed_is_idrefs(
+    value: &str,
+    type_key: TypeKey,
+    schema_set: &SchemaSet,
+    scope: &InScope<'_, '_>,
+) -> bool {
+    fn holds(value: &XmlValue) -> bool {
+        match &value.value {
+            XmlValueKind::Atomic(_) => value.type_code == XmlTypeCode::IdRef,
+            XmlValueKind::Union(member) => holds(member),
+            XmlValueKind::List { items, .. } => items.iter().any(holds),
+            XmlValueKind::UntypedAtomic(_) => false,
+        }
+    }
+    let resolver = |prefix: Option<&str>| scope.binding(prefix);
+    crate::validation::simple::validate_simple_type_in(value, type_key, schema_set, Some(&resolver))
+        .is_ok_and(|result| holds(&result.typed_value))
+}
+
+/// The namespace bindings in scope at a node of the document being built, as
+/// simple-type validation asks them (`validation::simple::PrefixResolver`):
+/// the answers `BufferDocNavigator` gives for the same node, so that the id
+/// and idrefs indexes classify a value by the union member its typed value
+/// has. Datatypes §3.3.18: the lexical mapping of a QName "depends on the
+/// namespace bindings in scope where the literal occurs" — read without them,
+/// a QName member whose facets need the expanded name (an `enumeration` of
+/// QNames) can fail where validation accepted it, and a later `xs:ID` /
+/// `xs:IDREF` member win.
+struct InScope<'d, 'a> {
+    names: &'a NameTable,
+    pages: &'d super::NamespacePageFactory<'a>,
+    /// The chain of the nearest element at or above the node that declares
+    /// namespaces.
+    head: NsRef,
+}
+
+impl<'d, 'a> InScope<'d, 'a> {
+    /// The bindings in scope at `node` (an attribute's are its element's).
+    fn at(doc: &'d BufferDocument<'a>, node: u32) -> Self {
+        let mut head = NsRef::NULL;
+        let mut cursor = node;
+        while cursor != NULL {
+            let n = doc.nodes.get(cursor);
+            if n.node_type() == NodeType::Element && n.has_flag(Node::HAS_NMSP_DECLS) {
+                if let Some(&found) = doc.element_namespaces.get(&cursor) {
+                    head = found;
+                    break;
+                }
+            }
+            cursor = n.parent;
+        }
+        Self {
+            names: doc.names,
+            pages: &doc.namespace_pages,
+            head,
+        }
+    }
+
+    /// For a prefix, the namespace it is bound to (`None` when it is bound
+    /// nowhere); for no prefix, the default namespace (`Some(None)` without
+    /// one). The `xml` prefix is always bound.
+    fn binding(&self, prefix: Option<&str>) -> Option<Option<NameId>> {
+        let target = prefix.unwrap_or("");
+        if target == "xml" {
+            return Some(Some(self.names.add(XML_NAMESPACE)));
+        }
+        let mut ns_ref = self.head;
+        while !ns_ref.is_null() {
+            let ns = self.pages.get(ns_ref);
+            if self.names.resolve_ref(ns.prefix) == target {
+                let bound = !self.names.resolve_ref(ns.namespace_uri).is_empty();
+                return if target.is_empty() {
+                    Some(bound.then_some(ns.namespace_uri))
+                } else {
+                    bound.then_some(Some(ns.namespace_uri))
+                };
+            }
+            ns_ref = ns.next;
+        }
+        target.is_empty().then_some(None)
+    }
+}
+
+/// The distinct tokens of `value` that are NCNames, the IDREF values an
+/// is-idrefs node answers to: F&O 1.0 §15.5.3 matches the candidate against
+/// "fn:tokenize(fn:normalize-space(fn:string($N)), ' ')", and "ill-formed
+/// IDREF values are ignored".
+fn idref_tokens(value: &str) -> Vec<&str> {
+    let mut tokens: Vec<&str> = Vec::new();
+    for token in value
+        .split([' ', '\t', '\n', '\r'])
+        .filter(|t| crate::namespace::is_ncname(t))
+    {
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+/// Files `node` under each of the IDREF tokens of `value`.
+fn file_idrefs(index: &mut HashMap<Box<str>, Vec<u32>>, node: u32, value: &str) {
+    for token in idref_tokens(value) {
+        match index.get_mut(token) {
+            Some(nodes) => {
+                if !nodes.contains(&node) {
+                    nodes.push(node);
+                }
+            }
+            None => {
+                index.insert(token.into(), vec![node]);
+            }
+        }
     }
 }
 

@@ -678,6 +678,19 @@ fn register_all_functions(registry: &mut FunctionRegistry) {
             SequenceType::star(crate::types::sequence::ItemType::AnyNode),
         ),
     ));
+    // fn:idref($arg as xs:string*) / fn:idref($arg as xs:string*, $node as
+    // node()) as node()* (F&O 1.0 §15.5.3).
+    registry.register(FunctionEntry::new(
+        FunctionId::Idref,
+        FunctionSignature::range(
+            FN_NAMESPACE,
+            "idref",
+            1,
+            2,
+            vec![string_star(), node()],
+            SequenceType::star(crate::types::sequence::ItemType::AnyNode),
+        ),
+    ));
     // fn:collection() / fn:collection($arg) — without an external default
     // collection or a registered URI, both forms return the empty sequence
     // (XPath 2.0 functions §15.5.6). This minimal stub is sufficient for

@@ -314,7 +314,11 @@ pub struct SchemaInfo {
     pub validity: SchemaValidity,
     /// How much validation was attempted (PSVI `[validation attempted]`)
     pub validation_attempted: ValidationAttempted,
-    /// Whether the value was supplied by a default declaration
+    /// Whether the value was supplied by the declaration's value constraint
+    /// — an element with no element or character \[children\] that took its
+    /// `default` or `fixed` value (clause 5.1 of Element Locally Valid
+    /// (Element), Structures §3.3.4.3; PSVI \[schema specified\] "schema",
+    /// §3.3.5.5)
     pub is_default: bool,
     /// Whether the element was declared nil via xsi:nil="true"
     pub is_nil: bool,
@@ -485,6 +489,16 @@ pub struct DefaultAttribute {
     /// The ·effective value constraint·'s lexical form: the use's `default` /
     /// `fixed` value, otherwise the declaration's
     pub value: String,
+    /// The ·effective value constraint·'s {value} — the defaulted attribute's
+    /// \[schema actual value\] (Structures §3.4.5.1) — read with the namespace
+    /// bindings of the schema element the value is written on (Datatypes
+    /// §3.3.18), so that an `xs:QName` / `xs:NOTATION` value has the schema's
+    /// expanded name, whatever the instance binds its prefix to. Present when
+    /// the run retains PSVI typed values
+    /// ([`ValidationFlags::BUILD_PSVI_TYPED_VALUES`]), and always for a type
+    /// whose values can be or hold QNames or NOTATIONs; `None` otherwise, or
+    /// when the value is not valid for the type.
+    pub typed_value: Option<XmlValue>,
 }
 
 /// An inherited attribute from an ancestor element (XSD 1.1 §3.3.5.6).

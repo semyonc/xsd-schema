@@ -280,6 +280,18 @@ pub trait DomNavigator: Clone {
     /// nodes, nilled elements, and element-only complex content.
     fn typed_value(&self) -> TypedValue;
 
+    /// The XDM is-idrefs property of the current node (XDM 1.0 §5.6):
+    /// whether it is an element or attribute whose typed value holds an
+    /// `xs:IDREF` / `xs:IDREFS` (or derived) atomic value (§6.2.4, §6.3.4).
+    ///
+    /// The default implementation returns `false`, which is correct for any
+    /// schema-unaware backend: a node constructed from an infoset without DTD
+    /// attribute types is never is-idrefs. Schema-aware navigators override
+    /// it, together with [`find_nodes_by_idref`](Self::find_nodes_by_idref).
+    fn is_idrefs(&self) -> bool {
+        false
+    }
+
     // ----- Default helper methods -----
 
     /// Check if the current element has attributes
@@ -346,6 +358,20 @@ pub trait DomNavigator: Clone {
     fn find_element_by_id(&self, id: &str) -> Result<Option<Self>, NavigatorError> {
         let _ = id;
         Ok(None)
+    }
+
+    /// The element and attribute nodes of this node's tree with the
+    /// is-idrefs property whose string value has `id` among its
+    /// whitespace-separated tokens — the nodes `fn:idref` returns for the
+    /// candidate `id` (F&O 1.0 §15.5.3), in document order. `id` is an
+    /// NCName; the function filters its candidates before asking.
+    ///
+    /// The default implementation returns no node, which is correct for a
+    /// backend whose nodes are never is-idrefs (see
+    /// [`is_idrefs`](Self::is_idrefs)).
+    fn find_nodes_by_idref(&self, id: &str) -> Result<Vec<Self>, NavigatorError> {
+        let _ = id;
+        Ok(Vec::new())
     }
 }
 

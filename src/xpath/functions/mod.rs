@@ -180,6 +180,8 @@ pub enum FunctionId {
     Id,
     /// fn:collection($arg as xs:string?) as node()*
     Collection,
+    /// fn:idref($arg as xs:string*, $node as node()) as node()*
+    Idref,
 
     // ========== DateTime Functions ==========
     /// fn:dateTime($arg1, $arg2)
@@ -833,6 +835,7 @@ pub fn eval_function<N: DomNavigator>(
         FunctionId::Lang => node::lang(context, args),
         FunctionId::Root => node::root(context, args),
         FunctionId::Id => node::id(context, args),
+        FunctionId::Idref => node::idref(context, args),
         FunctionId::Collection => {
             // fn:collection($arg?) — without a registered default collection
             // or URI handler, both forms return the empty sequence per

@@ -115,6 +115,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stipulates for the validation root. A `match` on `TypeSource` needs a
   wildcard arm.
 
+- `EndOfAttributesView` is `#[non_exhaustive]` and has a new field,
+  `default_attributes`: the attributes the element's attribute uses default.
+  It can no longer be built with a struct literal outside the crate.
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -209,6 +213,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cvc-elt.1`, `[validity]` notKnown). Every driver that takes the caller's
   runtime honours it, the typed build included.
 
+- `fn:idref` (F&O 1.0 §15.5.3), in its one- and two-argument forms: the
+  elements and attributes with the is-idrefs property whose string value has
+  one of the given IDs as a token, in document order. It is empty for a tree
+  without type annotations.
+- The is-idrefs property: `DomNavigator::is_idrefs` and
+  `DomNavigator::find_nodes_by_idref` (defaults: `false`, none). A typed
+  document sets it on an element or attribute whose typed value holds an
+  `xs:IDREF` value; `BufferDocumentBuilder::register_idrefs` sets it on a node
+  without an annotation.
+- `TypedBuildOptions::defaults_as_nodes` and
+  `TypedBuilderHandler::with_defaults_as_nodes` (default `true`).
+- `ValidationRuntime::take_default_attributes` and
+  `EndOfAttributesView::default_attributes`: the defaulted attributes of the
+  element, found by the end-of-attributes step.
+- `DefaultAttribute::typed_value`: the value constraint's {value}, read with
+  the namespace bindings of the schema element it is written on. It is present
+  when the run keeps PSVI typed values, and always for a type whose values can
+  be or hold QNames or NOTATIONs.
+
 ### Changed
 
 - The regular-expression engine of the `xsd11` feature is now `regexml-fork`
@@ -280,10 +303,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that wildcard's {process contents} (Structures §3.4.2.5; it took the weaker
   of the two), so some attributes the combined wildcard admitted laxly or
   skipped before are validated strictly now.
-- An empty element that takes a QName `default` (or `fixed`) value reads its
-  prefix with the element's own namespace bindings (Structures §3.3.4.3 clause
-  5.1.2): under a QName enumeration it is invalid when the instance binds that
-  prefix elsewhere, and its typed value names the instance's namespace.
+- A `default` or `fixed` value of type `xs:QName` or `xs:NOTATION` (also in a
+  list, or as a union's member) is read with the namespace bindings of the
+  schema element it is written on (Datatypes §3.3.18). An empty element that
+  takes such a value is validated and typed with it, also where the instance
+  binds the prefix elsewhere or not at all, and a defaulted attribute's value
+  joins identity constraints as that value.
+- A typed document (`build_typed_document`, `build_typed_document_with`,
+  `TypedBuilderHandler`) is the XDM instance of the PSVI in two more ways
+  (XDM 1.0 §6.2.4, §6.7.4):
+  - each defaulted attribute is an attribute node, and a valid empty element
+    that takes its `default` / `fixed` value has a text node with it. A QName
+    in such a value is written with a prefix the instance binds to its
+    namespace; a prefix is declared on the element when none is (a QName in
+    no namespace where a default namespace is in scope keeps its lexical
+    form). `with_defaults_as_nodes(false)` restores the old behaviour for
+    defaults;
+  - a text node that is all white space is not built in element-only
+    content.
 - In a typed document (`build_typed_document`, `build_typed_document_with`), a
   valid attribute and a valid element of a simple type or with simple content
   have their [schema normalized value] as their string value (XDM 1.0 §6.2.4,
@@ -499,6 +536,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   group wins over its declaration's (`get_default_attributes`, identity
   constraints, ID/IDREF, inherited attributes), as it already did for a
   reference in a complex type.
+
+- The typed value of a union-typed element or attribute is, for XPath, the
+  value of the member type that validated it (XDM 1.0 §3.3.1.2):
+  `data($n) instance of my:member` is true for a user-defined member type.
+- `fn:id` and the id index find an element whose typed value is a single
+  `xs:ID` (a simple type or simple content), in typed documents, annotated
+  copies and trees a host binds itself (XDM 1.0 §6.2.4, F&O 1.0 §15.5.2).
+- In a typed document, whether a union-typed element or attribute is an ID or
+  has the is-idrefs property is decided by the member type its value has with
+  the node's in-scope namespaces, as `fn:data` gives it: a value of a QName
+  member is no longer filed as an `xs:ID` or `xs:IDREF`.
+- `SchemaInfo::is_default` is set when an empty element takes its `fixed`
+  value, as for a `default`.
 
 ### Performance
 

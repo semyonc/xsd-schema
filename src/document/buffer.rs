@@ -89,7 +89,8 @@ pub(crate) fn id_index_key(value: &str) -> Option<Cow<'_, str>> {
 /// `attr` is the attribute node that makes `elem` answer to the value — an
 /// `xml:id`, or an attribute whose typed value is an `xs:ID` — so that the
 /// claim can be withdrawn when that attribute's value or annotation is
-/// replaced. It is [`NULL`] for a value filed by
+/// replaced; it is `elem` itself when the element's own typed value is the
+/// `xs:ID`. It is [`NULL`] for a value filed by
 /// [`BufferDocumentBuilder::register_xml_id`](super::BufferDocumentBuilder::register_xml_id),
 /// which no attribute stands behind and which is never withdrawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,11 +272,17 @@ pub struct BufferDocument<'a> {
     pub(crate) element_index: ElementIndex,
     pub(crate) source_spans: NodeSourceSpans,
     /// The id index: every element that answers to an id value — through an
-    /// `xml:id`, an attribute whose typed value is an `xs:ID`, or
-    /// `register_xml_id` — keyed by the normalized value; see
+    /// `xml:id`, an attribute whose typed value is an `xs:ID`, its own typed
+    /// value, or `register_xml_id` — keyed by the normalized value; see
     /// [`id_index_key`] for the key and [`IdSlot`] for the claims and the tree
     /// scope.
     pub(crate) id_elements: HashMap<Box<str>, IdSlot>,
+    /// The idrefs index: for each IDREF value, the element and attribute
+    /// nodes with the is-idrefs property ([`Node::IS_IDREFS`]) whose string
+    /// value has it as a token (F&O 1.0 §15.5.3) — each node once per value,
+    /// in filing order (see
+    /// [`nodes_by_idref`](Self::nodes_by_idref)).
+    pub(crate) idrefs: HashMap<Box<str>, Vec<u32>>,
     pub(crate) schema_set: Option<&'a SchemaSet>,
     /// Document-level base URI surfaced by `BufferDocNavigator::base_uri()`
     /// when no `xml:base` is found and the cursor reaches the document root.
@@ -574,8 +581,9 @@ impl<'a> BufferDocument<'a> {
         node_ref < self.nodes.len()
     }
 
-    /// Looks up an element node by its id: the value of its `xml:id`, or of an
-    /// attribute whose typed value is a single `xs:ID`.
+    /// Looks up an element node by its id: the value of its `xml:id`, of an
+    /// attribute whose typed value is a single `xs:ID`, or its own typed value
+    /// when that is a single `xs:ID`.
     ///
     /// The value is normalized the same way the index key is: XML whitespace
     /// is stripped at both ends and collapsed inside, and a value that is not
@@ -658,6 +666,27 @@ impl<'a> BufferDocument<'a> {
         let key = id_index_key(id)?;
         let slot = self.id_elements.get(key.as_ref())?;
         slot.in_range(root, self.subtree_end(root))
+    }
+
+    /// The element and attribute nodes with the is-idrefs property whose
+    /// string value has `id` as a token (F&O 1.0 §15.5.3), in document order,
+    /// inside the range `[start, end)` of node references, or in the whole
+    /// buffer when `range` is `None`. `id` is looked up as given: the caller
+    /// passes an NCName.
+    pub(crate) fn nodes_by_idref(&self, id: &str, range: Option<(u32, u32)>) -> Vec<u32> {
+        let Some(nodes) = self.idrefs.get(id) else {
+            return Vec::new();
+        };
+        let mut found: Vec<u32> = match range {
+            Some((start, end)) => nodes
+                .iter()
+                .copied()
+                .filter(|&n| n >= start && n < end)
+                .collect(),
+            None => nodes.clone(),
+        };
+        found.sort_unstable();
+        found
     }
 
     // ── CTA fragment configuration ─────────────────────────────────────
@@ -744,6 +773,7 @@ mod tests {
             element_index: ElementIndex::new(),
             source_spans: NodeSourceSpans::new(),
             id_elements: HashMap::new(),
+            idrefs: HashMap::new(),
             schema_set: None,
             fragment_base_uri: None,
             xml_declaration: None,

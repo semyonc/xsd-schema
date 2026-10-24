@@ -137,8 +137,17 @@ pub struct AttributeView<'a> {
 }
 
 /// Payload for [`ValidationEventHandler::after_end_of_attributes`].
+#[non_exhaustive]
 pub struct EndOfAttributesView<'a> {
     pub info: &'a SchemaInfo,
+    /// The defaulted attributes of the element (Structures §3.4.4.2) — the
+    /// optional attribute uses of its governing complex type with a `default`
+    /// or `fixed` value that the element does not carry, which §3.4.5.1 adds
+    /// to its \[attributes\] — with their value constraints' lexical forms as
+    /// the schema writes them
+    /// ([`ValidationRuntime::take_default_attributes`]). Empty for an element
+    /// without a complex type.
+    pub default_attributes: &'a [crate::validation::info::DefaultAttribute],
     /// Drained `take_deferred_attribute_results()` payload, in original
     /// attribute encounter order. Empty whenever no CTA reselection occurred.
     #[cfg(feature = "xsd11")]
@@ -801,8 +810,10 @@ where
     let eoa_info = runtime.validate_end_of_attributes();
     #[cfg(feature = "xsd11")]
     let deferred = runtime.take_deferred_attribute_results();
+    let defaults = runtime.take_default_attributes();
     let eoa_view = EndOfAttributesView {
         info: &eoa_info,
+        default_attributes: &defaults,
         #[cfg(feature = "xsd11")]
         deferred_attribute_results: &deferred,
     };

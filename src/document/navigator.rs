@@ -17,6 +17,7 @@ use crate::ids::{NameId, SimpleTypeKey, TypeKey};
 use crate::navigator::{
     DomNavigator, DomNodeType, NamespaceAxisScope, NavigatorError, TypedValue, XmlNodeOrder,
 };
+use crate::schema::SchemaSet;
 use crate::validation::info::ContentType;
 use crate::validation::simple::validate_simple_type_in;
 
@@ -152,6 +153,23 @@ impl<'a> BufferDocNavigator<'a> {
             assertion_fragment_root: node,
             orphan_root: node,
             ..Self::new(doc, node)
+        }
+    }
+
+    /// A navigator on the attribute node `attr_ref` (the attribute's index
+    /// among its element's attributes set, for document order).
+    fn at_attribute(doc: &'a BufferDocument<'a>, attr_ref: u32) -> Self {
+        let owner = doc.nodes.get(attr_ref).parent;
+        let mut index: u16 = 0;
+        let mut cursor = owner + 1;
+        while cursor != attr_ref && cursor != NULL {
+            cursor = doc.nodes.get(cursor).next_sibling;
+            index += 1;
+        }
+        Self {
+            virtual_parent: owner,
+            attr_index: index,
+            ..Self::new(doc, attr_ref)
         }
     }
 
@@ -668,6 +686,39 @@ impl<'a> BufferDocNavigator<'a> {
         }
 
         None
+    }
+}
+
+/// The lexical value an element bound with `binding` has its typed value
+/// computed from: its string value `value`, or — when that is empty and the
+/// element has no element children — its declaration's `default` / `fixed`
+/// value (clause 5.1 of Element Locally Valid (Element), Structures §3.3.4.3;
+/// the default first, as validation takes it). A typed build that makes
+/// defaults nodes has given such an element its default as text already; a
+/// tree built as read has not, and gets the same typed value. The builder's id
+/// and idrefs indexes compute an element's typed value from the same value.
+pub(crate) fn element_value_or_default<'v>(
+    value: Cow<'v, str>,
+    has_element_children: bool,
+    binding: &NodeSchemaBinding,
+    schema_set: &'v SchemaSet,
+) -> Cow<'v, str> {
+    if !value.is_empty() || has_element_children {
+        return value;
+    }
+    let Some(element) = binding
+        .element_decl
+        .and_then(|key| schema_set.arenas.elements.get(key))
+    else {
+        return value;
+    };
+    match element
+        .default_value
+        .as_deref()
+        .or(element.fixed_value.as_deref())
+    {
+        Some(default) => Cow::Borrowed(default),
+        None => value,
     }
 }
 
@@ -1200,30 +1251,9 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
         // Borrow the lexical value (single-text leaves borrow; only true mixed
         // content allocates) so simple-content elements cost no per-element copy.
         let value_str = self.value_ref();
-
-        // Default/fixed-aware value resolution (cvc-elt.5.2):
-        // Substitute element default or fixed only when there is no text
-        // content AND no child elements (matching runtime.rs semantics).
-        // XSD spec forbids both default and fixed on the same element,
-        // so at most one will be Some.  Priority matches runtime.rs.
-        let effective_value: Cow<'_, str> = if value_str.is_empty() && !self.has_element_children()
-        {
-            if let Some(elem_key) = binding.element_decl {
-                let elem_data = &schema_set.arenas.elements[elem_key];
-                if let Some(default_val) = &elem_data.default_value {
-                    Cow::Owned(default_val.clone())
-                } else if let Some(fixed_val) = &elem_data.fixed_value {
-                    // §3.3.4.3: fixed behaves as default when element is empty
-                    Cow::Owned(fixed_val.clone())
-                } else {
-                    value_str
-                }
-            } else {
-                value_str
-            }
-        } else {
-            value_str
-        };
+        let has_element_children = value_str.is_empty() && self.has_element_children();
+        let effective_value =
+            element_value_or_default(value_str, has_element_children, binding, schema_set);
 
         // QName / NOTATION values resolve their prefixes with the node's
         // in-scope namespaces (Datatypes §3.3.18), as the validation runtime
@@ -1239,6 +1269,55 @@ impl<'a> DomNavigator for BufferDocNavigator<'a> {
             Ok(r) => TypedValue::Value(self.resolve_qname_typed_value(r.typed_value)),
             Err(_) => TypedValue::Untyped,
         }
+    }
+
+    /// The is-idrefs property (XDM 1.0 §5.6): set on an element or attribute
+    /// whose typed value holds an `xs:IDREF` (or derived) atomic value, or that
+    /// a host marked (`BufferDocumentBuilder::register_idrefs`); `false` for
+    /// every other node, and for every node of a tree without annotations.
+    fn is_idrefs(&self) -> bool {
+        if self.is_on_namespace() {
+            return false;
+        }
+        matches!(
+            self.node().node_type(),
+            NodeType::Element | NodeType::Attribute
+        ) && self.node().has_flag(Node::IS_IDREFS)
+    }
+
+    /// The nodes with the is-idrefs property whose string value has `id` as a
+    /// token, in document order — scoped as
+    /// [`find_element_by_id`](DomNavigator::find_element_by_id) is: this
+    /// cursor's tree, or the subtree a parentless or asserted node roots.
+    fn find_nodes_by_idref(&self, id: &str) -> Result<Vec<Self>, NavigatorError> {
+        let scope_root = if self.orphan_root != NULL {
+            self.orphan_root
+        } else {
+            self.assertion_fragment_root
+        };
+        let range = if scope_root != NULL {
+            Some((scope_root, self.doc.subtree_end(scope_root)))
+        } else {
+            let tree = self.doc.tree_root_of(self.current);
+            (tree != super::buffer::DOCUMENT_NODE).then(|| (tree, self.doc.subtree_end(tree)))
+        };
+        Ok(self
+            .doc
+            .nodes_by_idref(id, range)
+            .into_iter()
+            .map(|r| {
+                let node = self.doc.nodes.get(r);
+                let mut nav = if node.node_type() == NodeType::Attribute {
+                    BufferDocNavigator::at_attribute(self.doc, r)
+                } else {
+                    BufferDocNavigator::new(self.doc, r)
+                };
+                nav.assertion_absolute_root = self.assertion_absolute_root;
+                nav.assertion_fragment_root = self.assertion_fragment_root;
+                nav.orphan_root = self.orphan_root;
+                nav
+            })
+            .collect())
     }
 
     /// The scope of an id is one tree: the search is anchored on this cursor's

@@ -114,7 +114,8 @@ impl NodeType {
 /// - Bits \[3:0\]   — [`NodeType`] discriminant (4 bits)
 /// - Bits \[7:4\]   — property flags (`HAS_ATTRIBUTE`, `HAS_CHILDREN`, `IS_COMPLEX_TYPE`, `HAS_NMSP_DECLS`)
 /// - Bit  \[8\]     — `IS_NIL` flag (xsi:nil="true")
-/// - Bits \[11:9\]  — reserved (must be 0)
+/// - Bit  \[9\]     — `IS_IDREFS` flag (the XDM is-idrefs property)
+/// - Bits \[11:10\] — reserved (must be 0)
 /// - Bits \[31:12\] — 20-bit binding index into `BindingRemapTable` (0 = unbound)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -145,6 +146,12 @@ impl Node {
     pub const HAS_NMSP_DECLS: u32 = 0x80;
     /// Element has xsi:nil="true".
     pub const IS_NIL: u32 = 0x100; // bit [8]
+    /// Element or attribute has the XDM is-idrefs property (XDM 1.0 §6.2.4,
+    /// §6.3.4): its typed value holds an `xs:IDREF` (or derived) atomic
+    /// value, or a host marked it so
+    /// ([`BufferDocumentBuilder::register_idrefs`](super::BufferDocumentBuilder::register_idrefs)).
+    /// Its string value's tokens are then in the document's idrefs index.
+    pub const IS_IDREFS: u32 = 0x200; // bit [9]
 
     // ── Accessors ──────────────────────────────────────────────────────
 
@@ -192,7 +199,7 @@ impl Node {
 
     /// Sets the 20-bit binding index in bits \[31:12\].
     ///
-    /// Preserves bits \[11:0\] (node type, flags, and IS_NIL).
+    /// Preserves bits \[11:0\] (node type, flags, IS_NIL and IS_IDREFS).
     ///
     /// # Panics (debug only)
     ///

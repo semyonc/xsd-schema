@@ -23,7 +23,8 @@ use crate::types::XmlTypeCode;
 /// Atomize a navigator node to its XDM atomic value.
 ///
 /// Interprets [`TypedValue`] with proper error handling:
-/// - `Value(v)` → `Ok(Some(v))`
+/// - `Value(v)` → `Ok(Some(v))`, a union's value as the value of its member
+///   type (below)
 /// - `Untyped` → `Ok(Some(untypedAtomic(string-value)))` (or `xs:string` for a
 ///   comment, processing instruction or namespace node — XPath 2.0 §I.2)
 /// - `Nilled` → `Ok(None)` (empty sequence)
@@ -38,9 +39,21 @@ use crate::types::XmlTypeCode;
 /// union that accepted that member (XDM 1.0 §3.3.1.2; XPath 2.0 §2.5.2: "The
 /// typed value of a node is never treated as an instance of a named list
 /// type").
+///
+/// The typed value of a node whose type is a union type comes back from the
+/// navigator as the union's value holding the value of the member type that
+/// validated it ([`XmlValueKind::Union`]); XPath sees the member's value
+/// itself, with the member type as its type annotation. XDM 1.0 §3.3.1.2: the
+/// typed value is M applied to the string value "as an instance of the
+/// appropriate value type, where the appropriate value type is the [member
+/// type definition] if T is a union type"; XPath 2.0 §2.5.2: "when the type
+/// annotation of a node is a union type, the typed value of the node will be
+/// an instance of one of the member types of the union". So `data($n)
+/// instance of my:member` holds for a user-defined member type, as it does
+/// for a built-in one.
 pub fn atomize_node<N: DomNavigator>(nav: &N) -> Result<Option<XmlValue>, XPathError> {
     match nav.typed_value() {
-        TypedValue::Value(v) => Ok(Some(v)),
+        TypedValue::Value(v) => Ok(Some(unwrap_union_owned(v))),
         TypedValue::Untyped => {
             let v = match nav.node_type() {
                 // XPath 2.0 §I.2 (Incompatibilities when Compatibility Mode is

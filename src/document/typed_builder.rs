@@ -15,6 +15,14 @@
 //!   [`drive_quick_xml_with`] themselves.
 //! * [`build_typed_document`] — the turn-key build: default flags, no
 //!   diagnostics ([`SilentValidationSink`]), no handler.
+//!
+//! The tree is the XDM instance of the PSVI (XDM 1.0 §3.3, §6): a valid node of
+//! a simple type or with simple content has its [schema normalized value] as
+//! its string value; defaulted attributes are attribute nodes and an empty
+//! element that takes its declaration's default has a text node with it
+//! ([`TypedBuilderHandler::with_defaults_as_nodes`]); white space in
+//! element-only content is no text node (§6.7.4). What a validation run
+//! reports about each node reaches the inner handler unchanged.
 
 use std::io::BufRead;
 
@@ -135,6 +143,28 @@ impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
 /// source-span tracking, and the content of simple-content elements, whose
 /// text becomes the [schema normalized value] once the element is known to be
 /// valid (XDM 1.0 §6.2.4; an attribute's value likewise, §6.3.4).
+///
+/// The tree differs from the events in two more ways, both XDM's
+/// construction from a PSVI:
+///
+/// * the defaulted attributes of each element
+///   ([`EndOfAttributesView::default_attributes`]) are added as attribute
+///   nodes, and a valid empty element that takes its declaration's `default` /
+///   `fixed` value gets a text node with it — see
+///   [`with_defaults_as_nodes`](Self::with_defaults_as_nodes), which can turn
+///   both off;
+/// * a text node of an element whose governing type has element-only content
+///   (or empty content, when the element is nilled) that is all XML white
+///   space is not built (XDM 1.0 §6.7.4: "if the resulting Text Node consists
+///   entirely of whitespace and … that parent is an element and its {content
+///   type} is not “mixed”, then the content of the Text Node is the
+///   zero-length string … an empty Text Node will be discarded"). The
+///   decision is made by the governing type when the text would become a node
+///   — a text node that is not all white space, which makes such content
+///   invalid, is kept as read with the white space in it; an element found
+///   invalid only later (a required child missing) has lost its white space
+///   already, consistently with the element-only annotation it keeps. The
+///   inner handler still sees every text event.
 pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     builder: &'b mut BufferDocumentBuilder<'a>,
     inner: H,
@@ -155,6 +185,8 @@ pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     /// Element-decl key for the currently open element (used so we can
     /// preserve `element_decl` when refreshing the binding after CTA).
     element_decl_stack: Vec<Option<crate::ids::ElementKey>>,
+    /// Per open element: whether it is nilled.
+    nilled_stack: Vec<bool>,
     /// Per open element: whether its content is a simple type's, and what is
     /// held back of it (see [`SimpleContent`]).
     simple_stack: Vec<SimpleContent>,
@@ -164,6 +196,9 @@ pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
         crate::ids::TypeKey,
         Option<crate::types::facets::WhitespaceMode>,
     )>,
+    /// Whether defaulted attributes and element defaults become nodes
+    /// ([`with_defaults_as_nodes`](Self::with_defaults_as_nodes)).
+    defaults_as_nodes: bool,
 }
 
 /// The content of an open element whose governing type is a simple type or a
@@ -179,31 +214,62 @@ enum SimpleContent {
     No,
     /// Nilled (`xsi:nil="true"`): no content to normalize.
     Nilled,
+    /// Element-only content (complex type, element-only content; or empty
+    /// content of a nilled element, which accepts white space too): a text
+    /// node that is all white space is no node (XDM 1.0 §6.7.4: "if the
+    /// resulting Text Node consists entirely of whitespace and … that parent
+    /// is an element and its {content type} is not “mixed”, then the content
+    /// of the Text Node is the zero-length string … an empty Text Node will be
+    /// discarded when its parent is constructed"). Decided when the text would
+    /// become a node, by the governing type: the element's validity is known
+    /// only at its end, after its children are built.
+    ElementOnly,
     /// Simple content of `type_key`. Until a comment or processing
     /// instruction comes, its text waits in the builder's pending text;
     /// after one, the content is held here, in order, until the element ends.
+    /// `saw_text`: a text event came (character \[children\], which keep an
+    /// empty element from taking its declaration's default, Structures
+    /// §3.3.4.3 clause 5.1).
     Yes {
         type_key: crate::ids::TypeKey,
         held: Option<Vec<HeldContent>>,
+        saw_text: bool,
     },
 }
 
 impl SimpleContent {
-    /// The slot of an element governed by `schema_type` with `content_type`.
+    /// The slot of an element governed by `schema_type` with `content_type`,
+    /// nilled or not.
     fn of(
         schema_type: Option<crate::ids::TypeKey>,
         content_type: Option<crate::validation::info::ContentType>,
+        nilled: bool,
     ) -> Self {
+        use crate::validation::info::ContentType;
         match (schema_type, content_type) {
-            (Some(type_key), Some(crate::validation::info::ContentType::TextOnly)) => {
-                SimpleContent::Yes {
-                    type_key,
-                    held: None,
-                }
+            (Some(crate::ids::TypeKey::Complex(_)), Some(ContentType::ElementOnly)) => {
+                SimpleContent::ElementOnly
             }
+            (Some(crate::ids::TypeKey::Complex(_)), Some(ContentType::Empty)) if nilled => {
+                SimpleContent::ElementOnly
+            }
+            _ if nilled => SimpleContent::Nilled,
+            (Some(type_key), Some(ContentType::TextOnly)) => SimpleContent::Yes {
+                type_key,
+                held: None,
+                saw_text: false,
+            },
             _ => SimpleContent::No,
         }
     }
+}
+
+/// Whether `text` is XML white space only (#x20, #x9, #xD, #xA) — the white
+/// space of XDM 1.0 §6.7.4 and of element-only content (Structures §3.4.4.2
+/// clause 1.3), not Unicode's.
+fn is_xml_whitespace(text: &str) -> bool {
+    text.bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 /// Content of a simple-content element held until its validity is known.
@@ -235,9 +301,42 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             current_attr_ref: None,
             deferred_attr_refs: Vec::new(),
             element_decl_stack: Vec::new(),
+            nilled_stack: Vec::new(),
             simple_stack: Vec::new(),
             whitespace_of: Vec::new(),
+            defaults_as_nodes: true,
         }
+    }
+
+    /// Whether the values the schema supplies become nodes of the tree — on
+    /// by default, as XDM 1.0 §6.2.4 builds them from the PSVI: each
+    /// defaulted attribute of an element (Structures §3.4.5.1) becomes an
+    /// attribute node, with a prefix bound to its namespace (declared on the
+    /// element when none is in scope, the ·namespace fixup·); and a valid
+    /// element of a simple type or with simple content that takes its
+    /// declaration's `default` / `fixed` value (no element or character
+    /// children, not nilled — clause 5.1 of Element Locally Valid (Element),
+    /// §3.3.4.3) gets a text node with it, before its comments and processing
+    /// instructions. Either value is the value constraint's {lexical form},
+    /// white space normalized as the node's type prescribes. An `xs:QName` /
+    /// `xs:NOTATION` in it (alone, in a list, or as a union's member) is the
+    /// schema's expanded name — the literal read with the bindings of the
+    /// schema element it is written on (Datatypes §3.3.18) — and is written
+    /// again with a prefix the instance binds to its namespace: the schema's
+    /// own prefix where the instance binds it so, another in-scope prefix, no
+    /// prefix under the same default namespace, else `ns0`, `ns1`, … declared on
+    /// the element (·namespace fixup·, which Structures §3.4.5.1 and §3.3.5.4
+    /// leave to the processor). Only a name in no namespace under a default
+    /// namespace cannot be written so (no prefix binds no namespace): it keeps
+    /// its lexical form. An element of mixed content takes no default text
+    /// (XDM leaves that case to the processor).
+    ///
+    /// `false` builds the tree as read: no defaulted attribute, no default
+    /// text (the navigator still gives an empty defaulted element its default
+    /// as its typed value).
+    pub fn with_defaults_as_nodes(mut self, defaults_as_nodes: bool) -> Self {
+        self.defaults_as_nodes = defaults_as_nodes;
+        self
     }
 
     /// The inner handler.
@@ -278,6 +377,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 self.replay(held)?;
             }
         }
+        self.drop_element_content_whitespace();
         let elem_ref = self.builder.start_element(
             view.local_name,
             view.namespace_uri,
@@ -299,11 +399,12 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             .last()
             .expect("after_element with empty stack");
         self.element_decl_stack.push(info.element_decl);
-        self.simple_stack.push(if info.is_nil {
-            SimpleContent::Nilled
-        } else {
-            SimpleContent::of(info.schema_type, info.content_type)
-        });
+        self.nilled_stack.push(info.is_nil);
+        self.simple_stack.push(SimpleContent::of(
+            info.schema_type,
+            info.content_type,
+            info.is_nil,
+        ));
         if let Some(tk) = info.schema_type {
             let binding = NodeSchemaBinding {
                 type_key: tk,
@@ -459,7 +560,6 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         &mut self,
         view: &EndOfAttributesView<'_>,
     ) -> Result<(), BufferDocumentError> {
-        self.builder.end_of_attributes();
         let elem_ref = *self
             .elem_ref_stack
             .last()
@@ -478,10 +578,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             };
             self.builder.set_node_binding(elem_ref, binding)?;
             // A type alternative selected the governing type: it decides.
+            let nilled = self.nilled_stack.last().copied().unwrap_or(false);
             if let Some(slot) = self.simple_stack.last_mut() {
-                if !matches!(slot, SimpleContent::Nilled) {
-                    *slot = SimpleContent::of(Some(tk), view.info.content_type);
-                }
+                *slot = SimpleContent::of(Some(tk), view.info.content_type, nilled);
             }
         }
 
@@ -508,7 +607,242 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 self.builder.set_node_binding(*attr_ref, binding)?;
             }
         }
+        if self.defaults_as_nodes {
+            for default in view.default_attributes {
+                self.add_defaulted_attribute(default)?;
+            }
+        }
+        self.builder.end_of_attributes();
         Ok(())
+    }
+
+    /// Add a defaulted attribute to the open element (Structures §3.4.5.1):
+    /// its {lexical form} normalized for its type, with a prefix bound to its
+    /// namespace — one in scope, or one declared on the element (·namespace
+    /// fixup·) — and bound to its declared type (`xs:anySimpleType` when the
+    /// declaration names none), which also files it in the id index when its
+    /// typed value is an `xs:ID`.
+    fn add_defaulted_attribute(
+        &mut self,
+        default: &crate::validation::info::DefaultAttribute,
+    ) -> Result<(), BufferDocumentError> {
+        let Some(schema_set) = self.builder.schema_set() else {
+            return Ok(());
+        };
+        let names = &schema_set.name_table;
+        let local = names.resolve_ref(default.local_name);
+        let namespace = default.namespace.map_or("", |ns| names.resolve_ref(ns));
+        let prefix = if namespace.is_empty() {
+            String::new()
+        } else if let Some(prefix) = self.builder.prefix_in_scope(namespace) {
+            prefix.to_string()
+        } else {
+            let prefix = (0..)
+                .map(|n| format!("ns{n}"))
+                .find(|p| !self.builder.prefix_is_declared(p))
+                .expect("an undeclared prefix");
+            self.builder
+                .declare_namespace_on_open_element(&prefix, namespace)?;
+            prefix
+        };
+        let type_key = default.type_key.or_else(|| {
+            schema_set
+                .builtin_types()
+                .get_by_type_code(crate::types::XmlTypeCode::AnySimpleType)
+                .map(crate::ids::TypeKey::Simple)
+        });
+        let normalized = type_key.and_then(|tk| {
+            let mode = self.whitespace(tk);
+            self.normalized(&default.value, tk, mode)
+        });
+        let lexical = normalized.as_deref().unwrap_or(&default.value);
+        // A QName / NOTATION in the value is the schema's expanded name (the
+        // {value}, read with the schema element's bindings): written again
+        // with a prefix the instance binds to its namespace.
+        let fixed_up = match default.typed_value.as_ref() {
+            Some(typed) => self.qname_lexical_in_scope(typed, lexical)?,
+            None => None,
+        };
+        let value = fixed_up.as_deref().unwrap_or(lexical);
+        let attr_ref = self.builder.attribute(local, namespace, &prefix, value)?;
+        if let Some(taken) = self.builder.dropped_duplicate_id() {
+            return Err(BufferDocumentError::DuplicateId(taken.into_string()));
+        }
+        if let Some(type_key) = type_key {
+            let binding = NodeSchemaBinding {
+                type_key,
+                element_decl: None,
+                attribute_decl: default.attribute_key,
+                content_type: None,
+            };
+            self.builder.set_node_binding(attr_ref, binding)?;
+        }
+        Ok(())
+    }
+
+    /// The `default` / `fixed` value of the open element's declaration, if
+    /// it has one (the default first, as validation takes it), with the
+    /// schema element it is written on.
+    fn declared_default(
+        &self,
+    ) -> Option<(&'a str, Option<&'a crate::parser::location::SourceRef>)> {
+        let decl = (*self.element_decl_stack.last()?)?;
+        let element = self.builder.schema_set()?.arenas.elements.get(decl)?;
+        let value = element
+            .default_value
+            .as_deref()
+            .or(element.fixed_value.as_deref())?;
+        Some((value, element.source.as_ref()))
+    }
+
+    /// The text an element's value constraint `value` (written on the schema
+    /// element `source`) becomes in the open element: its {lexical form},
+    /// white space normalized for `type_key`, a QName / NOTATION in it written
+    /// again for the instance ([`qname_lexical_in_scope`]).
+    ///
+    /// [`qname_lexical_in_scope`]: Self::qname_lexical_in_scope
+    fn default_text(
+        &mut self,
+        value: &str,
+        source: Option<&crate::parser::location::SourceRef>,
+        type_key: crate::ids::TypeKey,
+    ) -> Result<String, BufferDocumentError> {
+        let mode = self.whitespace(type_key);
+        let lexical = self
+            .normalized(value, type_key, mode)
+            .unwrap_or_else(|| value.to_string());
+        let Some(schema_set) = self.builder.schema_set() else {
+            return Ok(lexical);
+        };
+        if !crate::validation::simple::type_has_qname_values(type_key, schema_set) {
+            return Ok(lexical);
+        }
+        let Some(snapshot) = schema_set.value_constraint_namespaces(source) else {
+            return Ok(lexical);
+        };
+        let resolver =
+            crate::validation::simple::snapshot_prefixes(snapshot, &schema_set.name_table);
+        let Ok(typed) = crate::validation::simple::validate_simple_type_in(
+            &lexical,
+            type_key,
+            schema_set,
+            Some(&resolver),
+        ) else {
+            return Ok(lexical);
+        };
+        Ok(self
+            .qname_lexical_in_scope(&typed.typed_value, &lexical)?
+            .unwrap_or(lexical))
+    }
+
+    /// The lexical form, in the scope of the open element, of `typed` — a
+    /// value of a value constraint whose QNames / NOTATIONs hold the schema's
+    /// expanded names — when it holds any (`None` otherwise; `lexical`, its
+    /// {lexical form}, is then the text): each such name gets a prefix the
+    /// instance binds to its namespace, the other list members keep their
+    /// lexical forms. Structures §3.4.5.1 Note: "When a default value of type
+    /// QName or NOTATION is applied, it is ·implementation-dependent· whether
+    /// ·namespace fixup· occurs; if it does not, the prefix used in the
+    /// lexical representation … will not necessarily map to the namespace
+    /// name of the value" — this performs it.
+    fn qname_lexical_in_scope(
+        &mut self,
+        typed: &crate::types::value::XmlValue,
+        lexical: &str,
+    ) -> Result<Option<String>, BufferDocumentError> {
+        use crate::types::value::{XmlAtomicValue, XmlValueKind};
+        if !crate::validation::simple::holds_qname_value(typed) {
+            return Ok(None);
+        }
+        match &typed.value {
+            XmlValueKind::Atomic(XmlAtomicValue::QName(qn) | XmlAtomicValue::Notation(qn)) => {
+                self.qname_in_scope(qn).map(Some)
+            }
+            XmlValueKind::Union(member) => self.qname_lexical_in_scope(member, lexical),
+            XmlValueKind::List { items, .. } => {
+                let tokens: Vec<&str> = lexical
+                    .split([' ', '\t', '\n', '\r'])
+                    .filter(|t| !t.is_empty())
+                    .collect();
+                let mut out: Vec<String> = Vec::with_capacity(items.len());
+                for (i, item) in items.iter().enumerate() {
+                    match self.qname_lexical_in_scope(item, tokens.get(i).copied().unwrap_or(""))? {
+                        Some(written) => out.push(written),
+                        None => out.push(match tokens.get(i) {
+                            Some(token) => token.to_string(),
+                            None => item.to_string_value(),
+                        }),
+                    }
+                }
+                Ok(Some(out.join(" ")))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// `qn` written for the open element: with the schema's own prefix when
+    /// the instance binds it to the same namespace; unprefixed when the schema
+    /// wrote it so and the instance's default namespace is the same; else with
+    /// another prefix bound to the namespace in scope; else unprefixed when the
+    /// default namespace is it; else with a prefix declared on the element
+    /// (`ns0`, `ns1`, … — the ·namespace fixup·). A name in no namespace is
+    /// unprefixed: no prefix can be bound to no namespace, so under a default
+    /// namespace it keeps the lexical form, which then reads as a name in that
+    /// namespace (the one case the fixup cannot cover).
+    fn qname_in_scope(
+        &mut self,
+        qn: &crate::types::value::QNameValue,
+    ) -> Result<String, BufferDocumentError> {
+        let Some(schema_set) = self.builder.schema_set() else {
+            return Ok(qn.to_string());
+        };
+        let names = &schema_set.name_table;
+        let name = qn.name();
+        let local = names.resolve_ref(name.local_name);
+        let Some(ns) = name.namespace_uri else {
+            return Ok(local.to_string());
+        };
+        let uri = names.resolve_ref(ns);
+        let schema_prefix = name
+            .prefix
+            .map(|p| names.resolve_ref(p))
+            .filter(|p| !p.is_empty());
+        let default_ns = self.builder.default_namespace_in_scope();
+        match schema_prefix {
+            Some(p) if self.builder.namespace_of_prefix(p) == Some(uri) => {
+                return Ok(format!("{p}:{local}"));
+            }
+            None if default_ns == Some(uri) => return Ok(local.to_string()),
+            _ => {}
+        }
+        if let Some(p) = self.builder.prefix_in_scope(uri) {
+            return Ok(format!("{p}:{local}"));
+        }
+        if default_ns == Some(uri) {
+            return Ok(local.to_string());
+        }
+        let prefix = (0..)
+            .map(|n| format!("ns{n}"))
+            .find(|p| !self.builder.prefix_is_declared(p))
+            .expect("an undeclared prefix");
+        self.builder
+            .declare_namespace_on_open_element(&prefix, uri)?;
+        Ok(format!("{prefix}:{local}"))
+    }
+
+    /// XDM 1.0 §6.7.4: the text waiting to become a node of the open element
+    /// is no node when the element's content is element-only and the text is
+    /// all white space.
+    fn drop_element_content_whitespace(&mut self) {
+        if matches!(self.simple_stack.last(), Some(SimpleContent::ElementOnly)) {
+            self.drop_pending_whitespace();
+        }
+    }
+
+    fn drop_pending_whitespace(&mut self) {
+        if is_xml_whitespace(self.builder.pending_text()) {
+            self.builder.discard_pending_text();
+        }
     }
 
     fn build_after_end_element(
@@ -516,34 +850,60 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         validity: crate::validation::info::SchemaValidity,
     ) -> Result<(), BufferDocumentError> {
         let valid = validity == crate::validation::info::SchemaValidity::Valid;
+        // Clause 5.1 of Element Locally Valid (Element): an element with no
+        // element or character [children] takes its declaration's value
+        // constraint, whose {lexical form} is then its [schema normalized
+        // value] (§3.3.5.4 clause 1.1).
+        let default = |this: &Self, saw_text: bool| {
+            (this.defaults_as_nodes && !saw_text)
+                .then(|| this.declared_default())
+                .flatten()
+        };
         match self.simple_stack.pop() {
             Some(SimpleContent::Yes {
                 type_key,
                 held: None,
+                saw_text,
             }) => {
                 if valid && self.builder.has_only_pending_text() {
                     let mode = self.whitespace(type_key);
-                    if let Some(normalized) =
-                        self.normalized(self.builder.pending_text(), type_key, mode)
-                    {
-                        self.builder.replace_pending_text(&normalized);
+                    match default(self, saw_text) {
+                        Some((value, source)) => {
+                            let text = self.default_text(value, source, type_key)?;
+                            self.builder.replace_pending_text(&text);
+                        }
+                        None => {
+                            if let Some(normalized) =
+                                self.normalized(self.builder.pending_text(), type_key, mode)
+                            {
+                                self.builder.replace_pending_text(&normalized);
+                            }
+                        }
                     }
                 }
             }
             Some(SimpleContent::Yes {
                 type_key,
-                held: Some(held),
+                held: Some(mut held),
+                saw_text,
             }) => {
                 if valid {
                     // One text node with the normalized value, where the first
-                    // text was; the comments and instructions in their order.
-                    let text: String = held
-                        .iter()
-                        .filter_map(|content| match content {
-                            HeldContent::Text(text) => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect();
+                    // text was (or first, for a default); the comments and
+                    // instructions in their order.
+                    let text: String = match default(self, saw_text) {
+                        Some((value, source)) => {
+                            held.insert(0, HeldContent::Text(String::new()));
+                            self.default_text(value, source, type_key)?
+                        }
+                        None => held
+                            .iter()
+                            .filter_map(|content| match content {
+                                HeldContent::Text(text) => Some(text.as_str()),
+                                _ => None,
+                            })
+                            .collect(),
+                    };
                     let mode = self.whitespace(type_key);
                     let normalized = self.normalized(&text, type_key, mode).unwrap_or(text);
                     let mut text = Some(normalized);
@@ -563,11 +923,13 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                     self.replay(held)?;
                 }
             }
+            Some(SimpleContent::ElementOnly) => self.drop_pending_whitespace(),
             _ => {}
         }
         self.builder.end_element()?;
         self.elem_ref_stack.pop();
         self.element_decl_stack.pop();
+        self.nilled_stack.pop();
         Ok(())
     }
 
@@ -584,15 +946,15 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
         if self.elem_ref_stack.is_empty() {
             return;
         }
-        if let Some(SimpleContent::Yes {
-            held: Some(held), ..
-        }) = self.simple_stack.last_mut()
-        {
-            match held.last_mut() {
-                Some(HeldContent::Text(last)) => last.push_str(text),
-                _ => held.push(HeldContent::Text(text.to_string())),
+        if let Some(SimpleContent::Yes { held, saw_text, .. }) = self.simple_stack.last_mut() {
+            *saw_text = true;
+            if let Some(held) = held {
+                match held.last_mut() {
+                    Some(HeldContent::Text(last)) => last.push_str(text),
+                    _ => held.push(HeldContent::Text(text.to_string())),
+                }
+                return;
             }
-            return;
         }
         self.builder.text(text);
     }
@@ -689,6 +1051,7 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
 
     fn on_comment(&mut self, text: &str) -> Result<(), Self::Error> {
         if !self.hold(HeldContent::Comment(text.to_string())) {
+            self.drop_element_content_whitespace();
             self.builder.comment(text)?;
         }
         self.inner
@@ -701,6 +1064,7 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
             target.to_string(),
             data.to_string(),
         )) {
+            self.drop_element_content_whitespace();
             self.builder.processing_instruction(target, data)?;
         }
         self.inner
@@ -796,14 +1160,34 @@ impl<H: ValidationEventHandler + ?Sized> ValidationEventHandler for LentHandler<
 ///
 /// `#[non_exhaustive]`, so options can be added later: start from
 /// [`TypedBuildOptions::default`] and set what you need.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct TypedBuildOptions {
     /// Options of the document built (its kind, source-span tracking).
     pub document: BufferDocumentOptions,
+    /// Whether defaulted attributes and element defaults become nodes, as XDM
+    /// 1.0 §6.2.4 builds them from the PSVI — `true` by default; see
+    /// [`TypedBuilderHandler::with_defaults_as_nodes`].
+    pub defaults_as_nodes: bool,
+}
+
+impl Default for TypedBuildOptions {
+    fn default() -> Self {
+        Self {
+            document: BufferDocumentOptions::default(),
+            defaults_as_nodes: true,
+        }
+    }
 }
 
 impl TypedBuildOptions {
+    /// These options with `defaults_as_nodes` set (see
+    /// [`TypedBuilderHandler::with_defaults_as_nodes`]).
+    pub fn with_defaults_as_nodes(mut self, defaults_as_nodes: bool) -> Self {
+        self.defaults_as_nodes = defaults_as_nodes;
+        self
+    }
+
     /// These options with `document` as the document options.
     pub fn with_document_options(mut self, document: BufferDocumentOptions) -> Self {
         self.document = document;
@@ -855,8 +1239,12 @@ pub struct TypedBuild<'a> {
 /// — its white space normalized as its type prescribes (XDM 1.0 §6.2.4,
 /// §6.3.4) — whatever the validator's flags; such an element keeps a single
 /// text node (none for an empty value) beside its comments and processing
-/// instructions. Other content, and a node that is not valid, keeps its text as
-/// read; source spans still point at the text as read.
+/// instructions. Defaulted attributes are attribute nodes and an empty
+/// element that takes its default has it as a text node, unless
+/// [`TypedBuildOptions::defaults_as_nodes`] is `false`; white space in
+/// element-only content is no text node (see [`TypedBuilderHandler`]). Mixed
+/// content, and a node that is not valid, keeps its text as read; source spans
+/// still point at the text as read.
 ///
 /// # Example
 ///
@@ -938,7 +1326,8 @@ where
         options.document,
     )?;
     let driven = {
-        let mut typed = TypedBuilderHandler::with_handler(&mut builder, LentHandler(handler));
+        let mut typed = TypedBuilderHandler::with_handler(&mut builder, LentHandler(handler))
+            .with_defaults_as_nodes(options.defaults_as_nodes);
         drive_quick_xml_with(reader, runtime, schema_set, &mut typed)
     };
     let outcome = driven.map_err(|e| match e {
