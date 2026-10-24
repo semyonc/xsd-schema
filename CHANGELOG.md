@@ -110,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   local attribute declaration), and `DefaultAttribute` has a new field
   `type_key: Option<TypeKey>`, the declaration's type; `DefaultAttribute` is
   `#[non_exhaustive]`.
+- `TypeSource` is `#[non_exhaustive]` and has a new variant,
+  `TypeSource::Stipulated`: the governing type a `ValidationRoot::Type` run
+  stipulates for the validation root. A `match` on `TypeSource` needs a
+  wildcard arm.
 
 ### Added
 
@@ -197,6 +201,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   document that is not well-formed gets a source location.
 - `ParseLimit::description()` and `ParseLimit::unit()`: what a parse limit
   counts and its unit, the words `LimitExceeded` uses.
+- `ValidationRoot` and `ValidationRuntime::set_validation_root`: how a run
+  assesses its validation root (XSD 1.1 §5.2) — by the top-level declaration
+  of the root's name (the default, unchanged), against a stipulated element
+  declaration (`Element`) or type definition (`Type`: "validate as this type",
+  whatever the root's name), or laxly when the root is undeclared (`Lax`: no
+  `cvc-elt.1`, `[validity]` notKnown). Every driver that takes the caller's
+  runtime honours it, the typed build included.
 
 ### Changed
 
@@ -472,6 +483,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An attribute that `xs:schema` does not allow (or an invalid value of one it
   does) is reported with its name and location instead of the internal error
   "Root frame did not produce a schema result".
+- A required attribute inherited from a base type is reported missing when an
+  extension or an attribute group marks it `use="prohibited"` — a prohibition
+  only stops a restriction's inheritance (Structures §3.4.2.4); such an
+  attribute is also accepted on the element instead of being refused as
+  prohibited. A `use="prohibited"` attribute beside an attribute group no
+  longer hides the group's attribute of the same name.
+- Default and fixed attribute values from attribute groups and base types take
+  part in identity constraints and in ID/IDREF checks (Structures §3.11.4);
+  under XSD 1.1 an inheritable defaulted attribute from a base type is
+  inherited by descendant elements. A defaulted value is compared in its
+  type's value space, as an attribute the instance carries (an integer default
+  `1` and a string default `"1"` are different key values).
+- An attribute reference's own `default` or `fixed` value in an attribute
+  group wins over its declaration's (`get_default_attributes`, identity
+  constraints, ID/IDREF, inherited attributes), as it already did for a
+  reference in a complex type.
 
 ### Performance
 

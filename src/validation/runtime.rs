@@ -41,7 +41,7 @@ use super::info::{AssertionOutcome, InheritedAttribute};
 use super::info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
     NoNamespaceSchemaLocationHint, SchemaInfo, SchemaLocationHint, SchemaValidity, TypeSource,
-    ValidationAttempted, ValidationFlags,
+    ValidationAttempted, ValidationFlags, ValidationRoot,
 };
 use crate::types::complex::ProcessContents as TypesProcessContents;
 
@@ -73,10 +73,102 @@ struct GroupAttribute {
     /// The declaration the fixed value was written on (its namespace
     /// bindings read a QName value).
     fixed_source: Option<SourceRef>,
-    default_value: Option<String>,
+    /// The lexical form of the use's ·effective value constraint· (`default`
+    /// or `fixed`): the use's own, otherwise its declaration's.
+    value: Option<String>,
+    /// The element that value was written on (its namespace bindings read a
+    /// QName value).
+    value_source: Option<SourceRef>,
     #[cfg(feature = "xsd11")]
     inheritable: bool,
 }
+
+// ---------------------------------------------------------------------------
+// AttributeUseEntry — one member of a complex type's {attribute uses}
+// ---------------------------------------------------------------------------
+
+/// One member of a complex type's {attribute uses} (Structures §3.4.2.4), as
+/// [`ValidationRuntime::for_each_attribute_use`] reports it: never a
+/// prohibited `<attribute>`, which "does not correspond to any component".
+struct AttributeUseEntry<'s> {
+    name: NameId,
+    namespace: Option<NameId>,
+    /// `{required}`: `Required` or `Optional`.
+    use_kind: AttributeUseKind,
+    /// The global declaration, when the use references one.
+    attr_key: Option<AttributeKey>,
+    /// The use's resolved type, otherwise its declaration's.
+    type_key: Option<TypeKey>,
+    /// The lexical form of the use's ·effective value constraint· — its own
+    /// `default` / `fixed`, otherwise its declaration's.
+    value: Option<&'s str>,
+    /// The element `value` was written on: its namespace bindings read a
+    /// QName value.
+    value_source: Option<&'s SourceRef>,
+    /// The use's `inheritable` (XSD 1.1).
+    #[cfg(feature = "xsd11")]
+    inheritable: bool,
+}
+
+/// A set of attribute names for one walk of the attribute uses
+/// ([`ValidationRuntime::for_each_attribute_use`]): held inline while small,
+/// so the walk allocates nothing for the common type, and in a hash set past
+/// [`AttrNames::INLINE`] names.
+struct AttrNames {
+    inline: [(Option<NameId>, NameId); AttrNames::INLINE],
+    len: usize,
+    spilled: AttrNameSet,
+}
+
+impl AttrNames {
+    const INLINE: usize = 16;
+
+    fn new() -> Self {
+        AttrNames {
+            inline: [(None, NameId(0)); AttrNames::INLINE],
+            len: 0,
+            spilled: AttrNameSet::default(),
+        }
+    }
+
+    fn contains(&self, name: &(Option<NameId>, NameId)) -> bool {
+        self.inline[..self.len].contains(name) || self.spilled.contains(name)
+    }
+
+    /// Add `name`; `false` when it was already there.
+    fn insert(&mut self, name: (Option<NameId>, NameId)) -> bool {
+        if self.contains(&name) {
+            return false;
+        }
+        if self.len < AttrNames::INLINE {
+            self.inline[self.len] = name;
+            self.len += 1;
+        } else {
+            self.spilled.insert(name);
+        }
+        true
+    }
+
+    /// Move every name of `other` into this set, leaving `other` empty.
+    fn absorb(&mut self, other: &mut AttrNames) {
+        for i in 0..other.len {
+            self.insert(other.inline[i]);
+        }
+        for name in other.spilled.drain() {
+            self.insert(name);
+        }
+        other.len = 0;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.spilled.clear();
+    }
+}
+
+/// A defaulted attribute value for the identity constraints: local name,
+/// namespace (`NameId(0)` for none), lexical form, typed value.
+type IcDefault = (NameId, NameId, String, Option<XmlValue>);
 
 // ---------------------------------------------------------------------------
 // AttributeLookup — three-state result from find_attribute_in_type
@@ -561,6 +653,9 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     first_namespace_use: HashMap<Option<NameId>, u64, BuildHasherDefault<AHasher>>,
     /// Base URI of the instance document (set by caller for relative URI resolution).
     instance_base_uri: String,
+    /// How each validation root of the run is assessed (Structures §5.2);
+    /// consulted only at an element start with an empty stack.
+    validation_root: ValidationRoot,
     /// Cached `xs:ID` simple-type key for XSD 1.0's ct-props-correct.5
     /// "at most one ID-type attribute per element" runtime check. `None`
     /// under XSD 1.1 (the rule was removed) so the per-attribute hot path
@@ -737,7 +832,7 @@ fn init_declared_element_state(
     binding: DeclaredElementBinding,
     process_contents: ContentProcessing,
     content_type: ContentType,
-    edc_invalid: bool,
+    start_invalid: bool,
 ) {
     let DeclaredElementBinding {
         type_key,
@@ -750,7 +845,7 @@ fn init_declared_element_state(
     ev_state.type_source = Some(type_source);
     ev_state.content_type = Some(content_type);
     ev_state.is_nil = is_nil;
-    ev_state.validity = binding.state_validity(edc_invalid);
+    ev_state.validity = binding.state_validity(start_invalid);
     ev_state.process_contents = process_contents;
     // Strictly assessed: has governing declaration or type, and not skipped
     ev_state.strictly_assessed = (ev_state.element_decl.is_some()
@@ -777,14 +872,17 @@ impl DeclaredElementBinding {
     /// `[validity]` is `invalid` from the start event onward.
     ///
     /// So is `is_abstract` (cvc-elt.2): the same rule's "2 D.{abstract} =
-    /// false."
-    fn state_validity(&self, edc_invalid: bool) -> SchemaValidity {
+    /// false." `start_invalid` carries the verdicts found beside the binding:
+    /// a dynamic EDC violation (XSD 1.1), and a declaration stipulated for the
+    /// validation root whose name is not the element's (clause "1 D is not
+    /// ·absent· and E and D have the same expanded name").
+    fn state_validity(&self, start_invalid: bool) -> SchemaValidity {
         if self.xsi_type_invalid
             || self.is_abstract
             || self.abstract_type_invalid
             || self.nillable_violation
             || self.has_deferred_type_error
-            || edc_invalid
+            || start_invalid
         {
             SchemaValidity::Invalid
         } else {
@@ -1040,6 +1138,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             no_namespace_schema_location_hints: Vec::new(),
             first_namespace_use: HashMap::default(),
             instance_base_uri: String::new(),
+            validation_root: ValidationRoot::Declaration,
             #[cfg(feature = "xsd11")]
             assertion_source,
             #[cfg(feature = "xsd11")]
@@ -1119,6 +1218,78 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// when schemas are loaded later.
     pub fn set_instance_base_uri(&mut self, base_uri: impl Into<String>) {
         self.instance_base_uri = base_uri.into();
+    }
+
+    /// Choose how the run assesses its validation roots (Structures §5.2):
+    /// by the top-level declaration of the root's name (the default,
+    /// [`ValidationRoot::Declaration`]), against a stipulated element
+    /// declaration or type definition, or laxly when the root is undeclared —
+    /// see [`ValidationRoot`] for what each mode does to the root's
+    /// [`SchemaInfo`].
+    ///
+    /// Call it before the root's element event. It takes effect at the next
+    /// element started while no element is open, and holds for every such
+    /// root until it is set again. A stipulated declaration or type must
+    /// belong to this run's schema set: one the set does not hold makes the
+    /// root's element event an operational failure
+    /// (`validation-root-unknown`, see
+    /// [`operational_failure`](Self::operational_failure)), returned by
+    /// [`end_validation`](Self::end_validation).
+    ///
+    /// # Example
+    ///
+    /// Validate an element against a named type, whatever its name:
+    ///
+    /// ```
+    /// use xsd_schema::validation::{
+    ///     drive_quick_xml, CollectingValidationSink, SchemaValidator, SchemaValidity,
+    ///     ValidationFlags, ValidationRoot,
+    /// };
+    /// use xsd_schema::SchemaSetBuilder;
+    ///
+    /// let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///   <xs:complexType name="point">
+    ///     <xs:attribute name="x" type="xs:int" use="required"/>
+    ///   </xs:complexType>
+    /// </xs:schema>"#;
+    /// let schema_set = SchemaSetBuilder::new()
+    ///     .add_source(xsd, "file:///point.xsd")?
+    ///     .compile()?
+    ///     .into_schema_set();
+    /// let point = schema_set
+    ///     .lookup_type(None, schema_set.name_table.add("point"))
+    ///     .expect("a named type");
+    /// let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    ///
+    /// let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+    /// let mut runtime = validator.start_run(CollectingValidationSink {
+    ///     errors: &mut errors,
+    ///     warnings: &mut warnings,
+    /// });
+    /// runtime.set_validation_root(ValidationRoot::Type(point));
+    /// let outcome = drive_quick_xml(r#"<here x="3"/>"#.as_bytes(), &mut runtime, &schema_set)?;
+    /// assert_eq!(outcome.root_validity, Some(SchemaValidity::Valid));
+    ///
+    /// // Lax: an undeclared root is not an error; its [validity] is notKnown.
+    /// let mut runtime = validator.start_run(CollectingValidationSink {
+    ///     errors: &mut errors,
+    ///     warnings: &mut warnings,
+    /// });
+    /// runtime.set_validation_root(ValidationRoot::Lax);
+    /// let outcome = drive_quick_xml("<anything/>".as_bytes(), &mut runtime, &schema_set)?;
+    /// assert_eq!(outcome.root_validity, Some(SchemaValidity::NotKnown));
+    /// drop(runtime);
+    /// assert!(errors.is_empty());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn set_validation_root(&mut self, root: ValidationRoot) {
+        self.validation_root = root;
+    }
+
+    /// How the run assesses its validation roots (see
+    /// [`set_validation_root`](Self::set_validation_root)).
+    pub fn validation_root(&self) -> ValidationRoot {
+        self.validation_root
     }
 
     /// Returns accumulated `xsi:schemaLocation` hints.
@@ -1742,9 +1913,49 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             ParentAdvanceOutcome::Advanced(advance) => advance,
         };
 
-        // 3. Look up element declaration: prefer content model match, fall back to global
-        let governing =
-            self.resolve_governing_declaration(local_name, namespace, advance.match_info);
+        // 2b. A validation root: the run's mode (Structures §5.2) decides how
+        //     it is assessed. Every other element: as its parent decided.
+        let root_mode = if self.validation_stack.is_empty() {
+            self.validation_root
+        } else {
+            ValidationRoot::Declaration
+        };
+        let mut stipulated_name_mismatch = false;
+        let governing = match root_mode {
+            // Type-driven validation: no governing element declaration.
+            ValidationRoot::Type(stipulated) => {
+                return self.start_root_stipulated_type_element(
+                    stipulated, local_name, namespace, xsi_type, ns_context,
+                );
+            }
+            // Element-driven validation: the stipulated declaration governs.
+            ValidationRoot::Element(stipulated) => {
+                let Some((elem_key, name_matches)) =
+                    self.stipulated_element(stipulated, local_name, namespace)
+                else {
+                    self.fail_operational(
+                        "validation-root-unknown",
+                        "The element declaration stipulated for the validation root is not \
+                         part of this run's schema set"
+                            .to_string(),
+                    );
+                    return ElementStartOutcome::Invalid;
+                };
+                stipulated_name_mismatch = !name_matches;
+                GoverningDeclaration {
+                    element_key: Some(elem_key),
+                    matched_type: None,
+                    process_contents: ContentProcessing::Strict,
+                    #[cfg(feature = "xsd11")]
+                    matched_via_wildcard: false,
+                }
+            }
+            // 3. Look up element declaration: prefer content model match, fall
+            //    back to global
+            ValidationRoot::Declaration | ValidationRoot::Lax => {
+                self.resolve_governing_declaration(local_name, namespace, advance.match_info)
+            }
+        };
 
         // 4. No governing element declaration: a wildcard-matched child, root
         //    xsi:type promotion, or an undeclared element (skip/lax/strict).
@@ -1761,10 +1972,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             // PATH B2/B3 (which handles the wildcard-child case) and must run
             // *before* the unconditional cvc-elt.1 fall-through.
             if self.validation_stack.is_empty() {
+                // Lax wildcard validation (§5.2): an undeclared root is laxly
+                // assessed instead of being reported.
+                let lax = root_mode == ValidationRoot::Lax;
                 if let Some(outcome) = self.start_root_xsi_type_element(
-                    local_name, namespace, xsi_type, xsi_nil, ns_context,
+                    local_name, namespace, xsi_type, xsi_nil, ns_context, lax,
                 ) {
                     return outcome;
+                }
+                if lax {
+                    return self.start_undeclared_element(
+                        local_name,
+                        namespace,
+                        ns_context,
+                        ContentProcessing::Lax,
+                    );
                 }
             }
             return self.start_undeclared_element(
@@ -1805,6 +2027,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let edc_invalid = edc_violation_a.is_some();
         #[cfg(not(feature = "xsd11"))]
         let edc_invalid = false;
+        // Element Locally Valid (Element) (§3.3.4.3) clause 1 for a stipulated
+        // declaration of another name: invalid from the start.
+        let start_invalid = edc_invalid || stipulated_name_mismatch;
 
         // 9. Push ElementValidationState
         let mut ev_state = self.acquire_state(local_name, namespace);
@@ -1816,9 +2041,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             binding,
             governing.process_contents,
             content_type,
-            edc_invalid,
+            start_invalid,
         );
         self.push_element(ev_state);
+        if stipulated_name_mismatch {
+            let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
+            self.report_error(
+                "cvc-elt.1",
+                format!(
+                    "Element '{}' does not have the name of the element declaration stipulated \
+                     for the validation root",
+                    elem_name
+                ),
+            );
+        }
         #[cfg(feature = "xsd11")]
         if let Some(reason) = edc_violation_a.as_ref() {
             let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
@@ -1849,7 +2085,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ElementStartOutcome::Start {
             element_decl: Some(elem_key),
             schema_type: binding.type_key,
-            validity: binding.state_validity(edc_invalid),
+            validity: binding.state_validity(start_invalid),
             is_nil: binding.is_nil,
             content_type: Some(content_type),
             type_source: Some(binding.type_source),
@@ -2257,6 +2493,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// then laxly assessed against it. Returns `None` when there is no
     /// `xsi:type` and the caller must fall through to the undeclared-element
     /// paths.
+    ///
+    /// With `lax` (lax wildcard validation, [`ValidationRoot::Lax`]) an
+    /// `xsi:type` that resolves to no usable type is reported but the root is
+    /// not: it is laxly assessed, as an element a lax wildcard matched (PATH
+    /// B2), without `cvc-elt.1`.
     fn start_root_xsi_type_element(
         &mut self,
         local_name: NameId,
@@ -2264,6 +2505,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         xsi_type: Option<&str>,
         xsi_nil: Option<&str>,
         ns_context: &NamespaceContextSnapshot,
+        lax: bool,
     ) -> Option<ElementStartOutcome> {
         let xsi_type_str = xsi_type?;
         let mut deferred = Vec::new();
@@ -2309,21 +2551,160 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut ev_state = self.acquire_state(local_name, namespace);
                 ev_state.ns_context = Some(ns_context.clone());
                 ev_state.validity = SchemaValidity::Invalid;
+                if lax {
+                    ev_state.process_contents = ContentProcessing::Lax;
+                }
                 let (content_state, content_type) = self.lax_assessment_content_model();
                 ev_state.content_state = content_state;
                 ev_state.content_type = Some(content_type);
                 self.push_element(ev_state);
-                let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
-                self.report_error(
-                    "cvc-elt.1",
-                    format!("Element '{}' is not declared", elem_name),
-                );
+                if !lax {
+                    let elem_name = self.schema_set.name_table.resolve(local_name).to_string();
+                    self.report_error(
+                        "cvc-elt.1",
+                        format!("Element '{}' is not declared", elem_name),
+                    );
+                }
                 self.emit_deferred_xsi_type_errors(deferred);
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
                 self.detect_assertions_on_element(None, local_name, namespace);
                 Some(ElementStartOutcome::Invalid)
             }
+        }
+    }
+
+    /// Element-start step 2b (element-driven validation,
+    /// [`ValidationRoot::Element`]): the declaration stipulated for the root —
+    /// the one a reference entry resolves to — and whether its expanded name
+    /// is the element's. `None` when the run's schema set does not hold it.
+    fn stipulated_element(
+        &self,
+        stipulated: ElementKey,
+        local_name: NameId,
+        namespace: Option<NameId>,
+    ) -> Option<(ElementKey, bool)> {
+        let elements = &self.schema_set.arenas.elements;
+        let mut key = stipulated;
+        let mut decl = elements.get(key)?;
+        if let Some(target) = decl.resolved_ref {
+            key = target;
+            decl = elements.get(key)?;
+        }
+        Some((
+            key,
+            decl.name == Some(local_name) && decl.target_namespace == namespace,
+        ))
+    }
+
+    /// Element-start step 2b (type-driven validation,
+    /// [`ValidationRoot::Type`]): a validation root whose governing type the
+    /// run stipulated. Structures §3.3.4.6: no ·governing element
+    /// declaration· (clause 4.2), and the governing type definition is "1 An
+    /// ·instance-specified type definition· which ·overrides· a type
+    /// definition stipulated by the processor", else "2 A type definition
+    /// stipulated by the processor". The `xsi:type` check is the declared
+    /// element's (cvc-elt.4.1 – 4.3) with the stipulated type in the declared
+    /// type's place and no {disallowed substitutions}; an `xsi:type` that does
+    /// not override is reported and the stipulated type stays governing. The
+    /// root is strictly assessed (clause 1.2) and never ·nilled· (there is no
+    /// declaration, §3.3.1).
+    fn start_root_stipulated_type_element(
+        &mut self,
+        stipulated: TypeKey,
+        local_name: NameId,
+        namespace: Option<NameId>,
+        xsi_type: Option<&str>,
+        ns_context: &NamespaceContextSnapshot,
+    ) -> ElementStartOutcome {
+        let arenas = &self.schema_set.arenas;
+        let held = match stipulated {
+            TypeKey::Complex(k) => arenas.complex_types.get(k).is_some(),
+            TypeKey::Simple(k) => arenas.simple_types.get(k).is_some(),
+        };
+        if !held {
+            self.fail_operational(
+                "validation-root-unknown",
+                "The type definition stipulated for the validation root is not part of this \
+                 run's schema set"
+                    .to_string(),
+            );
+            return ElementStartOutcome::Invalid;
+        }
+
+        let mut deferred = Vec::new();
+        let mut type_key = stipulated;
+        let mut type_source = TypeSource::Stipulated;
+        let mut xsi_type_invalid = false;
+        if let Some(xsi_type_str) = xsi_type {
+            match self.resolve_xsi_type(
+                xsi_type_str,
+                Some(stipulated),
+                DerivationSet::empty(),
+                ns_context,
+                &mut deferred,
+            ) {
+                XsiTypeOutcome::Applied(overridden) => {
+                    type_key = overridden;
+                    type_source = TypeSource::XsiType;
+                }
+                XsiTypeOutcome::Unresolved | XsiTypeOutcome::InvalidDerivation => {
+                    xsi_type_invalid = true;
+                }
+            }
+        }
+        // Element Locally Valid (Type) (§3.3.4.4) clause 2: "If T is a complex
+        // type definition, then T.{abstract} = false."
+        let abstract_ct_info = match type_key {
+            TypeKey::Complex(k) if !xsi_type_invalid => self
+                .schema_set
+                .arenas
+                .complex_types
+                .get(k)
+                .filter(|ct| ct.is_abstract)
+                .map(|ct| (ct.name, ct.target_namespace)),
+            _ => None,
+        };
+
+        let (content_state, content_type) = self.init_content_model(Some(type_key));
+        let validity = if xsi_type_invalid || abstract_ct_info.is_some() {
+            SchemaValidity::Invalid
+        } else {
+            SchemaValidity::Valid
+        };
+        let mut ev_state = self.acquire_state(local_name, namespace);
+        ev_state.ns_context = Some(ns_context.clone());
+        ev_state.schema_type = Some(type_key);
+        ev_state.type_source = Some(type_source);
+        ev_state.content_state = content_state;
+        ev_state.content_type = Some(content_type);
+        ev_state.validity = validity;
+        ev_state.process_contents = ContentProcessing::Strict;
+        ev_state.strictly_assessed = true;
+        self.push_element(ev_state);
+        // Diagnostics after the push, so they land on the root.
+        self.emit_deferred_xsi_type_errors(deferred);
+        if let Some((ct_name, ct_ns)) = abstract_ct_info {
+            let type_name =
+                crate::schema::derivation::format_type_name(self.schema_set, ct_name, ct_ns);
+            self.report_error(
+                "cvc-type.2",
+                format!(
+                    "Type '{}' is abstract and cannot be used to validate an element",
+                    type_name
+                ),
+            );
+        }
+        self.advance_constraints_start_element(local_name, namespace, None);
+        #[cfg(feature = "xsd11")]
+        self.detect_assertions_on_element(Some(type_key), local_name, namespace);
+        ElementStartOutcome::Start {
+            element_decl: None,
+            schema_type: Some(type_key),
+            validity,
+            is_nil: false,
+            content_type: Some(content_type),
+            type_source: Some(type_source),
         }
     }
 
@@ -3357,15 +3738,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
-        // Check required attributes (cvc-complex-type.4).
+        // The attribute uses the instance did not carry, in one walk of the
+        // governing type's {attribute uses}: the required ones are missing
+        // (cvc-complex-type.4); the defaulted ones take part in identity
+        // constraints and ID/IDREF.
         if let Some(TypeKey::Complex(ct_key)) = schema_type {
-            self.report_missing_required_attributes(ct_key);
-        }
-
-        // Process default/fixed attribute values not explicitly provided in the
-        // instance (IC field matching + ID/IDREF collection).
-        if let Some(TypeKey::Complex(ct_key)) = schema_type {
-            self.process_absent_attribute_defaults(ct_key);
+            self.process_absent_attribute_uses(ct_key);
         }
 
         // Forward to assertion fragment builder (XSD 1.1)
@@ -3491,24 +3869,30 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// End-of-attributes step: report every required attribute use of the
-    /// governing complex type that the instance did not carry
-    /// (cvc-complex-type.4).
+    /// End-of-attributes step: the attribute uses of the governing complex
+    /// type the instance did not carry, found in one walk of its {attribute
+    /// uses} ([`for_each_attribute_use`](Self::for_each_attribute_use)).
     ///
-    /// Detection is `&self` and borrows `seen` straight from the validation
-    /// stack — no per-element clone of `seen_attributes` — then reporting is a
-    /// separate `&mut self` pass.
-    fn report_missing_required_attributes(&mut self, ct_key: ComplexTypeKey) {
-        let missing = {
-            let empty = AttrNameSet::default();
-            let seen = self
-                .validation_stack
-                .last()
-                .map(|s| &s.seen_attributes)
-                .unwrap_or(&empty);
-            let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-            self.missing_required_attributes(ct_data, seen)
-        };
+    /// Each required one is missing — cvc-complex-type.4 (§3.4.4.2 clause 4:
+    /// "For each attribute use U in {attribute uses}, if U.{required} = true,
+    /// then U.{attribute declaration} has the same expanded name as one of the
+    /// attribute information items in E.\[attributes\]"), reported in walk
+    /// order. Each optional one with a value constraint is a ·defaulted
+    /// attribute· (§3.4.4.2), which §3.4.5.1 adds to E.\[attributes\]: its
+    /// value takes part in identity constraints (§3.11.4: "default or fixed
+    /// value constraints may play a part in ·key sequence·s") and, for an
+    /// ID / IDREF / ENTITY type, in the ID/IDREF table (§3.17.5.2) and the
+    /// entity check.
+    fn process_absent_attribute_uses(&mut self, ct_key: ComplexTypeKey) {
+        let mut missing: Vec<(Option<NameId>, NameId)> = Vec::new();
+        let mut ic_defaults: Vec<IcDefault> = Vec::new();
+        let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
+        self.collect_absent_attribute_uses(
+            ct_key,
+            &mut missing,
+            &mut ic_defaults,
+            &mut id_defaults,
+        );
         if !missing.is_empty() {
             for (_ns, name) in missing {
                 let name_str = self.schema_set.name_table.resolve(name);
@@ -3519,23 +3903,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
             self.mark_current_invalid();
         }
-    }
-
-    /// End-of-attributes step: process default/fixed attribute values not
-    /// explicitly provided in the instance. A single pass over the attribute
-    /// uses handles both IC field matching (§3.11.4) and ID/IDREF collection
-    /// (§3.3.4 cvc-id.2) to avoid iterating twice.
-    fn process_absent_attribute_defaults(&mut self, ct_key: ComplexTypeKey) {
-        let mut ic_defaults: Vec<(NameId, NameId, String)> = Vec::new();
-        let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
-        self.collect_absent_attribute_defaults(ct_key, &mut ic_defaults, &mut id_defaults);
         // Feed IC field matches (borrow-split: active_constraints borrows &mut self)
         let mut multi_node_defaults: Vec<(NameId, usize, usize)> = Vec::new();
-        for (name, ns, value) in ic_defaults {
+        for (name, ns, value, typed_value) in ic_defaults {
             for cs in &mut self.active_constraints {
                 let matches = cs.matching_fields(name, ns);
                 for field_idx in matches {
-                    let already_matched = cs.set_field_value(field_idx, value.clone(), None);
+                    let already_matched =
+                        cs.set_field_value(field_idx, value.clone(), typed_value.clone());
                     if already_matched {
                         multi_node_defaults.push((
                             cs.key_table.constraint_name,
@@ -3581,17 +3956,53 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// The `&self` scan behind [`process_absent_attribute_defaults`]: collects
-    /// the default/fixed values of the attribute uses the instance did not
-    /// carry, split into the values an active identity constraint may select
-    /// and the ID/IDREF/ENTITY-typed values that still need validating.
-    fn collect_absent_attribute_defaults(
+    /// The typed value of a value constraint's lexical form `value` under
+    /// `type_key`, a QName / NOTATION read with the bindings in scope at
+    /// `source` (the element that carries the constraint; Datatypes §3.3.18:
+    /// the mapping "depends on the namespace bindings in scope where the
+    /// literal occurs"). `None` when the value is not valid for the type (the
+    /// schema is then in error) — the caller compares the lexical form.
+    fn value_constraint_typed_value(
+        &self,
+        value: &str,
+        type_key: TypeKey,
+        source: Option<&SourceRef>,
+    ) -> Option<XmlValue> {
+        let typed = super::simple::validate_simple_type(value, type_key, self.schema_set)
+            .ok()?
+            .typed_value;
+        let ctx = self.schema_set.value_constraint_namespaces(source);
+        match self.resolve_qname_typed_value_in(Some(&typed), value, ctx) {
+            Ok(Some(resolved)) => Some(resolved),
+            Ok(None) if !super::simple::holds_lexical_qname(&typed) => Some(typed),
+            // A QName whose prefix is bound nowhere at the declaration: no
+            // value to compare by (the lexical form is used).
+            _ => None,
+        }
+    }
+
+    /// The `&self` scan behind
+    /// [`process_absent_attribute_uses`](Self::process_absent_attribute_uses),
+    /// borrowing the element's seen attributes straight from the validation
+    /// stack (no per-element clone): the missing required uses, the defaulted
+    /// values an active identity constraint may select, and the
+    /// ID/IDREF/ENTITY-typed defaulted values that still need validating.
+    ///
+    /// A defaulted value goes to the identity constraints as its typed value
+    /// under the use's type, as an attribute the instance carries does
+    /// (`post_process_attribute`): key sequences are compared "pairwise
+    /// equal or identical, as defined by Equality and Identity in [XML
+    /// Schema: Datatypes]" (§3.11.4 clause 4.1), where "values from different
+    /// primitive data spaces are made artificially unequal" (Datatypes
+    /// §2.2.2). A QName / NOTATION value is read with the bindings in scope
+    /// at the element that carries the value constraint.
+    fn collect_absent_attribute_uses(
         &self,
         ct_key: ComplexTypeKey,
-        ic_defaults: &mut Vec<(NameId, NameId, String)>,
+        missing: &mut Vec<(Option<NameId>, NameId)>,
+        ic_defaults: &mut Vec<IcDefault>,
         id_defaults: &mut Vec<(String, TypeKey)>,
     ) {
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
         let empty_seen = AttrNameSet::default();
         let seen = self
             .validation_stack
@@ -3600,56 +4011,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .unwrap_or(&empty_seen);
         let has_ic = !self.active_constraints.is_empty();
         let builtin = self.schema_set.builtin_types();
-        let id_key = builtin.get_by_type_code(XmlTypeCode::Id);
-        let idref_key = builtin.get_by_type_code(XmlTypeCode::IdRef);
-        let idrefs_key = builtin.get_by_type_code(XmlTypeCode::IdRefs);
-        let entity_key = builtin.get_by_type_code(XmlTypeCode::Entity);
-        let entities_key = builtin.get_by_type_code(XmlTypeCode::Entities);
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            if attr_use.use_kind == AttributeUseKind::Prohibited {
-                continue;
+        let id_typed = [
+            builtin.get_by_type_code(XmlTypeCode::Id),
+            builtin.get_by_type_code(XmlTypeCode::IdRef),
+            builtin.get_by_type_code(XmlTypeCode::IdRefs),
+            builtin.get_by_type_code(XmlTypeCode::Entity),
+            builtin.get_by_type_code(XmlTypeCode::Entities),
+        ];
+        self.for_each_attribute_use(ct_key, |u| {
+            if seen.contains(&(u.namespace, u.name)) {
+                return;
             }
-            let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-            if seen.contains(&(attr_ns, attr_name)) {
-                continue;
+            if u.use_kind == AttributeUseKind::Required {
+                missing.push((u.namespace, u.name));
+                return;
             }
-            let attr_key = resolved.and_then(|r| r.resolved_ref);
-            let ref_decl = attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k));
-            let value = attr_use
-                .attribute
-                .default_value
-                .as_deref()
-                .or(attr_use.attribute.fixed_value.as_deref())
-                .or_else(|| {
-                    ref_decl.and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
-                });
-            let Some(v) = value else { continue };
+            let Some(v) = u.value else { return };
             if has_ic {
-                ic_defaults.push((attr_name, attr_ns.unwrap_or(NameId(0)), v.to_string()));
+                let typed_value = u
+                    .type_key
+                    .and_then(|tk| self.value_constraint_typed_value(v, tk, u.value_source));
+                ic_defaults.push((
+                    u.name,
+                    u.namespace.unwrap_or(NameId(0)),
+                    v.to_string(),
+                    typed_value,
+                ));
             }
-            // Check if this attribute's type is ID/IDREF/IDREFS/ENTITY/ENTITIES
-            // (need to validate defaults for these types).
-            let attr_type = resolved
-                .and_then(|r| r.resolved_type)
-                .or_else(|| ref_decl.and_then(|d| d.resolved_type));
-            let needs_default_validation = match attr_type {
-                Some(TypeKey::Simple(sk)) => {
-                    id_key == Some(sk)
-                        || idref_key == Some(sk)
-                        || idrefs_key == Some(sk)
-                        || entity_key == Some(sk)
-                        || entities_key == Some(sk)
-                }
-                _ => false,
-            };
-            if needs_default_validation {
-                if let Some(tk) = attr_type {
-                    id_defaults.push((v.to_string(), tk));
+            // An ID/IDREF/IDREFS/ENTITY/ENTITIES default still needs
+            // validating (its value joins the ID/IDREF table).
+            if let Some(TypeKey::Simple(sk)) = u.type_key {
+                if id_typed.contains(&Some(sk)) {
+                    id_defaults.push((v.to_string(), TypeKey::Simple(sk)));
                 }
             }
-        }
+        });
     }
 
     /// Validate a text content event
@@ -4950,111 +5346,23 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             _ => return Vec::new(),
         };
 
-        let any_type = self.schema_set.any_type_key();
         let mut result = Vec::new();
-        // Names a more derived restriction keeps out of what its base types
-        // contribute: the names it includes itself (§3.4.2.4 clause 3.2.1)
-        // and the ones it prohibits (clause 3.2.2).
-        let mut not_inherited = AttrNameSet::default();
-        let push = |result: &mut Vec<DefaultAttribute>,
-                    name: NameId,
-                    namespace: Option<NameId>,
-                    attribute_key: Option<AttributeKey>,
-                    type_key: Option<TypeKey>,
-                    value: &str| {
-            if !ev_state.seen_attributes.contains(&(namespace, name)) {
+        self.for_each_attribute_use(ct_key, |u| {
+            if u.use_kind != AttributeUseKind::Optional
+                || ev_state.seen_attributes.contains(&(u.namespace, u.name))
+            {
+                return;
+            }
+            if let Some(value) = u.value {
                 result.push(DefaultAttribute {
-                    local_name: name,
-                    namespace,
-                    attribute_key,
-                    type_key,
+                    local_name: u.name,
+                    namespace: u.namespace,
+                    attribute_key: u.attr_key,
+                    type_key: u.type_key,
                     value: value.to_string(),
                 });
             }
-        };
-
-        let mut current = Some(ct_key);
-        while let Some(key) = current.filter(|&key| key != any_type) {
-            let ct_data = &self.schema_set.arenas.complex_types[key];
-            // This type's own uses (clauses 1 and 2). A prohibited
-            // `<attribute>` is no use: it only keeps a restriction's base use
-            // of that name from being inherited, so it never hides a use of
-            // the type itself, from a group or not.
-            let mut own = AttrNameSet::default();
-            let mut prohibited = AttrNameSet::default();
-
-            for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-                let resolved = ct_data.resolved_attributes.get(i);
-                let (attr_name, attr_ns) =
-                    self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-                if attr_use.use_kind == AttributeUseKind::Prohibited {
-                    prohibited.insert((attr_ns, attr_name));
-                    continue;
-                }
-                if not_inherited.contains(&(attr_ns, attr_name))
-                    || !own.insert((attr_ns, attr_name))
-                    || attr_use.use_kind != AttributeUseKind::Optional
-                {
-                    continue;
-                }
-                let attr_key = resolved.and_then(|r| r.resolved_ref);
-                let decl = attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k));
-                let value = attr_use
-                    .attribute
-                    .default_value
-                    .as_deref()
-                    .or(attr_use.attribute.fixed_value.as_deref())
-                    .or_else(|| {
-                        decl.and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
-                    });
-                if let Some(value) = value {
-                    let type_key = resolved
-                        .and_then(|r| r.resolved_type)
-                        .or_else(|| decl.and_then(|d| d.resolved_type));
-                    push(&mut result, attr_name, attr_ns, attr_key, type_key, value);
-                }
-            }
-
-            for ga in self.collect_group_attributes(ct_data) {
-                // A prohibited use in an attribute group is no attribute use
-                // either (W3C Bugzilla #4043).
-                if ga.use_kind == AttributeUseKind::Prohibited
-                    || not_inherited.contains(&(ga.namespace, ga.name))
-                    || !own.insert((ga.namespace, ga.name))
-                    || ga.use_kind == AttributeUseKind::Required
-                {
-                    continue;
-                }
-                if let Some(value) = ga.default_value.as_deref().or(ga.fixed_value.as_deref()) {
-                    push(
-                        &mut result,
-                        ga.name,
-                        ga.namespace,
-                        ga.attr_key,
-                        ga.type_key,
-                        value,
-                    );
-                }
-            }
-
-            // Clause 3: an extension inherits every use of its base (3.1; its
-            // own names cannot repeat them, and a prohibition there is
-            // ignored); a restriction none of the names it includes or
-            // prohibits (3.2).
-            not_inherited.extend(own);
-            if !matches!(
-                ct_data.derivation_method,
-                Some(crate::parser::frames::DerivationMethod::Extension)
-            ) {
-                not_inherited.extend(prohibited);
-            }
-
-            current = match ct_data.resolved_base_type {
-                Some(TypeKey::Complex(base)) => Some(base),
-                _ => None,
-            };
-        }
-
+        });
         result
     }
 
@@ -6866,6 +7174,22 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         typed_value: Option<&XmlValue>,
         value: &str,
     ) -> Result<Option<XmlValue>, String> {
+        let ctx = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref());
+        self.resolve_qname_typed_value_in(typed_value, value, ctx)
+    }
+
+    /// [`resolve_attribute_qname_typed_value`](Self::resolve_attribute_qname_typed_value)
+    /// with the namespace bindings `ctx` — the instance element's, or, for a
+    /// value constraint, those in scope at the declaration that carries it.
+    fn resolve_qname_typed_value_in(
+        &self,
+        typed_value: Option<&XmlValue>,
+        value: &str,
+        ctx: Option<&NamespaceContextSnapshot>,
+    ) -> Result<Option<XmlValue>, String> {
         use crate::types::value::{QNameValue, XmlAtomicValue, XmlValueKind};
         let Some(tv) = typed_value else {
             return Ok(None);
@@ -6882,11 +7206,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         if !is_list && tv.type_code != XmlTypeCode::QName && tv.type_code != XmlTypeCode::Notation {
             return Ok(None);
         }
-        let Some(ctx) = self
-            .validation_stack
-            .last()
-            .and_then(|ev| ev.ns_context.as_ref())
-        else {
+        let Some(ctx) = ctx else {
             return Ok(None);
         };
         // A list value (also the one a union's chosen member type gave):
@@ -7374,11 +7694,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let (name, namespace) =
                 self.resolve_attr_use_name_ns(attr_use, resolved, group_data.target_namespace);
             let (fixed_value, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
-            let default_value = attr_use.attribute.default_value.clone().or_else(|| {
-                attr_key
-                    .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                    .and_then(|d| d.default_value.clone())
-            });
+            let (value, value_source) = self.effective_value_constraint(attr_use, attr_key);
             result.push(GroupAttribute {
                 name,
                 namespace,
@@ -7387,13 +7703,136 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 attr_key,
                 fixed_value,
                 fixed_source,
-                default_value,
+                value: value.map(str::to_string),
+                value_source: value_source.cloned(),
                 #[cfg(feature = "xsd11")]
                 inheritable: attr_use.attribute.inheritable,
             });
         }
         for &nested_key in &group_data.resolved_attribute_groups {
             self.collect_group_attributes_recursive(nested_key, result, visited);
+        }
+    }
+
+    /// Visit every member of the {attribute uses} of the complex type
+    /// `ct_key`, in order: its own `<attribute>` uses, its attribute groups'
+    /// uses, then those inherited from each base type down to `xs:anyType`.
+    ///
+    /// Structures §3.4.2.4 (Mapping Rule for Attribute Uses Property): "1 The
+    /// set of attribute uses corresponding to the <attribute> \[children\], if
+    /// any. 2 The {attribute uses} of the attribute groups … 3 The attribute
+    /// uses "inherited" from the {base type definition} T" — for an extension
+    /// (3.1) all of T's; for a restriction (3.2) all except those whose name is
+    /// "3.2.1 the expanded name of the {attribute declaration} of an attribute
+    /// use which has already been included in the set, following the rules in
+    /// clause 1 or clause 2 above; 3.2.2 the expanded name of the {attribute
+    /// declaration} of what would have been an attribute use corresponding to
+    /// an <attribute> \[child\], if the <attribute> had not had use =
+    /// prohibited." So a prohibition only stops a restriction's inheritance:
+    /// it never hides a use of the type itself, an extension's is "simply
+    /// ignored", and an attribute group's prohibited `<attribute>` is no use
+    /// at all (XSD 1.0 §3.2.2: it "corresponds to nothing at all"; W3C
+    /// Bugzilla #4043). The set is cumulative down the base chain, as the
+    /// clause composes. A name is reported once.
+    ///
+    /// The one walk behind every runtime consumer of the attribute uses: the
+    /// required-attribute check, the defaulted attributes (identity-constraint
+    /// fields, ID/IDREF, `get_default_attributes`) and the inheritable
+    /// defaults. [`find_attribute_in_type`](Self::find_attribute_in_type)
+    /// looks one name up by the same rule.
+    fn for_each_attribute_use(
+        &self,
+        ct_key: ComplexTypeKey,
+        mut visit: impl FnMut(&AttributeUseEntry<'_>),
+    ) {
+        let any_type = self.schema_set.any_type_key();
+        // Names a more derived restriction keeps out of what its base types
+        // contribute (clauses 3.2.1 and 3.2.2).
+        let mut not_inherited = AttrNames::new();
+        let mut own = AttrNames::new();
+        let mut prohibited = AttrNames::new();
+        let mut current = Some(ct_key);
+        while let Some(key) = current.filter(|&key| key != any_type) {
+            let ct_data = &self.schema_set.arenas.complex_types[key];
+            let base = match ct_data.resolved_base_type {
+                Some(TypeKey::Complex(base)) if base != any_type => Some(base),
+                _ => None,
+            };
+            let groups = self.collect_group_attributes(ct_data);
+            // The names are needed only to keep a group use from repeating a
+            // use of this type, and to stop inheritance from a base still to
+            // come — not for the common type with neither.
+            let track = base.is_some() || !groups.is_empty();
+            own.clear();
+            prohibited.clear();
+
+            for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+                let resolved = ct_data.resolved_attributes.get(i);
+                let (name, namespace) =
+                    self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+                if attr_use.use_kind == AttributeUseKind::Prohibited {
+                    if base.is_some() {
+                        prohibited.insert((namespace, name));
+                    }
+                    continue;
+                }
+                if not_inherited.contains(&(namespace, name))
+                    || (track && !own.insert((namespace, name)))
+                {
+                    continue;
+                }
+                let attr_key = resolved.and_then(|r| r.resolved_ref);
+                let decl = attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k));
+                let (value, value_source) = self.effective_value_constraint(attr_use, attr_key);
+                visit(&AttributeUseEntry {
+                    name,
+                    namespace,
+                    use_kind: attr_use.use_kind,
+                    attr_key,
+                    type_key: resolved
+                        .and_then(|r| r.resolved_type)
+                        .or_else(|| decl.and_then(|d| d.resolved_type)),
+                    value,
+                    value_source,
+                    #[cfg(feature = "xsd11")]
+                    inheritable: attr_use.attribute.inheritable,
+                });
+            }
+
+            for ga in &groups {
+                if ga.use_kind == AttributeUseKind::Prohibited
+                    || not_inherited.contains(&(ga.namespace, ga.name))
+                    || !own.insert((ga.namespace, ga.name))
+                {
+                    continue;
+                }
+                visit(&AttributeUseEntry {
+                    name: ga.name,
+                    namespace: ga.namespace,
+                    use_kind: ga.use_kind,
+                    attr_key: ga.attr_key,
+                    type_key: ga.type_key,
+                    value: ga.value.as_deref(),
+                    value_source: ga.value_source.as_ref(),
+                    #[cfg(feature = "xsd11")]
+                    inheritable: ga.inheritable,
+                });
+            }
+
+            if base.is_some() {
+                // Clause 3: an extension inherits every use of its base (3.1:
+                // its own names cannot repeat them, and a prohibition there is
+                // ignored); a restriction none of the names it includes or
+                // prohibits (3.2).
+                not_inherited.absorb(&mut own);
+                if !matches!(
+                    ct_data.derivation_method,
+                    Some(crate::parser::frames::DerivationMethod::Extension)
+                ) {
+                    not_inherited.absorb(&mut prohibited);
+                }
+            }
+            current = base;
         }
     }
 
@@ -7439,6 +7878,35 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     // which implements full §3.6.2.2 (own + groups intersection) plus
     // §3.4.2.5 (extension union over the base chain) in canonical form.
 
+    /// The lexical form of an attribute use's ·effective value constraint·
+    /// with the element it was written on. Structures §3.4.4.2: "The
+    /// effective value constraint of an attribute use U is U.{value
+    /// constraint}, if present, otherwise U.{attribute declaration}.{value
+    /// constraint}, if present, otherwise the effective value constraint is
+    /// ·absent·" — the use's own `default` / `fixed` first, for a reference
+    /// in a type or in an attribute group alike.
+    fn effective_value_constraint<'s>(
+        &'s self,
+        attr_use: &'s AttributeUseResult,
+        attr_key: Option<AttributeKey>,
+    ) -> (Option<&'s str>, Option<&'s SourceRef>) {
+        let own = &attr_use.attribute;
+        if let Some(value) = own.default_value.as_deref().or(own.fixed_value.as_deref()) {
+            return (Some(value), own.source.as_ref());
+        }
+        match attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k)) {
+            Some(decl) => match decl
+                .default_value
+                .as_deref()
+                .or(decl.fixed_value.as_deref())
+            {
+                Some(value) => (Some(value), decl.source.as_ref()),
+                None => (None, None),
+            },
+            None => (None, None),
+        }
+    }
+
     /// An attribute use's fixed value — its own, otherwise its declaration's —
     /// with the source of the element it was written on.
     fn attribute_use_fixed(
@@ -7455,19 +7923,36 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Find an attribute declaration in a complex type's attribute list
+    /// Look the attribute (`local_name`, `namespace`) up among the {attribute
+    /// uses} of the complex type `ct_data` (Structures §3.4.2.4), by the rule
+    /// of [`for_each_attribute_use`](Self::for_each_attribute_use): at each
+    /// level of the base chain, the type's own `<attribute>` uses, then its
+    /// attribute groups' uses; a prohibited `<attribute>` of that name keeps
+    /// the use from being inherited only when the level is a restriction
+    /// (clause 3.2.2) — it never hides a use of the type itself, an
+    /// extension's is ignored (clause 3.1), and a group's prohibited
+    /// `<attribute>` is no use at all (W3C Bugzilla #4043).
+    ///
+    /// `Prohibited` means a restriction removed the name (the caller's
+    /// wildcard rescue may still admit the attribute), `NotFound` that no
+    /// level declares or removes it.
     fn find_attribute_in_type(
         &self,
         ct_data: &ComplexTypeDefData,
         local_name: NameId,
         namespace: Option<NameId>,
     ) -> AttributeLookup {
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-
-            if attr_name == local_name && attr_ns == namespace {
+        let any_type = self.schema_set.any_type_key();
+        let mut ct_data = ct_data;
+        loop {
+            let mut prohibited_here = false;
+            for (i, attr_use) in ct_data.attributes.iter().enumerate() {
+                let resolved = ct_data.resolved_attributes.get(i);
+                let (attr_name, attr_ns) =
+                    self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
+                if attr_name != local_name || attr_ns != namespace {
+                    continue;
+                }
                 let attr_key = resolved.and_then(|r| r.resolved_ref);
                 let attr_type = resolved.and_then(|r| r.resolved_type).or_else(|| {
                     attr_key
@@ -7477,6 +7962,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 // Get fixed value from the attribute use or from the attribute declaration
                 let (fixed, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
+                let inheritable = attr_use.attribute.inheritable;
 
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
                     // In XSD 1.0, use="prohibited" combined with fixed=X is a valid
@@ -7484,7 +7970,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     // The combination means the attribute may appear with the fixed value.
                     // (W3C test attP031: schema valid in 1.0, instance with fixed value valid.)
                     if fixed.is_some() && self.schema_set.is_xsd10() {
-                        let inheritable = attr_use.attribute.inheritable;
                         return AttributeLookup::Found(
                             attr_key,
                             attr_type,
@@ -7493,10 +7978,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             inheritable,
                         );
                     }
-                    return AttributeLookup::Prohibited;
+                    prohibited_here = true;
+                    continue;
                 }
-
-                let inheritable = attr_use.attribute.inheritable;
                 return AttributeLookup::Found(
                     attr_key,
                     attr_type,
@@ -7505,93 +7989,73 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     inheritable,
                 );
             }
-        }
 
-        // Search attribute groups
-        for ga in self.collect_group_attributes(ct_data) {
-            if ga.name == local_name && ga.namespace == namespace {
-                if ga.use_kind == AttributeUseKind::Prohibited {
-                    // A prohibited use inside an attribute group is transparent —
-                    // it does NOT propagate the prohibition to the referencing type
-                    // (W3C Bugzilla #4043 / TSTF conclusion). Skip it and let the
-                    // base-type chain walk below decide.
-                    break;
+            // Search attribute groups. A prohibited use inside an attribute
+            // group is transparent — it does NOT propagate the prohibition to
+            // the referencing type (W3C Bugzilla #4043 / TSTF conclusion).
+            for ga in self.collect_group_attributes(ct_data) {
+                if ga.name == local_name
+                    && ga.namespace == namespace
+                    && ga.use_kind != AttributeUseKind::Prohibited
+                {
+                    #[cfg(feature = "xsd11")]
+                    let inheritable = ga.inheritable;
+                    #[cfg(not(feature = "xsd11"))]
+                    let inheritable = false;
+                    return AttributeLookup::Found(
+                        ga.attr_key,
+                        ga.type_key,
+                        ga.fixed_value,
+                        ga.fixed_source,
+                        inheritable,
+                    );
                 }
-                #[cfg(feature = "xsd11")]
-                let inheritable = ga.inheritable;
-                #[cfg(not(feature = "xsd11"))]
-                let inheritable = false;
-                return AttributeLookup::Found(
-                    ga.attr_key,
-                    ga.type_key,
-                    ga.fixed_value,
-                    ga.fixed_source,
-                    inheritable,
-                );
+            }
+
+            // Clause 3: the use is inherited from the base unless a
+            // restriction prohibits the name (an extension's prohibition is
+            // ignored).
+            let extension = matches!(
+                ct_data.derivation_method,
+                Some(crate::parser::frames::DerivationMethod::Extension)
+            );
+            if prohibited_here && !extension {
+                return AttributeLookup::Prohibited;
+            }
+            match ct_data.resolved_base_type {
+                Some(TypeKey::Complex(base)) if base != any_type => {
+                    ct_data = &self.schema_set.arenas.complex_types[base];
+                }
+                _ => return AttributeLookup::NotFound,
             }
         }
-
-        // Walk base type chain for inherited attributes (XSD spec §3.4.2.4)
-        if let Some(TypeKey::Complex(base_ct_key)) = ct_data.resolved_base_type {
-            if base_ct_key != self.schema_set.any_type_key() {
-                let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
-                return self.find_attribute_in_type(base_data, local_name, namespace);
-            }
-        }
-
-        AttributeLookup::NotFound
     }
 
     /// Record inheritable attributes with default/fixed values for propagation
     /// to descendant elements (XSD 1.1 §3.3.5.6).
     ///
-    /// Scans both direct attribute uses and attribute group uses. Only records
-    /// defaults for inheritable attributes that were not explicitly provided.
+    /// The ·defaulted attributes· (§3.4.4.2) of the element join its
+    /// \[attributes\] (§3.4.5.1), so an inheritable one is potentially
+    /// inherited like one the instance carried. Walks the type's {attribute
+    /// uses} — its own, its attribute groups', and those inherited from its
+    /// base types ([`for_each_attribute_use`](Self::for_each_attribute_use)) —
+    /// and records the optional inheritable ones with a value constraint that
+    /// were not explicitly provided.
     #[cfg(feature = "xsd11")]
     fn record_inheritable_defaults(&mut self, ct_key: ComplexTypeKey) {
         use super::context::InheritedAttributeValue;
 
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
-
         // Collect candidates to avoid borrow conflict with validation_stack
         let mut candidates: Vec<(Option<NameId>, NameId, String, Option<AttributeKey>)> =
             Vec::new();
-
-        // 1. Direct attribute uses
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            if attr_use.use_kind == AttributeUseKind::Prohibited || !attr_use.attribute.inheritable
-            {
-                continue;
+        self.for_each_attribute_use(ct_key, |u| {
+            if !u.inheritable || u.use_kind != AttributeUseKind::Optional {
+                return;
             }
-            let resolved = ct_data.resolved_attributes.get(i);
-            let attr_key = resolved.and_then(|r| r.resolved_ref);
-            let (name, ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-            let value = attr_use
-                .attribute
-                .default_value
-                .as_deref()
-                .or(attr_use.attribute.fixed_value.as_deref())
-                .or_else(|| {
-                    attr_key
-                        .and_then(|k| self.schema_set.arenas.attributes.get(k))
-                        .and_then(|d| d.default_value.as_deref().or(d.fixed_value.as_deref()))
-                });
-            if let Some(val) = value {
-                candidates.push((ns, name, val.to_string(), attr_key));
+            if let Some(val) = u.value {
+                candidates.push((u.namespace, u.name, val.to_string(), u.attr_key));
             }
-        }
-
-        // 2. Attribute group uses
-        for ga in self.collect_group_attributes(ct_data) {
-            if ga.use_kind == AttributeUseKind::Prohibited || !ga.inheritable {
-                continue;
-            }
-            let value = ga.default_value.as_deref().or(ga.fixed_value.as_deref());
-            if let Some(val) = value {
-                candidates.push((ga.namespace, ga.name, val.to_string(), ga.attr_key));
-            }
-        }
+        });
 
         // Apply to outgoing_inherited: only for attributes not explicitly
         // provided. Use insert() (not or_insert) so defaulted values from
@@ -7609,99 +8073,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
         }
-    }
-
-    /// Check that all required attributes are present.
-    ///
-    /// Walks the base type chain to find inherited required attributes
-    /// (XSD spec §3.4.2.4). Attributes already declared or prohibited in
-    /// derived types are skipped via `checked_names`.
-    /// Read-only detection half of the required-attribute check (§3.4.4
-    /// cvc-complex-type.4). Returns the `(namespace, local-name)` identities of
-    /// every *required* attribute declared by `ct_data` — including its
-    /// attribute groups and inherited from its base-type chain — that is absent
-    /// from `seen`, in the exact order the inline check used to report them.
-    ///
-    /// Pure computation: no error emission and no `&mut self`, so the caller can
-    /// borrow `seen` straight from the validation stack without cloning it. The
-    /// detection helpers it uses (`resolve_attr_use_name_ns`,
-    /// `collect_group_attributes`) are already `&self`. The caller
-    /// (`validate_end_of_attributes`) emits one `cvc-complex-type.4` error per
-    /// returned identity in order — the reporting half is intentionally split out.
-    fn missing_required_attributes(
-        &self,
-        ct_data: &ComplexTypeDefData,
-        seen: &AttrNameSet,
-    ) -> Vec<(Option<NameId>, NameId)> {
-        let mut missing: Vec<(Option<NameId>, NameId)> = Vec::new();
-        // `checked_names` keys are dense interned-int tuples → ahash, not SipHash.
-        let mut checked_names: AttrNameSet = AttrNameSet::default();
-
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-            checked_names.insert((attr_ns, attr_name));
-
-            if attr_use.use_kind != AttributeUseKind::Required {
-                continue;
-            }
-            if !seen.contains(&(attr_ns, attr_name)) {
-                missing.push((attr_ns, attr_name));
-            }
-        }
-
-        // Required attributes from attribute groups
-        for ga in self.collect_group_attributes(ct_data) {
-            checked_names.insert((ga.namespace, ga.name));
-            if ga.use_kind != AttributeUseKind::Required {
-                continue;
-            }
-            if !seen.contains(&(ga.namespace, ga.name)) {
-                missing.push((ga.namespace, ga.name));
-            }
-        }
-
-        // Walk base type chain for inherited required attributes
-        let any_type = self.schema_set.any_type_key();
-        let mut base_type = ct_data.resolved_base_type;
-        while let Some(TypeKey::Complex(base_ct_key)) = base_type {
-            if base_ct_key == any_type {
-                break;
-            }
-            let base_data = &self.schema_set.arenas.complex_types[base_ct_key];
-
-            for (i, attr_use) in base_data.attributes.iter().enumerate() {
-                let resolved = base_data.resolved_attributes.get(i);
-                let (attr_name, attr_ns) =
-                    self.resolve_attr_use_name_ns(attr_use, resolved, base_data.target_namespace);
-                if !checked_names.insert((attr_ns, attr_name)) {
-                    continue; // already handled by derived type
-                }
-                if attr_use.use_kind != AttributeUseKind::Required {
-                    continue;
-                }
-                if !seen.contains(&(attr_ns, attr_name)) {
-                    missing.push((attr_ns, attr_name));
-                }
-            }
-
-            for ga in self.collect_group_attributes(base_data) {
-                if !checked_names.insert((ga.namespace, ga.name)) {
-                    continue;
-                }
-                if ga.use_kind != AttributeUseKind::Required {
-                    continue;
-                }
-                if !seen.contains(&(ga.namespace, ga.name)) {
-                    missing.push((ga.namespace, ga.name));
-                }
-            }
-
-            base_type = base_data.resolved_base_type;
-        }
-
-        missing
     }
 }
 

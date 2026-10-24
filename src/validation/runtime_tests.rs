@@ -1605,6 +1605,99 @@ fn a_prohibition_in_an_extension_is_ignored() {
     defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", "A"), ("b", "", "B")]);
 }
 
+/// The name set of the attribute-use walk: inline up to `AttrNames::INLINE`
+/// names, spilled to a hash set past that, the same answers either way.
+#[test]
+fn attribute_name_sets_spill_past_the_inline_capacity() {
+    let name = |i: u32| (if i < 25 { None } else { Some(NameId(1000)) }, NameId(i));
+    let mut set = AttrNames::new();
+    for i in 0..40 {
+        assert!(set.insert(name(i)), "{i}");
+        assert!(!set.insert(name(i)), "{i} twice");
+    }
+    assert!((0..40).all(|i| set.contains(&name(i))));
+    assert!(!set.contains(&name(40)));
+    let mut other = AttrNames::new();
+    for i in 30..60 {
+        other.insert(name(i));
+    }
+    set.absorb(&mut other);
+    assert!((0..60).all(|i| set.contains(&name(i))));
+    assert!(!other.contains(&name(30)) && !other.contains(&name(59)));
+    set.clear();
+    assert!(!(0..60).any(|i| set.contains(&name(i))));
+    assert!(set.insert(name(5)));
+}
+
+/// A type with more attribute uses than the walk's inline name capacity, in
+/// a base chain: every inherited default is reported once, and a
+/// restriction's prohibitions still apply past the inline capacity.
+#[test]
+fn defaulted_attributes_of_a_wide_base_chain() {
+    let attrs = |prefix: &str, n: usize| {
+        (0..n)
+            .map(|i| {
+                format!(r#"<xs:attribute name="{prefix}{i}" type="xs:string" default="v{i}"/>"#)
+            })
+            .collect::<String>()
+    };
+    let prohibitions = (0..20)
+        .map(|i| format!(r#"<xs:attribute name="b{i}" use="prohibited"/>"#))
+        .collect::<String>();
+    let xsd = format!(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:complexType name="B">{base}</xs:complexType>
+    <xs:complexType name="R"><xs:complexContent><xs:restriction base="t:B">
+        {prohibitions}
+    </xs:restriction></xs:complexContent></xs:complexType>
+    <xs:complexType name="E"><xs:complexContent><xs:extension base="t:R">
+        {own}
+    </xs:extension></xs:complexContent></xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#,
+        base = attrs("b", 30),
+        own = attrs("e", 20),
+    );
+    let mut expected: Vec<(String, String, String)> = (20..30)
+        .map(|i| (format!("b{i}"), String::new(), format!("v{i}")))
+        .chain((0..20).map(|i| (format!("e{i}"), String::new(), format!("v{i}"))))
+        .collect();
+    expected.sort();
+    let expected: Vec<(&str, &str, &str)> = expected
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    defaulted_attributes_in_both_versions(&xsd, &[], &expected);
+}
+
+/// Fix round: the ·effective value constraint· of an attribute use "is
+/// U.{value constraint}, if present, otherwise U.{attribute
+/// declaration}.{value constraint}" (Structures §3.4.4.2) — for a reference
+/// in an attribute group as for a direct one: the group's `fixed="new"` (or
+/// `default="mid"`) wins over the declaration's `default="old"`; a reference
+/// without one takes `old`.
+#[test]
+fn a_group_reference_s_own_value_constraint_is_the_default() {
+    for (group_use, expected) in [
+        (r#"<xs:attribute ref="t:a" fixed="new"/>"#, "new"),
+        (r#"<xs:attribute ref="t:a" default="mid"/>"#, "mid"),
+        (r#"<xs:attribute ref="t:a"/>"#, "old"),
+    ] {
+        let xsd = format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:t" targetNamespace="urn:t">
+    <xs:attribute name="a" type="xs:string" default="old"/>
+    <xs:attributeGroup name="g">{group_use}</xs:attributeGroup>
+    <xs:complexType name="B"><xs:attributeGroup ref="t:g"/></xs:complexType>
+    <xs:complexType name="E"><xs:complexContent><xs:extension base="t:B"/></xs:complexContent></xs:complexType>
+    <xs:element name="root" type="t:E"/>
+</xs:schema>"#
+        );
+        defaulted_attributes_in_both_versions(&xsd, &[], &[("a", "urn:t", expected)]);
+    }
+}
+
 /// C74: a defaulted attribute names its global declaration when it has one
 /// (`None` for a local declaration) and carries the declaration's type.
 #[test]
@@ -7200,6 +7293,94 @@ fn test_inheritable_default_shadows_ancestor() {
 
     v.validate_text("text");
     v.validate_end_element();
+    v.validate_end_element();
+    v.validate_end_element();
+    v.end_validation().ok();
+    assert!(v.sink.errors.is_empty(), "errors: {:?}", v.sink.errors);
+}
+
+/// C75: the defaulted inheritable attribute of `mid` comes from a base type
+/// of mid's type — an extension inherits the base's attribute uses
+/// (Structures §3.4.2.4 clause 3.1), so the default joins mid's \[attributes\]
+/// (§3.4.5.1) and is potentially inherited by `leaf` (§3.3.5.6), shadowing
+/// the ancestor's value; a restriction that prohibits the use (clause 3.2.2)
+/// has no such default, so `leaf` sees the ancestor's value.
+#[test]
+#[cfg(feature = "xsd11")]
+fn an_inheritable_default_from_a_base_type_shadows_the_ancestor() {
+    for (mid_type, expected) in [("E", "fr"), ("R", "en")] {
+        let schema_set = load_schema_xsd11(&format!(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+            <xs:complexType name="B">
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attribute name="lang" type="xs:string" inheritable="true" default="fr"/>
+            </xs:complexType>
+            <xs:complexType name="E"><xs:complexContent><xs:extension base="B"/></xs:complexContent></xs:complexType>
+            <xs:complexType name="R"><xs:complexContent><xs:restriction base="B">
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attribute name="lang" use="prohibited"/>
+            </xs:restriction></xs:complexContent></xs:complexType>
+            <xs:element name="root">
+                <xs:complexType>
+                    <xs:sequence><xs:element name="mid" type="{mid_type}"/></xs:sequence>
+                    <xs:attribute name="lang" type="xs:string" inheritable="true"/>
+                </xs:complexType>
+            </xs:element>
+        </xs:schema>"#
+        ));
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+        let mut v = validator.start_run(TestSink::new());
+        let ns = empty_ns_context();
+        v.validate_element("root", "", None, None, &ns);
+        v.validate_attribute("lang", "", "en");
+        v.validate_end_of_attributes();
+        v.validate_element("mid", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        v.validate_element("leaf", "", None, None, &ns);
+        v.validate_end_of_attributes();
+        let inherited = v.get_inherited_attributes();
+        assert_eq!(inherited.len(), 1, "{mid_type}");
+        assert_eq!(inherited[0].value, expected, "{mid_type}");
+        v.validate_text("text");
+        v.validate_end_element();
+        v.validate_end_element();
+        v.validate_end_element();
+        v.end_validation().ok();
+        assert!(v.sink.errors.is_empty(), "{mid_type}: {:?}", v.sink.errors);
+    }
+}
+
+/// Fix round: an inheritable reference in an attribute group passes its own
+/// `fixed` value down, not its declaration's `default` (Structures §3.4.4.2,
+/// ·effective value constraint·).
+#[test]
+#[cfg(feature = "xsd11")]
+fn an_inheritable_group_reference_passes_its_own_value_constraint() {
+    let schema_set = load_schema_xsd11(
+        r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        <xs:attribute name="lang" type="xs:string" inheritable="true" default="old"/>
+        <xs:attributeGroup name="g">
+            <xs:attribute ref="lang" fixed="new" inheritable="true"/>
+        </xs:attributeGroup>
+        <xs:element name="root">
+            <xs:complexType>
+                <xs:sequence><xs:element name="leaf" type="xs:string"/></xs:sequence>
+                <xs:attributeGroup ref="g"/>
+            </xs:complexType>
+        </xs:element>
+    </xs:schema>"#,
+    );
+    let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
+    let mut v = validator.start_run(TestSink::new());
+    let ns = empty_ns_context();
+    v.validate_element("root", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    v.validate_element("leaf", "", None, None, &ns);
+    v.validate_end_of_attributes();
+    let inherited = v.get_inherited_attributes();
+    assert_eq!(inherited.len(), 1);
+    assert_eq!(inherited[0].value, "new");
+    v.validate_text("text");
     v.validate_end_element();
     v.validate_end_element();
     v.end_validation().ok();

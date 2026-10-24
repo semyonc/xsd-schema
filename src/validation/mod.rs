@@ -34,7 +34,7 @@ pub use info::{AssertionOutcome, InheritedAttribute};
 pub use info::{
     ContentProcessing, ContentType, DefaultAttribute, ExpectedAttribute, ExpectedElement,
     NoNamespaceSchemaLocationHint, NodeIdentity, SchemaInfo, SchemaLocationHint, SchemaValidity,
-    TypeSource, ValidationAttempted, ValidationFlags,
+    TypeSource, ValidationAttempted, ValidationFlags, ValidationRoot,
 };
 
 pub use content::{CompiledContentModel, ContentValidatorState, ElementMatchInfo};

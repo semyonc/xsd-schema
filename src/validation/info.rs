@@ -47,7 +47,11 @@ pub enum ContentType {
 }
 
 /// How the final `schema_type` was determined
+///
+/// `#[non_exhaustive]`: a variant can be added (one is feature-gated
+/// already), so a `match` needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeSource {
     /// From the element/attribute declaration's resolved_type
     Declaration,
@@ -56,6 +60,12 @@ pub enum TypeSource {
     /// Selected by Conditional Type Assignment (XSD 1.1)
     #[cfg(feature = "xsd11")]
     TypeAlternative,
+    /// The type definition the run stipulated for the validation root
+    /// ([`ValidationRoot::Type`], type-driven validation, Structures §5.2;
+    /// §3.3.4.6 governing type definition clause "2 A type definition
+    /// stipulated by the processor"). An `xsi:type` that overrides it is
+    /// [`XsiType`](Self::XsiType).
+    Stipulated,
 }
 
 /// Complex-type assertion evaluation outcome (XSD 1.1)
@@ -160,6 +170,119 @@ impl Default for ValidationFlags {
     fn default() -> Self {
         ValidationFlags::REPORT_WARNINGS | ValidationFlags::BUILD_PSVI_TYPED_VALUES
     }
+}
+
+/// How a run assesses its validation root — the element its first event
+/// opens (Structures §5.2 "Assessing Schema-Validity"). Set with
+/// [`ValidationRuntime::set_validation_root`](super::ValidationRuntime::set_validation_root)
+/// before the root's element event; the default is
+/// [`Declaration`](Self::Declaration), the behaviour of every run that does
+/// not set one.
+///
+/// Every driver that takes the caller's runtime honours it —
+/// `drive_quick_xml` and its variants, `drive_navigator`,
+/// `drive_buffer_document`, and the typed build `build_typed_document_with`
+/// (whose `TypedBuilderHandler` takes each element's binding from the
+/// [`SchemaInfo`] the mode produces). `build_typed_document`, which makes its
+/// own runtime, always uses the default.
+///
+/// The mode applies to each validation root of the run: every element
+/// started while no element is open. Only the root is affected; its
+/// attributes and children are assessed as Structures §3.3.4.6 prescribes
+/// for the root's governing declaration or type. The checks that need the
+/// whole run — Validation Root Valid (ID/IDREF) (§3.3.4.5) and identity
+/// constraints — apply in every mode.
+///
+/// | Mode | Root's `element_decl` | `schema_type` | `[validity]`, `[validation attempted]` | Errors of its own |
+/// |---|---|---|---|---|
+/// | `Declaration` | the top-level declaration of its name | the declaration's type (or `xsi:type`, a type alternative) | strict assessment | `cvc-elt.1` when undeclared and without `xsi:type` |
+/// | `Element(D)` | `D` | `D`'s type (or `xsi:type`, a type alternative) | strict assessment | `cvc-elt.1` when the root's name is not `D`'s |
+/// | `Type(T)` | none | `T`, or an `xsi:type` that overrides it | strict assessment | `cvc-elt.4.*` for an `xsi:type` that does not override `T`, `cvc-type.2` for an abstract governing type |
+/// | `Lax` | as `Declaration` | as `Declaration` | strict when declared or `xsi:type` names a type; otherwise *notKnown* (*invalid* for an invalid attribute or `xsi:type` of its own), and *none* / *partial* | none for an undeclared root |
+///
+/// `#[non_exhaustive]`, so further modes can be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ValidationRoot {
+    /// *Strict wildcard validation* (§5.2): "The processor starts from
+    /// Schema-Validity Assessment (Element) (§3.3.4.6) with no stipulated
+    /// declaration or definition. If the ·validation root· and the schema
+    /// determine an element declaration (by the name of the element) … or a
+    /// type definition (via xsi:type), then ·strict· validation is
+    /// performed"; otherwise the root is laxly assessed and its absence from
+    /// the schema is reported as `cvc-elt.1` — the case §5.2 describes as
+    /// "the invoking process expects the ·validation root· to be declared and
+    /// valid and will otherwise report an error to its environment". The
+    /// behaviour of a run that sets no mode.
+    #[default]
+    Declaration,
+    /// *Element-driven validation* (§5.2): "the item is validated as described
+    /// in Schema-Validity Assessment (Element) (§3.3.4.6) (with the stipulated
+    /// element declaration as the ·governing· declaration)" — §3.3.4.6,
+    /// governing element declaration, clause "1 A declaration stipulated by
+    /// the processor". The declaration governs whatever the root's name;
+    /// Element Locally Valid (Element) (§3.3.4.3) "1 D is not ·absent· and E
+    /// and D have the same expanded name" makes a root of another name
+    /// invalid (`cvc-elt.1`; XSD 1.0 §5.2: the application "checks that its
+    /// {name} and {target namespace} match"). Everything else — `xsi:type`,
+    /// `xsi:nil`, `{abstract}`, type alternatives, identity constraints — is
+    /// as for a declared element.
+    Element(crate::ids::ElementKey),
+    /// *Type-driven validation* (§5.2): "If the ·validation root· is an
+    /// element, then it is validated as described in Schema-Validity
+    /// Assessment (Element) (§3.3.4.6) (with the stipulated type definition
+    /// as the ·governing type definition·)". The root has no governing
+    /// element declaration, even when a top-level declaration of its name
+    /// exists (§3.3.4.6, governing element declaration clause 4.2: none is
+    /// resolved by name when "the processor has stipulated a type definition
+    /// for E").
+    ///
+    /// - **`xsi:type`**: the governing type is "1 An ·instance-specified type
+    ///   definition· which ·overrides· a type definition stipulated by the
+    ///   processor", else "2 A type definition stipulated by the processor".
+    ///   It overrides when ·validly substitutable· for the stipulated type
+    ///   "subject to the blocking keywords in the union of K and
+    ///   T.{prohibited substitutions}" with K empty (§3.3.4.2; XSD 1.0 §3.3.4
+    ///   clause 1.2.1.2.4: "validly derived from that type definition given
+    ///   its {prohibited substitutions}"). One that does not is reported as
+    ///   for a declared element (`cvc-elt.4.1` unresolved, `cvc-elt.4.2` not
+    ///   derived, `cvc-elt.4.3` blocked), the root is invalid, and the
+    ///   stipulated type stays governing.
+    /// - **Abstract**: an abstract governing complex type is `cvc-type.2`
+    ///   (Element Locally Valid (Type) §3.3.4.4 clause 2); an `xsi:type` that
+    ///   overrides it with a concrete type is valid.
+    /// - **`xsi:nil`**: ·nilled· is defined "with respect to some element
+    ///   declaration D" with "D.{nillable} = true" (§3.3.1), so the root is
+    ///   never nilled: `xsi:nil` is checked as an `xs:boolean` attribute and
+    ///   the content against the type.
+    /// - **PSVI**: `element_decl` `None`, `schema_type` the governing type,
+    ///   `type_source` [`TypeSource::Stipulated`] for the stipulated type and
+    ///   [`TypeSource::XsiType`] for an overriding `xsi:type`; strictly
+    ///   assessed (§3.3.4.6 clause 1.2), so `[validity]` is valid or invalid.
+    /// - A simple type is allowed (§3.3.4.4 clause 3.1: no attributes but
+    ///   `xsi:*`, no element children, the text String Valid).
+    Type(crate::ids::TypeKey),
+    /// *Lax wildcard validation* (§5.2): as [`Declaration`](Self::Declaration)
+    /// when the root's name resolves to a top-level declaration or its
+    /// `xsi:type` to a type — "then ·strict validation· is performed. If they
+    /// do not identify any declaration or definition, then ·lax assessment·
+    /// is performed" ("analogous to the validation of an element information
+    /// item which matches a lax wildcard"): "E is locally ·validated· with
+    /// respect to ·xs:anyType·" and the schema-validity of "E's \[attributes\]
+    /// and \[children\] is assessed" (§3.3.4.6) — a declared child or a
+    /// globally declared attribute strictly, and its errors reported.
+    ///
+    /// A laxly assessed root has no type and no declaration, its
+    /// `[validity]` is *notKnown* whatever its children (§3.3.5.1 clause 2),
+    /// and its `[validation attempted]` *none*, or *partial* when an
+    /// attribute or child was assessed. No `cvc-elt.1` is reported. As for an
+    /// element a lax wildcard matched, two things of the root's own make it
+    /// *invalid*: an attribute that its global declaration finds invalid, and
+    /// an `xsi:type` that names no type (`cvc-elt.4.1`).
+    ///
+    /// A host that wants an `xsi:type` attribute alone not to cause strict
+    /// validation passes no `xsi:type` to the element event.
+    Lax,
 }
 
 /// Content processing mode for wildcard-matched elements/attributes
