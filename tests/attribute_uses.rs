@@ -50,6 +50,18 @@ fn schema(version: XsdVersion, body: &str) -> SchemaSet {
         .into_schema_set()
 }
 
+/// The schema-construction error of `body`, if it is refused.
+fn schema_error(version: XsdVersion, body: &str) -> Option<String> {
+    let xsd =
+        format!(r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">{body}</xs:schema>"#);
+    SchemaSetBuilder::with_version(version)
+        .add_source(&xsd, "file:///attribute_uses.xsd")
+        .expect("schema source accepted")
+        .compile()
+        .err()
+        .map(|e| e.to_string())
+}
+
 fn validator(ss: &SchemaSet, psvi: bool) -> SchemaValidator<'_> {
     let mut flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
     if !psvi {
@@ -66,7 +78,10 @@ fn codes(errors: &[ValidationError]) -> Vec<String> {
     errors.iter().map(|e| e.constraint.to_string()).collect()
 }
 
-fn stream(ss: &SchemaSet, xml: &str, psvi: bool) -> Outcome {
+/// The unparsed entities a run declares (`None`: not checked).
+type Entities<'e> = Option<&'e std::collections::HashSet<String>>;
+
+fn stream(ss: &SchemaSet, xml: &str, psvi: bool, entities: Entities<'_>) -> Outcome {
     let v = validator(ss, psvi);
     let (mut errors, mut warnings) = (Vec::new(), Vec::new());
     let validity = {
@@ -74,6 +89,9 @@ fn stream(ss: &SchemaSet, xml: &str, psvi: bool) -> Outcome {
             errors: &mut errors,
             warnings: &mut warnings,
         });
+        if let Some(entities) = entities {
+            rt.set_unparsed_entities(entities.clone());
+        }
         drive_quick_xml(xml.as_bytes(), &mut rt, ss)
             .expect("stream drive completes")
             .root_validity
@@ -81,7 +99,7 @@ fn stream(ss: &SchemaSet, xml: &str, psvi: bool) -> Outcome {
     (validity, codes(&errors))
 }
 
-fn dom(ss: &SchemaSet, xml: &str) -> Outcome {
+fn dom(ss: &SchemaSet, xml: &str, entities: Entities<'_>) -> Outcome {
     let v = validator(ss, true);
     let doc = roxmltree::Document::parse(xml).expect("well-formed instance");
     let nav = RoXmlNavigator::new(&doc);
@@ -91,6 +109,9 @@ fn dom(ss: &SchemaSet, xml: &str) -> Outcome {
             errors: &mut errors,
             warnings: &mut warnings,
         });
+        if let Some(entities) = entities {
+            rt.set_unparsed_entities(entities.clone());
+        }
         drive_navigator(&nav, &mut rt, ss)
             .expect("navigator drive completes")
             .root_validity
@@ -99,7 +120,7 @@ fn dom(ss: &SchemaSet, xml: &str) -> Outcome {
 }
 
 #[cfg(feature = "xsd11")]
-fn buffer(ss: &SchemaSet, xml: &str) -> Outcome {
+fn buffer(ss: &SchemaSet, xml: &str, entities: Entities<'_>) -> Outcome {
     use xsd_schema::document::{BufferDocument, BufferDocumentOptions};
     use xsd_schema::validation::drive_buffer_document;
     let v = validator(ss, true);
@@ -118,6 +139,9 @@ fn buffer(ss: &SchemaSet, xml: &str) -> Outcome {
             errors: &mut errors,
             warnings: &mut warnings,
         });
+        if let Some(entities) = entities {
+            rt.set_unparsed_entities(entities.clone());
+        }
         drive_buffer_document(&doc, &mut rt, ss)
             .expect("buffer drive completes")
             .root_validity
@@ -126,7 +150,7 @@ fn buffer(ss: &SchemaSet, xml: &str) -> Outcome {
 }
 
 #[cfg(feature = "xsd11")]
-fn typed_build(ss: &SchemaSet, xml: &str) -> Outcome {
+fn typed_build(ss: &SchemaSet, xml: &str, entities: Entities<'_>) -> Outcome {
     use xsd_schema::document::{build_typed_document_with, TypedBuildOptions};
     use xsd_schema::validation::NoopHandler;
     let v = validator(ss, true);
@@ -137,6 +161,9 @@ fn typed_build(ss: &SchemaSet, xml: &str) -> Outcome {
             errors: &mut errors,
             warnings: &mut warnings,
         });
+        if let Some(entities) = entities {
+            rt.set_unparsed_entities(entities.clone());
+        }
         let built = build_typed_document_with(
             xml.as_bytes(),
             &arena,
@@ -155,15 +182,27 @@ fn typed_build(ss: &SchemaSet, xml: &str) -> Outcome {
 /// Every driver: the root's `[validity]` is `expected`, and an error whose
 /// constraint code starts with `code` was reported (`None`: no error at all).
 fn check(ss: &SchemaSet, label: &str, xml: &str, expected: SchemaValidity, code: Option<&str>) {
+    check_with(ss, label, xml, None, expected, code)
+}
+
+/// `check`, the run declaring the unparsed entities `entities`.
+fn check_with(
+    ss: &SchemaSet,
+    label: &str,
+    xml: &str,
+    entities: Entities<'_>,
+    expected: SchemaValidity,
+    code: Option<&str>,
+) {
     let runs = [
-        ("stream", stream(ss, xml, true)),
-        ("stream/no-psvi", stream(ss, xml, false)),
-        ("navigator", dom(ss, xml)),
+        ("stream", stream(ss, xml, true, entities)),
+        ("stream/no-psvi", stream(ss, xml, false, entities)),
+        ("navigator", dom(ss, xml, entities)),
     ];
     #[cfg(feature = "xsd11")]
     let runs = runs.into_iter().chain([
-        ("buffer", buffer(ss, xml)),
-        ("typed build", typed_build(ss, xml)),
+        ("buffer", buffer(ss, xml, entities)),
+        ("typed build", typed_build(ss, xml, entities)),
     ]);
     for (driver, (validity, errors)) in runs {
         assert_eq!(
@@ -226,9 +265,7 @@ fn an_extension_prohibition_keeps_a_required_base_attribute() {
 /// An attribute group's prohibited `<attribute>` is no attribute use (XSD 1.0
 /// §3.2.2 "corresponds to nothing at all"; W3C Bugzilla #4043): the base's
 /// required `r` is inherited by the extension. (The same group in a
-/// restriction of `B` is refused at schema construction today —
-/// `derivation-ok-restriction` reads the group's prohibition as one; a
-/// separate defect, not exercised here.)
+/// restriction of `B`: `a_group_prohibition_in_a_restriction_keeps_a_required_base_attribute`.)
 #[test]
 fn a_group_prohibition_keeps_a_required_base_attribute() {
     let body = format!(
@@ -663,4 +700,448 @@ fn a_reference_s_own_value_constraint_wins_over_the_declaration_s() {
         })
         .collect();
     check_all(body, &cases);
+}
+
+// ── C80: derivation-ok-restriction reads the {attribute uses} as validation does ──
+
+/// Structures 1.1 §3.4.6.3 (Derivation Valid (Restriction, Complex)) clause 3:
+/// "For every element information item E, if the [attributes] of E satisfy
+/// clause 2 and clause 3 of Element Locally Valid (Complex Type) (§3.4.4.2)
+/// with respect to T, then they also satisfy the same clauses with respect to
+/// B"; XSD 1.0 §3.4.6 clause 3: "For each attribute use in the {attribute
+/// uses} of the {base type definition} whose {required} is true, there must be
+/// an attribute use with an {attribute declaration} with the same {name} and
+/// {target namespace} as its {attribute declaration} in the {attribute uses}
+/// of the complex type definition itself whose {required} is true." An
+/// attribute group's `<attribute use="prohibited">` "corresponds to nothing at
+/// all" (§3.2.2.2; XSD 1.0 §3.2.2), so the restriction inherits `r`
+/// (§3.4.2.4 clause 3.2) — required, as in the base: the schema is valid, and
+/// validation requires `r`.
+#[test]
+fn a_group_prohibition_in_a_restriction_keeps_a_required_base_attribute() {
+    let body = format!(
+        r#"{REQUIRED_BASE}
+  <xs:complexType name="G"><xs:complexContent><xs:restriction base="B">
+    <xs:attributeGroup ref="prohibitsR"/>
+  </xs:restriction></xs:complexContent></xs:complexType>
+  <xs:element name="g" type="G"/>"#
+    );
+    for version in VERSIONS {
+        assert_eq!(schema_error(version, &body), None, "{version:?}");
+    }
+    check_all(
+        &body,
+        &[
+            ("<g/>", Invalid, Some("cvc-complex-type.4")),
+            ("<g r='1'/>", Valid, None),
+            ("<g r='x'/>", Invalid, Some("cvc-datatype-valid")),
+        ],
+    );
+}
+
+/// Guards: a restriction that removes a required base attribute itself
+/// (§3.4.2.4 clause 3.2.2: its own prohibited `<attribute>` stops the
+/// inheritance) or includes an optional use of it through a group (clause
+/// 3.2.1: the group's use is in the set, so the base's is not inherited) has
+/// no required `r` — refused, in both versions.
+#[test]
+fn a_restriction_that_removes_or_weakens_a_required_attribute_is_refused() {
+    let own = format!(
+        r#"{REQUIRED_BASE}
+  <xs:complexType name="P"><xs:complexContent><xs:restriction base="B">
+    <xs:attribute name="r" use="prohibited"/>
+  </xs:restriction></xs:complexContent></xs:complexType>"#
+    );
+    let group = format!(
+        r#"{REQUIRED_BASE}
+  <xs:attributeGroup name="optionalR"><xs:attribute name="r" type="xs:int"/></xs:attributeGroup>
+  <xs:complexType name="O"><xs:complexContent><xs:restriction base="B">
+    <xs:attributeGroup ref="optionalR"/>
+  </xs:restriction></xs:complexContent></xs:complexType>"#
+    );
+    for version in VERSIONS {
+        for body in [&own, &group] {
+            let error = schema_error(version, body);
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("derivation-ok-restriction")),
+                "{version:?}: {error:?}"
+            );
+        }
+    }
+}
+
+/// The base side of the comparison is the base's whole {attribute uses}
+/// (§3.4.2.4), cumulative down its base chain: an extension's prohibited
+/// `<attribute>` is "simply ignored" (clause 3.1 inherits every use), so `E`
+/// has `r` required, and a restriction of `E` that declares `r` optional
+/// weakens it — refused, although `E`'s wildcard would admit an `r` that
+/// matched no use of the base (XSD 1.0 clause 2.2). A restriction of `E` that
+/// leaves `r` alone inherits it, required.
+#[test]
+fn the_base_of_a_restriction_keeps_what_an_extension_prohibition_ignores() {
+    let base = r#"
+  <xs:complexType name="B">
+    <xs:attribute name="r" type="xs:int" use="required"/>
+    <xs:anyAttribute processContents="lax"/>
+  </xs:complexType>
+  <xs:complexType name="E"><xs:complexContent><xs:extension base="B">
+    <xs:attribute name="r" use="prohibited"/>
+  </xs:extension></xs:complexContent></xs:complexType>"#;
+    let weakened = format!(
+        r#"{base}
+  <xs:complexType name="R"><xs:complexContent><xs:restriction base="E">
+    <xs:attribute name="r" type="xs:int"/>
+  </xs:restriction></xs:complexContent></xs:complexType>"#
+    );
+    let kept = format!(
+        r#"{base}
+  <xs:complexType name="K"><xs:complexContent><xs:restriction base="E">
+    <xs:anyAttribute processContents="lax"/>
+  </xs:restriction></xs:complexContent></xs:complexType>
+  <xs:element name="k" type="K"/>"#
+    );
+    for version in VERSIONS {
+        let error = schema_error(version, &weakened);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("derivation-ok-restriction")),
+            "{version:?}: {error:?}"
+        );
+        assert_eq!(schema_error(version, &kept), None, "{version:?}");
+    }
+    check_all(
+        &kept,
+        &[
+            ("<k/>", Invalid, Some("cvc-complex-type.4")),
+            ("<k r='1'/>", Valid, None),
+        ],
+    );
+}
+
+/// The base side, an attribute group's prohibition: `M` restricts `B1` with a
+/// group that prohibits `p` — no attribute use, so `M` inherits `p`
+/// (`xs:int`) — and `R` restricts `M` with `p` of type `xs:string`, not validly
+/// derived from `xs:int` (XSD 1.0 clause 2.1.2; 1.1 clause 4 and clause 3's
+/// ·default binding·): refused, although `M`'s wildcard would admit a `p` that
+/// matched no use of the base. `M` itself validates `p` as an `xs:int`.
+#[test]
+fn the_base_of_a_restriction_keeps_what_a_group_prohibition_ignores() {
+    let base = r#"
+  <xs:complexType name="B1">
+    <xs:attribute name="p" type="xs:int"/>
+    <xs:anyAttribute processContents="lax"/>
+  </xs:complexType>
+  <xs:attributeGroup name="prohibitsP"><xs:attribute name="p" use="prohibited"/></xs:attributeGroup>
+  <xs:complexType name="M"><xs:complexContent><xs:restriction base="B1">
+    <xs:attributeGroup ref="prohibitsP"/>
+    <xs:anyAttribute processContents="lax"/>
+  </xs:restriction></xs:complexContent></xs:complexType>
+  <xs:element name="m" type="M"/>"#;
+    let retyped = format!(
+        r#"{base}
+  <xs:complexType name="R"><xs:complexContent><xs:restriction base="M">
+    <xs:attribute name="p" type="xs:string"/>
+  </xs:restriction></xs:complexContent></xs:complexType>"#
+    );
+    for version in VERSIONS {
+        assert_eq!(schema_error(version, base), None, "{version:?}");
+        let error = schema_error(version, &retyped);
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("derivation-ok-restriction")),
+            "{version:?}: {error:?}"
+        );
+    }
+    check_all(
+        base,
+        &[
+            ("<m p='1'/>", Valid, None),
+            ("<m p='x'/>", Invalid, Some("cvc-datatype-valid")),
+        ],
+    );
+}
+
+// ── C86: defaulted attributes of types derived from the ID family ─────────
+
+/// Structures §3.17.5.2 (the ID/IDREF table: "the ID/IDREF bindings … for
+/// every ·eligible item· … whose [type definition] is or is derived from ID,
+/// IDREF or IDREFS", list members and union values included) and Validation
+/// Root Valid (ID/IDREF) (§3.3.4.5). A defaulted attribute is one of
+/// E.[attributes] (§3.4.5.1), so its value takes part as a carried one does,
+/// whatever derives its type from `xs:IDREF`: a restriction, a list of it, a
+/// union with it as a member. Both versions (an IDREF default is allowed in
+/// XSD 1.0); one use comes from an attribute group, one is inherited.
+const DERIVED_IDREF: &str = r#"
+  <xs:simpleType name="pref"><xs:restriction base="xs:IDREF"><xs:pattern value="k.*"/></xs:restriction></xs:simpleType>
+  <xs:simpleType name="prefs"><xs:list itemType="pref"/></xs:simpleType>
+  <xs:simpleType name="intOrRef"><xs:union memberTypes="xs:integer pref"/></xs:simpleType>
+  <xs:attributeGroup name="refs"><xs:attribute name="to" type="prefs" default="k1 k2"/></xs:attributeGroup>
+  <xs:complexType name="U"><xs:attribute name="to" type="intOrRef" default="k1"/></xs:complexType>
+  <xs:element name="root"><xs:complexType><xs:sequence>
+    <xs:choice>
+      <xs:element name="r"><xs:complexType><xs:attribute name="to" type="pref" default="k1"/></xs:complexType></xs:element>
+      <xs:element name="l"><xs:complexType><xs:attributeGroup ref="refs"/></xs:complexType></xs:element>
+      <xs:element name="u"><xs:complexType><xs:complexContent><xs:extension base="U"/></xs:complexContent></xs:complexType></xs:element>
+      <xs:element name="n"><xs:complexType><xs:attribute name="to" type="intOrRef" default="12"/></xs:complexType></xs:element>
+    </xs:choice>
+    <xs:element name="id" minOccurs="0" maxOccurs="unbounded"><xs:complexType>
+      <xs:attribute name="id" type="xs:ID"/>
+    </xs:complexType></xs:element>
+  </xs:sequence></xs:complexType></xs:element>"#;
+
+#[test]
+fn a_defaulted_idref_of_a_derived_type_must_resolve() {
+    check_all(
+        DERIVED_IDREF,
+        &[
+            ("<root><r/></root>", Invalid, Some("cvc-id.1")),
+            ("<root><r/><id id='k1'/></root>", Valid, None),
+            ("<root><l/><id id='k1'/></root>", Invalid, Some("cvc-id.1")),
+            ("<root><l/><id id='k1'/><id id='k2'/></root>", Valid, None),
+            ("<root><u/></root>", Invalid, Some("cvc-id.1")),
+            ("<root><u/><id id='k1'/></root>", Valid, None),
+            // The union value `12` is an `xs:integer`: no IDREF.
+            ("<root><n/></root>", Valid, None),
+        ],
+    );
+}
+
+/// XSD 1.1 (a value constraint on an `xs:ID`-derived attribute is allowed;
+/// XSD 1.0's a-props-correct.3 refuses it): the batch (t) reproducer — two
+/// sibling `<a/>` defaulting a `pattern`-restricted `xs:ID` to `k1` — is a
+/// duplicate (`cvc-id.2`); so is a defaulted ID against a carried one, and a
+/// default of a union with an `xs:ID`-derived member whose value is of that
+/// member. The union's value is chosen with the bindings in scope at the
+/// declaration (Datatypes §3.3.18): `x` written under the default namespace
+/// `urn:t` is the QName `{urn:t}x` of the enumerated QName member, not an ID.
+#[test]
+fn a_defaulted_id_of_a_derived_type_is_counted() {
+    let body = r#"
+  <xs:simpleType name="pid"><xs:restriction base="xs:ID"><xs:pattern value="k.*"/></xs:restriction></xs:simpleType>
+  <xs:simpleType name="intOrId"><xs:union memberTypes="xs:integer pid"/></xs:simpleType>
+  <xs:element name="doc"><xs:complexType><xs:choice maxOccurs="unbounded">
+    <xs:element name="a"><xs:complexType><xs:attribute name="key" type="pid" default="k1"/></xs:complexType></xs:element>
+    <xs:element name="b"><xs:complexType><xs:attribute name="key" type="xs:ID"/></xs:complexType></xs:element>
+    <xs:element name="c"><xs:complexType><xs:attribute name="key" type="intOrId" default="k1"/></xs:complexType></xs:element>
+    <xs:element name="d"><xs:complexType><xs:attribute name="key" type="intOrId" default="7"/></xs:complexType></xs:element>
+    <xs:element name="q"><xs:complexType>
+      <xs:attribute name="key" default="x" xmlns="urn:t"><xs:simpleType><xs:union>
+        <xs:simpleType><xs:restriction base="xs:QName"><xs:enumeration value="x"/></xs:restriction></xs:simpleType>
+        <xs:simpleType><xs:restriction base="xs:ID"/></xs:simpleType>
+      </xs:union></xs:simpleType></xs:attribute>
+    </xs:complexType></xs:element>
+  </xs:choice></xs:complexType></xs:element>"#;
+    let ss = schema(XsdVersion::V1_1, body);
+    let label = "V1_1";
+    check(&ss, label, "<doc><a/><a/></doc>", Invalid, Some("cvc-id.2"));
+    check(&ss, label, "<doc><a/><a key='k2'/></doc>", Valid, None);
+    check(
+        &ss,
+        label,
+        "<doc><a/><b key='k1'/></doc>",
+        Invalid,
+        Some("cvc-id.2"),
+    );
+    check(&ss, label, "<doc><c/><c/></doc>", Invalid, Some("cvc-id.2"));
+    check(&ss, label, "<doc><d/><d/></doc>", Valid, None);
+    check(&ss, label, "<doc><q/><q/></doc>", Valid, None);
+}
+
+// ── C83: get_expected_attributes ─────────────────────────────────────────
+
+/// `get_expected_attributes` lists the element's {attribute uses}
+/// (§3.4.2.4) — its own, its attribute groups', and those inherited from its
+/// base types, each name once; a restriction's prohibited names are not
+/// inherited, a group's prohibited `<attribute>` is no use.
+#[test]
+fn expected_attributes_are_the_attribute_uses() {
+    use xsd_schema::namespace::context::NamespaceContextSnapshot;
+    let body = r#"
+  <xs:attributeGroup name="g">
+    <xs:attribute name="ga" type="xs:int"/>
+    <xs:attribute name="gp" use="prohibited"/>
+  </xs:attributeGroup>
+  <xs:complexType name="B">
+    <xs:attribute name="r" type="xs:int" use="required"/>
+    <xs:attribute name="o" type="xs:int"/>
+    <xs:attribute name="q" type="xs:int"/>
+  </xs:complexType>
+  <xs:complexType name="E"><xs:complexContent><xs:extension base="B">
+    <xs:attribute name="x" type="xs:int"/>
+    <xs:attributeGroup ref="g"/>
+  </xs:extension></xs:complexContent></xs:complexType>
+  <xs:complexType name="R"><xs:complexContent><xs:restriction base="E">
+    <xs:attribute name="o" use="prohibited"/>
+    <xs:attribute name="q" type="xs:int" use="required"/>
+  </xs:restriction></xs:complexContent></xs:complexType>
+  <xs:element name="e" type="E"/>
+  <xs:element name="rr" type="R"/>"#;
+    for version in VERSIONS {
+        let ss = schema(version, body);
+        let expected = |element: &str| {
+            let v = validator(&ss, true);
+            let (mut errors, mut warnings) = (Vec::new(), Vec::new());
+            let mut rt = v.start_run(CollectingValidationSink {
+                errors: &mut errors,
+                warnings: &mut warnings,
+            });
+            let ns = NamespaceContextSnapshot {
+                default_ns: None,
+                bindings: Vec::new(),
+            };
+            rt.validate_element(element, "", None, None, &ns);
+            let mut names: Vec<(String, bool)> = rt
+                .get_expected_attributes()
+                .iter()
+                .map(|a| (ss.name_table.resolve(a.local_name).to_string(), a.required))
+                .collect();
+            names.sort();
+            names
+        };
+        let own = |list: &[(&str, bool)]| -> Vec<(String, bool)> {
+            list.iter().map(|(n, r)| (n.to_string(), *r)).collect()
+        };
+        assert_eq!(
+            expected("e"),
+            own(&[
+                ("ga", false),
+                ("o", false),
+                ("q", false),
+                ("r", true),
+                ("x", false)
+            ]),
+            "{version:?} e"
+        );
+        assert_eq!(
+            expected("rr"),
+            own(&[("ga", false), ("q", true), ("r", true), ("x", false)]),
+            "{version:?} rr"
+        );
+    }
+}
+
+// ── C84: an attribute reference's {inheritable} ───────────────────────────
+
+/// XSD 1.1 §3.2.2.3 (Mapping Rules for References to Top-level Attribute
+/// Declarations): the attribute use's "{inheritable} The ·actual value· of the
+/// inheritable [attribute], if present, otherwise {attribute
+/// declaration}.{inheritable}"; §3.3.5.6: an attribute is potentially
+/// inherited when "3.1 A is ·attributed to· an Attribute Use whose
+/// {inheritable} = true". `lang` is declared `inheritable="true"`; `doc`
+/// refers to it with no `inheritable` (inherited — the type alternative of
+/// `chap` sees it), with `inheritable="false"` (not inherited: the W3C
+/// `cta0012` case), and with a `default` (the defaulted value is inherited).
+#[cfg(feature = "xsd11")]
+#[test]
+fn an_attribute_reference_inherits_the_declaration_s_inheritable() {
+    let body = |use_attrs: &str| {
+        format!(
+            r#"
+  <xs:attribute name="lang" type="xs:language" inheritable="true"/>
+  <xs:complexType name="De"><xs:sequence><xs:element name="de"/></xs:sequence></xs:complexType>
+  <xs:complexType name="En"><xs:sequence><xs:element name="en"/></xs:sequence></xs:complexType>
+  <xs:element name="chap">
+    <xs:alternative test="@lang = 'de'" type="De"/>
+    <xs:alternative type="En"/>
+  </xs:element>
+  <xs:element name="doc"><xs:complexType>
+    <xs:sequence><xs:element ref="chap" maxOccurs="unbounded"/></xs:sequence>
+    <xs:attribute ref="lang" {use_attrs}/>
+  </xs:complexType></xs:element>"#
+        )
+    };
+    let label = "V1_1";
+    let ss = schema(XsdVersion::V1_1, &body(""));
+    check(
+        &ss,
+        label,
+        "<doc lang='de'><chap><de/></chap></doc>",
+        Valid,
+        None,
+    );
+    check(
+        &ss,
+        label,
+        "<doc lang='de'><chap><en/></chap></doc>",
+        Invalid,
+        Some("cvc-complex-type.2.4"),
+    );
+    check(&ss, label, "<doc><chap><en/></chap></doc>", Valid, None);
+    let ss = schema(XsdVersion::V1_1, &body(r#"inheritable="false""#));
+    check(
+        &ss,
+        label,
+        "<doc lang='de'><chap><en/></chap></doc>",
+        Valid,
+        None,
+    );
+    let ss = schema(XsdVersion::V1_1, &body(r#"inheritable="true""#));
+    check(
+        &ss,
+        label,
+        "<doc lang='de'><chap><de/></chap></doc>",
+        Valid,
+        None,
+    );
+    let ss = schema(XsdVersion::V1_1, &body(r#"default="de""#));
+    check(&ss, label, "<doc><chap><de/></chap></doc>", Valid, None);
+    check(
+        &ss,
+        label,
+        "<doc lang='en'><chap><en/></chap></doc>",
+        Valid,
+        None,
+    );
+}
+
+/// C86, the ENTITY half (fix round 1, F6): String Valid (§3.16.4) "3 … every
+/// ENTITY value … is a declared entity name" — checked against the unparsed
+/// entities the run declares (`set_unparsed_entities`). A defaulted attribute
+/// of a type derived from `xs:ENTITY` — a restriction, a list of it, a union
+/// with it as a member — is checked as a carried one is; the built-in type was
+/// checked before (guard). Both versions (an ENTITY default is allowed in XSD
+/// 1.0).
+#[test]
+fn a_defaulted_entity_of_a_derived_type_is_checked() {
+    let body = r#"
+  <xs:simpleType name="pent"><xs:restriction base="xs:ENTITY"><xs:pattern value="p.*"/></xs:restriction></xs:simpleType>
+  <xs:simpleType name="pents"><xs:list itemType="pent"/></xs:simpleType>
+  <xs:simpleType name="intOrEnt"><xs:union memberTypes="xs:integer pent"/></xs:simpleType>
+  <xs:element name="root"><xs:complexType><xs:choice>
+    <xs:element name="e"><xs:complexType><xs:attribute name="pic" type="pent" default="pnone"/></xs:complexType></xs:element>
+    <xs:element name="l"><xs:complexType><xs:attribute name="pic" type="pents" default="plogo pnone"/></xs:complexType></xs:element>
+    <xs:element name="u"><xs:complexType><xs:attribute name="pic" type="intOrEnt" default="pnone"/></xs:complexType></xs:element>
+    <xs:element name="n"><xs:complexType><xs:attribute name="pic" type="intOrEnt" default="12"/></xs:complexType></xs:element>
+    <xs:element name="b"><xs:complexType><xs:attribute name="pic" type="xs:ENTITY" default="pnone"/></xs:complexType></xs:element>
+    <xs:element name="ok"><xs:complexType><xs:attribute name="pic" type="pents" default="plogo"/></xs:complexType></xs:element>
+  </xs:choice></xs:complexType></xs:element>"#;
+    let entities: std::collections::HashSet<String> = ["plogo".to_string()].into_iter().collect();
+    for version in VERSIONS {
+        let ss = schema(version, body);
+        let label = format!("{version:?}");
+        for element in ["e", "l", "u", "b"] {
+            check_with(
+                &ss,
+                &label,
+                &format!("<root><{element}/></root>"),
+                Some(&entities),
+                Invalid,
+                Some("cvc-datatype-valid.1.2.1"),
+            );
+        }
+        for element in ["n", "ok"] {
+            check_with(
+                &ss,
+                &label,
+                &format!("<root><{element}/></root>"),
+                Some(&entities),
+                Valid,
+                None,
+            );
+        }
+    }
 }

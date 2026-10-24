@@ -89,24 +89,14 @@ pub(super) fn resolve_single_attribute_use(
             .and_then(|decl| decl.default_value.clone())
     });
 
-    // {inheritable} per §3.2.2.3: the actual value of the use's
-    // `inheritable` attribute (default false). For ref-based uses, the
-    // mapping rule says use the {attribute declaration}.{inheritable} —
-    // but the parser stores the use's literal value with a `false`
-    // default, indistinguishable from "unspecified". Fall back to the
-    // referenced declaration's inheritable when the use itself is a
-    // ref and is not flagged.
-    let inheritable = if attr_use.attribute.inheritable {
-        true
-    } else if attr_use.attribute.ref_name.is_some() {
+    // {inheritable} per §3.2.2.2 / §3.2.2.3: the actual value of the use's
+    // `inheritable` attribute, if present, otherwise false for a local
+    // declaration and the referenced declaration's {inheritable} for a ref.
+    let inheritable = attr_use.use_inheritable(
         resolved
             .and_then(|r| r.resolved_ref)
-            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key))
-            .map(|decl| decl.inheritable)
-            .unwrap_or(false)
-    } else {
-        false
-    };
+            .and_then(|ref_key| schema_set.arenas.attributes.get(ref_key)),
+    );
 
     Some(EffectiveAttributeUse {
         name,
@@ -120,71 +110,126 @@ pub(super) fn resolve_single_attribute_use(
     })
 }
 
-/// Collect effective attribute uses from a complex type definition.
+/// The attribute uses a complex type declares itself — §3.4.2.4 (Mapping
+/// Rule for Attribute Uses Property) clauses 1 and 2: "1 The set of attribute
+/// uses corresponding to the <attribute> \[children\], if any. 2 The
+/// {attribute uses} of the attribute groups ·resolved· to by the ·actual
+/// value·s of the ref \[attribute\] of the <attributeGroup> \[children\], if
+/// any." — each name once, the type's own first.
 ///
-/// Resolves attribute refs and expands attribute groups into a flat list.
+/// An `<attribute use="prohibited">` corresponds to no attribute use
+/// (§3.2.2.2 / §3.2.2.3: "unless use='prohibited', in which case the item
+/// corresponds to nothing at all"; XSD 1.0 §3.2.2 alike). An attribute
+/// group's is therefore dropped. The type's own is kept, after the uses and
+/// only for a name none of them has, as a marker (`use_kind` `Prohibited`):
+/// in a restriction it keeps the base's use of that name from being inherited
+/// (clause 3.2.2: "what would have been an attribute use corresponding to an
+/// <attribute> \[child\], if the <attribute> had not had use = prohibited";
+/// XSD 1.0 clause 3.2: "the relevant <attribute> among the \[children\] of
+/// <restriction>"), in an extension it is ignored (clause 3.1). This is the
+/// rule the validation runtime's walk of the {attribute uses} follows
+/// (`ValidationRuntime::for_each_attribute_use`).
+///
 /// Attributes are always on `type_def.attributes` (moved from sc/cc at parse time).
 fn collect_effective_attribute_uses(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
 ) -> Vec<EffectiveAttributeUse> {
+    fn has(list: &[EffectiveAttributeUse], eau: &EffectiveAttributeUse) -> bool {
+        list.iter()
+            .any(|a| a.name == eau.name && a.target_namespace == eau.target_namespace)
+    }
     let mut result = Vec::new();
+    let mut prohibited = Vec::new();
 
     for (i, attr_use) in type_def.attributes.iter().enumerate() {
         let resolved = type_def.resolved_attributes.get(i);
         if let Some(eau) = resolve_single_attribute_use(schema_set, attr_use, resolved) {
+            if eau.use_kind == AttributeUseKind::Prohibited {
+                prohibited.push(eau);
+            } else if !has(&result, &eau) {
+                result.push(eau);
+            }
+        }
+    }
+
+    let mut group_uses = Vec::new();
+    for &ag_key in &type_def.resolved_attribute_groups {
+        collect_attribute_group_uses(schema_set, ag_key, &mut group_uses, 0);
+    }
+    for eau in group_uses {
+        if eau.use_kind != AttributeUseKind::Prohibited && !has(&result, &eau) {
             result.push(eau);
         }
     }
 
-    for &ag_key in &type_def.resolved_attribute_groups {
-        collect_attribute_group_uses(schema_set, ag_key, &mut result, 0);
+    for eau in prohibited {
+        if !has(&result, &eau) {
+            result.push(eau);
+        }
     }
 
     result
 }
 
 /// The complete `{attribute uses}` of a complex type, including the ones it
-/// inherits from its base type definition (§3.4.2.4).
+/// inherits from its base type definition (§3.4.2.4) — the *base* side of a
+/// restriction check, which needs the full picture, or every attribute the
+/// base itself inherited looks like an attribute the restriction invented.
+/// ([`collect_effective_attribute_uses`] is the *derived* side: the checks
+/// below are written around "not re-declared here means inherited
+/// unchanged".)
 ///
-/// `collect_effective_attribute_uses` only reports what a type declares
-/// itself (plus its attribute groups).  That is the right input for the
-/// *derived* side of a restriction — the checks below are written around
-/// "not re-declared here means inherited unchanged" — but the *base* side
-/// needs the full picture, or every attribute the base itself inherited looks
-/// like an attribute the restriction invented.
-///
-/// Uses declared locally win over inherited ones of the same expanded name;
-/// `use="prohibited"` therefore removes the inherited use, and per §3.4.2.4
-/// contributes no attribute use of its own.
+/// Clause 3: the uses "inherited" from the {base type definition} — for an
+/// extension all of them (3.1), for a restriction all but those whose name is
+/// "3.2.1 the expanded name of the {attribute declaration} of an attribute use
+/// which has already been included in the set, following the rules in clause
+/// 1 or clause 2 above; 3.2.2 the expanded name of the {attribute
+/// declaration} of what would have been an attribute use corresponding to an
+/// <attribute> \[child\], if the <attribute> had not had use = prohibited."
+/// So a prohibition only stops a restriction's inheritance — an extension's
+/// is "simply ignored", an attribute group's is no use at all — and the set
+/// is cumulative down the base chain to `xs:anyType`, as the clause composes.
+/// The same walk as the validation runtime's.
 fn collect_inherited_attribute_uses(
     schema_set: &SchemaSet,
     type_def: &crate::arenas::ComplexTypeDefData,
-    depth: usize,
 ) -> Vec<EffectiveAttributeUse> {
-    let mut result = collect_effective_attribute_uses(schema_set, type_def);
-
-    if depth < 50 {
-        if let Some(TypeKey::Complex(base_key)) = type_def.resolved_base_type {
-            if base_key != schema_set.any_type_key() {
-                if let Some(base_type) = schema_set.arenas.complex_types.get(base_key) {
-                    for inherited in
-                        collect_inherited_attribute_uses(schema_set, base_type, depth + 1)
-                    {
-                        let overridden = result.iter().any(|a| {
-                            a.name == inherited.name
-                                && a.target_namespace == inherited.target_namespace
-                        });
-                        if !overridden {
-                            result.push(inherited);
-                        }
-                    }
+    let any_type = schema_set.any_type_key();
+    let mut result = Vec::new();
+    // Names a more derived level keeps out of what its base types contribute.
+    let mut not_inherited: Vec<(Option<NameId>, NameId)> = Vec::new();
+    let mut current = Some(type_def);
+    let mut depth = 0;
+    while let Some(level) = current {
+        if depth > 50 {
+            break;
+        }
+        let restriction = level.derivation_method != Some(DerivationMethod::Extension);
+        let mut level_names = Vec::new();
+        for eau in collect_effective_attribute_uses(schema_set, level) {
+            let name = (eau.target_namespace, eau.name);
+            if eau.use_kind == AttributeUseKind::Prohibited {
+                // Clause 3.2.2 (a restriction); an extension's is ignored.
+                if restriction {
+                    level_names.push(name);
                 }
+                continue;
+            }
+            level_names.push(name);
+            if !not_inherited.contains(&name) {
+                result.push(eau);
             }
         }
+        not_inherited.extend(level_names);
+        current = match level.resolved_base_type {
+            Some(TypeKey::Complex(base_key)) if base_key != any_type => {
+                schema_set.arenas.complex_types.get(base_key)
+            }
+            _ => None,
+        };
+        depth += 1;
     }
-
-    result.retain(|a| a.use_kind != AttributeUseKind::Prohibited);
     result
 }
 
@@ -1065,7 +1110,7 @@ pub(super) fn validate_attribute_restriction(
     base: &crate::arenas::ComplexTypeDefData,
 ) -> SchemaResult<()> {
     let derived_attrs = collect_effective_attribute_uses(schema_set, derived);
-    let base_attrs = collect_inherited_attribute_uses(schema_set, base, 0);
+    let base_attrs = collect_inherited_attribute_uses(schema_set, base);
 
     let location = derived
         .source
@@ -1096,13 +1141,15 @@ pub(super) fn validate_attribute_restriction(
     // Check clause 3: required base attributes must remain required in the
     // derived type's effective {attribute uses}.
     //
-    // Per §3.4.2.3 mapping rules, an attribute use in the base that is NOT
-    // matched (by name + target namespace) by a directly-declared use in the
-    // restriction is inherited into the derived type's {attribute uses}
-    // unchanged.  The derived type therefore satisfies clause 3 trivially for
-    // inherited attribute uses — we only need to reject cases where the
-    // derived type explicitly *declares* the attribute with a weaker use
-    // kind (optional or prohibited).
+    // Per the §3.4.2.4 mapping rule, an attribute use in the base that is NOT
+    // matched (by name + target namespace) by a use of the restriction — its
+    // own `<attribute>` or one of its attribute groups' — nor by its own
+    // prohibited `<attribute>` is inherited into the derived type's
+    // {attribute uses} unchanged (an attribute group's prohibited
+    // `<attribute>` is no use and removes nothing). The derived type
+    // therefore satisfies clause 3 trivially for inherited attribute uses —
+    // we only need to reject cases where the derived type *declares* the
+    // attribute with a weaker use kind (optional) or prohibits it itself.
     for base_attr in &base_attrs {
         if base_attr.use_kind != AttributeUseKind::Required {
             continue;

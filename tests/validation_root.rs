@@ -686,25 +686,26 @@ fn an_undeclared_root_under_lax_is_laxly_assessed() {
             NotKnown,
             Some("cvc-datatype-valid"),
         );
-        // The root's own attribute, assessed by its global declaration: the
-        // runtime marks a laxly assessed element with an invalid attribute
-        // invalid, as it does for an element a lax wildcard matched.
+        // The root's own attribute, assessed by its global declaration, is
+        // invalid and reported; the laxly assessed root stays notKnown
+        // (§3.3.5.1 clause 2), as an element a lax wildcard matched does.
         check(
             &ss,
             &label,
             lax,
             "<u ga='x'/>",
-            Invalid,
+            NotKnown,
             Some("cvc-datatype-valid"),
         );
         // An xsi:type that names no type: reported as for a lax wildcard's
-        // element, no cvc-elt.1.
+        // element, no cvc-elt.1; no ·instance-specified type definition·
+        // (§3.3.4.1 clause 3), so the root is laxly assessed — notKnown.
         check(
             &ss,
             &label,
             lax,
             &format!("<u {XSI} xsi:type='Nowhere'/>"),
-            Invalid,
+            NotKnown,
             Some("cvc-elt.4.1"),
         );
 

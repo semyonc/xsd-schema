@@ -119,6 +119,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `default_attributes`: the attributes the element's attribute uses default.
   It can no longer be built with a struct literal outside the crate.
 
+- `EndElementInfo` is `#[non_exhaustive]` and has a new field,
+  `validation_attempted`: the element's `[validation attempted]` beside its
+  `[validity]`.
+- `parser::frames::AttributeFrameResult::inheritable` is an `Option<bool>`:
+  `None` when the schema document does not write `inheritable`, so that an
+  attribute reference takes its declaration's `{inheritable}` (XSD 1.1
+  §3.2.2.3).
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -549,6 +557,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member is no longer filed as an `xs:ID` or `xs:IDREF`.
 - `SchemaInfo::is_default` is set when an empty element takes its `fixed`
   value, as for a `default`.
+
+- Restrictions of complex types read the {attribute uses} as Structures
+  §3.4.2.4 builds them, on both sides of the comparison. Newly accepted: a
+  restriction whose attribute group marks a required base attribute
+  `use="prohibited"` (the group's prohibition is no attribute use, so the
+  attribute is inherited, still required); a restriction with its own
+  `use="prohibited"` attribute beside an attribute group's required use of the
+  same attribute. Newly refused: a restriction that weakens, retypes or
+  changes the `fixed` value of an attribute its base still has — the base side
+  is the base's complete {attribute uses}, so an extension's or an attribute
+  group's "prohibition" further up the base chain no longer hides the base's
+  use of it.
+- XSD 1.1: an attribute reference without `inheritable` inherits its
+  declaration's `{inheritable}`; an explicit `inheritable="false"` on such a
+  reference is honoured, also by the restriction check (a restriction that
+  turns an inherited `true` into `false` this way is refused; it was
+  accepted).
+- An element assessed laxly (matched by a lax wildcard, or the undeclared root
+  of a `ValidationRoot::Lax` run, with no usable `xsi:type`) has `[validity]`
+  notKnown, also when one of its attributes or descendants is invalid (which
+  is still reported).
+- An element is nilled only when its declaration is nillable: with no
+  governing element declaration, or with a non-nillable one (where `xsi:nil`
+  is still reported, `cvc-elt.3.1`), `xsi:nil="true"` neither suppresses the
+  check of the content against the element's type nor makes content an error.
+  In a typed document only a valid element is nilled.
+- XSD 1.1: an `xsi:type` attribute that resolves to no type definition is
+  invalid (Structures 1.1 §3.2.4.1 clause 5, `cvc-attribute.5`); the problem
+  is still reported once, as `cvc-elt.4.1`, when the element event carries the
+  `xsi:type`.
+- `get_expected_attributes` lists the attribute uses inherited from base
+  types.
+- In a typed document, an element no declaration or type governs is typed
+  `xs:anyType` when one of its attributes or descendants was assessed (XDM 1.0
+  §3.3.1.1), and stays untyped otherwise.
+- Defaulted attributes whose types are derived from `xs:ID`, `xs:IDREF` or
+  `xs:ENTITY` — by restriction, list or union — take part in the ID/IDREF and
+  ENTITY checks.
 
 ### Performance
 

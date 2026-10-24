@@ -161,6 +161,51 @@ pub(crate) fn type_has_qname_values(type_key: TypeKey, schema_set: &SchemaSet) -
     walk(type_key, schema_set, 0)
 }
 
+/// Whether values of the simple type `type_key` can be (or contain) `xs:ID`,
+/// `xs:IDREF` or `xs:ENTITY` values — the ones the ID/IDREF table
+/// (Structures §3.17.5.2: "is or is derived from ID, IDREF or IDREFS") and the
+/// ENTITY check take: an atomic type derived from one of them, a list whose
+/// item type can (`xs:IDREFS`, `xs:ENTITIES` included), a union with such a
+/// member type. Which members a value has is then decided by its typed value.
+pub(crate) fn type_has_id_family_values(type_key: TypeKey, schema_set: &SchemaSet) -> bool {
+    fn walk(type_key: TypeKey, schema_set: &SchemaSet, depth: u32) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        let TypeKey::Simple(sk) = type_key else {
+            return false;
+        };
+        let Some(st) = schema_set.arenas.simple_types.get(sk) else {
+            return false;
+        };
+        match st.variety {
+            SimpleTypeVariety::Atomic => matches!(
+                resolve_type_code(sk, schema_set),
+                Some(
+                    XmlTypeCode::Id
+                        | XmlTypeCode::IdRef
+                        | XmlTypeCode::IdRefs
+                        | XmlTypeCode::Entity
+                        | XmlTypeCode::Entities
+                )
+            ),
+            SimpleTypeVariety::List => {
+                matches!(
+                    resolve_type_code(sk, schema_set),
+                    Some(XmlTypeCode::IdRefs | XmlTypeCode::Entities)
+                ) || st
+                    .resolved_item_type
+                    .is_some_and(|item| walk(item, schema_set, depth + 1))
+            }
+            SimpleTypeVariety::Union => st
+                .resolved_member_types
+                .iter()
+                .any(|&member| walk(member, schema_set, depth + 1)),
+        }
+    }
+    walk(type_key, schema_set, 0)
+}
+
 /// [`fixed_values_equal`] for two literals each read with the namespace
 /// bindings in scope where it was written (`a_ns`, `b_ns`): two
 /// `xs:QName` / `xs:NOTATION` values (or lists, unions holding them) are

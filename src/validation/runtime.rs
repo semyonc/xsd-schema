@@ -674,6 +674,11 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     /// any XSD 1.1 schema without an `inheritable="true"` attribute).
     #[cfg(feature = "xsd11")]
     has_inheritable_attributes: bool,
+    /// The serial of the element whose start reported its `xsi:type` as
+    /// resolving to no type (`cvc-elt.4.1`), so that its `xsi:type`
+    /// attribute, invalid by XSD 1.1 §3.2.4.1 clause 5, is not reported a
+    /// second time.
+    xsi_type_unresolved_reported: Option<u64>,
     /// `!Send + !Sync` marker
     _not_thread_safe: PhantomData<*const ()>,
 }
@@ -689,14 +694,16 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
 fn schema_has_inheritable_attributes(schema_set: &SchemaSet) -> bool {
     let arenas = &schema_set.arenas;
     arenas.attributes.values().any(|d| d.inheritable)
-        || arenas
-            .complex_types
-            .values()
-            .any(|ct| ct.attributes.iter().any(|au| au.attribute.inheritable))
-        || arenas
-            .attribute_groups
-            .values()
-            .any(|g| g.attributes.iter().any(|au| au.attribute.inheritable))
+        || arenas.complex_types.values().any(|ct| {
+            ct.attributes
+                .iter()
+                .any(|au| au.attribute.inheritable == Some(true))
+        })
+        || arenas.attribute_groups.values().any(|g| {
+            g.attributes
+                .iter()
+                .any(|au| au.attribute.inheritable == Some(true))
+        })
 }
 
 /// Per-complex-type compiled content models, keyed by the interned slotmap
@@ -823,6 +830,22 @@ struct DeclaredElementBinding {
 fn invalidate(validity: &mut SchemaValidity) {
     if *validity == SchemaValidity::Valid {
         *validity = SchemaValidity::Invalid;
+    }
+}
+
+/// The `[validity]` of a closing element (Structures §3.3.5.1): "1 If it was
+/// ·strictly assessed·, then … valid … otherwise invalid. 2 otherwise
+/// notKnown." An element that is laxly assessed — no governing element
+/// declaration nor type, in a lax context (§3.3.4.6 clause 3) — is notKnown
+/// whatever was found among its attributes and children (an invalid attribute
+/// or descendant is reported and is invalid itself); XSD 1.0 §3.3.5 alike.
+/// Under a strict wildcard (or the default strict root) such an element is an
+/// error, `cvc-elt.1`, and keeps the runtime's `Invalid`.
+fn assessed_validity(ev_state: &ElementValidationState) -> SchemaValidity {
+    if !ev_state.strictly_assessed && ev_state.process_contents == ContentProcessing::Lax {
+        SchemaValidity::NotKnown
+    } else {
+        ev_state.validity
     }
 }
 
@@ -1161,6 +1184,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             cached_xsd10_id_key,
             #[cfg(feature = "xsd11")]
             has_inheritable_attributes,
+            xsi_type_unresolved_reported: None,
             _not_thread_safe: PhantomData,
         }
     }
@@ -1967,7 +1991,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let Some(elem_key) = governing.element_key else {
             if advance.content_model_accepted {
                 return self.start_wildcard_matched_child(
-                    local_name, namespace, xsi_type, xsi_nil, ns_context, governing,
+                    local_name, namespace, xsi_type, ns_context, governing,
                 );
             }
             // Root xsi:type promotion: at the document root with no governing
@@ -1980,9 +2004,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // Lax wildcard validation (§5.2): an undeclared root is laxly
                 // assessed instead of being reported.
                 let lax = root_mode == ValidationRoot::Lax;
-                if let Some(outcome) = self.start_root_xsi_type_element(
-                    local_name, namespace, xsi_type, xsi_nil, ns_context, lax,
-                ) {
+                if let Some(outcome) = self
+                    .start_root_xsi_type_element(local_name, namespace, xsi_type, ns_context, lax)
+                {
                     return outcome;
                 }
                 if lax {
@@ -2311,7 +2335,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         local_name: NameId,
         namespace: Option<NameId>,
         xsi_type: Option<&str>,
-        xsi_nil: Option<&str>,
         ns_context: &NamespaceContextSnapshot,
         governing: GoverningDeclaration,
     ) -> ElementStartOutcome {
@@ -2320,10 +2343,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             self.push_skipped_element(local_name, namespace, ns_context);
             return ElementStartOutcome::Empty;
         }
-
         // Content model accepted this element (wildcard in content model)
-        // but no global declaration exists.
-        let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
+        // but no global declaration exists. Structures §3.3.1: E is ·nilled·
+        // "with respect to some element declaration D" when "1 E has xsi:nil =
+        // true. 2 D.{nillable} = true" — so an element governed by no
+        // declaration the runtime holds is never nilled: its `xsi:nil` is an
+        // attribute of the built-in declaration (`xs:boolean`), and its
+        // content is checked against its governing type, if any. That holds
+        // for PATH B2 / B3 (a wildcard's element) and for PATH B1 too: a local
+        // element term the content model resolved with a type but without its
+        // declaration's key, whose {nillable} is therefore unknown (a
+        // defensive path — no test and no W3C case reaches it).
+        let is_nil = false;
         let mut ev_state = self.acquire_state(local_name, namespace);
         ev_state.ns_context = Some(ns_context.clone());
         ev_state.validity = SchemaValidity::Valid;
@@ -2343,6 +2374,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ev_state.strictly_assessed = (ev_state.element_decl.is_some()
             || ev_state.schema_type.is_some())
             && ev_state.process_contents != ContentProcessing::Skip;
+        // Laxly assessed (no governing declaration or type, Schema-Validity
+        // Assessment (Element) §3.3.4.6 clause 3): §3.3.5.1 `[validity]` "2
+        // otherwise notKnown", whatever its attributes and children — an
+        // `xsi:type` that resolved to no type included (no ·instance-specified
+        // type definition·, §3.3.4.1 clause 3). Under a strict wildcard the
+        // element is an error (`cvc-elt.1`) and stays invalid.
+        if !ev_state.strictly_assessed && process_contents == ContentProcessing::Lax {
+            ev_state.validity = SchemaValidity::NotKnown;
+        }
         // §3.4.6.4 dynamic EDC for the no-element-key wildcard branch:
         // even without a governing global declaration, an xsi:type may
         // supply a governing type whose binding must agree with any
@@ -2502,13 +2542,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// With `lax` (lax wildcard validation, [`ValidationRoot::Lax`]) an
     /// `xsi:type` that resolves to no usable type is reported but the root is
     /// not: it is laxly assessed, as an element a lax wildcard matched (PATH
-    /// B2), without `cvc-elt.1`.
+    /// B2), without `cvc-elt.1` — `[validity]` notKnown. The root is never
+    /// ·nilled· (no declaration, §3.3.1).
     fn start_root_xsi_type_element(
         &mut self,
         local_name: NameId,
         namespace: Option<NameId>,
         xsi_type: Option<&str>,
-        xsi_nil: Option<&str>,
         ns_context: &NamespaceContextSnapshot,
         lax: bool,
     ) -> Option<ElementStartOutcome> {
@@ -2522,7 +2562,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             &mut deferred,
         ) {
             XsiTypeOutcome::Applied(type_key) => {
-                let is_nil = matches!(xsi_nil, Some("true") | Some("1"));
+                // No governing element declaration, so never ·nilled· (§3.3.1:
+                // "with respect to some element declaration D … D.{nillable} =
+                // true"): `xsi:nil` is only an attribute, the content is
+                // checked against the type.
                 let mut ev_state = self.acquire_state(local_name, namespace);
                 ev_state.ns_context = Some(ns_context.clone());
                 let (content_state, content_type) = self.init_content_model(Some(type_key));
@@ -2530,7 +2573,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 ev_state.type_source = Some(TypeSource::XsiType);
                 ev_state.content_state = content_state;
                 ev_state.content_type = Some(content_type);
-                ev_state.is_nil = is_nil;
+                ev_state.is_nil = false;
                 ev_state.validity = SchemaValidity::Valid;
                 ev_state.process_contents = ContentProcessing::Strict;
                 ev_state.strictly_assessed = true;
@@ -2542,7 +2585,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     element_decl: None,
                     schema_type: Some(type_key),
                     validity: SchemaValidity::Valid,
-                    is_nil,
+                    is_nil: false,
                     content_type: Some(content_type),
                     type_source: Some(TypeSource::XsiType),
                 })
@@ -2555,7 +2598,13 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 // the child.
                 let mut ev_state = self.acquire_state(local_name, namespace);
                 ev_state.ns_context = Some(ns_context.clone());
-                ev_state.validity = SchemaValidity::Invalid;
+                // Lax: no ·instance-specified type definition· (§3.3.4.1
+                // clause 3), so laxly assessed — notKnown (§3.3.5.1 clause 2).
+                ev_state.validity = if lax {
+                    SchemaValidity::NotKnown
+                } else {
+                    SchemaValidity::Invalid
+                };
                 if lax {
                     ev_state.process_contents = ContentProcessing::Lax;
                 }
@@ -2574,7 +2623,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 self.advance_constraints_start_element(local_name, namespace, None);
                 #[cfg(feature = "xsd11")]
                 self.detect_assertions_on_element(None, local_name, namespace);
-                Some(ElementStartOutcome::Invalid)
+                Some(if lax {
+                    ElementStartOutcome::Empty
+                } else {
+                    ElementStartOutcome::Invalid
+                })
             }
         }
     }
@@ -2877,12 +2930,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         #[cfg(not(feature = "xsd11"))]
         let abstract_type_invalid = abstract_ct_info.is_some();
 
-        // 7. xsi:nil
-        let is_nil = if let Some(nil_str) = xsi_nil {
-            nil_str == "true" || nil_str == "1"
-        } else {
-            false
-        };
+        // 7. xsi:nil. Structures §3.3.1: E is ·nilled· "with respect to some
+        // element declaration D if and only if … 1 E has xsi:nil = true. 2
+        // D.{nillable} = true" — a non-nillable declaration nils nothing: its
+        // `xsi:nil` is `cvc-elt.3.1` (below), and the content is checked
+        // against the type (XSD 1.0: Element Locally Valid (Type) clause 3.1.3
+        // and (Complex Type) clause 2 apply "If clause 3.2 of Element Locally
+        // Valid (Element) did not apply", and 3.2 needs {nillable} true).
+        let is_nil = elem_data.nillable && matches!(xsi_nil, Some("true") | Some("1"));
         // cvc-elt.3.1 (XSD 1.0 §3.3.4): the mere *presence* of xsi:nil on a
         // non-nillable element is invalid, regardless of value. xsi:nil="false"
         // on a non-nillable element still violates the rule because the element
@@ -3912,7 +3967,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn process_absent_attribute_uses(&mut self, ct_key: ComplexTypeKey, collect_defaults: bool) {
         let mut missing: Vec<(Option<NameId>, NameId)> = Vec::new();
         let mut ic_defaults: Vec<IcDefault> = Vec::new();
-        let mut id_defaults: Vec<(String, TypeKey)> = Vec::new();
+        let mut id_defaults: Vec<(String, XmlValue)> = Vec::new();
         let mut defaults = std::mem::take(&mut self.default_attributes);
         self.collect_absent_attribute_uses(
             ct_key,
@@ -3973,14 +4028,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .last()
             .map(|e| e.element_serial)
             .unwrap_or(0);
-        for (value, type_key) in id_defaults {
-            if let Ok(result) =
-                super::simple::validate_simple_type(&value, type_key, self.schema_set)
-            {
-                self.collect_id_idref(&result.typed_value, &value, default_owner);
-                if self.check_entity_declared(&result.typed_value) {
-                    self.invalidate_attribute_owner();
-                }
+        for (value, typed_value) in id_defaults {
+            self.collect_id_idref(&typed_value, &value, default_owner);
+            if self.check_entity_declared(&typed_value) {
+                self.invalidate_attribute_owner();
             }
         }
     }
@@ -4056,7 +4107,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         ct_key: ComplexTypeKey,
         missing: &mut Vec<(Option<NameId>, NameId)>,
         ic_defaults: &mut Vec<IcDefault>,
-        id_defaults: &mut Vec<(String, TypeKey)>,
+        id_defaults: &mut Vec<(String, XmlValue)>,
         mut defaults: Option<&mut Vec<DefaultAttribute>>,
     ) {
         let empty_seen = AttrNameSet::default();
@@ -4066,14 +4117,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .map(|s| &s.seen_attributes)
             .unwrap_or(&empty_seen);
         let has_ic = !self.active_constraints.is_empty();
-        let builtin = self.schema_set.builtin_types();
-        let id_typed = [
-            builtin.get_by_type_code(XmlTypeCode::Id),
-            builtin.get_by_type_code(XmlTypeCode::IdRef),
-            builtin.get_by_type_code(XmlTypeCode::IdRefs),
-            builtin.get_by_type_code(XmlTypeCode::Entity),
-            builtin.get_by_type_code(XmlTypeCode::Entities),
-        ];
         self.for_each_attribute_use(ct_key, |u| {
             if seen.contains(&(u.namespace, u.name)) {
                 return;
@@ -4083,10 +4126,52 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 return;
             }
             let Some(v) = u.value else { return };
-            let typed_value = || {
+            // The value constraint's {value} — computed once, and only when
+            // a consumer wants it: the defaulted attribute handed out (PSVI
+            // typed values retained, or a QName-capable type), an active
+            // identity constraint, the ID/IDREF table and ENTITY check (a type
+            // that can hold such values). The last consumer takes it; the
+            // others clone it.
+            let want_default = defaults.is_some()
+                && u.type_key
+                    .is_some_and(|tk| self.default_typed_value_wanted(tk));
+            let want_id = u
+                .type_key
+                .is_some_and(|tk| super::simple::type_has_id_family_values(tk, self.schema_set));
+            let mut consumers = u8::from(want_default) + u8::from(has_ic) + u8::from(want_id);
+            let mut typed = if consumers > 0 {
                 u.type_key
                     .and_then(|tk| self.value_constraint_typed_value(v, tk, u.value_source))
+            } else {
+                None
             };
+            let mut next_typed = || {
+                consumers -= 1;
+                if consumers == 0 {
+                    typed.take()
+                } else {
+                    typed.clone()
+                }
+            };
+            // A default whose type can hold ID / IDREF / ENTITY values — the
+            // built-in types, a restriction of one, a list of one, a union
+            // with one as a member — joins the ID/IDREF table and the entity
+            // check as the typed value of its value constraint (read with the
+            // declaration's bindings, so a union picks the member the schema
+            // means), exactly as a carried attribute's typed value does.
+            if want_id {
+                if let Some(typed_value) = next_typed() {
+                    id_defaults.push((v.to_string(), typed_value));
+                }
+            }
+            if has_ic {
+                ic_defaults.push((
+                    u.name,
+                    u.namespace.unwrap_or(NameId(0)),
+                    v.to_string(),
+                    next_typed(),
+                ));
+            }
             if let Some(defaults) = defaults.as_deref_mut() {
                 defaults.push(DefaultAttribute {
                     local_name: u.name,
@@ -4094,27 +4179,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     attribute_key: u.attr_key,
                     type_key: u.type_key,
                     value: v.to_string(),
-                    typed_value: u
-                        .type_key
-                        .filter(|&tk| self.default_typed_value_wanted(tk))
-                        .and_then(|_| typed_value()),
+                    typed_value: if want_default { next_typed() } else { None },
                 });
-            }
-            if has_ic {
-                let typed_value = typed_value();
-                ic_defaults.push((
-                    u.name,
-                    u.namespace.unwrap_or(NameId(0)),
-                    v.to_string(),
-                    typed_value,
-                ));
-            }
-            // An ID/IDREF/IDREFS/ENTITY/ENTITIES default still needs
-            // validating (its value joins the ID/IDREF table).
-            if let Some(TypeKey::Simple(sk)) = u.type_key {
-                if id_typed.contains(&Some(sk)) {
-                    id_defaults.push((v.to_string(), TypeKey::Simple(sk)));
-                }
             }
         });
     }
@@ -4415,9 +4481,17 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// typed-builder / push-API callers keep the value-returning method.
     /// See `PERF_P1_PLAN` §Step 4.
     pub fn validate_end_element_novalue(&mut self) -> SchemaValidity {
+        self.validate_end_element_verdict().0
+    }
+
+    /// [`validate_end_element_novalue`](Self::validate_end_element_novalue)
+    /// with the element's `[validation attempted]` beside its `[validity]` —
+    /// what the streaming driver hands its handler
+    /// ([`EndElementInfo`](super::EndElementInfo)).
+    pub(crate) fn validate_end_element_verdict(&mut self) -> (SchemaValidity, ValidationAttempted) {
         let finished = match self.finish_top_element() {
             Some(f) => f,
-            None => return SchemaValidity::Invalid,
+            None => return (SchemaValidity::Invalid, ValidationAttempted::None),
         };
         #[cfg(feature = "xsd11")]
         let (ev_state, _assertion_outcome) = finished;
@@ -4426,10 +4500,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
         // Same PSVI side effects (path pop, state machine, [validation attempted]
         // propagation) as the value path — only the `SchemaInfo` literal is skipped.
-        let _ = self.finalize_element(&ev_state);
-        let validity = ev_state.validity;
+        let validation_attempted = self.finalize_element(&ev_state);
+        let validity = assessed_validity(&ev_state);
         self.state_pool.push(ev_state);
-        validity
+        (validity, validation_attempted)
     }
 
     /// F2/B1 step 1: content-model completion check (cvc-complex-type.2.4).
@@ -5220,7 +5294,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         #[cfg(feature = "xsd11")] assertion_outcome: Option<AssertionOutcome>,
     ) -> SchemaInfo {
         let validation_attempted = self.finalize_element(ev_state);
-        let validity = ev_state.validity;
+        let validity = assessed_validity(ev_state);
 
         SchemaInfo {
             element_decl: ev_state.element_decl,
@@ -5361,7 +5435,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         }
     }
 
-    /// Get attributes expected/allowed for the current element
+    /// The attributes expected or allowed on the current element: the
+    /// {attribute uses} of its complex type (Structures §3.4.2.4) — its own
+    /// `<attribute>` uses, those of its attribute groups, and those inherited
+    /// from its base types, except, in a restriction, those whose names the
+    /// restriction includes itself or prohibits — each name once, in that
+    /// order, with whether the use is required. A prohibited `<attribute>` is
+    /// no use. The type's attribute wildcard is not listed. Empty when the
+    /// element has no complex type (simple type, skipped, or not yet
+    /// validated).
     pub fn get_expected_attributes(&self) -> Vec<ExpectedAttribute> {
         let ev_state = match self.validation_stack.last() {
             Some(s) => s,
@@ -5373,40 +5455,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             _ => return Vec::new(),
         };
 
-        let ct_data = &self.schema_set.arenas.complex_types[ct_key];
         let mut result = Vec::new();
-
-        for (i, attr_use) in ct_data.attributes.iter().enumerate() {
-            let use_kind = attr_use.use_kind;
-            if use_kind == AttributeUseKind::Prohibited {
-                continue;
-            }
-            let resolved = ct_data.resolved_attributes.get(i);
-            let (attr_name, attr_ns) =
-                self.resolve_attr_use_name_ns(attr_use, resolved, ct_data.target_namespace);
-            let attr_key = resolved.and_then(|r| r.resolved_ref);
-
+        self.for_each_attribute_use(ct_key, |u| {
             result.push(ExpectedAttribute {
-                local_name: attr_name,
-                namespace: attr_ns,
-                attribute_key: attr_key,
-                required: use_kind == AttributeUseKind::Required,
+                local_name: u.name,
+                namespace: u.namespace,
+                attribute_key: u.attr_key,
+                required: u.use_kind == AttributeUseKind::Required,
             });
-        }
-
-        // Include attributes from attribute groups
-        for ga in self.collect_group_attributes(ct_data) {
-            if ga.use_kind == AttributeUseKind::Prohibited {
-                continue;
-            }
-            result.push(ExpectedAttribute {
-                local_name: ga.name,
-                namespace: ga.namespace,
-                attribute_key: ga.attr_key,
-                required: ga.use_kind == AttributeUseKind::Required,
-            });
-        }
-
+        });
         result
     }
 
@@ -5898,11 +5955,37 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn validate_xsi_attribute(&mut self, local_name: NameId, value: &str) -> SchemaInfo {
         let builtin = self.schema_set.builtin_types();
         if local_name == well_known::XSI_TYPE {
-            // Attribute-level: lexical xs:QName validation only.
-            // Semantic resolution (cvc-elt.4.1) is handled in validate_element_by_id.
+            // The value is an xs:QName (String Valid). The element's start
+            // resolves it as its ·instance-specified type definition· and
+            // reports one that resolves to nothing (cvc-elt.4.1).
             let type_key = TypeKey::Simple(builtin.qname);
             let attr_key = builtin.xsi_type_attr;
-            return self.validate_xsi_simple_value(value, type_key, attr_key);
+            let mut info = self.validate_xsi_simple_value(value, type_key, attr_key);
+            // XSD 1.1 Attribute Locally Valid (§3.2.4.1): "5 If D is the
+            // built-in declaration for xsi:type (Attribute Declaration for the
+            // 'type' attribute (§3.2.7.1)), then A's ·actual value· ·resolves·
+            // to a type definition." XSD 1.0's rule has no such clause
+            // (clauses 1–4), so there the attribute stays valid. Reported here
+            // only when the element's start did not report it already.
+            if self.schema_set.is_xsd11()
+                && info.validity == SchemaValidity::Valid
+                && !self.xsi_type_resolves(value)
+            {
+                info.validity = SchemaValidity::Invalid;
+                let serial = self.validation_stack.last().map(|ev| ev.element_serial);
+                if serial.is_some() && self.xsi_type_unresolved_reported == serial {
+                    info.schema_error_codes.push("cvc-attribute.5");
+                } else {
+                    self.report_error(
+                        "cvc-attribute.5",
+                        format!(
+                            "Attribute xsi:type value '{}' does not resolve to a type definition",
+                            value
+                        ),
+                    );
+                }
+            }
+            return info;
         }
         if local_name == well_known::XSI_NIL {
             let type_key = TypeKey::Simple(builtin.boolean);
@@ -7518,7 +7601,36 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// Emit deferred xsi:type errors (collected by [`resolve_xsi_type`]).
     fn emit_deferred_xsi_type_errors(&mut self, errors: Vec<(&'static str, String)>) {
         for (constraint, message) in errors {
+            if constraint == "cvc-elt.4.1" {
+                self.xsi_type_unresolved_reported =
+                    self.validation_stack.last().map(|ev| ev.element_serial);
+            }
             self.report_error(constraint, message);
+        }
+    }
+
+    /// Whether the `xsi:type` value `value` ·resolves· to a type definition
+    /// with the current element's in-scope namespaces (§3.3.4.1 clause 3).
+    fn xsi_type_resolves(&self, value: &str) -> bool {
+        let empty = NamespaceContextSnapshot {
+            default_ns: None,
+            bindings: Vec::new(),
+        };
+        let ns_context = self
+            .validation_stack
+            .last()
+            .and_then(|ev| ev.ns_context.as_ref())
+            .unwrap_or(&empty);
+        match parse_qname_with_snapshot(value, ns_context, &self.schema_set.name_table, true) {
+            Ok(qname) => self
+                .schema_set
+                .lookup_type(qname.namespace_uri, qname.local_name)
+                .or_else(|| {
+                    self.schema_set
+                        .get_built_in_type_by_qname(qname.namespace_uri, qname.local_name)
+                })
+                .is_some(),
+            Err(_) => false,
         }
     }
 
@@ -7802,7 +7914,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 value: value.map(str::to_string),
                 value_source: value_source.cloned(),
                 #[cfg(feature = "xsd11")]
-                inheritable: attr_use.attribute.inheritable,
+                inheritable: attr_use.use_inheritable(
+                    attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k)),
+                ),
             });
         }
         for &nested_key in &group_data.resolved_attribute_groups {
@@ -7833,8 +7947,8 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     ///
     /// The one walk behind every runtime consumer of the attribute uses: the
     /// required-attribute check, the defaulted attributes (identity-constraint
-    /// fields, ID/IDREF, `get_default_attributes`) and the inheritable
-    /// defaults. [`find_attribute_in_type`](Self::find_attribute_in_type)
+    /// fields, ID/IDREF, `get_default_attributes`), the inheritable defaults
+    /// and `get_expected_attributes`. [`find_attribute_in_type`](Self::find_attribute_in_type)
     /// looks one name up by the same rule.
     fn for_each_attribute_use(
         &self,
@@ -7891,7 +8005,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     value,
                     value_source,
                     #[cfg(feature = "xsd11")]
-                    inheritable: attr_use.attribute.inheritable,
+                    inheritable: attr_use.use_inheritable(decl),
                 });
             }
 
@@ -8058,7 +8172,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
                 // Get fixed value from the attribute use or from the attribute declaration
                 let (fixed, fixed_source) = self.attribute_use_fixed(attr_use, attr_key);
-                let inheritable = attr_use.attribute.inheritable;
+                let inheritable = attr_use.use_inheritable(
+                    attr_key.and_then(|k| self.schema_set.arenas.attributes.get(k)),
+                );
 
                 if attr_use.use_kind == AttributeUseKind::Prohibited {
                     // In XSD 1.0, use="prohibited" combined with fixed=X is a valid

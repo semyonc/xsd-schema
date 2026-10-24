@@ -198,7 +198,7 @@ impl Default for ValidationFlags {
 /// | `Declaration` | the top-level declaration of its name | the declaration's type (or `xsi:type`, a type alternative) | strict assessment | `cvc-elt.1` when undeclared and without `xsi:type` |
 /// | `Element(D)` | `D` | `D`'s type (or `xsi:type`, a type alternative) | strict assessment | `cvc-elt.1` when the root's name is not `D`'s |
 /// | `Type(T)` | none | `T`, or an `xsi:type` that overrides it | strict assessment | `cvc-elt.4.*` for an `xsi:type` that does not override `T`, `cvc-type.2` for an abstract governing type |
-/// | `Lax` | as `Declaration` | as `Declaration` | strict when declared or `xsi:type` names a type; otherwise *notKnown* (*invalid* for an invalid attribute or `xsi:type` of its own), and *none* / *partial* | none for an undeclared root |
+/// | `Lax` | as `Declaration` | as `Declaration` | strict when declared or `xsi:type` names a type; otherwise *notKnown*, and *none* / *partial* | none for an undeclared root |
 ///
 /// `#[non_exhaustive]`, so further modes can be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -273,12 +273,16 @@ pub enum ValidationRoot {
     /// globally declared attribute strictly, and its errors reported.
     ///
     /// A laxly assessed root has no type and no declaration, its
-    /// `[validity]` is *notKnown* whatever its children (§3.3.5.1 clause 2),
-    /// and its `[validation attempted]` *none*, or *partial* when an
-    /// attribute or child was assessed. No `cvc-elt.1` is reported. As for an
-    /// element a lax wildcard matched, two things of the root's own make it
-    /// *invalid*: an attribute that its global declaration finds invalid, and
-    /// an `xsi:type` that names no type (`cvc-elt.4.1`).
+    /// `[validity]` is *notKnown* whatever its attributes and children
+    /// (§3.3.5.1 clause 2: "2 otherwise notKnown"), and its `[validation
+    /// attempted]` *none*, or *partial* when an attribute or child was
+    /// assessed. No `cvc-elt.1` is reported. As for an element a lax wildcard
+    /// matched, an attribute of its own that its global declaration finds
+    /// invalid, and an `xsi:type` that names no type (`cvc-elt.4.1`; no
+    /// ·instance-specified type definition·, §3.3.4.1), are reported, and the
+    /// root stays notKnown. The root is ·nilled· only with a declaration
+    /// (§3.3.1): with an `xsi:type` alone, `xsi:nil` is an attribute and the
+    /// content is checked against the type.
     ///
     /// A host that wants an `xsi:type` attribute alone not to cause strict
     /// validation passes no `xsi:type` to the element event.
@@ -320,7 +324,11 @@ pub struct SchemaInfo {
     /// (Element), Structures §3.3.4.3; PSVI \[schema specified\] "schema",
     /// §3.3.5.5)
     pub is_default: bool,
-    /// Whether the element was declared nil via xsi:nil="true"
+    /// Whether the element is ·nilled· (Structures §3.3.1: "1 E has xsi:nil =
+    /// true. 2 D.{nillable} = true", with respect to its governing element
+    /// declaration D) — `xsi:nil="true"` on an element whose declaration is
+    /// nillable. `false` without a declaration and on a non-nillable one
+    /// (where `xsi:nil` is `cvc-elt.3.1`).
     pub is_nil: bool,
     /// Content type of the element (Empty, TextOnly, ElementOnly, Mixed)
     pub content_type: Option<ContentType>,

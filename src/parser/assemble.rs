@@ -661,7 +661,9 @@ impl<'a> SchemaAssembler<'a> {
             fixed_value,
             use_kind,
             form,
-            inheritable,
+            // §3.2.2.1 / §3.2.2.2: "The ·actual value· of the inheritable
+            // [attribute], if present, otherwise false."
+            inheritable: inheritable.unwrap_or(false),
             id,
             annotation,
             source,

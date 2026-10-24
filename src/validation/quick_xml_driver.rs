@@ -180,10 +180,18 @@ pub struct DoctypeView<'a> {
     pub byte_pos: usize,
 }
 
-/// What the runtime returned from `validate_end_element`.
+/// What the runtime returned from `validate_end_element`: the element's
+/// `[validity]` and `[validation attempted]` (Structures §3.3.5.1).
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct EndElementInfo {
+    /// The element's `[validity]`.
     pub validity: SchemaValidity,
+    /// The element's `[validation attempted]`: `full` when it and everything
+    /// below it was strictly assessed, `none` when nothing was, `partial`
+    /// otherwise — e.g. an element no declaration governs (laxly assessed)
+    /// with an assessed attribute or descendant.
+    pub validation_attempted: crate::validation::info::ValidationAttempted,
 }
 
 /// How a text/CDATA event was dispatched into the runtime.
@@ -536,11 +544,13 @@ where
                 )?;
             }
             Ok(Event::End(_)) => {
-                // Streaming consumers receive only `[validity]` per element, so
-                // use the value-free end path (no per-element SchemaInfo).
-                let end_validity = runtime.validate_end_element_novalue();
+                // Streaming consumers receive only `[validity]` and `[validation
+                // attempted]` per element, so use the value-free end path (no
+                // per-element SchemaInfo).
+                let (end_validity, validation_attempted) = runtime.validate_end_element_verdict();
                 let end = EndElementInfo {
                     validity: end_validity,
+                    validation_attempted,
                 };
                 handler
                     .after_end_element(&end, depth)
@@ -823,11 +833,13 @@ where
 
     // 7. For empty elements, close inline.
     if is_empty {
-        // Streaming consumers receive only `[validity]` per element (the handler
-        // hook takes an `EndElementInfo`), so use the value-free end path.
-        let end_validity = runtime.validate_end_element_novalue();
+        // Streaming consumers receive only `[validity]` and `[validation
+        // attempted]` per element (the handler hook takes an `EndElementInfo`),
+        // so use the value-free end path.
+        let (end_validity, validation_attempted) = runtime.validate_end_element_verdict();
         let end = EndElementInfo {
             validity: end_validity,
+            validation_attempted,
         };
         handler
             .after_end_element(&end, *depth)

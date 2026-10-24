@@ -31,7 +31,7 @@ use bumpalo::Bump;
 use crate::parser::location::SourceSpan;
 use crate::schema::SchemaSet;
 use crate::validation::errors::ValidationError;
-use crate::validation::info::{SchemaInfo, ValidationFlags};
+use crate::validation::info::{SchemaInfo, ValidationAttempted, ValidationFlags};
 use crate::validation::quick_xml_driver::{
     drive_quick_xml_with, AttributeView, DoctypeView, DriveOutcome, DriveWithError,
     ElementStartView, EndElementInfo, EndOfAttributesView, NoopHandler, TextKind,
@@ -144,7 +144,7 @@ impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
 /// text becomes the [schema normalized value] once the element is known to be
 /// valid (XDM 1.0 §6.2.4; an attribute's value likewise, §6.3.4).
 ///
-/// The tree differs from the events in two more ways, both XDM's
+/// The tree differs from the events in three more ways, all XDM's
 /// construction from a PSVI:
 ///
 /// * the defaulted attributes of each element
@@ -164,7 +164,28 @@ impl<E: std::error::Error + 'static> std::error::Error for TypedBuildError<E> {
 ///   invalid, is kept as read with the white space in it; an element found
 ///   invalid only later (a required child missing) has lost its white space
 ///   already, consistently with the element-only annotation it keeps. The
-///   inner handler still sees every text event.
+///   inner handler still sees every text event;
+/// * an element no declaration or type governs (laxly assessed: under a lax
+///   wildcard, or the undeclared root of a `ValidationRoot::Lax` run) is
+///   unbound — `xs:untyped` — when nothing in it was assessed, and bound to
+///   `xs:anyType` when its `[validation attempted]` is partial: an attribute
+///   (an `xsi:*` one included, which its built-in declaration governs) or a
+///   descendant was assessed (XDM 1.0 §3.3.1.1). That is known when the
+///   element ends ([`EndElementInfo::validation_attempted`]), so the binding
+///   is set then.
+///
+/// Deliberately, the `xs:anyType` rule is applied to unbound elements only.
+/// XDM 1.0 §3.3.1.1 reads "The \[validity\] property exists and is "invalid",
+/// or the \[validation attempted\] property exists and is "partial", the schema
+/// type of an element is xs:anyType and the type of an attribute is
+/// xs:anySimpleType" — taken literally, also a *strictly assessed* element
+/// whose own `[validation attempted]` is partial (a valid element with a child
+/// a lax or skip wildcard left unassessed, say) or which is invalid, and an
+/// invalid attribute. Such a node keeps the binding its declaration or type
+/// gives it: its type is the one validation used, and a declared element
+/// with an open wildcard would otherwise lose its type to `xs:anyType`. The
+/// tree's `nilled` property follows XDM §6.2.4: an element is nilled only if
+/// it is valid and its declaration nils it.
 pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     builder: &'b mut BufferDocumentBuilder<'a>,
     inner: H,
@@ -185,8 +206,12 @@ pub struct TypedBuilderHandler<'b, 'a, H = NoopHandler> {
     /// Element-decl key for the currently open element (used so we can
     /// preserve `element_decl` when refreshing the binding after CTA).
     element_decl_stack: Vec<Option<crate::ids::ElementKey>>,
-    /// Per open element: whether it is nilled.
+    /// Per open element: whether its start `SchemaInfo` nils it. The tree's
+    /// nilled property is set when it ends, and only if it is valid.
     nilled_stack: Vec<bool>,
+    /// Per open element: whether it has a binding (a governing type, from its
+    /// start or a type alternative).
+    bound_stack: Vec<bool>,
     /// Per open element: whether its content is a simple type's, and what is
     /// held back of it (see [`SimpleContent`]).
     simple_stack: Vec<SimpleContent>,
@@ -302,6 +327,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             deferred_attr_refs: Vec::new(),
             element_decl_stack: Vec::new(),
             nilled_stack: Vec::new(),
+            bound_stack: Vec::new(),
             simple_stack: Vec::new(),
             whitespace_of: Vec::new(),
             defaults_as_nodes: true,
@@ -400,6 +426,7 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             .expect("after_element with empty stack");
         self.element_decl_stack.push(info.element_decl);
         self.nilled_stack.push(info.is_nil);
+        self.bound_stack.push(info.schema_type.is_some());
         self.simple_stack.push(SimpleContent::of(
             info.schema_type,
             info.content_type,
@@ -413,9 +440,6 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 content_type: info.content_type,
             };
             self.builder.set_node_binding(elem_ref, binding)?;
-        }
-        if info.is_nil {
-            self.builder.set_nil(elem_ref);
         }
         Ok(())
     }
@@ -577,6 +601,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
                 content_type: view.info.content_type,
             };
             self.builder.set_node_binding(elem_ref, binding)?;
+            if let Some(bound) = self.bound_stack.last_mut() {
+                *bound = true;
+            }
             // A type alternative selected the governing type: it decides.
             let nilled = self.nilled_stack.last().copied().unwrap_or(false);
             if let Some(slot) = self.simple_stack.last_mut() {
@@ -847,9 +874,9 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
 
     fn build_after_end_element(
         &mut self,
-        validity: crate::validation::info::SchemaValidity,
+        info: &EndElementInfo,
     ) -> Result<(), BufferDocumentError> {
-        let valid = validity == crate::validation::info::SchemaValidity::Valid;
+        let valid = info.validity == crate::validation::info::SchemaValidity::Valid;
         // Clause 5.1 of Element Locally Valid (Element): an element with no
         // element or character [children] takes its declaration's value
         // constraint, whose {lexical form} is then its [schema normalized
@@ -926,10 +953,44 @@ impl<'b, 'a, H> TypedBuilderHandler<'b, 'a, H> {
             Some(SimpleContent::ElementOnly) => self.drop_pending_whitespace(),
             _ => {}
         }
+        // An element no declaration or type governed — laxly assessed — is
+        // `xs:untyped` only while nothing in it was assessed: XDM 1.0
+        // §3.3.1.1, "The [validity] property exists and is "invalid", or the
+        // [validation attempted] property exists and is "partial", the schema
+        // type of an element is xs:anyType"; "The [validity] property exists
+        // and is "notKnown", and the [validation attempted] property exists
+        // and is "none", the schema type of an element is xs:untyped" (and
+        // §6.2.1: an `xs:untyped` element has only `xs:untyped` descendants).
+        // Known only now, when the element ends.
+        let bound = self.bound_stack.pop().unwrap_or(true);
+        if !bound && info.validation_attempted == ValidationAttempted::Partial {
+            if let (Some(&elem_ref), Some(schema_set)) =
+                (self.elem_ref_stack.last(), self.builder.schema_set())
+            {
+                let binding = NodeSchemaBinding {
+                    type_key: crate::ids::TypeKey::Complex(schema_set.any_type_key()),
+                    element_decl: None,
+                    attribute_decl: None,
+                    content_type: Some(crate::validation::info::ContentType::Mixed),
+                };
+                self.builder.set_node_binding(elem_ref, binding)?;
+            }
+        }
+        // XDM 1.0 §6.2.4 `nilled`: "If the [validity] property exists on an
+        // information item and is "valid" then if the [nil] property exists
+        // and is true, then the nilled property is "true". In all other cases
+        // … the nilled property is "false"" — decided now, when the element's
+        // validity is known (a nillable element with `xsi:nil="true"` and
+        // content, `cvc-elt.3.2.1`, is not nilled).
+        let nilled = self.nilled_stack.pop().unwrap_or(false);
+        if nilled && valid {
+            if let Some(&elem_ref) = self.elem_ref_stack.last() {
+                self.builder.set_nil(elem_ref);
+            }
+        }
         self.builder.end_element()?;
         self.elem_ref_stack.pop();
         self.element_decl_stack.pop();
-        self.nilled_stack.pop();
         Ok(())
     }
 
@@ -1029,7 +1090,7 @@ impl<H: ValidationEventHandler> ValidationEventHandler for TypedBuilderHandler<'
         info: &EndElementInfo,
         depth: usize,
     ) -> Result<(), Self::Error> {
-        self.build_after_end_element(info.validity)?;
+        self.build_after_end_element(info)?;
         self.inner
             .after_end_element(info, depth)
             .map_err(TypedBuildError::Handler)
