@@ -927,6 +927,8 @@ fn test_particle_restricts_all_required_over_empty_all_rejects() {
         source: None,
         collapsed_from: None,
         folded_group_occurs: false,
+        counts: None,
+        as_written: None,
     };
 
     let derived = NormalizedParticle {
@@ -939,6 +941,8 @@ fn test_particle_restricts_all_required_over_empty_all_rejects() {
         source: None,
         collapsed_from: None,
         folded_group_occurs: false,
+        counts: None,
+        as_written: None,
     };
     let base_empty_all = NormalizedParticle {
         term: NormalizedParticleTerm::Group(NormalizedGroup {
@@ -950,6 +954,8 @@ fn test_particle_restricts_all_required_over_empty_all_rejects() {
         source: None,
         collapsed_from: None,
         folded_group_occurs: false,
+        counts: None,
+        as_written: None,
     };
 
     assert!(

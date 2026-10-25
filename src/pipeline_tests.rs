@@ -4487,12 +4487,14 @@ fn test_restriction_sees_attributes_the_base_inherited() {
     );
 }
 
-/// A single-branch `<choice>` restricting a multi-branch base choice: the
-/// pointless-particle collapse turns it into a sequence, and XSD 1.0's
-/// structural rules then reject it (msData groupH021v / particlesZ024).  XSD
-/// 1.1 compares languages, so the same schema is valid there.
+/// A single-branch `<choice minOccurs="0">` restricting a multi-branch base
+/// choice. The choice is not pointless (XSD 1.0 §3.9.6 clause 2.2 asks for a
+/// 1..1 particle), so XSD 1.0's RecurseLax maps its branch onto the base's
+/// second branch and accepts it, as Xerces-J does; XSD 1.1 compares
+/// languages. (A *unit* single-branch choice is pointless and collapses —
+/// msData groupH021v / particlesZ024, invalid in 1.0.)
 #[test]
-fn test_single_branch_choice_restriction_is_version_dependent() {
+fn test_single_branch_optional_choice_restriction() {
     let xsd = r#"<?xml version="1.0" encoding="UTF-8"?>
         <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
             <xs:complexType name="Base">
@@ -4521,10 +4523,8 @@ fn test_single_branch_choice_restriction_is_version_dependent() {
             </xs:complexType>
         </xs:schema>"#;
 
-    assert!(
-        load_strict(xsd, false).is_err(),
-        "XSD 1.0 rejects intensional restrictions of this shape"
-    );
+    let xsd10 = load_strict(xsd, false);
+    assert!(xsd10.is_ok(), "XSD 1.0 accepts it (RecurseLax): {xsd10:?}");
     let xsd11 = load_strict(xsd, true);
     assert!(xsd11.is_ok(), "XSD 1.1 accepts it: {xsd11:?}");
 }

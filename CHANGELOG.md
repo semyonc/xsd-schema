@@ -346,6 +346,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   all-optional base one after another was rejected. For example Exchange Web
   Services' `WellKnownResponseObjectType` now loads.
 
+- The restriction check counts occurrences exactly, on both sides: a group
+  that repeats a particle needing two or more occurrences admits counts with
+  gaps (`sequence{1,2}(b{2,2})` admits two or four `b`s, never three), and the
+  check no longer fills them in. Restrictions whose content admits child
+  sequences their base rejects are now rejected in both versions — a choice
+  branch that needs two or more occurrences restricted to fewer, a
+  single-branch choice or a sequence repeating such a branch (W3C
+  `particlesHa147` under XSD 1.1), a repeated group branch, a repeated choice
+  whose iterations mix its branches in an order the base rejects
+  (`choice{0,2}(a, b)` admits `(b, a)`), and a base sequence repeated more
+  than once matched by a single iteration's worth of the restriction
+  (`sequence(sequence{2,2}(b, c), d?)` restricted to `sequence(b, c)`). Valid
+  restrictions with such counts load in both versions, an identical
+  restriction among them.
+- The restriction check's occurrence arithmetic is exact far beyond any schema
+  (products of nested bounds up to 2¹²⁰) and every comparison is bounded: a
+  restriction whose bounds multiply past 64 bits — for example
+  `choice{3000000,∞}(choice{3000000,∞}(a{3000000}))` restricted by itself — no
+  longer hangs.
+- A particle with `minOccurs="0" maxOccurs="0"` maps to no component: under
+  XSD 1.1 a choice whose branches are all such particles accepts nothing when
+  it must occur, and repeating it does not make it admit anything
+  (`choice{1,unbounded}(a{0,0})` no longer admits `a`).
+- XSD 1.1: a repeated choice restricting a base sequence is accepted when one
+  child of the sequence accepts the whole choice and the other children are
+  emptiable (`sequence(choice{0,2}(a, b), c?)` restricted to `choice{0,2}(a,
+  b)`); a restriction to an optional element is accepted when a sibling branch
+  of the base choice is emptiable (`choice(a, b?)` restricted to `a?`). XSD
+  1.0 keeps §3.9.6's rule that a choice cannot restrict a sequence.
+- XSD 1.0: a single-child sequence or choice that is not pointless (its
+  occurrence range is not 1..1) is compared as written, child ranges included,
+  against the base as written (`choice?(a?)` does not restrict `choice?(a,
+  b)`; `sequence(a, sequence?(b))` restricts `sequence(a, sequence?(b, c?))`).
+  All GAEB DA XML 3.3 schemas now load under XSD 1.0.
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`

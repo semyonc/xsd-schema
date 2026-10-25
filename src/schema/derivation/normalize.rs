@@ -3,6 +3,7 @@
 //! flattening, single-child-group collapsing) applied before a particle
 //! restriction check.
 
+use super::counts::Counts;
 use crate::error::{SchemaError, SchemaResult};
 use crate::ids::{ElementKey, NameId, TypeKey};
 use crate::parser::frames::{
@@ -28,6 +29,41 @@ pub(super) struct NormalizedParticle {
     /// Unlike `collapsed_from`, this survives nested unit wrappers, allowing
     /// XSD 1.0 restriction checks to distinguish repeated groups from elements.
     pub(super) folded_group_occurs: bool,
+    /// The exact counts of `term` this particle admits, when they are not
+    /// every count in `[min_occurs, max_occurs]` — the fold of a repeated
+    /// group whose child needs two or more occurrences: `choice{1,2}(b{2,2})`
+    /// folded into `b{2,4}` admits two or four `b`s, never three. `None`:
+    /// every count in the range. Restriction checks compare these sets, not
+    /// the ranges ([`NormalizedParticle::occurrences`]).
+    pub(super) counts: Option<Counts>,
+    /// The single-child group that `collapse_single_child_groups` folded
+    /// into this particle, as it was before the fold — group and child
+    /// with their own ranges. XSD 1.0 compares a choice that §3.9.6 clause
+    /// 2.2 does not make pointless in this form (`particle_restricts`).
+    pub(super) as_written: Option<Box<NormalizedParticle>>,
+}
+
+impl NormalizedParticle {
+    /// The counts of the term this particle admits: `counts`, or the range.
+    pub(super) fn occurrences(&self) -> Counts {
+        self.counts
+            .unwrap_or_else(|| Counts::range(self.min_occurs, self.max_occurs))
+    }
+
+    /// Sets the counts of the term, and the range to their hull (saturated
+    /// to `u32`). The set is kept where the range does not say it exactly:
+    /// gaps, or bounds beyond `u32`. Gaps are dropped when the term accepts
+    /// the empty sequence: `L(T)^c ⊆ L(T)^{c+1}`, so the hull admits the
+    /// same sequences.
+    pub(super) fn set_occurrences(&mut self, counts: Counts) {
+        let counts = if super::particle::term_is_emptiable(&self.term) {
+            counts.hull_set()
+        } else {
+            counts
+        };
+        (self.min_occurs, self.max_occurs) = counts.hull();
+        self.counts = (!counts.is_u32_range()).then_some(counts);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +159,8 @@ impl<'a> ParticleNormalizer<'a> {
             source: particle.source.clone(),
             collapsed_from: None,
             folded_group_occurs: false,
+            counts: None,
+            as_written: None,
         }))
     }
 
@@ -222,6 +260,27 @@ impl<'a> ParticleNormalizer<'a> {
         })
     }
 
+    /// XSD 1.1: a group's particles without those that map to no component —
+    /// an `<element>`, `<group>`, `<any>` or model group with `minOccurs =
+    /// maxOccurs = 0` (Structures §3.3.2, §3.7.2, §3.8.2, §3.10.2). They are
+    /// dropped before the group is collapsed or folded, so a choice whose
+    /// branches all have `maxOccurs="0"` is an empty choice — no sequence at
+    /// all when it must occur — and never an optional branch. XSD 1.0 keeps
+    /// them until `remove_pointless_particles`, after the collapse, as its
+    /// structural rules were checked against before.
+    fn without_absent_particles(
+        &self,
+        particles: Vec<NormalizedParticle>,
+    ) -> Vec<NormalizedParticle> {
+        if !self.schema_set.is_xsd11() {
+            return particles;
+        }
+        particles
+            .into_iter()
+            .filter(|particle| !(particle.min_occurs == 0 && particle.max_occurs == Some(0)))
+            .collect()
+    }
+
     fn normalize_group(&mut self, group: &ModelGroupDefResult) -> SchemaResult<NormalizedGroup> {
         if let Some(ref_name) = &group.ref_name {
             let group_key = self
@@ -249,7 +308,7 @@ impl<'a> ParticleNormalizer<'a> {
                 .collect::<SchemaResult<Vec<_>>>()?;
             return Ok(NormalizedGroup {
                 compositor,
-                particles,
+                particles: nested.without_absent_particles(particles),
             });
         }
 
@@ -263,7 +322,7 @@ impl<'a> ParticleNormalizer<'a> {
             .collect::<SchemaResult<Vec<_>>>()?;
         Ok(NormalizedGroup {
             compositor,
-            particles,
+            particles: self.without_absent_particles(particles),
         })
     }
 }
@@ -381,6 +440,8 @@ pub(super) fn normalized_effective_base_particle(
                     source: None,
                     collapsed_from: None,
                     folded_group_occurs: false,
+                    counts: None,
+                    as_written: None,
                 })
             }
         }
@@ -398,7 +459,7 @@ pub(super) fn normalize_type_particle(
         &type_def.resolved_content_particle_types,
     );
     let particle = normalizer.normalize_particle(particle)?;
-    let particle = remove_pointless_particles(particle);
+    let particle = remove_pointless_particles(particle, schema_set.is_xsd11());
     // XSD 1.1: skip flattening to preserve structural grouping needed for
     // intensional restriction (e.g. a single-branch choice whose collapsed
     // sequence must match against a multi-branch choice in the base).
@@ -438,6 +499,7 @@ pub(super) fn normalize_model_group_as_particle(
         .iter()
         .map(|particle| normalizer.normalize_particle(particle))
         .collect::<SchemaResult<Vec<_>>>()?;
+    let particles = normalizer.without_absent_particles(particles);
 
     let wrapper = NormalizedParticle {
         term: NormalizedParticleTerm::Group(NormalizedGroup {
@@ -449,6 +511,8 @@ pub(super) fn normalize_model_group_as_particle(
         source: group_data.source.clone(),
         collapsed_from: None,
         folded_group_occurs: false,
+        counts: None,
+        as_written: None,
     };
 
     // `normalize_particle` collapses every child; the outer wrapper we
@@ -456,7 +520,7 @@ pub(super) fn normalize_model_group_as_particle(
     // a single-element named group ends up shaped identically to the same
     // content inside a complex type.
     let particle = collapse_single_child_groups(wrapper);
-    let particle = remove_pointless_particles(particle);
+    let particle = remove_pointless_particles(particle, schema_set.is_xsd11());
     // XSD 1.1: skip flattening (same rationale as `normalize_type_particle`).
     if !schema_set.is_xsd11() {
         let particle = flatten_same_compositor_groups(particle);
@@ -468,13 +532,25 @@ pub(super) fn normalize_model_group_as_particle(
 /// Remove "pointless" particles per Section 3.8 normalization:
 /// - Particles with maxOccurs=0 are effectively absent
 /// - Groups with no remaining children after removal are also pointless
-fn remove_pointless_particles(mut particle: NormalizedParticle) -> NormalizedParticle {
+///
+/// Under XSD 1.1 (`keep_empty_branches`) an empty group that accepts the
+/// empty sequence stays when it is a branch of a choice: there it is the
+/// choice's empty alternative, which the language keeps (§3.8.4.1.2). XSD
+/// 1.0 ignores it, as §3.9.6 clause 2.2 calls it pointless.
+pub(super) fn remove_pointless_particles(
+    mut particle: NormalizedParticle,
+    keep_empty_branches: bool,
+) -> NormalizedParticle {
     if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        let in_choice = group.compositor == Compositor::Choice;
         group.particles = group
             .particles
             .drain(..)
-            .map(remove_pointless_particles)
-            .filter(|p| p.max_occurs != Some(0) && !is_pointless_empty_group(p))
+            .map(|child| remove_pointless_particles(child, keep_empty_branches))
+            .filter(|p| {
+                p.max_occurs != Some(0)
+                    && (!is_pointless_empty_group(p) || keep_empty_branches && in_choice)
+            })
             .collect();
     }
     particle
@@ -512,7 +588,9 @@ fn is_pointless_empty_group(particle: &NormalizedParticle) -> bool {
 /// Flatten nested groups with unit occurs and the same compositor into
 /// their parent (Section 3.8 particle normalization).
 /// E.g. sequence(sequence{1,1}(a, b), c) → sequence(a, b, c).
-fn flatten_same_compositor_groups(mut particle: NormalizedParticle) -> NormalizedParticle {
+pub(super) fn flatten_same_compositor_groups(
+    mut particle: NormalizedParticle,
+) -> NormalizedParticle {
     if let NormalizedParticleTerm::Group(group) = &mut particle.term {
         // First recurse into children
         group.particles = group
@@ -586,7 +664,7 @@ pub(super) fn collapse_single_child_groups(mut particle: NormalizedParticle) -> 
     }
 
     loop {
-        let child = match &particle.term {
+        let folded = match &particle.term {
             NormalizedParticleTerm::Group(group)
                 if group.particles.len() == 1
                     && can_collapse_single_child_group(
@@ -596,33 +674,21 @@ pub(super) fn collapse_single_child_groups(mut particle: NormalizedParticle) -> 
                         &group.particles[0],
                     ) =>
             {
-                Some(group.particles[0].clone())
+                fold_into_child(&particle)
             }
             _ => None,
         };
-        let Some(child) = child else {
+        let Some(folded) = folded else {
             return particle;
         };
-        let (min_occurs, max_occurs) = multiply_occurs(
-            particle.min_occurs,
-            particle.max_occurs,
-            child.min_occurs,
-            child.max_occurs,
-        );
         let compositor = match &particle.term {
             NormalizedParticleTerm::Group(group) => Some(group.compositor),
             _ => None,
         };
-        let folded_group_occurs = particle.folded_group_occurs
-            || child.folded_group_occurs
-            || !occurs_is_unit(particle.min_occurs, particle.max_occurs);
         particle = NormalizedParticle {
-            term: child.term,
-            min_occurs,
-            max_occurs,
-            source: particle.source.clone().or(child.source),
             collapsed_from: compositor,
-            folded_group_occurs,
+            as_written: Some(Box::new(particle)),
+            ..folded
         };
     }
 }
@@ -640,50 +706,85 @@ fn can_collapse_single_child_group(
     occurs_is_unit(group_min_occurs, group_max_occurs) || child.max_occurs == Some(1)
 }
 
+/// The counts of `child`'s term in the group particle `group` around it —
+/// `{M, N}` iterations, or the group's own exact counts — with
+/// `empty_iteration`, an iteration of the group may also produce none of
+/// it: `⋃ₖ [k·m, k·n]`, gaps kept. `None` when they are not one [`Counts`]
+/// set (a child with gaps repeated) or need counts beyond its limit (2¹²⁰):
+/// the group is then not folded.
+pub(super) fn folded_occurrences(
+    group: &NormalizedParticle,
+    child: &NormalizedParticle,
+    empty_iteration: bool,
+) -> Option<Counts> {
+    if super::particle::term_is_emptiable(&child.term) {
+        // `L(T)^c ⊆ L(T)^{c+1}`: the hull admits the same sequences.
+        return child
+            .occurrences()
+            .repeated_hull(group.occurrences(), empty_iteration);
+    }
+    child
+        .occurrences()
+        .repeated(group.occurrences(), empty_iteration)
+}
+
+/// [`folded_occurrences`], or where that is not one set a subset of the
+/// counts that is ([`Counts::repeated_under`]) — for the base side only.
+pub(super) fn folded_occurrences_under(
+    group: &NormalizedParticle,
+    child: &NormalizedParticle,
+    empty_iteration: bool,
+) -> Option<Counts> {
+    folded_occurrences(group, child, empty_iteration).or_else(|| {
+        child
+            .occurrences()
+            .repeated_under(group.occurrences(), empty_iteration)
+    })
+}
+
+/// The single-child group `particle` folded into its child: the child's
+/// term with the counts the group gives it ([`folded_occurrences`]), or
+/// `None` when they are not one set.
+fn fold_into_child(particle: &NormalizedParticle) -> Option<NormalizedParticle> {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return None;
+    };
+    let [child] = group.particles.as_slice() else {
+        return None;
+    };
+    let counts = folded_occurrences(particle, child, false)?;
+    let mut folded = NormalizedParticle {
+        term: child.term.clone(),
+        min_occurs: 0,
+        max_occurs: None,
+        source: particle.source.clone().or(child.source.clone()),
+        collapsed_from: None,
+        folded_group_occurs: particle.folded_group_occurs
+            || child.folded_group_occurs
+            || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
+        counts: None,
+        as_written: None,
+    };
+    folded.set_occurrences(counts);
+    Some(folded)
+}
+
 pub(super) fn occurs_is_unit(min_occurs: u32, max_occurs: Option<u32>) -> bool {
     min_occurs == 1 && max_occurs == Some(1)
 }
 
-pub(super) fn multiply_occurs(
-    left_min: u32,
-    left_max: Option<u32>,
-    right_min: u32,
-    right_max: Option<u32>,
-) -> (u32, Option<u32>) {
-    let min_occurs = left_min.saturating_mul(right_min);
-    let max_occurs = match (left_max, right_max) {
-        (Some(left), Some(right)) => Some(left.saturating_mul(right)),
-        (Some(0), None) | (None, Some(0)) => Some(0),
-        _ => None,
-    };
-    (min_occurs, max_occurs)
-}
-
-/// XSD 1.1: fold a single-child sequence/all group by multiplying occurs.
-/// sequence{M,N}(e{m,n}) ≡ e{M*m, N*n}
+/// XSD 1.1: fold a single-child sequence/all group by multiplying occurs,
+/// `sequence{M,N}(e{m,n})` → `e{M*m, N*n}`, with the exact counts kept
+/// ([`NormalizedParticle::counts`]). `None` when it is not such a group or
+/// its counts are not one set.
 pub(super) fn fold_single_child_group(particle: &NormalizedParticle) -> Option<NormalizedParticle> {
-    if let NormalizedParticleTerm::Group(group) = &particle.term {
-        if group.particles.len() == 1
-            && matches!(group.compositor, Compositor::Sequence | Compositor::All)
+    match &particle.term {
+        NormalizedParticleTerm::Group(group)
+            if group.particles.len() == 1
+                && matches!(group.compositor, Compositor::Sequence | Compositor::All) =>
         {
-            let child = &group.particles[0];
-            let (min_occurs, max_occurs) = multiply_occurs(
-                particle.min_occurs,
-                particle.max_occurs,
-                child.min_occurs,
-                child.max_occurs,
-            );
-            return Some(NormalizedParticle {
-                term: child.term.clone(),
-                min_occurs,
-                max_occurs,
-                source: particle.source.clone().or(child.source.clone()),
-                collapsed_from: None,
-                folded_group_occurs: particle.folded_group_occurs
-                    || child.folded_group_occurs
-                    || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
-            });
+            fold_into_child(particle)
         }
+        _ => None,
     }
-    None
 }

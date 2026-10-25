@@ -1,12 +1,15 @@
 //! §3.9.6 Particle Valid (Restriction): the particle subsumption core
 //! that decides whether a derived particle restricts a base particle.
 
+use super::counts::{Count, Counts};
 use super::format_type_name;
 use super::normalize::{
     collapse_single_child_groups, complex_content_particle, effective_base_content_particle,
-    flatten_nested_sequences, fold_single_child_group, is_effectively_empty, multiply_occurs,
-    normalize_type_particle, normalized_effective_base_particle, occurs_is_unit, NormalizedElement,
-    NormalizedGroup, NormalizedParticle, NormalizedParticleTerm, NormalizedWildcard,
+    flatten_nested_sequences, flatten_same_compositor_groups, fold_single_child_group,
+    folded_occurrences, folded_occurrences_under, is_effectively_empty, normalize_type_particle,
+    normalized_effective_base_particle, occurs_is_unit, remove_pointless_particles,
+    NormalizedElement, NormalizedGroup, NormalizedParticle, NormalizedParticleTerm,
+    NormalizedWildcard,
 };
 use super::wildcard::{
     process_contents_strictness, wildcard_allows_element, wildcard_restricts,
@@ -78,6 +81,13 @@ pub(super) fn validate_content_particle_restriction(
         (Some(derived_particle), Some(base_particle)) => {
             let derived_particle = normalize_type_particle(schema_set, derived, derived_particle)?;
 
+            // XSD 1.1: a derived particle that accepts no sequence at all (a
+            // required choice whose branches all map to no component) has an
+            // empty language, a subset of any (§3.4.6.4 clause 1). XSD 1.0
+            // takes an empty group as empty content, as before.
+            if schema_set.is_xsd11() && particle_accepts_nothing(&derived_particle) {
+                return Ok(());
+            }
             if is_effectively_empty(&derived_particle) {
                 if particle_is_emptiable(&base_particle) {
                     return Ok(());
@@ -114,23 +124,349 @@ pub(super) fn validate_content_particle_restriction(
     }
 }
 
+/// Does `derived` restrict `base` (§3.9.6 for XSD 1.0, §3.4.6.4 for 1.1)?
+///
+/// **Termination.** Every recursive call compares a strictly smaller pair:
+/// a fold (`fold_single_child_group`, `under_folded_base`, `over_folded`,
+/// a folded branch) removes a group node from one side, the structural
+/// rules recurse into children, and the mixing rules compare a derived
+/// branch (a child) with a base or a base copy with new counts but no new
+/// nodes. Two steps add a node: the XSD 1.1 re-expansion into the base's
+/// compositor (never applied to a group that already has it, and followed
+/// by the base's children), and the XSD 1.0 comparison of a single-child
+/// group as written ([`unpointless_group_as_written`]), which goes one fold
+/// back each time along a finite chain and then descends structurally. The
+/// loops here run over the children of finite groups; the count comparisons
+/// themselves are bounded (`counts.rs`).
 pub(super) fn particle_restricts(
     schema_set: &SchemaSet,
     derived: &NormalizedParticle,
     base: &NormalizedParticle,
 ) -> bool {
+    // XSD 1.1: a derived particle that accepts the empty sequence and
+    // nothing else (an empty group kept as a choice's empty alternative, a
+    // group whose term accepts nothing and may occur zero times) restricts
+    // exactly the bases that accept it; one that accepts nothing restricts
+    // any (§3.4.6.4 clause 1).
+    if schema_set.is_xsd11() {
+        match degenerate_language(derived) {
+            Some(Degenerate::OnlyEmpty) => return particle_is_emptiable(base),
+            Some(Degenerate::Nothing) => return true,
+            None => {}
+        }
+    }
     // XSD 1.1 intensional restriction: fold single-child sequence/all groups
     // symmetrically on both sides so they are compared in the same normal form.
+    // The fold keeps the exact counts (`sequence{1,2}(b{2,2})` admits two or
+    // four `b`s, never three — particlesHa147), and every comparison of
+    // occurrences below compares those sets.
     if schema_set.is_xsd11() {
         if let Some(folded) = fold_single_child_group(derived) {
-            return particle_restricts(schema_set, &folded, base);
+            // A fold with gaps or beyond `u32`, into a child whose term
+            // accepts the empty sequence, or of one group into another loses
+            // structure that an identical or narrowed base group would
+            // match: try both.
+            let lossy = folded.counts.is_some()
+                || matches!(&derived.term, NormalizedParticleTerm::Group(group)
+                if group.particles.first().is_some_and(|child| {
+                    term_is_emptiable(&child.term)
+                        || matches!(child.term, NormalizedParticleTerm::Group(_))
+                }));
+            return particle_restricts(schema_set, &folded, base)
+                || lossy && particle_restricts_unfolded(schema_set, derived, base);
+        }
+        if is_unfoldable_group(derived, &[Compositor::Sequence, Compositor::All]) {
+            // A derived group whose counts are not one set: as it is (an
+            // identical or narrowed group), against the base folded, then
+            // folded with more counts than it admits.
+            return particle_restricts_unfolded(schema_set, derived, base)
+                || fold_single_child_group(base)
+                    .or_else(|| under_folded_base(base))
+                    .is_some_and(|folded_base| {
+                        particle_restricts(schema_set, derived, &folded_base)
+                    })
+                || over_folded(derived)
+                    .is_some_and(|over| particle_restricts(schema_set, &over, base));
         }
         if let Some(folded_base) = fold_single_child_group(base) {
             return particle_restricts(schema_set, derived, &folded_base);
         }
+        // A base group whose counts are not one set: folded with fewer
+        // counts than it admits, then as it is.
+        if under_folded_base(base)
+            .is_some_and(|folded_base| particle_restricts(schema_set, derived, &folded_base))
+        {
+            return true;
+        }
     }
 
-    particle_restricts_unfolded(schema_set, derived, base)
+    if particle_restricts_unfolded(schema_set, derived, base) {
+        return true;
+    }
+    // A derived single-branch choice that normalization could not collapse
+    // exactly (its counts are not one set): collapsed with more counts.
+    is_unfoldable_group(derived, &[Compositor::Choice])
+        && over_folded(derived).is_some_and(|over| particle_restricts(schema_set, &over, base))
+}
+
+/// A single-child group with one of `compositors` that is not folded into
+/// its child: its counts are not one [`Counts`] set (a child with gaps
+/// repeated).
+fn is_unfoldable_group(particle: &NormalizedParticle, compositors: &[Compositor]) -> bool {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return false;
+    };
+    let [child] = group.particles.as_slice() else {
+        return false;
+    };
+    compositors.contains(&group.compositor) && folded_occurrences(particle, child, false).is_none()
+}
+
+/// A base single-child sequence or all group whose counts are not one set,
+/// folded into its child with a subset of its counts
+/// ([`folded_occurrences_under`]): what restricts the fold restricts the
+/// group.
+fn under_folded_base(particle: &NormalizedParticle) -> Option<NormalizedParticle> {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return None;
+    };
+    let [child] = group.particles.as_slice() else {
+        return None;
+    };
+    if group.compositor == Compositor::Choice {
+        return None;
+    }
+    let counts = folded_occurrences_under(particle, child, false)?;
+    Some(fold_with(particle, child, counts))
+}
+
+/// The child of the group `particle`, with `counts`.
+fn fold_with(
+    particle: &NormalizedParticle,
+    child: &NormalizedParticle,
+    counts: Counts,
+) -> NormalizedParticle {
+    let mut folded = NormalizedParticle {
+        term: child.term.clone(),
+        min_occurs: 0,
+        max_occurs: None,
+        source: particle.source.clone().or(child.source.clone()),
+        collapsed_from: None,
+        folded_group_occurs: true,
+        counts: None,
+        as_written: None,
+    };
+    folded.set_occurrences(counts);
+    folded
+}
+
+/// A single-child group folded into its child with a set of counts that
+/// holds all of the group's and more ([`Counts::repeated_over`]): for the
+/// derived side only — what it restricts, the group restricts.
+fn over_folded(particle: &NormalizedParticle) -> Option<NormalizedParticle> {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return None;
+    };
+    let [child] = group.particles.as_slice() else {
+        return None;
+    };
+    let counts = folded_occurrences(particle, child, false).unwrap_or_else(|| {
+        child
+            .occurrences()
+            .repeated_over(particle.occurrences(), false)
+    });
+    let mut over = NormalizedParticle {
+        term: child.term.clone(),
+        min_occurs: 0,
+        max_occurs: None,
+        source: particle.source.clone().or(child.source.clone()),
+        collapsed_from: (group.compositor == Compositor::Choice).then_some(Compositor::Choice),
+        folded_group_occurs: true,
+        counts: None,
+        as_written: None,
+    };
+    over.set_occurrences(counts);
+    Some(over)
+}
+
+/// Are the derived particle's counts among the base particle's — §3.9.6
+/// Occurrence Range OK, with the exact sets ([`NormalizedParticle::counts`])?
+fn occurrences_within(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+) -> bool {
+    if derived.counts.is_none() && base.counts.is_none() {
+        let (base_min, base_max) = effective_range(schema_set, base);
+        return occurs_range_is_subset(derived.min_occurs, derived.max_occurs, base_min, base_max);
+    }
+    derived
+        .occurrences()
+        .within(&effective_occurrences(schema_set, base))
+}
+
+/// Is every count in `[min, max]` among the base particle's counts?
+fn range_within(
+    schema_set: &SchemaSet,
+    min: u32,
+    max: Option<u32>,
+    base: &NormalizedParticle,
+) -> bool {
+    if base.counts.is_none() {
+        let (base_min, base_max) = effective_range(schema_set, base);
+        return occurs_range_is_subset(min, max, base_min, base_max);
+    }
+    Counts::range(min, max).within(&effective_occurrences(schema_set, base))
+}
+
+/// Does the base particle admit exactly one occurrence of its term?
+fn admits_one(schema_set: &SchemaSet, base: &NormalizedParticle) -> bool {
+    range_within(schema_set, 1, Some(1), base)
+}
+
+/// A base particle's range as far as its language goes: when its term
+/// accepts the empty sequence, `L(T)^c ⊆ L(T)^{c+1}`, so fewer occurrences
+/// than its minimum add no sequence it lacks — the range starts at 0.
+fn effective_range(schema_set: &SchemaSet, base: &NormalizedParticle) -> (u32, Option<u32>) {
+    if schema_set.is_xsd11() && term_is_emptiable(&base.term) {
+        (0, base.max_occurs)
+    } else {
+        (base.min_occurs, base.max_occurs)
+    }
+}
+
+fn effective_occurrences(schema_set: &SchemaSet, base: &NormalizedParticle) -> Counts {
+    if schema_set.is_xsd11() && term_is_emptiable(&base.term) {
+        base.occurrences().up_to_max()
+    } else {
+        base.occurrences()
+    }
+}
+
+/// `particle` without its empty sequence: its counts other than 0.
+fn without_empty(particle: &NormalizedParticle) -> NormalizedParticle {
+    let mut non_empty = particle.clone();
+    non_empty.set_occurrences(particle.occurrences().without_zero());
+    non_empty
+}
+
+/// What a particle's language reduces to when it is degenerate.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Degenerate {
+    /// No sequence at all: a required group whose term accepts none — at
+    /// the bottom a required empty choice, whose branches all map to no
+    /// component.
+    Nothing,
+    /// The empty sequence and nothing else.
+    OnlyEmpty,
+}
+
+/// `Some` when `particle` accepts no sequence or only the empty one.
+pub(super) fn degenerate_language(particle: &NormalizedParticle) -> Option<Degenerate> {
+    if particle.max_occurs == Some(0) {
+        return Some(Degenerate::OnlyEmpty);
+    }
+    let term = match &particle.term {
+        NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => return None,
+        NormalizedParticleTerm::Group(group) => {
+            let children: Vec<Option<Degenerate>> =
+                group.particles.iter().map(degenerate_language).collect();
+            match group.compositor {
+                Compositor::Sequence | Compositor::All => {
+                    if children.contains(&Some(Degenerate::Nothing)) {
+                        Degenerate::Nothing
+                    } else if children.iter().all(|c| *c == Some(Degenerate::OnlyEmpty)) {
+                        Degenerate::OnlyEmpty
+                    } else {
+                        return None;
+                    }
+                }
+                Compositor::Choice => {
+                    if children.iter().all(|c| *c == Some(Degenerate::Nothing)) {
+                        Degenerate::Nothing
+                    } else if children.iter().all(Option::is_some) {
+                        Degenerate::OnlyEmpty
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+    };
+    Some(match term {
+        Degenerate::Nothing if particle.min_occurs > 0 => Degenerate::Nothing,
+        _ => Degenerate::OnlyEmpty,
+    })
+}
+
+/// Does `particle` accept no sequence at all?
+pub(super) fn particle_accepts_nothing(particle: &NormalizedParticle) -> bool {
+    degenerate_language(particle) == Some(Degenerate::Nothing)
+}
+
+/// XSD 1.0: the single-child choice or sequence normalization collapsed
+/// into `particle`, as written, when §3.9.6 clause 2.2 does not make it
+/// pointless: its particle is not 1..1 (clause 2.2.2.1; a single-child
+/// `all` is always pointless). A pointless group is skipped, as the REC
+/// ignores it, and the particle it held is looked at instead. Each step goes
+/// one fold back, so the walk ends.
+fn unpointless_group_as_written(particle: &NormalizedParticle) -> Option<&NormalizedParticle> {
+    let mut current = particle;
+    loop {
+        if !matches!(
+            current.collapsed_from,
+            Some(Compositor::Choice | Compositor::Sequence)
+        ) {
+            return None;
+        }
+        let written = current.as_written.as_deref()?;
+        if !occurs_is_unit(written.min_occurs, written.max_occurs) {
+            return Some(written);
+        }
+        let NormalizedParticleTerm::Group(group) = &written.term else {
+            return None;
+        };
+        current = group.particles.first()?;
+    }
+}
+
+/// `derived` for a comparison with one of the base's children
+/// (RecurseAsIfGroup's implicit group, one branch of a base choice, one
+/// child of a base sequence): under XSD 1.0 without the group it was
+/// collapsed from. [`particle_restricts_unfolded`] has already compared that
+/// group as written with the base itself — the level the REC compares it at.
+fn compared_whole(schema_set: &SchemaSet, derived: &NormalizedParticle) -> NormalizedParticle {
+    let mut element = derived.clone();
+    if schema_set.is_xsd10() {
+        element.as_written = None;
+    }
+    element
+}
+
+/// XSD 1.0: `particle` with every single-child group that normalization
+/// collapsed and §3.9.6 clause 2.2 does not make pointless put back as
+/// written, at every depth ([`unpointless_group_as_written`]). The groups
+/// clause 2.2 does make pointless stay out: collapsed single-child groups
+/// stay collapsed, and the written forms (taken before the rest of the
+/// normalization) lose their empty groups and have their unit groups merged
+/// into a parent of the same compositor, as the rest of the tree did.
+fn written_in_full(particle: &NormalizedParticle) -> NormalizedParticle {
+    fn put_back(particle: &NormalizedParticle) -> NormalizedParticle {
+        let mut written = unpointless_group_as_written(particle)
+            .unwrap_or(particle)
+            .clone();
+        written.collapsed_from = None;
+        written.as_written = None;
+        if let NormalizedParticleTerm::Group(group) = &mut written.term {
+            // What the rest of the tree dropped stays dropped.
+            group.particles.retain(|child| child.max_occurs != Some(0));
+            for child in &mut group.particles {
+                *child = put_back(child);
+            }
+        }
+        written
+    }
+    flatten_same_compositor_groups(remove_pointless_particles(put_back(particle), false))
 }
 
 /// `particle_restricts` minus the XSD 1.1 single-child fold.
@@ -174,6 +510,22 @@ fn particle_restricts_unfolded(
                 NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_)
             ),
         };
+        // XSD 1.0: a single-child choice or sequence that §3.9.6 clause 2.2
+        // does not make pointless is compared as written — the group and its
+        // child with their own ranges (RecurseLax maps `a?` onto a base `a`
+        // only if `a?`'s range lies within it) — and so is the base, all the
+        // way down, so that the comparison is the REC's own.
+        if schema_set.is_xsd10() {
+            if let Some(written) = unpointless_group_as_written(derived) {
+                if particle_restricts_unfolded(
+                    schema_set,
+                    &written_in_full(written),
+                    &written_in_full(base),
+                ) {
+                    return true;
+                }
+            }
+        }
         if schema_set.is_xsd11()
             && derived.collapsed_from == Some(base_group.compositor)
             && !already_grouped
@@ -189,6 +541,8 @@ fn particle_restricts_unfolded(
                         source: derived.source.clone(),
                         collapsed_from: None,
                         folded_group_occurs: false,
+                        counts: None,
+                        as_written: None,
                     }],
                 }),
                 min_occurs: derived.min_occurs,
@@ -196,6 +550,8 @@ fn particle_restricts_unfolded(
                 source: derived.source.clone(),
                 collapsed_from: None,
                 folded_group_occurs: derived.folded_group_occurs,
+                counts: derived.counts,
+                as_written: None,
             };
             if particle_restricts_unfolded(schema_set, &expanded, base) {
                 return true;
@@ -213,12 +569,11 @@ fn particle_restricts_unfolded(
         (&derived.term, &base.term)
     {
         if schema_set.is_xsd10() && base_group.compositor == Compositor::Choice {
-            let implicit_range_fits =
-                occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs);
+            let implicit_range_fits = admits_one(schema_set, base);
             if implicit_range_fits
                 && choice_branches_restrict_ordered(
                     schema_set,
-                    std::slice::from_ref(derived),
+                    &[compared_whole(schema_set, derived)],
                     &base_group.particles,
                 )
             {
@@ -277,16 +632,13 @@ fn particle_restricts_unfolded(
         if derived_choice.compositor == Compositor::Choice
             && base_choice.compositor == Compositor::Choice
         {
-            if occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            ) && choice_branches_restrict_ordered(
-                schema_set,
-                &derived_choice.particles,
-                &base_choice.particles,
-            ) {
+            if occurrences_within(schema_set, derived, base)
+                && choice_branches_restrict_ordered(
+                    schema_set,
+                    &derived_choice.particles,
+                    &base_choice.particles,
+                )
+            {
                 return true;
             }
             // Under XSD 1.0 RecurseLax *is* the whole rule for choice:choice,
@@ -302,7 +654,7 @@ fn particle_restricts_unfolded(
         }
     }
 
-    if let Some(base_branches) = expand_choice_branches(base) {
+    if let Some(base_branches) = base_choice_branches(schema_set, base) {
         if let Some(derived_branches) = expand_choice_branches(derived) {
             // XSD 1.0 RecurseLax: order-preserving mapping required.
             // XSD 1.1: unordered set-based matching.
@@ -313,6 +665,73 @@ fn particle_restricts_unfolded(
                     &base_branches,
                 );
             }
+            // A repeated derived choice mixes its branches across iterations,
+            // which no branch-by-branch check sees (`choice{0,2}(a, b)` admits
+            // `(a, b)`). Accept it whole against one base branch (a wildcard
+            // branch absorbs the mixtures), or iteration by iteration:
+            // RecurseLax without the order, sound because each derived
+            // iteration is then one base iteration.
+            if let (
+                true,
+                NormalizedParticleTerm::Group(derived_group),
+                NormalizedParticleTerm::Group(base_group),
+            ) = (choice_iterations_mix(derived), &derived.term, &base.term)
+            {
+                // Each derived iteration one base iteration: a derived
+                // branch restricts a base branch, or — when the base can
+                // iterate emptily (an emptiable branch) — its non-empty form
+                // does.
+                let base_empty_iteration = base_group.particles.iter().any(particle_is_emptiable);
+                let branch_restricts = |branch: &NormalizedParticle| {
+                    let restricts_raw = |branch: &NormalizedParticle| {
+                        base_group
+                            .particles
+                            .iter()
+                            .any(|candidate| particle_restricts(schema_set, branch, candidate))
+                    };
+                    restricts_raw(branch)
+                        || base_empty_iteration
+                            && particle_is_emptiable(branch)
+                            && branch.max_occurs != Some(0)
+                            && restricts_raw(&without_empty(branch))
+                };
+                // Or each derived iteration one or more base iterations:
+                // branch `Y` restricts the base's term repeated `[1, ∞)`
+                // times, and every total the derived iterations can make —
+                // `[K·r, ∞)` over their counts `K`, `r = 0` when a branch is
+                // emptiable — is a count of the base.
+                let absorbed = |derived: &NormalizedParticle| {
+                    let mut repeated = base.clone();
+                    repeated.set_occurrences(Counts::range(1, None));
+                    if !derived_group
+                        .particles
+                        .iter()
+                        .all(|branch| particle_restricts(schema_set, branch, &repeated))
+                    {
+                        return false;
+                    }
+                    let low = u32::from(!derived_group.particles.iter().any(particle_is_emptiable));
+                    let totals =
+                        Counts::range(low, None).repeated_over(derived.occurrences(), false);
+                    totals.within(&effective_occurrences(schema_set, base))
+                };
+                let iterations_restrict = |derived: &NormalizedParticle| {
+                    restricts_some_base_branch(schema_set, derived, &base_branches)
+                        || occurrences_within(schema_set, derived, base)
+                            && derived_group.particles.iter().all(branch_restricts)
+                        || absorbed(derived)
+                };
+                if iterations_restrict(derived) {
+                    return true;
+                }
+                // An optional derived choice whose empty sequence the base
+                // accepts (an emptiable branch) only has to show its
+                // non-empty iterations: `choice{0,n}` is ε or `choice{1,n}`.
+                if derived.min_occurs == 0 && particle_is_emptiable(base) {
+                    return iterations_restrict(&without_empty(derived));
+                }
+                return false;
+            }
             // XSD 1.1: each derived branch must restrict some base branch —
             // OR, when the derived branch is emptiable and at least one base
             // branch is emptiable, the derived branch's empty production is
@@ -321,25 +740,22 @@ fn particle_restricts_unfolded(
             // like addB118 where the derived choice is optional (min=0) but
             // no single base choice branch is emptiable AND accepts the
             // derived's elements — the union of branches covers it.
-            let base_has_emptiable_branch = base_branches.iter().any(particle_is_emptiable);
+            let base_has_emptiable_branch = particle_is_emptiable(base);
             return derived_branches.iter().all(|branch| {
-                if base_branches
-                    .iter()
-                    .any(|candidate| particle_restricts(schema_set, branch, candidate))
-                {
+                if restricts_some_base_branch(schema_set, branch, &base_branches) {
                     return true;
                 }
                 if branch.min_occurs == 0 && base_has_emptiable_branch {
-                    let mut non_empty = branch.clone();
-                    non_empty.min_occurs = non_empty.min_occurs.max(1);
-                    if non_empty.max_occurs.is_some_and(|m| m == 0) {
+                    if branch.max_occurs == Some(0) {
                         // original was min=0,max=0 (empty); empty production
                         // alone is covered, no non-empty form to check.
                         return true;
                     }
-                    return base_branches
-                        .iter()
-                        .any(|candidate| particle_restricts(schema_set, &non_empty, candidate));
+                    return restricts_some_base_branch(
+                        schema_set,
+                        &without_empty(branch),
+                        &base_branches,
+                    );
                 }
                 false
             });
@@ -351,13 +767,10 @@ fn particle_restricts_unfolded(
                 // XSD 1.1: try "restricts any single branch" first.
                 // Sound because if derived restricts one branch, it restricts
                 // a subset of the choice's language.
-                if schema_set.is_xsd11() {
-                    let any_branch = base_branches
-                        .iter()
-                        .any(|candidate| particle_restricts(schema_set, derived, candidate));
-                    if any_branch {
-                        return true;
-                    }
+                if schema_set.is_xsd11()
+                    && restricts_some_base_branch(schema_set, derived, &base_branches)
+                {
+                    return true;
                 }
                 let NormalizedParticleTerm::Group(base_group) = &base.term else {
                     unreachable!()
@@ -372,12 +785,25 @@ fn particle_restricts_unfolded(
             }
         }
 
-        return base_branches
-            .iter()
-            .any(|candidate| particle_restricts(schema_set, derived, candidate));
+        return restricts_some_base_branch(schema_set, derived, &base_branches);
     }
 
     if let Some(derived_branches) = expand_choice_branches(derived) {
+        // A repeated derived choice against a base sequence: its iterations
+        // can put the branches in an order the sequence rejects, so the
+        // branches are not compared one by one. XSD 1.0 §3.9.6 marks
+        // Choice:Sequence Forbidden outright; XSD 1.1 compares the whole
+        // choice with the sequence's children — one iteration of the
+        // sequence, or one child repeated over its iterations.
+        if choice_iterations_mix(derived) {
+            if let NormalizedParticleTerm::Group(base_group) = &base.term {
+                if base_group.compositor == Compositor::Sequence {
+                    return schema_set.is_xsd11()
+                        && (restricts_one_sequence_child(schema_set, derived, base, base_group)
+                            || restricts_repeated_child(schema_set, derived, base, base_group));
+                }
+            }
+        }
         return derived_branches
             .iter()
             .all(|branch| particle_restricts(schema_set, branch, base));
@@ -402,13 +828,8 @@ fn particle_restricts_unfolded(
             // NameAndTypeOK (§3.9.6):
             // 1. Names match or substitution group
             (names_match || subst_match)
-            // 2. Occurrence range subset
-            && occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            )
+            // 2. Occurrence range subset (exact counts)
+            && occurrences_within(schema_set, derived, base)
             // 3. nillable: derived nillable only if base nillable
             && (base_element.nillable || !derived_element.nillable)
             // 4. fixed value: if base is fixed, derived must be fixed with same value (value-space)
@@ -441,38 +862,31 @@ fn particle_restricts_unfolded(
             NormalizedParticleTerm::Element(element),
             NormalizedParticleTerm::Wildcard(base_wildcard),
         ) => {
-            occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            ) && wildcard_allows_element(element, base_wildcard)
+            occurrences_within(schema_set, derived, base)
+                && wildcard_allows_element(element, base_wildcard)
         }
         (
             NormalizedParticleTerm::Wildcard(derived_wildcard),
             NormalizedParticleTerm::Wildcard(base_wildcard),
         ) => {
-            occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            ) && wildcard_restricts(derived_wildcard, base_wildcard)
+            occurrences_within(schema_set, derived, base)
+                && wildcard_restricts(derived_wildcard, base_wildcard)
         }
         (
             NormalizedParticleTerm::Group(derived_group),
             NormalizedParticleTerm::Wildcard(base_wildcard),
-        ) => group_particle_restricts_wildcard(derived, derived_group, base, base_wildcard),
+        ) => group_particle_restricts_wildcard(
+            schema_set,
+            derived,
+            derived_group,
+            base,
+            base_wildcard,
+        ),
         (
             NormalizedParticleTerm::Group(derived_group),
             NormalizedParticleTerm::Group(base_group),
         ) if derived_group.compositor == base_group.compositor => {
-            if !occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            ) {
+            if !occurrences_within(schema_set, derived, base) {
                 return false;
             }
             match derived_group.compositor {
@@ -498,12 +912,7 @@ fn particle_restricts_unfolded(
         ) if derived_group.compositor == Compositor::Sequence
             && base_group.compositor == Compositor::All =>
         {
-            if !occurs_range_is_subset(
-                derived.min_occurs,
-                derived.max_occurs,
-                base.min_occurs,
-                base.max_occurs,
-            ) {
+            if !occurrences_within(schema_set, derived, base) {
                 return false;
             }
             recurse_unordered(schema_set, &derived_group.particles, &base_group.particles)
@@ -525,21 +934,24 @@ fn particle_restricts_unfolded(
                 _ => sequence_particles_restrict(schema_set, children, &base_group.particles),
             };
 
-            occurs_range_is_subset(1, Some(1), base.min_occurs, base.max_occurs)
-                && match_children(std::slice::from_ref(derived))
+            admits_one(schema_set, base) && match_children(&[compared_whole(schema_set, derived)])
+                || schema_set.is_xsd11()
+                    && restricts_repeated_child(schema_set, derived, base, base_group)
         }
         _ => false,
     }
 }
 
 fn group_particle_restricts_wildcard(
+    schema_set: &SchemaSet,
     derived: &NormalizedParticle,
     group: &NormalizedGroup,
     base: &NormalizedParticle,
     wildcard: &NormalizedWildcard,
 ) -> bool {
     let (derived_min, derived_max) = particle_total_occurrence_range(derived);
-    if !occurs_range_is_subset(derived_min, derived_max, base.min_occurs, base.max_occurs) {
+    if !Counts::covering(derived_min, derived_max).within(&effective_occurrences(schema_set, base))
+    {
         return false;
     }
 
@@ -563,6 +975,11 @@ fn occurs_range_is_subset(
     }
 }
 
+/// The branches of the derived choice `particle`, each with the choice's
+/// range folded in: `choice{m,n}(…, X{p,q}, …)` gives `X` with the counts
+/// `⋃ₖ [k·p, k·q]`, exact where they are one set and a superset
+/// ([`Counts::repeated_over`]) otherwise — a derived particle may admit more
+/// than the branch does, never less (each branch alone; see `choice_iterations_mix` for the mixtures).
 fn expand_choice_branches(particle: &NormalizedParticle) -> Option<Vec<NormalizedParticle>> {
     let NormalizedParticleTerm::Group(group) = &particle.term else {
         return None;
@@ -576,54 +993,193 @@ fn expand_choice_branches(particle: &NormalizedParticle) -> Option<Vec<Normalize
             .particles
             .iter()
             .map(|child| {
-                let (min_occurs, max_occurs) = multiply_occurs(
-                    particle.min_occurs,
-                    particle.max_occurs,
-                    child.min_occurs,
-                    child.max_occurs,
-                );
-                collapse_single_child_groups(NormalizedParticle {
-                    term: child.term.clone(),
-                    min_occurs,
-                    max_occurs,
-                    source: particle.source.clone().or(child.source.clone()),
-                    collapsed_from: None,
-                    folded_group_occurs: particle.folded_group_occurs
-                        || child.folded_group_occurs
-                        || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
-                })
+                let counts = folded_occurrences(particle, child, false).unwrap_or_else(|| {
+                    child
+                        .occurrences()
+                        .repeated_over(particle.occurrences(), false)
+                });
+                folded_branch(particle, child, counts)
             })
             .collect(),
     )
 }
 
-fn particle_total_occurrence_range(particle: &NormalizedParticle) -> (u32, Option<u32>) {
+/// The branches of the base choice `particle`, each with the choice's range
+/// folded in, admitting only sequences the choice admits:
+/// `choice{m,n}(…, X{p,q}, …)` gives `X` with the counts `⋃ₖ [k·p, k·q]`
+/// (Structures 1.1 §3.9.4.1.1, §3.8.4.1.2) — under XSD 1.1 including the
+/// empty iterations an emptiable sibling branch allows (k from 0). A branch
+/// whose counts are not one set is offered with a subset of them
+/// ([`folded_occurrences_under`]), or not at all. The folding code compared
+/// with `X{m·p, n·q}`, which admits counts no number of iterations produces
+/// once `p ≥ 2`.
+fn base_choice_branches(
+    schema_set: &SchemaSet,
+    particle: &NormalizedParticle,
+) -> Option<Vec<NormalizedParticle>> {
+    let NormalizedParticleTerm::Group(group) = &particle.term else {
+        return None;
+    };
+    if group.compositor != Compositor::Choice {
+        return None;
+    }
+    let emptiable = group
+        .particles
+        .iter()
+        .filter(|child| particle_is_emptiable(child))
+        .count();
+    Some(
+        group
+            .particles
+            .iter()
+            .filter_map(|child| {
+                let empty_iteration =
+                    schema_set.is_xsd11() && emptiable > usize::from(particle_is_emptiable(child));
+                let counts = folded_occurrences_under(particle, child, empty_iteration)?;
+                Some(folded_branch(particle, child, counts))
+            })
+            .collect(),
+    )
+}
+
+/// The branch `child` of the choice `particle`, with `counts`.
+fn folded_branch(
+    particle: &NormalizedParticle,
+    child: &NormalizedParticle,
+    counts: Counts,
+) -> NormalizedParticle {
+    let mut branch = NormalizedParticle {
+        term: child.term.clone(),
+        min_occurs: 0,
+        max_occurs: None,
+        source: particle.source.clone().or(child.source.clone()),
+        collapsed_from: None,
+        folded_group_occurs: particle.folded_group_occurs
+            || child.folded_group_occurs
+            || !occurs_is_unit(particle.min_occurs, particle.max_occurs),
+        counts: None,
+        as_written: None,
+    };
+    branch.set_occurrences(counts);
+    collapse_single_child_groups(branch)
+}
+
+/// A choice with two or more branches that may repeat: its iterations can
+/// mix branches, so checking the branches one at a time (each with the
+/// choice's range folded in) says nothing about the mixtures.
+fn choice_iterations_mix(particle: &NormalizedParticle) -> bool {
+    matches!(&particle.term, NormalizedParticleTerm::Group(group)
+        if group.compositor == Compositor::Choice && group.particles.len() > 1)
+        && !matches!(particle.max_occurs, Some(0 | 1))
+}
+
+/// Does `derived` restrict one child of the base sequence or all group
+/// `base`, repeated as often as `base` iterates, while every other child is
+/// emptiable? Each iteration of `base` can then be that child alone, so
+/// `L(base)` holds the child repeated over the iterations — counts
+/// [`folded_occurrences_under`]. RecurseAsIfGroup over several iterations,
+/// for a derived particle that needs more than one — XSD 1.1 only: XSD
+/// 1.0's RecurseAsIfGroup asks for the 1..1 range (§3.9.6).
+fn restricts_repeated_child(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+    base_group: &NormalizedGroup,
+) -> bool {
+    if base_group.particles.len() < 2 {
+        return false;
+    }
+    let mut required = base_group
+        .particles
+        .iter()
+        .filter(|child| !particle_is_emptiable(child));
+    let candidates: Vec<&NormalizedParticle> = match (required.next(), required.next()) {
+        (None, _) => base_group.particles.iter().collect(),
+        (Some(child), None) => vec![child],
+        (Some(_), Some(_)) => return false,
+    };
+    candidates.into_iter().any(|child| {
+        folded_occurrences_under(base, child, false).is_some_and(|counts| {
+            particle_restricts(schema_set, derived, &fold_with(base, child, counts))
+        })
+    })
+}
+
+/// XSD 1.1: does `derived`, taken whole, restrict one child of the base
+/// sequence `base` while every other child is emptiable?
+///
+/// Then each sequence `derived` accepts is accepted by that child, the other
+/// children match the empty sequence, and one iteration of `base` — the rest,
+/// if `base` must repeat, empty — accepts it (§3.8.4.1.1, §3.9.4.1.1), as
+/// §3.4.6.4 clause 1 requires. A repeated choice that only several children
+/// together accept is not shown this way.
+fn restricts_one_sequence_child(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base: &NormalizedParticle,
+    base_group: &NormalizedGroup,
+) -> bool {
+    // One iteration of `base`, or several with all but one empty.
+    let one_iteration =
+        admits_one(schema_set, base) || term_is_emptiable(&base.term) && base.max_occurs != Some(0);
+    if !one_iteration {
+        return false;
+    }
+    let mut required = base_group
+        .particles
+        .iter()
+        .filter(|child| !particle_is_emptiable(child));
+    let derived = compared_whole(schema_set, derived);
+    match (required.next(), required.next()) {
+        (None, _) => base_group
+            .particles
+            .iter()
+            .any(|child| particle_restricts(schema_set, &derived, child)),
+        (Some(child), None) => particle_restricts(schema_set, &derived, child),
+        (Some(_), Some(_)) => false,
+    }
+}
+
+/// Does `derived` restrict one of the base choice's branches, each with the
+/// choice's range folded in exactly ([`base_choice_branches`])?
+fn restricts_some_base_branch(
+    schema_set: &SchemaSet,
+    derived: &NormalizedParticle,
+    base_branches: &[NormalizedParticle],
+) -> bool {
+    let derived = compared_whole(schema_set, derived);
+    base_branches
+        .iter()
+        .any(|candidate| particle_restricts(schema_set, &derived, candidate))
+}
+
+/// The counts of element and wildcard occurrences a derived particle's
+/// sequences can have, as a range that holds them all: sums and products
+/// exact in [`Count`], a maximum that overflows taken as unbounded.
+fn particle_total_occurrence_range(particle: &NormalizedParticle) -> (Count, Option<Count>) {
+    let add = |x: Option<Count>, y: Option<Count>| match (x, y) {
+        (Some(x), Some(y)) => x.checked_add(y),
+        _ => None,
+    };
     let (term_min, term_max) = match &particle.term {
         NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => (1, Some(1)),
         NormalizedParticleTerm::Group(group) => match group.compositor {
-            Compositor::Sequence | Compositor::All => {
-                group
-                    .particles
-                    .iter()
-                    .fold((0u32, Some(0u32)), |(acc_min, acc_max), child| {
-                        let (child_min, child_max) = particle_total_occurrence_range(child);
-                        (
-                            acc_min.saturating_add(child_min),
-                            add_optional_occurs(acc_max, child_max),
-                        )
-                    })
-            }
+            Compositor::Sequence | Compositor::All => group.particles.iter().fold(
+                (0, Some(0)),
+                |(acc_min, acc_max): (Count, Option<Count>), child| {
+                    let (child_min, child_max) = particle_total_occurrence_range(child);
+                    (acc_min.saturating_add(child_min), add(acc_max, child_max))
+                },
+            ),
             Compositor::Choice => {
-                let mut min_total: Option<u32> = None;
-                let mut max_total: Option<Option<u32>> = None;
+                let mut min_total: Option<Count> = None;
+                let mut max_total: Option<Option<Count>> = None;
                 for child in &group.particles {
                     let (child_min, child_max) = particle_total_occurrence_range(child);
-                    min_total = Some(match min_total {
-                        Some(current) => current.min(child_min),
-                        None => child_min,
-                    });
+                    min_total = Some(min_total.map_or(child_min, |current| current.min(child_min)));
                     max_total = Some(match max_total {
-                        Some(current) => max_optional_occurs(current, child_max),
+                        Some(Some(current)) => child_max.map(|child| current.max(child)),
+                        Some(None) => None,
                         None => child_max,
                     });
                 }
@@ -631,22 +1187,13 @@ fn particle_total_occurrence_range(particle: &NormalizedParticle) -> (u32, Optio
             }
         },
     };
-
-    multiply_occurs(particle.min_occurs, particle.max_occurs, term_min, term_max)
-}
-
-fn add_optional_occurs(left: Option<u32>, right: Option<u32>) -> Option<u32> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.saturating_add(right)),
+    let occurrences = particle.occurrences();
+    let max = match (occurrences.max(), term_max) {
+        (Some(0), _) | (_, Some(0)) => Some(0),
+        (Some(x), Some(y)) => x.checked_mul(y),
         _ => None,
-    }
-}
-
-fn max_optional_occurs(left: Option<u32>, right: Option<u32>) -> Option<u32> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.max(right)),
-        _ => None,
-    }
+    };
+    (occurrences.min().saturating_mul(term_min), max)
 }
 
 fn group_particles_fit_wildcard(
@@ -718,20 +1265,19 @@ fn sequence_restricts_choice(
     }
 
     // The total choice iterations across all sequence repetitions must fit
-    // within the base choice's occurs range.
-    let min_demand = derived.min_occurs.saturating_mul(required_per_iter);
-    let max_demand = match derived.max_occurs {
-        Some(m) => Some(m.saturating_mul(total_per_iter)),
-        None => {
-            if total_per_iter == 0 {
-                Some(0)
-            } else {
-                None
-            }
-        }
+    // within the base choice's occurs range: from the derived sequence's
+    // exact counts, a product beyond the counts' limit taken as unbounded
+    // (more demand, never less).
+    let occurrences = derived.occurrences();
+    let min_demand = occurrences
+        .min()
+        .saturating_mul(Count::from(required_per_iter));
+    let max_demand = match (occurrences.max(), total_per_iter) {
+        (_, 0) => Some(0),
+        (Some(max), per_iter) => max.checked_mul(Count::from(per_iter)),
+        (None, _) => None,
     };
-
-    occurs_range_is_subset(min_demand, max_demand, base.min_occurs, base.max_occurs)
+    Counts::covering(min_demand, max_demand).within(&effective_occurrences(schema_set, base))
 }
 
 /// XSD 1.0 RecurseLax: order-preserving matching of choice branches.
@@ -784,9 +1330,15 @@ fn sequence_particles_restrict(
             //    sequence group (e.g. an expanded repetition unit), try to
             //    match a contiguous slice of derived particles against the
             //    unit's children.  This keeps the unit atomic — either the
-            //    full slice matches or we fall through.
+            //    full slice matches or we fall through. The slice is one
+            //    iteration of the unit, so the unit must admit one: its
+            //    range holds 1, or its term is emptiable and it may occur
+            //    (the other iterations empty).
             if let NormalizedParticleTerm::Group(base_group) = &base.term {
-                if base_group.compositor == Compositor::Sequence && !base_group.particles.is_empty()
+                if base_group.compositor == Compositor::Sequence
+                    && !base_group.particles.is_empty()
+                    && (admits_one(schema_set, base)
+                        || term_is_emptiable(&base.term) && base.max_occurs != Some(0))
                 {
                     let unit_len = base_group.particles.len();
                     let remaining = derived_particles.len() - derived_index;
@@ -807,8 +1359,10 @@ fn sequence_particles_restrict(
 
             // 3. XSD 1.1: expand choice in derived sequence.
             //    Each branch must independently work from the current base position
-            //    for the entire remaining derived + base suffix.
-            if schema_set.is_xsd11() {
+            //    for the entire remaining derived + base suffix. Not for a
+            //    choice whose iterations mix its branches: no single branch
+            //    stands for `(b, a)` of `choice{0,2}(a, b)`.
+            if schema_set.is_xsd11() && !choice_iterations_mix(&derived_particles[derived_index]) {
                 if let Some(branches) = expand_choice_branches(&derived_particles[derived_index]) {
                     let all_ok = branches.iter().all(|branch| {
                         let mut remaining = vec![branch.clone()];
@@ -897,11 +1451,17 @@ fn merge_duplicate_elements(particles: &[NormalizedParticle]) -> Vec<NormalizedP
             )
         });
         if let Some(existing) = existing {
-            existing.min_occurs = existing.min_occurs.saturating_add(particle.min_occurs);
-            existing.max_occurs = match (existing.max_occurs, particle.max_occurs) {
-                (None, _) | (_, None) => None,
-                (Some(a), Some(b)) => Some(a.saturating_add(b)),
+            // The summed range (a derived particle may admit more, never
+            // less), exact in `Count`, a maximum that overflows unbounded.
+            let (left, right) = (existing.occurrences(), particle.occurrences());
+            let max = match (left.max(), right.max()) {
+                (Some(x), Some(y)) => x.checked_add(y),
+                _ => None,
             };
+            existing.set_occurrences(Counts::covering(
+                left.min().saturating_add(right.min()),
+                max,
+            ));
         } else {
             merged.push(particle.clone());
         }
@@ -1019,7 +1579,9 @@ fn try_count_based_subsumption(
     let expanded = expand_top_level_choices_for_unordered(derived_particles)?;
 
     // Step 2: Bucket each expanded derived particle to a base index.
-    let mut buckets: Vec<Vec<(u32, Option<u32>)>> = vec![Vec::new(); base_particles.len()];
+    // Each derived particle's counts as a range (a gapped set by its hull:
+    // more, never less), exact in `Count`.
+    let mut buckets: Vec<Vec<(Count, Option<Count>)>> = vec![Vec::new(); base_particles.len()];
     for derived in &expanded {
         // Nested groups are not bucket-able here.
         if matches!(&derived.term, NormalizedParticleTerm::Group(_)) {
@@ -1028,7 +1590,8 @@ fn try_count_based_subsumption(
 
         match find_subsumption_bucket(schema_set, derived, base_particles)? {
             BucketAssignment::Single(idx) => {
-                buckets[idx].push((derived.min_occurs, derived.max_occurs))
+                let occurrences = derived.occurrences();
+                buckets[idx].push((occurrences.min(), occurrences.max()))
             }
             BucketAssignment::Partition(idxs) => {
                 // Each base bucket the partition spans must be emptiable
@@ -1040,7 +1603,7 @@ fn try_count_based_subsumption(
                     if base.min_occurs > 0 {
                         return Some(false);
                     }
-                    if !occurs_max_fits(derived.max_occurs, base.max_occurs) {
+                    if !count_max_fits(derived.occurrences().max(), base.occurrences().max()) {
                         return Some(false);
                     }
                 }
@@ -1048,7 +1611,7 @@ fn try_count_based_subsumption(
                 // total never exceeds the partition's d_max in any one
                 // bucket, but might be 0.
                 for &i in &idxs {
-                    buckets[i].push((0, derived.max_occurs));
+                    buckets[i].push((0, derived.occurrences().max()));
                 }
             }
             BucketAssignment::None => return Some(false),
@@ -1064,13 +1627,18 @@ fn try_count_based_subsumption(
                 return Some(false);
             }
         } else {
-            let (sum_min, sum_max) =
-                ranges
-                    .iter()
-                    .fold((0u32, Some(0u32)), |(amin, amax), &(min, max)| {
-                        (amin.saturating_add(min), add_optional_occurs(amax, max))
-                    });
-            if !occurs_range_is_subset(sum_min, sum_max, base.min_occurs, base.max_occurs) {
+            let (sum_min, sum_max) = ranges.iter().fold(
+                (0, Some(0)),
+                |(amin, amax): (Count, Option<Count>), &(min, max)| {
+                    let amax = match (amax, max) {
+                        (Some(x), Some(y)) => x.checked_add(y),
+                        _ => None,
+                    };
+                    (amin.saturating_add(min), amax)
+                },
+            );
+            if !Counts::covering(sum_min, sum_max).within(&effective_occurrences(schema_set, base))
+            {
                 return Some(false);
             }
         }
@@ -1096,26 +1664,33 @@ fn expand_top_level_choices_for_unordered(
             NormalizedParticleTerm::Group(group) if group.compositor == Compositor::Choice => {
                 // Each branch becomes a particle with min=0 (might not be picked)
                 // and max = outer_max * branch_max.
-                let outer_max = p.max_occurs;
+                let outer_max = p.occurrences().max();
                 for branch in &group.particles {
                     if matches!(&branch.term, NormalizedParticleTerm::Group(_)) {
                         // Nested group inside choice — bail to bipartite.
                         return None;
                     }
-                    let new_max = match (outer_max, branch.max_occurs) {
-                        (Some(om), Some(bm)) => Some(om.saturating_mul(bm)),
+                    // Exact in `Count`; a product that overflows unbounded
+                    // (a derived particle may admit more, never less).
+                    let new_max = match (outer_max, branch.occurrences().max()) {
+                        (Some(0), _) | (_, Some(0)) => Some(0),
+                        (Some(om), Some(bm)) => om.checked_mul(bm),
                         _ => None,
                     };
-                    result.push(NormalizedParticle {
+                    let mut alternative = NormalizedParticle {
                         term: branch.term.clone(),
                         min_occurs: 0,
-                        max_occurs: new_max,
+                        max_occurs: None,
                         source: branch.source.clone(),
                         collapsed_from: None,
                         folded_group_occurs: p.folded_group_occurs
                             || branch.folded_group_occurs
                             || !occurs_is_unit(p.min_occurs, p.max_occurs),
-                    });
+                        counts: None,
+                        as_written: None,
+                    };
+                    alternative.set_occurrences(Counts::covering(0, new_max));
+                    result.push(alternative);
                 }
             }
             NormalizedParticleTerm::Group(_) => {
@@ -1249,10 +1824,8 @@ fn find_subsumption_bucket(
     }
 }
 
-/// Return the smallest occurs-max that fits both `derived_max` and
-/// `base_max`, treating `None` as unbounded. `derived_max` must fit within
-/// `base_max`.
-fn occurs_max_fits(derived_max: Option<u32>, base_max: Option<u32>) -> bool {
+/// Is `derived_max` at most `base_max` (`None`: unbounded)?
+fn count_max_fits(derived_max: Option<Count>, base_max: Option<Count>) -> bool {
     match (derived_max, base_max) {
         (_, None) => true,
         (None, Some(_)) => false,
@@ -1358,11 +1931,12 @@ fn all_particles_restrict(
 }
 
 pub(super) fn particle_is_emptiable(particle: &NormalizedParticle) -> bool {
-    if particle.min_occurs == 0 {
-        return true;
-    }
+    particle.min_occurs == 0 || term_is_emptiable(&particle.term)
+}
 
-    match &particle.term {
+/// Does one occurrence of `term` accept the empty sequence?
+pub(super) fn term_is_emptiable(term: &NormalizedParticleTerm) -> bool {
+    match term {
         NormalizedParticleTerm::Element(_) | NormalizedParticleTerm::Wildcard(_) => false,
         NormalizedParticleTerm::Group(group) => match group.compositor {
             Compositor::Sequence | Compositor::All => {
