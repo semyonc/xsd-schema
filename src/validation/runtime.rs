@@ -4680,6 +4680,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     ) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
+                            self.note_seconds_capacity(&result.typed_value, &ev_state.text_content);
                             ev_state.member_type = result.member_type;
                             ev_state.typed_value = Some(result.typed_value);
                             ev_state.normalized_value = result.normalized_value;
@@ -4691,9 +4692,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // flagged here against the element's snapshot.
                             // This applies to a single (atomic) QName/NOTATION
                             // value; list members are checked one by one below.
+                            // A union value holding a QName or NOTATION
+                            // value is checked as the atomic value it holds.
                             let needs_qname_check =
                                 ev_state.typed_value.as_ref().is_some_and(|v| {
-                                    matches!(v.value, crate::types::value::XmlValueKind::Atomic(_))
+                                    !super::simple::holds_list(v)
+                                        && (matches!(
+                                            v.value,
+                                            crate::types::value::XmlValueKind::Atomic(_)
+                                        ) || super::simple::holds_lexical_qname(v))
                                         && (v.type_code == XmlTypeCode::QName
                                             || v.type_code == XmlTypeCode::Notation)
                                 });
@@ -5908,6 +5915,41 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         self.sink.on_warning(warning);
     }
 
+    /// Report [`SECONDS_CAPACITY_WARNING`](crate::types::validators::SECONDS_CAPACITY_WARNING)
+    /// for a date/time or duration value whose seconds have more fraction
+    /// digits than this implementation holds: the value is valid; its facets,
+    /// value constraints and identity constraints compare the literal as
+    /// written, while its typed value holds the seconds truncated toward zero
+    /// to the digits that fit — never rounded up to the next second — so a
+    /// consumer of the typed value (the PSVI, an assertion or type
+    /// alternative expression) sees the truncated value (Datatypes §5.4: the
+    /// processor "must indicate to the user and/or downstream application that
+    /// it cannot process the input data with assured correctness").
+    ///
+    /// Reported only while [`ValidationFlags::REPORT_WARNINGS`] is set.
+    fn note_seconds_capacity(&mut self, typed_value: &XmlValue, text: &str) {
+        if !self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
+            return;
+        }
+        let Some(lexical) = super::simple::capacity_seconds(typed_value, text) else {
+            return;
+        };
+        let at = match self.current_element_path() {
+            Some(path) => format!(" ({})", path.local_name_path()),
+            None => String::new(),
+        };
+        let message = format!(
+            "value '{lexical}'{at} is valid but its seconds have more fraction digits than \
+             this implementation holds (at most 28); facets, value constraints and identity \
+             constraints were checked on the value as written, but its typed value holds \
+             the seconds truncated toward zero, so expressions on it do not distinguish it \
+             from a value that differs only in the dropped digits"
+        );
+        let warning =
+            self.warning_here(crate::types::validators::SECONDS_CAPACITY_WARNING, message);
+        self.sink.on_warning(warning);
+    }
+
     /// Mark the current element as invalid.
     fn mark_current_invalid(&mut self) {
         if let Some(s) = self.validation_stack.last_mut() {
@@ -6921,6 +6963,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 match self.validate_attribute_value(value, type_key) {
                     Ok(result) => {
                         self.note_decimal_capacity(&result.typed_value);
+                        self.note_seconds_capacity(&result.typed_value, value);
                         member_type = result.member_type;
                         typed_value = Some(result.typed_value);
                         normalized_value = result.normalized_value;
@@ -6938,22 +6981,12 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         // §3.3.19) — the simple-type validator can't see namespaces.
         // Skipped on the fast path (string-family types are never QName).
         if !used_fast_path && attr_validity == SchemaValidity::Valid {
-            match self.resolve_attribute_qname_typed_value(typed_value.as_ref(), value) {
-                Ok(Some(resolved)) => typed_value = Some(resolved),
-                Ok(None) => {}
-                Err(prefix) => {
-                    let attr_name = self.schema_set.name_table.resolve(local_name);
-                    self.report_error(
-                        "cvc-datatype-valid.1.2.1",
-                        format!(
-                            "Attribute '{}' has QName value '{}' with undeclared prefix '{}'",
-                            attr_name, value, prefix
-                        ),
-                    );
-                    self.mark_current_invalid();
-                    attr_validity = SchemaValidity::Invalid;
-                }
-            }
+            self.check_attribute_qname_prefixes(
+                &mut typed_value,
+                &mut attr_validity,
+                local_name,
+                value,
+            );
         }
 
         if let Some(fixed) = fixed_value {
@@ -7337,6 +7370,38 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             .lookup_notation(qn.namespace_uri, qn.local_name)
     }
 
+    /// The QName / NOTATION prefix-binding check of an attribute's value
+    /// (Datatypes §3.3.18: "the bindings to be used in the ·lexical mapping·
+    /// are those in the [in-scope namespaces] property of the relevant
+    /// element") — a declared attribute and one a `strict` or `lax` wildcard
+    /// admits alike, of an atomic, list or union type: a prefix bound nowhere
+    /// is `cvc-datatype-valid.1.2.1`, the attribute and its element are
+    /// invalid; a value resolved here replaces `typed_value`.
+    fn check_attribute_qname_prefixes(
+        &mut self,
+        typed_value: &mut Option<XmlValue>,
+        attr_validity: &mut SchemaValidity,
+        local_name: NameId,
+        value: &str,
+    ) {
+        match self.resolve_attribute_qname_typed_value(typed_value.as_ref(), value) {
+            Ok(Some(resolved)) => *typed_value = Some(resolved),
+            Ok(None) => {}
+            Err(prefix) => {
+                let attr_name = self.schema_set.name_table.resolve(local_name);
+                self.report_error(
+                    "cvc-datatype-valid.1.2.1",
+                    format!(
+                        "Attribute '{}' has QName value '{}' with undeclared prefix '{}'",
+                        attr_name, value, prefix
+                    ),
+                );
+                self.mark_current_invalid();
+                *attr_validity = SchemaValidity::Invalid;
+            }
+        }
+    }
+
     /// Resolve a QName/NOTATION attribute's typed value against the current
     /// element's namespace context.
     ///
@@ -7671,6 +7736,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     match self.validate_attribute_value(value, type_key) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
+                            self.note_seconds_capacity(&result.typed_value, value);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
@@ -7683,6 +7749,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             }
                         }
                     }
+                }
+                if attr_validity == SchemaValidity::Valid {
+                    self.check_attribute_qname_prefixes(
+                        &mut typed_value,
+                        &mut attr_validity,
+                        local_name,
+                        value,
+                    );
                 }
 
                 if let Some(fixed_val) = fixed {
@@ -7785,6 +7859,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     match self.validate_attribute_value(value, type_key) {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
+                            self.note_seconds_capacity(&result.typed_value, value);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
@@ -7797,6 +7872,14 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             }
                         }
                     }
+                }
+                if attr_validity == SchemaValidity::Valid {
+                    self.check_attribute_qname_prefixes(
+                        &mut typed_value,
+                        &mut attr_validity,
+                        local_name,
+                        value,
+                    );
                 }
 
                 if let Some(fixed_val) = fixed {

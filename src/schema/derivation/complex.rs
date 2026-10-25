@@ -493,6 +493,14 @@ fn validate_complex_restriction(
                 // Validate simpleContent inline type restriction
                 // (derivation-ok-restriction clause 2.2.2.1)
                 validate_simple_content_restriction(schema_set, type_def, base_type)?;
+
+                // The simpleContent restriction's own facets restrict the
+                // base content type (Datatypes constraints on facets).
+                super::simple::validate_simple_content_restriction_facets(
+                    schema_set,
+                    type_def,
+                    base_complex_key,
+                )?;
             }
         }
     }

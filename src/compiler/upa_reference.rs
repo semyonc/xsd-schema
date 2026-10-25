@@ -187,7 +187,6 @@ pub(super) fn check_upa(
                 &reachable.wildcards,
                 state.id,
                 target_namespace,
-                xsd_version,
                 schema_set,
                 &substitution_sets,
             ) {
@@ -196,12 +195,9 @@ pub(super) fn check_upa(
         }
 
         // Check wildcard-wildcard conflicts (always an error)
-        if let Err(error) = check_wildcard_wildcard_conflicts(
-            &reachable.wildcards,
-            state.id,
-            target_namespace,
-            xsd_version,
-        ) {
+        if let Err(error) =
+            check_wildcard_wildcard_conflicts(&reachable.wildcards, state.id, target_namespace)
+        {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
     }
@@ -215,7 +211,6 @@ pub(super) fn check_all_group_upa(
     schema_set: &SchemaSet,
     target_namespace: Option<NameId>,
 ) -> SchemaResult<()> {
-    let xsd_version = schema_set.xsd_version;
     let substitution_sets = substitution_map_per_call(schema_set);
 
     let mut elements: Vec<ReachableTerm> = Vec::new();
@@ -244,12 +239,9 @@ pub(super) fn check_all_group_upa(
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 
-    if let Err(error) = check_wildcard_wildcard_conflicts(
-        &wildcards,
-        ALL_GROUP_STATE_ID,
-        target_namespace,
-        xsd_version,
-    ) {
+    if let Err(error) =
+        check_wildcard_wildcard_conflicts(&wildcards, ALL_GROUP_STATE_ID, target_namespace)
+    {
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 

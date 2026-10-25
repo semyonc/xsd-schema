@@ -504,7 +504,7 @@ pub fn fixed_values_equal(
     let Ok(b_result) = validate_simple_type(b, tk, schema_set) else {
         return false;
     };
-    typed_values_equal(&a_result.typed_value, &b_result.typed_value)
+    typed_literals_equal(&a_result.typed_value, a, &b_result.typed_value, b)
 }
 
 /// Whether two lexical forms of `type_key` denote **identical** values — the
@@ -524,12 +524,17 @@ pub(crate) fn fixed_values_identical(
     if a == b {
         return Some(true);
     }
-    let a = validate_simple_type(a, type_key, schema_set).ok()?;
-    let b = validate_simple_type(b, type_key, schema_set).ok()?;
+    let a_result = validate_simple_type(a, type_key, schema_set).ok()?;
+    let b_result = validate_simple_type(b, type_key, schema_set).ok()?;
     Some(if schema_set.is_xsd10() {
-        typed_values_equal(&a.typed_value, &b.typed_value)
+        typed_literals_equal(&a_result.typed_value, a, &b_result.typed_value, b)
     } else {
-        super::identity::values_identical(&a.typed_value, &b.typed_value)
+        super::identity::literal_values_identical(
+            &a_result.typed_value,
+            a,
+            &b_result.typed_value,
+            b,
+        )
     })
 }
 
@@ -552,6 +557,25 @@ pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
     a == b || super::identity::values_equal_or_identical(a, b)
 }
 
+/// [`typed_values_equal`] of two values read from the literals `a_lexical`
+/// and `b_lexical`: a date/time or duration literal whose seconds have more
+/// fraction digits than its typed value holds is compared with the fraction
+/// as written
+/// ([`literal_values_equal_or_identical`](super::identity::literal_values_equal_or_identical)).
+pub(crate) fn typed_literals_equal(
+    a: &XmlValue,
+    a_lexical: &str,
+    b: &XmlValue,
+    b_lexical: &str,
+) -> bool {
+    use crate::types::validators::seconds_beyond_capacity;
+    if seconds_beyond_capacity(a_lexical) || seconds_beyond_capacity(b_lexical) {
+        super::identity::literal_values_equal_or_identical(a, a_lexical, b, b_lexical)
+    } else {
+        typed_values_equal(a, b)
+    }
+}
+
 /// The first `xs:decimal` inside a valid typed value that is carried as a
 /// string because `rust_decimal::Decimal` cannot hold it — the value itself, a
 /// union's member value, or a list member — as its canonical representation;
@@ -563,6 +587,34 @@ pub(crate) fn typed_values_equal(a: &XmlValue, b: &XmlValue) -> bool {
 /// are.
 pub(crate) fn capacity_decimal(value: &XmlValue) -> Option<String> {
     crate::types::exact_decimal::first_lexical_decimal(value).map(str::to_owned)
+}
+
+/// The first member literal of a date/time or duration value whose seconds
+/// had more fraction digits than this implementation holds, and were
+/// truncated to fit
+/// ([`seconds_beyond_capacity`](crate::types::validators::seconds_beyond_capacity));
+/// `None` when every
+/// seconds number was kept exactly. `text` is the literal the value was
+/// validated from; a list member is paired with its whitespace-separated
+/// token.
+pub(crate) fn capacity_seconds(value: &XmlValue, text: &str) -> Option<String> {
+    match &value.value {
+        XmlValueKind::Atomic(
+            XmlAtomicValue::DateTime(_)
+            | XmlAtomicValue::Time(_)
+            | XmlAtomicValue::Duration(_)
+            | XmlAtomicValue::DayTimeDuration(_),
+        ) => {
+            let text = text.trim();
+            crate::types::validators::seconds_beyond_capacity(text).then(|| text.to_owned())
+        }
+        XmlValueKind::Atomic(_) | XmlValueKind::UntypedAtomic(_) => None,
+        XmlValueKind::Union(inner) => capacity_seconds(inner, text),
+        XmlValueKind::List { items, .. } => items
+            .iter()
+            .zip(text.split_ascii_whitespace())
+            .find_map(|(item, token)| capacity_seconds(item, token)),
+    }
 }
 
 /// Value-space equality when the instance's typed value is already computed.
@@ -587,7 +639,12 @@ pub fn fixed_matches_typed(
     let Ok(fixed_result) = validate_simple_type(fixed, tk, schema_set) else {
         return false;
     };
-    typed_values_equal(instance_typed, &fixed_result.typed_value)
+    typed_literals_equal(
+        instance_typed,
+        instance_raw,
+        &fixed_result.typed_value,
+        fixed,
+    )
 }
 
 /// PERF_LAZY_PSVI Phase 2 — opt-out fast path.
@@ -1132,6 +1189,117 @@ fn xsd10_nan_bound_facets(
     Some(admitted)
 }
 
+/// XSD 1.0 §3.2.7: "'-0001' is the lexical representation of the year 1
+/// Before Common Era (1 BCE …)" and the year 0000 is disallowed, so a 1.0
+/// year before year 1 is one later than the 1.1 reading the validators order
+/// in (Datatypes 1.1 §3.3.7: "'0000' … 1 BCE"). For a `xs:dateTime`,
+/// `xs:date`, `xs:gYear` or `xs:gYearMonth` value in XSD 1.0 mode where the
+/// value or a bound or enumeration value has a negative year, the facets
+/// without the bounds and the enumeration, which
+/// [`check_xsd10_year_facets`] then checks in the 1.0 numbering; `None`
+/// when no negative year is involved.
+fn xsd10_year_facets(
+    facets: &FacetSet,
+    type_code: XmlTypeCode,
+    normalized: &str,
+) -> Option<FacetSet> {
+    if !matches!(
+        type_code,
+        XmlTypeCode::DateTime | XmlTypeCode::Date | XmlTypeCode::GYear | XmlTypeCode::GYearMonth
+    ) {
+        return None;
+    }
+    let negative = |literal: &str| literal.trim_start().starts_with('-');
+    let bounds = [
+        facets.min_inclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_inclusive.as_ref().map(|f| f.value.as_str()),
+        facets.min_exclusive.as_ref().map(|f| f.value.as_str()),
+        facets.max_exclusive.as_ref().map(|f| f.value.as_str()),
+    ];
+    let enumerated = facets
+        .enumeration
+        .as_ref()
+        .map(|e| e.values.iter().any(|v| negative(v)));
+    let has_facet = bounds.iter().any(Option::is_some) || enumerated.is_some();
+    let involved = negative(normalized)
+        || bounds.iter().flatten().any(|b| negative(b))
+        || enumerated == Some(true);
+    if !has_facet || !involved {
+        return None;
+    }
+    let mut rest = facets.clone();
+    rest.min_inclusive = None;
+    rest.max_inclusive = None;
+    rest.min_exclusive = None;
+    rest.max_exclusive = None;
+    rest.enumeration = None;
+    Some(rest)
+}
+
+/// The bounds and enumeration [`xsd10_year_facets`] took out, on the value
+/// `val` (written `raw`), in the XSD 1.0 year numbering.
+fn check_xsd10_year_facets(
+    val: &XmlValue,
+    facets: &FacetSet,
+    type_code: XmlTypeCode,
+    raw: &str,
+) -> Result<(), ValidationError> {
+    use crate::error::FacetError;
+    use crate::types::value_order::literal_cmp_in;
+    use std::cmp::Ordering::{Equal, Greater, Less};
+    let XmlValueKind::Atomic(atom) = &val.value else {
+        return Ok(());
+    };
+    let order = |literal: &str| {
+        VALIDATOR_REGISTRY
+            .validate(type_code, literal)
+            .ok()
+            .and_then(|bound| match bound.value {
+                XmlValueKind::Atomic(bound) => literal_cmp_in(true, atom, raw, &bound, literal),
+                _ => None,
+            })
+    };
+    let value = raw.to_string();
+    if let Some(f) = &facets.min_inclusive {
+        if !matches!(order(&f.value), Some(Greater | Equal)) {
+            return Err(facet_error(FacetError::MinInclusiveViolation {
+                value,
+                min: f.value.clone(),
+            }));
+        }
+    }
+    if let Some(f) = &facets.max_inclusive {
+        if !matches!(order(&f.value), Some(Less | Equal)) {
+            return Err(facet_error(FacetError::MaxInclusiveViolation {
+                value,
+                max: f.value.clone(),
+            }));
+        }
+    }
+    if let Some(f) = &facets.min_exclusive {
+        if order(&f.value) != Some(Greater) {
+            return Err(facet_error(FacetError::MinExclusiveViolation {
+                value,
+                min: f.value.clone(),
+            }));
+        }
+    }
+    if let Some(f) = &facets.max_exclusive {
+        if order(&f.value) != Some(Less) {
+            return Err(facet_error(FacetError::MaxExclusiveViolation {
+                value,
+                max: f.value.clone(),
+            }));
+        }
+    }
+    if let Some(enumeration) = &facets.enumeration {
+        if !enumeration.values.iter().any(|v| order(v) == Some(Equal)) {
+            return Err(facet_error(FacetError::enumeration(raw)));
+        }
+    }
+    Ok(())
+}
+
 /// Walk the resolved_base_type chain from `sk` until we find a built-in type code.
 /// Returns `None` if no built-in ancestor is found (cycle guard at depth 100).
 fn resolve_type_code(sk: SimpleTypeKey, schema_set: &SchemaSet) -> Option<XmlTypeCode> {
@@ -1224,10 +1392,15 @@ fn validate_atomic_type(
         .unwrap_or_else(|| validator.whitespace());
     let normalized = normalize_whitespace(value, effective_ws);
 
+    let year_facets = schema_set
+        .is_xsd10()
+        .then(|| xsd10_year_facets(&facets, type_code, &normalized))
+        .flatten();
     let xsd10 = schema_set
         .is_xsd10()
         .then(|| xsd10_nan_bound_facets(&facets, type_code, &normalized))
-        .flatten();
+        .flatten()
+        .or_else(|| year_facets.clone());
     let typed_value = if facets.is_empty() {
         validator.validate(value)
     } else {
@@ -1248,6 +1421,9 @@ fn validate_atomic_type(
             if schema_set.is_xsd10() {
                 check_xsd10_year_zero(&val, value)?;
                 check_xsd10_plus_inf(&val, value)?;
+                if year_facets.is_some() {
+                    check_xsd10_year_facets(&val, &facets, type_code, value)?;
+                }
             }
             // XSD 1.1: evaluate assertion facets
             #[cfg(feature = "xsd11")]
@@ -1506,7 +1682,14 @@ fn check_list_facets(
                 .validate_enum_value_space(
                     |literal| {
                         literal_readings(enumeration, literal, &schema_set.name_table, &|reading| {
-                            list_literal_matches(literal, items, item_type_key, schema_set, reading)
+                            list_literal_matches(
+                                literal,
+                                items,
+                                normalized,
+                                item_type_key,
+                                schema_set,
+                                reading,
+                            )
                         })
                     },
                     normalized,
@@ -1525,6 +1708,7 @@ fn check_list_facets(
 fn list_literal_matches(
     literal: &str,
     members: &[XmlValue],
+    instance: &str,
     item_type_key: TypeKey,
     schema_set: &SchemaSet,
     resolver: Option<PrefixResolver<'_>>,
@@ -1536,16 +1720,21 @@ fn list_literal_matches(
         collapsed.split(' ').collect()
     };
     tokens.len() == members.len()
-        && tokens.iter().zip(members).all(|(token, member)| {
-            validate_simple_type_inner(token, item_type_key, schema_set, resolver).is_ok_and(
-                |item| {
-                    super::identity::values_equal_or_identical(
-                        &list_member(item.typed_value),
-                        member,
-                    )
-                },
-            )
-        })
+        && tokens
+            .iter()
+            .zip(members.iter().zip(instance.split_ascii_whitespace()))
+            .all(|(token, (member, member_lexical))| {
+                validate_simple_type_inner(token, item_type_key, schema_set, resolver).is_ok_and(
+                    |item| {
+                        super::identity::literal_values_equal_or_identical(
+                            &list_member(item.typed_value),
+                            token,
+                            member,
+                            member_lexical,
+                        )
+                    },
+                )
+            })
 }
 
 /// The facets of a union type on a value of it: its lexical form `value`, the
@@ -1611,10 +1800,9 @@ fn check_union_facets(
             let name = name.name();
             index.admits(&check_value, true, name.namespace_uri, name.local_name)
         }
-        _ => index
-            .values()
-            .iter()
-            .any(|literal| union_literal_equals(literal, member)),
+        _ => index.values().iter().any(|(literal, literal_value)| {
+            union_literal_equals(literal_value, literal, member, &lex_value)
+        }),
     };
     if admitted {
         Ok(())
@@ -1655,7 +1843,7 @@ pub(crate) fn union_enumeration_index(
                 for snapshot in snapshots {
                     let resolver = snapshot_prefixes(snapshot, names);
                     if let Some(value) = value_of(literal, Some(&resolver)) {
-                        index.push_value(value);
+                        index.push_value(literal, value);
                     }
                 }
             }
@@ -1664,7 +1852,7 @@ pub(crate) fn union_enumeration_index(
                     if !holds_list(&value) && holds_lexical_qname(&value) {
                         index.push_lexical(literal);
                     }
-                    index.push_value(value);
+                    index.push_value(literal, value);
                 }
             }
         }
@@ -1673,32 +1861,27 @@ pub(crate) fn union_enumeration_index(
 }
 
 /// Whether the union literal value `literal` equals the instance value
-/// `value` (Datatypes §4.3.5.4, "equal or identical"): lists member for
-/// member; atomic values only within one primitive datatype (§2.2.3: "no two
-/// values from different ·primitive· ·value spaces· are equal") — decimals by
-/// exact value, QName / NOTATION values by expanded name, other values by
-/// their canonical form, as the union check compared them before.
-fn union_literal_equals(literal: &XmlValue, value: &XmlValue) -> bool {
-    if holds_list(literal) || holds_list(value) {
-        return super::identity::values_equal_or_identical(literal, value);
-    }
-    let (literal, value) = (unwrap_unions(literal), unwrap_unions(value));
-    if let (Some(a), Some(b)) = (literal.primitive_type(), value.primitive_type()) {
-        if a != b {
-            return false;
-        }
-    }
-    if let (
-        XmlValueKind::Atomic(XmlAtomicValue::QName(a) | XmlAtomicValue::Notation(a)),
-        XmlValueKind::Atomic(XmlAtomicValue::QName(b) | XmlAtomicValue::Notation(b)),
-    ) = (&literal.value, &value.value)
-    {
-        return a == b;
-    }
-    match crate::types::exact_decimal::decimal_values_equal(literal, value) {
-        Some(equal) => equal,
-        None => literal.to_string_value() == value.to_string_value(),
-    }
+/// `value` (Datatypes §4.3.5.4, "equal or identical"): the comparison every
+/// value constraint and identity constraint makes
+/// ([`values_equal_or_identical`](super::identity::values_equal_or_identical))
+/// — lists member for member; atomic values only within one primitive
+/// datatype (§2.2.3: "no two values from different ·primitive· ·value
+/// spaces· are equal"), each in its value space: decimals by exact value,
+/// `0` equal to `-0`, date/time values on the time line (§D.2.1), durations
+/// by months and seconds, QName / NOTATION values by expanded name — as an
+/// atomic type's own `enumeration` compares them.
+fn union_literal_equals(
+    literal: &XmlValue,
+    literal_lexical: &str,
+    value: &XmlValue,
+    value_lexical: &str,
+) -> bool {
+    super::identity::literal_values_equal_or_identical(
+        literal,
+        literal_lexical,
+        value,
+        value_lexical,
+    )
 }
 
 /// `value` with its union wrappers taken off (nested unions included).
@@ -1752,42 +1935,27 @@ fn validate_union_type(
         }
     };
 
-    // Try each member type in order
+    // Try each member type in order (Datatypes §2.4.1.3: "validated against
+    // the ·member types· in the order in which they appear in the definition
+    // until a match is found"). With namespace bindings, a QName / NOTATION
+    // member whose prefix they bind nowhere does not match: the literal has no
+    // lexical mapping there (§3.3.18). It is kept, and taken — for the caller
+    // to report the prefix (`cvc-datatype-valid.1.2.1`) — only when no later
+    // member matches.
+    let mut unbound: Option<(SimpleTypeResult, TypeKey)> = None;
     for &member_key in &st_data.resolved_member_types {
         if let Ok(result) = validate_simple_type_inner(value, member_key, schema_set, resolver) {
-            // Match found — check union-level facets (pattern, enumeration)
-            let facets = schema_set.effective_facets(sk);
-            if !facets.is_empty() {
-                check_union_facets(
-                    &facets,
-                    Some(sk),
-                    value,
-                    &result.typed_value,
-                    &st_data.resolved_member_types,
-                    schema_set,
-                )?;
+            if resolver.is_some() && holds_lexical_qname(&result.typed_value) {
+                if unbound.is_none() {
+                    unbound = Some((result, member_key));
+                }
+                continue;
             }
-
-            // Propagate schema type on inner value from the matched member type
-            let mut inner = result.typed_value;
-            if inner.schema_type.is_none() {
-                inner.schema_type = member_key.as_simple();
-            }
-
-            // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
-            #[cfg(feature = "xsd11")]
-            evaluate_assertion_facets(&inner, &facets, schema_set)?;
-
-            return Ok(SimpleTypeResult {
-                normalized_value: result.normalized_value,
-                typed_value: XmlValue::with_schema_type(
-                    inner.type_code,
-                    sk,
-                    XmlValueKind::Union(Box::new(inner)),
-                ),
-                member_type: Some(member_key),
-            });
+            return union_member_result(value, sk, schema_set, result, member_key);
         }
+    }
+    if let Some((result, member_key)) = unbound {
+        return union_member_result(value, sk, schema_set, result, member_key);
     }
 
     // No member matched
@@ -1799,6 +1967,53 @@ fn validate_union_type(
         ),
         None,
     ))
+}
+
+/// The union value of `sk` for the value `result` its member type
+/// `member_key` gave: the union-level facets (pattern, enumeration) and
+/// assertions on it, the member's typed value wrapped as the union's.
+fn union_member_result(
+    value: &str,
+    sk: SimpleTypeKey,
+    schema_set: &SchemaSet,
+    result: SimpleTypeResult,
+    member_key: TypeKey,
+) -> Result<SimpleTypeResult, ValidationError> {
+    let st_data = schema_set.arenas.simple_types.get(sk);
+    let members = st_data
+        .map(|d| d.resolved_member_types.as_slice())
+        .unwrap_or_default();
+    let facets = schema_set.effective_facets(sk);
+    if !facets.is_empty() {
+        check_union_facets(
+            &facets,
+            Some(sk),
+            value,
+            &result.typed_value,
+            members,
+            schema_set,
+        )?;
+    }
+
+    // Propagate schema type on inner value from the matched member type
+    let mut inner = result.typed_value;
+    if inner.schema_type.is_none() {
+        inner.schema_type = member_key.as_simple();
+    }
+
+    // XSD 1.1: evaluate assertion facets ($value is the member-validated value)
+    #[cfg(feature = "xsd11")]
+    evaluate_assertion_facets(&inner, &facets, schema_set)?;
+
+    Ok(SimpleTypeResult {
+        normalized_value: result.normalized_value,
+        typed_value: XmlValue::with_schema_type(
+            inner.type_code,
+            sk,
+            XmlValueKind::Union(Box::new(inner)),
+        ),
+        member_type: Some(member_key),
+    })
 }
 
 // ---------------------------------------------------------------------------

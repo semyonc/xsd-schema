@@ -127,6 +127,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute reference takes its declaration's `{inheritable}` (XSD 1.1
   §3.2.2.3).
 
+- `FacetSet::merge_with_base` takes the built-in datatype the facet values
+  belong to (`merge_with_base(&base, XmlTypeCode::Decimal)`) and compares them
+  in its value space: a `fixed` bound is matched by another literal of the
+  same value, an enumeration value must equal a value of the base's, the
+  bounds are ordered as the datatype orders them (exactly for `xs:decimal`, in
+  the partial orders of the date/time and duration datatypes), every bound is
+  checked against every bound of the base by the "valid restriction"
+  constraints, and a `length` must equal the base's. `base` is the base type's
+  facets, inherited ones included. With `XmlTypeCode::AnySimpleType` (a list
+  or union type), and for `xs:QName` / `xs:NOTATION`, literals are compared as
+  written. The schema compiler uses the same method. Upgrading: pass the
+  nearest built-in type code of the restricted type and the base's effective
+  facets.
+- The `PartialOrd` and `PartialEq` of the date/time value structs
+  (`DateTimeValue`, `DateValue`, `TimeValue` and the five `g*` structs) and of
+  `DurationValue`, `YearMonthDurationValue` and `DayTimeDurationValue` are now
+  the XSD order and equality, computed exactly: date/time values on the time
+  line, a value without a time zone offset incomparable (`None`) with one that
+  has an offset unless 14 hours either way give the same order, and never
+  equal to it; durations by the four reference dateTimes (`P1M` and `P30D` are
+  incomparable, `P1D == PT24H`, `P400Y == P146097D`). Before, `PartialEq`
+  compared fields and `PartialOrd` read a missing offset as UTC and durations
+  in average months. The derived `PartialEq` of `XmlAtomicValue` and
+  `XmlValue` follows. Upgrading: code that used `==` to mean "the same fields"
+  compares the fields; `partial_cmp` may return `None`, so sort with your own
+  total order if you need one.
+- `types::complex::other_matches_namespace`,
+  `types::complex::NamespaceConstraint::matches` and
+  `schema::wildcard::NamespaceConstraint::allows` no longer take an
+  `XsdVersion`: no namespace constraint depends on the version.
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -386,6 +417,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   competing pairs could name a different pair from run to run; the verdict and
   the constraint were already stable.
 
+- Facet verdicts follow the specification text where Xerces-J 2.12.2 (XSD 1.0)
+  differs: it reports a minimum and a maximum bound that are incomparable
+  (date/time values with and without a time zone offset, durations such as
+  `P1M` and `P30D`) as out of order, where the text forbids only "greater
+  than"; it keeps a base's `fixed` facet after a restriction step restates it
+  without `fixed` and does not check a facet against an inclusive bound a
+  later step replaced; and it compares `fixed` `g*` values as strings.
+- The date/time and duration values hold a year in `i32`, the other duration
+  fields in `u32` and the seconds in a 96-bit decimal; literals beyond those
+  are refused (unchanged; now documented in `types::value`). A seconds number
+  with more fraction digits than the typed value holds (28) is valid: the
+  typed value holds it truncated toward zero (it was rounded, and `…59.999…`
+  with 29 nines became an invalid second 60); the facets, value constraints
+  and identity constraints compare the literal as written, and the validator
+  reports the warning `xs-seconds-capacity`.
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
@@ -644,6 +691,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Defaulted attributes whose types are derived from `xs:ID`, `xs:IDREF` or
   `xs:ENTITY` — by restriction, list or union — take part in the ID/IDREF and
   ENTITY checks.
+
+- `-0` (and `-00`, …) is a valid `xs:unsignedLong`, `unsignedInt`,
+  `unsignedShort` and `unsignedByte` value with every driver, as a default,
+  enumeration value or bound, and in casts to derived types; it is also
+  accepted as the value of `length`, `minLength`, `maxLength`,
+  `fractionDigits`, `minOccurs` and `maxOccurs`.
+- A restriction may set `minExclusive` equal to `maxExclusive`; an exclusive
+  bound may equal the base's of the same kind also when the base inherited it;
+  every bound is checked against the base's bounds of the other kinds
+  (`minExclusive="0" maxExclusive="0"` on `xs:unsignedLong` is an error).
+- Date/time bounds that are incomparable are no longer reported as out of
+  order; in XSD 1.0 the year `-0001` is 1 BCE, directly before `0001`.
+- Duration bounds use the partial order of the four reference dateTimes:
+  `maxInclusive="P1M"` no longer admits `P28D` – `P31D`, and
+  `minInclusive="P1M"` with `maxInclusive="P30D"` compiles; durations whose
+  four sums agree are equal (`P400Y` and `P146097D`).
+- Durations, `xs:dayTimeDuration` and the date/time time line are compared
+  exactly: a fraction of a second added to a large timestamp or duration no
+  longer rounds away (`PT0.00000000000000000001S` is above `PT0S`), and the
+  largest values no longer overflow (a panic) or compare unequal to
+  themselves. The canonical form of a duration with very large fields no
+  longer overflows.
+- The `g*` types are equal on the time line for `fixed` values, identity
+  constraints and (XSD 1.0) attribute-use value constraints; a union's
+  `enumeration` compares its member values the same way.
+- The `pattern` of the `g*` types constrains the lexical form, not the
+  canonical one.
+- Facet derivation compares values and checks the facets of every ancestor,
+  `length` included; a `whiteSpace` value other than `preserve`, `replace` or
+  `collapse` is a schema error; a simple-content restriction's facets are
+  checked against its base content type (value space and applicability).
+- A QName value whose prefix is bound nowhere is invalid on attributes
+  admitted by a `strict` or `lax` attribute wildcard and on elements of a
+  union type with a QName member — unless a later member of the union accepts
+  the literal (`xs:QName xs:string`), which is then the value; declared
+  attributes, list items and identity-constraint fields follow the same rule.
 
 ### Performance
 

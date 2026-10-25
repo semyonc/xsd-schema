@@ -442,6 +442,7 @@ pub(crate) fn first_lexical_decimal(value: &XmlValue) -> Option<&str> {
 /// Value equality of two `xs:decimal`-family values when at least one of them
 /// is not a plain `Decimal`/`Integer` pair that `PartialEq` already compares
 /// by value; `None` when either is not of the family.
+#[cfg_attr(not(feature = "xsd11"), allow(dead_code))] // XPath only
 pub(crate) fn decimal_values_equal(a: &XmlValue, b: &XmlValue) -> Option<bool> {
     Some(ExactDecimal::from_value(a)? == ExactDecimal::from_value(b)?)
 }

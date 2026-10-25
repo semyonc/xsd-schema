@@ -255,6 +255,9 @@ pub fn parse_occurs(value: &str) -> Result<Option<u32>, String> {
     if value == "unbounded" {
         Ok(None)
     } else {
+        // An `xs:nonNegativeInteger`: zero "may be preceded by a positive
+        // ("+") or a negative ("-") sign" (XSD 1.0 §3.3.20.1).
+        let value = crate::types::validators::unsigned_lexical(value);
         match value.parse::<u32>() {
             Ok(n) => Ok(Some(n)),
             Err(_) => {
@@ -327,6 +330,9 @@ mod tests {
         );
         assert!(parse_occurs("").is_err());
         assert!(parse_occurs("-1").is_err());
+        assert_eq!(parse_occurs("-0"), Ok(Some(0)));
+        assert_eq!(parse_occurs("-00"), Ok(Some(0)));
+        assert_eq!(parse_occurs("+0"), Ok(Some(0)));
     }
 
     #[test]

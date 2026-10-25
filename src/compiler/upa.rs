@@ -277,7 +277,6 @@ fn element_wildcard_overlap(
     element_namespace: Option<NameId>,
     wildcard: &NamespaceConstraint,
     target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
 ) -> bool {
     match wildcard {
         NamespaceConstraint::Any => true,
@@ -285,7 +284,7 @@ fn element_wildcard_overlap(
         NamespaceConstraint::Other => {
             // ##other matches any namespace except the target namespace and
             // ·absent· — in both XSD versions (Structures §3.10.2.2)
-            other_matches_namespace(element_namespace, target_namespace, xsd_version)
+            other_matches_namespace(element_namespace, target_namespace)
         }
 
         NamespaceConstraint::TargetNamespace => {
@@ -313,7 +312,6 @@ fn wildcards_overlap(
     wc1: &NamespaceConstraint,
     wc2: &NamespaceConstraint,
     target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
 ) -> bool {
     use NamespaceConstraint::*;
 
@@ -347,14 +345,12 @@ fn wildcards_overlap(
 
         // ##other vs ##local: never overlap — ##other excludes ·absent·, the
         // only namespace ##local admits (Structures §3.10.2.2)
-        (Other, Local) | (Local, Other) => {
-            other_matches_namespace(None, target_namespace, xsd_version)
-        }
+        (Other, Local) | (Local, Other) => other_matches_namespace(None, target_namespace),
 
         // ##other vs list: overlap if list has any ns other than target
         (Other, List(ns_list)) | (List(ns_list), Other) => ns_list
             .iter()
-            .any(|ns| other_matches_namespace(*ns, target_namespace, xsd_version)),
+            .any(|ns| other_matches_namespace(*ns, target_namespace)),
 
         // ##targetNamespace vs ##targetNamespace: overlap (both match target ns)
         (TargetNamespace, TargetNamespace) => true,
@@ -540,7 +536,6 @@ fn check_element_wildcard_conflicts(
     wildcards: &[ReachableTerm],
     from_state_id: StateId,
     target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
     schema_set: &SchemaSet,
     substitution_sets: &SubstitutionGroupMap,
 ) -> UpaResult<()> {
@@ -575,7 +570,6 @@ fn check_element_wildcard_conflicts(
                             *match_ns,
                             namespace_constraint,
                             target_namespace,
-                            xsd_version,
                         ) {
                             return false;
                         }
@@ -610,7 +604,6 @@ fn check_wildcard_wildcard_conflicts(
     wildcards: &[ReachableTerm],
     from_state_id: StateId,
     target_namespace: Option<NameId>,
-    xsd_version: XsdVersion,
 ) -> UpaResult<()> {
     for i in 0..wildcards.len() {
         for j in (i + 1)..wildcards.len() {
@@ -633,7 +626,7 @@ fn check_wildcard_wildcard_conflicts(
                 },
             ) = (&wc1.term, &wc2.term)
             {
-                if wildcards_overlap(constraint1, constraint2, target_namespace, xsd_version) {
+                if wildcards_overlap(constraint1, constraint2, target_namespace) {
                     return Err(Box::new(UpaError::WildcardWildcardConflict {
                         first_constraint: constraint1.clone(),
                         second_constraint: constraint2.clone(),
@@ -730,7 +723,6 @@ pub(crate) fn check_upa_with_substitutions(
                 &reachable.wildcards,
                 state.id,
                 target_namespace,
-                xsd_version,
                 schema_set,
                 substitution_sets,
             ) {
@@ -739,12 +731,9 @@ pub(crate) fn check_upa_with_substitutions(
         }
 
         // Check wildcard-wildcard conflicts (always an error)
-        if let Err(error) = check_wildcard_wildcard_conflicts(
-            &reachable.wildcards,
-            state.id,
-            target_namespace,
-            xsd_version,
-        ) {
+        if let Err(error) =
+            check_wildcard_wildcard_conflicts(&reachable.wildcards, state.id, target_namespace)
+        {
             return Err(upa_error_to_schema_error(schema_set, error));
         }
     }
@@ -788,8 +777,6 @@ pub(crate) fn check_all_group_upa_with_substitutions(
     target_namespace: Option<NameId>,
     substitution_sets: &SubstitutionGroupMap,
 ) -> SchemaResult<()> {
-    let xsd_version = schema_set.xsd_version;
-
     let mut elements: Vec<ReachableTerm> = Vec::new();
     let mut wildcards: Vec<ReachableTerm> = Vec::new();
     for particle in &model.particles {
@@ -816,12 +803,9 @@ pub(crate) fn check_all_group_upa_with_substitutions(
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 
-    if let Err(error) = check_wildcard_wildcard_conflicts(
-        &wildcards,
-        ALL_GROUP_STATE_ID,
-        target_namespace,
-        xsd_version,
-    ) {
+    if let Err(error) =
+        check_wildcard_wildcard_conflicts(&wildcards, ALL_GROUP_STATE_ID, target_namespace)
+    {
         return Err(upa_error_to_schema_error(schema_set, error));
     }
 

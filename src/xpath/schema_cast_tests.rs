@@ -1426,3 +1426,46 @@ fn casts_to_qname_and_notation_types_compare_expanded_names() {
     }
     assert!(failures.is_empty(), "\n{}", failures.join("\n"));
 }
+
+/// A cast checks the target type's facets in the value space instance
+/// validation uses (F&O §17.4 / §17.5: the value must be "in the value space"
+/// of the target): `-0` is zero for the unsigned types (Datatypes 1.1
+/// §3.4.24.1), `P30D` is ·incomparable· with `P1M` (§3.3.6.1), so outside
+/// `maxInclusive="P1M"`, and a `g*` pattern constrains the lexical form of a
+/// string source (§4.3.4) while a `g*` value is cast through its canonical
+/// representation (§17.4, as for every other primitive).
+#[test]
+fn casts_check_facets_in_the_value_space_of_the_target() {
+    const XSD: &str = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:c37">
+      <xs:simpleType name="tiny"><xs:restriction base="xs:unsignedByte"><xs:maxInclusive value="5"/></xs:restriction></xs:simpleType>
+      <xs:simpleType name="yPlus"><xs:restriction base="xs:gYear"><xs:pattern value="\d{4}\+00:00"/></xs:restriction></xs:simpleType>
+      <xs:simpleType name="upTo1M"><xs:restriction base="xs:duration"><xs:maxInclusive value="P1M"/></xs:restriction></xs:simpleType>
+      <xs:simpleType name="day2"><xs:restriction base="xs:gDay"><xs:enumeration value="---02-14:00"/></xs:restriction></xs:simpleType>
+    </xs:schema>"#;
+    let cases = [
+        ("my:tiny('-0')", "0"),
+        ("'-00' cast as my:tiny", "0"),
+        ("'-1' castable as my:tiny", "false"),
+        ("xs:unsignedInt('-0')", "0"),
+        ("'2000+00:00' castable as my:yPlus", "true"),
+        ("'2000Z' castable as my:yPlus", "false"),
+        ("xs:gYear('2000+00:00') castable as my:yPlus", "false"),
+        ("'P30D' castable as my:upTo1M", "false"),
+        ("'P27D' castable as my:upTo1M", "true"),
+        ("'---03+10:00' castable as my:day2", "true"),
+    ];
+    let mut failures = Vec::new();
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let set = compile_set(version, XSD);
+        let ctx = context(&set);
+        for (expr, expected) in cases {
+            let got = eval(&ctx, expr);
+            if got != expected {
+                failures.push(format!(
+                    "{version:?}: {expr}  =>  {got}  (expected {expected})"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}

@@ -27,6 +27,7 @@ pub mod sequence;
 pub mod simple;
 pub mod validators;
 pub mod value;
+pub(crate) mod value_order;
 
 // Re-exports
 pub use builtin::BuiltinTypes;

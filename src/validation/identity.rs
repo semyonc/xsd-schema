@@ -95,6 +95,103 @@ pub(crate) fn values_equal_or_identical(a: &XmlValue, b: &XmlValue) -> bool {
     atomic_ic_eq(a, b).unwrap_or_else(|| a.to_string_value() == b.to_string_value())
 }
 
+/// [`values_equal_or_identical`] of two values read from the literals
+/// `a_lexical` and `b_lexical`: a date/time or duration literal whose seconds
+/// have more fraction digits than its typed value holds (truncated) is
+/// compared with the fraction as written
+/// ([`literal_cmp_in`](crate::types::value_order::literal_cmp_in)); a list
+/// member is paired with its whitespace-separated token.
+pub(crate) fn literal_values_equal_or_identical(
+    a: &XmlValue,
+    a_lexical: &str,
+    b: &XmlValue,
+    b_lexical: &str,
+) -> bool {
+    use crate::types::validators::seconds_beyond_capacity;
+    use crate::types::value::XmlValueKind as K;
+    if !seconds_beyond_capacity(a_lexical) && !seconds_beyond_capacity(b_lexical) {
+        return values_equal_or_identical(a, b);
+    }
+    let (a, b) = (unwrap_union(a), unwrap_union(b));
+    match (&a.value, &b.value) {
+        (K::List { items: xs, .. }, K::List { items: ys, .. }) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(a_lexical.split_ascii_whitespace())
+                    .zip(ys.iter().zip(b_lexical.split_ascii_whitespace()))
+                    .all(|((x, xl), (y, yl))| literal_values_equal_or_identical(x, xl, y, yl))
+        }
+        // An atomic value equals the list of that one value (§3.11.4).
+        (K::List { items, .. }, K::Atomic(_)) if items.len() == 1 => {
+            literal_values_equal_or_identical(&items[0], a_lexical.trim(), b, b_lexical)
+        }
+        (K::Atomic(_), K::List { items, .. }) if items.len() == 1 => {
+            literal_values_equal_or_identical(a, a_lexical, &items[0], b_lexical.trim())
+        }
+        (K::Atomic(x), K::Atomic(y)) if seconds_type(x) && seconds_type(y) => {
+            crate::types::value_order::literal_cmp_in(false, x, a_lexical, y, b_lexical)
+                == Some(std::cmp::Ordering::Equal)
+        }
+        _ => values_equal_or_identical(a, b),
+    }
+}
+
+/// [`values_identical`] of two values read from the literals `a_lexical` and
+/// `b_lexical`, with the seconds as written as in
+/// [`literal_values_equal_or_identical`]: two date/time values are
+/// identical when their seven properties are, the seconds exactly; two
+/// durations when their months and exact seconds are.
+pub(crate) fn literal_values_identical(
+    a: &XmlValue,
+    a_lexical: &str,
+    b: &XmlValue,
+    b_lexical: &str,
+) -> bool {
+    use crate::types::validators::seconds_beyond_capacity;
+    use crate::types::value::XmlValueKind as K;
+    if !seconds_beyond_capacity(a_lexical) && !seconds_beyond_capacity(b_lexical) {
+        return values_identical(a, b);
+    }
+    let (a, b) = (unwrap_union(a), unwrap_union(b));
+    match (&a.value, &b.value) {
+        (K::List { items: xs, .. }, K::List { items: ys, .. }) => {
+            xs.len() == ys.len()
+                && xs
+                    .iter()
+                    .zip(a_lexical.split_ascii_whitespace())
+                    .zip(ys.iter().zip(b_lexical.split_ascii_whitespace()))
+                    .all(|((x, xl), (y, yl))| literal_values_identical(x, xl, y, yl))
+        }
+        (K::Atomic(x), K::Atomic(y)) if seconds_type(x) && seconds_type(y) => {
+            crate::types::value_order::literal_same_properties(x, a_lexical, y, b_lexical)
+        }
+        _ => values_identical(a, b),
+    }
+}
+
+/// Whether `value` is, or (inside unions and lists) holds, a value of a
+/// datatype with seconds.
+fn holds_seconds(value: &XmlValue) -> bool {
+    use crate::types::value::XmlValueKind as K;
+    match &value.value {
+        K::Atomic(atom) => seconds_type(atom),
+        K::Union(inner) => holds_seconds(inner),
+        K::List { items, .. } => items.iter().any(holds_seconds),
+        K::UntypedAtomic(_) => false,
+    }
+}
+
+/// Whether `atom` is a value of a datatype with seconds (`xs:dateTime`,
+/// `xs:time`, the durations with a day-time part).
+fn seconds_type(atom: &crate::types::value::XmlAtomicValue) -> bool {
+    use crate::types::value::XmlAtomicValue as V;
+    matches!(
+        atom,
+        V::DateTime(_) | V::Time(_) | V::Duration(_) | V::DayTimeDuration(_)
+    )
+}
+
 /// Whether two typed values are **identical** (Datatypes 1.1 §2.2.1: "Two
 /// things are identical if and only if they are actually the same thing") —
 /// stricter than [`values_equal_or_identical`] in exactly the places 1.1
@@ -102,8 +199,9 @@ pub(crate) fn values_equal_or_identical(a: &XmlValue, b: &XmlValue) -> bool {
 /// but not identical, NaN is identical to itself, and two date/time values on
 /// one instant with different time zone offsets are "equal but not identical"
 /// (§3.3.7). Decimals compare by value (precision is not part of it), durations
-/// by months and seconds ("two duration values are equal if and only if they
-/// are identical"), lists pairwise; values of different primitive datatypes are
+/// by months and seconds (the two properties of the value, §3.3.6.1 — so
+/// `P400Y` and `P146097D`, equal by the four reference dateTimes, are not
+/// identical), lists pairwise; values of different primitive datatypes are
 /// distinct, and restrictions do not create new values.
 pub(crate) fn values_identical(a: &XmlValue, b: &XmlValue) -> bool {
     use crate::types::value::{XmlAtomicValue as V, XmlValueKind as K};
@@ -132,11 +230,15 @@ pub(crate) fn values_identical(a: &XmlValue, b: &XmlValue) -> bool {
         (K::Atomic(V::Float(x)), K::Atomic(V::Float(y))) => {
             (x.is_nan() && y.is_nan()) || (x == y && x.is_sign_negative() == y.is_sign_negative())
         }
-        (K::Atomic(x), K::Atomic(y)) => match (duration_parts(x), duration_parts(y)) {
+        (K::Atomic(x), K::Atomic(y)) => match (
+            crate::types::value_order::duration_parts(x),
+            crate::types::value_order::duration_parts(y),
+        ) {
             (Some(dx), Some(dy)) => dx == dy,
-            // Every other value is its fields: a date/time keeps its time zone
-            // offset, a string its characters.
-            _ => x == y,
+            // A date/time value is its seven properties (it keeps its time
+            // zone offset); every other value is what its `PartialEq` compares
+            // (a string its characters).
+            _ => crate::types::value_order::same_properties(x, y).unwrap_or(x == y),
         },
         _ => a.value == b.value,
     }
@@ -247,84 +349,29 @@ fn xml_value_nan_eq(a: &XmlValue, b: &XmlValue) -> bool {
     }
 }
 
-/// Value-space equality for date/time/duration atomic kinds.
+/// Value-space equality for date/time/duration atomic kinds — the order the
+/// facets use (`types::value_order`), so `fixed`, identity constraints,
+/// `enumeration` and the bounds agree.
 ///
-/// Date/time values compare by their `PartialOrd` implementations, i.e. by
-/// time on the time line (Datatypes §D.2.1: values "are ordered the same as
-/// their ·timeOnTimeline· values"), so one instant written in two time zones is
+/// Date/time values are equal when they are one instant on the time line
+/// (Datatypes §D.2.1: values "are ordered the same as their ·timeOnTimeline·
+/// values"; every seven-property datatype, the `g*` ones included: §3.3.13.1
+/// "---15−11:00 = ---16+13:00"), so one instant written in two time zones is
 /// equal; a value with a time zone and one without are incomparable, never
 /// equal.
 ///
-/// Durations compare exactly: two durations are equal when their months and
-/// their seconds are (Datatypes §3.3.7: equality "is determined by adding each
-/// duration in the pair to each of" four dateTime values, which separates any
-/// two different (months, seconds) pairs) — `PT60S` equals `PT1M`, `P1M` equals
-/// no number of days. `xs:yearMonthDuration` and `xs:dayTimeDuration` are
-/// restrictions of `xs:duration`, so a value of one equals the same value of
-/// another.
+/// Durations compare exactly, by the four reference dateTimes (Datatypes
+/// §3.3.6.1: "the equality or order of two duration values is determined by
+/// adding each duration in the pair to each of the following four dateTime
+/// values") — `PT60S` equals `PT1M`, `P1M` equals no number of days, and
+/// `P400Y` equals `P146097D`. `xs:yearMonthDuration` and `xs:dayTimeDuration`
+/// are restrictions of `xs:duration`, so a value of one equals the same value
+/// of another. Identity ([`values_identical`]) is the same months and seconds.
 fn xml_atomic_datetime_eq(
     a: &crate::types::value::XmlAtomicValue,
     b: &crate::types::value::XmlAtomicValue,
 ) -> bool {
-    use crate::types::value::XmlAtomicValue as V;
-    match (a, b) {
-        (V::DateTime(x), V::DateTime(y)) => {
-            x.timezone.is_some() == y.timezone.is_some()
-                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
-        }
-        (V::Date(x), V::Date(y)) => {
-            x.timezone.is_some() == y.timezone.is_some()
-                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
-        }
-        (V::Time(x), V::Time(y)) => {
-            x.timezone.is_some() == y.timezone.is_some()
-                && x.partial_cmp(y) == Some(std::cmp::Ordering::Equal)
-        }
-        _ => match (duration_parts(a), duration_parts(b)) {
-            (Some(x), Some(y)) => x == y,
-            _ => false,
-        },
-    }
-}
-
-/// A duration value as the (months, seconds) pair its value space consists of
-/// (Datatypes §3.3.7.1), signed; `None` for any other value.
-fn duration_parts(
-    atom: &crate::types::value::XmlAtomicValue,
-) -> Option<(i64, rust_decimal::Decimal)> {
-    use crate::types::value::XmlAtomicValue as V;
-    use rust_decimal::Decimal;
-    let signed = |negative: bool, months: i64, seconds: Decimal| {
-        if negative {
-            (-months, -seconds)
-        } else {
-            (months, seconds)
-        }
-    };
-    let day_seconds = |days: u32, hours: u32, minutes: u32, seconds: Decimal| {
-        Decimal::from(days) * Decimal::from(86_400)
-            + Decimal::from(hours) * Decimal::from(3_600)
-            + Decimal::from(minutes) * Decimal::from(60)
-            + seconds
-    };
-    match atom {
-        V::Duration(d) => Some(signed(
-            d.negative,
-            i64::from(d.years) * 12 + i64::from(d.months),
-            day_seconds(d.days, d.hours, d.minutes, d.seconds),
-        )),
-        V::YearMonthDuration(d) => Some(signed(
-            d.negative,
-            i64::from(d.years) * 12 + i64::from(d.months),
-            Decimal::ZERO,
-        )),
-        V::DayTimeDuration(d) => Some(signed(
-            d.negative,
-            0,
-            day_seconds(d.days, d.hours, d.minutes, d.seconds),
-        )),
-        _ => None,
-    }
+    crate::types::value_order::date_time_or_duration_eq(a, b).unwrap_or(false)
 }
 
 fn xml_value_datetime_eq(a: &XmlValue, b: &XmlValue) -> bool {
@@ -462,7 +509,17 @@ pub struct KeyFieldValue {
 
 impl PartialEq for KeyFieldValue {
     fn eq(&self, other: &Self) -> bool {
+        use crate::types::validators::seconds_beyond_capacity;
         match (&self.typed_value, &other.typed_value) {
+            (Some(a), Some(b))
+                if (holds_seconds(a) || holds_seconds(b))
+                    && (seconds_beyond_capacity(&self.string_value)
+                        || seconds_beyond_capacity(&other.string_value)) =>
+            {
+                // A seconds number with more fraction digits than the typed
+                // value holds: compare the literals' fractions as written.
+                literal_values_equal_or_identical(a, &self.string_value, b, &other.string_value)
+            }
             (Some(a), Some(b)) => {
                 let (a, b) = (unwrap_union(a), unwrap_union(b));
                 if list_members(a).is_some() || list_members(b).is_some() {

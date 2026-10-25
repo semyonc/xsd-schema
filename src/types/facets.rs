@@ -495,8 +495,9 @@ pub(crate) struct EnumerationIndex {
     /// `(is NOTATION, namespace, local name)` of the QName / NOTATION values.
     names: HashSet<(bool, Option<crate::ids::NameId>, crate::ids::NameId)>,
     lexical: HashSet<String>,
-    /// A union type's literal values, one per reading of each literal.
-    values: Vec<super::value::XmlValue>,
+    /// A union type's literals and their values, one per reading of each
+    /// literal.
+    values: Vec<(Box<str>, super::value::XmlValue)>,
 }
 
 impl EnumerationIndex {
@@ -542,7 +543,7 @@ impl EnumerationIndex {
     /// Add a union literal's value (as the member type that accepted it gave
     /// it): kept for comparison, and, when it is a resolved QName / NOTATION
     /// value, its expanded name.
-    pub(crate) fn push_value(&mut self, value: super::value::XmlValue) {
+    pub(crate) fn push_value(&mut self, literal: &str, value: super::value::XmlValue) {
         use super::value::{XmlAtomicValue, XmlValueKind};
         let mut atom = &value;
         while let XmlValueKind::Union(inner) = &atom.value {
@@ -561,7 +562,7 @@ impl EnumerationIndex {
             }
             _ => {}
         }
-        self.values.push(value);
+        self.values.push((literal.into(), value));
     }
 
     /// Add a QName / NOTATION literal kept by lexical form.
@@ -591,8 +592,8 @@ impl EnumerationIndex {
         self.names.contains(&(notation, namespace, local))
     }
 
-    /// A union type's literal values (empty for an atomic type).
-    pub(crate) fn values(&self) -> &[super::value::XmlValue] {
+    /// A union type's literals and their values (empty for an atomic type).
+    pub(crate) fn values(&self) -> &[(Box<str>, super::value::XmlValue)] {
         &self.values
     }
 }
@@ -1079,22 +1080,56 @@ impl FacetSet {
     /// Returns a new FacetSet combining base and derived facets, or an error
     /// if the derivation rules are violated.
     ///
-    /// The facets' datatype is not known here, so a lower bound is checked
-    /// against an upper one by comparing the two literals as `f64` numbers
-    /// (literals that are not numbers are not compared).
-    pub fn merge_with_base(&self, base: &FacetSet) -> FacetResult<FacetSet> {
-        self.merge_with_base_ordered(base, BoundOrder::Unknown)
-    }
-
-    /// [`FacetSet::merge_with_base`] for facets of a datatype whose order
-    /// relation `order` names: the bounds are compared in that value space
-    /// (Datatypes 1.1 §4.3.7–§4.3.10 compare bound values "according to the
-    /// datatype's order relation").
-    pub(crate) fn merge_with_base_ordered(
-        &self,
-        base: &FacetSet,
-        order: BoundOrder,
-    ) -> FacetResult<FacetSet> {
+    /// `datatype` is the built-in datatype whose value space the facet values
+    /// are in — the primitive, or any built-in type derived from it, of the
+    /// type the facets restrict (Datatypes 1.1 §4.3.5.1 / §4.3.7.1: {value}
+    /// is "A value from the ·value space· of the {base type definition}").
+    /// The facet values are read with its lexical mapping and compared as
+    /// values:
+    ///
+    /// - a `fixed` bound (§4.3.7.1: "cannot specify a value for maxInclusive
+    ///   other than {value}") is matched by any literal of the same value —
+    ///   `10.0` for a decimal `10`, `2000-01-01+00:00` for `2000-01-01Z`;
+    /// - a lower bound is checked against an upper one in the datatype's
+    ///   order (§4.3.7.4 – §4.3.10.4) — exactly for `xs:decimal` and its
+    ///   restrictions, in the float / double value space for those, in the
+    ///   partial orders of the date/time and duration datatypes, where two
+    ///   ·incomparable· bounds are not out of order; `minExclusive` may equal
+    ///   `maxExclusive`;
+    /// - each bound is checked against every bound of `base` by the four
+    ///   "valid restriction" constraints (§4.3.7.4 – §4.3.10.4), and a
+    ///   `length` must equal the base's (§4.3.1.4 length valid restriction);
+    /// - each derived `enumeration` value must be equal or identical to a
+    ///   value of the base's (§4.3.5.5).
+    ///
+    /// `base` is the base type's {facets}: its own and those it inherits. A
+    /// literal the datatype's lexical mapping does not accept, and every
+    /// literal when `datatype` has no registered validator (such as
+    /// `XmlTypeCode::AnySimpleType`, for a list or union type), is compared
+    /// as written, and such bounds are not ordered. `xs:QName` and
+    /// `xs:NOTATION` literals are compared as written too: without the
+    /// namespace bindings they were written with, `p:a` and `q:a` differ even
+    /// when `p` and `q` name one namespace (the schema compiler compares them
+    /// by expanded name itself). Two date/time bounds with years on both
+    /// sides of year 1 are not ordered: XSD 1.0 and 1.1 number those years
+    /// differently. Whether each facet value is itself in the base type's
+    /// value space is not checked here.
+    pub fn merge_with_base(&self, base: &FacetSet, datatype: XmlTypeCode) -> FacetResult<FacetSet> {
+        // Datatypes 1.1 §4.3.8.4 / §4.3.9.4 (XSD 1.0 alike): "It is an
+        // ·error· for both ·maxInclusive· and ·maxExclusive· to be specified
+        // in the same derivation step" — this step's own facets; a base may
+        // carry both from different steps (Structures §3.16.6.4 overlays
+        // facets of the same kind only), and then both bound its values.
+        if self.min_inclusive.is_some() && self.min_exclusive.is_some() {
+            return Err(FacetError::conflicting(
+                "cannot have both minInclusive and minExclusive",
+            ));
+        }
+        if self.max_inclusive.is_some() && self.max_exclusive.is_some() {
+            return Err(FacetError::conflicting(
+                "cannot have both maxInclusive and maxExclusive",
+            ));
+        }
         // XSD Datatypes Part 2 §4.3.1.4 "length and minLength or maxLength":
         // both `length` and `minLength` in {facets} is an error UNLESS
         // (1.1) minLength <= length AND (1.2) some restriction ancestor has
@@ -1131,6 +1166,8 @@ impl FacetSet {
             }
         }
 
+        self.check_bound_restrictions(base, datatype)?;
+
         let mut result = self.clone();
 
         // === Length facets ===
@@ -1146,6 +1183,16 @@ impl FacetSet {
                             base_length.value.to_string(),
                             derived.value.to_string(),
                         ));
+                    }
+                    // Datatypes §4.3.1.4 length valid restriction (XSD 1.0
+                    // alike): "It is an ·error· if length is among the members
+                    // of {facets} of {base type definition} and {value} is not
+                    // equal to the {value} of the parent length" — fixed or not.
+                    if derived.value != base_length.value {
+                        return Err(FacetError::derivation(format!(
+                            "length {} differs from base length {} (length valid restriction)",
+                            derived.value, base_length.value
+                        )));
                     }
                 }
                 None => {
@@ -1221,7 +1268,12 @@ impl FacetSet {
                 Some(derived_enum) => {
                     // Check that derived values are subset of base values
                     for value in &derived_enum.values {
-                        if !base_enum.values.contains(value) {
+                        if !base_enum.values.contains(value)
+                            && !base_enum
+                                .values
+                                .iter()
+                                .any(|member| literal_values_equal(datatype, value, member))
+                        {
                             return Err(FacetError::derivation(format!(
                                 "enumeration value '{}' is not in base enumeration",
                                 value
@@ -1272,7 +1324,9 @@ impl FacetSet {
         // derived type already supplies the complementary one.
         if let Some(ref base_facet) = base.min_inclusive {
             if let Some(ref derived) = result.min_inclusive {
-                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
+                if base_facet.fixed == FacetFixed::Fixed
+                    && !literal_values_equal(datatype, &derived.value, &base_facet.value)
+                {
                     return Err(FacetError::fixed_violation(
                         "minInclusive",
                         &base_facet.value,
@@ -1287,7 +1341,9 @@ impl FacetSet {
 
         if let Some(ref base_facet) = base.max_inclusive {
             if let Some(ref derived) = result.max_inclusive {
-                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
+                if base_facet.fixed == FacetFixed::Fixed
+                    && !literal_values_equal(datatype, &derived.value, &base_facet.value)
+                {
                     return Err(FacetError::fixed_violation(
                         "maxInclusive",
                         &base_facet.value,
@@ -1302,7 +1358,9 @@ impl FacetSet {
 
         if let Some(ref base_facet) = base.min_exclusive {
             if let Some(ref derived) = result.min_exclusive {
-                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
+                if base_facet.fixed == FacetFixed::Fixed
+                    && !literal_values_equal(datatype, &derived.value, &base_facet.value)
+                {
                     return Err(FacetError::fixed_violation(
                         "minExclusive",
                         &base_facet.value,
@@ -1317,7 +1375,9 @@ impl FacetSet {
 
         if let Some(ref base_facet) = base.max_exclusive {
             if let Some(ref derived) = result.max_exclusive {
-                if base_facet.fixed == FacetFixed::Fixed && derived.value != base_facet.value {
+                if base_facet.fixed == FacetFixed::Fixed
+                    && !literal_values_equal(datatype, &derived.value, &base_facet.value)
+                {
                     return Err(FacetError::fixed_violation(
                         "maxExclusive",
                         &base_facet.value,
@@ -1417,13 +1477,109 @@ impl FacetSet {
         }
 
         // === Validate conflicting facets ===
-        result.validate_consistency(order)?;
+        result.validate_consistency(datatype)?;
 
         Ok(result)
     }
 
+    /// The four "valid restriction" constraints of the bounding facets
+    /// (Datatypes 1.1 §4.3.7.4 – §4.3.10.4): each bound of this step against
+    /// every bound among the base's {facets}, in `datatype`'s order — also a
+    /// base bound of the opposite kind that this step's own bound replaces in
+    /// the merged set (`maxExclusive 0` under the `minInclusive 0` of
+    /// `xs:unsignedLong`, clause 3: "less than or equal to the {value} of that
+    /// minInclusive"). ·Incomparable· values break no clause. The 1.1 tables
+    /// are used in both versions: where XSD 1.0's minExclusive valid
+    /// restriction lacks 1.1's clause 3 ("greater than or equal to the
+    /// {value} of that maxInclusive"), its "minExclusive < maxInclusive … for
+    /// the same datatype" forbids the same value, the inherited maxInclusive
+    /// being among the datatype's {facets}.
+    fn check_bound_restrictions(&self, base: &FacetSet, datatype: XmlTypeCode) -> FacetResult<()> {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        let derived = [
+            (
+                "minInclusive",
+                self.min_inclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "maxInclusive",
+                self.max_inclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "minExclusive",
+                self.min_exclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "maxExclusive",
+                self.max_exclusive.as_ref().map(|f| &f.value),
+            ),
+        ];
+        let base_bounds = [
+            (
+                "minInclusive",
+                base.min_inclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "maxInclusive",
+                base.max_inclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "minExclusive",
+                base.min_exclusive.as_ref().map(|f| &f.value),
+            ),
+            (
+                "maxExclusive",
+                base.max_exclusive.as_ref().map(|f| &f.value),
+            ),
+        ];
+        for (kind, value) in derived {
+            let Some(value) = value else { continue };
+            for (base_kind, base_value) in base_bounds {
+                let Some(base_value) = base_value else {
+                    continue;
+                };
+                let Some(order) = literal_order(datatype, value, base_value) else {
+                    continue;
+                };
+                // The clause tables: the orders of {value} against the base
+                // facet that are an error.
+                let error = match (kind, base_kind) {
+                    ("maxInclusive", "maxInclusive") => order == Greater,
+                    ("maxInclusive", "maxExclusive") => order != Less,
+                    ("maxInclusive", "minInclusive") => order == Less,
+                    ("maxInclusive", "minExclusive") => order != Greater,
+                    ("maxExclusive", "maxExclusive") => order == Greater,
+                    ("maxExclusive", "maxInclusive") => order == Greater,
+                    ("maxExclusive", "minInclusive") => order != Greater,
+                    ("maxExclusive", "minExclusive") => order != Greater,
+                    ("minExclusive", "minExclusive") => order == Less,
+                    ("minExclusive", "minInclusive") => order == Less,
+                    ("minExclusive", "maxInclusive") => order != Less,
+                    ("minExclusive", "maxExclusive") => order != Less,
+                    ("minInclusive", "minInclusive") => order == Less,
+                    ("minInclusive", "maxInclusive") => order == Greater,
+                    ("minInclusive", "minExclusive") => order != Greater,
+                    ("minInclusive", "maxExclusive") => order != Less,
+                    _ => false,
+                };
+                if error {
+                    let relation = match order {
+                        Less => "less than",
+                        Equal => "equal to",
+                        Greater => "greater than",
+                    };
+                    return Err(FacetError::derivation(format!(
+                        "{kind} '{value}' is {relation} the base's {base_kind} '{base_value}' \
+                         ({kind} valid restriction)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate internal consistency of facets
-    fn validate_consistency(&self, order: BoundOrder) -> FacetResult<()> {
+    fn validate_consistency(&self, datatype: XmlTypeCode) -> FacetResult<()> {
         // Check minLength <= maxLength
         if let (Some(min), Some(max)) = (&self.min_length, &self.max_length) {
             if min.value > max.value {
@@ -1454,19 +1610,6 @@ impl FacetSet {
             }
         }
 
-        // Check minInclusive <= maxInclusive (string comparison, approximate)
-        // Note: Full validation would require parsing the numeric values
-        if self.min_inclusive.is_some() && self.min_exclusive.is_some() {
-            return Err(FacetError::conflicting(
-                "cannot have both minInclusive and minExclusive",
-            ));
-        }
-        if self.max_inclusive.is_some() && self.max_exclusive.is_some() {
-            return Err(FacetError::conflicting(
-                "cannot have both maxInclusive and maxExclusive",
-            ));
-        }
-
         // Check fractionDigits <= totalDigits
         if let (Some(fd), Some(td)) = (&self.fraction_digits, &self.total_digits) {
             if fd.value > td.value {
@@ -1480,7 +1623,7 @@ impl FacetSet {
         // Check numeric bound consistency (minInclusive vs maxInclusive, etc.)
         // Uses decimal parsing for numeric comparison
         if let (Some(min_incl), Some(max_incl)) = (&self.min_inclusive, &self.max_inclusive) {
-            if let Some(cmp) = order.compare(&min_incl.value, &max_incl.value) {
+            if let Some(cmp) = literal_order(datatype, &min_incl.value, &max_incl.value) {
                 if cmp == std::cmp::Ordering::Greater {
                     return Err(FacetError::conflicting(format!(
                         "minInclusive '{}' is greater than maxInclusive '{}'",
@@ -1489,18 +1632,22 @@ impl FacetSet {
                 }
             }
         }
+        // Datatypes 1.1 §4.3.8.4 (XSD 1.0 alike), "minExclusive <=
+        // maxExclusive": "It is an ·error· for the value specified for
+        // ·minExclusive· to be greater than the value specified for
+        // ·maxExclusive·" — equal is allowed (the value space is empty).
         if let (Some(min_excl), Some(max_excl)) = (&self.min_exclusive, &self.max_exclusive) {
-            if let Some(cmp) = order.compare(&min_excl.value, &max_excl.value) {
-                if cmp != std::cmp::Ordering::Less {
+            if let Some(cmp) = literal_order(datatype, &min_excl.value, &max_excl.value) {
+                if cmp == std::cmp::Ordering::Greater {
                     return Err(FacetError::conflicting(format!(
-                        "minExclusive '{}' must be less than maxExclusive '{}'",
+                        "minExclusive '{}' is greater than maxExclusive '{}'",
                         min_excl.value, max_excl.value
                     )));
                 }
             }
         }
         if let (Some(min_incl), Some(max_excl)) = (&self.min_inclusive, &self.max_exclusive) {
-            if let Some(cmp) = order.compare(&min_incl.value, &max_excl.value) {
+            if let Some(cmp) = literal_order(datatype, &min_incl.value, &max_excl.value) {
                 if cmp != std::cmp::Ordering::Less {
                     return Err(FacetError::conflicting(format!(
                         "minInclusive '{}' must be less than maxExclusive '{}'",
@@ -1510,7 +1657,7 @@ impl FacetSet {
             }
         }
         if let (Some(min_excl), Some(max_incl)) = (&self.min_exclusive, &self.max_inclusive) {
-            if let Some(cmp) = order.compare(&min_excl.value, &max_incl.value) {
+            if let Some(cmp) = literal_order(datatype, &min_excl.value, &max_incl.value) {
                 if cmp != std::cmp::Ordering::Less {
                     return Err(FacetError::conflicting(format!(
                         "minExclusive '{}' must be less than maxInclusive '{}'",
@@ -2000,55 +2147,74 @@ fn is_whitespace_more_restrictive(derived: WhitespaceMode, base: WhitespaceMode)
     }
 }
 
-/// The order relation in which [`FacetSet::merge_with_base_ordered`] compares
-/// a lower bound with an upper bound.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BoundOrder {
-    /// The datatype is not known: numeric literals compare as `f64`.
-    Unknown,
-    /// `xs:decimal` and the types derived from it: exactly, at any size and
-    /// precision.
-    Decimal,
-    /// `xs:float`: as the `f32` values the literals denote.
-    Float,
-    /// `xs:double`: as the `f64` values the literals denote.
-    Double,
+/// A facet literal as a value of `datatype`, through its registered
+/// validator's lexical mapping; `None` when the datatype has no validator or
+/// the literal is not one of its lexical forms.
+fn literal_value(datatype: XmlTypeCode, literal: &str) -> Option<super::value::XmlValue> {
+    super::validators::VALIDATOR_REGISTRY
+        .get_by_code(datatype)?
+        .validate(literal)
+        .ok()
 }
 
-impl BoundOrder {
-    /// The order of the datatypes whose primitive is `primitive`; `Unknown`
-    /// for the non-numeric primitives (their bounds are compared elsewhere,
-    /// on typed values).
-    pub(crate) fn for_primitive(primitive: Option<super::PrimitiveTypeCode>) -> Self {
-        match primitive {
-            Some(super::PrimitiveTypeCode::Decimal) => BoundOrder::Decimal,
-            Some(super::PrimitiveTypeCode::Float) => BoundOrder::Float,
-            Some(super::PrimitiveTypeCode::Double) => BoundOrder::Double,
-            _ => BoundOrder::Unknown,
+/// The order of two bound literals of `datatype` in its value space, or
+/// `None` when either is not a literal of the datatype (such a bound is
+/// rejected on its own), the datatype has no order here, or the two are
+/// ·incomparable· (`NaN`; date/time values with and without a time zone
+/// offset; durations such as `P1M` and `P30D`).
+///
+/// Exact comparison is right only for `xs:decimal`: two `xs:double`
+/// literals that differ beyond double precision, such as `0.1` and
+/// `0.10000000000000000001`, denote the same value.
+pub(crate) fn literal_order(datatype: XmlTypeCode, a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use super::exact_decimal::ExactDecimal;
+    use super::validators::{parse_double, parse_float};
+    use super::PrimitiveTypeCode;
+    let collapse = |s: &str| normalize_whitespace(s, WhitespaceMode::Collapse).into_owned();
+    match PrimitiveTypeCode::from_type_code(datatype)? {
+        PrimitiveTypeCode::Decimal => {
+            Some(ExactDecimal::parse(&collapse(a))?.cmp(&ExactDecimal::parse(&collapse(b))?))
         }
-    }
-
-    /// The order of two bound literals, or `None` when either is not a
-    /// literal of the datatype (such a bound is rejected on its own) or the
-    /// two are unordered (`NaN`).
-    ///
-    /// Exact comparison is right only for `xs:decimal`: two `xs:double`
-    /// literals that differ beyond double precision, such as `0.1` and
-    /// `0.10000000000000000001`, denote the same value.
-    fn compare(self, a: &str, b: &str) -> Option<std::cmp::Ordering> {
-        use super::exact_decimal::ExactDecimal;
-        use super::validators::{parse_double, parse_float};
-        let (a, b) = (a.trim(), b.trim());
-        match self {
-            BoundOrder::Decimal => Some(ExactDecimal::parse(a)?.cmp(&ExactDecimal::parse(b)?)),
-            BoundOrder::Float => parse_float(a).ok()?.partial_cmp(&parse_float(b).ok()?),
-            BoundOrder::Double => parse_double(a).ok()?.partial_cmp(&parse_double(b).ok()?),
-            BoundOrder::Unknown => {
-                let a: f64 = a.parse().ok()?;
-                let b: f64 = b.parse().ok()?;
-                a.partial_cmp(&b)
+        PrimitiveTypeCode::Float => parse_float(&collapse(a))
+            .ok()?
+            .partial_cmp(&parse_float(&collapse(b)).ok()?),
+        PrimitiveTypeCode::Double => parse_double(&collapse(a))
+            .ok()?
+            .partial_cmp(&parse_double(&collapse(b)).ok()?),
+        _ => {
+            use super::value::XmlValueKind::Atomic;
+            use super::value_order::{literal_cmp_in, negative_year};
+            match (
+                literal_value(datatype, a)?.value,
+                literal_value(datatype, b)?.value,
+            ) {
+                // XSD 1.0 and 1.1 number the years before year 1 differently
+                // (1.0 has no year 0000); this method does not know the
+                // version, so such a pair is not ordered here.
+                (Atomic(x), Atomic(y)) if negative_year(&x) != negative_year(&y) => None,
+                (Atomic(x), Atomic(y)) => literal_cmp_in(false, &x, a, &y, b),
+                _ => None,
             }
         }
+    }
+}
+
+/// Whether two facet literals denote the same value of `datatype`: equal or
+/// identical (Datatypes 1.1 §2.2.1 – §2.2.2) as the instance comparisons
+/// decide it — decimals exactly, `NaN` identical to itself and `0` equal to
+/// `-0`, date/time values on the time line, durations by months and
+/// seconds, strings by their characters, lists member for member. Literals
+/// the datatype does not read (or every literal, without a validator) are
+/// equal only when they are written alike.
+pub(crate) fn literal_values_equal(datatype: XmlTypeCode, a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    match (literal_value(datatype, a), literal_value(datatype, b)) {
+        (Some(x), Some(y)) => {
+            crate::validation::identity::literal_values_equal_or_identical(&x, a, &y, b)
+        }
+        _ => false,
     }
 }
 
@@ -3251,7 +3417,8 @@ mod tests {
 
     /// Datatypes 1.1 §4.3.7–§4.3.10: a lower bound above an upper bound is
     /// an error, "according to the datatype's order relation" — exact for
-    /// `xs:decimal`, in the float or double value space for those types.
+    /// `xs:decimal`, in the float or double value space for those types, in
+    /// the partial orders of date/time values and durations.
     #[test]
     fn test_bound_consistency_in_the_datatype_value_space() {
         let bounds = |min: &str, max: &str| {
@@ -3262,38 +3429,52 @@ mod tests {
         };
         let base = FacetSet::new();
         let consistent =
-            |facets: &FacetSet, order| facets.merge_with_base_ordered(&base, order).is_ok();
+            |facets: &FacetSet, datatype| facets.merge_with_base(&base, datatype).is_ok();
         // The same double, spelled two ways.
         let dbl = bounds("0.10000000000000000001", "0.1");
-        assert!(consistent(&dbl, BoundOrder::Double));
-        assert!(consistent(&dbl, BoundOrder::Unknown));
-        assert!(!consistent(&dbl, BoundOrder::Decimal));
+        assert!(consistent(&dbl, XmlTypeCode::Double));
+        assert!(!consistent(&dbl, XmlTypeCode::Decimal));
         // The same float, but two doubles.
         let flt = bounds("0.1000000001", "0.1");
-        assert!(consistent(&flt, BoundOrder::Float));
-        assert!(!consistent(&flt, BoundOrder::Double));
+        assert!(consistent(&flt, XmlTypeCode::Float));
+        assert!(!consistent(&flt, XmlTypeCode::Double));
         // Decimals beyond double precision.
         let dec = bounds(
             "1.00000000000000000000000000002",
             "1.00000000000000000000000000001",
         );
-        assert!(!consistent(&dec, BoundOrder::Decimal));
-        assert!(consistent(&dec, BoundOrder::Double));
+        assert!(!consistent(&dec, XmlTypeCode::Decimal));
+        assert!(consistent(&dec, XmlTypeCode::Double));
         // Genuine conflicts in every order; special values in float/double.
-        for order in [
-            BoundOrder::Decimal,
-            BoundOrder::Float,
-            BoundOrder::Double,
-            BoundOrder::Unknown,
+        for datatype in [
+            XmlTypeCode::Decimal,
+            XmlTypeCode::Integer,
+            XmlTypeCode::Float,
+            XmlTypeCode::Double,
         ] {
-            assert!(!consistent(&bounds("0.2", "0.1"), order), "{order:?}");
-            assert!(consistent(&bounds("0.1", "0.2"), order), "{order:?}");
+            assert!(!consistent(&bounds("2", "1"), datatype), "{datatype:?}");
+            assert!(consistent(&bounds("1", "2"), datatype), "{datatype:?}");
         }
-        assert!(consistent(&bounds("-INF", "INF"), BoundOrder::Double));
-        assert!(!consistent(&bounds("INF", "-INF"), BoundOrder::Float));
-        // The public method keeps comparing as f64.
-        assert!(dbl.merge_with_base(&base).is_ok());
-        assert!(dec.merge_with_base(&base).is_ok());
+        assert!(consistent(&bounds("-INF", "INF"), XmlTypeCode::Double));
+        assert!(!consistent(&bounds("INF", "-INF"), XmlTypeCode::Float));
+        // Without an order (no datatype) bounds are not compared.
+        assert!(consistent(&bounds("2", "1"), XmlTypeCode::AnySimpleType));
+        // Dates: in order, out of order, incomparable.
+        assert!(consistent(
+            &bounds("2000-01-01Z", "2000-01-02Z"),
+            XmlTypeCode::Date
+        ));
+        assert!(!consistent(
+            &bounds("2000-01-02Z", "2000-01-01Z"),
+            XmlTypeCode::Date
+        ));
+        assert!(consistent(
+            &bounds("2000-01-01T05:00:00", "2000-01-01T00:00:00Z"),
+            XmlTypeCode::DateTime
+        ));
+        // Durations: P1M and P30D are incomparable, P1M and P27D are not.
+        assert!(consistent(&bounds("P1M", "P30D"), XmlTypeCode::Duration));
+        assert!(!consistent(&bounds("P1M", "P27D"), XmlTypeCode::Duration));
     }
 
     #[test]
@@ -3387,7 +3568,7 @@ mod tests {
         base.set_max_length(100, FacetFixed::Default, None);
 
         let derived = FacetSet::new();
-        let merged = derived.merge_with_base(&base).unwrap();
+        let merged = derived.merge_with_base(&base, XmlTypeCode::String).unwrap();
 
         assert_eq!(merged.min_length.as_ref().unwrap().value, 5);
         assert_eq!(merged.max_length.as_ref().unwrap().value, 100);
@@ -3403,7 +3584,7 @@ mod tests {
         derived.set_min_length(10, FacetFixed::Default, None); // More restrictive
         derived.set_max_length(50, FacetFixed::Default, None); // More restrictive
 
-        let merged = derived.merge_with_base(&base).unwrap();
+        let merged = derived.merge_with_base(&base, XmlTypeCode::String).unwrap();
         assert_eq!(merged.min_length.as_ref().unwrap().value, 10);
         assert_eq!(merged.max_length.as_ref().unwrap().value, 50);
     }
@@ -3416,7 +3597,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_min_length(5, FacetFixed::Default, None); // Less restrictive
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
     }
 
@@ -3428,7 +3609,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_max_length(100, FacetFixed::Default, None); // Less restrictive
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
     }
 
@@ -3440,7 +3621,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_length(10, FacetFixed::Default, None); // Same value
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_ok());
     }
 
@@ -3452,7 +3633,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_length(20, FacetFixed::Default, None); // Different value
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
         if let Err(FacetError::FixedFacetViolation { facet_name, .. }) = result {
             assert_eq!(facet_name, "length");
@@ -3482,7 +3663,7 @@ mod tests {
             )
             .unwrap();
 
-        let merged = derived.merge_with_base(&base).unwrap();
+        let merged = derived.merge_with_base(&base, XmlTypeCode::String).unwrap();
         // Derived step (one OR'd pattern) AND base step (one OR'd pattern)
         // = two separate AND'd steps.
         assert_eq!(merged.patterns.len(), 2);
@@ -3499,7 +3680,7 @@ mod tests {
         derived.add_enumeration("red".to_string(), None);
         derived.add_enumeration("blue".to_string(), None);
 
-        let merged = derived.merge_with_base(&base);
+        let merged = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(merged.is_ok());
     }
 
@@ -3512,7 +3693,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.add_enumeration("yellow".to_string(), None); // Not in base
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
     }
 
@@ -3524,7 +3705,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_whitespace(WhitespaceMode::Collapse, FacetFixed::Default, None);
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_ok());
     }
 
@@ -3536,7 +3717,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_whitespace(WhitespaceMode::Preserve, FacetFixed::Default, None);
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
     }
 
@@ -3550,7 +3731,7 @@ mod tests {
         derived.set_total_digits(5, FacetFixed::Default, None); // More restrictive
         derived.set_fraction_digits(2, FacetFixed::Default, None); // More restrictive
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_ok());
     }
 
@@ -3562,7 +3743,7 @@ mod tests {
         let mut derived = FacetSet::new();
         derived.set_total_digits(10, FacetFixed::Default, None); // Less restrictive
 
-        let result = derived.merge_with_base(&base);
+        let result = derived.merge_with_base(&base, XmlTypeCode::String);
         assert!(result.is_err());
     }
 
@@ -3576,7 +3757,7 @@ mod tests {
         base.set_min_length(10, FacetFixed::Default, None);
         base.set_max_length(5, FacetFixed::Default, None);
 
-        let result = base.merge_with_base(&FacetSet::new());
+        let result = base.merge_with_base(&FacetSet::new(), XmlTypeCode::Decimal);
         assert!(result.is_err());
     }
 
@@ -3586,7 +3767,7 @@ mod tests {
         base.set_min_inclusive("0".to_string(), FacetFixed::Default, None);
         base.set_min_exclusive("0".to_string(), FacetFixed::Default, None);
 
-        let result = base.merge_with_base(&FacetSet::new());
+        let result = base.merge_with_base(&FacetSet::new(), XmlTypeCode::Decimal);
         assert!(result.is_err());
     }
 
@@ -3596,7 +3777,7 @@ mod tests {
         base.set_total_digits(3, FacetFixed::Default, None);
         base.set_fraction_digits(5, FacetFixed::Default, None);
 
-        let result = base.merge_with_base(&FacetSet::new());
+        let result = base.merge_with_base(&FacetSet::new(), XmlTypeCode::Decimal);
         assert!(result.is_err());
     }
 

@@ -8,7 +8,7 @@ use crate::ids::{
     SimpleTypeKey, TypeKey,
 };
 use crate::parser::location::SourceRef;
-use crate::schema::model::{DerivationSet, XsdVersion};
+use crate::schema::model::DerivationSet;
 
 /// Complex type content kind
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -260,16 +260,17 @@ pub enum NamespaceConstraint {
 
 impl NamespaceConstraint {
     /// Check whether an element namespace matches this wildcard constraint.
+    /// No constraint kind depends on the XSD version (`##other` is the same in
+    /// both, [`other_matches_namespace`]).
     pub fn matches(
         &self,
         element_namespace: Option<NameId>,
         target_namespace: Option<NameId>,
-        xsd_version: XsdVersion,
     ) -> bool {
         match self {
             NamespaceConstraint::Any => true,
             NamespaceConstraint::Other => {
-                other_matches_namespace(element_namespace, target_namespace, xsd_version)
+                other_matches_namespace(element_namespace, target_namespace)
             }
             NamespaceConstraint::TargetNamespace => element_namespace == target_namespace,
             NamespaceConstraint::Local => element_namespace.is_none(),
@@ -285,12 +286,9 @@ impl NamespaceConstraint {
 /// schema has no target namespace, it still excludes absent — only non-absent
 /// namespaces match.
 ///
-/// `_xsd_version` is retained in the signature for API stability; the rule is
-/// version-independent after the XSD 1.1 §3.10.4 alignment.
 pub fn other_matches_namespace(
     element_namespace: Option<NameId>,
     target_namespace: Option<NameId>,
-    _xsd_version: XsdVersion,
 ) -> bool {
     element_namespace.is_some() && element_namespace != target_namespace
 }
