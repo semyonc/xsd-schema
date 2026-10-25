@@ -25,6 +25,10 @@ impl AlternativeFrame {
         let test = attrs
             .get_value_by_name(name_table, "test")
             .map(String::from);
+        #[cfg(feature = "xsd11")]
+        if let Some(test) = &test {
+            crate::xpath::depth::check_schema_test(test, xsd_names::ALTERNATIVE)?;
+        }
 
         let type_ref = attrs
             .get_value_by_name(name_table, "type")
@@ -143,6 +147,8 @@ impl AssertFrame {
             .get_value_by_name(name_table, "test")
             .map(String::from)
             .unwrap_or_default();
+        #[cfg(feature = "xsd11")]
+        crate::xpath::depth::check_schema_test(&test, xsd_names::ASSERT)?;
 
         let xpath_default_namespace = attrs
             .get_value_by_name(name_table, "xpathDefaultNamespace")

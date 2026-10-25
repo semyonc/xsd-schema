@@ -528,7 +528,7 @@ pub fn validate_complex_type_attribute_uniqueness(schema_set: &SchemaSet) -> Sch
         seen: &mut HashSet<AttrDeclId>,
         out: &mut Vec<EffectiveAttributeUse>,
     ) {
-        if depth > 50 {
+        if depth > schema_set.recursion_bound(50) {
             return;
         }
         for (i, attr_use) in type_def.attributes.iter().enumerate() {
@@ -927,7 +927,7 @@ pub fn validate_local_decl_target_namespace(schema_set: &SchemaSet) -> SchemaRes
         schema_tns: Option<NameId>,
         depth: usize,
     ) -> Option<(Option<SourceRef>, String)> {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return None;
         }
         match &particle.term {
@@ -1074,7 +1074,7 @@ pub fn validate_substitution_group_element_consistency(schema_set: &SchemaSet) -
         out: &mut HashMap<(Option<NameId>, NameId), Vec<Entry>>,
         depth: usize,
     ) {
-        if depth > 100 {
+        if depth > schema_set.recursion_bound(100) {
             return;
         }
         match &particle.term {

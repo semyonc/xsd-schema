@@ -19,7 +19,7 @@
 
 use crate::ids::NameId;
 use ahash::RandomState;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 /// Entry in the name table
 ///
@@ -69,6 +69,8 @@ pub struct NameTable {
     /// names interned from untrusted input. `NameId` is assigned by insertion
     /// order, independent of the hash, so interning results stay deterministic.
     hasher: RandomState,
+    /// Bytes of interned text, for [`heap_bytes`](Self::heap_bytes).
+    text_bytes: Cell<usize>,
 }
 
 impl NameTable {
@@ -81,6 +83,7 @@ impl NameTable {
             entries: RefCell::new(Vec::with_capacity(Self::INITIAL_BUCKETS)),
             buckets: RefCell::new(vec![-1; Self::INITIAL_BUCKETS]),
             hasher: RandomState::new(),
+            text_bytes: Cell::new(0),
         };
 
         // Pre-seed standard values
@@ -189,6 +192,30 @@ impl NameTable {
         self.entries.borrow().len()
     }
 
+    /// The heap memory the table holds, in bytes, in constant time: the
+    /// interned text, the entry and bucket arrays (their capacity), and one
+    /// heap block per entry's text. An estimate of what the table costs —
+    /// the allocator adds its own rounding — so that a host that validates
+    /// documents against a long-lived schema set can watch how much the
+    /// names of those documents grow it (every distinct name is interned for
+    /// good) and rebuild the set past a budget.
+    ///
+    /// ```
+    /// use xsd_schema::namespace::NameTable;
+    ///
+    /// let table = NameTable::new();
+    /// let before = table.heap_bytes();
+    /// table.add(&"x".repeat(1000));
+    /// assert!(table.heap_bytes() >= before + 1000);
+    /// ```
+    pub fn heap_bytes(&self) -> usize {
+        let entries = self.entries.borrow().capacity();
+        let buckets = self.buckets.borrow().capacity();
+        self.text_bytes.get()
+            + entries * std::mem::size_of::<Entry>()
+            + buckets * std::mem::size_of::<i32>()
+    }
+
     /// Check if the table is empty
     pub fn is_empty(&self) -> bool {
         self.entries.borrow().is_empty()
@@ -244,6 +271,7 @@ impl NameTable {
             text: value.into(),
         });
         buckets[bucket_idx] = id.0 as i32;
+        self.text_bytes.set(self.text_bytes.get() + value.len());
 
         id
     }

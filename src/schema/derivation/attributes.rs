@@ -202,7 +202,7 @@ fn collect_inherited_attribute_uses(
     let mut current = Some(type_def);
     let mut depth = 0;
     while let Some(level) = current {
-        if depth > 50 {
+        if depth > schema_set.recursion_bound(50) {
             break;
         }
         let restriction = level.derivation_method != Some(DerivationMethod::Extension);
@@ -667,7 +667,7 @@ fn compute_runtime_attribute_wildcard_bounded(
     ct_key: ComplexTypeKey,
     depth: u32,
 ) -> Option<EffectiveAttributeWildcard> {
-    if depth > 100 {
+    if depth as usize > schema_set.recursion_bound(100) {
         return None;
     }
     let ct = schema_set.arenas.complex_types.get(ct_key)?;
@@ -822,7 +822,7 @@ fn collect_effective_group_wildcards(
     out: &mut Vec<EffectiveAttributeWildcard>,
     depth: usize,
 ) -> SchemaResult<()> {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return Err(attribute_group_cycle_error());
     }
 
@@ -850,7 +850,7 @@ fn effective_attribute_wildcard_for_group(
     ag: &crate::arenas::AttributeGroupData,
     depth: usize,
 ) -> SchemaResult<Option<EffectiveAttributeWildcard>> {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return Err(attribute_group_cycle_error());
     }
 
@@ -1024,7 +1024,7 @@ pub(super) fn collect_attribute_group_uses(
     result: &mut Vec<EffectiveAttributeUse>,
     depth: usize,
 ) {
-    if depth > 20 {
+    if depth > schema_set.recursion_bound(20) {
         return;
     }
 

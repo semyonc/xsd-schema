@@ -55,6 +55,16 @@ use crate::schema::annotation::ForeignAttribute;
 use crate::schema::model::XsdVersion;
 use crate::SchemaSet;
 
+/// The default nesting limit of schemas: [`ParserConfig::max_depth`] and
+/// [`SchemaSet::max_depth`](crate::SchemaSet::max_depth).
+///
+/// The deepest schema of the W3C XSD test suite nests its elements 16 deep,
+/// the deepest of 1,700 real-world WSDL / XSD files 25 deep; the limit leaves
+/// a margin of five over that, and keeps the recursion of every schema-time
+/// pass well inside a 2 MiB thread stack (the default of spawned threads),
+/// in debug builds too.
+pub const DEFAULT_MAX_DEPTH: usize = 128;
+
 /// Parser configuration options
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
@@ -62,7 +72,27 @@ pub struct ParserConfig {
     pub error_recovery: bool,
     /// Whether to collect foreign attributes
     pub collect_foreign_attributes: bool,
-    /// Maximum nesting depth (0 = unlimited)
+    /// The nesting limit of schemas (`0` = unlimited); default
+    /// [`DEFAULT_MAX_DEPTH`].
+    ///
+    /// A schema document whose elements nest deeper is refused when it is
+    /// read, with a [`SchemaError::LimitExceeded`] (limit
+    /// [`SchemaLimit::ElementDepth`]) at the element that breaks the limit:
+    /// `Schema limit ParserConfig::max_depth exceeded at main.xsd:1:2177:
+    /// element depth 129, the limit is 128`; the `xs:schema` element is at
+    /// depth one. [`SchemaSetBuilder::compile`](crate::SchemaSetBuilder::compile)
+    /// and [`load_and_process_schema`](crate::load_and_process_schema) also
+    /// bound the nesting of the schema's components through references with
+    /// it (see [`SchemaSet::max_depth`](crate::SchemaSet::max_depth)).
+    /// Together they bound the recursion of the schema-time passes, so that
+    /// a schema nested deeply enough to overflow the stack is refused
+    /// instead. Raising the limit needs a larger stack for such schemas;
+    /// `0` turns this protection off — the crate's own recursion bounds then
+    /// refuse only some shapes, and a deeply nested schema can overflow the
+    /// stack and abort the process.
+    ///
+    /// [`SchemaError::LimitExceeded`]: crate::SchemaError::LimitExceeded
+    /// [`SchemaLimit::ElementDepth`]: crate::SchemaLimit::ElementDepth
     pub max_depth: usize,
     /// XSD version mode (1.0 or 1.1).
     /// Derived from `SchemaSet.xsd_version` in `parse_schema_with_config`.
@@ -74,7 +104,7 @@ impl Default for ParserConfig {
         Self {
             error_recovery: true,
             collect_foreign_attributes: true,
-            max_depth: 0,
+            max_depth: DEFAULT_MAX_DEPTH,
             xsd_version: XsdVersion::V1_0,
         }
     }
@@ -310,8 +340,15 @@ pub fn parse_schema_with_chameleon(
         chameleon_namespace,
     );
 
-    // Create XML reader
-    let mut reader = TrackedReader::from_bytes(xml);
+    // Create XML reader; the nesting limit is checked on the raw markup.
+    let mut reader = if config.max_depth == 0 {
+        TrackedReader::from_bytes(xml)
+    } else {
+        TrackedReader::from_bytes_with_limits(
+            xml,
+            &crate::xml::ParseLimits::none().with_max_depth(config.max_depth),
+        )
+    };
     let mut buf = Vec::new();
 
     // Track if we've seen the root schema element
@@ -573,7 +610,7 @@ fn handle_start_element(
             return Err(SchemaError::structural(
                 "sch-props-correct",
                 format!("Root element must be xs:schema, found '{}'", local_name),
-                None,
+                Some(state.source_map.locate(span.start)),
             ));
         }
     }
@@ -716,7 +753,7 @@ fn handle_start_element(
             // subtree so subsequent valid content can still be parsed.
             let location = source_ref.as_ref().map(|s| s.to_location(state.source_map));
             state.recover_or_fail(SchemaError::structural(
-                "sch-props-correct",
+                "s4s-elt-invalid-content",
                 format!(
                     "Foreign-namespace element '{}' is not allowed here",
                     local_name
@@ -728,21 +765,18 @@ fn handle_start_element(
         }
 
         if !allows_child {
+            let error = SchemaError::structural(
+                "s4s-elt-invalid-content",
+                format!("Unexpected element '{}' in current context", local_name),
+                source_ref.as_ref().map(|s| s.to_location(state.source_map)),
+            );
             if state.config.error_recovery {
                 // Push a skip frame for error recovery
-                state.add_error(SchemaError::structural(
-                    "sch-props-correct",
-                    format!("Unexpected element '{}' in current context", local_name),
-                    None,
-                ));
+                state.add_error(error);
                 push_skip_frame(state, source_ref, foreign_attrs)?;
                 return Ok(());
             } else {
-                return Err(SchemaError::structural(
-                    "sch-props-correct",
-                    format!("Unexpected element '{}' in current context", local_name),
-                    None,
-                ));
+                return Err(error);
             }
         }
 
@@ -773,6 +807,11 @@ fn handle_start_element(
         state.ns_context.name_table(),
         &validation_ctx,
     ) {
+        // Located at the element, unless the check located it itself.
+        let e = match &source_ref {
+            Some(src) => e.with_location(state.source_map.locate(src.span.start)),
+            None => e,
+        };
         state.recover_or_fail(e)?;
     }
 
@@ -1588,7 +1627,7 @@ mod tests {
         let config = ParserConfig::default();
         assert!(config.error_recovery);
         assert!(config.collect_foreign_attributes);
-        assert_eq!(config.max_depth, 0);
+        assert_eq!(config.max_depth, DEFAULT_MAX_DEPTH);
     }
 
     #[test]

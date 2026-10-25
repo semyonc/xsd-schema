@@ -5085,15 +5085,27 @@ fn test_attribute_group_form_qualified() {
 #[cfg(feature = "xsd11")]
 #[test]
 fn test_attribute_explicit_target_namespace() {
+    // XSD 1.1 §3.2.3 clause 6.3: an explicit `targetNamespace` on a local
+    // attribute declaration is allowed only inside a `<restriction>` of a
+    // base other than xs:anyType (here one whose attribute wildcard allows
+    // the attribute). The one-document pipeline checks it since C87, as the
+    // builder always did.
     let schema_set = load_schema_xsd11(
         r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                      targetNamespace="http://example.com/ns"
                      xmlns:tns="http://example.com/ns"
                      xmlns:other="http://other.com/ns">
+            <xs:complexType name="Base">
+                <xs:anyAttribute namespace="##any" processContents="lax"/>
+            </xs:complexType>
             <xs:element name="root">
                 <xs:complexType>
-                    <xs:attribute name="id" type="xs:string"
-                                  targetNamespace="http://other.com/ns"/>
+                    <xs:complexContent>
+                        <xs:restriction base="tns:Base">
+                            <xs:attribute name="id" type="xs:string"
+                                          targetNamespace="http://other.com/ns"/>
+                        </xs:restriction>
+                    </xs:complexContent>
                 </xs:complexType>
             </xs:element>
         </xs:schema>"###,

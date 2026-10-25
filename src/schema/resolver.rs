@@ -1068,7 +1068,7 @@ fn validate_particle_qname_visibility(schema_set: &SchemaSet) -> SchemaResult<()
         particles: &[ParticleResult],
         depth: usize,
     ) -> SchemaResult<()> {
-        if depth > 64 {
+        if depth > schema_set.recursion_bound(64) {
             return Ok(());
         }
         for particle in particles {
@@ -1345,8 +1345,14 @@ fn build_deferred_type_resolve(
     source: Option<&SourceRef>,
     label: &str,
 ) -> crate::arenas::DeferredSrcResolve {
+    // A missing type may be in a schema document that could not be read:
+    // name those documents, as a compile-time `src-resolve` does.
+    let note = crate::pipeline::unread_documents_note(schema_set).unwrap_or_default();
     crate::arenas::DeferredSrcResolve {
-        message: format_type_not_found_message(schema_set, qname, label),
+        message: format!(
+            "{}{note}",
+            format_type_not_found_message(schema_set, qname, label)
+        ),
         source: source.cloned(),
     }
 }

@@ -128,9 +128,25 @@ impl<'a> ParticleNormalizer<'a> {
         &mut self,
         particle: &ParticleResult,
     ) -> SchemaResult<NormalizedParticle> {
-        if self.depth >= MAX_PARTICLE_RESTRICTION_DEPTH {
-            return Err(SchemaError::internal(
-                "particle restriction normalization exceeded recursion limit",
+        if self.depth
+            >= self
+                .schema_set
+                .recursion_bound(MAX_PARTICLE_RESTRICTION_DEPTH)
+        {
+            let bound = self
+                .schema_set
+                .recursion_bound(MAX_PARTICLE_RESTRICTION_DEPTH);
+            return Err(SchemaError::limit(
+                crate::error::SchemaLimit::ComponentDepth,
+                bound,
+                self.depth + 1,
+                format!(
+                    "particle restriction normalization nests {} levels deep (its recursion \
+                     bound; SchemaSet::max_depth is {})",
+                    self.depth + 1,
+                    self.schema_set.max_depth()
+                ),
+                None,
             ));
         }
 
@@ -381,7 +397,7 @@ pub(super) fn effective_base_content_particle<'a>(
             return (current, None);
         };
         depth += 1;
-        if depth > 50 {
+        if depth > schema_set.recursion_bound(50) {
             return (current, None); // safety limit
         }
         current = base_type;
@@ -410,7 +426,9 @@ pub(super) fn normalized_effective_base_particle(
         None => None,
     };
 
-    if depth > 50 || base.derivation_method != Some(DerivationMethod::Extension) {
+    if depth > schema_set.recursion_bound(50)
+        || base.derivation_method != Some(DerivationMethod::Extension)
+    {
         return Ok(own);
     }
     let Some(TypeKey::Complex(base_key)) = base.resolved_base_type else {

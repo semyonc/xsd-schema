@@ -111,6 +111,23 @@ impl Frame for OpenContentFrame {
                 None,
             ));
         }
+        // Structures 1.1 §3.4.3 Complex Type Definition Representation OK,
+        // clause 3: "If <openContent> is present and has mode ≠ 'none', then
+        // there must be an <any> among the [children] of <openContent>."
+        if self.mode != OpenContentMode::None && self.wildcard.is_none() {
+            let mode = match self.mode {
+                OpenContentMode::Suffix => "suffix",
+                _ => "interleave",
+            };
+            return Err(SchemaError::structural(
+                "src-ct",
+                format!(
+                    "xs:openContent with mode='{mode}' must contain an xs:any child \
+                     (Complex Type Definition Representation OK, clause 3)"
+                ),
+                None,
+            ));
+        }
         let annotation = merge_foreign_attributes(
             self.annotation,
             self.foreign_attributes,

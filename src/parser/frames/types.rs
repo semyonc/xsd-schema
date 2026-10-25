@@ -1120,7 +1120,7 @@ impl Frame for SimpleContentFrame {
 
     fn finish(self: Box<Self>) -> SchemaResult<FrameResult> {
         let base_type = self.base_type.ok_or_else(|| SchemaError::structural(
-            "ct-props-correct",
+            "s4s-att-must-appear",
             "xs:simpleContent requires a base type",
             None,
         ))?;

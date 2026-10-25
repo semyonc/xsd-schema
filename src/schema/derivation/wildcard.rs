@@ -655,7 +655,7 @@ fn compute_effective_open_content_bounded(
 ) -> Option<EffectiveOpenContent> {
     // Guard against pathological cycles — reference resolution should have
     // detected them upstream, but keep a local belt-and-braces cap.
-    if depth > 100 {
+    if depth as usize > schema_set.recursion_bound(100) {
         return None;
     }
     let type_data = schema_set.arenas.complex_types.get(key)?;
@@ -751,7 +751,7 @@ fn explicit_content_is_empty(
     type_data: &crate::arenas::ComplexTypeDefData,
     depth: u32,
 ) -> bool {
-    if depth > 100 {
+    if depth as usize > schema_set.recursion_bound(100) {
         return true;
     }
     // Use the §3.4.2.3 5.2.2 gate (explicit content type variety = empty),

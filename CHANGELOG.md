@@ -158,6 +158,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schema::wildcard::NamespaceConstraint::allows` no longer take an
   `XsdVersion`: no namespace constraint depends on the version.
 
+- Schemas are bounded in nesting, so that a deeply nested schema is refused
+  with an error instead of overflowing a 2 MiB thread stack (for XPath
+  expressions: in an optimized build). `ParserConfig::max_depth` (default
+  `DEFAULT_MAX_DEPTH` = 128, `0` = no limit) bounds the element nesting of
+  each schema document and, as `SchemaSet::max_depth`, the nesting of
+  components through references (model groups, base / item / member types,
+  attribute groups, substitution group heads), checked before any pass
+  recurses along it. `ResolverConfig::max_depth` (default 100) bounds the
+  chain of `xs:include` / `xs:import` / `xs:redefine` / `xs:override`
+  directives. XPath expressions nest at most
+  `xpath::depth::MAX_EXPRESSION_DEPTH` = 256 levels — in a schema's assertions
+  and type alternatives, checked when the schema is read, and in any
+  expression the XPath engine parses; at that depth an optimized build
+  evaluates within half a MiB of stack (an unoptimized build needs a larger
+  stack near the limit). Each refusal is a `SchemaError::LimitExceeded` naming
+  its setting (`SchemaLimit`), or `XPathError::LimitExceeded`. `0` turns the
+  schema limits off, and with them this protection. The deepest schema of the
+  W3C XSD suite nests 16 elements deep; the deepest XPath expression of the
+  W3C XSD and XQuery test suites 14 levels.
+- `SchemaError` and `xpath::parser::ParseError` are `#[non_exhaustive]`; a
+  `match` needs a wildcard arm. `SchemaError::location()` gives any variant's
+  location.
+- Every entry point checks a schema alike: `load_and_process_schema` and
+  `load_and_process_schema_async` run the builder's directive rules and phases
+  — the asynchronous pipeline used to skip UPA, the XSD 1.0 all-group rules,
+  local element value constraints, type alternatives, identity-constraint
+  references and the substitution-group checks, the synchronous one the local
+  `targetNamespace`, `no-xsi` and substitution-group consistency checks — and
+  the asynchronous directive resolution applies the synchronous rules (it
+  skipped the `src-import` / `src-include` namespace checks and tried catalog
+  entries first). The pipeline adds the XML catalog and records its primary
+  document as loaded, like the builder.
+- Schema locations are resolved as RFC 3986 URI references (§5.2) and
+  normalized (§6.2.2, §6.2.3) when the location or its base has a scheme: dot
+  segments are removed, scheme and host compared in lower case, `file:` URIs
+  resolved and read, and one document is loaded once however its URL is
+  spelled — a local `file:` URI and the path it names are one document. A
+  relative location under a relative base is no longer made absolute against
+  the working directory.
+- A failed `xs:redefine` that redefines components is an error
+  (`src-redefine`; Structures §4.2.4, clause 1: its `schemaLocation` "must
+  successfully resolve").
+- `xs:openContent` with a mode other than `none` and no `xs:any` child is
+  refused (XSD 1.1, Complex Type Definition Representation OK, clause 3).
+- A model group that contains itself is reported as `mg-props-correct.2`;
+  attributes and elements the schema for schemas does not allow, and invalid
+  attribute values, as `s4s-att-not-allowed` / `s4s-elt-invalid-content` /
+  `s4s-att-invalid-value` (was `ct-props-correct` / `sch-props-correct`).
+
 ### Added
 
 - `xpath::RegexCache`: compiled regular expressions of `fn:matches`,
@@ -270,6 +319,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the namespace bindings of the schema element it is written on. It is present
   when the run keeps PSVI typed values, and always for a type whose values can
   be or hold QNames or NOTATIONs.
+
+- `SchemaSet::directive_failures` / `CompiledSchemaSet::directive_failures`
+  and `DirectiveFailure`: the directives whose schema document could not be
+  read (not schema errors, Structures §4.2.3 / §4.2.6.2), with the location as
+  written, the namespace, the location read and the directive's position. A
+  reference that then fails to resolve names those documents.
+- `LocationRewriter` / `LocationRequest`,
+  `SchemaSetBuilder::set_location_rewriter`,
+  `SchemaResolver::set_location_rewriter`: map the locations of directives
+  (with the import's namespace) and the locations given to the builder before
+  they are identified and loaded, in the style of an XML Catalog's
+  `rewriteSystem` / `uri` entries. The answer is final — an absolute URI or
+  file path is loaded as it is, whatever the base of the document that named
+  the location; a relative path is resolved against the working directory —
+  and the rewriter is asked once per location.
+- `SchemaSetBuilder::with_resolver`, `SchemaResolver::{catalog, config,
+  loader}`, `SchemaSet::{max_depth, set_max_depth}`,
+  `parser::DEFAULT_MAX_DEPTH`, `TrackedReader::from_bytes_with_limits`,
+  `SchemaError::LimitExceeded`, `SchemaLimit`, `XPathError::LimitExceeded`,
+  `xpath::depth::{MAX_EXPRESSION_DEPTH, expression_depth}`,
+  `NameTable::heap_bytes`.
 
 ### Changed
 
@@ -727,6 +797,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   union type with a QName member — unless a later member of the union accepts
   the literal (`xs:QName xs:string`), which is then the value; declared
   attributes, list items and identity-constraint fields follow the same rule.
+
+- `SchemaSetBuilder::compile_async` overflowed the stack on a cycle of
+  includes.
+- The content model of an extension chain was compiled in time exponential in
+  the chain's length (25 levels took seconds); the base content model is
+  compiled once.
+- Recursion bounds of the derivation and compilation passes no longer cut
+  legal schemas short (attribute inheritance stopped after 50 derivation
+  levels, attribute groups after 20 levels, group references after about 50).
+- "Unexpected element" errors in schema documents carry their location.
 
 ### Performance
 

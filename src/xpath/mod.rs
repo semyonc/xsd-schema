@@ -34,6 +34,7 @@ pub(crate) mod general_compare;
 // node, for the duration of one evaluation run. Internal, and likewise
 // answer-preserving.
 pub(crate) mod compare_cache;
+pub mod depth;
 pub mod lexer;
 pub mod node_test;
 pub mod operators;
@@ -102,6 +103,7 @@ pub use self::bind::bind_node;
 pub use self::collation::{Collation, CollationResolver, CODEPOINT_COLLATION_URI};
 pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
 pub use self::deps::FunctionCallRef;
+pub use self::depth::{expression_depth, MAX_EXPRESSION_DEPTH};
 pub use self::error::XPathError;
 pub use self::eval::eval_node;
 pub use self::functions::{

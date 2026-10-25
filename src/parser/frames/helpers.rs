@@ -15,7 +15,7 @@ where
         Some(value) => {
             let parsed = parse(value).map_err(|err| {
                 SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-invalid-value",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -64,7 +64,7 @@ fn parse_occurs_attr_raw(
         Some(value) => {
             let parsed = parse_occurs(value).map_err(|err| {
                 SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-invalid-value",
                     format!("Invalid value for attribute '{}': {}", name, err),
                     None,
                 )
@@ -84,7 +84,7 @@ fn parse_min_occurs_attr(
         None => Ok(1),
         Some(Some(value)) => Ok(value),
         Some(None) => Err(SchemaError::structural(
-            "ct-props-correct",
+            "s4s-att-invalid-value",
             format!("Invalid value for attribute '{}': 'unbounded'", name),
             None,
         )),

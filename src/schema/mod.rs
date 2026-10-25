@@ -28,6 +28,7 @@ pub mod edc;
 pub mod group;
 pub mod inline;
 pub mod model;
+pub(crate) mod nesting;
 #[cfg(feature = "xsd11")]
 pub mod override_dir;
 pub mod redefine;

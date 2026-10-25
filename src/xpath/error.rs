@@ -333,6 +333,27 @@ pub enum XPathError {
     Raised(RaisedErrorInfo),
 
     // ========================================================================
+    // Implementation limits
+    // ========================================================================
+    /// The expression nests deeper than
+    /// [`MAX_EXPRESSION_DEPTH`](crate::xpath::depth::MAX_EXPRESSION_DEPTH),
+    /// the limit that keeps binding and evaluation, which recurse over the
+    /// expression tree, from overflowing the stack. XPath 2.0 §2.3.1 leaves
+    /// such limits to the implementation, so it has no error code
+    /// ([`error_code`](XPathError::error_code) is `None`).
+    #[error(
+        "XPath limit xpath::depth::MAX_EXPRESSION_DEPTH exceeded: nesting depth {found}, \
+         the limit is {max}"
+    )]
+    #[non_exhaustive]
+    LimitExceeded {
+        /// The limit.
+        max: usize,
+        /// The nesting depth of the expression (greater than `max`).
+        found: usize,
+    },
+
+    // ========================================================================
     // Internal/General Errors
     // ========================================================================
     /// Internal error for unexpected failures.
@@ -342,8 +363,13 @@ pub enum XPathError {
 
 impl From<crate::xpath::parser::ParseError> for XPathError {
     fn from(e: crate::xpath::parser::ParseError) -> Self {
-        XPathError::XPST0003 {
-            message: e.to_string(),
+        match e {
+            crate::xpath::parser::ParseError::LimitExceeded { max, found } => {
+                XPathError::LimitExceeded { max, found }
+            }
+            e => XPathError::XPST0003 {
+                message: e.to_string(),
+            },
         }
     }
 }
@@ -871,6 +897,7 @@ impl XPathError {
             XPathError::UnaryOperatorNotDefined { .. } => Some("XPTY0004"),
             XPathError::Internal(_) if self.is_decimal_capacity_operand() => Some("FOAR0002"),
             XPathError::Internal(_) => None,
+            XPathError::LimitExceeded { .. } => None,
             XPathError::Raised(info) => {
                 if info.namespace_uri() != XQT_ERRORS_NAMESPACE {
                     return None;

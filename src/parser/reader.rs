@@ -85,6 +85,17 @@ impl<'a> TrackedReader<&'a [u8]> {
     pub fn from_bytes(bytes: &'a [u8]) -> Self {
         TrackedReader::from_reader(bytes)
     }
+
+    /// Create a reader from a byte slice that refuses a document nested
+    /// deeper than `limits.max_depth` — the schema-document parser's
+    /// `ParserConfig::max_depth` ([`SchemaError::LimitExceeded`]).
+    pub(crate) fn from_bytes_with_limits(bytes: &'a [u8], limits: &ParseLimits) -> Self {
+        Self {
+            reader: WfReader::new(bytes, limits, true),
+            last_position: 0,
+            error_position: None,
+        }
+    }
 }
 
 impl<R: BufRead> TrackedReader<R> {
@@ -124,6 +135,18 @@ impl<R: BufRead> TrackedReader<R> {
             }
             Err(WfError::Limit(e)) => {
                 self.error_position = Some(e.position() as usize);
+                // Only the schema-document parser sets limits on this reader
+                // (`from_bytes_with_limits`), and only the depth limit, from
+                // `ParserConfig::max_depth`.
+                if e.limit() == crate::xml::ParseLimit::Depth {
+                    return Err(SchemaError::limit(
+                        crate::error::SchemaLimit::ElementDepth,
+                        e.max(),
+                        e.found(),
+                        format!("element depth {}", e.found()),
+                        None,
+                    ));
+                }
                 return Err(SchemaError::xml(e.to_string(), None));
             }
         };

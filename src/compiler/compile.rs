@@ -811,7 +811,7 @@ impl<'a> CompileContext<'a> {
 
     /// Check recursion depth
     fn check_recursion(&self, source: Option<&SourceRef>) -> NfaCompileResult<()> {
-        if self.depth >= MAX_RECURSION_DEPTH {
+        if self.depth >= self.schema_set.recursion_bound(MAX_RECURSION_DEPTH) {
             return Err(NfaCompileError::recursion_exceeded(source.cloned()));
         }
         Ok(())
@@ -895,7 +895,7 @@ impl<'a> CompileContext<'a> {
         depth: usize,
     ) -> Vec<(Option<NameId>, NameId)> {
         // Defense-in-depth: bail on unreasonably deep nesting
-        if depth >= MAX_RECURSION_DEPTH {
+        if depth >= self.schema_set.recursion_bound(MAX_RECURSION_DEPTH) {
             return Vec::new();
         }
         let mut result = Vec::new();
@@ -1135,24 +1135,80 @@ pub(crate) fn validate_outer_all_group_occurs(
 /// result the UPA check then discards.
 #[cfg(feature = "xsd11")]
 fn compile_base_all_group(
-    schema_set: &SchemaSet,
+    base: &mut LazyBase<'_>,
     type_def: &ComplexTypeDefData,
-    upa_mode: bool,
 ) -> NfaCompileResult<Option<AllGroupModel>> {
-    let base_ct_key = match type_def.resolved_base_type {
-        Some(TypeKey::Complex(key)) => key,
-        _ => return Ok(None),
+    let Some(base_type_def) = base.def() else {
+        return Ok(None);
     };
-    let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
-    let base_matcher = compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
-    match base_matcher {
-        ContentModelMatcher::AllGroup(mut model) => {
-            if base_type_def.target_namespace != type_def.target_namespace {
-                pin_all_group_namespaces(&mut model, base_type_def.target_namespace);
-            }
-            Ok(Some(model))
+    if !matches!(base.get()?, ContentModelMatcher::AllGroup(_)) {
+        return Ok(None);
+    }
+    let ContentModelMatcher::AllGroup(mut model) = base.take()? else {
+        unreachable!("checked above");
+    };
+    if base_type_def.target_namespace != type_def.target_namespace {
+        pin_all_group_namespaces(&mut model, base_type_def.target_namespace);
+    }
+    Ok(Some(model))
+}
+
+/// The content model of an extension's base type, compiled once, when it
+/// is first needed: each of the matchers below may look at it, and an
+/// extension chain compiled once per look would cost time exponential in
+/// its length.
+struct LazyBase<'a> {
+    schema_set: &'a SchemaSet,
+    base: Option<&'a ComplexTypeDefData>,
+    upa_mode: bool,
+    compiled: Option<NfaCompileResult<ContentModelMatcher>>,
+}
+
+impl<'a> LazyBase<'a> {
+    fn new(schema_set: &'a SchemaSet, type_def: &ComplexTypeDefData, upa_mode: bool) -> Self {
+        let base = match type_def.resolved_base_type {
+            Some(TypeKey::Complex(key)) => schema_set.arenas.complex_types.get(key),
+            _ => None,
+        };
+        LazyBase {
+            schema_set,
+            base,
+            upa_mode,
+            compiled: None,
         }
-        _ => Ok(None),
+    }
+
+    /// The base type, when it is a complex type.
+    fn def(&self) -> Option<&'a ComplexTypeDefData> {
+        self.base
+    }
+
+    fn compile(&mut self) {
+        if self.compiled.is_none() {
+            let base = self.base.expect("a complex base type");
+            self.compiled = Some(compile_content_model_matcher_impl(
+                self.schema_set,
+                base,
+                self.upa_mode,
+            ));
+        }
+    }
+
+    /// The base type's content model (compiled on first use).
+    #[cfg_attr(not(feature = "xsd11"), allow(dead_code))]
+    fn get(&mut self) -> NfaCompileResult<&ContentModelMatcher> {
+        self.compile();
+        match self.compiled.as_ref().expect("compiled") {
+            Ok(matcher) => Ok(matcher),
+            Err(e) => Err(e.clone()),
+        }
+    }
+
+    /// The base type's content model, moved out (compiled again if asked
+    /// for after that).
+    fn take(&mut self) -> NfaCompileResult<ContentModelMatcher> {
+        self.compile();
+        self.compiled.take().expect("compiled")
     }
 }
 
@@ -1165,15 +1221,14 @@ fn try_xsd10_empty_base_all_extension(
     schema_set: &SchemaSet,
     type_def: &ComplexTypeDefData,
     is_extension: bool,
+    base: &mut LazyBase<'_>,
 ) -> NfaCompileResult<Option<ContentModelMatcher>> {
-    if !is_extension || !schema_set.is_xsd10() {
+    if !is_extension || !schema_set.is_xsd10() || base.def().is_none() {
         return Ok(None);
     }
-    let Some(base_all_model) = compile_base_all_group(schema_set, type_def, ctx.upa_mode)? else {
-        return Ok(None);
-    };
-    if !base_all_model.particles.is_empty() {
-        return Ok(None);
+    match base.get()? {
+        ContentModelMatcher::AllGroup(model) if model.particles.is_empty() => {}
+        _ => return Ok(None),
     }
     let ComplexContentResult::Complex(def) = &type_def.content else {
         return Ok(None);
@@ -1451,11 +1506,12 @@ fn compile_all_group_extension_matcher(
     type_def: &ComplexTypeDefData,
     is_extension: bool,
     upa_mode: bool,
+    base: &mut LazyBase<'_>,
 ) -> NfaCompileResult<Option<ContentModelMatcher>> {
     if !is_extension || !schema_set.is_xsd11() {
         return Ok(None);
     }
-    let Some(base_all_model) = compile_base_all_group(schema_set, type_def, upa_mode)? else {
+    let Some(base_all_model) = compile_base_all_group(base, type_def)? else {
         return Ok(None);
     };
 
@@ -1548,7 +1604,7 @@ fn compile_nfa_matcher(
     schema_set: &SchemaSet,
     type_def: &ComplexTypeDefData,
     is_extension: bool,
-    upa_mode: bool,
+    base: &mut LazyBase<'_>,
 ) -> NfaCompileResult<ContentModelMatcher> {
     let own_nfa = match &type_def.content {
         ComplexContentResult::Complex(def) => match &def.particle {
@@ -1572,14 +1628,12 @@ fn compile_nfa_matcher(
     let mut base_target_ns: Option<NameId> = None;
 
     let base_nfa = if is_extension {
-        if let Some(TypeKey::Complex(base_ct_key)) = type_def.resolved_base_type {
-            let base_type_def = &schema_set.arenas.complex_types[base_ct_key];
+        if let Some(base_type_def) = base.def() {
             #[cfg(feature = "xsd11")]
             {
                 base_target_ns = base_type_def.target_namespace;
             }
-            let mut base_matcher =
-                compile_content_model_matcher_impl(schema_set, base_type_def, upa_mode)?;
+            let mut base_matcher = base.take()?;
             if base_type_def.target_namespace != type_def.target_namespace {
                 pin_wildcard_namespaces(&mut base_matcher, base_type_def.target_namespace);
             }
@@ -1673,6 +1727,8 @@ fn compile_content_model_matcher_impl(
         Some(DerivationMethod::Extension)
     );
 
+    let mut base = LazyBase::new(schema_set, type_def, upa_mode);
+
     // Try the all-group path for non-extension types with an inline xs:all
     if let Some(matcher) = compile_all_group_matcher(&mut ctx, schema_set, type_def, is_extension)?
     {
@@ -1686,7 +1742,7 @@ fn compile_content_model_matcher_impl(
     // contributes nothing so the result is the extension's own all-group.
     #[cfg(feature = "xsd11")]
     if let Some(matcher) =
-        try_xsd10_empty_base_all_extension(&mut ctx, schema_set, type_def, is_extension)?
+        try_xsd10_empty_base_all_extension(&mut ctx, schema_set, type_def, is_extension, &mut base)?
     {
         return Ok(matcher);
     }
@@ -1694,14 +1750,18 @@ fn compile_content_model_matcher_impl(
     // XSD 1.1: extension from an all-group base type — produce the all-group
     // §3.4.2.3.3 clause 4.2.3 prescribes instead of the lossy NFA conversion.
     #[cfg(feature = "xsd11")]
-    if let Some(matcher) =
-        compile_all_group_extension_matcher(schema_set, type_def, is_extension, upa_mode)?
-    {
+    if let Some(matcher) = compile_all_group_extension_matcher(
+        schema_set,
+        type_def,
+        is_extension,
+        upa_mode,
+        &mut base,
+    )? {
         return Ok(matcher);
     }
 
     // Standard NFA path (sequences, choices, named group refs, extensions)
-    compile_nfa_matcher(&mut ctx, schema_set, type_def, is_extension, upa_mode)
+    compile_nfa_matcher(&mut ctx, schema_set, type_def, is_extension, &mut base)
 }
 
 /// §3.4.2.3 clauses 5–6: effective open content for an XSD 1.1 extension type.

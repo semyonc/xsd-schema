@@ -143,7 +143,7 @@ pub mod compiler;
 pub mod validation;
 
 // Re-export primary types
-pub use error::{FacetError, FacetResult, SchemaError, SchemaResult};
+pub use error::{FacetError, FacetResult, SchemaError, SchemaLimit, SchemaResult};
 pub use ids::*;
 pub use schema::{SchemaDocument, SchemaSet};
 
@@ -199,8 +199,9 @@ pub use builder::{CompilationStats, CompiledSchemaSet, SchemaSetBuilder};
 
 // Re-export resolver types
 pub use parser::resolver::{
-    decode_xml_bytes, decode_xml_to_utf8_bytes, EmbeddedLoader, FileSystemLoader, LoaderChain,
-    ResolverConfig, SchemaCatalog, SchemaLoader, SchemaResolver,
+    decode_xml_bytes, decode_xml_to_utf8_bytes, DirectiveFailure, EmbeddedLoader, FileSystemLoader,
+    LoaderChain, LocationRequest, LocationRewriter, ResolverConfig, SchemaCatalog, SchemaLoader,
+    SchemaResolver,
 };
 
 // Re-export async loader trait

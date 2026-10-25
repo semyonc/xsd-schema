@@ -757,8 +757,11 @@ pub trait Frame {
             };
 
             if !self.allows_attribute(&local_name, name_table) {
+                // The schema for schemas does not declare the attribute on
+                // this element (a schema-document error, located by the
+                // parser at the element).
                 return Err(SchemaError::structural(
-                    "ct-props-correct",
+                    "s4s-att-not-allowed",
                     format!("Attribute '{}' is not allowed here", local_name),
                     None,
                 ));

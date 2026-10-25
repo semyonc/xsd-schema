@@ -21,6 +21,7 @@ pub mod parse;
 pub mod reader;
 pub mod resolver;
 pub mod structure;
+pub(crate) mod uri;
 
 // Re-exports from location
 pub use location::{SourceLocation, SourceMap, SourceRef, SourceRetention, SourceSpan};
@@ -40,7 +41,7 @@ pub use attrs::{
 // Phase 1 (parsing + assembly). For typical use cases, prefer:
 // - `crate::load_and_process_schema` for single schemas with full processing
 // - `crate::parse_schema_only` + `crate::process_loaded_schemas` for multiple schemas
-pub use parse::{parse_schema, parse_schema_with_config, ParserConfig};
+pub use parse::{parse_schema, parse_schema_with_config, ParserConfig, DEFAULT_MAX_DEPTH};
 
 // Re-exports from assemble
 pub use assemble::{assemble_schema, parse_form_choice};
@@ -61,9 +62,12 @@ pub use resolver::{
     fixup_composition_edges,
     resolve_all_directives,
     CatalogEntry,
+    DirectiveFailure,
     EmbeddedLoader,
     FileSystemLoader,
     LoaderChain,
+    LocationRequest,
+    LocationRewriter,
     ResolutionResult,
     ResolverConfig,
     SchemaCatalog,

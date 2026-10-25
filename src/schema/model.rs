@@ -183,6 +183,14 @@ pub struct SchemaSet {
     /// occurs" (Datatypes §3.3.18).
     value_constraint_namespaces:
         HashMap<(DocumentId, usize), crate::namespace::context::NamespaceContextSnapshot>,
+
+    /// The directives whose schema document could not be read, in the
+    /// order they were met (see [`SchemaSet::directive_failures`]).
+    directive_failures: Vec<crate::parser::resolver::DirectiveFailure>,
+
+    /// The nesting limit of the passes over the set's components (see
+    /// [`SchemaSet::max_depth`]).
+    max_depth: usize,
 }
 
 impl SchemaSet {
@@ -218,6 +226,8 @@ impl SchemaSet {
             builtin_types: None,
             parsing_errors: Vec::new(),
             value_constraint_namespaces: HashMap::new(),
+            directive_failures: Vec::new(),
+            max_depth: crate::parser::parse::DEFAULT_MAX_DEPTH,
         };
 
         // Initialize built-in types
@@ -346,6 +356,118 @@ impl SchemaSet {
         source
             .and_then(|s| self.documents.get(s.doc_id as usize))
             .map_or(fallback, |doc| doc.target_namespace)
+    }
+
+    /// The `xs:include`, `xs:import`, `xs:redefine` and `xs:override`
+    /// directives whose schema document could not be read, in the order they
+    /// were met while the set was loaded.
+    ///
+    /// Such a directive is not a schema error: Structures §4.2.3 says "It is
+    /// not an error for the ·actual value· of the schemaLocation \[attribute\]
+    /// to fail to resolve at all, in which case the corresponding inclusion
+    /// must not be performed", and §4.2.6.2 "It is not an error for the
+    /// application schema component reference strategy to fail" — so the set
+    /// compiles without the document. But the schema may then lack
+    /// components the author meant it to have ("Failure to resolve is likely
+    /// to cause less than complete ·assessment· outcomes, of course"): a
+    /// host that needs the whole schema checks that this list is empty, or
+    /// that each failure is of an `xs:import` location hint whose namespace
+    /// another document supplies ([`DirectiveFailure::namespace_supplied`](crate::DirectiveFailure::namespace_supplied)).
+    ///
+    /// A document that was read but is not a schema document (not
+    /// well-formed, no `xs:schema` root, the wrong target namespace) is an
+    /// error, as before, and is not listed here.
+    ///
+    /// ```
+    /// use xsd_schema::SchemaSetBuilder;
+    ///
+    /// let compiled = SchemaSetBuilder::new()
+    ///     .add_source(
+    ///         r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    ///              <xs:include schemaLocation="no-such-file.xsd"/>
+    ///              <xs:element name="root"/>
+    ///            </xs:schema>"#,
+    ///         "/schemas/main.xsd",
+    ///     )
+    ///     .unwrap()
+    ///     .compile()
+    ///     .expect("the set compiles without the missing document");
+    /// let failures = compiled.directive_failures();
+    /// assert_eq!(failures.len(), 1);
+    /// assert_eq!(failures[0].schema_location(), Some("no-such-file.xsd"));
+    /// assert!(failures[0].to_string().contains("could not be read"));
+    /// ```
+    pub fn directive_failures(&self) -> &[crate::parser::resolver::DirectiveFailure] {
+        &self.directive_failures
+    }
+
+    /// Mark the failed imports whose namespace a document of the set
+    /// supplies (`DirectiveFailure::namespace_supplied`). Run after the
+    /// directives are resolved.
+    pub(crate) fn refresh_directive_failures(&mut self) {
+        let documents = &self.documents;
+        let names = &self.name_table;
+        for failure in &mut self.directive_failures {
+            failure.refresh_supplied(|ns| {
+                names.get(ns).is_some_and(|id| {
+                    documents.iter().any(|d| {
+                        d.target_namespace == Some(id) || d.declared_target_namespace == Some(id)
+                    })
+                })
+            });
+        }
+    }
+
+    /// Record a directive whose schema document could not be read.
+    pub(crate) fn record_directive_failure(
+        &mut self,
+        failure: crate::parser::resolver::DirectiveFailure,
+    ) {
+        self.directive_failures.push(failure);
+    }
+
+    /// The nesting limit the passes over the set's components enforce: the
+    /// longest chain of components nested in each other — model groups in
+    /// model groups (inline or by reference), a type in its base type or in
+    /// the types it lists or unites, an attribute group in the attribute
+    /// groups it references, an element in its substitution group's head —
+    /// may be at most this long. A schema that breaks it is refused with a
+    /// [`SchemaError::LimitExceeded`](crate::SchemaError::LimitExceeded)
+    /// (limit [`SchemaLimit::ComponentDepth`](crate::SchemaLimit::ComponentDepth)).
+    /// `0` is no limit, and turns off this protection against stack
+    /// overflow: the passes' own recursion bounds then refuse only some
+    /// shapes (a content model nesting more group references than the
+    /// content-model compiler's bound), and others overflow the stack.
+    ///
+    /// The schema-document parser bounds the element nesting of each schema
+    /// document with [`ParserConfig::max_depth`](crate::parser::parse::ParserConfig::max_depth);
+    /// [`SchemaSetBuilder::compile`](crate::SchemaSetBuilder::compile) and
+    /// [`load_and_process_schema`](crate::load_and_process_schema) set this
+    /// limit to the same value before they process the set. Both bound the
+    /// recursion of the schema-time passes, so that a deeply nested schema is
+    /// refused with an error instead of overflowing the stack. The default
+    /// is [`DEFAULT_MAX_DEPTH`](crate::parser::parse::DEFAULT_MAX_DEPTH).
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// Set the nesting limit of the passes over the set's components (see
+    /// [`max_depth`](Self::max_depth)); for a set processed with
+    /// [`process_loaded_schemas`](crate::process_loaded_schemas).
+    pub fn set_max_depth(&mut self, max_depth: usize) {
+        self.max_depth = max_depth;
+    }
+
+    /// The bound for a recursive pass whose own safety bound is `own`: never
+    /// below `own`, and above the nesting limit by a margin, so that the
+    /// bound is never reached by a schema within the limit. With no limit
+    /// (`0`), `own`.
+    pub(crate) fn recursion_bound(&self, own: usize) -> usize {
+        if self.max_depth == 0 {
+            own
+        } else {
+            own.max(self.max_depth.saturating_mul(2).saturating_add(16))
+        }
     }
 
     /// Returns `true` if any parsing errors were collected during error-recovery parsing.
