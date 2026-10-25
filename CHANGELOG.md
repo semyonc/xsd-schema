@@ -337,6 +337,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and processing instructions; invalid nodes and mixed or element-only content
   keep their text as read. XSD 1.1 assertions see the same string values.
 
+- Complex-content restriction (`derivation-ok-restriction`) is checked against
+  the base's content with its nested sequences flattened: the sequence an
+  extension builds from its base's content and its own (one extension level is
+  enough), nested `xs:sequence` elements, and, under XSD 1.1, model-group
+  references. XSD 1.0 §3.9.6 ignores these "pointless" sequences and XSD 1.1
+  §3.4.6.4 compares languages; a restriction that lists the elements of an
+  all-optional base one after another was rejected. For example Exchange Web
+  Services' `WellKnownResponseObjectType` now loads.
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`

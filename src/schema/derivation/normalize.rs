@@ -539,6 +539,43 @@ fn flatten_same_compositor_groups(mut particle: NormalizedParticle) -> Normalize
     particle
 }
 
+/// Splice every unit-occurs `sequence` child of a `sequence` into its parent,
+/// at any depth.
+///
+/// XSD 1.0 §3.9.6 clause 2.2 ignores such a `<sequence>` when it checks a
+/// restriction ("pointless": its particle has {min occurs} and {max occurs}
+/// of 1 and is among the {particles} of a `<sequence>`). XSD 1.1 §3.4.6.4
+/// compares languages, and a sequence's language is the concatenation of its
+/// particles' languages (§3.8.4.1.1), so the splice is sound there too.
+///
+/// Sequences only: an `all` inside an `all` is left alone (XSD 1.1 matches
+/// all-groups unordered, by their own particles).
+pub(super) fn flatten_nested_sequences(mut particle: NormalizedParticle) -> NormalizedParticle {
+    if let NormalizedParticleTerm::Group(group) = &mut particle.term {
+        let children: Vec<_> = group
+            .particles
+            .drain(..)
+            .map(flatten_nested_sequences)
+            .collect();
+        if group.compositor != Compositor::Sequence {
+            group.particles = children;
+            return particle;
+        }
+        for child in children {
+            match child.term {
+                NormalizedParticleTerm::Group(inner)
+                    if inner.compositor == Compositor::Sequence
+                        && occurs_is_unit(child.min_occurs, child.max_occurs) =>
+                {
+                    group.particles.extend(inner.particles);
+                }
+                term => group.particles.push(NormalizedParticle { term, ..child }),
+            }
+        }
+    }
+    particle
+}
+
 pub(super) fn collapse_single_child_groups(mut particle: NormalizedParticle) -> NormalizedParticle {
     if let NormalizedParticleTerm::Group(group) = &mut particle.term {
         group.particles = group

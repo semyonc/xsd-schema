@@ -4,9 +4,9 @@
 use super::format_type_name;
 use super::normalize::{
     collapse_single_child_groups, complex_content_particle, effective_base_content_particle,
-    fold_single_child_group, is_effectively_empty, multiply_occurs, normalize_type_particle,
-    normalized_effective_base_particle, occurs_is_unit, NormalizedElement, NormalizedGroup,
-    NormalizedParticle, NormalizedParticleTerm, NormalizedWildcard,
+    flatten_nested_sequences, fold_single_child_group, is_effectively_empty, multiply_occurs,
+    normalize_type_particle, normalized_effective_base_particle, occurs_is_unit, NormalizedElement,
+    NormalizedGroup, NormalizedParticle, NormalizedParticleTerm, NormalizedWildcard,
 };
 use super::wildcard::{
     process_contents_strictness, wildcard_allows_element, wildcard_restricts,
@@ -27,7 +27,12 @@ pub(super) fn validate_content_particle_restriction(
     // chain: an empty extension inherits its base's content model, and a
     // non-empty one is `sequence(inherited, own)` per §3.4.2.3.
     let (effective_base, _) = effective_base_content_particle(schema_set, base);
-    let base_particle = normalized_effective_base_particle(schema_set, base, 0)?;
+    // That sequence, like a nested `<sequence>` written in the base or
+    // reached through a model-group reference, is a pointless sequence of
+    // XSD 1.0 §3.9.6 clause 2.2. The parts were normalized before the chain
+    // was assembled (and XSD 1.1 never flattens), so flatten the whole base.
+    let base_particle =
+        normalized_effective_base_particle(schema_set, base, 0)?.map(flatten_nested_sequences);
 
     let location = derived
         .source
