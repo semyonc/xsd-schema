@@ -1526,3 +1526,74 @@ fn test_upa_extension_of_all_group_base_is_counter_free() {
         other => panic!("expected an NFA UPA model, got {other:?}"),
     }
 }
+
+// ========================================================================
+// P15: the reported pair does not depend on hashing
+// ========================================================================
+
+/// A competing pair is reported in the order the epsilon closure collects the
+/// terms, which follows the NFA's state order, not a hash set's: the same
+/// schema names the same two particles on every compile, in every process.
+///
+/// The model is Exchange Web Services' `ArrayOfTransitionsType`: four
+/// optional, repeatable element references, the last the head of a
+/// substitution group whose members are the other three. The closure of the
+/// start state reaches all four, and the head competes with each member.
+#[test]
+fn test_reported_conflict_pair_is_deterministic() {
+    let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        xmlns:t="urn:ews" targetNamespace="urn:ews" elementFormDefault="qualified">
+      <xs:complexType name="TransitionType">
+        <xs:sequence><xs:element name="To" type="xs:string"/></xs:sequence>
+      </xs:complexType>
+      <xs:complexType name="AbsoluteDateTransitionType">
+        <xs:complexContent><xs:extension base="t:TransitionType">
+          <xs:sequence><xs:element name="DateTime" type="xs:dateTime"/></xs:sequence>
+        </xs:extension></xs:complexContent>
+      </xs:complexType>
+      <xs:element name="Transition" type="t:TransitionType"/>
+      <xs:element name="AbsoluteDateTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:element name="RecurringDayTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:element name="RecurringDateTransition" type="t:AbsoluteDateTransitionType"
+          substitutionGroup="t:Transition"/>
+      <xs:complexType name="ArrayOfTransitionsType">
+        <xs:sequence>
+          <xs:element ref="t:AbsoluteDateTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:RecurringDayTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:RecurringDateTransition" minOccurs="0" maxOccurs="unbounded"/>
+          <xs:element ref="t:Transition" minOccurs="0" maxOccurs="unbounded"/>
+        </xs:sequence>
+      </xs:complexType>
+    </xs:schema>"#;
+
+    for version in [XsdVersion::V1_0, XsdVersion::V1_1] {
+        let messages: std::collections::BTreeSet<String> = (0..24)
+            .map(|_| {
+                let Err(error) = crate::SchemaSetBuilder::with_version(version)
+                    .add_source(xsd, "file:///ews-transitions.xsd")
+                    .expect("schema source accepted")
+                    .compile()
+                else {
+                    panic!("{version:?}: ArrayOfTransitionsType violates UPA");
+                };
+                assert!(
+                    error.to_string().contains("cos-nonambig"),
+                    "{version:?}: expected cos-nonambig, got {error}"
+                );
+                error.to_string()
+            })
+            .collect();
+        assert_eq!(
+            messages.len(),
+            1,
+            "{version:?}: the reported pair varies between compiles: {messages:#?}"
+        );
+        let message = messages.into_iter().next().unwrap();
+        assert!(
+            message.contains("elements 'AbsoluteDateTransition' and 'Transition' conflict"),
+            "{version:?}: the first competing pair in state order: {message}"
+        );
+    }
+}

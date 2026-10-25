@@ -381,6 +381,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   b)`; `sequence(a, sequence?(b))` restricts `sequence(a, sequence?(b, c?))`).
   All GAEB DA XML 3.3 schemas now load under XSD 1.0.
 
+- `cos-nonambig` (Unique Particle Attribution) names the same competing pair
+  on every run: the first in content-model order. A content model with several
+  competing pairs could name a different pair from run to run; the verdict and
+  the constraint were already stable.
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
@@ -657,6 +662,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A path step with a named kind test (`element(c)`) compares names without
   allocating, about twice as fast; `instance of` / `treat as` resolve their
   type once per expression.
+- Unique Particle Attribution: the epsilon closure of each content-model state
+  reuses its working storage instead of building a hash set per state. Large
+  WSDL schema sets compile up to 2.7 times faster (NetSuite 0.47 s → 0.24 s,
+  0.36 s → 0.13 s under XSD 1.1; vSphere 66 → 53 ms; Workday Human Resources
+  25 → 20 ms).
 
 ## [0.2.3] - 2026-10-15
 

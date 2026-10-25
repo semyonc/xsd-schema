@@ -13,7 +13,7 @@
 //! | Wildcard-Wildcard   | Error   | Error               |
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 
 use ahash::AHasher;
@@ -147,6 +147,34 @@ struct ReachableTerms {
     wildcards: Vec<ReachableTerm>,
 }
 
+/// Working storage for the epsilon closures of one NFA's states, reused from
+/// state to state ([`check_upa_with_substitutions`] computes one closure per
+/// state).
+struct ClosureScratch {
+    /// `visited[s]`: state `s` is in the closure being computed. All false
+    /// between two closures.
+    visited: Vec<bool>,
+    stack: Vec<StateId>,
+    /// The states of the closure being computed.
+    closure: Vec<StateId>,
+}
+
+impl ClosureScratch {
+    fn new(nfa: &NfaTable) -> Self {
+        ClosureScratch {
+            visited: vec![false; nfa.states.len()],
+            stack: Vec::new(),
+            closure: Vec::new(),
+        }
+    }
+}
+
+/// [`epsilon_closure_with_terms_in`] with fresh working storage.
+#[cfg(test)]
+fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> ReachableTerms {
+    epsilon_closure_with_terms_in(nfa, start_state, &mut ClosureScratch::new(nfa))
+}
+
 /// Compute epsilon closure and collect all reachable terms from a start state.
 ///
 /// Uses DFS traversal following **only** `TransitionKind::Epsilon` transitions.
@@ -154,16 +182,36 @@ struct ReachableTerms {
 /// counter-free NFA for UPA checking by capping occurrence bounds to at most 2
 /// (via `compile_content_model_for_upa`), so all transitions in the UPA NFA
 /// are epsilon transitions.
-fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> ReachableTerms {
+///
+/// The terms are collected in increasing state order. The checks report the
+/// first conflict in this order, so the pair a `cos-nonambig` error names is
+/// the same on every run.
+fn epsilon_closure_with_terms_in(
+    nfa: &NfaTable,
+    start_state: StateId,
+    scratch: &mut ClosureScratch,
+) -> ReachableTerms {
     let mut result = ReachableTerms::default();
-    let mut closure = HashSet::new();
-    let mut stack = vec![start_state];
+    let ClosureScratch {
+        visited,
+        stack,
+        closure,
+    } = scratch;
+    stack.clear();
+    closure.clear();
+    stack.push(start_state);
 
     // Compute epsilon closure
     while let Some(state_id) = stack.pop() {
-        if !closure.insert(state_id) {
+        // A state outside the table has no transitions and no term.
+        let Some(seen) = visited.get_mut(state_id as usize) else {
+            continue;
+        };
+        if *seen {
             continue;
         }
+        *seen = true;
+        closure.push(state_id);
 
         if let Some(state) = nfa.get_state(state_id) {
             for transition in &state.transitions {
@@ -173,10 +221,14 @@ fn epsilon_closure_with_terms(nfa: &NfaTable, start_state: StateId) -> Reachable
             }
         }
     }
+    for &state_id in closure.iter() {
+        visited[state_id as usize] = false;
+    }
+    closure.sort_unstable();
 
     // Collect terms from states in the closure that have terms
     // These are the states where we can consume input
-    for &state_id in &closure {
+    for &state_id in closure.iter() {
         if let Some(state) = nfa.get_state(state_id) {
             if let Some(term) = &state.term {
                 let reachable = ReachableTerm {
@@ -655,10 +707,11 @@ pub(crate) fn check_upa_with_substitutions(
     substitution_sets: &SubstitutionGroupMap,
 ) -> SchemaResult<()> {
     let xsd_version = schema_set.xsd_version;
+    let mut scratch = ClosureScratch::new(nfa);
 
     // Check from each state in the NFA
     for state in &nfa.states {
-        let reachable = epsilon_closure_with_terms(nfa, state.id);
+        let reachable = epsilon_closure_with_terms_in(nfa, state.id, &mut scratch);
 
         // Check element-element conflicts (always an error)
         if let Err(error) = check_element_element_conflicts(
