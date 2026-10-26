@@ -115,7 +115,7 @@ pub(crate) fn collect_inherited_assertions(
 ///
 /// Takes the **owner** `ComplexTypeKey` (from `collect_inherited_assertions`),
 /// not the derived type, so inherited assertions get the correct type-level default.
-fn resolve_ct_assertion_default_ns(
+pub(crate) fn resolve_ct_assertion_default_ns(
     assertion: &AssertResult,
     owner_ct_key: ComplexTypeKey,
     schema_set: &SchemaSet,
@@ -242,7 +242,15 @@ pub(crate) fn evaluate_complex_type_assertions(
             continue;
         }
 
-        // Build XPath static context with schema-time namespace snapshot
+        // The schema-time check (`schema::validate_assertion_xpath`) compiled
+        // this test with only the built-in components in scope (Structures
+        // §3.13.6.2 clause 2.2.5) and refused the schema for any user-defined
+        // type or declaration it named. Evaluation needs the schema set to
+        // answer questions about the instance's type annotations (a node of
+        // a user type derived from `xs:integer` is an
+        // `element(*, xs:integer)`); `without_schema_casts` is kept as a
+        // second guard. A test that still fails to compile here calls a
+        // function this engine lacks: `cvc-assertion` below.
         let ctx = XPathContext::new(&schema_set.name_table)
             .with_namespaces(assertion.ns_snapshot.clone())
             .with_schema_set(schema_set)

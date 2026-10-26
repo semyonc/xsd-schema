@@ -700,6 +700,20 @@ impl BuiltinTypes {
         self.get_type_code(key).is_some()
     }
 
+    /// True when `key` is one of the four attribute declarations present in
+    /// every schema by definition (Structures 1.1 §3.2.7): `xsi:type`,
+    /// `xsi:nil`, `xsi:schemaLocation`, `xsi:noNamespaceSchemaLocation`.
+    #[cfg(feature = "xsd11")]
+    pub(crate) fn is_builtin_attribute(&self, key: AttributeKey) -> bool {
+        [
+            self.xsi_type_attr,
+            self.xsi_nil_attr,
+            self.xsi_schema_location_attr,
+            self.xsi_no_namespace_schema_location_attr,
+        ]
+        .contains(&key)
+    }
+
     /// True when `key` is the `xs:anyAtomicType` built-in (XSD 1.1 only).
     #[inline]
     pub fn is_any_atomic_type(&self, key: SimpleTypeKey) -> bool {

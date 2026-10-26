@@ -543,6 +543,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after atomization. `XPathMode::XPath10`: `number()` reads strings as XPath
   1.0 does (no exponent, `+` or `INF`).
 
+- Keyrefs see only their own element's keys. A `keyref` is checked against the
+  identity-constraint table of the element that declares it — its own keys and
+  uniques and those of its descendants (Structures §3.11.4 clause 4.3,
+  §3.11.5). A key declared on a sibling or an ancestor of that element no
+  longer satisfies it; such instances were accepted and are now invalid
+  (`cvc-identity-constraint.4.3`).
+- `refer` may name a key declared later. A keyref's `refer` is resolved once
+  every identity constraint of the schema is known, so a key or unique
+  declared later in the document, on a local element, or in another schema
+  document of the namespace is found. Such schemas were refused with
+  `src-identity-constraint`.
+- Assertions after the attribute wildcard (XSD 1.1). `<xs:assert>` is accepted
+  after `<xs:anyAttribute>` in `<complexType>` and in the `<restriction>` /
+  `<extension>` of simple and complex content, as Structures 1.1 §3.4.2
+  allows, and the children of these elements are checked in the order the
+  content models give: an `assert` before an attribute, an attribute group,
+  the attribute wildcard, a particle or an `openContent`, a second
+  `openContent`, an `openContent` after the particle, and a facet after an
+  `assert` are refused. An `assert` or `openContent` in a simple type's
+  `<restriction>`, and an inline `<simpleType>` in a complex-content
+  `<restriction>`, are refused; they were accepted and ignored.
+- The end-of-element `SchemaInfo::is_nil` is the [nil] property (Structures
+  §3.3.5.3): `false` for an element with `xsi:nil="true"` that has character
+  or element children (`cvc-elt.3.2.1`, still reported). The start-of-element
+  value still says whether the element is nilled.
+- Schema errors are deterministic. When several independent components are
+  invalid, the error reported no longer varies from run to run: types are
+  checked in the order they are defined, enumeration values in sorted order.
+- The XPath of assertions and type alternatives sees only the built-in
+  components (XSD 1.1). Structures 1.1 §3.13.6.2 (XPath Valid) gives the tests
+  of `xs:assert`, `xs:assertion` and `xs:alternative` a static context whose
+  "in-scope schema definitions are those components that are present in every
+  schema by definition", and a static error makes the schema invalid
+  (§3.13.6.1, §3.12.6). Each test is now checked when the schema is built: one
+  that names a user-defined type or declaration — `instance of`, `treat as`,
+  `cast as`, `castable as`, a constructor, `element(*, T)`, `attribute(*, T)`,
+  `schema-element`, `schema-attribute` — or has another static error (an
+  undeclared prefix, an undefined variable, an unknown `xs:` constructor, a
+  syntax error) is refused with `as-props-correct` (assertions) or
+  `src-ct-alternative` (type alternatives). The components present in every
+  schema stay in scope: the built-in types and the four `xsi:` attribute
+  declarations, so `schema-attribute(xsi:nil)` is fine; there is no built-in
+  element declaration. Such assertions used to fail or pass on each instance;
+  `instance of` / `treat as` a user type were evaluated. A function the engine
+  does not know, in a namespace other than the XML Schema one, is still left
+  to the evaluation (`cvc-assertion`). The schema-time check of a type
+  alternative now also applies the schema document's `xpathDefaultNamespace`.
+  Upgrading: an assertion such as `$value instance of my:t` or
+  `@a castable as my:t` must be written against built-in types —
+  `$value instance of xs:integer and $value le 10`,
+  `@a castable as xs:integer and xs:integer(@a) le 10` — or the condition
+  moved into facets of `my:t`; `element(*, my:T)` / `schema-element(my:e)`
+  become name tests (`self::my:e`) or checks of built-in types. Node type
+  annotations still count: a node of a user type derived from `xs:integer`
+  matches `element(*, xs:integer)`.
+
+### Deprecated
+
+- `ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS`. Identity constraints are
+  always enforced — they are part of an element's validity (Structures
+  §3.3.4.3 clause 6) — and the bit never had an effect; remove it.
+
 ### Fixed
 
 - Casting an `xs:QName` or `xs:NOTATION` to `xs:string` or `xs:untypedAtomic`
@@ -875,6 +937,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   WSDL schema sets compile up to 2.7 times faster (NetSuite 0.47 s → 0.24 s,
   0.36 s → 0.13 s under XSD 1.1; vSphere 66 → 53 ms; Workday Human Resources
   25 → 20 ms).
+- Key, unique and keyref tables are indexed: validating a document with
+  100,000 keys and 100,000 keyrefs takes under half a second instead of over
+  five minutes.
 
 ## [0.2.3] - 2026-10-15
 

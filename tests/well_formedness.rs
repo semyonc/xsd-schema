@@ -1607,41 +1607,14 @@ fn xml_1_1_schema_documents_undeclare_prefixes() {
              <xs:alternative xmlns:p=\"\" test=\"@p:b\" type=\"xs:string\"/></xs:element>",
             true,
         );
-        // The XPath of an assertion (XSD 1.1), compiled when it is evaluated:
-        // `p:x` is a static error (XPST0081), not a test for an unqualified
-        // `x`, which this instance has.
-        let mut ss = schema_set_empty(true);
-        let xsd = format!(
-            "{V11}<xs:schema {XS} xmlns:p=\"urn:p\" targetNamespace=\"urn:p\">\
-             <xs:complexType name=\"c\"><xs:sequence><xs:element name=\"x\" type=\"xs:string\"/></xs:sequence>\
-             <xs:assert xmlns:p=\"\" test=\"p:x\"/></xs:complexType>\
-             <xs:element name=\"ce\" type=\"p:c\"/></xs:schema>"
-        );
-        load_and_process_schema(xsd.as_bytes(), "file:///wf-assert.xsd", &mut ss, None)
-            .expect("the assertion is compiled when it is evaluated");
-        let validator = SchemaValidator::new(
-            &ss,
-            ValidationFlags::default() | ValidationFlags::PROCESS_ASSERTIONS,
-        );
-        let (mut errors, mut warnings) = (Vec::new(), Vec::new());
-        {
-            let mut runtime = validator.start_run(CollectingValidationSink {
-                errors: &mut errors,
-                warnings: &mut warnings,
-            });
-            drive_quick_xml(
-                &b"<p:ce xmlns:p=\"urn:p\"><x>a</x></p:ce>"[..],
-                &mut runtime,
-                &ss,
-            )
-            .expect("well-formed");
-        }
-        let shown: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
-        assert!(
-            shown
-                .iter()
-                .any(|m| m.contains("XPST0081") && m.contains("'p'")),
-            "{shown:?}"
+        // The XPath of an assertion (XSD 1.1), checked when the schema is
+        // loaded as well (Structures 1.1 §3.13.6.1: a static error makes the
+        // schema invalid): `p:x` is a static error (XPST0081), not a test for
+        // an unqualified `x`.
+        unbound(
+            "<xs:complexType name=\"c\"><xs:sequence><xs:element name=\"x\" type=\"xs:string\"/></xs:sequence>\
+             <xs:assert xmlns:p=\"\" test=\"p:x\"/></xs:complexType>",
+            true,
         );
     }
 }

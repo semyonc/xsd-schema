@@ -616,6 +616,36 @@ impl KeyTable {
         element_path: &str,
         location: Option<SourceLocation>,
     ) -> Vec<ValidationError> {
+        let duplicate =
+            self.duplicate_check(&seq, |table, seq| table.find_duplicate(seq).is_some());
+        self.push_checked(seq, duplicate, name_table, element_path, location)
+    }
+
+    /// Whether `seq` must be checked for a duplicate, and if so, whether it is
+    /// one (`has_duplicate`): keys always, uniques when complete, keyrefs
+    /// never.
+    fn duplicate_check(
+        &self,
+        seq: &KeySequence,
+        has_duplicate: impl FnOnce(&Self, &KeySequence) -> bool,
+    ) -> bool {
+        match self.kind {
+            IdentityKind::Key => has_duplicate(self, seq),
+            IdentityKind::Unique => seq.is_complete() && has_duplicate(self, seq),
+            IdentityKind::Keyref => false,
+        }
+    }
+
+    /// Store `seq` and report what [`add_sequence`](Self::add_sequence)
+    /// reports for it; `duplicate` is the result of the duplicate check.
+    fn push_checked(
+        &mut self,
+        seq: KeySequence,
+        duplicate: bool,
+        name_table: &NameTable,
+        element_path: &str,
+        location: Option<SourceLocation>,
+    ) -> Vec<ValidationError> {
         let mut errors = Vec::new();
         let name = name_table.resolve(self.constraint_name);
 
@@ -631,7 +661,7 @@ impl KeyTable {
                 }
                 // Check for duplicate even if incomplete (per spec, key requires
                 // completeness AND uniqueness)
-                if self.find_duplicate(&seq).is_some() {
+                if duplicate {
                     errors.push(error_with_path(
                         "cvc-identity-constraint.4.2.2",
                         format!("Key constraint '{}': duplicate key value detected", name),
@@ -642,7 +672,7 @@ impl KeyTable {
             }
             IdentityKind::Unique => {
                 // For unique, only check duplicates when the sequence is complete
-                if seq.is_complete() && self.find_duplicate(&seq).is_some() {
+                if duplicate {
                     errors.push(error_with_path(
                         "cvc-identity-constraint.4.2.2",
                         format!("Unique constraint '{}': duplicate key value detected", name),
@@ -668,6 +698,19 @@ impl KeyTable {
         target: &KeyTable,
         name_table: &NameTable,
     ) -> Vec<ValidationError> {
+        self.keyref_errors(target.constraint_name, name_table, |seq| {
+            target.sequences.iter().any(|ts| ts == seq)
+        })
+    }
+
+    /// `cvc-identity-constraint.4.3` for every complete keyref sequence that
+    /// `found` does not find in the table of the constraint `target_name`.
+    fn keyref_errors(
+        &self,
+        target_name: NameId,
+        name_table: &NameTable,
+        found: impl Fn(&KeySequence) -> bool,
+    ) -> Vec<ValidationError> {
         let mut errors = Vec::new();
         let name = name_table.resolve(self.constraint_name);
 
@@ -676,14 +719,13 @@ impl KeyTable {
                 // Incomplete keyref sequences are not checked
                 continue;
             }
-            let found = target.sequences.iter().any(|ts| ts == seq);
-            if !found {
+            if !found(seq) {
                 errors.push(error(
                     "cvc-identity-constraint.4.3",
                     format!(
                         "Keyref constraint '{}': no matching key value found in referenced constraint '{}'",
                         name,
-                        name_table.resolve(target.constraint_name)
+                        name_table.resolve(target_name)
                     ),
                     None,
                 ));
@@ -696,6 +738,336 @@ impl KeyTable {
     /// Linear scan for a duplicate of `seq` in the existing sequences.
     fn find_duplicate(&self, seq: &KeySequence) -> Option<usize> {
         self.sequences.iter().position(|existing| existing == seq)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KeyIndex / IndexedKeyTable
+// ---------------------------------------------------------------------------
+
+/// How the values one field of a key table holds compare, as far as the
+/// index needs to know (see [`KeyIndex`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldClass {
+    /// No value in this field yet (absent everywhere).
+    Unknown,
+    /// Values compared by their strings: no typed value, or a typed value
+    /// without a primitive type ([`KeyFieldValue`]'s string fallback).
+    Strings,
+    /// Atomic values of a primitive type (compared in its value space).
+    Atomic,
+    /// List values (compared member by member).
+    Lists,
+    /// Values of more than one class: a pair of them may be equal through
+    /// the string fallback or the list-of-one rule, so this field does not
+    /// discriminate in the index.
+    Mixed,
+}
+
+/// One field value's class and the key its class hashes, for
+/// [`KeyIndex`]. Equal values (by [`KeyFieldValue`]'s `==`) of one class
+/// always get the same key; unequal ones may share one (a bucket is then
+/// searched with `==`).
+fn field_class_and_key(value: &KeyFieldValue, hasher: &mut ahash::AHasher) -> FieldClass {
+    use crate::types::value::{XmlAtomicValue as V, XmlValueKind as K};
+    use std::hash::Hash;
+    let Some(typed) = value.typed_value.as_ref() else {
+        1u8.hash(hasher);
+        value.string_value.hash(hasher);
+        return FieldClass::Strings;
+    };
+    let typed = unwrap_union(typed);
+    let K::Atomic(atom) = &typed.value else {
+        if list_members(typed).is_some() {
+            3u8.hash(hasher);
+            return FieldClass::Lists;
+        }
+        // `UntypedAtomic`: no primitive type.
+        1u8.hash(hasher);
+        value.string_value.hash(hasher);
+        return FieldClass::Strings;
+    };
+    let Some(primitive) = typed.primitive_type() else {
+        1u8.hash(hasher);
+        value.string_value.hash(hasher);
+        return FieldClass::Strings;
+    };
+    2u8.hash(hasher);
+    match (primitive, atom) {
+        (PrimitiveTypeCode::String, V::String(s)) | (PrimitiveTypeCode::AnyUri, V::AnyUri(s)) => {
+            primitive.hash(hasher);
+            s.hash(hasher);
+        }
+        (PrimitiveTypeCode::Boolean, V::Boolean(b)) => {
+            primitive.hash(hasher);
+            b.hash(hasher);
+        }
+        (PrimitiveTypeCode::Decimal, _) => {
+            primitive.hash(hasher);
+            // The exact value, normalized (`1.0`, `1`, `+01.00` are one
+            // value), read from the canonical form every decimal-family value
+            // displays as — a `Decimal`, an `Integer`, or the lexical form of
+            // a value beyond `Decimal`'s capacity.
+            let text = atom.to_string();
+            match crate::types::exact_decimal::ExactDecimal::parse(&text) {
+                Some(exact) => exact.to_string().hash(hasher),
+                None => text.hash(hasher),
+            }
+        }
+        (PrimitiveTypeCode::Float, V::Float(x)) => {
+            primitive.hash(hasher);
+            // `0 = -0`; NaN is identical to NaN (see `xml_atomic_nan_eq`).
+            let bits = if x.is_nan() {
+                u32::MAX
+            } else if *x == 0.0 {
+                0
+            } else {
+                x.to_bits()
+            };
+            bits.hash(hasher);
+        }
+        (PrimitiveTypeCode::Double, V::Double(x)) => {
+            primitive.hash(hasher);
+            let bits = if x.is_nan() {
+                u64::MAX
+            } else if *x == 0.0 {
+                0
+            } else {
+                x.to_bits()
+            };
+            bits.hash(hasher);
+        }
+        (PrimitiveTypeCode::QName, V::QName(q)) | (PrimitiveTypeCode::Notation, V::Notation(q)) => {
+            primitive.hash(hasher);
+            q.hash(hasher);
+        }
+        (PrimitiveTypeCode::HexBinary, V::HexBinary(b))
+        | (PrimitiveTypeCode::Base64Binary, V::Base64Binary(b)) => {
+            primitive.hash(hasher);
+            b.hash(hasher);
+        }
+        // Dates, times, durations (equal across time zones and by the four
+        // reference dateTimes, seconds compared as written) and anything
+        // else: one key for all of them.
+        _ => 0xFFu8.hash(hasher),
+    }
+    FieldClass::Atomic
+}
+
+/// A hash index over a key table's sequences, for its duplicate check and
+/// keyref lookups in expected constant time per sequence.
+///
+/// A sequence's hash combines one key per field. Equality of field values
+/// ([`KeyFieldValue`]'s `==`) is not transitive across classes — a typed
+/// value equals an untyped one by its string, an atomic value equals the
+/// list of that value — so a field whose values come from more than one
+/// [`FieldClass`] stops contributing (and the index is rebuilt, once per
+/// field). Within a class, equal values hash equally. A bucket is searched
+/// with `==`, so a shared hash is never a false match.
+#[derive(Debug, Default)]
+struct KeyIndex {
+    classes: Vec<FieldClass>,
+    /// Hash of a sequence → its last indexed position; `next` chains the
+    /// earlier positions with the same hash (`u32::MAX` ends a chain).
+    heads: std::collections::HashMap<u64, u32, std::hash::BuildHasherDefault<ahash::AHasher>>,
+    next: Vec<u32>,
+}
+
+impl KeyIndex {
+    const END: u32 = u32::MAX;
+
+    /// The classes of `seq`'s fields (`Unknown` for an absent one).
+    fn classes_of(seq: &KeySequence) -> Vec<FieldClass> {
+        let mut scratch = ahash::AHasher::default();
+        seq.fields
+            .iter()
+            .map(|f| match f {
+                Some(v) => field_class_and_key(v, &mut scratch),
+                None => FieldClass::Unknown,
+            })
+            .collect()
+    }
+
+    /// The hash of `seq` under this index's classes.
+    fn hash(&self, seq: &KeySequence) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = ahash::AHasher::default();
+        for (i, field) in seq.fields.iter().enumerate() {
+            if self.classes.get(i) == Some(&FieldClass::Mixed) {
+                4u8.hash(&mut hasher);
+                continue;
+            }
+            match field {
+                None => 0u8.hash(&mut hasher),
+                Some(v) => {
+                    field_class_and_key(v, &mut hasher);
+                }
+            }
+        }
+        seq.fields.len().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Merge `seq`'s classes into the index's; `true` when a field became
+    /// `Mixed` (the existing entries must be rehashed).
+    fn merge_classes(&mut self, seq: &KeySequence) -> bool {
+        let classes = Self::classes_of(seq);
+        if self.classes.len() < classes.len() {
+            self.classes.resize(classes.len(), FieldClass::Unknown);
+        }
+        let mut became_mixed = false;
+        for (have, new) in self.classes.iter_mut().zip(classes) {
+            match (*have, new) {
+                (_, FieldClass::Unknown) | (FieldClass::Mixed, _) => {}
+                (FieldClass::Unknown, c) => *have = c,
+                (h, c) if h == c => {}
+                _ => {
+                    *have = FieldClass::Mixed;
+                    became_mixed = true;
+                }
+            }
+        }
+        became_mixed
+    }
+
+    /// Index `sequences[position]`, after merging its classes.
+    fn insert(&mut self, sequences: &[KeySequence], position: usize) {
+        if self.merge_classes(&sequences[position]) {
+            self.rebuild(&sequences[..position]);
+        }
+        self.link(sequences, position);
+    }
+
+    fn link(&mut self, sequences: &[KeySequence], position: usize) {
+        let h = self.hash(&sequences[position]);
+        let previous = self.heads.insert(h, position as u32).unwrap_or(Self::END);
+        if self.next.len() <= position {
+            self.next.resize(position + 1, Self::END);
+        }
+        self.next[position] = previous;
+    }
+
+    /// Rehash `sequences` (all indexed before) under the current classes.
+    fn rebuild(&mut self, sequences: &[KeySequence]) {
+        self.heads.clear();
+        self.next.clear();
+        for position in 0..sequences.len() {
+            self.link(sequences, position);
+        }
+    }
+
+    /// Whether `sequences` holds a sequence equal to `probe`. Falls back to
+    /// a scan when `probe` has a field of another class than the table's
+    /// (equality then may hold through the string fallback only).
+    fn contains(&self, sequences: &[KeySequence], probe: &KeySequence) -> bool {
+        let comparable = Self::classes_of(probe)
+            .iter()
+            .enumerate()
+            .all(|(i, class)| {
+                match (
+                    self.classes.get(i).copied().unwrap_or(FieldClass::Unknown),
+                    *class,
+                ) {
+                    (FieldClass::Mixed, _)
+                    | (_, FieldClass::Unknown)
+                    | (FieldClass::Unknown, _) => true,
+                    (have, probe) => have == probe,
+                }
+            });
+        if !comparable {
+            return sequences.iter().any(|s| s == probe);
+        }
+        let mut at = self
+            .heads
+            .get(&self.hash(probe))
+            .copied()
+            .unwrap_or(Self::END);
+        while at != Self::END {
+            if &sequences[at as usize] == probe {
+                return true;
+            }
+            at = self.next[at as usize];
+        }
+        false
+    }
+}
+
+/// A [`KeyTable`] with a [`KeyIndex`]: what the validation runtime keeps for
+/// `key` and `unique` node tables, so that the duplicate check and the keyref
+/// lookup do not scan the table (a table of n sequences costs O(n) to build
+/// instead of O(n²)). Verdicts and error order are those of [`KeyTable`].
+pub(crate) struct IndexedKeyTable {
+    table: KeyTable,
+    index: KeyIndex,
+}
+
+impl IndexedKeyTable {
+    pub(crate) fn new(
+        ic_key: IdentityConstraintKey,
+        constraint_name: NameId,
+        kind: IdentityKind,
+    ) -> Self {
+        IndexedKeyTable {
+            table: KeyTable::new(ic_key, constraint_name, kind),
+            index: KeyIndex::default(),
+        }
+    }
+
+    /// [`KeyTable::add_sequence`], with the indexed duplicate check.
+    pub(crate) fn add_sequence(
+        &mut self,
+        seq: KeySequence,
+        name_table: &NameTable,
+        element_path: &str,
+        location: Option<SourceLocation>,
+    ) -> Vec<ValidationError> {
+        if self.table.kind == IdentityKind::Keyref {
+            // Keyref tables are only ever probed against, never searched.
+            return self
+                .table
+                .add_sequence(seq, name_table, element_path, location);
+        }
+        let index = &self.index;
+        let duplicate = self
+            .table
+            .duplicate_check(&seq, |table, seq| index.contains(&table.sequences, seq));
+        let errors = self
+            .table
+            .push_checked(seq, duplicate, name_table, element_path, location);
+        let position = self.table.sequences.len() - 1;
+        self.index.insert(&self.table.sequences, position);
+        errors
+    }
+
+    /// Append the sequences of `other` (a node table of the same constraint
+    /// propagated from a child, §3.11.5), in order, without checks.
+    pub(crate) fn append(&mut self, other: IndexedKeyTable) {
+        let start = self.table.sequences.len();
+        self.table.sequences.extend(other.table.sequences);
+        if self.table.kind != IdentityKind::Keyref {
+            for position in start..self.table.sequences.len() {
+                self.index.insert(&self.table.sequences, position);
+            }
+        }
+    }
+
+    /// [`KeyTable::check_keyref_against`] with this table as the target.
+    pub(crate) fn check_keyref(
+        &self,
+        keyref: &KeyTable,
+        name_table: &NameTable,
+    ) -> Vec<ValidationError> {
+        keyref.keyref_errors(self.table.constraint_name, name_table, |seq| {
+            self.index.contains(&self.table.sequences, seq)
+        })
+    }
+
+    pub(crate) fn table(&self) -> &KeyTable {
+        &self.table
+    }
+
+    pub(crate) fn into_table(self) -> KeyTable {
+        self.table
     }
 }
 
@@ -745,7 +1117,7 @@ pub(crate) struct ConstraintStruct {
     /// Empty means no selector match is currently active.
     collection_stack: Vec<FieldCollectionFrame>,
     /// Key table accumulating complete key sequences.
-    pub key_table: KeyTable,
+    pub key_table: IndexedKeyTable,
     /// Validation-stack index of the element whose declaration carries this
     /// constraint (its scope element). Every violation of the constraint makes
     /// *that* element invalid — Structures §3.3.4.3 Element Locally Valid
@@ -770,7 +1142,7 @@ impl ConstraintStruct {
             field_asttrees: compiled.fields.clone(),
             field_count: compiled.field_count,
             collection_stack: Vec::new(),
-            key_table: KeyTable::new(compiled.key, compiled.name, compiled.kind),
+            key_table: IndexedKeyTable::new(compiled.key, compiled.name, compiled.kind),
             owner_depth: 0,
         }
     }
@@ -931,7 +1303,7 @@ impl ConstraintStruct {
                     if frame.field_match_count[field_idx] > 0 {
                         // §3.11.4 cvc-identity-constraint.4.2.1: field evaluates to
                         // a node-set with more than one member.
-                        let name = name_table.resolve(self.key_table.constraint_name);
+                        let name = name_table.resolve(self.key_table.table().constraint_name);
                         errors.push(error_with_path(
                             "cvc-identity-constraint.4.2.1",
                             format!(
@@ -953,7 +1325,7 @@ impl ConstraintStruct {
                             // and xs:unique (not merely "absent"), because the node IS present
                             // but its type precludes a meaningful field value.
                             let constraint_name =
-                                name_table.resolve(self.key_table.constraint_name);
+                                name_table.resolve(self.key_table.table().constraint_name);
                             errors.push(error_with_path(
                                 "cvc-identity-constraint.4",
                                 format!(
@@ -1450,10 +1822,10 @@ mod tests {
         assert!(errors.is_empty());
 
         // Key table should have one sequence
-        assert_eq!(cs.key_table.sequences.len(), 1);
-        assert!(cs.key_table.sequences[0].is_complete());
+        assert_eq!(cs.key_table.table().sequences.len(), 1);
+        assert!(cs.key_table.table().sequences[0].is_complete());
         assert_eq!(
-            cs.key_table.sequences[0].fields[0]
+            cs.key_table.table().sequences[0].fields[0]
                 .as_ref()
                 .unwrap()
                 .string_value,
@@ -1498,9 +1870,9 @@ mod tests {
         // End inner </item> — finalizes inner sequence
         let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item/item", None);
         assert!(errors.is_empty());
-        assert_eq!(cs.key_table.sequences.len(), 1);
+        assert_eq!(cs.key_table.table().sequences.len(), 1);
         assert_eq!(
-            cs.key_table.sequences[0].fields[0]
+            cs.key_table.table().sequences[0].fields[0]
                 .as_ref()
                 .unwrap()
                 .string_value,
@@ -1513,9 +1885,9 @@ mod tests {
         // End outer </item> — finalizes outer sequence
         let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item", None);
         assert!(errors.is_empty());
-        assert_eq!(cs.key_table.sequences.len(), 2);
+        assert_eq!(cs.key_table.table().sequences.len(), 2);
         assert_eq!(
-            cs.key_table.sequences[1].fields[0]
+            cs.key_table.table().sequences[1].fields[0]
                 .as_ref()
                 .unwrap()
                 .string_value,
@@ -1555,6 +1927,141 @@ mod tests {
 
         let errors = cs.end_element_with_text("", None, false, false, &nt, "/root/item", None);
         assert!(errors.is_empty());
-        assert!(cs.key_table.sequences[0].is_complete());
+        assert!(cs.key_table.table().sequences[0].is_complete());
+    }
+
+    /// The indexed table reports exactly what the linear [`KeyTable`] does,
+    /// on sequences mixing every class of field value: strings, decimals in
+    /// several forms, doubles (`0` / `-0` / NaN), dates, untyped values,
+    /// lists (a singleton list equals its atomic value), absent fields — in
+    /// several orders, so that fields turn `Mixed` at different points.
+    #[test]
+    fn indexed_key_table_agrees_with_the_linear_one() {
+        use crate::types::value::{XmlAtomicValue, XmlValue, XmlValueKind};
+        use num_bigint::BigInt;
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let nt = make_name_table();
+        let name = nt.add("k");
+        let typed = |s: &str, v: XmlValue| KeyFieldValue {
+            string_value: s.to_string(),
+            typed_value: Some(v),
+        };
+        let int = |s: &str| {
+            typed(
+                s,
+                XmlValue::integer(BigInt::from_str(s.trim_start_matches('+')).unwrap()),
+            )
+        };
+        let dec = |s: &str| typed(s, XmlValue::decimal(Decimal::from_str(s).unwrap()));
+        let dbl = |s: &str, d: f64| typed(s, XmlValue::double(d));
+        let st = |s: &str| typed(s, XmlValue::string(s));
+        let untyped = |s: &str| typed(s, XmlValue::untyped(s));
+        let list = |s: &str, items: &[i64]| {
+            typed(
+                s,
+                XmlValue::new(
+                    XmlTypeCode::Int,
+                    XmlValueKind::List {
+                        item_type: XmlTypeCode::Int,
+                        items: items
+                            .iter()
+                            .map(|i| {
+                                XmlValue::new(
+                                    XmlTypeCode::Int,
+                                    XmlValueKind::Atomic(XmlAtomicValue::Integer(BigInt::from(*i))),
+                                )
+                            })
+                            .collect(),
+                    },
+                ),
+            )
+        };
+        let values: Vec<Option<KeyFieldValue>> = vec![
+            Some(int("1")),
+            Some(dec("1.0")),
+            Some(dec("1.50")),
+            Some(dec("1.5")),
+            Some(int("+1")),
+            Some(dbl("0", 0.0)),
+            Some(dbl("-0", -0.0)),
+            Some(dbl("NaN", f64::NAN)),
+            Some(dbl("NaN", f64::NAN)),
+            Some(st("a")),
+            Some(st("1")),
+            Some(make_string_field("1")),
+            Some(make_string_field("a")),
+            Some(untyped("a")),
+            Some(untyped("1.0")),
+            Some(list("7", &[7])),
+            Some(int("7")),
+            Some(list("7 8", &[7, 8])),
+            Some(list(" 7  8 ", &[7, 8])),
+            None,
+            None,
+        ];
+        // Deterministic pseudo-random orders and pairings.
+        let mut state: u64 = 0x2545F4914F6CDD1D;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for kind in [IdentityKind::Key, IdentityKind::Unique] {
+            for round in 0..60 {
+                let mut linear = KeyTable::new(IdentityConstraintKey::default(), name, kind);
+                let mut indexed =
+                    IndexedKeyTable::new(IdentityConstraintKey::default(), name, kind);
+                let fields = 1 + (round % 3);
+                for step in 0..40 {
+                    let seq = KeySequence {
+                        fields: (0..fields)
+                            .map(|_| values[(next() % values.len() as u64) as usize].clone())
+                            .collect(),
+                    };
+                    let a: Vec<String> = linear
+                        .add_sequence(seq.clone(), &nt, "/p", None)
+                        .iter()
+                        .map(|e| e.constraint.to_string())
+                        .collect();
+                    let b: Vec<String> = indexed
+                        .add_sequence(seq.clone(), &nt, "/p", None)
+                        .iter()
+                        .map(|e| e.constraint.to_string())
+                        .collect();
+                    assert_eq!(a, b, "{kind:?} round {round} step {step}: {seq:?}");
+                    // A keyref probe of the same shape finds the same.
+                    let probe = KeySequence {
+                        fields: (0..fields)
+                            .map(|_| values[(next() % values.len() as u64) as usize].clone())
+                            .collect(),
+                    };
+                    let mut keyref =
+                        KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Keyref);
+                    keyref.sequences.push(probe.clone());
+                    assert_eq!(
+                        keyref.check_keyref_against(&linear, &nt).len(),
+                        indexed.check_keyref(&keyref, &nt).len(),
+                        "{kind:?} round {round} step {step}: probe {probe:?}"
+                    );
+                }
+                // Appending one table to another keeps them in agreement.
+                let mut merged = IndexedKeyTable::new(IdentityConstraintKey::default(), name, kind);
+                merged.append(indexed);
+                let probe = KeySequence {
+                    fields: vec![values[0].clone(); fields],
+                };
+                let mut keyref =
+                    KeyTable::new(IdentityConstraintKey::default(), name, IdentityKind::Keyref);
+                keyref.sequences.push(probe);
+                assert_eq!(
+                    keyref.check_keyref_against(&linear, &nt).len(),
+                    merged.check_keyref(&keyref, &nt).len()
+                );
+                assert_eq!(merged.table().sequences.len(), linear.sequences.len());
+            }
+        }
     }
 }

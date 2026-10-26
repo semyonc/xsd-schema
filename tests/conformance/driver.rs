@@ -94,6 +94,9 @@ pub enum ExpectedOutcome {
     InstanceRuntimeSchemaError,
     /// Instance validity should be `notKnown`
     InstanceNotKnown,
+    /// No `<expected>` entry applies to the configuration the test runs in
+    /// (only produced by the `--versionless-1.1` mode)
+    NotPrescribed,
 }
 
 /// Test suite statistics
@@ -198,7 +201,8 @@ fn parse_expected_outcome(
 fn is_non_asserting_expected(outcome: ExpectedOutcome) -> bool {
     matches!(
         outcome,
-        ExpectedOutcome::Indeterminate
+        ExpectedOutcome::NotPrescribed
+            | ExpectedOutcome::Indeterminate
             | ExpectedOutcome::ImplementationDefined
             | ExpectedOutcome::ImplementationDependent
             | ExpectedOutcome::InstanceIndeterminate
@@ -226,6 +230,9 @@ fn expected_skip_reason(outcome: ExpectedOutcome) -> Option<&'static str> {
         ExpectedOutcome::InstanceRuntimeSchemaError => Some(
             "W3C expected outcome 'runtime-schema-error' is not modeled separately by this driver",
         ),
+        ExpectedOutcome::NotPrescribed => {
+            Some("no <expected> entry of the manifest applies to XSD 1.1 (only versioned ones)")
+        }
         _ => None,
     }
 }
@@ -278,6 +285,11 @@ pub struct TestCase {
     pub version: String,
     /// Raw version attribute from the manifest (may be a profile label)
     pub version_label: String,
+    /// No level of the manifest (test, group, test set) names an XSD version and
+    /// no `<expected>` entry gives the test an XSD 1.1 variant: the default runs
+    /// execute it in 1.0 mode only. The `--versionless-1.1` mode runs these tests
+    /// under `SchemaSet::xsd11()` as well.
+    pub versionless: bool,
     /// Description
     pub description: Option<String>,
 }
@@ -468,6 +480,14 @@ impl TestSuiteParser {
                                 group: current_group.clone(),
                                 version: xsd_versions[0].to_string(),
                                 version_label: raw_label,
+                                versionless: [
+                                    test_version_attr.as_deref(),
+                                    group_version_attr.as_deref(),
+                                    testset_version_attr.as_deref(),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .all(|attr| extract_xsd_versions(attr).is_empty()),
                                 description: None,
                             };
 
@@ -640,6 +660,7 @@ impl TestSuiteParser {
                     group,
                     version: "1.0".to_string(),
                     version_label: "1.0".to_string(),
+                    versionless: false,
                     description: None,
                 });
             }
@@ -754,9 +775,14 @@ fn expand_test_versions(test: TestCase, out: &mut Vec<TestCase>) {
             .then_with(|| a.profile_label.cmp(&b.profile_label))
     });
 
+    // A test is run in 1.0 mode only when no manifest level names an XSD
+    // version and no <expected> entry adds a 1.1 variant.
+    let versionless = test.versionless && !xsd_versions.iter().any(|v| v == "1.1");
+
     // Emit one TestCase per variant
     for variant in &variants {
         let mut copy = test.clone();
+        copy.versionless = versionless;
         copy.version = variant.xsd_version.clone();
         if let Some(ref label) = variant.profile_label {
             copy.version_label = label.clone();
@@ -813,6 +839,60 @@ fn resolve_expected_for_version(test: &mut TestCase) {
 
     // 4. If only versioned entries exist but none match, use the first one
     test.expected = test.expected_versions[0].outcome;
+}
+
+/// The `--versionless-1.1` mode: the tests the default runs execute in 1.0 mode
+/// only because the manifest names no XSD version for them, re-targeted at
+/// `SchemaSet::xsd11()`.
+///
+/// The test-suite metadata (`common/xsts.xsd`, `testSuite/@version`): "If no
+/// `version` value is given, or if the value is the empty string, all processors
+/// should run the tests." The expected outcome is the one an XSD 1.1
+/// configuration is given: an `<expected>` entry for `1.1`, then one for the
+/// test's profile label, then the unversioned entry. An `<expected>` entry
+/// whose `version` names another XSD version does not apply ("if a processor
+/// configuration supports *all* of them, the result given is prescribed"), so a
+/// test with only such entries is reported as skipped (`NotPrescribed`).
+///
+/// Where the manifest gives results per Unicode version, the `Unicode_6.0.0`
+/// one is used: the XSD 1.1 regular-expression engine uses a later Unicode
+/// Character Database than 6.0.0, which Datatypes 1.1 §G.4.2.2 allows ("or in
+/// some later version of the Unicode database"); the 1.0 runs keep the
+/// `Unicode_4.0.0` results of their pinned tables.
+fn versionless_under_xsd11(tests: Vec<TestCase>) -> Vec<TestCase> {
+    const XSD11_UNICODE_PROFILE: &str = "Unicode_6.0.0";
+    tests
+        .into_iter()
+        .filter(|t| t.versionless && t.version == "1.0")
+        .map(|mut t| {
+            t.version = "1.1".to_string();
+            if t.version_label == "1.0" {
+                t.version_label = "1.1".to_string();
+            }
+            if t.expected_versions
+                .iter()
+                .any(|ve| ve.version.as_deref() == Some(XSD11_UNICODE_PROFILE))
+            {
+                t.version_label = XSD11_UNICODE_PROFILE.to_string();
+            }
+            if !t.expected_versions.is_empty() {
+                let applies = |v: &Option<String>| match v.as_deref() {
+                    Some("1.1") => 0,
+                    Some(label) if label == t.version_label && !is_xsd_version(label) => 1,
+                    None => 2,
+                    Some(_) => 3,
+                };
+                t.expected = t
+                    .expected_versions
+                    .iter()
+                    .filter(|ve| applies(&ve.version) < 3)
+                    .min_by_key(|ve| applies(&ve.version))
+                    .map(|ve| ve.outcome)
+                    .unwrap_or(ExpectedOutcome::NotPrescribed);
+            }
+            t
+        })
+        .collect()
 }
 
 /// Conformance test runner
@@ -1310,14 +1390,13 @@ fn validate_instance_pass(
         ValidationEventHandler,
     };
 
-    // Conformance runs identity-constraint processing on top of the
-    // strict-conformance default flags. `ALLOW_XML_ATTRIBUTES` is deliberately
+    // Conformance runs the strict-conformance default flags (identity
+    // constraints are always enforced). `ALLOW_XML_ATTRIBUTES` is deliberately
     // NOT added — the W3C XSD test suite exercises the spec rule that
     // xml:lang / xml:space / xml:base must be matched by a declared attribute
     // use or an attribute wildcard whose namespace constraint admits the
     // xml namespace (e.g. open044/open045).
-    let mut flags = xsd_schema::validation::ValidationFlags::default()
-        | xsd_schema::validation::ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let mut flags = xsd_schema::validation::ValidationFlags::default();
 
     // Acceptance check for PERF_LAZY_PSVI Phase 2: CONF_NO_PSVI=1 clears
     // BUILD_PSVI_TYPED_VALUES so the whole suite runs the opt-out path. Pass/fail
@@ -1724,6 +1803,7 @@ fn main() {
     let mut max_tests: usize = 0;
     let mut verbose = false;
     let mut expect_pass = false;
+    let mut versionless_11 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -1764,6 +1844,9 @@ fn main() {
             "--expect-pass" => {
                 expect_pass = true;
             }
+            "--versionless-1.1" => {
+                versionless_11 = true;
+            }
             "--help" | "-h" => {
                 println!("XSD Conformance Test Driver");
                 println!();
@@ -1777,6 +1860,12 @@ fn main() {
                 println!("  -m, --max NUM           Maximum number of tests to run");
                 println!("  -v, --verbose           Enable verbose output");
                 println!("  --expect-pass           Exit non-zero if any test fails or errors");
+                println!(
+                    "  --versionless-1.1       Run only the tests without an XSD version in the"
+                );
+                println!(
+                    "                          manifest (run as 1.0 by default) under XSD 1.1"
+                );
                 println!("  -h, --help              Show this help message");
                 return;
             }
@@ -1828,6 +1917,20 @@ fn main() {
                 }
             }
         }
+    };
+
+    let tests = if versionless_11 {
+        if version_filter.is_some() {
+            eprintln!(
+                "Error: --versionless-1.1 selects its own tests; do not combine it with --version"
+            );
+            std::process::exit(2);
+        }
+        let t = versionless_under_xsd11(tests);
+        println!("Versionless tests run under XSD 1.1: {}", t.len());
+        t
+    } else {
+        tests
     };
 
     if tests.is_empty() {

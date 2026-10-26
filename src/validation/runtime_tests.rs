@@ -7714,7 +7714,7 @@ fn test_psvi_identity_constraint_tables() {
             </xs:element>
         </xs:schema>"#,
     );
-    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let flags = ValidationFlags::default();
     let validator = SchemaValidator::new(&schema_set, flags);
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
@@ -9141,7 +9141,7 @@ fn test_ic_singleton_list_equals_atomic() {
 /// reference, and return the constraint codes of the errors.
 fn ic_list_key_errors(xsd: &str, keys: &[&str], refs: &[&str]) -> Vec<String> {
     let schema_set = load_schema(xsd);
-    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let flags = ValidationFlags::default();
     let validator = SchemaValidator::new(&schema_set, flags);
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
@@ -9577,7 +9577,7 @@ fn test_xsd11_ic_ref_resolves_global() {
         </xs:schema>"#,
     );
 
-    let flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let flags = ValidationFlags::default();
     let validator = SchemaValidator::new(&schema_set, flags);
     let mut v = validator.start_run(TestSink::new());
     let ns = empty_ns_context();
@@ -10600,10 +10600,7 @@ mod diagnostic_context_tests {
                 </xs:element>
             </xs:schema>"#,
         );
-        let validator = SchemaValidator::new(
-            &schema_set,
-            ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS,
-        );
+        let validator = SchemaValidator::new(&schema_set, ValidationFlags::default());
         let mut v = validator.start_run(TestSink::new());
         let ns = empty_ns_context();
         v.validate_element("root", "", None, None, &ns);

@@ -95,12 +95,20 @@ bitflags! {
     pub struct ValidationFlags: u32 {
         /// Report warnings in addition to errors (default on).
         const REPORT_WARNINGS = 0x0001;
-        /// Process identity constraints (key, unique, keyref).
+        /// Has no effect: identity constraints (`xs:key`, `xs:unique`,
+        /// `xs:keyref`) are always enforced.
         ///
-        /// When this bit is clear, the runtime still parses `xs:key` /
-        /// `xs:unique` / `xs:keyref` declarations but skips constraint
-        /// evaluation during instance validation. Clear this bit to save
-        /// work when you only need type-level validation.
+        /// They are part of an element's validity — Structures §3.3.4.3
+        /// Element Locally Valid (Element), clause 6: "E is ·valid· with
+        /// respect to each of the {identity-constraint definitions} as per
+        /// Identity-constraint Satisfied (§3.11.4)" — and the runtime has
+        /// always enforced them whether or not this bit was set; their cost
+        /// is paid only by elements in the scope of a constraint. Setting or
+        /// clearing the bit changes nothing; remove it from your flags.
+        #[deprecated(
+            since = "0.3.0",
+            note = "identity constraints are always enforced; the flag has no effect"
+        )]
         const PROCESS_IDENTITY_CONSTRAINTS = 0x0002;
         /// Accept every attribute in the reserved
         /// `http://www.w3.org/XML/1998/namespace` namespace (i.e. `xml:lang`,
@@ -152,17 +160,17 @@ impl Default for ValidationFlags {
     /// The strict-conformance defaults.
     ///
     /// The default enables `REPORT_WARNINGS` and `BUILD_PSVI_TYPED_VALUES`
-    /// (PSVI typed/normalized values are retained for back-compat). Identity
-    /// constraints, `xml:*` leniency, strict-mode warning promotion, and XSD
-    /// 1.1 assertion processing are all opt-in — combine them with `|`; PSVI
-    /// retention is opt-*out* — remove it with `& !`:
+    /// (PSVI typed/normalized values are retained for back-compat).
+    /// `xml:*` leniency, strict-mode warning promotion, and XSD 1.1 assertion
+    /// processing are opt-in — combine them with `|`; PSVI retention is
+    /// opt-*out* — remove it with `& !`. Identity constraints are always
+    /// enforced (the `PROCESS_IDENTITY_CONSTRAINTS` bit is deprecated and has
+    /// no effect):
     ///
     /// ```
     /// use xsd_schema::validation::ValidationFlags;
     ///
-    /// let flags = ValidationFlags::default()
-    ///     | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
-    ///     | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+    /// let flags = ValidationFlags::default() | ValidationFlags::ALLOW_XML_ATTRIBUTES;
     /// // Opt out of PSVI value retention for faster streaming:
     /// let lean = ValidationFlags::default() & !ValidationFlags::BUILD_PSVI_TYPED_VALUES;
     /// # let _ = (flags, lean);
@@ -324,11 +332,17 @@ pub struct SchemaInfo {
     /// (Element), Structures §3.3.4.3; PSVI \[schema specified\] "schema",
     /// §3.3.5.5)
     pub is_default: bool,
-    /// Whether the element is ·nilled· (Structures §3.3.1: "1 E has xsi:nil =
-    /// true. 2 D.{nillable} = true", with respect to its governing element
-    /// declaration D) — `xsi:nil="true"` on an element whose declaration is
-    /// nillable. `false` without a declaration and on a non-nillable one
-    /// (where `xsi:nil` is `cvc-elt.3.1`).
+    /// For an element's start: whether the element is ·nilled· (Structures
+    /// §3.3.1: "1 E has xsi:nil = true. 2 D.{nillable} = true", with respect
+    /// to its governing element declaration D) — `xsi:nil="true"` on an
+    /// element whose declaration is nillable. `false` without a declaration
+    /// and on a non-nillable one (where `xsi:nil` is `cvc-elt.3.1`).
+    ///
+    /// For an element's end (`validate_end_element`): its \[nil\] (§3.3.5.3:
+    /// "true if clause 3.2.3 of Element Locally Valid (Element) … is
+    /// satisfied, otherwise false"), so also `false` for a nilled element
+    /// that has character or element \[children\] (clause 3.2.3.1; the
+    /// element is invalid, `cvc-elt.3.2.1`).
     pub is_nil: bool,
     /// Content type of the element (Empty, TextOnly, ElementOnly, Mixed)
     pub content_type: Option<ContentType>,
@@ -633,10 +647,13 @@ mod tests {
         assert!(flags.contains(ValidationFlags::REPORT_WARNINGS));
         // PSVI typed/normalized values are retained by default (opt-out).
         assert!(flags.contains(ValidationFlags::BUILD_PSVI_TYPED_VALUES));
-        // Strict-conformance defaults: ALLOW_XML_ATTRIBUTES, identity
-        // constraints, and strict-mode warning promotion are all opt-in.
+        // Strict-conformance defaults: ALLOW_XML_ATTRIBUTES and strict-mode
+        // warning promotion are opt-in. (Identity constraints are always
+        // enforced; their deprecated bit stays out of the default value.)
         assert!(!flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
-        assert!(!flags.contains(ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS));
+        #[allow(deprecated)]
+        let ic = ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+        assert!(!flags.contains(ic));
         assert!(!flags.contains(ValidationFlags::STRICT_MODE));
     }
 
@@ -645,10 +662,10 @@ mod tests {
         let flags = ValidationFlags::REPORT_WARNINGS | ValidationFlags::STRICT_MODE;
         assert!(flags.contains(ValidationFlags::REPORT_WARNINGS));
         assert!(flags.contains(ValidationFlags::STRICT_MODE));
-        assert!(!flags.contains(ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS));
+        assert!(!flags.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
 
-        let combined = flags | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
-        assert!(combined.contains(ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS));
+        let combined = flags | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+        assert!(combined.contains(ValidationFlags::ALLOW_XML_ATTRIBUTES));
     }
 
     #[cfg(feature = "xsd11")]

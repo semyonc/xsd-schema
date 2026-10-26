@@ -35,7 +35,7 @@ use super::context::{AttrNameSet, ElementValidationState, ValidatorState};
 use super::errors::{
     self, ExpandedName, InstancePath, PathStep, ValidationError, ValidationSubject,
 };
-use super::identity::{CompiledIdentityConstraint, ConstraintStruct, KeyTable};
+use super::identity::{CompiledIdentityConstraint, ConstraintStruct, IndexedKeyTable, KeyTable};
 #[cfg(feature = "xsd11")]
 use super::info::{AssertionOutcome, InheritedAttribute};
 use super::info::{
@@ -205,19 +205,6 @@ enum AttributeOwnerType {
     /// The element admits no attribute use at all (a simple-typed element):
     /// the attribute was rejected and this is its `SchemaInfo`.
     NotAllowed(SchemaInfo),
-}
-
-/// A keyref whose referenced key/unique table was not in scope when the
-/// keyref's element closed; retried as its ancestors close.
-struct DeferredKeyref {
-    table: KeyTable,
-    refer_key: Option<IdentityConstraintKey>,
-    /// Serials of the elements a failure would still invalidate: the keyref's
-    /// own element and the run of strictly assessed ancestors above it, as of
-    /// the deferral (see `ValidationRuntime::invalidity_reach`).
-    reach: Vec<u64>,
-    /// The keyref's element, which a later failure is reported about.
-    context: ErrorContext,
 }
 
 // ---------------------------------------------------------------------------
@@ -595,11 +582,10 @@ pub struct ValidationRuntime<'a, S: ValidationSink> {
     unparsed_entities: Option<HashSet<String>>,
     /// Limits on the document a quick-xml driver reads in this run.
     parse_limits: crate::xml::ParseLimits,
-    /// Per-element scope stack of key/unique tables
-    ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, KeyTable>>>,
-    /// Keyrefs whose refer target was not yet available when they deactivated.
-    /// Carried upward and retried after each scope propagation.
-    deferred_keyrefs: Vec<DeferredKeyref>,
+    /// Per-element scope stack of key/unique tables: an element's slot holds
+    /// the node tables of its [identity-constraint table] (Structures
+    /// §3.11.5) — its own constraints' and those propagated from its children.
+    ic_scope_tables: Vec<Option<HashMap<IdentityConstraintKey, IndexedKeyTable>>>,
     /// A duplicate ID (cvc-id.2) was reported since the current validation
     /// root opened; the root is then invalid (§3.3.4.3 clause 7, §3.3.4.5
     /// clause 2). Applied and cleared when the root closes.
@@ -1158,7 +1144,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             unparsed_entities: None,
             parse_limits: crate::xml::ParseLimits::none(),
             ic_scope_tables: Vec::new(),
-            deferred_keyrefs: Vec::new(),
             root_id_conflict: false,
             root_idref_start: 0,
             final_ic_tables: None,
@@ -4001,7 +3986,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         cs.set_field_value(field_idx, value.clone(), typed_value.clone());
                     if already_matched {
                         multi_node_defaults.push((
-                            cs.key_table.constraint_name,
+                            cs.key_table.table().constraint_name,
                             field_idx,
                             cs.owner_depth,
                         ));
@@ -5063,9 +5048,10 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
 
     /// F2/B1 step 3: identity-constraint scope teardown.
     ///
-    /// Records selector/field values for this element, pops the IC scope table
-    /// and propagates key/unique tables to the parent (or saves the root
-    /// tables), then retries deferred keyrefs against the enriched parent scope.
+    /// Records selector/field values for this element, checks the keyrefs whose
+    /// scope it is against its own [identity-constraint table], pops the IC
+    /// scope table and propagates key/unique tables to the parent (or saves
+    /// the root tables).
     fn finish_identity_constraints(&mut self, ev_state: &mut ElementValidationState) {
         // 3. Identity constraint processing (field values + scope exit + keyref cross-ref)
         // §3.11.4 Identity-constraint Satisfied clause 3: a field node must have
@@ -5093,109 +5079,31 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             is_complex_content,
             &mut ev_state.error_codes,
             &mut ev_state.validity,
-            ev_state.element_serial,
         );
 
         // 3b. Pop scope table and propagate key/unique tables upward to parent
+        // (§3.11.5 [node table] clause 1: the entries of the children's tables).
         if let Some(Some(scope_map)) = self.ic_scope_tables.pop() {
             if let Some(parent_slot) = self.ic_scope_tables.last_mut() {
                 let parent_map = parent_slot.get_or_insert_with(HashMap::new);
                 for (ic_key, key_table) in scope_map {
-                    parent_map
-                        .entry(ic_key)
-                        .and_modify(|existing| {
-                            existing.sequences.extend(key_table.sequences.clone())
-                        })
-                        .or_insert(key_table);
+                    match parent_map.entry(ic_key) {
+                        std::collections::hash_map::Entry::Occupied(mut existing) => {
+                            existing.get_mut().append(key_table)
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(key_table);
+                        }
+                    }
                 }
             } else {
                 // Root element — save for public access via identity_constraint_tables()
-                self.final_ic_tables = Some(scope_map);
-            }
-        }
-
-        // 3c. Retry deferred keyrefs against enriched parent scope
-        if !self.deferred_keyrefs.is_empty() {
-            let pending = std::mem::take(&mut self.deferred_keyrefs);
-            let name_table = &self.schema_set.name_table;
-            let scope_empty = self.ic_scope_tables.is_empty();
-            let mut still_deferred = Vec::new();
-            let mut deferred_errors = Vec::new();
-            // Reaches of the keyrefs that failed here: the keyref's own element
-            // has closed, so its verdict lands on the open part of its reach.
-            let mut failed_reaches: Vec<Vec<u64>> = Vec::new();
-            for deferred in pending {
-                let DeferredKeyref {
-                    table: keyref_table,
-                    refer_key,
-                    reach,
-                    context,
-                } = deferred;
-                let target = refer_key.and_then(|rk| {
-                    self.ic_scope_tables
-                        .last()
-                        .and_then(|slot| slot.as_ref())
-                        .and_then(|map| map.get(&rk))
-                });
-                match target {
-                    Some(target_table) => {
-                        let errs = keyref_table.check_keyref_against(target_table, name_table);
-                        if !errs.is_empty() {
-                            failed_reaches.push(reach);
-                        }
-                        deferred_errors
-                            .extend(errs.into_iter().map(|err| context.attach(err, false)));
-                    }
-                    None => {
-                        if scope_empty {
-                            // Root element closed — no more ancestors to try
-                            let keyref_name = name_table.resolve(keyref_table.constraint_name);
-                            let refer_display = self
-                                .compiled_constraints
-                                .get(&keyref_table.ic_key)
-                                .and_then(|opt| opt.as_ref())
-                                .and_then(|compiled| {
-                                    compiled.refer.as_ref().map(|refer| {
-                                        let refer_ns =
-                                            refer.namespace.or(compiled.target_namespace);
-                                        format_resolved_qname(
-                                            name_table,
-                                            refer_ns,
-                                            refer.local_name,
-                                        )
-                                    })
-                                })
-                                .unwrap_or_else(|| "<unknown>".to_string());
-                            let err = errors::error(
-                                "cvc-identity-constraint.4.3",
-                                format!(
-                                    "Keyref '{}' references unknown constraint '{}'",
-                                    keyref_name, refer_display
-                                ),
-                                None,
-                            );
-                            deferred_errors.push(context.attach(err, false));
-                            failed_reaches.push(reach);
-                        } else {
-                            still_deferred.push(DeferredKeyref {
-                                table: keyref_table,
-                                refer_key,
-                                reach,
-                                context,
-                            });
-                        }
-                    }
-                }
-            }
-            self.deferred_keyrefs = still_deferred;
-            for reach in &failed_reaches {
-                self.invalidate_late(reach, ev_state);
-            }
-            // Emit deferred errors directly through the sink (not emit_error) because
-            // the original keyref element has already been popped from validation_stack.
-            // Using emit_error() would misattribute the error to the current ancestor.
-            for err in deferred_errors {
-                self.sink.on_error(err);
+                self.final_ic_tables = Some(
+                    scope_map
+                        .into_iter()
+                        .map(|(ic_key, table)| (ic_key, table.into_table()))
+                        .collect(),
+                );
             }
         }
     }
@@ -5330,7 +5238,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             validity,
             validation_attempted,
             is_default: ev_state.is_default,
-            is_nil: ev_state.is_nil,
+            // [nil] (§3.3.5.3): "true if clause 3.2.3 of Element Locally
+            // Valid (Element) … is satisfied" — not for a nilled element with
+            // character or element [children], whose clause 3.2.3.1 failed
+            // (`cvc-elt.3.2.1`, recorded on the element's own codes).
+            is_nil: ev_state.is_nil && !ev_state.error_codes.contains(&"cvc-elt.3.2.1"),
             content_type: ev_state.content_type,
             typed_value: ev_state.typed_value.take(),
             normalized_value: ev_state.normalized_value.take(),
@@ -6528,10 +6440,9 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     /// deactivate finished constraints, and perform scope-local keyref
     /// cross-reference.
     ///
-    /// `validity` and `serial` are the closing element's `[validity]` and
-    /// element serial: a violation of a constraint that element carries (its
-    /// scope just closed, or a field or selector match finished here) makes it
-    /// invalid (§3.3.4.3 clause 6).
+    /// `validity` is the closing element's `[validity]`: a violation of a
+    /// constraint that element carries (its scope just closed, or a field or
+    /// selector match finished here) makes it invalid (§3.3.4.3 clause 6).
     #[allow(clippy::too_many_arguments)]
     fn process_constraints_end_element(
         &mut self,
@@ -6541,7 +6452,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         is_complex_content: bool,
         error_codes: &mut Vec<&'static str>,
         validity: &mut SchemaValidity,
-        serial: u64,
     ) {
         // 1. Advance all constraints (field value collection + key sequence
         //    finalization). Gated on a non-empty active list so the common
@@ -6593,73 +6503,103 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             }
         }
 
-        // 3. Scope-local keyref cross-reference using ic_scope_tables
+        // 3. Keyrefs against the closing element's [identity-constraint table]
         if !deactivated.is_empty() {
             let mut scope_keyrefs: Vec<(KeyTable, Option<IdentityConstraintKey>)> = Vec::new();
 
             // Deactivated constraints belong to the closing element (their
             // scope element): a keyref failure below is its violation.
             for cs in deactivated {
-                if cs.key_table.kind == IdentityKind::Keyref {
+                if cs.key_table.table().kind == IdentityKind::Keyref {
                     // Extract the resolved refer_key from the compiled constraint
                     let refer_key = self
                         .compiled_constraints
                         .get(&cs.ic_key)
                         .and_then(|opt| opt.as_ref())
                         .and_then(|compiled| compiled.refer_key);
-                    scope_keyrefs.push((cs.key_table, refer_key));
+                    scope_keyrefs.push((cs.key_table.into_table(), refer_key));
                 } else {
                     // Insert key/unique table into current scope
                     let scope_slot = self.ic_scope_tables.last_mut();
                     if let Some(slot) = scope_slot {
                         let scope_map = slot.get_or_insert_with(HashMap::new);
-                        let ic_key = cs.key_table.ic_key;
-                        scope_map
-                            .entry(ic_key)
-                            .and_modify(|existing| {
-                                existing.sequences.extend(cs.key_table.sequences.clone())
-                            })
-                            .or_insert(cs.key_table);
+                        match scope_map.entry(cs.ic_key) {
+                            std::collections::hash_map::Entry::Occupied(mut existing) => {
+                                existing.get_mut().append(cs.key_table)
+                            }
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(cs.key_table);
+                            }
+                        }
                     }
                 }
             }
 
-            // Cross-reference each keyref against key/unique tables in current scope.
-            // The scope map already contains child-propagated tables.
-            // If the target isn't in scope yet (ancestor key), defer to parent.
+            // §3.11.4 clause 4.3: "there is a ·node table· associated with the
+            // {referenced key} in the [identity-constraint table] of E … and
+            // there is an entry in that table whose ·key-sequence· is equal or
+            // identical to the keyref member's ·key-sequence·". E's table is
+            // the scope map of the closing element: its own key/unique tables
+            // and those its children propagated (§3.11.5). A key on a sibling
+            // or an ancestor is not in it — "only element information items
+            // within the sub-tree rooted at the element information item being
+            // ·validated· can be referenced successfully" — so a keyref member
+            // finds no entry then.
             let name_table = &self.schema_set.name_table;
             for (keyref_table, refer_key) in scope_keyrefs {
-                let target = refer_key.and_then(|rk| {
-                    self.ic_scope_tables
-                        .last()
-                        .and_then(|slot| slot.as_ref())
-                        .and_then(|map| map.get(&rk))
-                });
-                match target {
-                    Some(target_table) => {
-                        let errs = keyref_table.check_keyref_against(target_table, name_table);
-                        if !errs.is_empty() {
-                            invalidate(validity);
-                        }
-                        for err in errs {
-                            self.emit_error_to(err, error_codes);
-                        }
-                    }
+                let errs = match refer_key {
                     None => {
-                        // Target not yet in scope — defer to ancestor element end.
-                        // A later failure invalidates this (closing) element —
-                        // when it is retried still within this close — or the
-                        // open ancestors its verdict reaches.
-                        let mut reach = self.invalidity_reach();
-                        reach.push(serial);
-                        let context = self.capture_context();
-                        self.deferred_keyrefs.push(DeferredKeyref {
-                            table: keyref_table,
-                            refer_key,
-                            reach,
-                            context,
-                        });
+                        // Unresolvable at run time (the schema check resolves
+                        // every `refer`): report the keyref once.
+                        let keyref_name = name_table.resolve(keyref_table.constraint_name);
+                        let refer_display = self
+                            .compiled_constraints
+                            .get(&keyref_table.ic_key)
+                            .and_then(|opt| opt.as_ref())
+                            .and_then(|compiled| {
+                                compiled.refer.as_ref().map(|refer| {
+                                    let refer_ns = refer.namespace.or(compiled.target_namespace);
+                                    format_resolved_qname(name_table, refer_ns, refer.local_name)
+                                })
+                            })
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        vec![errors::error(
+                            "cvc-identity-constraint.4.3",
+                            format!(
+                                "Keyref '{}' references unknown constraint '{}'",
+                                keyref_name, refer_display
+                            ),
+                            None,
+                        )]
                     }
+                    Some(rk) => {
+                        let target = self
+                            .ic_scope_tables
+                            .last()
+                            .and_then(|slot| slot.as_ref())
+                            .and_then(|map| map.get(&rk));
+                        match target {
+                            Some(target_table) => {
+                                target_table.check_keyref(&keyref_table, name_table)
+                            }
+                            // No node table for the referenced key in E's
+                            // table: every complete keyref member is unmatched.
+                            None => {
+                                let target_name =
+                                    self.schema_set.arenas.identity_constraints[rk].name;
+                                keyref_table.check_keyref_against(
+                                    &KeyTable::new(rk, target_name, IdentityKind::Key),
+                                    name_table,
+                                )
+                            }
+                        }
+                    }
+                };
+                if !errs.is_empty() {
+                    invalidate(validity);
+                }
+                for err in errs {
+                    self.emit_error_to(err, error_codes);
                 }
             }
         }
@@ -6682,46 +6622,6 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
     fn invalidate_open_ic_owner(&mut self, owner_depth: usize) {
         if let Some(owner) = self.validation_stack.get_mut(owner_depth) {
             invalidate(&mut owner.validity);
-        }
-    }
-
-    /// For an element that just closed (already popped): the serial numbers of
-    /// the open ancestors its `invalid` would still reach — the unbroken run
-    /// of strictly assessed elements from its parent upward (§3.3.5.1
-    /// `[validity]` clause 1.1.2; a laxly assessed ancestor is `notKnown`,
-    /// clause 2, and stops the run). Used for a verdict on that element that
-    /// is only known later, after the ancestors in the run may have closed.
-    fn invalidity_reach(&self) -> Vec<u64> {
-        let run = self
-            .validation_stack
-            .iter()
-            .rev()
-            .take_while(|ev| ev.strictly_assessed)
-            .count();
-        let start = self.validation_stack.len() - run;
-        self.validation_stack[start..]
-            .iter()
-            .map(|ev| ev.element_serial)
-            .collect()
-    }
-
-    /// Apply a late verdict on an element that has closed: invalidate the
-    /// deepest still-open element of its `reach` (see
-    /// [`invalidity_reach`](Self::invalidity_reach)) — `closing` (the element
-    /// being closed now, already popped) if it is in the reach, else the
-    /// innermost stack entry that is. Every other open member of the reach is
-    /// an ancestor of that one and follows through the usual child→parent
-    /// propagation when it closes.
-    fn invalidate_late(&mut self, reach: &[u64], closing: &mut ElementValidationState) {
-        if reach.contains(&closing.element_serial) {
-            invalidate(&mut closing.validity);
-        } else if let Some(open) = self
-            .validation_stack
-            .iter_mut()
-            .rev()
-            .find(|ev| reach.contains(&ev.element_serial))
-        {
-            invalidate(&mut open.validity);
         }
     }
 
@@ -7237,7 +7137,11 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
             let matches = cs.matching_fields(local_name, ns);
             for field_idx in matches {
                 if cs.increment_field_match_count(field_idx) {
-                    multi_node_ic.push((cs.key_table.constraint_name, field_idx, cs.owner_depth));
+                    multi_node_ic.push((
+                        cs.key_table.table().constraint_name,
+                        field_idx,
+                        cs.owner_depth,
+                    ));
                 }
             }
         }
@@ -7392,7 +7296,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         cs.set_field_value(field_idx, value.to_string(), ic_typed_value.clone());
                     if already_matched {
                         multi_node_ic.push((
-                            cs.key_table.constraint_name,
+                            cs.key_table.table().constraint_name,
                             field_idx,
                             cs.owner_depth,
                         ));

@@ -988,35 +988,59 @@ fn assertion_errors(set: &SchemaSet, xml: &str) -> Vec<String> {
     codes
 }
 
-/// An assertion does not see the casts and constructors of user types: the
-/// verdicts are the ones they had before those existed. Built-in casts and
-/// constructors, and `instance of` a user type, are evaluated.
+/// An assertion does not see the casts, constructors or other names of user
+/// types: its static context has only the built-in components (Structures 1.1
+/// §3.13.6.2 clause 2.2.5), so naming one is a static error and the schema is
+/// invalid (`as-props-correct`). Built-in casts and constructors are
+/// evaluated.
 #[test]
 fn assertions_keep_user_type_casts_and_constructors_out() {
-    let set = compile_set(XsdVersion::V1_1, ASSERT_SCHEMA);
-    let ns = r#"xmlns:my="urn:c37""#;
-    let mut failures = Vec::new();
-    for (xml, expected) in [
-        // `castable as my:t` is false whatever the value.
-        (format!(r#"<my:castable {ns} a="7"/>"#), "cvc-assertion"),
-        (format!(r#"<my:castable {ns} a="70"/>"#), "cvc-assertion"),
-        (format!(r#"<my:notCastable {ns} a="7"/>"#), ""),
-        // `cast as my:t` is XPST0051 when evaluated, `my:t(..)` XPST0017.
-        (format!(r#"<my:cast {ns} a="7"/>"#), "cvc-assertion"),
-        (format!(r#"<my:ctor {ns} a="7"/>"#), "cvc-assertion"),
-        // The same in an assertion facet of a simple type.
-        (format!(r#"<my:facet {ns}>7</my:facet>"#), "cvc-assertion"),
-        // Built-in casts and constructors, and `instance of`, are evaluated.
-        (format!(r#"<my:builtin {ns} a="7"/>"#), ""),
-        (format!(r#"<my:builtin {ns} a="12"/>"#), "cvc-assertion"),
-        (format!(r#"<my:typed {ns} h="7"/>"#), ""),
-    ] {
-        let got = assertion_errors(&set, &xml).join(" ");
-        if got != expected {
-            failures.push(format!("{xml}: [{got}] (expected [{expected}])"));
+    // Every one of these assertions names `my:hatSize`.
+    for assertion in ["castable", "notCastable", "cast", "ctor", "typed", "facet"] {
+        let mut xsd = ASSERT_SCHEMA.to_string();
+        for other in ["castable", "notCastable", "cast", "ctor", "typed"] {
+            if other != assertion {
+                let start = xsd
+                    .find(&format!(r#"<xs:element name="{other}">"#))
+                    .unwrap();
+                let end =
+                    start + xsd[start..].find("</xs:element>").unwrap() + "</xs:element>".len();
+                xsd.replace_range(start..end, "");
+            }
         }
+        if assertion != "facet" {
+            xsd = xsd.replace(
+                r#"<xs:assertion test="$value castable as my:hatSize"/>"#,
+                "",
+            );
+        }
+        let err = SchemaSetBuilder::with_version(XsdVersion::V1_1)
+            .add_source(&xsd, "file:///c37.xsd")
+            .and_then(|b| b.compile())
+            .err()
+            .unwrap_or_else(|| panic!("{assertion}: schema accepted"));
+        assert!(
+            err.to_string().contains("as-props-correct"),
+            "{assertion}: {err}"
+        );
     }
-    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    // Built-in casts and constructors are evaluated.
+    let builtin_only = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+           targetNamespace="urn:c37" xmlns:my="urn:c37" elementFormDefault="qualified">
+  <xs:element name="builtin">
+    <xs:complexType>
+      <xs:attribute name="a" type="xs:string"/>
+      <xs:assert test="xs:integer(@a) le 10 and @a castable as xs:byte"/>
+    </xs:complexType>
+  </xs:element>
+</xs:schema>"#;
+    let set = compile_set(XsdVersion::V1_1, builtin_only);
+    let ns = r#"xmlns:my="urn:c37""#;
+    assert!(assertion_errors(&set, &format!(r#"<my:builtin {ns} a="7"/>"#)).is_empty());
+    assert_eq!(
+        assertion_errors(&set, &format!(r#"<my:builtin {ns} a="12"/>"#)),
+        ["cvc-assertion"]
+    );
 }
 
 /// A type alternative's test that calls a user type's constructor is a type
@@ -1059,10 +1083,10 @@ fn a_type_alternative_calling_a_user_constructor_is_a_schema_error() {
 }
 
 /// An assertion facet that casts to a user type — even the type it constrains
-/// — cannot reach that type: the cast is not in its static context, so
-/// `castable as` is false and the facet fails. (The engine also guards the
-/// facet check against re-entry, see `schema_cast::check_facets`; with
-/// assertions kept out of user-type casts nothing reaches the guard.)
+/// — cannot reach that type: the cast is not in its static context (only the
+/// built-in components are), so the schema is invalid. (The engine also
+/// guards the facet check against re-entry, see `schema_cast::check_facets`;
+/// with assertions kept out of user types nothing reaches the guard.)
 #[test]
 fn an_assertion_facet_cannot_cast_to_its_own_type() {
     let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
@@ -1085,16 +1109,12 @@ fn an_assertion_facet_cannot_cast_to_its_own_type() {
   </xs:simpleType>
   <xs:element name="e" type="my:selfish"/>
 </xs:schema>"#;
-    let set = compile_set(XsdVersion::V1_1, xsd);
-    let ctx = context(&set);
-    assert_eq!(eval(&ctx, "my:selfish(4)"), "error:FORG0001");
-    assert_eq!(eval(&ctx, "4 castable as my:selfish"), "false");
-    assert_eq!(eval(&ctx, "my:ping(4)"), "error:FORG0001");
-    assert_eq!(eval(&ctx, "my:identity(4)"), "error:FORG0001");
-    assert_eq!(
-        assertion_errors(&set, r#"<my:e xmlns:my="urn:c37">4</my:e>"#),
-        vec!["cvc-assertion".to_string()]
-    );
+    let err = SchemaSetBuilder::with_version(XsdVersion::V1_1)
+        .add_source(xsd, "file:///c37.xsd")
+        .and_then(|b| b.compile())
+        .err()
+        .expect("schema refused");
+    assert!(err.to_string().contains("as-props-correct"), "{err}");
 }
 
 /// A tree bound twice binds the same: a node made from an unprefixed

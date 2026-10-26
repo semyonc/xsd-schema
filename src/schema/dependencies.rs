@@ -39,6 +39,12 @@ pub struct DependencyGraph {
     /// All types in the graph
     all_types: HashSet<TypeKey>,
 
+    /// All types in the order they were first added — the order every pass
+    /// over the graph follows, so that the compilation order (and with it the
+    /// first error reported among independent types) does not depend on hash
+    /// order
+    order: Vec<TypeKey>,
+
     /// Topologically sorted type keys (dependencies first)
     /// Populated after calling sort()
     sorted_types: Vec<TypeKey>,
@@ -60,6 +66,7 @@ impl DependencyGraph {
             dependencies: HashMap::new(),
             dependents: HashMap::new(),
             all_types: HashSet::new(),
+            order: Vec::new(),
             sorted_types: Vec::new(),
             is_sorted: false,
         }
@@ -67,8 +74,14 @@ impl DependencyGraph {
 
     /// Add a type to the graph (without dependencies)
     pub fn add_type(&mut self, type_key: TypeKey) {
-        self.all_types.insert(type_key);
+        self.insert_type(type_key);
         self.is_sorted = false;
+    }
+
+    fn insert_type(&mut self, type_key: TypeKey) {
+        if self.all_types.insert(type_key) {
+            self.order.push(type_key);
+        }
     }
 
     /// Add a type dependency (derived_type depends on base_type)
@@ -76,8 +89,8 @@ impl DependencyGraph {
     /// This means base_type must be compiled before derived_type.
     pub fn add_dependency(&mut self, derived: TypeKey, base: TypeKey) {
         // Add both types to the graph
-        self.all_types.insert(derived);
-        self.all_types.insert(base);
+        self.insert_type(derived);
+        self.insert_type(base);
 
         // Add forward edge: derived -> base (derived depends on base)
         self.dependencies.entry(derived).or_default().push(base);
@@ -129,7 +142,7 @@ impl DependencyGraph {
 
         // Calculate in-degrees (number of dependencies for each type)
         let mut in_degree: HashMap<TypeKey, usize> = HashMap::new();
-        for type_key in &self.all_types {
+        for type_key in &self.order {
             let deps = self
                 .dependencies
                 .get(type_key)
@@ -138,11 +151,13 @@ impl DependencyGraph {
             in_degree.insert(*type_key, deps);
         }
 
-        // Queue of types with no dependencies (in-degree 0)
-        let mut queue: VecDeque<TypeKey> = in_degree
+        // Queue of types with no dependencies (in-degree 0), in the order
+        // the types were added: independent types keep that order.
+        let mut queue: VecDeque<TypeKey> = self
+            .order
             .iter()
-            .filter(|(_, &deg)| deg == 0)
-            .map(|(&key, _)| key)
+            .copied()
+            .filter(|key| in_degree.get(key) == Some(&0))
             .collect();
 
         let mut sorted = Vec::with_capacity(self.all_types.len());
@@ -194,7 +209,7 @@ impl DependencyGraph {
         let mut in_stack = HashSet::new();
         let mut path = Vec::new();
 
-        for &start in &self.all_types {
+        for &start in &self.order {
             if !visited.contains(&start) {
                 if let Some(cycle) =
                     self.dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path)
@@ -249,7 +264,7 @@ impl DependencyGraph {
         let mut in_stack = HashSet::new();
         let mut path = Vec::new();
 
-        for &start in &self.all_types {
+        for &start in &self.order {
             if !visited.contains(&start)
                 && self
                     .dfs_find_cycle(start, &mut visited, &mut in_stack, &mut path)

@@ -350,3 +350,65 @@ fn parse_errors_collected_in_recovery_are_reported_everywhere() {
         );
     }
 }
+
+/// Structures 1.1 §3.13.6.1 / §3.13.6.2 (XPath Valid, clause 2.2.5: only the
+/// built-in components are in scope) and §3.12.6: an assertion, an assertion
+/// facet or a type alternative — on a top-level or a local declaration — that
+/// names a user-defined type is refused by every entry point.
+#[cfg(feature = "xsd11")]
+#[test]
+fn assertion_and_alternative_xpath_is_checked_everywhere() {
+    let ns = r#"targetNamespace="urn:t" xmlns:t="urn:t""#;
+    let small = r#"<xs:simpleType name="small"><xs:restriction base="xs:int"/></xs:simpleType>"#;
+    let cases = [
+        (
+            "assertion",
+            format!(
+                r#"{small}<xs:complexType name="T"><xs:attribute name="a" type="t:small"/>
+                   <xs:assert test="data(@a) instance of t:small"/></xs:complexType>"#
+            ),
+            "as-props-correct",
+        ),
+        (
+            "local assertion",
+            format!(
+                r#"{small}<xs:element name="r"><xs:complexType><xs:sequence>
+                     <xs:element name="x"><xs:complexType>
+                       <xs:attribute name="a" type="t:small"/>
+                       <xs:assert test="(@a cast as t:small) = 1"/>
+                     </xs:complexType></xs:element>
+                   </xs:sequence></xs:complexType></xs:element>"#
+            ),
+            "as-props-correct",
+        ),
+        (
+            "assertion facet",
+            format!(
+                r#"{small}<xs:simpleType name="s"><xs:restriction base="t:small">
+                   <xs:assertion test="t:small($value) = $value"/></xs:restriction></xs:simpleType>"#
+            ),
+            "as-props-correct",
+        ),
+        (
+            "simple-content assertion facet",
+            format!(
+                r#"{small}<xs:complexType name="B"><xs:simpleContent><xs:extension base="t:small"/></xs:simpleContent></xs:complexType>
+                   <xs:complexType name="R"><xs:simpleContent><xs:restriction base="t:B">
+                   <xs:assertion test="$value instance of t:small"/></xs:restriction></xs:simpleContent></xs:complexType>"#
+            ),
+            "as-props-correct",
+        ),
+        (
+            "local type alternative",
+            format!(
+                r#"{small}<xs:element name="r"><xs:complexType><xs:sequence>
+                     <xs:element name="x"><xs:alternative test="exists(@a[. instance of attribute(*, t:small)])" type="xs:anyType"/></xs:element>
+                   </xs:sequence></xs:complexType></xs:element>"#
+            ),
+            "src-ct-alternative",
+        ),
+    ];
+    for (name, body, expected) in cases {
+        assert_parity(name, XsdVersion::V1_1, &schema(ns, &body), Some(expected));
+    }
+}

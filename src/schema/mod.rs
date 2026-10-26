@@ -82,6 +82,8 @@ pub use dependencies::{build_dependency_graph, DependencyGraph, DependencyStats}
 
 // Re-exports from derivation
 #[cfg(feature = "xsd11")]
+pub use cta::validate_assertion_xpath;
+#[cfg(feature = "xsd11")]
 pub use cta::validate_cta_substitutability;
 #[cfg(feature = "xsd11")]
 pub use cta::validate_cta_xpath;

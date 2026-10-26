@@ -32,7 +32,6 @@ fn schema(version: XsdVersion, body: &str) -> SchemaSet {
 }
 
 fn validator(ss: &SchemaSet, flags: ValidationFlags) -> SchemaValidator<'_> {
-    let flags = flags | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
     #[cfg(feature = "xsd11")]
     {
         SchemaValidator::new_fragment_buffer(ss, flags)

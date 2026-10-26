@@ -507,12 +507,18 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
     // element couldn't resolve until now (the local IC was registered by the
     // allocation pass).
     crate::schema::finalize_pending_ic_refs(schema_set)?;
+    // Every identity constraint is in the arena now (top-level and local
+    // elements, every document): a keyref's `refer` may name any of them.
+    crate::schema::inline::validate_all_keyref_refers(schema_set)?;
     // e-props-correct.2 / .4 against local element default/fixed values
     // (saxon `s3_3_4si07/08`).
     validate_element_value_constraints(schema_set)?;
     #[cfg(feature = "xsd11")]
     {
         crate::schema::validate_cta_xpath(schema_set)?;
+        // Every complex and simple type exists now, the inline types of local
+        // elements' alternatives included.
+        crate::schema::validate_assertion_xpath(schema_set)?;
         crate::schema::validate_cta_substitutability(schema_set)?;
     }
     #[cfg(feature = "xsd11")]
@@ -535,8 +541,9 @@ fn finalize_local_element_pass(schema_set: &mut SchemaSet) -> SchemaResult<()> {
 fn xsd11_pre_resolution_validations(schema_set: &SchemaSet) -> SchemaResult<()> {
     // src-type-alternative: only the last <xs:alternative> may omit @test.
     crate::schema::validate_element_type_alternatives(schema_set)?;
-    // §3.12.4: undefined variables, unbound prefixes, user-defined types
-    // in instance-of/cast.
+    // §3.12.6 / §3.13.6.2: XPath Valid with only the built-in components in
+    // the static context (undefined variables, unbound prefixes, user-defined
+    // types and declarations, unknown constructors).
     crate::schema::validate_cta_xpath(schema_set)?;
     // §3.12.6 cos-ct-alternative-substitutable.
     crate::schema::validate_cta_substitutability(schema_set)?;

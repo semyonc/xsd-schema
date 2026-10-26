@@ -176,29 +176,26 @@ with `-`, and test with `.contains(...)`.
 | --- | --- | --- |
 | `REPORT_WARNINGS` | **on** | Emit XSD warnings (non-fatal diagnostics) to the sink alongside errors. Clear this if you only want hard errors. |
 | `BUILD_PSVI_TYPED_VALUES` | **on** | Retain the typed value and whitespace-normalized value (PSVI `[schema actual value]` / `[schema normalized value]`) on the returned `SchemaInfo`, so callers can read `typed_value` / `normalized_value`. On by default for back-compat. **Clear it for validity-only streaming**: the runtime then skips building and keeping values the caller would discard — including an allocation-free fast path for the string family and for the integer hierarchy / `xs:decimal` (no per-value `BigInt`). **Validity and diagnostics are never affected** — values are still materialized internally wherever something *needs* one: a value-space facet (numeric range, `totalDigits`, value-space `enumeration`), a `fixed`/`default` comparison, ID/IDREF/ENTITY, an identity constraint, QName/NOTATION prefix binding, or an XSD 1.1 assertion. The fast paths only *accept* values they can prove valid; anything else defers to the normal path, so the emitted error codes are identical too. Only the *retained output* is dropped: with the bit clear, `SchemaInfo.typed_value` / `normalized_value` are `None` for nodes nothing else consumed. The W3C suite pass/fail set is identical with the bit on or off. |
-| `PROCESS_IDENTITY_CONSTRAINTS` | off | Evaluate `xs:key`, `xs:unique`, and `xs:keyref` during instance validation. Declarations are always *parsed*; this bit controls whether their constraints are *enforced*. Leave off when you only need type-level validation — saves the per-element key/keyref bookkeeping. |
+| `PROCESS_IDENTITY_CONSTRAINTS` | — | **Deprecated, no effect.** `xs:key`, `xs:unique` and `xs:keyref` are always enforced: they are part of an element's validity (Structures §3.3.4.3 clause 6), and the bookkeeping costs only elements in a constraint's scope. Remove the bit from your flags. |
 | `ALLOW_XML_ATTRIBUTES` | off | Accept every attribute in the reserved `http://www.w3.org/XML/1998/namespace` namespace (`xml:lang`, `xml:space`, `xml:base`, `xml:id`) **without** checking the element's complex type for an allowing declaration or wildcard. This is a lenient-parser convenience and is **not** XSD-conformant: the spec requires every attribute (including those in the xml namespace) to be matched by a declared `{attribute use}` or an `{attribute wildcard}` whose namespace constraint admits the xml namespace. Set this bit when you want `xml:lang` to "just work" against schemas that don't explicitly import the xml namespace; leave it clear for strict conformance (e.g. when running the W3C XSD test suite). `xml:base` base-URI tracking for `xsi:schemaLocation` hint resolution happens **regardless** of this flag — the flag only affects whether the attribute itself participates in type-level attribute validation. |
 | `STRICT_MODE` | off | Promote warnings to errors. Combine with `REPORT_WARNINGS`. |
 | `PROCESS_ASSERTIONS` (`xsd11`) | off | Enable XSD 1.1 `xs:assert` processing. `SchemaValidator::new(...)` honours the bit: with it set, assertions are evaluated inline while streaming (the subtree of each asserted element is buffered) — the mode `SchemaValidator::new_fragment_buffer(...)` selects, which sets the bit for you. Without the bit, `xs:assert` is not evaluated and an asserted element reports `AssertionOutcome::NotEvaluated`. (The `assertion` facet of simple types is part of simple-type validation and runs either way.) |
 
 The default — `ValidationFlags::default()` — enables `REPORT_WARNINGS` and
 `BUILD_PSVI_TYPED_VALUES`. This matches the strict-conformance posture:
-identity constraints, `xml:*` leniency, and strict-mode warning promotion are
-all opt-in, and the PSVI typed values are populated for back-compat. Two common
-recipes:
+`xml:*` leniency and strict-mode warning promotion are opt-in, identity
+constraints are always enforced, and the PSVI typed values are populated for
+back-compat. Common recipes:
 
 ```rust
 use xsd_schema::validation::ValidationFlags;
 
-// Strict XSD conformance with key/unique/keyref enforcement:
-let strict = ValidationFlags::default()
-    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+// Strict XSD conformance (key/unique/keyref included):
+let strict = ValidationFlags::default();
 
 // Lenient mode for hand-written schemas: accept xml:lang / xml:space / xml:base
 // on any element even if the schema does not declare them.
-let lenient = ValidationFlags::default()
-    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS
-    | ValidationFlags::ALLOW_XML_ATTRIBUTES;
+let lenient = ValidationFlags::default() | ValidationFlags::ALLOW_XML_ATTRIBUTES;
 
 // Lean streaming: only need valid/invalid + errors, not the PSVI typed values.
 // Drops per-value materialization (incl. BigInt per integer) where nothing
@@ -214,8 +211,7 @@ constructor, which sets the flag for you:
 ```rust
 use xsd_schema::validation::{SchemaValidator, ValidationFlags};
 
-let flags = ValidationFlags::default()
-    | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+let flags = ValidationFlags::default();
 // Both evaluate xs:assert inline while streaming:
 let validator = SchemaValidator::new(&schema_set, flags | ValidationFlags::PROCESS_ASSERTIONS);
 let validator = SchemaValidator::new_fragment_buffer(&schema_set, flags);
@@ -232,6 +228,28 @@ explicitly when you ship XSD 1.1 validation:
 | XSD 1.0, or XSD 1.1 without `xs:assert` | `SchemaValidator::new(...)` |
 | XSD 1.1 with `xs:assert` evaluation, streaming | `SchemaValidator::new(...)` with `PROCESS_ASSERTIONS`, or `SchemaValidator::new_fragment_buffer(...)` |
 | — | `SchemaValidator::new_main_document(...)` selects the `MainDocument` assertion mode, in which **no assertion is evaluated** (an instance that violates an `xs:assert` validates; the asserted element reports `AssertionOutcome::NotEvaluated`). Do not use it to check assertions. |
+
+The XPath of an assertion (`xs:assert`, the `xs:assertion` facet) and of a
+type alternative (`xs:alternative/@test`) sees only the built-in components:
+Structures 1.1 §3.13.6.2 (XPath Valid) gives it a static context whose
+"in-scope schema definitions are those components that are present in every
+schema by definition": the built-in types (`xs:anyType`, the built-in simple
+types) and the four attribute declarations `xsi:type`, `xsi:nil`,
+`xsi:schemaLocation` and `xsi:noNamespaceSchemaLocation`, so
+`schema-attribute(xsi:nil)` is fine — there is no built-in element declaration.
+A test that names a user-defined type or declaration —
+`$value instance of my:t`, `@a cast as my:t`, `my:t(@a)`, `element(*, my:T)`,
+`schema-element(my:e)` — or that has another static error (an undeclared
+prefix, an undefined variable, an unknown `xs:` constructor) makes the
+**schema** invalid: `as-props-correct` for an assertion, `src-ct-alternative`
+for a type alternative. Write such tests against the built-in type the user
+type is derived from (`$value instance of xs:integer`, `@a castable as
+xs:integer and xs:integer(@a) le 10`), or state the condition as facets. A
+function the engine does not know, in a namespace other than the XML Schema
+one, is left to the evaluation: the assertion then fails (`cvc-assertion`)
+and the alternative never matches. Evaluation itself still uses the schema
+set, so a node of a user type derived from `xs:integer` matches
+`element(*, xs:integer)`.
 
 ### Driving validation from a `quick-xml` stream
 

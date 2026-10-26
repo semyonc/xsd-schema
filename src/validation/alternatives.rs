@@ -26,7 +26,7 @@ use crate::xpath::XPathContext;
 // ---------------------------------------------------------------------------
 
 /// Two-level cascade: **alternative-level > schema-document-level**.
-fn resolve_alternative_default_ns(
+pub(crate) fn resolve_alternative_default_ns(
     alt: &AlternativeResult,
     elem_key: ElementKey,
     schema_set: &SchemaSet,
@@ -168,7 +168,11 @@ pub(crate) fn evaluate_type_alternatives(
     // Evaluate each alternative
     for alt in alternatives {
         if let Some(ref test_expr) = alt.test {
-            // Build XPath context with the alternative's namespace snapshot
+            // Build XPath context with the alternative's namespace snapshot.
+            // The schema-time check (`schema::validate_cta_xpath`) refused any
+            // test naming a user-defined component (only the built-in ones
+            // are in its static context, Structures §3.12.6, §3.13.6.2); the
+            // schema set serves the evaluation (type annotations of nodes).
             let ctx = XPathContext::new(&schema_set.name_table)
                 .with_namespaces(alt.ns_snapshot.clone())
                 .with_schema_set(schema_set);

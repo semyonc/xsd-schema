@@ -2021,7 +2021,7 @@ fn union_member_result(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "xsd11")]
-fn resolve_assertion_default_ns(
+pub(crate) fn resolve_assertion_default_ns(
     raw: Option<&str>,
     source: Option<&crate::parser::location::SourceRef>,
     ns_snapshot: &crate::namespace::context::NamespaceContextSnapshot,
@@ -2076,7 +2076,10 @@ pub(crate) fn evaluate_assertion_facets(
             .as_ref()
             .and_then(|s| schema_set.source_maps.locate(s));
 
-        // Build XPath static context
+        // Static context: the schema-time check
+        // (`schema::validate_assertion_xpath`) refused every user-defined name
+        // in the built-ins-only context of XPath Valid; the schema set serves
+        // the evaluation, and `without_schema_casts` stays as a second guard.
         let ctx = XPathContext::new(&schema_set.name_table)
             .with_namespaces(assertion.ns_snapshot.clone())
             .with_schema_set(schema_set)
@@ -2677,6 +2680,16 @@ mod xsd11_tests {
         schema_set
     }
 
+    /// The constraint the schema is refused with (Structures 1.1 §3.13.6.1:
+    /// an assertion whose test is not XPath Valid makes the schema invalid).
+    fn refused_with(xsd: &str) -> &'static str {
+        let mut schema_set = SchemaSet::xsd11();
+        match load_and_process_schema(xsd.as_bytes(), "test.xsd", &mut schema_set, None) {
+            Err(crate::error::SchemaError::StructuralError { constraint, .. }) => constraint,
+            other => panic!("expected a structural error, got {other:?}"),
+        }
+    }
+
     fn element_type(schema_set: &SchemaSet, local_name: &str) -> TypeKey {
         let name_id = schema_set.name_table.add(local_name);
         let elem_key = schema_set
@@ -2984,15 +2997,33 @@ mod xsd11_tests {
 
     #[test]
     fn test_assertion_compile_error() {
-        // Invalid XPath in assertion test → cvc-assertion error
-        let schema = load_schema(
-            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+        // Invalid XPath in an assertion test: a static error (XPST0003), so
+        // the test is not XPath Valid and the schema is invalid
+        // (as-props-correct, Structures 1.1 §3.13.6.1).
+        let xsd = r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
                 <xs:simpleType name="badAssert">
                     <xs:restriction base="xs:integer">
                         <xs:assertion test="$value @@@ invalid"/>
                     </xs:restriction>
                 </xs:simpleType>
                 <xs:element name="e" type="badAssert"/>
+            </xs:schema>"#;
+        assert_eq!(refused_with(xsd), "as-props-correct");
+    }
+
+    #[test]
+    fn test_assertion_unknown_foreign_function_fails_the_value() {
+        // A function of another namespace that the engine lacks is not a
+        // schema error (the function signatures are implementation-defined,
+        // §3.13.6.2 clause 2.2.8): each value fails the assertion.
+        let schema = load_schema(
+            r#"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:f="urn:f">
+                <xs:simpleType name="foreign">
+                    <xs:restriction base="xs:integer">
+                        <xs:assertion test="f:check($value)"/>
+                    </xs:restriction>
+                </xs:simpleType>
+                <xs:element name="e" type="foreign"/>
             </xs:schema>"#,
         );
         let tk = element_type(&schema, "e");
@@ -3138,10 +3169,9 @@ mod xsd11_tests {
     fn test_assertion_xpath_default_ns_assertion_level_overrides_schema() {
         // Schema-level xpathDefaultNamespace is the XS namespace, but the
         // assertion element overrides it with ##local.  Now unprefixed
-        // `integer` resolves to no-namespace, which has no matching type,
-        // so the assertion must fail.
-        let schema = load_schema(
-            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        // `integer` resolves to no-namespace, which names no built-in type:
+        // a static error (XPST0051), so the schema is invalid.
+        let xsd = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                         xpathDefaultNamespace="http://www.w3.org/2001/XMLSchema">
                 <xs:simpleType name="checkedInt">
                     <xs:restriction base="xs:integer">
@@ -3150,22 +3180,19 @@ mod xsd11_tests {
                     </xs:restriction>
                 </xs:simpleType>
                 <xs:element name="e" type="checkedInt"/>
-            </xs:schema>"###,
-        );
-        let tk = element_type(&schema, "e");
-        // ##local overrides → `integer` resolves to no-namespace → assertion fails
-        let err = validate_simple_type("42", tk, &schema).unwrap_err();
-        assert_eq!(err.constraint, "cvc-assertion");
+            </xs:schema>"###;
+        // ##local overrides → `integer` resolves to no-namespace → refused
+        assert_eq!(refused_with(xsd), "as-props-correct");
     }
 
     #[test]
     fn test_assertion_xpath_default_ns_target_namespace_token() {
         // xpathDefaultNamespace="##targetNamespace" with a non-XS target namespace.
         // Unprefixed `integer` resolves to http://example.com/ns (the target
-        // namespace), not to the XS namespace, so `instance of integer` must
-        // fail — proving the token is correctly resolved.
-        let schema = load_schema(
-            r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+        // namespace), not to the XS namespace, so `instance of integer` names
+        // no built-in type — proving the token is resolved: the schema is
+        // invalid (XPST0051 in the built-ins-only static context).
+        let xsd = r###"<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
                         targetNamespace="http://example.com/ns"
                         xmlns:tns="http://example.com/ns"
                         xpathDefaultNamespace="##targetNamespace">
@@ -3175,18 +3202,8 @@ mod xsd11_tests {
                     </xs:restriction>
                 </xs:simpleType>
                 <xs:element name="e" type="tns:checkedInt"/>
-            </xs:schema>"###,
-        );
-        let ns_id = schema.name_table.add("http://example.com/ns");
-        let name_id = schema.name_table.add("e");
-        let elem_key = schema
-            .lookup_element(Some(ns_id), name_id)
-            .expect("element not found");
-        let tk = schema.arenas.elements[elem_key]
-            .resolved_type
-            .expect("element has no resolved type");
-        // ##targetNamespace → http://example.com/ns → `integer` is NOT xs:integer → fails
-        let err = validate_simple_type("42", tk, &schema).unwrap_err();
-        assert_eq!(err.constraint, "cvc-assertion");
+            </xs:schema>"###;
+        // ##targetNamespace → http://example.com/ns → `integer` is NOT xs:integer
+        assert_eq!(refused_with(xsd), "as-props-correct");
     }
 }

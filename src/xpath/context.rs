@@ -80,6 +80,10 @@ pub struct XPathContext<'a> {
     /// `castable as` and have constructor functions, set off by
     /// [`without_schema_casts`](Self::without_schema_casts).
     schema_casts: bool,
+    /// Whether the in-scope schema definitions are only the components present
+    /// in every schema by definition, set by
+    /// [`with_built_in_components_only`](Self::with_built_in_components_only).
+    built_in_components_only: bool,
 }
 
 impl<'a> XPathContext<'a> {
@@ -101,6 +105,7 @@ impl<'a> XPathContext<'a> {
             collation_resolver: None,
             default_collation: None,
             schema_casts: true,
+            built_in_components_only: false,
         }
     }
 
@@ -347,6 +352,29 @@ impl<'a> XPathContext<'a> {
     /// constructor functions (see [`without_schema_casts`](Self::without_schema_casts)).
     pub(crate) fn schema_casts(&self) -> bool {
         self.schema_casts
+    }
+
+    /// Keep only the components present in every schema by definition in the
+    /// in-scope schema definitions (Structures 1.1 §3.13.6.2 clause 2.2.5):
+    /// the built-in types — whose names resolve without a schema set — and,
+    /// of the attached schema set's declarations, the four built-in `xsi:`
+    /// attribute declarations (§3.2.7). Its named types and its element and
+    /// other attribute declarations stay out: naming one is the static error
+    /// it is without a schema set. Implies
+    /// [`without_schema_casts`](Self::without_schema_casts).
+    ///
+    /// The static context in which an XSD 1.1 assertion, assertion facet or
+    /// type alternative must be XPath Valid when the schema is built.
+    pub(crate) fn with_built_in_components_only(mut self) -> Self {
+        self.built_in_components_only = true;
+        self.without_schema_casts()
+    }
+
+    /// The schema set whose named types and top-level declarations are in the
+    /// in-scope schema definitions: the attached one, or none under
+    /// [`with_built_in_components_only`](Self::with_built_in_components_only).
+    pub(crate) fn user_components(&self) -> Option<&'a SchemaSet> {
+        self.schema_set.filter(|_| !self.built_in_components_only)
     }
 
     /// Set the function catalog for custom function support.

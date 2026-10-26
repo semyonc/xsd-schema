@@ -238,8 +238,8 @@ Important runtime modules:
 | `src/validation/hint_loader.rs` | `xsi:schemaLocation` / `xsi:noNamespaceSchemaLocation` enrichment. |
 
 `ValidationFlags` controls optional runtime behavior. Identity constraints are
-parsed unconditionally but enforced only when `PROCESS_IDENTITY_CONSTRAINTS` is
-set. XSD 1.1 assertions are evaluated when `PROCESS_ASSERTIONS` is set —
+always enforced (the `PROCESS_IDENTITY_CONSTRAINTS` bit is deprecated and has no
+effect). XSD 1.1 assertions are evaluated when `PROCESS_ASSERTIONS` is set —
 `SchemaValidator::new` honours it, and `SchemaValidator::new_fragment_buffer`
 sets it.
 
@@ -413,6 +413,14 @@ element whose governing complex type has assertions is opened,
 into it. When the element closes, the fragment is finalized, XPath
 assertions are evaluated with the asserted element as context item, and the
 temporary arena is released.
+
+The test of each assertion and type alternative is checked when the schema
+is built, in the static context Structures 1.1 §3.13.6.2 (XPath Valid) gives
+it — the built-in components only (the built-in types and the four `xsi:`
+attribute declarations, §3.2.7), so a test naming a user-defined type or
+declaration makes the schema invalid (`src/schema/cta.rs`). Evaluation compiles
+the test again with the schema set, which it needs for the type annotations of
+the instance's nodes.
 
 The public API stays push-based; XPath only sees a navigable fragment for
 the scope that needs one. A fully built typed `BufferDocument` is an

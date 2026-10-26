@@ -436,6 +436,12 @@ fn check_kind_test_prefixes(
 /// The name expands as the matcher expands it (an unprefixed `ElementName` in
 /// the default element/type namespace, an unprefixed `AttributeName` in no
 /// namespace); its prefix has already been checked (XPST0081).
+///
+/// A context limited to the built-in components
+/// ([`XPathContext::with_built_in_components_only`]) has no element
+/// declaration in scope and, of the attribute declarations, the four built-in
+/// `xsi:` ones (Structures 1.1 §3.2.7: "There are four attribute declarations
+/// present in every schema by definition").
 fn check_schema_declaration_in_scope(
     name: &str,
     ctx: &XPathContext<'_>,
@@ -444,14 +450,18 @@ fn check_schema_declaration_in_scope(
     let declared = crate::xpath::node_test::resolve_schema_test_name(name, ctx, principal)
         .zip(ctx.schema_set)
         .is_some_and(|(qname, schema_set)| {
+            let user_components = ctx.user_components().is_some();
             if principal == crate::xpath::DomNodeType::Attribute {
                 schema_set
                     .lookup_attribute(qname.namespace_uri, qname.local_name)
-                    .is_some()
+                    .is_some_and(|key| {
+                        user_components || schema_set.builtin_types().is_builtin_attribute(key)
+                    })
             } else {
-                schema_set
-                    .lookup_element(qname.namespace_uri, qname.local_name)
-                    .is_some()
+                user_components
+                    && schema_set
+                        .lookup_element(qname.namespace_uri, qname.local_name)
+                        .is_some()
             }
         });
     if declared {
@@ -468,7 +478,8 @@ fn check_schema_declaration_in_scope(
 /// \[err:XPST0008\]" (§2.5.4.5 for attributes). The in-scope schema types are
 /// the built-in types of the XML Schema namespace — which include `xs:untyped`
 /// and `xs:untypedAtomic` (§2.5.1) — plus, when a schema set is attached, its
-/// named types. §2.5.1 leaves the predefined set to the host; this engine's is
+/// named types, unless the context is limited to the built-in components
+/// ([`XPathContext::with_built_in_components_only`]). §2.5.1 leaves the predefined set to the host; this engine's is
 /// every built-in type it knows, the XSD 1.1 ones included, whatever the
 /// schema set's version (see `TypeTest::BuiltIn`). An unprefixed `TypeName` is in the default element/type
 /// namespace. The prefix has already been checked (XPST0081).
@@ -489,7 +500,7 @@ fn check_type_name_in_scope(
     let in_scope = if is_xs {
         type_name.local == "untyped" || XmlTypeCode::from_local_name(&type_name.local).is_some()
     } else {
-        ctx.schema_set.is_some_and(|schema_set| {
+        ctx.user_components().is_some_and(|schema_set| {
             schema_set
                 .lookup_type(ns_id, ctx.names.add(&type_name.local))
                 .is_some()
@@ -657,8 +668,10 @@ fn resolve_atomic_type_qname(
 /// accepted."
 ///
 /// The in-scope schema types are the built-in types of the XML Schema namespace
-/// plus, when a schema set is attached to the static context, its named types;
-/// of those, only the atomic ones qualify — not a union or list type of the
+/// plus, when a schema set is attached to the static context, its named types
+/// (unless the context is limited to the built-in components,
+/// [`XPathContext::with_built_in_components_only`]); of those, only the atomic
+/// ones qualify — not a union or list type of the
 /// schema, nor a restriction of one.
 ///
 /// Note: `xs:NOTATION` and `xs:anyAtomicType` are atomic types and so pass this
@@ -703,7 +716,7 @@ fn check_atomic_type_name(
     // types when a schema set is attached, and must be an *atomic* simple type
     // there: a union or a list type (or a restriction of one) is a simple type
     // but not an atomic type, so it is XPST0051 just like a complex type.
-    let schema_set = ctx.schema_set.ok_or_else(unknown)?;
+    let schema_set = ctx.user_components().ok_or_else(unknown)?;
     match schema_set.lookup_type(resolved.namespace_uri, resolved.local_name) {
         Some(key) if crate::xpath::node_test::is_atomic_simple_type(schema_set, key) => Ok(()),
         _ => Err(unknown()),

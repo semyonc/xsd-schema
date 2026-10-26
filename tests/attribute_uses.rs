@@ -63,7 +63,7 @@ fn schema_error(version: XsdVersion, body: &str) -> Option<String> {
 }
 
 fn validator(ss: &SchemaSet, psvi: bool) -> SchemaValidator<'_> {
-    let mut flags = ValidationFlags::default() | ValidationFlags::PROCESS_IDENTITY_CONSTRAINTS;
+    let mut flags = ValidationFlags::default();
     if !psvi {
         // The lexical fast paths (no typed values) must reach the same verdicts.
         flags &= !ValidationFlags::BUILD_PSVI_TYPED_VALUES;

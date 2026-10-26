@@ -664,6 +664,16 @@ fn is_notation_or_qname_base(schema_set: &SchemaSet, key: TypeKey) -> bool {
     schema_set.derives_from(sk, bt.notation) || schema_set.derives_from(sk, bt.qname)
 }
 
+/// The values of an enumeration facet in a fixed order (sorted), so that the
+/// value an error names does not depend on hash order. The facet's {value} is
+/// a set (Datatypes 1.1 §4.3.5.1), so no order is implied; sorted is the
+/// deterministic one the stored set gives.
+fn sorted_values(enumeration: &crate::types::facets::EnumerationFacet) -> Vec<&String> {
+    let mut values: Vec<&String> = enumeration.values.iter().collect();
+    values.sort_unstable();
+    values
+}
+
 /// Validate that facet values are in the value space of the base type.
 ///
 /// Reuses the existing `validate_simple_type` runtime infrastructure (type code
@@ -713,7 +723,7 @@ fn validate_facet_values_against_base_type(
                     base_facets.enumeration.as_ref(),
                     schema_set.enumeration_index(base_sk),
                 ) {
-                    if let Some(value) = enum_facet.values.iter().find(|value| {
+                    if let Some(value) = sorted_values(enum_facet).into_iter().find(|value| {
                         !crate::validation::simple::qname_literal_enumerated(
                             enum_facet,
                             value,
@@ -747,7 +757,7 @@ fn validate_facet_values_against_base_type(
             (base_key, type_def.facets.enumeration.as_ref())
         {
             if schema_set.derives_from(base_sk, schema_set.builtin_types().any_uri) {
-                for value in &enum_facet.values {
+                for value in sorted_values(enum_facet) {
                     if !crate::types::validators::is_strict_xsd10_anyuri_enum_value(value) {
                         return Err(SchemaError::structural(
                             "enumeration-valid-restriction",
@@ -769,7 +779,7 @@ fn validate_facet_values_against_base_type(
     // {base type definition}" — the base's facets, its enumeration included
     // (compared by value, also for a list or a union base).
     if let Some(ref enum_facet) = type_def.facets.enumeration {
-        for value in &enum_facet.values {
+        for value in sorted_values(enum_facet) {
             if crate::validation::simple::validate_simple_type(value, base_key, schema_set).is_err()
             {
                 return Err(SchemaError::structural(
@@ -1129,9 +1139,8 @@ pub(super) fn validate_simple_content_restriction_facets(
         crate::validation::simple::validate_simple_type(value, facet_base, schema_set)
     };
     if let Some(enumeration) = &sc.facets.enumeration {
-        if let Some(value) = enumeration
-            .values
-            .iter()
+        if let Some(value) = sorted_values(enumeration)
+            .into_iter()
             .find(|value| in_base(value).is_err())
         {
             return Err(SchemaError::structural(

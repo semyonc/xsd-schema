@@ -523,16 +523,8 @@ impl<'a> SchemaAssembler<'a> {
             }
         }
 
-        // Validate keyref constraints: refer must resolve to a key/unique
-        // with matching field count (§3.11.4, §3.11.6)
-        crate::schema::inline::validate_keyref_refers(
-            &identity_constraints,
-            self.target_namespace,
-            &self.schema_set.name_table,
-            &self.schema_set.source_maps,
-            &self.schema_set.arenas.identity_constraints,
-            &self.schema_set.documents,
-        )?;
+        // A keyref's `refer` is checked once every identity constraint of the
+        // schema is known (`validate_all_keyref_refers`, pipeline).
 
         // Allocate identity constraints into the arena and register in namespace table
         let mut identity_constraint_keys: Vec<IdentityConstraintKey> =
