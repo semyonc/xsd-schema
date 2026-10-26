@@ -203,7 +203,17 @@ pub(crate) fn evaluate_type_alternatives(
             };
 
             let nav = BufferDocNavigator::new(&doc, elem_ref);
-            let result = match expr.evaluator(&ctx).run_with_node(nav) {
+            let warnings = std::cell::RefCell::new(Vec::new());
+            let outcome = expr
+                .evaluator(&ctx)
+                .with_warnings(&warnings)
+                .run_with_node(nav);
+            super::assertions::note_expression_warnings(
+                "type alternative test",
+                test_expr,
+                warnings.into_inner(),
+            );
+            let result = match outcome {
                 Ok(r) => r,
                 Err(_) => continue,
             };

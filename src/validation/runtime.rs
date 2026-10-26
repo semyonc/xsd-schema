@@ -49,6 +49,7 @@ use crate::types::complex::ProcessContents as TypesProcessContents;
 use super::assertions::{
     evaluate_complex_type_assertions, has_inherited_assertions, AssertionBufferFrame,
 };
+use super::expression_warnings::{self, ExpressionWarning};
 #[cfg(feature = "xsd11")]
 use super::validator::AssertionSource;
 use super::validator::{ValidationSink, ValidationWarning};
@@ -3881,15 +3882,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                         cta_attrs.push((*ns, *name, val.value.clone()));
                     }
                 }
-                let new_type = super::alternatives::evaluate_type_alternatives(
-                    elem_key,
-                    ev_state.local_name,
-                    ev_state.namespace,
-                    &cta_attrs,
-                    ev_state.ns_context.as_ref(),
-                    Some(self.instance_base_uri.as_str()).filter(|s| !s.is_empty()),
-                    self.schema_set,
-                );
+                let (new_type, raised) = self.collect_expression_warnings(|| {
+                    super::alternatives::evaluate_type_alternatives(
+                        elem_key,
+                        ev_state.local_name,
+                        ev_state.namespace,
+                        &cta_attrs,
+                        ev_state.ns_context.as_ref(),
+                        Some(self.instance_base_uri.as_str()).filter(|s| !s.is_empty()),
+                        self.schema_set,
+                    )
+                });
+                self.report_expression_warnings(raised);
                 if let Some(new_type_key) = new_type {
                     selected = true;
                     if Some(new_type_key) != st {
@@ -4670,17 +4674,21 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                     };
                     let names = &self.schema_set.name_table;
                     let resolver = qname_ctx.map(|ns| super::simple::snapshot_prefixes(ns, names));
-                    match super::simple::validate_simple_type_in(
-                        &ev_state.text_content,
-                        schema_type,
-                        self.schema_set,
-                        resolver
-                            .as_ref()
-                            .map(|r| r as super::simple::PrefixResolver<'_>),
-                    ) {
+                    let (outcome, raised) = self.collect_expression_warnings(|| {
+                        super::simple::validate_simple_type_in(
+                            &ev_state.text_content,
+                            schema_type,
+                            self.schema_set,
+                            resolver
+                                .as_ref()
+                                .map(|r| r as super::simple::PrefixResolver<'_>),
+                        )
+                    });
+                    match outcome {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
                             self.note_seconds_capacity(&result.typed_value, &ev_state.text_content);
+                            self.report_expression_warnings(raised);
                             ev_state.member_type = result.member_type;
                             ev_state.typed_value = Some(result.typed_value);
                             ev_state.normalized_value = result.normalized_value;
@@ -4776,6 +4784,7 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             }
                         }
                         Err(err) => {
+                            self.report_expression_warnings(raised);
                             self.report_validation_error_to(err, &mut ev_state.error_codes);
                             ev_state.validity = SchemaValidity::Invalid;
                         }
@@ -4968,11 +4977,18 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                             // Evaluate nested (deferred) frames first
                             let pending = std::mem::take(&mut self.pending_assertion_frames);
                             for pf in &pending {
-                                let errs = evaluate_complex_type_assertions(
-                                    &doc,
-                                    pf.element_ref,
-                                    pf.complex_type_key,
-                                    self.schema_set,
+                                let (errs, raised) = self.collect_expression_warnings(|| {
+                                    evaluate_complex_type_assertions(
+                                        &doc,
+                                        pf.element_ref,
+                                        pf.complex_type_key,
+                                        self.schema_set,
+                                    )
+                                });
+                                self.report_expression_warnings_deferred(
+                                    raised,
+                                    &pf.context,
+                                    &pf.location,
                                 );
                                 // The nested element is invalid; so is every
                                 // strictly assessed ancestor up to this one
@@ -4989,12 +5005,15 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                                 );
                             }
                             // Evaluate outermost frame (the current path is its own)
-                            let errs = evaluate_complex_type_assertions(
-                                &doc,
-                                frame.element_ref,
-                                frame.complex_type_key,
-                                self.schema_set,
-                            );
+                            let (errs, raised) = self.collect_expression_warnings(|| {
+                                evaluate_complex_type_assertions(
+                                    &doc,
+                                    frame.element_ref,
+                                    frame.complex_type_key,
+                                    self.schema_set,
+                                )
+                            });
+                            self.report_expression_warnings(raised);
                             if errs.is_empty() {
                                 assertion_outcome = Some(AssertionOutcome::Passed);
                             } else {
@@ -5948,6 +5967,74 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
         let warning =
             self.warning_here(crate::types::validators::SECONDS_CAPACITY_WARNING, message);
         self.sink.on_warning(warning);
+    }
+
+    /// Run `validate` — a value's validation, or an assertion's or a type
+    /// alternative's evaluation — and collect the warnings that the XSD 1.1
+    /// expressions it evaluates raise (`expression_warnings`), when warnings
+    /// are reported: an expression whose date/time or duration result keeps
+    /// its seconds truncated reports
+    /// [`SECONDS_CAPACITY_WARNING`](crate::types::validators::SECONDS_CAPACITY_WARNING)
+    /// as a literal does ([`note_seconds_capacity`](Self::note_seconds_capacity)).
+    fn collect_expression_warnings<R>(
+        &self,
+        validate: impl FnOnce() -> R,
+    ) -> (R, Vec<ExpressionWarning>) {
+        if cfg!(feature = "xsd11") && self.flags.contains(ValidationFlags::REPORT_WARNINGS) {
+            expression_warnings::collecting(validate)
+        } else {
+            (validate(), Vec::new())
+        }
+    }
+
+    /// Report the warnings [`collect_expression_warnings`](Self::collect_expression_warnings)
+    /// collected, about the current item.
+    fn report_expression_warnings(&mut self, warnings: Vec<ExpressionWarning>) {
+        for ExpressionWarning {
+            code,
+            source,
+            message,
+        } in warnings
+        {
+            let at = match self.current_element_path() {
+                Some(path) => format!(" ({})", path.local_name_path()),
+                None => String::new(),
+            };
+            let warning = self.warning_here(code, format!("{source}{at}: {message}"));
+            self.sink.on_warning(warning);
+        }
+    }
+
+    /// Report the warnings [`collect_expression_warnings`](Self::collect_expression_warnings)
+    /// collected for a deferred (nested) assertion frame, about the item and
+    /// at the location it recorded.
+    #[cfg(feature = "xsd11")]
+    fn report_expression_warnings_deferred(
+        &mut self,
+        warnings: Vec<ExpressionWarning>,
+        context: &ErrorContext,
+        location: &Option<SourceLocation>,
+    ) {
+        for ExpressionWarning {
+            code,
+            source,
+            message,
+        } in warnings
+        {
+            let at = match &context.item {
+                Some((_, path)) => format!(" ({})", path.local_name_path()),
+                None => String::new(),
+            };
+            let warning =
+                ValidationWarning::new(code, format!("{source}{at}: {message}"), location.clone());
+            let warning = match &context.item {
+                Some((subject, path)) => warning
+                    .with_subject(subject.clone())
+                    .with_instance_path(path.clone()),
+                None => warning,
+            };
+            self.sink.on_warning(warning);
+        }
     }
 
     /// Mark the current element as invalid.
@@ -6960,15 +7047,19 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 }
             }
             if !used_fast_path {
-                match self.validate_attribute_value(value, type_key) {
+                let (outcome, raised) = self
+                    .collect_expression_warnings(|| self.validate_attribute_value(value, type_key));
+                match outcome {
                     Ok(result) => {
                         self.note_decimal_capacity(&result.typed_value);
                         self.note_seconds_capacity(&result.typed_value, value);
+                        self.report_expression_warnings(raised);
                         member_type = result.member_type;
                         typed_value = Some(result.typed_value);
                         normalized_value = result.normalized_value;
                     }
                     Err(err) => {
+                        self.report_expression_warnings(raised);
                         self.report_validation_error(err);
                         attr_validity = SchemaValidity::Invalid;
                         self.mark_current_invalid();
@@ -7733,15 +7824,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match self.validate_attribute_value(value, type_key) {
+                    let (outcome, raised) = self.collect_expression_warnings(|| {
+                        self.validate_attribute_value(value, type_key)
+                    });
+                    match outcome {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
                             self.note_seconds_capacity(&result.typed_value, value);
+                            self.report_expression_warnings(raised);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
                         }
                         Err(err) => {
+                            self.report_expression_warnings(raised);
                             self.report_validation_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {
@@ -7856,15 +7952,20 @@ impl<'a, S: ValidationSink> ValidationRuntime<'a, S> {
                 let mut normalized_value = None;
                 let mut attr_validity = SchemaValidity::Valid;
                 if let Some(type_key) = attr_type {
-                    match self.validate_attribute_value(value, type_key) {
+                    let (outcome, raised) = self.collect_expression_warnings(|| {
+                        self.validate_attribute_value(value, type_key)
+                    });
+                    match outcome {
                         Ok(result) => {
                             self.note_decimal_capacity(&result.typed_value);
                             self.note_seconds_capacity(&result.typed_value, value);
+                            self.report_expression_warnings(raised);
                             member_type = result.member_type;
                             typed_value = Some(result.typed_value);
                             normalized_value = result.normalized_value;
                         }
                         Err(err) => {
+                            self.report_expression_warnings(raised);
                             self.report_validation_error(err);
                             attr_validity = SchemaValidity::Invalid;
                             if let Some(s) = self.validation_stack.last_mut() {

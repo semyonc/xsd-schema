@@ -341,6 +341,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `xpath::depth::{MAX_EXPRESSION_DEPTH, expression_depth}`,
   `NameTable::heap_bytes`.
 
+- `DynamicContext::implicit_timezone_or_host`,
+  `xpath::operators::eval_binary_with_timezone`.
+- XPath warnings: `xpath::XPathWarning`, `XPathEvaluator::with_warnings`,
+  `DynamicContext::take_warnings`. A date/time or duration result of `+`, `-`,
+  `fn:sum` or `fn:avg` whose seconds have more fraction digits than the value
+  holds beside the whole seconds keeps them truncated toward zero and raises
+  the warning `xs-seconds-capacity` (once per evaluation and operator or
+  function). During validation, such a warning from an XSD 1.1 assertion or
+  type alternative is reported to the sink, as the same code is for a literal
+  (with `ValidationFlags::REPORT_WARNINGS`).
+
 ### Changed
 
 - The regular-expression engine of the `xsd11` feature is now `regexml-fork`
@@ -502,6 +513,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with 29 nines became an invalid second 60); the facets, value constraints
   and identity constraints compare the literal as written, and the validator
   reports the warning `xs-seconds-capacity`.
+
+- XPath: date/time comparisons, the subtraction of two date/time values,
+  `fn:adjust-*-to-timezone` (one argument), `fn:implicit-timezone` and
+  `fn:current-dateTime` read the implicit timezone of the dynamic context
+  (`DynamicContext::implicit_timezone`); without one, the host's local offset,
+  read once per evaluation. `fn:current-dateTime()` is the current instant
+  expressed in that timezone. `eq` on `xs:gYear`, `xs:gYearMonth`,
+  `xs:gMonthDay`, `xs:gMonth` and `xs:gDay` compares starting instants with
+  the implicit timezone (F&O §10.4.15 – §10.4.19).
+- XPath: date/time and duration comparisons are exact (no rounding beyond 28
+  digits) and durations compare by months and seconds; arithmetic is exact and
+  raises FODT0001 / FODT0002 / FOCA0005 / FOAR0001 / FOAR0002 at the limits of
+  the values instead of panicking or wrapping. An XSD 1.1 assertion or type
+  alternative comparing the largest durations no longer panics.
+- XPath casts: `xs:nonNegativeInteger`, `xs:positiveInteger`,
+  `xs:nonPositiveInteger` and `xs:negativeInteger` have no size limit;
+  `xs:float`/`xs:double` → `xs:decimal` raises FOCA0001 when too large and
+  gives ±10⁻²⁸ for magnitudes in (5 × 10⁻²⁹, 10⁻²⁸); a date/time or duration
+  literal beyond the value limits raises FODT0001 / FODT0002.
+- XPath: a cast or constructor to `xs:QName` (or a type derived from
+  `xs:QName` or `xs:NOTATION`) from anything but a string literal or a value
+  of the same base type raises XPTY0004, and `castable as` is false.
+- XPath: `fn:subsequence` with an empty `$startingLoc` or `$length` raises
+  XPTY0004; an unclosed `(:` comment is XPST0003; `fn:base-uri` resolves
+  `xml:base` per RFC 3986 (dot segments removed); the substring functions
+  answer a zero-length second argument before FOCH0004.
+- XPath 1.0 compatibility mode: general comparisons follow XPath 2.0 §3.5.2
+  after atomization. `XPathMode::XPath10`: `number()` reads strings as XPath
+  1.0 does (no exponent, `+` or `INF`).
 
 ### Fixed
 
@@ -807,6 +847,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   legal schemas short (attribute inheritance stopped after 50 derivation
   levels, attribute groups after 20 levels, group references after about 50).
 - "Unexpected element" errors in schema documents carry their location.
+
+- A year `-2147483648` is written as itself (was `--2147483648`).
+- `fn:adjust-dateTime-to-timezone` and `fn:adjust-date-to-timezone` raise
+  FODT0001 when the adjusted year is out of range (a debug build panicked, a
+  release build wrapped the year).
 
 ### Performance
 

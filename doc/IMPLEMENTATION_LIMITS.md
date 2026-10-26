@@ -60,9 +60,22 @@ Casting a string to `xs:decimal`, or writing a decimal literal, follows F&O
 | nonzero magnitude below `10^−28`, the smallest positive value held | `0` (underflow) |
 | any other value with more precision than is held | `FOCA0006` |
 
+Casting an `xs:float` or `xs:double` to `xs:decimal` follows F&O §17.1.3.3 ("the
+xs:decimal value … that is numerically closest to SV"):
+
+| Value | Result |
+| --- | --- |
+| magnitude larger than held | `FOCA0001` |
+| `NaN`, `INF`, `-INF` | `FOCA0002` |
+| nonzero magnitude below `10^−28` | `±10^−28` above `5 × 10^−29`, else `0` |
+| any other value | the shortest decimal that converts back to the same binary value |
+
 ## 2. `xs:integer`
 
-`xs:integer` values have no size limit (`BigInt`).
+`xs:integer` values have no size limit (`BigInt`), and neither have the four
+types derived from it whose value space is unbounded on one side:
+`xs:nonNegativeInteger`, `xs:positiveInteger`, `xs:nonPositiveInteger` and
+`xs:negativeInteger`.
 
 ## 3. Regular expressions
 
@@ -152,3 +165,42 @@ the byte position (XML 1.0 §1.2: a fatal error); the checks are always on.
   normalized to a line feed, and in an XML 1.1 document NEL and LINE
   SEPARATOR stay as they are there. Character data and attribute values are
   normalized.
+
+## 5. Dates, times and durations
+
+### The typed values
+
+A year is held in `i32` (`xs:dateTime`, `xs:date`, `xs:gYearMonth`,
+`xs:gYear`), the year, month, day, hour and minute numbers of a duration in
+`u32`, and seconds in a `rust_decimal::Decimal` (whole seconds below `2^96`, at
+most 28 fraction digits). A literal beyond the integer limits is not a value
+here; one with more fraction digits than a `Decimal` holds is valid and its
+typed value keeps the fraction truncated toward zero (the `types::value`
+module documentation has the details for validation).
+
+### In XPath
+
+- **Comparison** (`eq`, `lt`, …, the general comparisons, `min`, `max`,
+  `distinct-values`, `index-of`, `deep-equal`) is exact for every value held:
+  whole seconds in `i128` and the fraction apart, so no comparison rounds or
+  overflows. Durations compare by their months and seconds (F&O §10.4.5).
+- **Arithmetic** is exact up to the limits of the result's value struct; beyond
+  them it raises the F&O error rather than wrapping or panicking (F&O §10.1.1):
+  `FODT0001` for a date/time result whose year leaves `i32` and for the
+  difference of two date/time values beyond `2^32 − 1` days, `FODT0002` for a
+  duration result beyond `2^32 − 1` days or years. A result's seconds field
+  holds at most the digits a `Decimal` holds next to its whole seconds; more
+  fraction digits are truncated toward zero.
+- **Casts** of a literal beyond the integer limits raise `FODT0001` (date/time
+  types) or `FODT0002` (durations), F&O §17.1.1.
+- **Year numbering**: as XSD 1.0, `-0001` is the year before `0001`; a year
+  `0000`, which the XSD 1.1 lexical space admits, is read as `0001` (F&O
+  §10.1.1: "The results of operations on dates that cross the year 0000 are
+  implementation-defined").
+- **The implicit timezone** comes from the dynamic context
+  (`DynamicContext::implicit_timezone`, F&O §10.4). A context without one
+  uses the host's local offset (the process's `TZ`), read once per
+  evaluation together with the instant `fn:current-dateTime` reports. The
+  functions that take no dynamic context (`operators::value_eq`, `eval_binary`,
+  …) read the host's offset when they compare a date/time value;
+  `operators::eval_binary_with_timezone` takes the timezone explicitly.

@@ -104,7 +104,7 @@ pub use self::collation::{Collation, CollationResolver, CODEPOINT_COLLATION_URI}
 pub use self::context::{DynamicContext, NameBinder, VarRef, VarSlotId, VarStore, XPathContext};
 pub use self::deps::FunctionCallRef;
 pub use self::depth::{expression_depth, MAX_EXPRESSION_DEPTH};
-pub use self::error::XPathError;
+pub use self::error::{XPathError, XPathWarning};
 pub use self::eval::eval_node;
 pub use self::functions::{
     FunctionArity, FunctionId, FunctionSignature, XPathValue, FUNCTION_REGISTRY,

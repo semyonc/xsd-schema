@@ -25,6 +25,7 @@ use crate::namespace::context::NamespaceContextSnapshot;
 use crate::namespace::qname::QualifiedName;
 use crate::namespace::NameTable;
 use crate::types::sequence::SequenceType;
+use crate::types::value::TimezoneOffset;
 use crate::xpath::ast::{AstNode, BinaryOpKind};
 use crate::xpath::bind::bind_node;
 use crate::xpath::context::NameBinder;
@@ -103,9 +104,23 @@ fn check_stream(
         let active = crate::xpath::collation::resolve_default(context);
         let probe_values = atomized(varying);
         let outcome = if is_eq {
-            indexed_eq(context, side, &mut operand, &probe_values, active.as_ref())
+            indexed_eq(
+                context,
+                side,
+                &mut operand,
+                &probe_values,
+                active.as_ref(),
+                crate::xpath::operators::static_timezone(context),
+            )
         } else {
-            indexed_ne(context, side, &mut operand, &probe_values, active.as_ref())
+            indexed_ne(
+                context,
+                side,
+                &mut operand,
+                &probe_values,
+                active.as_ref(),
+                crate::xpath::operators::static_timezone(context),
+            )
         };
         total += 1;
         let got: Result<bool, XPathError> = match outcome {
@@ -278,6 +293,7 @@ fn an_answer_does_not_depend_on_the_order_of_the_stream() {
                     &mut forwards,
                     varying,
                     CollationRef::Codepoint,
+                    TimezoneOffset::UTC,
                 ))
             })
             .collect();
@@ -291,6 +307,7 @@ fn an_answer_does_not_depend_on_the_order_of_the_stream() {
                     &mut backwards,
                     varying,
                     CollationRef::Codepoint,
+                    TimezoneOffset::UTC,
                 ))
             })
             .collect();
@@ -862,7 +879,7 @@ fn the_footprint_of_an_index_is_proportional_to_the_operand() {
         PairKind::Comparable(bucket) => bucket,
         _ => panic!("integers compare with integers"),
     };
-    assert!(operand.ensure_table(class, bucket, CollationRef::Codepoint));
+    assert!(operand.ensure_table(class, bucket, CollationRef::Codepoint, TimezoneOffset::UTC));
     let per_value = operand.footprint() / 1000;
     println!(
         "index footprint: {} bytes for 1000 xs:integer items, {} per item \

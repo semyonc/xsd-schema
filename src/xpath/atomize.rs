@@ -530,12 +530,59 @@ pub(crate) fn to_string_10<N: DomNavigator>(value: &XPathValue<N>) -> String {
 
 /// Convert an XPathValue to number using XPath 1.0 rules.
 ///
-/// Converts to string first (via `to_string_10`), then parses as f64.
+/// Converts to string first (via `to_string_10`), then parses it as XPath 1.0
+/// `number()` does ([`xpath10_string_to_number`]).
 pub(crate) fn to_number_10<N: DomNavigator>(value: &XPathValue<N>) -> f64 {
     match value {
         XPathValue::Empty => f64::NAN,
-        XPathValue::Item(XmlItem::Atomic(v)) => to_number(v),
-        _ => to_string_10(value).trim().parse().unwrap_or(f64::NAN),
+        XPathValue::Item(XmlItem::Atomic(v)) => to_number_xpath10(v),
+        _ => xpath10_string_to_number(&to_string_10(value)),
+    }
+}
+
+/// XPath 1.0 `number()` of one atomic value: a number is itself, a boolean
+/// `1` or `0`, and anything else is its string value read by
+/// [`xpath10_string_to_number`].
+pub(crate) fn to_number_xpath10(value: &XmlValue) -> f64 {
+    let code = value.type_code;
+    if code.is_numeric() || code == crate::types::XmlTypeCode::Boolean {
+        to_number(value)
+    } else {
+        xpath10_string_to_number(&value.to_string_value())
+    }
+}
+
+/// XPath 1.0 §4.4 `number()` of a string: "a string that consists of
+/// optional whitespace followed by an optional minus sign followed by a Number
+/// followed by whitespace is converted to the IEEE 754 number that is nearest
+/// (according to the IEEE 754 round-to-nearest rule) to the mathematical value
+/// represented by the string; any other string is converted to NaN", with
+/// §3.7 `Number ::= Digits ('.' Digits?)? | '.' Digits` and whitespace the
+/// four characters of `ExprWhitespace`. No exponent, no `+`, no `INF` — those
+/// are XPath 2.0's `xs:double` lexical forms, not XPath 1.0's.
+pub(crate) fn xpath10_string_to_number(s: &str) -> f64 {
+    let trimmed = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+    let (negative, number) = match trimmed.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, trimmed),
+    };
+    let mut digits = 0usize;
+    let mut points = 0usize;
+    for b in number.bytes() {
+        match b {
+            b'0'..=b'9' => digits += 1,
+            b'.' => points += 1,
+            _ => return f64::NAN,
+        }
+    }
+    if digits == 0 || points > 1 {
+        return f64::NAN;
+    }
+    // Rust's `f64` parser rounds to nearest, and accepts `5.` and `.5`.
+    match number.parse::<f64>() {
+        Ok(value) if negative => -value,
+        Ok(value) => value,
+        Err(_) => f64::NAN,
     }
 }
 

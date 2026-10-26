@@ -46,7 +46,7 @@ use crate::xpath::node_test::{
     matches_item_type_node, name_test_for_principal_kind, principal_node_kind, NodeTest,
 };
 use crate::xpath::operators::{
-    eval_binary, eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter_collated,
+    eval_numeric_binary_10, eval_range, eval_unary, general_eq_iter_collated,
     general_ge_iter_collated, general_gt_iter_collated, general_le_iter_collated,
     general_lt_iter_collated, general_ne_iter_collated,
 };
@@ -244,7 +244,8 @@ pub fn eval_node<N: DomNavigator>(
             if ctx.static_context.xpath10_compatibility() {
                 // §3.4: in compatibility mode an empty operand makes the whole
                 // arithmetic expression NaN, so there is no empty result.
-                let result = match arithmetic_operand_10(operand_val)? {
+                let xpath10_language = ebv_is_xpath10(ctx.static_context);
+                let result = match arithmetic_operand_10(operand_val, xpath10_language)? {
                     Some(operand) => eval_unary(unary_op.kind, &operand)?,
                     None => crate::types::XmlValue::double(f64::NAN),
                 };
@@ -336,8 +337,9 @@ pub fn eval_node<N: DomNavigator>(
                     // comparisons (which XPath 1.0 does not have) keep the 2.0
                     // rules.
                     if is_arithmetic && ctx.static_context.xpath10_compatibility() {
-                        let left = arithmetic_operand_10(left_val)?;
-                        let right = arithmetic_operand_10(right_val)?;
+                        let xpath10_language = ebv_is_xpath10(ctx.static_context);
+                        let left = arithmetic_operand_10(left_val, xpath10_language)?;
+                        let right = arithmetic_operand_10(right_val, xpath10_language)?;
                         let (Some(left), Some(right)) = (left, right) else {
                             // "If the atomized operand is an empty sequence, the
                             // result of the arithmetic expression is the
@@ -357,7 +359,19 @@ pub fn eval_node<N: DomNavigator>(
                         let result = if numeric_pair && !matches!(bin_op.kind, BinaryOpKind::IDiv) {
                             eval_numeric_binary_10(bin_op.kind, &left, &right)?
                         } else {
-                            eval_binary(bin_op.kind, &left, &right)?
+                            let mut truncated = false;
+                            let result = crate::xpath::operators::eval_binary_noted(
+                                bin_op.kind,
+                                &left,
+                                &right,
+                                crate::xpath::collation::CollationRef::Codepoint,
+                                ctx.implicit_timezone_or_host(),
+                                &mut truncated,
+                            )?;
+                            if truncated {
+                                warn_truncated_seconds(ctx, arena, id, bin_op.kind, &result);
+                            }
+                            result
                         };
                         return Ok(XPathValue::from_atomic(result));
                     }
@@ -379,14 +393,25 @@ pub fn eval_node<N: DomNavigator>(
                             // ignore it. It is resolved only if two strings
                             // are actually compared (and then through the
                             // per-run memo), and costs a discriminant test when
-                            // it is the codepoint collation.
+                            // it is the codepoint collation. A date/time
+                            // operand without a timezone is read in the
+                            // implicit timezone of this dynamic context (F&O
+                            // §10.4), in comparisons and in subtraction.
+                            let tz = ctx.implicit_timezone_or_host();
                             let deferred = ctx.deferred_default_collation();
-                            let result = crate::xpath::operators::eval_binary_collated(
+                            let mut truncated = false;
+                            let result = crate::xpath::operators::eval_binary_noted(
                                 bin_op.kind,
                                 &left,
                                 &right,
                                 deferred.as_ref(),
+                                tz,
+                                &mut truncated,
                             )?;
+                            drop(deferred);
+                            if truncated {
+                                warn_truncated_seconds(ctx, arena, id, bin_op.kind, &result);
+                            }
                             Ok(XPathValue::from_atomic(result))
                         }
                     }
@@ -489,38 +514,51 @@ pub fn eval_node<N: DomNavigator>(
                         // `ne`, …, so two strings are compared under the
                         // default collation, as the value comparisons above
                         // compare them — resolved only if two strings meet.
+                        //
+                        // In the XPath 1.0 language (`XPathMode::XPath10`) the
+                        // pairs follow XPath 1.0 §3.4; an XPath 2.0 expression
+                        // in compatibility mode follows §3.5.2 after
+                        // atomization, with the static context for its casts.
+                        let static_context = ctx.static_context;
+                        let compat = (!ebv_is_xpath10(static_context)).then_some(static_context);
+                        let tz = ctx.implicit_timezone_or_host();
                         let deferred = ctx.deferred_default_collation();
                         crate::xpath::operators::general_compare_iter_10(
                             bin_op.kind,
                             &left_iter,
                             &right_iter,
                             deferred.as_ref(),
+                            tz,
+                            compat,
                         )?
                     } else {
                         // The default collation is resolved only if two strings
                         // are compared, and then through the per-run memo.
+                        // F&O §10.4: the implicit timezone of the dynamic
+                        // context, for date/time values without one.
                         let static_context = ctx.static_context;
+                        let tz = ctx.implicit_timezone_or_host();
                         let deferred = ctx.deferred_default_collation();
                         let collation = deferred.as_ref();
                         let (l, r) = (&left_iter, &right_iter);
                         match bin_op.kind {
                             BinaryOpKind::GeneralEq => {
-                                general_eq_iter_collated(static_context, l, r, collation)?
+                                general_eq_iter_collated(static_context, l, r, collation, tz)?
                             }
                             BinaryOpKind::GeneralNe => {
-                                general_ne_iter_collated(static_context, l, r, collation)?
+                                general_ne_iter_collated(static_context, l, r, collation, tz)?
                             }
                             BinaryOpKind::GeneralLt => {
-                                general_lt_iter_collated(static_context, l, r, collation)?
+                                general_lt_iter_collated(static_context, l, r, collation, tz)?
                             }
                             BinaryOpKind::GeneralLe => {
-                                general_le_iter_collated(static_context, l, r, collation)?
+                                general_le_iter_collated(static_context, l, r, collation, tz)?
                             }
                             BinaryOpKind::GeneralGt => {
-                                general_gt_iter_collated(static_context, l, r, collation)?
+                                general_gt_iter_collated(static_context, l, r, collation, tz)?
                             }
                             BinaryOpKind::GeneralGe => {
-                                general_ge_iter_collated(static_context, l, r, collation)?
+                                general_ge_iter_collated(static_context, l, r, collation, tz)?
                             }
                             _ => unreachable!(),
                         }
@@ -593,12 +631,15 @@ fn eval_type_expr<N: DomNavigator>(
 ) -> Result<XPathValue<N>, XPathError> {
     // Evaluate the operand
     let operand = eval_node(arena, type_expr.operand, ctx)?;
+    // XPath 2.0 §3.10.2: a cast to `xs:QName` (or a type derived from it or
+    // from `xs:NOTATION`) from a string needs a string literal.
+    let string_literal = is_string_literal_expression(arena, type_expr.operand);
 
     match type_expr.kind {
         TypeExprKind::InstanceOf => eval_instance_of(operand, type_expr, ctx),
         TypeExprKind::TreatAs => eval_treat_as(operand, type_expr, ctx),
-        TypeExprKind::CastAs => eval_cast_as(operand, type_expr, ctx),
-        TypeExprKind::CastableAs => eval_castable_as(operand, type_expr, ctx),
+        TypeExprKind::CastAs => eval_cast_as(operand, type_expr, string_literal, ctx),
+        TypeExprKind::CastableAs => eval_castable_as(operand, type_expr, string_literal, ctx),
     }
 }
 
@@ -758,6 +799,7 @@ fn describe_item<N: DomNavigator>(item: &XmlItem<N>) -> String {
 fn eval_cast_as<N: DomNavigator>(
     operand: XPathValue<N>,
     type_expr: &TypeExprNode,
+    string_literal: bool,
     ctx: &DynamicContext<'_, N>,
 ) -> Result<XPathValue<N>, XPathError> {
     // Cast only works with atomic types
@@ -807,9 +849,55 @@ fn eval_cast_as<N: DomNavigator>(
                 Some(ItemTypeNode::Atomic(name)) => name.to_string(),
                 _ => type_expr.target_type.to_string(),
             };
+            if !name_cast_source_allowed(&value, target, string_literal) {
+                return Err(XPathError::XPTY0004 {
+                    expected: format!(
+                        "a string literal or a value of the base type of {}",
+                        type_name()
+                    ),
+                    found: format!("a computed {}", describe_type_code(value.type_code)),
+                });
+            }
             let result = cast_value(ctx.static_context, &value, target, &type_name)?;
             Ok(XPathValue::from_atomic(result))
         }
+    }
+}
+
+/// Whether `value` may be cast to `target` as far as the rule for the names
+/// goes. XPath 2.0 §3.10.2: "If the target type of a cast expression is
+/// xs:QName, or is a type that is derived from xs:QName or xs:NOTATION, and
+/// if the base type of the input is not the same as the base type of the
+/// target type, then the input expression must be a string literal
+/// \[err:XPTY0004\]"; §3.10.4 applies it to the constructor functions, and
+/// F&O 1.0 §17.1.1: "If the argument to such a cast is computed dynamically,
+/// \[err:XPTY0004\] is raised if the value is of any type other than xs:QName
+/// or xs:NOTATION respectively (including the case where it is an
+/// xs:string)". So the value is an `xs:QName` for an `xs:QName` target, an
+/// `xs:NOTATION` for a `xs:NOTATION` one (their type codes), or the operand
+/// is a string literal; every other target is unaffected.
+fn name_cast_source_allowed(
+    value: &crate::types::XmlValue,
+    target: CastTarget,
+    string_literal: bool,
+) -> bool {
+    let builtin = match target {
+        CastTarget::BuiltIn(code) => code,
+        CastTarget::Schema { builtin, .. } => builtin,
+    };
+    match builtin {
+        XmlTypeCode::QName | XmlTypeCode::Notation => {
+            value.type_code == builtin || (string_literal && value.type_code == XmlTypeCode::String)
+        }
+        _ => true,
+    }
+}
+
+/// `xs:<name>` of a type code, for an error message.
+fn describe_type_code(code: XmlTypeCode) -> String {
+    match code.local_name() {
+        Some(name) => format!("xs:{name}"),
+        None => "atomic value".to_string(),
     }
 }
 
@@ -833,6 +921,7 @@ fn cast_target(type_expr: &TypeExprNode, ctx: &XPathContext<'_>) -> Result<CastT
 fn eval_castable_as<N: DomNavigator>(
     operand: XPathValue<N>,
     type_expr: &TypeExprNode,
+    string_literal: bool,
     ctx: &DynamicContext<'_, N>,
 ) -> Result<XPathValue<N>, XPathError> {
     // Cast only works with atomic types
@@ -862,7 +951,13 @@ fn eval_castable_as<N: DomNavigator>(
             let Ok(target) = cast_target(type_expr, ctx.static_context) else {
                 return Ok(XPathValue::boolean(false));
             };
-            let is_castable = cast_value(ctx.static_context, &value, target, &String::new).is_ok();
+            // §3.10.3: "If the target type of a castable expression is
+            // xs:QName, or is a type that is derived from xs:QName or
+            // xs:NOTATION, and the input argument of the expression is of type
+            // xs:string but it is not a literal string, the result of the
+            // castable expression is false."
+            let is_castable = name_cast_source_allowed(&value, target, string_literal)
+                && cast_value(ctx.static_context, &value, target, &String::new).is_ok();
             Ok(XPathValue::boolean(is_castable))
         }
     }
@@ -910,8 +1005,13 @@ fn first_atomized_item<N: DomNavigator>(
 ///
 /// `None` means the operand atomized to the empty sequence, which makes the
 /// whole arithmetic expression `NaN`.
+///
+/// `xpath10_language` is the XPath 1.0 language (`XPathMode::XPath10`), whose
+/// `number()` reads a string as XPath 1.0 §4.4 does; an XPath 2.0 expression in
+/// compatibility mode uses the XPath 2.0 `fn:number`.
 fn arithmetic_operand_10<N: DomNavigator>(
     value: XPathValue<N>,
+    xpath10_language: bool,
 ) -> Result<Option<crate::types::XmlValue>, XPathError> {
     let Some(first) = first_atomized_item(value)? else {
         return Ok(None);
@@ -922,9 +1022,12 @@ fn arithmetic_operand_10<N: DomNavigator>(
         || code.is_string_derived()
         || (code.is_numeric() && code != XmlTypeCode::Double);
     if needs_number {
-        return Ok(Some(crate::types::XmlValue::double(
-            crate::xpath::atomize::to_number(&first),
-        )));
+        let number = if xpath10_language {
+            crate::xpath::atomize::to_number_xpath10(&first)
+        } else {
+            crate::xpath::atomize::to_number(&first)
+        };
+        return Ok(Some(crate::types::XmlValue::double(number)));
     }
     Ok(Some(first))
 }
@@ -1030,6 +1133,59 @@ fn apply_function_conversion_10<N: DomNavigator>(
     }
 
     Ok(())
+}
+
+/// Report, once per evaluation of the operator node `site`, that the
+/// date/time or duration `result` of `op` keeps its seconds truncated toward
+/// zero (`xs-seconds-capacity`; see
+/// [`eval_binary_noted`](crate::xpath::operators::eval_binary_noted)).
+fn warn_truncated_seconds<N: DomNavigator>(
+    ctx: &mut DynamicContext<'_, N>,
+    arena: &AstArena,
+    site: AstNodeId,
+    op: BinaryOpKind,
+    result: &crate::types::XmlValue,
+) {
+    let symbol = match op {
+        BinaryOpKind::Add => "+",
+        BinaryOpKind::Sub => "-",
+        BinaryOpKind::Mul => "*",
+        BinaryOpKind::Div => "div",
+        _ => "an operator",
+    };
+    let site = crate::xpath::context::WarningSite::Node {
+        expression: std::ptr::from_ref(arena) as usize,
+        node: site,
+    };
+    ctx.warn_once(site, || {
+        crate::xpath::operators::seconds_capacity_warning(
+            &format!("the operator `{symbol}`"),
+            result,
+        )
+    });
+}
+
+/// Whether an expression is a string literal (XPath 2.0 §3.1.1), seen through
+/// the wrappers the grammar's step chain adds around a primary expression — a
+/// single-step relative `PathExpr` over an unfiltered `FilterExpr`, a
+/// parenthesized expression of one operand — exactly as
+/// [`is_empty_sequence_expression`] sees through them.
+fn is_string_literal_expression(arena: &AstArena, id: AstNodeId) -> bool {
+    match arena.try_get(id) {
+        Some(AstNode::Value(ValueNode::String(_))) => true,
+        Some(AstNode::Expr(expr)) => match expr.items.as_slice() {
+            [only] => is_string_literal_expression(arena, *only),
+            _ => false,
+        },
+        Some(AstNode::PathExpr(path)) => match path.steps.as_slice() {
+            [only] if !path.is_absolute => is_string_literal_expression(arena, *only),
+            _ => false,
+        },
+        Some(AstNode::FilterExpr(filter)) if filter.predicates.is_empty() => {
+            is_string_literal_expression(arena, filter.base)
+        }
+        _ => false,
+    }
 }
 
 /// Whether an expression is the literal empty sequence — the one expression

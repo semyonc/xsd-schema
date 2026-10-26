@@ -234,7 +234,31 @@ pub trait DomNavigator: Clone {
         Cow::Owned(self.value())
     }
 
-    /// Get the base URI of the current node
+    /// The base URI this navigator knows for the current node, **unresolved**.
+    ///
+    /// What a navigator returns:
+    ///
+    /// * at the document node: the base URI of the document entity — the URI
+    ///   the document was retrieved from, or was given when it was built — or
+    ///   `""` when none is known. `xml:base` never changes it;
+    /// * at any other node: either that same document base URI
+    ///   ([`RoXmlNavigator`] reports it for every node), or the value of the
+    ///   `xml:base` attribute in scope at the node, exactly as written
+    ///   (`document::BufferDocNavigator` reports it where there is one) —
+    ///   never a value resolved from the two;
+    /// * at the topmost node of a tree without a document node (a fragment):
+    ///   the document's base URI when the node carries no `xml:base` of its
+    ///   own.
+    ///
+    /// Who resolves: the consumer. `fn:base-uri` takes this value at the
+    /// document node (or at the topmost node of a fragment), resolves every
+    /// `xml:base` from the outermost ancestor-or-self inward against it (XML
+    /// Base; RFC 3986 §5.2, which removes dot segments, §5.2.4), and finally
+    /// resolves the result against the static base URI when it is still
+    /// relative. A navigator does not resolve the `xml:base` chain itself — a
+    /// consumer that does so would apply it twice — and a host that needs the
+    /// base URI of a node (to resolve a relative reference found in it)
+    /// resolves it the same way.
     fn base_uri(&self) -> &str;
 
     // ----- Typed value hooks -----

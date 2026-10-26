@@ -11,7 +11,7 @@
 use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
 
-use crate::types::value::{XmlAtomicValue, XmlValue};
+use crate::types::value::{TimezoneOffset, XmlAtomicValue, XmlValue};
 use crate::types::XmlTypeCode;
 use crate::xpath::collation::{ActiveCollation, CollationRef};
 use crate::xpath::context::DynamicContext;
@@ -22,8 +22,8 @@ use crate::xpath::DomNavigator;
 
 use super::numeric::round_half_toward_positive_infinity_f64;
 use super::{
-    atomize_sequence, atomize_to_double, atomize_to_single, atomize_to_single_opt,
-    atomize_to_string_opt, convert, materialize, XPathValue,
+    atomize_sequence, atomize_to_single, atomize_to_single_opt, atomize_to_string_opt, convert,
+    materialize, XPathValue,
 };
 
 /// The collation of a call: its `$collation` argument if it has one, and
@@ -104,6 +104,7 @@ pub fn index_of<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 3;
     let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
+    let tz = context.implicit_timezone_or_host();
 
     // Get the sequence (arg 0) and search value (arg 1)
     let seq = args.remove(0);
@@ -119,7 +120,7 @@ pub fn index_of<N: DomNavigator>(
     // Find matching positions (1-based)
     let mut positions = Vec::new();
     for (idx, item) in seq_values.iter().enumerate() {
-        if values_equal(item, &search_value, collation.as_ref())? {
+        if values_equal(item, &search_value, collation.as_ref(), tz)? {
             positions.push(XmlItem::Atomic(XmlValue::integer(BigInt::from(idx + 1))));
         }
     }
@@ -150,6 +151,7 @@ fn values_equal(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
@@ -159,7 +161,7 @@ fn values_equal(
         return Ok(numeric_values_equal(&left_norm, &right_norm));
     }
 
-    eq_or_distinct(&left_norm, &right_norm, collation)
+    eq_or_distinct(&left_norm, &right_norm, collation, tz)
 }
 
 /// `left eq right` under `collation`, where a pair the `eq` operator is not
@@ -170,8 +172,9 @@ fn eq_or_distinct(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    match crate::xpath::operators::value_eq_collated(left, right, collation) {
+    match crate::xpath::operators::value_eq_collated(left, right, collation, tz) {
         Ok(equal) => Ok(equal),
         Err(XPathError::BinaryOperatorNotDefined { .. }) => Ok(false),
         Err(err) => Err(err),
@@ -256,6 +259,7 @@ fn distinct_values_equal(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     let left_norm = normalize_for_comparison(left);
     let right_norm = normalize_for_comparison(right);
@@ -267,8 +271,10 @@ fn distinct_values_equal(
 
     // Everything else is `eq`: durations compare across their subtypes
     // (`P0M eq PT0S`, `P12M eq P1Y`), dates and times by their timeline value,
-    // QNames by expanded name, strings under the collation.
-    eq_or_distinct(&left_norm, &right_norm, collation)
+    // QNames by expanded name, strings under the collation; a date/time value
+    // without a timezone in the implicit timezone (F&O §15.1.8 compares "using
+    // the eq operator").
+    eq_or_distinct(&left_norm, &right_norm, collation, tz)
 }
 
 /// Normalize a value for comparison (UntypedAtomic and AnyUri become string).
@@ -407,6 +413,7 @@ pub fn distinct_values<N: DomNavigator>(
 
     let has_collation_arg = args.len() == 2;
     let collation = call_collation(context, &mut args, has_collation_arg, has_collation_arg)?;
+    let tz = context.implicit_timezone_or_host();
     let seq = args.remove(0);
 
     // Atomize the sequence
@@ -422,7 +429,7 @@ pub fn distinct_values<N: DomNavigator>(
     for value in values {
         let mut is_duplicate = false;
         for existing in &distinct {
-            if distinct_values_equal(existing, &value, collation.as_ref())? {
+            if distinct_values_equal(existing, &value, collation.as_ref(), tz)? {
                 is_duplicate = true;
                 break;
             }
@@ -531,6 +538,21 @@ pub fn insert_before<N: DomNavigator>(
     Ok(XPathValue::from_sequence(result))
 }
 
+/// The `xs:double` of an argument declared `as xs:double`: one item, the
+/// empty sequence being XPTY0004.
+fn required_double<N: DomNavigator>(
+    value: XPathValue<N>,
+    parameter: &str,
+) -> Result<f64, XPathError> {
+    match atomize_to_single_opt(value)? {
+        Some(atomic) => Ok(crate::xpath::atomize::to_number(&atomic)),
+        None => Err(XPathError::XPTY0004 {
+            expected: format!("xs:double for {parameter} of fn:subsequence"),
+            found: "empty-sequence()".to_string(),
+        }),
+    }
+}
+
 // ============================================================================
 // fn:subsequence($sourceSeq as item()*, $startingLoc as xs:double,
 //                $length as xs:double?) as item()*
@@ -551,6 +573,8 @@ pub fn insert_before<N: DomNavigator>(
 /// - NaN startingLoc or length -> empty
 /// - +Infinity startingLoc -> empty
 /// - -Infinity length -> empty
+/// - the empty sequence for either -> XPTY0004 (outside XPath 1.0
+///   compatibility mode, whose function conversion rules make it NaN)
 pub fn subsequence<N: DomNavigator>(
     _context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,
@@ -571,12 +595,16 @@ pub fn subsequence<N: DomNavigator>(
         None
     };
 
-    // Get starting location as double
-    let starting_loc = atomize_to_double(starting_loc_arg)?;
+    // F&O §15.1.10: `$startingLoc as xs:double` and `$length as xs:double`
+    // take exactly one value — the empty sequence is a type error (XPath 2.0
+    // §3.1.5, XPTY0004). In XPath 1.0 compatibility mode the function
+    // conversion rules have already applied `fn:number`, so an empty argument
+    // arrives here as NaN.
+    let starting_loc = required_double(starting_loc_arg, "$startingLoc")?;
 
     // Get optional length as double
     let length = match length_arg {
-        Some(arg) => Some(atomize_to_double(arg)?),
+        Some(arg) => Some(required_double(arg, "$length")?),
         None => None,
     };
 
@@ -672,6 +700,7 @@ pub fn deep_equal<N: DomNavigator>(
     // the walk starts rather than silently become the codepoint one.
     let has_collation_arg = args.len() == 3;
     let collation = call_collation(context, &mut args, has_collation_arg, true)?;
+    let tz = context.implicit_timezone_or_host();
 
     let param1 = args.remove(0);
     let param2 = args.remove(0);
@@ -698,8 +727,11 @@ pub fn deep_equal<N: DomNavigator>(
     // contents, typed values of elements and attributes, and free-standing
     // atomic items — "but not when names are compared", so element, attribute
     // and PI *names* stay codepoint comparisons.
-    let comparer =
-        NodeComparer::deep_equal_function(context.static_context.schema_set, collation.as_ref());
+    let comparer = NodeComparer::deep_equal_function(
+        context.static_context.schema_set,
+        collation.as_ref(),
+        tz,
+    );
     let result = comparer.deep_equal_iter(&iter1, &iter2)?;
 
     Ok(XPathValue::boolean(result))

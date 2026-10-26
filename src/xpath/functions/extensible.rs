@@ -662,11 +662,14 @@ impl<N: DomNavigator> FunctionEvaluator<N> for XPath10Evaluator {
                     0 => {
                         let item = ctx.require_context_item()?.clone();
                         let d = match item {
+                            // XPath 1.0 §4.4: the string value read as a
+                            // Number, or NaN.
                             crate::xpath::iterator::XmlItem::Node(nav) => {
-                                let s = nav.value();
-                                s.trim().parse().unwrap_or(f64::NAN)
+                                atomize::xpath10_string_to_number(&nav.value())
                             }
-                            crate::xpath::iterator::XmlItem::Atomic(v) => atomize::to_number(&v),
+                            crate::xpath::iterator::XmlItem::Atomic(v) => {
+                                atomize::to_number_xpath10(&v)
+                            }
                         };
                         Ok(XPathValue::double(d))
                     }

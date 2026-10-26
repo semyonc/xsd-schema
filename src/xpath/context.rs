@@ -764,6 +764,41 @@ impl<V> Default for VarStore<V> {
 }
 
 // ============================================================================
+// The host's clock
+// ============================================================================
+
+/// The current instant and the host's local offset at that instant, read
+/// together once per dynamic context.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostClock {
+    /// The current instant.
+    pub(crate) now: chrono::DateTime<chrono::Utc>,
+    /// The host's local offset at `now`.
+    pub(crate) offset: TimezoneOffset,
+}
+
+impl HostClock {
+    fn now() -> Self {
+        let now = chrono::Utc::now();
+        Self {
+            now,
+            offset: host_offset_at(now),
+        }
+    }
+}
+
+/// The host's local offset (`chrono::Local`, the process's `TZ`) at `instant`,
+/// in whole minutes.
+pub(crate) fn host_offset_at(instant: chrono::DateTime<chrono::Utc>) -> TimezoneOffset {
+    use chrono::{Offset, TimeZone};
+    let seconds = chrono::Local
+        .offset_from_utc_datetime(&instant.naive_utc())
+        .fix()
+        .local_minus_utc();
+    TimezoneOffset((seconds / 60) as i16)
+}
+
+// ============================================================================
 // DynamicContext (for eval-time)
 // ============================================================================
 
@@ -775,6 +810,31 @@ impl<V> Default for VarStore<V> {
 /// - Variable bindings (indexed by VarSlotId)
 /// - Current date/time (stable for duration of query)
 /// - Implicit timezone
+///
+/// # The implicit timezone and the current dateTime
+///
+/// F&O 1.0 §10.4 takes the implicit timezone of every date/time comparison
+/// from the dynamic context: "If either operand to a comparison function on
+/// date or time values does not have an (explicit) timezone then, for the
+/// purpose of the operation, an implicit timezone, provided by the dynamic
+/// context …, is assumed to be present as part of the value." The engine
+/// reads [`implicit_timezone`](Self::implicit_timezone) in every comparison,
+/// in the subtraction of two date/time values, in the one-argument
+/// `fn:adjust-*-to-timezone` functions and in `fn:implicit-timezone`. When it
+/// is `None`, the context falls back to the host's local offset (the `TZ` of
+/// the process, through `chrono::Local`), read the first time it is needed
+/// and kept for the rest of this context's evaluation, together with the
+/// instant `fn:current-dateTime` reports — so both are ·stable· (F&O §16.3)
+/// even across a daylight-saving change.
+/// [`implicit_timezone_or_host`](Self::implicit_timezone_or_host) is the
+/// timezone in force.
+///
+/// [`current_datetime`](Self::current_datetime), when set, is what
+/// `fn:current-dateTime` returns; otherwise the function returns the current
+/// instant expressed in the implicit timezone, and keeps it. A host that
+/// evaluates several expressions as one unit of work sets both
+/// fields on every dynamic context it builds, so that they stay the same
+/// throughout.
 pub struct DynamicContext<'a, N: DomNavigator> {
     /// Reference to the static context
     pub static_context: &'a XPathContext<'a>,
@@ -786,10 +846,16 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     pub context_size: usize,
     /// Current date/time (stable for entire query evaluation)
     pub current_datetime: Option<DateTimeValue>,
-    /// Implicit timezone
+    /// Implicit timezone; `None` falls back to the host's local offset (see
+    /// [`implicit_timezone_or_host`](Self::implicit_timezone_or_host)).
     pub implicit_timezone: Option<TimezoneOffset>,
     /// Base URI for resolving relative URIs
     pub base_uri: Option<String>,
+    /// The host's clock, read once: the instant `fn:current-dateTime` reports
+    /// when [`current_datetime`](Self::current_datetime) is not set, and the
+    /// host's offset at that instant, the implicit timezone when
+    /// [`implicit_timezone`](Self::implicit_timezone) is not set.
+    host_clock: std::cell::OnceCell<HostClock>,
     /// Variable bindings (indexed by VarSlotId from NameBinder)
     pub variables: VarStore<super::functions::XPathValue<N>>,
     /// Function evaluator for eval-time dispatch (None = use builtins).
@@ -819,6 +885,26 @@ pub struct DynamicContext<'a, N: DomNavigator> {
     /// allocation-free unless a non-codepoint collation is used, and dropped
     /// with the context.
     collation_cache: crate::xpath::collation::CollationCache,
+    /// The warnings this evaluation raised and nobody took yet; see
+    /// [`take_warnings`](Self::take_warnings).
+    warnings: Vec<super::error::XPathWarning>,
+    /// The sites that have warned in this evaluation: each warns once.
+    warned_sites: Vec<WarningSite>,
+}
+
+/// Where a warning came from, so that it is raised once per evaluation and
+/// site however often the site runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WarningSite {
+    /// An operator node of an expression: the address of the expression's
+    /// node arena (which tells apart expressions evaluated in one context)
+    /// and the node.
+    Node {
+        expression: usize,
+        node: crate::xpath::arena::AstNodeId,
+    },
+    /// A built-in function, by name.
+    Function(&'static str),
 }
 
 impl<'a, N: DomNavigator> DynamicContext<'a, N> {
@@ -834,6 +920,7 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             current_datetime: None,
             implicit_timezone: static_context.implicit_timezone,
             base_uri: static_context.base_uri.clone(),
+            host_clock: std::cell::OnceCell::new(),
             variables: VarStore::new(var_count),
             function_evaluator: None,
             extension: None,
@@ -841,6 +928,8 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
             regex_cache: Default::default(),
             host_regex_cache: None,
             collation_cache: Default::default(),
+            warnings: Vec::new(),
+            warned_sites: Vec::new(),
         }
     }
 
@@ -874,6 +963,65 @@ impl<'a, N: DomNavigator> DynamicContext<'a, N> {
     pub fn with_implicit_timezone(mut self, tz: TimezoneOffset) -> Self {
         self.implicit_timezone = Some(tz);
         self
+    }
+
+    /// The implicit timezone in force:
+    /// [`implicit_timezone`](Self::implicit_timezone) when it is set, else the
+    /// host's local offset, read once for this context (see the
+    /// [type documentation](Self)).
+    ///
+    /// ```
+    /// use xsd_schema::namespace::table::NameTable;
+    /// use xsd_schema::types::value::TimezoneOffset;
+    /// use xsd_schema::xpath::{DynamicContext, RoXmlNavigator, XPathContext};
+    ///
+    /// let names = NameTable::new();
+    /// let ctx = XPathContext::new(&names);
+    /// let dynamic = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0)
+    ///     .with_implicit_timezone(TimezoneOffset::from_hm(5, 30));
+    /// assert_eq!(dynamic.implicit_timezone_or_host(), TimezoneOffset::from_hm(5, 30));
+    ///
+    /// // Without one, the host's offset — the same value every time it is asked.
+    /// let host = DynamicContext::<RoXmlNavigator<'static>>::new(&ctx, 0);
+    /// assert_eq!(host.implicit_timezone_or_host(), host.implicit_timezone_or_host());
+    /// ```
+    pub fn implicit_timezone_or_host(&self) -> TimezoneOffset {
+        match self.implicit_timezone {
+            Some(tz) => tz,
+            None => self.host_clock().offset,
+        }
+    }
+
+    /// The warnings this evaluation has raised since they were last taken
+    /// ([`XPathWarning`](super::error::XPathWarning)): each site of the
+    /// expression — an operator, a function — warns once per evaluation however
+    /// often it runs. An evaluation through
+    /// [`XPathEvaluator`](crate::xpath::XPathEvaluator) hands them to the
+    /// collector of [`with_warnings`](crate::xpath::XPathEvaluator::with_warnings);
+    /// a host that drives [`eval_node`](crate::xpath::eval_node) with its own
+    /// dynamic context takes them here. Taking them ends the evaluation for
+    /// this purpose: a site warns again afterwards.
+    pub fn take_warnings(&mut self) -> Vec<super::error::XPathWarning> {
+        self.warned_sites.clear();
+        std::mem::take(&mut self.warnings)
+    }
+
+    /// Raise the warning `warning` builds, unless `site` has warned in this
+    /// evaluation already.
+    pub(crate) fn warn_once(
+        &mut self,
+        site: WarningSite,
+        warning: impl FnOnce() -> super::error::XPathWarning,
+    ) {
+        if !self.warned_sites.contains(&site) {
+            self.warned_sites.push(site);
+            self.warnings.push(warning());
+        }
+    }
+
+    /// The host's clock, read the first time it is needed.
+    pub(crate) fn host_clock(&self) -> &HostClock {
+        self.host_clock.get_or_init(HostClock::now)
     }
 
     /// Get the context item, returning an error if undefined.

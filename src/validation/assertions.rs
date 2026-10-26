@@ -198,6 +198,23 @@ fn compute_dollar_value<'doc>(
     }
 }
 
+/// Hand the warnings an assertion's or a type alternative's expression `test`
+/// raised to the validation run (`expression_warnings`), naming the
+/// expression.
+pub(crate) fn note_expression_warnings(
+    what: &str,
+    test: &str,
+    warnings: Vec<crate::xpath::XPathWarning>,
+) {
+    for warning in warnings {
+        super::expression_warnings::note(
+            warning.code(),
+            || format!("{what} '{test}'"),
+            warning.message().to_string(),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // evaluate_complex_type_assertions — core evaluation
 // ---------------------------------------------------------------------------
@@ -260,13 +277,17 @@ pub(crate) fn evaluate_complex_type_assertions(
         let nav = BufferDocNavigator::new_assertion(doc, element_ref);
         let value_for_eval = dollar_value.clone();
 
-        let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let outcome = crate::xpath::operators::with_decimal_capacity_marks(|| {
             expr.evaluator(&ctx)
+                .with_warnings(&warnings)
                 .run_with_node_and_setup(Some(nav), |eval| {
                     eval.set_variable_by_name("value", value_for_eval)
                         .expect("$value declared via compile_with_vars");
                 })
-        }) {
+        });
+        note_expression_warnings("assertion", &assertion.test, warnings.into_inner());
+        let result = match outcome {
             Ok(r) => r,
             // Datatypes 1.1 §5.4: an `xs:decimal` beyond this implementation's
             // capacity "must not be treated as invalid". An assertion whose

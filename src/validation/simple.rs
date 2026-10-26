@@ -2111,13 +2111,22 @@ pub(crate) fn evaluate_assertion_facets(
         // with the type that validated it.
         let xpath_value = typed_value.to_xpath_value::<RoXmlNavigator<'static>>();
 
-        // Evaluate with $value bound
-        let result = match crate::xpath::operators::with_decimal_capacity_marks(|| {
+        // Evaluate with $value bound; the expression's warnings go to the
+        // validation run (`expression_warnings`).
+        let warnings = std::cell::RefCell::new(Vec::new());
+        let outcome = crate::xpath::operators::with_decimal_capacity_marks(|| {
             expr.evaluator(&ctx)
+                .with_warnings(&warnings)
                 .run_with::<RoXmlNavigator<'static>, _>(|eval| {
                     eval.set_variable_by_name("value", xpath_value).unwrap();
                 })
-        }) {
+        });
+        super::assertions::note_expression_warnings(
+            "assertion",
+            &assertion.test,
+            warnings.into_inner(),
+        );
+        let result = match outcome {
             Ok(result) => result,
             // Datatypes 1.1 §5.4: an `xs:decimal` beyond this implementation's
             // capacity "must not be treated as invalid". When the assertion

@@ -377,7 +377,11 @@ pub fn escape_html_uri<N: DomNavigator>(
 /// collation a collation unit is a codepoint and that is plain substring
 /// search; under a host collation it is
 /// [`Collation::find`](crate::xpath::collation::Collation::find), and a
-/// collation that has no collation units raises FOCH0004.
+/// collation that has no collation units raises FOCH0004. The order is F&O
+/// §7.5.1's: an unsupported collation is FOCH0002 first (§7.3.1), then a
+/// zero-length `$arg2` is `true` whatever the collation ("If the value of $arg2
+/// is the zero-length string, then the function returns true"), and only a
+/// search that needs collation units can raise FOCH0004.
 pub fn contains<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     mut args: Vec<XPathValue<N>>,

@@ -382,11 +382,11 @@ fn a_collation_without_collation_units_is_foch0004_in_the_five_substring_functio
         "ends-with('abc', 'c', '{URI}')",
         "substring-before('abc', 'b', '{URI}')",
         "substring-after('abc', 'b', '{URI}')",
-        // The zero-length-argument forms too, so that the answer does not
-        // depend on the arguments.
-        "contains('abc', '', '{URI}')",
-        "starts-with('abc', '', '{URI}')",
-        "ends-with('abc', '', '{URI}')",
+        // A zero-length *first* argument still needs the collation units of
+        // the second: under a collation with ignorable units it may be
+        // equivalent to the zero-length string (F&O §7.5.1).
+        "contains('', 'b', '{URI}')",
+        "starts-with((), 'b', '{URI}')",
     ] {
         let src = template.replace("{URI}", ORDER_ONLY);
         let err = expect_err(eval(&resolver, &src), &src);
@@ -399,6 +399,49 @@ fn a_collation_without_collation_units_is_foch0004_in_the_five_substring_functio
             crate::xpath::error::XQT_ERRORS_NAMESPACE
         );
         assert!(raised.description.unwrap().contains(ORDER_ONLY));
+    }
+}
+
+/// F&O 1.0 §7.5.1 – §7.5.5 decide a zero-length second argument whatever the
+/// collation: "If the value of $arg2 is the zero-length string, then the
+/// function returns true" (`contains`, `starts-with`, `ends-with`), "returns the
+/// zero-length string" (`substring-before`) and "returns the value of $arg1"
+/// (`substring-after`). Only then: "If the specified collation does not support
+/// collation units an error ·may· be raised \[err:FOCH0004\]" — so a collation
+/// without collation units answers these, and an unsupported one is still
+/// FOCH0002 first (F&O §7.3.1).
+#[test]
+fn the_zero_length_cases_come_before_foch0004() {
+    let resolver = Recording::default();
+    for (template, expected) in [
+        ("string(contains('abc', '', '{URI}'))", "true"),
+        ("string(contains('abc', (), '{URI}'))", "true"),
+        ("string(contains((), '', '{URI}'))", "true"),
+        ("string(starts-with('abc', '', '{URI}'))", "true"),
+        ("string(ends-with('abc', (), '{URI}'))", "true"),
+        ("substring-before('abc', '', '{URI}')", ""),
+        ("substring-after('abc', '', '{URI}')", "abc"),
+        ("substring-after((), (), '{URI}')", ""),
+    ] {
+        let src = template.replace("{URI}", ORDER_ONLY);
+        let value = eval(&resolver, &src).unwrap_or_else(|e| panic!("{src} raised {e}"));
+        let text = value
+            .into_vec()
+            .into_iter()
+            .map(|item| match item {
+                crate::xpath::iterator::XmlItem::Atomic(a) => a.to_string_value(),
+                crate::xpath::iterator::XmlItem::Node(_) => "<node>".to_string(),
+            })
+            .collect::<String>();
+        assert_eq!(text, expected, "{src}");
+    }
+    for template in [
+        "contains('abc', '', '{URI}')",
+        "substring-after('abc', '', '{URI}')",
+    ] {
+        let src = template.replace("{URI}", UNKNOWN);
+        let err = expect_err(eval(&resolver, &src), &src);
+        assert_eq!(code(&err), Some("FOCH0002"), "{src} gave {err}");
     }
 }
 
@@ -909,9 +952,13 @@ fn the_index_and_the_pairwise_loop_agree_item_by_item() {
                 let right_buf = BufferedNodeIterator::preload(iter_of(right)).unwrap();
 
                 let expected_eq = general_eq_iter_pairwise(&ctx, &left_iter, &right_buf);
-                if let Some(got) =
-                    general_compare::try_indexed_eq(&ctx, &left_iter, &right_buf, active.as_ref())
-                {
+                if let Some(got) = general_compare::try_indexed_eq(
+                    &ctx,
+                    &left_iter,
+                    &right_buf,
+                    active.as_ref(),
+                    crate::xpath::operators::static_timezone(&ctx),
+                ) {
                     decided_eq += 1;
                     assert_eq!(
                         format!("{:?}", expected_eq.as_ref().map_err(|e| e.to_string())),
@@ -921,9 +968,12 @@ fn the_index_and_the_pairwise_loop_agree_item_by_item() {
                 }
 
                 let expected_ne = general_ne_iter_pairwise(&ctx, &left_iter, &right_buf);
-                if let Some(got) =
-                    general_compare::try_indexed_ne(&left_iter, &right_buf, active.as_ref())
-                {
+                if let Some(got) = general_compare::try_indexed_ne(
+                    &left_iter,
+                    &right_buf,
+                    active.as_ref(),
+                    crate::xpath::operators::static_timezone(&ctx),
+                ) {
                     assert_eq!(
                         format!("{:?}", expected_ne.as_ref().map_err(|e| e.to_string())),
                         format!("{:?}", got.as_ref().map_err(|e| e.to_string())),
@@ -967,8 +1017,13 @@ fn a_collation_without_a_sort_key_sends_the_index_back_to_the_pairwise_loop() {
         let active = super::resolve_default(&ctx);
         let left_iter = iter(&values);
         let right_buf = BufferedNodeIterator::preload(iter(&values)).unwrap();
-        let outcome =
-            general_compare::try_indexed_eq(&ctx, &left_iter, &right_buf, active.as_ref());
+        let outcome = general_compare::try_indexed_eq(
+            &ctx,
+            &left_iter,
+            &right_buf,
+            active.as_ref(),
+            crate::xpath::operators::static_timezone(&ctx),
+        );
         assert_eq!(outcome.is_some(), decides, "{uri}");
     }
 }

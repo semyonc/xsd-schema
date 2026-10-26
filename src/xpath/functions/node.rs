@@ -747,9 +747,14 @@ fn compute_base_uri<N: DomNavigator>(node: &N, static_base_uri: Option<&str>) ->
             // observe a `Root` node above the test element. The
             // navigator still surfaces the document-level base URI
             // via `nav.base_uri()` once no `xml:base` is found, so
-            // pick it up here as the bottom of the chain.
+            // pick it up here as the bottom of the chain — unless it is
+            // the topmost element's own `xml:base`, already collected,
+            // which a navigator may report there instead
+            // (`DomNavigator::base_uri`).
             let doc_base = nav.base_uri();
-            if !doc_base.is_empty() {
+            let own_xml_base = nav.node_type() == DomNodeType::Element
+                && get_xml_base_attr(&nav).is_some_and(|own| own == doc_base);
+            if !doc_base.is_empty() && !own_xml_base {
                 xml_bases.push(doc_base.to_string());
             }
             break;
@@ -785,43 +790,15 @@ fn get_xml_base_attr<N: DomNavigator>(nav: &N) -> Option<String> {
     None
 }
 
-/// Resolve a URI reference against a base URI.
-///
-/// Simple implementation that handles:
-/// - Absolute URIs (returned as-is)
-/// - Relative paths resolved against base
+/// Resolve a URI reference against a base URI (RFC 3986 §5.2, the crate's
+/// `parser::uri::resolve`).
 fn resolve_uri(uri: &str, base: Option<&str>) -> String {
-    // If URI is absolute (has scheme), return as-is
-    if uri.contains("://") || uri.starts_with("file:") {
-        return uri.to_string();
-    }
-
+    // XML Base §4.2 / RFC 3986 §5.2: the reference resolved against the base
+    // URI, dot segments removed (§5.2.4). Without a base URI the reference is
+    // all there is.
     match base {
+        Some(base) => crate::parser::uri::resolve(base, uri),
         None => uri.to_string(),
-        Some(base_uri) => {
-            if uri.is_empty() {
-                return base_uri.to_string();
-            }
-
-            // Simple resolution: append relative to base directory
-            if uri.starts_with('/') {
-                // Absolute path - find scheme://host and append
-                if let Some(scheme_end) = base_uri.find("://") {
-                    if let Some(path_start) = base_uri[scheme_end + 3..].find('/') {
-                        let host_end = scheme_end + 3 + path_start;
-                        return format!("{}{}", &base_uri[..host_end], uri);
-                    }
-                }
-                uri.to_string()
-            } else {
-                // Relative path - append to base directory
-                if let Some(last_slash) = base_uri.rfind('/') {
-                    format!("{}/{}", &base_uri[..last_slash], uri)
-                } else {
-                    uri.to_string()
-                }
-            }
-        }
     }
 }
 

@@ -12,6 +12,7 @@ pub mod asttree;
 pub mod content;
 pub mod context;
 pub mod errors;
+pub(crate) mod expression_warnings;
 pub mod hint_loader;
 pub mod identity;
 pub mod identity_lexer;

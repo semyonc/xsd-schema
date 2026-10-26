@@ -696,7 +696,8 @@ fn format_double(v: f64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
 /// Positive years use standard 4-digit zero-padded format.
 fn format_year(year: i32, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     if year < 0 {
-        write!(f, "-{:04}", -year)
+        // `unsigned_abs`: `-year` overflows for `i32::MIN`.
+        write!(f, "-{:04}", year.unsigned_abs())
     } else {
         write!(f, "{:04}", year)
     }
@@ -1293,7 +1294,7 @@ impl fmt::Display for TimezoneOffset {
 /// The day of `year-month-day` counted from 1970-01-01 in the proleptic
 /// Gregorian calendar of Datatypes 1.1 (§E.3.4: the year 0000 is a leap year),
 /// exact for every year (`i128`, floor division).
-fn day_number(year: i32, month: u8, day: u8) -> i128 {
+pub(crate) fn day_number(year: i32, month: u8, day: u8) -> i128 {
     crate::types::value_order::days_from_civil(i128::from(year), i128::from(month))
         + i128::from(day)
         - 1
@@ -1302,8 +1303,10 @@ fn day_number(year: i32, month: u8, day: u8) -> i128 {
 /// A position on the time line, exactly: whole seconds from 1970-01-01T00:00Z
 /// (a missing time zone offset read as `Z`), and the fraction of a second in
 /// `[0, 1)` as parsed — kept apart so that no sum rounds (Datatypes 1.1 §E.3.4
-/// ·timeOnTimeline·). Compared lexicographically.
-fn time_line_seconds(
+/// ·timeOnTimeline·). Compared lexicographically. The XPath operators order
+/// date/time values on the same key, with their implicit time zone in place
+/// of a missing offset.
+pub(crate) fn time_line_seconds(
     days: i128,
     hour: u8,
     minute: u8,

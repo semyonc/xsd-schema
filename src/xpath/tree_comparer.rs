@@ -16,9 +16,10 @@ use super::atomize::{self, Atoms};
 use super::collation::CollationRef;
 use super::error::XPathError;
 use super::iterator::{XmlItemRef, XmlNodeIterator};
-use super::operators::eval_binary_collated;
+use super::operators::{eval_binary_collated, is_gregorian_code, is_temporal_type};
 use super::string_ops::is_xml_whitespace;
 use super::{DomNavigator, DomNodeType};
+use crate::types::value::TimezoneOffset;
 
 /// Compares XPath nodes and sequences for deep equality.
 #[derive(Debug, Clone, Default)]
@@ -132,6 +133,9 @@ pub(crate) struct NodeComparer<'s> {
     /// codepoint collation, which is what a round-trip check wants and what it
     /// has always done.
     collation: CollationRef<'s>,
+    /// The implicit timezone of the dynamic context, for date/time values
+    /// without one (F&O §10.4); the host's offset for [`TreeComparer`].
+    implicit_timezone: TimezoneOffset,
 }
 
 impl NodeComparer<'static> {
@@ -142,6 +146,7 @@ impl NodeComparer<'static> {
             function_rules: false,
             schema_set: None,
             collation: CollationRef::Codepoint,
+            implicit_timezone: super::operators::host_implicit_timezone(),
         }
     }
 }
@@ -163,12 +168,14 @@ impl<'s> NodeComparer<'s> {
     pub(crate) fn deep_equal_function(
         schema_set: Option<&'s SchemaSet>,
         collation: CollationRef<'s>,
+        implicit_timezone: TimezoneOffset,
     ) -> Self {
         Self {
             ignore_whitespace: false,
             function_rules: true,
             schema_set,
             collation,
+            implicit_timezone,
         }
     }
 
@@ -217,6 +224,13 @@ impl<'s> NodeComparer<'s> {
         if self.is_nan_value(left) && self.is_nan_value(right) {
             return true;
         }
+        // Date/time, duration and gregorian values are equal as `eq` says
+        // (F&O §15.3.1), with the implicit timezone — not as the order of the
+        // schema facets, which their own `PartialEq` is (`P400Y` equals
+        // `P146097D` there, a value without a timezone equals none with one).
+        if is_temporal_type(left.type_code) || is_gregorian_code(left.type_code) {
+            return false;
+        }
         left == right
     }
 
@@ -230,9 +244,13 @@ impl<'s> NodeComparer<'s> {
 
         // `eq` under this comparer's collation: a string pair is compared with
         // it, every other pair ignores it.
-        if let Ok(result) =
-            eval_binary_collated(BinaryOpKind::ValueEq, &left, &right, self.collation)
-        {
+        if let Ok(result) = eval_binary_collated(
+            BinaryOpKind::ValueEq,
+            &left,
+            &right,
+            self.collation,
+            self.implicit_timezone,
+        ) {
             return result.as_boolean().unwrap_or(false);
         }
 
@@ -742,7 +760,7 @@ mod tests {
     /// entry point the function itself uses.
     fn nodes_deep_equal<N: DomNavigator>(left: N, right: N) -> bool {
         sequences_deep_equal(
-            &NodeComparer::deep_equal_function(None, CollationRef::Codepoint),
+            &NodeComparer::deep_equal_function(None, CollationRef::Codepoint, TimezoneOffset::UTC),
             vec![XmlItem::Node(left)],
             vec![XmlItem::Node(right)],
         )
@@ -1205,7 +1223,11 @@ mod tests {
             right: BufferDocNavigator<'_>,
         ) -> bool {
             sequences_deep_equal(
-                &NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint),
+                &NodeComparer::deep_equal_function(
+                    schema_set,
+                    CollationRef::Codepoint,
+                    TimezoneOffset::UTC,
+                ),
                 vec![XmlItem::Node(left)],
                 vec![XmlItem::Node(right)],
             )
@@ -1472,8 +1494,12 @@ mod tests {
             left: &BufferDocNavigator<'_>,
             right: &BufferDocNavigator<'_>,
         ) -> bool {
-            NodeComparer::deep_equal_function(schema_set, CollationRef::Codepoint)
-                .element_content_equal(left, right)
+            NodeComparer::deep_equal_function(
+                schema_set,
+                CollationRef::Codepoint,
+                TimezoneOffset::UTC,
+            )
+            .element_content_equal(left, right)
         }
 
         /// Review finding: a nilled element whose complex type has simple

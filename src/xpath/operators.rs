@@ -6,7 +6,6 @@
 
 use std::cmp::Ordering;
 
-use chrono::Local;
 use num_bigint::BigInt;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use rust_decimal::Decimal;
@@ -15,17 +14,19 @@ use crate::ids::{SimpleTypeKey, TypeKey};
 use crate::namespace::qname::QualifiedName;
 use crate::schema::model::SchemaSet;
 use crate::types::validators::VALIDATOR_REGISTRY;
+use crate::types::value::{day_number, time_line_seconds};
 use crate::types::value::{
-    DateTimeValue, DateValue, DayTimeDurationValue, DurationValue, QNameValue, TimeValue,
-    TimezoneOffset, XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
+    DateTimeValue, DateValue, DayTimeDurationValue, QNameValue, TimeValue, TimezoneOffset,
+    XmlAtomicValue, XmlValue, XmlValueKind, YearMonthDurationValue,
 };
+use crate::types::value_order::{day_time_duration_parts, DurationParts};
 use crate::types::XmlTypeCode;
 use crate::xpath::ast::{BinaryOpKind, UnaryOpKind};
 use crate::xpath::atomize::{self, ListMembers};
 use crate::xpath::cast::cast_to;
 use crate::xpath::collation::{self, CollationRef};
 use crate::xpath::context::XPathContext;
-use crate::xpath::error::XPathError;
+use crate::xpath::error::{XPathError, XPathWarning};
 use crate::xpath::general_compare;
 use crate::xpath::iterator::{BufferedNodeIterator, XmlItemRef, XmlNodeIterator};
 use crate::xpath::type_info::type_code_to_name;
@@ -89,15 +90,59 @@ pub fn eval_unary(op: UnaryOpKind, value: &XmlValue) -> Result<XmlValue, XPathEr
 /// compare them under the static context's default collation instead — which is
 /// what the `eq`, `ne`, `lt`, `le`, `gt` and `ge` operators of an expression do
 /// — the engine uses the crate-private `eval_binary_collated`.
+///
+/// A date/time operand without a timezone is read in the host's local offset
+/// at the time of the call (F&O 1.0 §10.4 takes the implicit timezone from the
+/// dynamic context, and this function has none); use
+/// [`eval_binary_with_timezone`] to give the implicit timezone.
 pub fn eval_binary(
     op: BinaryOpKind,
     left: &XmlValue,
     right: &XmlValue,
 ) -> Result<XmlValue, XPathError> {
-    eval_binary_collated(op, left, right, CollationRef::Codepoint)
+    eval_binary_with_timezone(op, left, right, host_timezone_for(left, right))
 }
 
-/// [`eval_binary`] with an explicit collation for string operands.
+/// [`eval_binary`] with `implicit_timezone` as the implicit timezone of the
+/// dynamic context: the timezone of a date/time operand that has none, in
+/// comparisons (F&O 1.0 §10.4: "If either operand to a comparison function on
+/// date or time values does not have an (explicit) timezone then, for the
+/// purpose of the operation, an implicit timezone, provided by the dynamic
+/// context …, is assumed to be present as part of the value") and in the
+/// subtraction of two date/time values (§10.8.1 – §10.8.3).
+///
+/// A host that evaluates expressions passes the timezone of the dynamic
+/// context it evaluates them in —
+/// [`DynamicContext::implicit_timezone_or_host`](crate::xpath::DynamicContext::implicit_timezone_or_host)
+/// — so that its own comparisons (sort keys, grouping keys) agree with the
+/// expressions'.
+///
+/// ```
+/// use xsd_schema::types::value::{TimezoneOffset, XmlValue};
+/// use xsd_schema::types::XmlTypeCode;
+/// use xsd_schema::types::validators::VALIDATOR_REGISTRY;
+/// use xsd_schema::xpath::ast::BinaryOpKind;
+/// use xsd_schema::xpath::operators::eval_binary_with_timezone;
+///
+/// let local = VALIDATOR_REGISTRY.validate(XmlTypeCode::DateTime, "2000-01-01T00:00:00").unwrap();
+/// let zoned = VALIDATOR_REGISTRY.validate(XmlTypeCode::DateTime, "2000-01-01T00:00:00+05:00").unwrap();
+/// let five = TimezoneOffset::from_hm(5, 0);
+/// let eq = eval_binary_with_timezone(BinaryOpKind::ValueEq, &local, &zoned, five).unwrap();
+/// assert_eq!(eq.as_boolean(), Some(true));
+/// let utc = eval_binary_with_timezone(BinaryOpKind::ValueEq, &local, &zoned, TimezoneOffset::UTC).unwrap();
+/// assert_eq!(utc.as_boolean(), Some(false));
+/// ```
+pub fn eval_binary_with_timezone(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+    implicit_timezone: TimezoneOffset,
+) -> Result<XmlValue, XPathError> {
+    eval_binary_collated(op, left, right, CollationRef::Codepoint, implicit_timezone)
+}
+
+/// [`eval_binary`] with an explicit collation for string operands and the
+/// implicit timezone `tz` for date/time operands.
 ///
 /// `collation` is [`CollationRef::Codepoint`] for the Unicode codepoint
 /// collation, which takes the very same code path [`eval_binary`] always took.
@@ -115,32 +160,68 @@ pub(crate) fn eval_binary_collated(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
+) -> Result<XmlValue, XPathError> {
+    eval_binary_noted(op, left, right, collation, tz, &mut false)
+}
+
+/// The `xs-seconds-capacity` warning for `what` — an operator or a function —
+/// whose date/time or duration result keeps its seconds truncated toward zero
+/// (see [`eval_binary_noted`]): the code the validator reports for a literal
+/// with more fraction digits than this implementation holds, so that both
+/// report alike.
+pub(crate) fn seconds_capacity_warning(what: &str, result: &XmlValue) -> XPathWarning {
+    XPathWarning::new(
+        crate::types::validators::SECONDS_CAPACITY_WARNING,
+        format!(
+            "{what} gave a value whose seconds have more fraction digits than this \
+             implementation holds beside the whole seconds (a 96-bit mantissa); the value \
+             keeps them truncated toward zero: {}",
+            result.to_string_value()
+        ),
+    )
+}
+
+/// [`eval_binary_collated`], setting `truncated` when a date/time or duration
+/// result's seconds field could not hold the whole fraction and keeps it
+/// truncated toward zero — for the caller to report `xs-seconds-capacity`
+/// (Datatypes 1.1 §5.4). Only `+` and `-` with a `xs:dateTime`, `xs:time` or
+/// `xs:dayTimeDuration` result can: their seconds below 60 and a fraction of
+/// up to 28 digits may need 30; a date drops its time of day, and `*` / `div`
+/// compute in `xs:decimal`, whose result's seconds field always fits.
+pub(crate) fn eval_binary_noted(
+    op: BinaryOpKind,
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+    tz: TimezoneOffset,
+    truncated: &mut bool,
 ) -> Result<XmlValue, XPathError> {
     match op {
         BinaryOpKind::Add | BinaryOpKind::Sub | BinaryOpKind::Mul | BinaryOpKind::Div => {
-            if let Some(result) = eval_temporal_binary(op, left, right)? {
+            if let Some(result) = eval_temporal_binary(op, left, right, tz, truncated)? {
                 return Ok(result);
             }
             eval_numeric_binary(op, left, right)
         }
         BinaryOpKind::IDiv | BinaryOpKind::Mod => eval_numeric_binary(op, left, right),
         BinaryOpKind::GeneralEq | BinaryOpKind::ValueEq => {
-            Ok(XmlValue::boolean(compare_eq(left, right, collation)?))
+            Ok(XmlValue::boolean(compare_eq(left, right, collation, tz)?))
         }
         BinaryOpKind::GeneralNe | BinaryOpKind::ValueNe => {
-            Ok(XmlValue::boolean(!compare_eq(left, right, collation)?))
+            Ok(XmlValue::boolean(!compare_eq(left, right, collation, tz)?))
         }
         BinaryOpKind::GeneralGt | BinaryOpKind::ValueGt => {
-            Ok(XmlValue::boolean(compare_gt(left, right, collation)?))
+            Ok(XmlValue::boolean(compare_gt(left, right, collation, tz)?))
         }
         BinaryOpKind::GeneralGe | BinaryOpKind::ValueGe => {
-            Ok(XmlValue::boolean(compare_ge(left, right, collation)?))
+            Ok(XmlValue::boolean(compare_ge(left, right, collation, tz)?))
         }
         BinaryOpKind::GeneralLt | BinaryOpKind::ValueLt => {
-            Ok(XmlValue::boolean(compare_lt(left, right, collation)?))
+            Ok(XmlValue::boolean(compare_lt(left, right, collation, tz)?))
         }
         BinaryOpKind::GeneralLe | BinaryOpKind::ValueLe => {
-            Ok(XmlValue::boolean(compare_le(left, right, collation)?))
+            Ok(XmlValue::boolean(compare_le(left, right, collation, tz)?))
         }
         BinaryOpKind::And | BinaryOpKind::Or => eval_boolean_logic(op, left, right),
         BinaryOpKind::Is | BinaryOpKind::Before | BinaryOpKind::After => {
@@ -228,11 +309,12 @@ fn compare_eq(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
-    if let Some(result) = compare_temporal_eq(left, right)? {
+    if let Some(result) = compare_temporal_eq(left, right, tz)? {
         return Ok(result);
     }
 
@@ -273,11 +355,12 @@ fn compare_gt(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
     let left = unwrap_union_value(left);
     let right = unwrap_union_value(right);
 
-    if let Some(result) = compare_temporal_gt(left, right)? {
+    if let Some(result) = compare_temporal_gt(left, right, tz)? {
         return Ok(result);
     }
 
@@ -306,11 +389,12 @@ fn compare_ge(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    match compare_eq(left, right, collation) {
+    match compare_eq(left, right, collation, tz) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_gt(left, right, collation),
-        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right, collation),
+        Ok(false) => compare_gt(left, right, collation, tz),
+        Err(err) if is_operator_not_defined(&err) => compare_gt(left, right, collation, tz),
         Err(err) => Err(err),
     }
 }
@@ -319,19 +403,21 @@ fn compare_lt(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    compare_gt(right, left, collation)
+    compare_gt(right, left, collation, tz)
 }
 
 fn compare_le(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    match compare_eq(left, right, collation) {
+    match compare_eq(left, right, collation, tz) {
         Ok(true) => Ok(true),
-        Ok(false) => compare_lt(left, right, collation),
-        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right, collation),
+        Ok(false) => compare_lt(left, right, collation, tz),
+        Err(err) if is_operator_not_defined(&err) => compare_lt(left, right, collation, tz),
         Err(err) => Err(err),
     }
 }
@@ -340,23 +426,50 @@ fn eval_temporal_binary(
     op: BinaryOpKind,
     left: &XmlValue,
     right: &XmlValue,
+    tz: TimezoneOffset,
+    truncated: &mut bool,
 ) -> Result<Option<XmlValue>, XPathError> {
     if !is_temporal_type(left.type_code) && !is_temporal_type(right.type_code) {
         return Ok(None);
     }
 
     let result = match op {
-        BinaryOpKind::Add => eval_temporal_add(left, right),
-        BinaryOpKind::Sub => eval_temporal_sub(left, right),
-        BinaryOpKind::Mul => eval_temporal_mul(left, right),
-        BinaryOpKind::Div => eval_temporal_div(left, right),
+        BinaryOpKind::Add => eval_temporal_add(left, right, truncated),
+        BinaryOpKind::Sub => eval_temporal_sub(left, right, tz, truncated),
+        BinaryOpKind::Mul => eval_temporal_mul(left, right, truncated),
+        BinaryOpKind::Div => eval_temporal_div(left, right, truncated),
         _ => return Ok(None),
     }?;
 
     Ok(Some(result))
 }
 
-fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>, XPathError> {
+/// `eq` on two date/time, duration or gregorian values, with `tz` as the
+/// implicit timezone; `None` when neither operand is of those types.
+///
+/// F&O 1.0 §10.4: "If either operand to a comparison function on date or
+/// time values does not have an (explicit) timezone then, for the purpose of
+/// the operation, an implicit timezone, provided by the dynamic context …, is
+/// assumed to be present as part of the value." The values are compared on
+/// exact keys (whole seconds, the fraction apart), and durations by their
+/// months and seconds (§10.4.5).
+fn compare_temporal_eq(
+    left: &XmlValue,
+    right: &XmlValue,
+    tz: TimezoneOffset,
+) -> Result<Option<bool>, XPathError> {
+    if is_gregorian_code(left.type_code) || is_gregorian_code(right.type_code) {
+        // §10.4.15 – §10.4.19: the starting instants of the two values, for
+        // two values of one gregorian type.
+        if left.type_code != right.type_code {
+            return Err(operator_not_defined("op:eq", left, right));
+        }
+        let (Some(l), Some(r)) = (gregorian_key(left, tz), gregorian_key(right, tz)) else {
+            return Err(XPathError::internal("Expected a gregorian value"));
+        };
+        return Ok(Some(l == r));
+    }
+
     if !is_temporal_type(left.type_code) && !is_temporal_type(right.type_code) {
         return Ok(None);
     }
@@ -369,7 +482,9 @@ fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
             as_datetime(left).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         let right_dt =
             as_datetime(right).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
-        return Ok(Some(compare_datetime_eq(left_dt, right_dt)?));
+        return Ok(Some(
+            datetime_key(left_dt, tz) == datetime_key(right_dt, tz),
+        ));
     }
 
     if left.type_code == XmlTypeCode::Date || right.type_code == XmlTypeCode::Date {
@@ -379,7 +494,7 @@ fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
         let left_date = as_date(left).ok_or_else(|| XPathError::internal("Expected date value"))?;
         let right_date =
             as_date(right).ok_or_else(|| XPathError::internal("Expected date value"))?;
-        return Ok(Some(compare_date_eq(left_date, right_date)?));
+        return Ok(Some(date_key(left_date, tz) == date_key(right_date, tz)));
     }
 
     if left.type_code == XmlTypeCode::Time || right.type_code == XmlTypeCode::Time {
@@ -389,7 +504,7 @@ fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
         let left_time = as_time(left).ok_or_else(|| XPathError::internal("Expected time value"))?;
         let right_time =
             as_time(right).ok_or_else(|| XPathError::internal("Expected time value"))?;
-        return Ok(Some(compare_time_eq(left_time, right_time)?));
+        return Ok(Some(time_key(left_time, tz) == time_key(right_time, tz)));
     }
 
     if is_duration_code(left.type_code) || is_duration_code(right.type_code) {
@@ -397,16 +512,24 @@ fn compare_temporal_eq(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
             return Err(operator_not_defined("op:eq", left, right));
         }
         let left_parts =
-            duration_parts(left)?.ok_or_else(|| XPathError::internal("Expected duration value"))?;
-        let right_parts = duration_parts(right)?
-            .ok_or_else(|| XPathError::internal("Expected duration value"))?;
+            duration_key(left).ok_or_else(|| XPathError::internal("Expected duration value"))?;
+        let right_parts =
+            duration_key(right).ok_or_else(|| XPathError::internal("Expected duration value"))?;
+        // §10.4.5: "the function returns true if the months and seconds
+        // values of the two durations are equal".
         return Ok(Some(left_parts == right_parts));
     }
 
     Err(operator_not_defined("op:eq", left, right))
 }
 
-fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>, XPathError> {
+/// `gt` on two date/time or totally ordered duration values, with `tz` as
+/// the implicit timezone; `None` when neither operand is of those types.
+fn compare_temporal_gt(
+    left: &XmlValue,
+    right: &XmlValue,
+    tz: TimezoneOffset,
+) -> Result<Option<bool>, XPathError> {
     if !is_temporal_type(left.type_code) && !is_temporal_type(right.type_code) {
         return Ok(None);
     }
@@ -419,7 +542,7 @@ fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
             as_datetime(left).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
         let right_dt =
             as_datetime(right).ok_or_else(|| XPathError::internal("Expected dateTime value"))?;
-        return Ok(Some(compare_datetime_gt(left_dt, right_dt)?));
+        return Ok(Some(datetime_key(left_dt, tz) > datetime_key(right_dt, tz)));
     }
 
     if left.type_code == XmlTypeCode::Date || right.type_code == XmlTypeCode::Date {
@@ -429,7 +552,7 @@ fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
         let left_date = as_date(left).ok_or_else(|| XPathError::internal("Expected date value"))?;
         let right_date =
             as_date(right).ok_or_else(|| XPathError::internal("Expected date value"))?;
-        return Ok(Some(compare_date_gt(left_date, right_date)?));
+        return Ok(Some(date_key(left_date, tz) > date_key(right_date, tz)));
     }
 
     if left.type_code == XmlTypeCode::Time || right.type_code == XmlTypeCode::Time {
@@ -439,7 +562,7 @@ fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
         let left_time = as_time(left).ok_or_else(|| XPathError::internal("Expected time value"))?;
         let right_time =
             as_time(right).ok_or_else(|| XPathError::internal("Expected time value"))?;
-        return Ok(Some(compare_time_gt(left_time, right_time)?));
+        return Ok(Some(time_key(left_time, tz) > time_key(right_time, tz)));
     }
 
     if left.type_code == XmlTypeCode::YearMonthDuration
@@ -472,7 +595,8 @@ fn compare_temporal_gt(left: &XmlValue, right: &XmlValue) -> Result<Option<bool>
         let right_duration = as_day_time_duration(right)
             .ok_or_else(|| XPathError::internal("Expected dayTimeDuration value"))?;
         return Ok(Some(
-            day_time_total_seconds(left_duration)? > day_time_total_seconds(right_duration)?,
+            seconds_key(&day_time_duration_parts(left_duration))
+                > seconds_key(&day_time_duration_parts(right_duration)),
         ));
     }
 
@@ -543,14 +667,19 @@ fn compare_string_values(
     collation.compare(left, right)
 }
 
-fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
+fn eval_temporal_add(
+    left: &XmlValue,
+    right: &XmlValue,
+    truncated: &mut bool,
+) -> Result<XmlValue, XPathError> {
     if let Some(left_dt) = as_datetime(left) {
         if let Some(duration) = as_year_month_duration(right) {
-            let result = add_datetime_year_month(left_dt, duration)?;
+            let result = add_datetime_year_month(left_dt, year_month_total_months(duration))?;
             return Ok(xml_datetime_value(left.type_code, result));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_datetime_day_time(left_dt, duration)?;
+            let result =
+                add_datetime_day_time(left_dt, &day_time_duration_parts(duration), truncated)?;
             return Ok(xml_datetime_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Add, left, right));
@@ -558,11 +687,11 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_date) = as_date(left) {
         if let Some(duration) = as_year_month_duration(right) {
-            let result = add_date_year_month(left_date, duration)?;
+            let result = add_date_year_month(left_date, year_month_total_months(duration))?;
             return Ok(xml_date_value(left.type_code, result));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_date_day_time(left_date, duration)?;
+            let result = add_date_day_time(left_date, &day_time_duration_parts(duration))?;
             return Ok(xml_date_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Add, left, right));
@@ -570,7 +699,8 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_time) = as_time(left) {
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_time_day_time(left_time, duration)?;
+            let result =
+                add_time_day_time(left_time, &day_time_duration_parts(duration), truncated);
             return Ok(xml_time_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Add, left, right));
@@ -578,6 +708,7 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_duration) = as_year_month_duration(left) {
         if let Some(right_duration) = as_year_month_duration(right) {
+            // Both totals are below 13 × 2³², so the sum cannot overflow.
             let total =
                 year_month_total_months(left_duration) + year_month_total_months(right_duration);
             return Ok(xml_year_month_duration_value(year_month_from_months(
@@ -585,32 +716,40 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
             )?));
         }
         if let Some(right_dt) = as_datetime(right) {
-            let result = add_datetime_year_month(right_dt, left_duration)?;
+            let result = add_datetime_year_month(right_dt, year_month_total_months(left_duration))?;
             return Ok(xml_datetime_value(right.type_code, result));
         }
         if let Some(right_date) = as_date(right) {
-            let result = add_date_year_month(right_date, left_duration)?;
+            let result = add_date_year_month(right_date, year_month_total_months(left_duration))?;
             return Ok(xml_date_value(right.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Add, left, right));
     }
 
     if let Some(left_duration) = as_day_time_duration(left) {
+        let left_parts = day_time_duration_parts(left_duration);
         if let Some(right_duration) = as_day_time_duration(right) {
-            let total =
-                day_time_total_seconds(left_duration)? + day_time_total_seconds(right_duration)?;
-            return Ok(xml_day_time_duration_value(day_time_from_seconds(total)?));
+            let (seconds, fraction) = add_seconds(
+                seconds_key(&left_parts),
+                &day_time_duration_parts(right_duration),
+            );
+            return Ok(xml_day_time_duration_value(day_time_from_exact(
+                seconds,
+                fraction,
+                XPathError::FODT0002,
+                truncated,
+            )?));
         }
         if let Some(right_dt) = as_datetime(right) {
-            let result = add_datetime_day_time(right_dt, left_duration)?;
+            let result = add_datetime_day_time(right_dt, &left_parts, truncated)?;
             return Ok(xml_datetime_value(right.type_code, result));
         }
         if let Some(right_date) = as_date(right) {
-            let result = add_date_day_time(right_date, left_duration)?;
+            let result = add_date_day_time(right_date, &left_parts)?;
             return Ok(xml_date_value(right.type_code, result));
         }
         if let Some(right_time) = as_time(right) {
-            let result = add_time_day_time(right_time, left_duration)?;
+            let result = add_time_day_time(right_time, &left_parts, truncated);
             return Ok(xml_time_value(right.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Add, left, right));
@@ -619,18 +758,34 @@ fn eval_temporal_add(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     Err(unsupported_operator(BinaryOpKind::Add, left, right))
 }
 
-fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
+/// The subtraction operators (F&O §10.6.2, §10.6.7, §10.8.1 – §10.8.3, the
+/// `subtract-*-from-*` functions of §10.8), with `tz` as the implicit timezone
+/// of the two date/time values one subtracts from the other.
+fn eval_temporal_sub(
+    left: &XmlValue,
+    right: &XmlValue,
+    tz: TimezoneOffset,
+    truncated: &mut bool,
+) -> Result<XmlValue, XPathError> {
     if let Some(left_dt) = as_datetime(left) {
         if let Some(right_dt) = as_datetime(right) {
-            let result = diff_datetime(left_dt, right_dt)?;
+            let result = time_line_difference(
+                datetime_key(left_dt, tz),
+                datetime_key(right_dt, tz),
+                truncated,
+            )?;
             return Ok(xml_day_time_duration_value(result));
         }
         if let Some(duration) = as_year_month_duration(right) {
-            let result = add_datetime_year_month(left_dt, &negate_year_month_duration(duration))?;
+            let result = add_datetime_year_month(left_dt, -year_month_total_months(duration))?;
             return Ok(xml_datetime_value(left.type_code, result));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_datetime_day_time(left_dt, &negate_day_time_duration(duration))?;
+            let result = add_datetime_day_time(
+                left_dt,
+                &negated(day_time_duration_parts(duration)),
+                truncated,
+            )?;
             return Ok(xml_datetime_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
@@ -638,15 +793,16 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_date) = as_date(left) {
         if let Some(right_date) = as_date(right) {
-            let result = diff_date(left_date, right_date)?;
+            let result =
+                time_line_difference(date_key(left_date, tz), date_key(right_date, tz), truncated)?;
             return Ok(xml_day_time_duration_value(result));
         }
         if let Some(duration) = as_year_month_duration(right) {
-            let result = add_date_year_month(left_date, &negate_year_month_duration(duration))?;
+            let result = add_date_year_month(left_date, -year_month_total_months(duration))?;
             return Ok(xml_date_value(left.type_code, result));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_date_day_time(left_date, &negate_day_time_duration(duration))?;
+            let result = add_date_day_time(left_date, &negated(day_time_duration_parts(duration)))?;
             return Ok(xml_date_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
@@ -654,11 +810,16 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_time) = as_time(left) {
         if let Some(right_time) = as_time(right) {
-            let result = diff_time(left_time, right_time)?;
+            let result =
+                time_line_difference(time_key(left_time, tz), time_key(right_time, tz), truncated)?;
             return Ok(xml_day_time_duration_value(result));
         }
         if let Some(duration) = as_day_time_duration(right) {
-            let result = add_time_day_time(left_time, &negate_day_time_duration(duration))?;
+            let result = add_time_day_time(
+                left_time,
+                &negated(day_time_duration_parts(duration)),
+                truncated,
+            );
             return Ok(xml_time_value(left.type_code, result));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
@@ -677,9 +838,16 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if let Some(left_duration) = as_day_time_duration(left) {
         if let Some(right_duration) = as_day_time_duration(right) {
-            let total =
-                day_time_total_seconds(left_duration)? - day_time_total_seconds(right_duration)?;
-            return Ok(xml_day_time_duration_value(day_time_from_seconds(total)?));
+            let (seconds, fraction) = add_seconds(
+                seconds_key(&day_time_duration_parts(left_duration)),
+                &negated(day_time_duration_parts(right_duration)),
+            );
+            return Ok(xml_day_time_duration_value(day_time_from_exact(
+                seconds,
+                fraction,
+                XPathError::FODT0002,
+                truncated,
+            )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Sub, left, right));
     }
@@ -687,12 +855,16 @@ fn eval_temporal_sub(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     Err(unsupported_operator(BinaryOpKind::Sub, left, right))
 }
 
-fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
+fn eval_temporal_mul(
+    left: &XmlValue,
+    right: &XmlValue,
+    truncated: &mut bool,
+) -> Result<XmlValue, XPathError> {
     if let Some(duration) = as_year_month_duration(left) {
         if right.type_code.is_numeric() {
-            let factor = numeric_to_f64(right)?;
             return Ok(xml_year_month_duration_value(year_month_mul_numeric(
-                duration, factor,
+                duration,
+                numeric_factor(right)?,
             )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Mul, left, right));
@@ -701,7 +873,7 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
             return Ok(xml_day_time_duration_value(day_time_mul_numeric_value(
-                duration, right,
+                duration, right, truncated,
             )?));
         }
         return Err(unsupported_operator(BinaryOpKind::Mul, left, right));
@@ -709,14 +881,14 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
 
     if left.type_code.is_numeric() {
         if let Some(duration) = as_year_month_duration(right) {
-            let factor = numeric_to_f64(left)?;
             return Ok(xml_year_month_duration_value(year_month_mul_numeric(
-                duration, factor,
+                duration,
+                numeric_factor(left)?,
             )?));
         }
         if let Some(duration) = as_day_time_duration(right) {
             return Ok(xml_day_time_duration_value(day_time_mul_numeric_value(
-                duration, left,
+                duration, left, truncated,
             )?));
         }
     }
@@ -724,12 +896,16 @@ fn eval_temporal_mul(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     Err(unsupported_operator(BinaryOpKind::Mul, left, right))
 }
 
-fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPathError> {
+fn eval_temporal_div(
+    left: &XmlValue,
+    right: &XmlValue,
+    truncated: &mut bool,
+) -> Result<XmlValue, XPathError> {
     if let Some(duration) = as_year_month_duration(left) {
         if right.type_code.is_numeric() {
-            let divisor = numeric_to_f64(right)?;
             return Ok(xml_year_month_duration_value(year_month_div_numeric(
-                duration, divisor,
+                duration,
+                numeric_factor(right)?,
             )?));
         }
         if let Some(right_duration) = as_year_month_duration(right) {
@@ -744,7 +920,7 @@ fn eval_temporal_div(left: &XmlValue, right: &XmlValue) -> Result<XmlValue, XPat
     if let Some(duration) = as_day_time_duration(left) {
         if right.type_code.is_numeric() {
             return Ok(xml_day_time_duration_value(day_time_div_numeric_value(
-                duration, right,
+                duration, right, truncated,
             )?));
         }
         if let Some(right_duration) = as_day_time_duration(right) {
@@ -1497,13 +1673,6 @@ fn as_time(value: &XmlValue) -> Option<&TimeValue> {
     }
 }
 
-fn as_duration(value: &XmlValue) -> Option<&DurationValue> {
-    match &value.value {
-        XmlValueKind::Atomic(XmlAtomicValue::Duration(v)) => Some(v),
-        _ => None,
-    }
-}
-
 fn as_year_month_duration(value: &XmlValue) -> Option<&YearMonthDurationValue> {
     match &value.value {
         XmlValueKind::Atomic(XmlAtomicValue::YearMonthDuration(v)) => Some(v),
@@ -1518,50 +1687,178 @@ fn as_day_time_duration(value: &XmlValue) -> Option<&DayTimeDurationValue> {
     }
 }
 
-fn duration_parts(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError> {
-    if let Some(duration) = as_duration(value) {
-        let months = duration_total_months(duration);
-        let seconds = duration_total_seconds(duration)?;
-        return Ok(Some((months, seconds)));
+/// The gregorian types, on which only `eq` and `ne` are defined (F&O 1.0
+/// §10.1: "only equality is defined on xs:gYearMonth, xs:gYear,
+/// xs:gMonthDay, xs:gMonth and xs:gDay values").
+pub(super) fn is_gregorian_code(code: XmlTypeCode) -> bool {
+    matches!(
+        code,
+        XmlTypeCode::GYearMonth
+            | XmlTypeCode::GYear
+            | XmlTypeCode::GMonthDay
+            | XmlTypeCode::GMonth
+            | XmlTypeCode::GDay
+    )
+}
+
+// ----------------------------------------------------------------------------
+// Exact keys
+// ----------------------------------------------------------------------------
+//
+// Date/time values are compared, and subtracted, on the time line the schema
+// facets use (`types::value::time_line_seconds`): whole seconds from
+// 1970-01-01T00:00:00Z in `i128` and the fraction of a second in `[0, 1)`
+// apart, so no comparison rounds and no sum overflows. Durations are compared
+// on `types::value_order::DurationParts` — months and seconds, exactly.
+//
+// The keys read a value's own timezone, or the implicit timezone `tz` when it
+// has none (F&O §10.4), and its year in the XSD 1.0 numbering the XPath
+// arithmetic uses (`astronomical_year`).
+
+/// A position on the time line: whole seconds from 1970-01-01T00:00:00Z and
+/// the fraction of a second in `[0, 1)`, compared lexicographically.
+pub(super) type TimeLineKey = (i128, Decimal);
+
+/// The proleptic Gregorian (astronomical) year of an XPath date/time year.
+///
+/// The XPath arithmetic numbers years as XSD 1.0 does: `-0001` is the year
+/// before `0001` (1 BCE). A year `0000`, which the XSD 1.1 lexical space
+/// admits, is read as `0001` (F&O 1.0 §10.1.1: "The results of operations on
+/// dates that cross the year 0000 are ·implementation-defined·").
+fn astronomical_year(year: i32) -> i32 {
+    if year <= 0 {
+        year + 1
+    } else {
+        year
     }
-    if let Some(duration) = as_year_month_duration(value) {
-        return Ok(Some((year_month_total_months(duration), Decimal::ZERO)));
+}
+
+/// The XPath year of an astronomical year — FODT0001 beyond the `i32` the
+/// value structs hold (F&O §10.1.1: "It ·must· raise an error
+/// \[err:FODT0001\] in case of overflow").
+fn xpath_year(astronomical: i128) -> Result<i32, XPathError> {
+    let year = if astronomical <= 0 {
+        astronomical - 1
+    } else {
+        astronomical
+    };
+    i32::try_from(year).map_err(|_| XPathError::FODT0001)
+}
+
+/// `value`'s instant, with `tz` for a missing timezone.
+fn datetime_key(value: &DateTimeValue, tz: TimezoneOffset) -> TimeLineKey {
+    time_line_seconds(
+        day_number(astronomical_year(value.year), value.month, value.day),
+        value.hour,
+        value.minute,
+        value.second,
+        Some(value.timezone.unwrap_or(tz)),
+    )
+}
+
+/// The starting instant of an `xs:date` (F&O §10.4.9: "the xs:dateTime at
+/// time 00:00:00 on that date").
+fn date_key(value: &DateValue, tz: TimezoneOffset) -> TimeLineKey {
+    time_line_seconds(
+        day_number(astronomical_year(value.year), value.month, value.day),
+        0,
+        0,
+        Decimal::ZERO,
+        Some(value.timezone.unwrap_or(tz)),
+    )
+}
+
+/// An `xs:time` on the reference date (F&O §10.4.12; one reference date for
+/// every time, so it is day 0 here).
+fn time_key(value: &TimeValue, tz: TimezoneOffset) -> TimeLineKey {
+    time_line_seconds(
+        0,
+        value.hour,
+        value.minute,
+        value.second,
+        Some(value.timezone.unwrap_or(tz)),
+    )
+}
+
+/// The starting instant of a gregorian value (F&O §10.4.15 – §10.4.19): the
+/// missing components from a reference dateTime — 1972 (a leap year) for
+/// the month and day types, December for `xs:gDay` (31 days) — and the
+/// first day of the month. (§10.4.15 and §10.4.18 fill in the last day; any
+/// day gives the same equality, since only values of one month are equal.)
+fn gregorian_key(value: &XmlValue, tz: TimezoneOffset) -> Option<TimeLineKey> {
+    let (days, timezone) = match &value.value {
+        XmlValueKind::Atomic(XmlAtomicValue::GYearMonth(v)) => (
+            day_number(astronomical_year(v.year), v.month, 1),
+            v.timezone,
+        ),
+        XmlValueKind::Atomic(XmlAtomicValue::GYear(v)) => {
+            (day_number(astronomical_year(v.year), 1, 1), v.timezone)
+        }
+        XmlValueKind::Atomic(XmlAtomicValue::GMonthDay(v)) => {
+            (day_number(1972, v.month, v.day), v.timezone)
+        }
+        XmlValueKind::Atomic(XmlAtomicValue::GMonth(v)) => {
+            (day_number(1972, v.month, 1), v.timezone)
+        }
+        XmlValueKind::Atomic(XmlAtomicValue::GDay(v)) => (day_number(1972, 12, v.day), v.timezone),
+        _ => return None,
+    };
+    Some(time_line_seconds(
+        days,
+        0,
+        0,
+        Decimal::ZERO,
+        Some(timezone.unwrap_or(tz)),
+    ))
+}
+
+/// The months and seconds of any duration value (F&O §10.4.5), exactly.
+fn duration_key(value: &XmlValue) -> Option<DurationParts> {
+    match &value.value {
+        XmlValueKind::Atomic(atom) => crate::types::value_order::duration_parts(atom),
+        _ => None,
     }
-    if let Some(duration) = as_day_time_duration(value) {
-        let seconds = day_time_total_seconds(duration)?;
-        return Ok(Some((0, seconds)));
-    }
-    Ok(None)
+}
+
+/// The seconds of a duration as a time line offset: whole seconds and the
+/// fraction in `[0, 1)`.
+fn seconds_key(parts: &DurationParts) -> TimeLineKey {
+    (parts.seconds, parts.fraction)
 }
 
 // ----------------------------------------------------------------------------
 // Comparison keys for the indexed general comparison
 // ----------------------------------------------------------------------------
 //
-// Each of these exposes the *exact* normalization `compare_eq` performs on a
-// value of that family, so that `general_compare` can key a hash table on it
-// without inventing a second notion of equality. `None` means the value does
-// not hold the expected representation, which is the case in which the
-// comparison itself would raise.
+// Each of these exposes the *exact* key `compare_eq` compares a value of that
+// family by, so that `general_compare` can key a hash table on it without
+// inventing a second notion of equality. `None` means the value does not hold
+// the expected representation, which is the case in which the comparison
+// itself would raise.
 
 /// The instant `eq` compares an `xs:dateTime`/`xs:dateTimeStamp` value at.
-pub(super) fn datetime_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
-    as_datetime(value).map(datetime_instant_for_compare)
+pub(super) fn datetime_compare_key(value: &XmlValue, tz: TimezoneOffset) -> Option<TimeLineKey> {
+    as_datetime(value).map(|v| datetime_key(v, tz))
 }
 
 /// The instant `eq` compares an `xs:date` value at.
-pub(super) fn date_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
-    as_date(value).map(date_instant_for_compare)
+pub(super) fn date_compare_key(value: &XmlValue, tz: TimezoneOffset) -> Option<TimeLineKey> {
+    as_date(value).map(|v| date_key(v, tz))
 }
 
-/// The seconds-of-day `eq` compares an `xs:time` value at.
-pub(super) fn time_compare_key(value: &XmlValue) -> Option<Result<Decimal, XPathError>> {
-    as_time(value).map(time_seconds_for_compare)
+/// The instant `eq` compares an `xs:time` value at.
+pub(super) fn time_compare_key(value: &XmlValue, tz: TimezoneOffset) -> Option<TimeLineKey> {
+    as_time(value).map(|v| time_key(v, tz))
 }
 
-/// The (months, seconds) pair `eq` compares any duration value by.
-pub(super) fn duration_compare_key(value: &XmlValue) -> Result<Option<(i64, Decimal)>, XPathError> {
-    duration_parts(value)
+/// The starting instant `eq` compares a gregorian value at.
+pub(super) fn gregorian_compare_key(value: &XmlValue, tz: TimezoneOffset) -> Option<TimeLineKey> {
+    gregorian_key(value, tz)
+}
+
+/// The months and seconds `eq` compares any duration value by.
+pub(super) fn duration_compare_key(value: &XmlValue) -> Option<DurationParts> {
+    duration_key(value)
 }
 
 fn numeric_to_f64(value: &XmlValue) -> Result<f64, XPathError> {
@@ -1585,77 +1882,204 @@ fn numeric_to_decimal(value: &XmlValue) -> Result<Decimal, XPathError> {
     }
 }
 
-fn compare_datetime_eq(left: &DateTimeValue, right: &DateTimeValue) -> Result<bool, XPathError> {
-    let left_inst = datetime_instant_for_compare(left)?;
-    let right_inst = datetime_instant_for_compare(right)?;
-    Ok(left_inst == right_inst)
+/// The numeric multiplier or divisor of a duration as an `xs:double`, NaN and
+/// the infinities included (F&O §10.6.3, §10.6.4, §10.6.8, §10.6.9 name what
+/// each of them does).
+fn numeric_factor(value: &XmlValue) -> Result<f64, XPathError> {
+    value
+        .as_double()
+        .ok_or_else(|| XPathError::internal("Expected numeric value"))
 }
 
-fn compare_datetime_gt(left: &DateTimeValue, right: &DateTimeValue) -> Result<bool, XPathError> {
-    let left_inst = datetime_instant_for_compare(left)?;
-    let right_inst = datetime_instant_for_compare(right)?;
-    Ok(left_inst > right_inst)
+/// The `fn:implicit-timezone` of a context that has none: the host's local
+/// offset now (`chrono::Local`).
+///
+/// Used by the public functions that take no dynamic context
+/// ([`value_eq`], [`eval_binary`], …); a dynamic context reads its own once
+/// per evaluation ([`DynamicContext::implicit_timezone_or_host`]).
+///
+/// [`DynamicContext::implicit_timezone_or_host`]: crate::xpath::DynamicContext::implicit_timezone_or_host
+pub(crate) fn host_implicit_timezone() -> TimezoneOffset {
+    crate::xpath::context::host_offset_at(chrono::Utc::now())
 }
 
-fn compare_date_eq(left: &DateValue, right: &DateValue) -> Result<bool, XPathError> {
-    let left_inst = date_instant_for_compare(left)?;
-    let right_inst = date_instant_for_compare(right)?;
-    Ok(left_inst == right_inst)
+/// The host's implicit timezone when `left` or `right` is a value the
+/// implicit timezone can apply to (a date/time or gregorian value), else `Z`,
+/// which nothing reads — so the context-free functions consult the host's
+/// clock only for the comparisons that need it.
+fn host_timezone_for(left: &XmlValue, right: &XmlValue) -> TimezoneOffset {
+    let zoned = |value: &XmlValue| {
+        let code = unwrap_union_value(value).type_code;
+        (is_temporal_type(code) && !is_duration_code(code)) || is_gregorian_code(code)
+    };
+    if zoned(left) || zoned(right) {
+        host_implicit_timezone()
+    } else {
+        TimezoneOffset::UTC
+    }
 }
 
-fn compare_date_gt(left: &DateValue, right: &DateValue) -> Result<bool, XPathError> {
-    let left_inst = date_instant_for_compare(left)?;
-    let right_inst = date_instant_for_compare(right)?;
-    Ok(left_inst > right_inst)
+/// The implicit timezone of a static context: its own, or the host's.
+pub(super) fn static_timezone(context: &XPathContext) -> TimezoneOffset {
+    context
+        .implicit_timezone
+        .unwrap_or_else(host_implicit_timezone)
 }
 
-fn compare_time_eq(left: &TimeValue, right: &TimeValue) -> Result<bool, XPathError> {
-    let left_inst = time_seconds_for_compare(left)?;
-    let right_inst = time_seconds_for_compare(right)?;
-    Ok(left_inst == right_inst)
+// ----------------------------------------------------------------------------
+// Exact date/time and duration arithmetic
+// ----------------------------------------------------------------------------
+//
+// F&O 1.0 §10.1.1: a processor that limits the representation of date/time
+// values "·must· raise an error [err:FODT0001] in case of overflow" in the
+// arithmetic of §10.8, and one that limits durations "·must· raise an error
+// [err:FODT0002] in case of overflow" in that of §10.6. The limits are the
+// value structs' own: a year in `i32`, the day, hour and minute fields of a
+// duration in `u32`, the months of a `xs:yearMonthDuration` below
+// 2³² years, seconds in a `Decimal`. Results are computed exactly (whole
+// seconds in `i128`, the fraction apart) and checked against those limits;
+// only the fraction of a result's seconds field can exceed what a `Decimal`
+// holds next to the whole seconds, and it is then truncated toward zero
+// (`seconds_with_fraction`), never rounded up to the next second.
+
+/// `key + parts.seconds` on the time line, exactly (the months of `parts`
+/// are not added here).
+fn add_seconds(key: TimeLineKey, parts: &DurationParts) -> TimeLineKey {
+    let (mut whole, fraction) = key;
+    whole += parts.seconds;
+    // Two fractions in [0, 1) of at most 28 digits: the sum is exact.
+    let mut fraction = fraction + parts.fraction;
+    if fraction >= Decimal::ONE {
+        fraction -= Decimal::ONE;
+        whole += 1;
+    }
+    (whole, fraction.normalize())
 }
 
-fn compare_time_gt(left: &TimeValue, right: &TimeValue) -> Result<bool, XPathError> {
-    let left_inst = time_seconds_for_compare(left)?;
-    let right_inst = time_seconds_for_compare(right)?;
-    Ok(left_inst > right_inst)
+/// The negation of a duration's parts, with the fraction back in `[0, 1)`.
+fn negated(parts: DurationParts) -> DurationParts {
+    if parts.fraction.is_zero() {
+        DurationParts {
+            months: -parts.months,
+            seconds: -parts.seconds,
+            fraction: Decimal::ZERO,
+        }
+    } else {
+        DurationParts {
+            months: -parts.months,
+            seconds: -parts.seconds - 1,
+            fraction: Decimal::ONE - parts.fraction,
+        }
+    }
 }
 
-fn datetime_instant_for_compare(value: &DateTimeValue) -> Result<Decimal, XPathError> {
-    let instant = datetime_to_instant(value)?;
-    apply_timezone_offset(instant, value.timezone)
+/// `whole + fraction` as the seconds field of a value (`whole` below 60):
+/// exact when the sum fits a `Decimal`, else with the fraction truncated
+/// toward zero to the digits that fit — and then `truncated` is set, for the
+/// caller to report `xs-seconds-capacity` (the fraction is normalized, so any
+/// digit dropped is a nonzero one).
+fn seconds_with_fraction(whole: u32, fraction: Decimal, truncated: &mut bool) -> Decimal {
+    let fraction = fraction.normalize();
+    let mut scale = fraction.scale();
+    loop {
+        let digits = fraction.trunc_with_scale(scale);
+        let mantissa = digits.mantissa() * 10i128.pow(scale - digits.scale())
+            + i128::from(whole) * 10i128.pow(scale);
+        if let Ok(seconds) = Decimal::try_from_i128_with_scale(mantissa, scale) {
+            if scale < fraction.scale() {
+                *truncated = true;
+            }
+            return seconds;
+        }
+        // Scale 0 always fits: `whole` is below 60.
+        scale -= 1;
+    }
 }
 
-fn date_instant_for_compare(value: &DateValue) -> Result<Decimal, XPathError> {
-    let instant = date_to_instant(value)?;
-    apply_timezone_offset(instant, value.timezone)
+/// The `xs:dayTimeDuration` of `seconds + fraction` seconds (`fraction` in
+/// `[0, 1)`), or `overflow` when its days exceed what the value struct holds.
+fn day_time_from_exact(
+    seconds: i128,
+    fraction: Decimal,
+    overflow: XPathError,
+    truncated: &mut bool,
+) -> Result<DayTimeDurationValue, XPathError> {
+    let negative = seconds < 0;
+    let (whole, fraction) = if !negative {
+        (seconds, fraction)
+    } else if fraction.is_zero() {
+        (-seconds, Decimal::ZERO)
+    } else {
+        (-seconds - 1, Decimal::ONE - fraction)
+    };
+    let days = u32::try_from(whole / 86_400).map_err(|_| overflow)?;
+    let rest = whole % 86_400;
+    Ok(DayTimeDurationValue {
+        negative,
+        days,
+        // Below 24, 60 and 60.
+        hours: (rest / 3_600) as u32,
+        minutes: (rest % 3_600 / 60) as u32,
+        seconds: seconds_with_fraction((rest % 60) as u32, fraction, truncated),
+    })
 }
 
-fn time_seconds_for_compare(value: &TimeValue) -> Result<Decimal, XPathError> {
-    let seconds = time_to_seconds(value)?;
-    apply_timezone_offset(seconds, value.timezone)
+/// The `xs:dayTimeDuration` between two instants (F&O §10.8.1 – §10.8.3);
+/// FODT0001 beyond the value struct (§10.1.1).
+fn time_line_difference(
+    left: TimeLineKey,
+    right: TimeLineKey,
+    truncated: &mut bool,
+) -> Result<DayTimeDurationValue, XPathError> {
+    let mut seconds = left.0 - right.0;
+    let mut fraction = left.1 - right.1;
+    if fraction.is_sign_negative() && !fraction.is_zero() {
+        fraction += Decimal::ONE;
+        seconds -= 1;
+    }
+    day_time_from_exact(seconds, fraction, XPathError::FODT0001, truncated)
 }
 
-fn apply_timezone_offset(
-    instant: Decimal,
-    timezone: Option<TimezoneOffset>,
-) -> Result<Decimal, XPathError> {
-    let offset = timezone.unwrap_or_else(implicit_timezone_offset);
-    let offset_minutes = decimal_from_i64(offset.0 as i64)?;
-    Ok(instant - offset_minutes * Decimal::from(60))
+/// The local (timezone-free) position of a date/time: the fields read as
+/// UTC.
+fn local_key(year: i32, month: u8, day: u8, hour: u8, minute: u8, second: Decimal) -> TimeLineKey {
+    time_line_seconds(
+        day_number(astronomical_year(year), month, day),
+        hour,
+        minute,
+        second,
+        None,
+    )
 }
 
-fn implicit_timezone_offset() -> TimezoneOffset {
-    let seconds = Local::now().offset().local_minus_utc();
-    TimezoneOffset((seconds / 60) as i16)
+/// The calendar fields of a local position, or FODT0001 when its year is
+/// beyond the `i32` the value structs hold.
+fn civil_fields(
+    key: TimeLineKey,
+    truncated: &mut bool,
+) -> Result<(i32, u8, u8, u8, u8, Decimal), XPathError> {
+    let (whole, fraction) = key;
+    let days = whole.div_euclid(86_400);
+    let second_of_day = whole.rem_euclid(86_400);
+    let (astronomical, month, day) = civil_from_days(days);
+    let year = xpath_year(astronomical)?;
+    Ok((
+        year,
+        month,
+        day,
+        (second_of_day / 3_600) as u8,
+        (second_of_day % 3_600 / 60) as u8,
+        seconds_with_fraction((second_of_day % 60) as u32, fraction, truncated),
+    ))
 }
 
+/// F&O §10.8.4, §10.8.5 (and the subtractions): the months are added to the
+/// local value, the day pinned to the month's length, the timezone kept.
 fn add_datetime_year_month(
     value: &DateTimeValue,
-    duration: &YearMonthDurationValue,
+    months: i64,
 ) -> Result<DateTimeValue, XPathError> {
-    let delta = year_month_total_months(duration);
-    let (year, month, day) = add_months_to_date(value.year, value.month, value.day, delta)?;
+    let (year, month, day) = add_months_to_date(value.year, value.month, value.day, months)?;
     Ok(DateTimeValue {
         year,
         month,
@@ -1667,12 +2091,8 @@ fn add_datetime_year_month(
     })
 }
 
-fn add_date_year_month(
-    value: &DateValue,
-    duration: &YearMonthDurationValue,
-) -> Result<DateValue, XPathError> {
-    let delta = year_month_total_months(duration);
-    let (year, month, day) = add_months_to_date(value.year, value.month, value.day, delta)?;
+fn add_date_year_month(value: &DateValue, months: i64) -> Result<DateValue, XPathError> {
+    let (year, month, day) = add_months_to_date(value.year, value.month, value.day, months)?;
     Ok(DateValue {
         year,
         month,
@@ -1681,33 +2101,26 @@ fn add_date_year_month(
     })
 }
 
+/// F&O §10.8.6: the seconds are added to the local value; the timezone kept.
 fn add_datetime_day_time(
     value: &DateTimeValue,
-    duration: &DayTimeDurationValue,
+    duration: &DurationParts,
+    truncated: &mut bool,
 ) -> Result<DateTimeValue, XPathError> {
-    let instant = datetime_to_instant(value)?;
-    let delta = day_time_total_seconds(duration)?;
-    instant_to_datetime(instant + delta, value.timezone)
-}
-
-fn add_date_day_time(
-    value: &DateValue,
-    duration: &DayTimeDurationValue,
-) -> Result<DateValue, XPathError> {
-    let instant = date_to_instant(value)?;
-    let delta = day_time_total_seconds(duration)?;
-    instant_to_date(instant + delta, value.timezone)
-}
-
-fn add_time_day_time(
-    value: &TimeValue,
-    duration: &DayTimeDurationValue,
-) -> Result<TimeValue, XPathError> {
-    let seconds = time_to_seconds(value)?;
-    let delta = day_time_total_seconds(duration)?;
-    let normalized = normalize_seconds_in_day(seconds + delta)?;
-    let (hour, minute, second) = time_components_from_seconds(normalized)?;
-    Ok(TimeValue {
+    let key = local_key(
+        value.year,
+        value.month,
+        value.day,
+        value.hour,
+        value.minute,
+        value.second,
+    );
+    let (year, month, day, hour, minute, second) =
+        civil_fields(add_seconds(key, duration), truncated)?;
+    Ok(DateTimeValue {
+        year,
+        month,
+        day,
         hour,
         minute,
         second,
@@ -1715,25 +2128,35 @@ fn add_time_day_time(
     })
 }
 
-fn diff_datetime(
-    left: &DateTimeValue,
-    right: &DateTimeValue,
-) -> Result<DayTimeDurationValue, XPathError> {
-    let left_inst = datetime_instant_for_compare(left)?;
-    let right_inst = datetime_instant_for_compare(right)?;
-    day_time_from_seconds(left_inst - right_inst)
+/// F&O §10.8.7: the date of the starting instant plus the seconds.
+fn add_date_day_time(value: &DateValue, duration: &DurationParts) -> Result<DateValue, XPathError> {
+    let key = local_key(value.year, value.month, value.day, 0, 0, Decimal::ZERO);
+    // A date keeps no time of day (§10.8.7: the date of the instant), so no
+    // seconds field is truncated here.
+    let (year, month, day, ..) = civil_fields(add_seconds(key, duration), &mut false)?;
+    Ok(DateValue {
+        year,
+        month,
+        day,
+        timezone: value.timezone,
+    })
 }
 
-fn diff_date(left: &DateValue, right: &DateValue) -> Result<DayTimeDurationValue, XPathError> {
-    let left_inst = date_instant_for_compare(left)?;
-    let right_inst = date_instant_for_compare(right)?;
-    day_time_from_seconds(left_inst - right_inst)
-}
-
-fn diff_time(left: &TimeValue, right: &TimeValue) -> Result<DayTimeDurationValue, XPathError> {
-    let left_inst = time_seconds_for_compare(left)?;
-    let right_inst = time_seconds_for_compare(right)?;
-    day_time_from_seconds(left_inst - right_inst)
+/// F&O §10.8.9: the time of day plus the seconds, modulo a day.
+fn add_time_day_time(
+    value: &TimeValue,
+    duration: &DurationParts,
+    truncated: &mut bool,
+) -> TimeValue {
+    let key = time_line_seconds(0, value.hour, value.minute, value.second, None);
+    let (whole, fraction) = add_seconds(key, duration);
+    let second_of_day = whole.rem_euclid(86_400);
+    TimeValue {
+        hour: (second_of_day / 3_600) as u8,
+        minute: (second_of_day % 3_600 / 60) as u8,
+        second: seconds_with_fraction((second_of_day % 60) as u32, fraction, truncated),
+        timezone: value.timezone,
+    }
 }
 
 fn year_month_total_months(value: &YearMonthDurationValue) -> i64 {
@@ -1745,249 +2168,196 @@ fn year_month_total_months(value: &YearMonthDurationValue) -> i64 {
     }
 }
 
-fn duration_total_months(value: &DurationValue) -> i64 {
-    let total = value.years as i64 * 12 + value.months as i64;
-    if value.negative {
-        -total
-    } else {
-        total
-    }
-}
-
-fn day_time_total_seconds(value: &DayTimeDurationValue) -> Result<Decimal, XPathError> {
-    let days = decimal_from_i64(value.days as i64)?;
-    let hours = decimal_from_i64(value.hours as i64)?;
-    let minutes = decimal_from_i64(value.minutes as i64)?;
-    let total = days * Decimal::from(86_400)
-        + hours * Decimal::from(3_600)
-        + minutes * Decimal::from(60)
-        + value.seconds;
-    Ok(if value.negative { -total } else { total })
-}
-
-fn duration_total_seconds(value: &DurationValue) -> Result<Decimal, XPathError> {
-    let days = decimal_from_i64(value.days as i64)?;
-    let hours = decimal_from_i64(value.hours as i64)?;
-    let minutes = decimal_from_i64(value.minutes as i64)?;
-    let total = days * Decimal::from(86_400)
-        + hours * Decimal::from(3_600)
-        + minutes * Decimal::from(60)
-        + value.seconds;
-    Ok(if value.negative { -total } else { total })
-}
-
-fn negate_year_month_duration(value: &YearMonthDurationValue) -> YearMonthDurationValue {
-    let negative = if value.years == 0 && value.months == 0 {
-        false
-    } else {
-        !value.negative
-    };
-    YearMonthDurationValue {
-        negative,
-        years: value.years,
-        months: value.months,
-    }
-}
-
-fn negate_day_time_duration(value: &DayTimeDurationValue) -> DayTimeDurationValue {
-    let negative =
-        if value.days == 0 && value.hours == 0 && value.minutes == 0 && value.seconds.is_zero() {
-            false
-        } else {
-            !value.negative
-        };
-    DayTimeDurationValue {
-        negative,
-        days: value.days,
-        hours: value.hours,
-        minutes: value.minutes,
-        seconds: value.seconds,
-    }
-}
-
+/// The `xs:yearMonthDuration` of `months` months, or FODT0002 when its years
+/// exceed the `u32` the value struct holds (F&O §10.1.1).
 fn year_month_from_months(months: i64) -> Result<YearMonthDurationValue, XPathError> {
     let negative = months < 0;
-    let abs_months = months.abs();
-    let years = abs_months / 12;
-    let months = abs_months % 12;
-    let years = u32::try_from(years)
-        .map_err(|_| XPathError::internal("yearMonthDuration years out of range"))?;
-    let months = u32::try_from(months)
-        .map_err(|_| XPathError::internal("yearMonthDuration months out of range"))?;
+    let abs_months = months.unsigned_abs();
+    let years = u32::try_from(abs_months / 12).map_err(|_| XPathError::FODT0002)?;
     Ok(YearMonthDurationValue {
         negative,
         years,
-        months,
+        months: (abs_months % 12) as u32,
     })
 }
 
-fn day_time_from_seconds(seconds: Decimal) -> Result<DayTimeDurationValue, XPathError> {
-    let negative = seconds.is_sign_negative();
-    let abs = if negative { -seconds } else { seconds };
-    let seconds_per_day = decimal_from_i64(86_400)?;
-    let days = (abs / seconds_per_day).floor();
-    let mut remainder = abs - days * seconds_per_day;
-    let hours = (remainder / Decimal::from(3_600)).floor();
-    remainder -= hours * Decimal::from(3_600);
-    let minutes = (remainder / Decimal::from(60)).floor();
-    let seconds = remainder - minutes * Decimal::from(60);
-    let days = decimal_to_u32(days, "days")?;
-    let hours = decimal_to_u32(hours, "hours")?;
-    let minutes = decimal_to_u32(minutes, "minutes")?;
-    Ok(DayTimeDurationValue {
-        negative,
-        days,
-        hours,
-        minutes,
-        seconds,
-    })
+/// A month count computed in floating point, rounded to the nearest month
+/// (F&O §10.6.3: "The result is rounded to the nearest month"), or FODT0002
+/// beyond the value struct.
+fn year_month_from_rounded(months: f64) -> Result<YearMonthDurationValue, XPathError> {
+    const MAX_MONTHS: f64 = u32::MAX as f64 * 12.0 + 11.0;
+    let rounded = (months + 0.5).floor();
+    if !rounded.is_finite() || rounded.abs() > MAX_MONTHS {
+        return Err(XPathError::FODT0002);
+    }
+    year_month_from_months(rounded as i64)
 }
 
+/// F&O §10.6.3: "If $arg2 is positive or negative zero, the result is a
+/// zero-length duration. If $arg2 is positive or negative infinity, the
+/// result overflows and is handled as discussed in 10.1.1 Limits and
+/// Precision. If $arg2 is NaN an error is raised \[err:FOCA0005\]".
 fn year_month_mul_numeric(
     value: &YearMonthDurationValue,
     factor: f64,
 ) -> Result<YearMonthDurationValue, XPathError> {
-    if !factor.is_finite() {
-        return Err(XPathError::internal("Numeric value is not finite"));
+    if factor.is_nan() {
+        return Err(XPathError::FOCA0005);
     }
-    let months = year_month_total_months(value) as f64 * factor;
-    let rounded = (months + 0.5).floor();
-    year_month_from_months(rounded as i64)
+    if factor.is_infinite() {
+        return Err(XPathError::FODT0002);
+    }
+    year_month_from_rounded(year_month_total_months(value) as f64 * factor)
 }
 
+/// F&O §10.6.4: "If $arg2 is positive or negative infinity, the result is a
+/// zero-length duration. If $arg2 is positive or negative zero, the result
+/// overflows … If $arg2 is NaN an error is raised \[err:FOCA0005\]".
 fn year_month_div_numeric(
     value: &YearMonthDurationValue,
     divisor: f64,
 ) -> Result<YearMonthDurationValue, XPathError> {
+    if divisor.is_nan() {
+        return Err(XPathError::FOCA0005);
+    }
     if divisor == 0.0 {
-        return Err(XPathError::internal("Division by zero"));
+        return Err(XPathError::FODT0002);
     }
-    if !divisor.is_finite() {
-        return Err(XPathError::internal("Numeric value is not finite"));
+    if divisor.is_infinite() {
+        return year_month_from_months(0);
     }
-    let months = year_month_total_months(value) as f64 / divisor;
-    let rounded = (months + 0.5).floor();
-    year_month_from_months(rounded as i64)
+    year_month_from_rounded(year_month_total_months(value) as f64 / divisor)
 }
 
+/// F&O §10.6.5: "identical to op:numeric-divide with xs:integer operands" —
+/// FOAR0001 for a zero divisor (§6.2.4).
 fn year_month_div_duration(
     left: &YearMonthDurationValue,
     right: &YearMonthDurationValue,
 ) -> Result<Decimal, XPathError> {
-    let left_months = year_month_total_months(left);
     let right_months = year_month_total_months(right);
     if right_months == 0 {
-        return Err(XPathError::internal("Division by zero"));
+        return Err(XPathError::FOAR0001);
     }
-    let left = decimal_from_i64(left_months)?;
-    let right = decimal_from_i64(right_months)?;
-    Ok(left / right)
+    Decimal::from(year_month_total_months(left))
+        .checked_div(Decimal::from(right_months))
+        .ok_or(XPathError::FOAR0002)
 }
 
-fn day_time_mul_numeric(
+/// The seconds of a dayTimeDuration as one `Decimal` — `overflow` when they
+/// exceed what a `Decimal` holds (2⁹⁶ − 1); the fraction rounded when the sum
+/// has more digits than it holds.
+fn day_time_decimal_seconds(
     value: &DayTimeDurationValue,
-    factor: Decimal,
-) -> Result<DayTimeDurationValue, XPathError> {
-    // F&O §10.6.3: an overflowing duration is FODT0002.
-    let total = day_time_total_seconds(value)?
-        .checked_mul(factor)
-        .ok_or(XPathError::FODT0002)?;
-    day_time_from_seconds(total)
+    overflow: XPathError,
+) -> Result<Decimal, XPathError> {
+    let parts = day_time_duration_parts(value);
+    Decimal::from_i128(parts.seconds)
+        .and_then(|whole| whole.checked_add(parts.fraction))
+        .ok_or(overflow)
 }
 
-fn day_time_div_numeric(
-    value: &DayTimeDurationValue,
-    divisor: Decimal,
+/// The `xs:dayTimeDuration` of a `Decimal` number of seconds; FODT0002
+/// beyond the value struct.
+fn day_time_from_decimal_seconds(
+    seconds: Decimal,
+    truncated: &mut bool,
 ) -> Result<DayTimeDurationValue, XPathError> {
-    if divisor.is_zero() {
-        return Err(XPathError::internal("Division by zero"));
-    }
-    let total = day_time_total_seconds(value)?
-        .checked_div(divisor)
-        .ok_or(XPathError::FODT0002)?;
-    day_time_from_seconds(total)
+    let whole = seconds.floor();
+    let fraction = seconds - whole;
+    let whole = whole.to_i128().ok_or(XPathError::FODT0002)?;
+    day_time_from_exact(whole, fraction, XPathError::FODT0002, truncated)
 }
 
-/// Multiply dayTimeDuration by a numeric value, falling back to f64 arithmetic
-/// when the numeric value is outside Decimal's representable range (e.g. ±1.8e308).
+/// F&O §10.6.8: "If $arg2 is positive or negative zero, the result is a
+/// zero-length duration. If $arg2 is positive or negative infinity, the
+/// result overflows … If $arg2 is NaN an error is raised \[err:FOCA0005\]".
+/// A factor beyond `Decimal`'s range is applied in `f64`.
 fn day_time_mul_numeric_value(
     value: &DayTimeDurationValue,
     factor: &XmlValue,
+    truncated: &mut bool,
 ) -> Result<DayTimeDurationValue, XPathError> {
-    match numeric_to_decimal(factor) {
-        Ok(d) => day_time_mul_numeric(value, d),
+    let as_double = numeric_factor(factor)?;
+    if as_double.is_nan() {
+        return Err(XPathError::FOCA0005);
+    }
+    if as_double.is_infinite() {
+        return Err(XPathError::FODT0002);
+    }
+    let seconds = day_time_decimal_seconds(value, XPathError::FODT0002)?;
+    let total = match numeric_to_decimal(factor) {
+        Ok(d) => seconds.checked_mul(d).ok_or(XPathError::FODT0002)?,
         Err(_) => {
-            let f = numeric_to_f64(factor)?;
-            let total = day_time_total_seconds(value)?
+            let total = seconds
                 .to_f64()
                 .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
-            let result = Decimal::from_f64(total * f).ok_or(XPathError::FODT0002)?;
-            day_time_from_seconds(result)
+            Decimal::from_f64(total * as_double).ok_or(XPathError::FODT0002)?
         }
-    }
+    };
+    day_time_from_decimal_seconds(total, truncated)
 }
 
-/// Divide dayTimeDuration by a numeric value, falling back to f64 arithmetic
-/// when the numeric value is outside Decimal's representable range.
+/// F&O §10.6.9: "If $arg2 is positive or negative infinity, the result is a
+/// zero-length duration. If $arg2 is positive or negative zero, the result
+/// overflows … If $arg2 is NaN an error is raised \[err:FOCA0005\]".
 fn day_time_div_numeric_value(
     value: &DayTimeDurationValue,
     divisor: &XmlValue,
+    truncated: &mut bool,
 ) -> Result<DayTimeDurationValue, XPathError> {
-    match numeric_to_decimal(divisor) {
-        Ok(d) => day_time_div_numeric(value, d),
-        Err(_) => {
-            let f = numeric_to_f64(divisor)?;
-            if f == 0.0 {
-                return Err(XPathError::FODT0002);
-            }
-            let total = day_time_total_seconds(value)?
+    let as_double = numeric_factor(divisor)?;
+    if as_double.is_nan() {
+        return Err(XPathError::FOCA0005);
+    }
+    if as_double == 0.0 {
+        return Err(XPathError::FODT0002);
+    }
+    if as_double.is_infinite() {
+        return day_time_from_exact(0, Decimal::ZERO, XPathError::FODT0002, truncated);
+    }
+    let seconds = day_time_decimal_seconds(value, XPathError::FODT0002)?;
+    let total = match numeric_to_decimal(divisor) {
+        Ok(d) if !d.is_zero() => seconds.checked_div(d).ok_or(XPathError::FODT0002)?,
+        _ => {
+            let total = seconds
                 .to_f64()
                 .ok_or_else(|| XPathError::internal("Failed to convert seconds to f64"))?;
-            let result = Decimal::from_f64(total / f).ok_or(XPathError::FODT0002)?;
-            day_time_from_seconds(result)
+            Decimal::from_f64(total / as_double).ok_or(XPathError::FODT0002)?
         }
-    }
+    };
+    day_time_from_decimal_seconds(total, truncated)
 }
 
+/// F&O §10.6.10: "identical to op:numeric-divide with xs:decimal operands" —
+/// FOAR0001 for a zero divisor, FOAR0002 when an operand's seconds or the
+/// quotient exceed what an `xs:decimal` holds here (§6.2).
 fn day_time_div_duration(
     left: &DayTimeDurationValue,
     right: &DayTimeDurationValue,
 ) -> Result<Decimal, XPathError> {
-    let left_seconds = day_time_total_seconds(left)?;
-    let right_seconds = day_time_total_seconds(right)?;
+    let right_seconds = day_time_decimal_seconds(right, XPathError::FOAR0002)?;
     if right_seconds.is_zero() {
-        return Err(XPathError::internal("Division by zero"));
+        return Err(XPathError::FOAR0001);
     }
-    Ok(left_seconds / right_seconds)
+    day_time_decimal_seconds(left, XPathError::FOAR0002)?
+        .checked_div(right_seconds)
+        .ok_or(XPathError::FOAR0002)
 }
 
+/// The date `delta_months` months from `year-month-day`, the day pinned to
+/// the length of the new month; FODT0001 when the year leaves `i32`.
 fn add_months_to_date(
     year: i32,
     month: u8,
     day: u8,
     delta_months: i64,
 ) -> Result<(i32, u8, u8), XPathError> {
-    // Convert XSD year (no year 0) to astronomical year (continuous, with year 0)
-    // XSD year > 0 → astro = year; XSD year < 0 → astro = year + 1
-    let astro_year = if year <= 0 {
-        year as i64 + 1
-    } else {
-        year as i64
-    };
-    let month_index = month as i64 - 1;
-    let total = astro_year * 12 + month_index + delta_months;
-    let new_astro_year = total.div_euclid(12);
-    let new_month = total.rem_euclid(12) + 1;
-    // Convert back to XSD year (skip year 0)
-    let new_year = if new_astro_year <= 0 {
-        new_astro_year - 1
-    } else {
-        new_astro_year
-    };
-    let year = i32::try_from(new_year).map_err(|_| XPathError::internal("Year out of range"))?;
-    let month = u8::try_from(new_month).map_err(|_| XPathError::internal("Month out of range"))?;
-    let max_day = days_in_month(year, month)?;
-    let day = day.min(max_day);
+    // |delta_months| is below 13 × 2³²: no overflow in i64.
+    let total = i64::from(astronomical_year(year)) * 12 + i64::from(month) - 1 + delta_months;
+    let year = xpath_year(i128::from(total.div_euclid(12)))?;
+    let month = (total.rem_euclid(12) + 1) as u8;
+    let day = day.min(days_in_month(year, month)?);
     Ok((year, month, day))
 }
 
@@ -2008,169 +2378,26 @@ fn days_in_month(year: i32, month: u8) -> Result<u8, XPathError> {
 }
 
 fn is_leap_year(xsd_year: i32) -> bool {
-    // Convert XSD year (no year 0) to astronomical year (with year 0) for correct leap year calc
-    let year = if xsd_year <= 0 {
-        xsd_year as i64 + 1
-    } else {
-        xsd_year as i64
-    };
+    // The astronomical year, with year 0, for the Gregorian rule.
+    let year = i64::from(astronomical_year(xsd_year));
     year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0)
 }
 
-fn datetime_to_instant(value: &DateTimeValue) -> Result<Decimal, XPathError> {
-    // Convert XSD year (no year 0) to astronomical year for days_from_civil
-    let astro_year = if value.year <= 0 {
-        value.year + 1
-    } else {
-        value.year
-    };
-    let days = days_from_civil(astro_year, value.month, value.day);
-    let seconds = time_to_seconds_components(value.hour, value.minute, value.second)?;
-    Ok(decimal_from_i64(days)? * Decimal::from(86_400) + seconds)
-}
-
-fn date_to_instant(value: &DateValue) -> Result<Decimal, XPathError> {
-    // Convert XSD year (no year 0) to astronomical year for days_from_civil
-    let astro_year = if value.year <= 0 {
-        value.year + 1
-    } else {
-        value.year
-    };
-    let days = days_from_civil(astro_year, value.month, value.day);
-    Ok(decimal_from_i64(days)? * Decimal::from(86_400))
-}
-
-fn time_to_seconds(value: &TimeValue) -> Result<Decimal, XPathError> {
-    time_to_seconds_components(value.hour, value.minute, value.second)
-}
-
-fn time_to_seconds_components(
-    hour: u8,
-    minute: u8,
-    second: Decimal,
-) -> Result<Decimal, XPathError> {
-    let hours = decimal_from_i64(hour as i64)?;
-    let minutes = decimal_from_i64(minute as i64)?;
-    Ok(hours * Decimal::from(3_600) + minutes * Decimal::from(60) + second)
-}
-
-fn instant_to_datetime(
-    instant: Decimal,
-    timezone: Option<TimezoneOffset>,
-) -> Result<DateTimeValue, XPathError> {
-    let day_seconds = decimal_from_i64(86_400)?;
-    let days = (instant / day_seconds).floor();
-    let mut seconds_in_day = instant - days * day_seconds;
-    if seconds_in_day < Decimal::ZERO {
-        seconds_in_day += day_seconds;
-    }
-    let days = decimal_to_i64(days, "day count")?;
-    let (astro_year, month, day) = civil_from_days(days);
-    // Convert astronomical year back to XSD year (skip year 0)
-    let year = if astro_year <= 0 {
-        astro_year - 1
-    } else {
-        astro_year
-    };
-    let (hour, minute, second) = time_components_from_seconds(seconds_in_day)?;
-    Ok(DateTimeValue {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        timezone,
-    })
-}
-
-fn instant_to_date(
-    instant: Decimal,
-    timezone: Option<TimezoneOffset>,
-) -> Result<DateValue, XPathError> {
-    let day_seconds = decimal_from_i64(86_400)?;
-    let days = (instant / day_seconds).floor();
-    let days = decimal_to_i64(days, "day count")?;
-    let (astro_year, month, day) = civil_from_days(days);
-    // Convert astronomical year back to XSD year (skip year 0)
-    let year = if astro_year <= 0 {
-        astro_year - 1
-    } else {
-        astro_year
-    };
-    Ok(DateValue {
-        year,
-        month,
-        day,
-        timezone,
-    })
-}
-
-fn normalize_seconds_in_day(seconds: Decimal) -> Result<Decimal, XPathError> {
-    let day_seconds = decimal_from_i64(86_400)?;
-    let days = (seconds / day_seconds).floor();
-    let mut remainder = seconds - days * day_seconds;
-    if remainder < Decimal::ZERO {
-        remainder += day_seconds;
-    }
-    Ok(remainder)
-}
-
-fn time_components_from_seconds(seconds: Decimal) -> Result<(u8, u8, Decimal), XPathError> {
-    let hours = (seconds / Decimal::from(3_600)).floor();
-    let mut remainder = seconds - hours * Decimal::from(3_600);
-    let minutes = (remainder / Decimal::from(60)).floor();
-    remainder -= minutes * Decimal::from(60);
-    let hour = decimal_to_u8(hours, "hours")?;
-    let minute = decimal_to_u8(minutes, "minutes")?;
-    Ok((hour, minute, remainder))
-}
-
-fn days_from_civil(year: i32, month: u8, day: u8) -> i64 {
-    let y = year as i64 - if month <= 2 { 1 } else { 0 };
-    let m = month as i64;
-    let d = day as i64;
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = m + if m > 2 { -3 } else { 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
-}
-
-fn civil_from_days(days: i64) -> (i32, u8, u8) {
+/// The astronomical year, month and day of a day number counted from
+/// 1970-01-01 — the inverse of `types::value::day_number`, for every day an
+/// `i128` holds.
+fn civil_from_days(days: i128) -> (i128, u8, u8) {
     let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
     let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    let year = y + if m <= 2 { 1 } else { 0 };
-    (year as i32, m as u8, d as u8)
-}
-
-fn decimal_from_i64(value: i64) -> Result<Decimal, XPathError> {
-    Decimal::from_i64(value)
-        .ok_or_else(|| XPathError::internal("Failed to convert integer to decimal"))
-}
-
-fn decimal_to_i64(value: Decimal, label: &str) -> Result<i64, XPathError> {
-    value
-        .to_i64()
-        .ok_or_else(|| XPathError::internal(format!("Failed to convert {} to integer", label)))
-}
-
-fn decimal_to_u32(value: Decimal, label: &str) -> Result<u32, XPathError> {
-    let val = decimal_to_i64(value, label)?;
-    u32::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
-}
-
-fn decimal_to_u8(value: Decimal, label: &str) -> Result<u8, XPathError> {
-    let val = decimal_to_i64(value, label)?;
-    u8::try_from(val).map_err(|_| XPathError::internal(format!("{} out of range", label)))
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    (year, m as u8, d as u8)
 }
 
 pub(super) fn is_string_like(code: XmlTypeCode) -> bool {
@@ -2596,55 +2823,88 @@ impl<I: XmlNodeIterator> AtomCursor<I> {
 ///
 /// Strings are compared under the Unicode codepoint collation; the collated
 /// twins below take the collation the expression is actually evaluated with.
+/// A date/time value without a timezone is read in the host's local offset at
+/// the time of the call; [`eval_binary_with_timezone`] takes the implicit
+/// timezone of a dynamic context instead.
 pub fn value_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_eq(left, right, CollationRef::Codepoint)
+    compare_eq(
+        left,
+        right,
+        CollationRef::Codepoint,
+        host_timezone_for(left, right),
+    )
 }
 
-/// Compare two values for greater-than (value comparison).
+/// Compare two values for greater-than (value comparison); see [`value_eq`].
 pub fn value_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_gt(left, right, CollationRef::Codepoint)
+    compare_gt(
+        left,
+        right,
+        CollationRef::Codepoint,
+        host_timezone_for(left, right),
+    )
 }
 
-/// Compare two values for greater-than-or-equal (value comparison).
+/// Compare two values for greater-than-or-equal (value comparison); see
+/// [`value_eq`].
 pub fn value_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_ge(left, right, CollationRef::Codepoint)
+    compare_ge(
+        left,
+        right,
+        CollationRef::Codepoint,
+        host_timezone_for(left, right),
+    )
 }
 
-/// Compare two values for less-than (value comparison).
+/// Compare two values for less-than (value comparison); see [`value_eq`].
 pub fn value_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_lt(left, right, CollationRef::Codepoint)
+    compare_lt(
+        left,
+        right,
+        CollationRef::Codepoint,
+        host_timezone_for(left, right),
+    )
 }
 
-/// Compare two values for less-than-or-equal (value comparison).
+/// Compare two values for less-than-or-equal (value comparison); see
+/// [`value_eq`].
 pub fn value_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
-    compare_le(left, right, CollationRef::Codepoint)
+    compare_le(
+        left,
+        right,
+        CollationRef::Codepoint,
+        host_timezone_for(left, right),
+    )
 }
 
-/// [`value_eq`] under `collation` (`None` = codepoint).
+/// [`value_eq`] under `collation`, with the implicit timezone `tz`.
 pub(crate) fn value_eq_collated(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    compare_eq(left, right, collation)
+    compare_eq(left, right, collation, tz)
 }
 
-/// [`value_gt`] under `collation` (`None` = codepoint).
+/// [`value_gt`] under `collation`, with the implicit timezone `tz`.
 pub(crate) fn value_gt_collated(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    compare_gt(left, right, collation)
+    compare_gt(left, right, collation, tz)
 }
 
-/// [`value_lt`] under `collation` (`None` = codepoint).
+/// [`value_lt`] under `collation`, with the implicit timezone `tz`.
 pub(crate) fn value_lt_collated(
     left: &XmlValue,
     right: &XmlValue,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError> {
-    compare_lt(left, right, collation)
+    compare_lt(left, right, collation, tz)
 }
 
 // ============================================================================
@@ -2657,13 +2917,13 @@ pub(crate) fn value_lt_collated(
 /// For sequence comparisons, use `general_eq_seq`.
 pub fn general_eq(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_eq(&l, &r, CollationRef::Codepoint)
+    compare_eq(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
 }
 
 /// General greater-than comparison with magnitude relationship promotion (single values).
 pub fn general_gt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_gt(&l, &r, CollationRef::Codepoint)
+    compare_gt(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
 }
 
 /// General not-equal comparison with magnitude relationship promotion (single values).
@@ -2674,19 +2934,19 @@ pub fn general_ne(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError>
 /// General greater-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_ge(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_ge(&l, &r, CollationRef::Codepoint)
+    compare_ge(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
 }
 
 /// General less-than comparison with magnitude relationship promotion (single values).
 pub fn general_lt(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_lt(&l, &r, CollationRef::Codepoint)
+    compare_lt(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
 }
 
 /// General less-than-or-equal comparison with magnitude relationship promotion (single values).
 pub fn general_le(left: &XmlValue, right: &XmlValue) -> Result<bool, XPathError> {
     let (l, r) = magnitude_relationship(left, right)?;
-    compare_le(&l, &r, CollationRef::Codepoint)
+    compare_le(&l, &r, CollationRef::Codepoint, host_timezone_for(&l, &r))
 }
 
 // ============================================================================
@@ -2709,7 +2969,13 @@ where
     // the handle is `Codepoint`, which is the code path every line below took
     // before collations existed.
     let deferred = collation::DeferredDefault::new(context);
-    general_eq_iter_collated(context, left, right, deferred.as_ref())
+    general_eq_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_eq_iter`] under the collation `collation` — the evaluator's entry
@@ -2719,6 +2985,7 @@ pub(crate) fn general_eq_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2730,7 +2997,8 @@ where
     // whose product is no larger than the budget, and every comparison whose
     // first true pair falls inside it, is decided at exactly the cost it had
     // before — which is what the small comparisons in predicates need.
-    if let Some(result) = general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    if let Some(result) =
+        general_eq_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation, tz)?
     {
         return Ok(result);
     }
@@ -2738,11 +3006,12 @@ where
     // Only a genuinely large product gets here. A hash index answers the same
     // question in O(|A| + |B|) for the operand shapes where that is provably
     // the same answer, errors included; it declines everything else.
-    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf, collation) {
+    if let Some(result) = general_compare::try_indexed_eq(context, left, &right_buf, collation, tz)
+    {
         return result;
     }
 
-    Ok(general_eq_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
+    Ok(general_eq_scan(context, left, &right_buf, usize::MAX, collation, tz)?.unwrap_or(false))
 }
 
 /// How many pairs of the Cartesian product are compared before an index is
@@ -2769,7 +3038,15 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    Ok(general_eq_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
+    Ok(general_eq_scan(
+        context,
+        left,
+        right_buf,
+        usize::MAX,
+        deferred.as_ref(),
+        static_timezone(context),
+    )?
+    .unwrap_or(false))
 }
 
 /// Walk at most `budget` pairs of the product in row-major order.
@@ -2784,6 +3061,7 @@ fn general_eq_scan<I1, I2>(
     right_buf: &BufferedNodeIterator<I2>,
     budget: usize,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<Option<bool>, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2808,7 +3086,7 @@ where
             remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq_collated(&l, &r, collation) {
+            match value_eq_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(Some(true)),
                 Ok(false) => continue,
                 Err(err) if is_operator_not_defined(&err) => {
@@ -2836,7 +3114,13 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    general_ne_iter_collated(context, left, right, deferred.as_ref())
+    general_ne_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_ne_iter`] under the collation `collation`.
@@ -2845,6 +3129,7 @@ pub(crate) fn general_ne_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2855,16 +3140,17 @@ where
     // `!=` already stops at the first unequal pair, so the bounded prefix
     // decides it in practice; the index is only there for the degenerate
     // all-equal product, and it declines everything else.
-    if let Some(result) = general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation)?
+    if let Some(result) =
+        general_ne_scan(context, left, &right_buf, INDEX_AFTER_PAIRS, collation, tz)?
     {
         return Ok(result);
     }
 
-    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf, collation) {
+    if let Some(result) = general_compare::try_indexed_ne(left, &right_buf, collation, tz) {
         return result;
     }
 
-    Ok(general_ne_scan(context, left, &right_buf, usize::MAX, collation)?.unwrap_or(false))
+    Ok(general_ne_scan(context, left, &right_buf, usize::MAX, collation, tz)?.unwrap_or(false))
 }
 
 /// The Cartesian-product evaluation of `A != B` (the tests' reference, like
@@ -2880,7 +3166,15 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    Ok(general_ne_scan(context, left, right_buf, usize::MAX, deferred.as_ref())?.unwrap_or(false))
+    Ok(general_ne_scan(
+        context,
+        left,
+        right_buf,
+        usize::MAX,
+        deferred.as_ref(),
+        static_timezone(context),
+    )?
+    .unwrap_or(false))
 }
 
 /// The `!=` counterpart of [`general_eq_scan`]; see it for what `Ok(None)` means.
@@ -2890,6 +3184,7 @@ fn general_ne_scan<I1, I2>(
     right_buf: &BufferedNodeIterator<I2>,
     budget: usize,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<Option<bool>, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2913,7 +3208,7 @@ where
             remaining -= 1;
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq_collated(&l, &r, collation) {
+            match value_eq_collated(&l, &r, collation, tz) {
                 Ok(true) => continue,
                 Ok(false) => return Ok(Some(true)),
                 Err(err) if is_operator_not_defined(&err) => {
@@ -2941,7 +3236,13 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    general_lt_iter_collated(context, left, right, deferred.as_ref())
+    general_lt_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_lt_iter`] under the collation `collation`.
@@ -2950,6 +3251,7 @@ pub(crate) fn general_lt_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -2964,7 +3266,7 @@ where
         while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_lt_collated(&l, &r, collation) {
+            match value_lt_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -2985,7 +3287,13 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    general_le_iter_collated(context, left, right, deferred.as_ref())
+    general_le_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_le_iter`] under the collation `collation`.
@@ -2994,6 +3302,7 @@ pub(crate) fn general_le_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -3008,14 +3317,14 @@ where
         while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq_collated(&l, &r, collation) {
+            match value_eq_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_lt_collated(&l, &r, collation) {
+            match value_lt_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -3036,7 +3345,13 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    general_gt_iter_collated(context, left, right, deferred.as_ref())
+    general_gt_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_gt_iter`] under the collation `collation`.
@@ -3045,6 +3360,7 @@ pub(crate) fn general_gt_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -3059,7 +3375,7 @@ where
         while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_gt_collated(&l, &r, collation) {
+            match value_gt_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -3080,7 +3396,13 @@ where
     I2: XmlNodeIterator,
 {
     let deferred = collation::DeferredDefault::new(context);
-    general_ge_iter_collated(context, left, right, deferred.as_ref())
+    general_ge_iter_collated(
+        context,
+        left,
+        right,
+        deferred.as_ref(),
+        static_timezone(context),
+    )
 }
 
 /// [`general_ge_iter`] under the collation `collation`.
@@ -3089,6 +3411,7 @@ pub(crate) fn general_ge_iter_collated<I1, I2>(
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
@@ -3103,14 +3426,14 @@ where
         while let Some(right_value) = right_atoms.next_atom()? {
             let (l, r) = magnitude_relationship_ctx(context, &left_value, &right_value)?;
 
-            match value_eq_collated(&l, &r, collation) {
+            match value_eq_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => {}
                 Err(err) if is_operator_not_defined(&err) => {}
                 Err(err) => return Err(err),
             }
 
-            match value_gt_collated(&l, &r, collation) {
+            match value_gt_collated(&l, &r, collation, tz) {
                 Ok(true) => return Ok(true),
                 Ok(false) => continue,
                 Err(err) => return Err(err),
@@ -3151,8 +3474,8 @@ fn coerce_for_comparison_10(
 
         // Rule 2: if either is numeric, convert both to number
         if left.type_code.is_numeric() || right.type_code.is_numeric() {
-            let l_num = crate::xpath::atomize::to_number(left);
-            let r_num = crate::xpath::atomize::to_number(right);
+            let l_num = crate::xpath::atomize::to_number_xpath10(left);
+            let r_num = crate::xpath::atomize::to_number_xpath10(right);
             return (XmlValue::double(l_num), XmlValue::double(r_num));
         }
 
@@ -3163,8 +3486,8 @@ fn coerce_for_comparison_10(
     }
 
     // Relational operators: always numeric
-    let l_num = crate::xpath::atomize::to_number(left);
-    let r_num = crate::xpath::atomize::to_number(right);
+    let l_num = crate::xpath::atomize::to_number_xpath10(left);
+    let r_num = crate::xpath::atomize::to_number_xpath10(right);
     (XmlValue::double(l_num), XmlValue::double(r_num))
 }
 
@@ -3187,6 +3510,89 @@ fn ebv_atomic(value: &XmlValue) -> bool {
     !s.is_empty()
 }
 
+/// A general comparison in XPath 1.0 compatibility mode, after the boolean
+/// rule and atomization (XPath 2.0 §3.5.2): the existential comparison of the
+/// pairs by [`compare_pair_compat`]. A pair of types `eq` is not defined for
+/// is a type error, raised — as without compatibility mode — only when no
+/// pair has the required magnitude relationship.
+fn general_compare_compat<I1, I2>(
+    op: BinaryOpKind,
+    context: &XPathContext,
+    left: &I1,
+    right_buf: &BufferedNodeIterator<I2>,
+    collation: CollationRef<'_>,
+    tz: TimezoneOffset,
+) -> Result<bool, XPathError>
+where
+    I1: XmlNodeIterator,
+    I2: XmlNodeIterator,
+{
+    let mut left_atoms = AtomCursor::new(left.clone());
+    let mut deferred: Option<XPathError> = None;
+    while let Some(left_value) = left_atoms.next_atom()? {
+        let mut right_atoms = AtomCursor::new(right_buf.clone());
+        while let Some(right_value) = right_atoms.next_atom()? {
+            match compare_pair_compat(op, context, &left_value, &right_value, collation, tz) {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(err) if is_operator_not_defined(&err) => {
+                    deferred.get_or_insert(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    match deferred {
+        Some(err) => Err(err),
+        None => Ok(false),
+    }
+}
+
+/// The magnitude relationship of two atomic values in XPath 1.0
+/// compatibility mode (XPath 2.0 §3.5.2): "If the comparison operator is <,
+/// <=, >, or >=, then each item in both of the operand sequences is converted
+/// to the type xs:double by applying the fn:number function"; otherwise "If at
+/// least one of the two atomic values is an instance of a numeric type, then
+/// both atomic values are converted to the type xs:double by applying the
+/// fn:number function", and an `xs:untypedAtomic` value is cast as without
+/// compatibility mode (two of them to `xs:string`, one to the other value's
+/// type). "After performing the conversions described above, the atomic
+/// values are compared using one of the value comparison operators eq, ne,
+/// lt, le, gt, or ge".
+fn compare_pair_compat(
+    op: BinaryOpKind,
+    context: &XPathContext,
+    left: &XmlValue,
+    right: &XmlValue,
+    collation: CollationRef<'_>,
+    tz: TimezoneOffset,
+) -> Result<bool, XPathError> {
+    let relational = matches!(
+        op,
+        BinaryOpKind::GeneralLt
+            | BinaryOpKind::GeneralLe
+            | BinaryOpKind::GeneralGt
+            | BinaryOpKind::GeneralGe
+    );
+    let (l, r) = if relational || left.type_code.is_numeric() || right.type_code.is_numeric() {
+        (
+            XmlValue::double(crate::xpath::atomize::to_number(left)),
+            XmlValue::double(crate::xpath::atomize::to_number(right)),
+        )
+    } else {
+        magnitude_relationship_ctx(context, left, right)?
+    };
+    match op {
+        BinaryOpKind::GeneralEq => compare_eq(&l, &r, collation, tz),
+        BinaryOpKind::GeneralNe => compare_eq(&l, &r, collation, tz).map(|eq| !eq),
+        BinaryOpKind::GeneralLt => compare_lt(&l, &r, collation, tz),
+        BinaryOpKind::GeneralLe => compare_le(&l, &r, collation, tz),
+        BinaryOpKind::GeneralGt => compare_gt(&l, &r, collation, tz),
+        BinaryOpKind::GeneralGe => compare_ge(&l, &r, collation, tz),
+        _ => Err(XPathError::internal("not a general comparison operator")),
+    }
+}
+
 /// XPath 1.0 general equality comparison (iterator-based, Cartesian product).
 pub fn general_eq_iter_10<I1, I2>(left: &I1, right: &I2) -> Result<bool, XPathError>
 where
@@ -3198,6 +3604,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3212,6 +3620,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3226,6 +3636,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3240,6 +3652,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3254,6 +3668,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3268,6 +3684,8 @@ where
         left,
         right,
         CollationRef::Codepoint,
+        host_implicit_timezone(),
+        None,
     )
 }
 
@@ -3287,17 +3705,28 @@ where
 /// every operand is converted with `fn:number` first (§3.5.2 rule 3). An
 /// unsupported collation is therefore FOCH0002 exactly where two strings are
 /// compared, and nowhere else.
+///
+/// `compat` is the static context of an XPath 2.0 expression evaluated in XPath
+/// 1.0 compatibility mode, for which the pairs are compared by §3.5.2 itself
+/// ([`compare_pair_compat`]); `None` is the XPath 1.0 language
+/// (`XPathMode::XPath10`, and the public `general_*_iter_10` functions), whose
+/// §3.4 rules [`coerce_for_comparison_10`] applies.
 pub(crate) fn general_compare_iter_10<I1, I2>(
     op: BinaryOpKind,
     left: &I1,
     right: &I2,
     collation: CollationRef<'_>,
+    tz: TimezoneOffset,
+    compat: Option<&XPathContext>,
 ) -> Result<bool, XPathError>
 where
     I1: XmlNodeIterator,
     I2: XmlNodeIterator,
 {
     let right_buf = BufferedNodeIterator::preload(right.clone())?;
+    if let Some(context) = compat {
+        return general_compare_compat(op, context, left, &right_buf, collation, tz);
+    }
     let mut left_atoms = AtomCursor::new(left.clone());
 
     while let Some(left_value) = left_atoms.next_atom()? {
@@ -3307,12 +3736,12 @@ where
             let (l, r) = coerce_for_comparison_10(op, &left_value, &right_value);
 
             let compared = match op {
-                BinaryOpKind::GeneralEq => compare_eq(&l, &r, collation),
-                BinaryOpKind::GeneralNe => compare_eq(&l, &r, collation).map(|eq| !eq),
-                BinaryOpKind::GeneralLt => compare_lt(&l, &r, collation),
-                BinaryOpKind::GeneralLe => compare_le(&l, &r, collation),
-                BinaryOpKind::GeneralGt => compare_gt(&l, &r, collation),
-                BinaryOpKind::GeneralGe => compare_ge(&l, &r, collation),
+                BinaryOpKind::GeneralEq => compare_eq(&l, &r, collation, tz),
+                BinaryOpKind::GeneralNe => compare_eq(&l, &r, collation, tz).map(|eq| !eq),
+                BinaryOpKind::GeneralLt => compare_lt(&l, &r, collation, tz),
+                BinaryOpKind::GeneralLe => compare_le(&l, &r, collation, tz),
+                BinaryOpKind::GeneralGt => compare_gt(&l, &r, collation, tz),
+                BinaryOpKind::GeneralGe => compare_ge(&l, &r, collation, tz),
                 _ => unreachable!(),
             };
             let satisfied = match compared {
@@ -3550,6 +3979,7 @@ mod tests {
     use crate::namespace::qname::QualifiedName;
     use crate::namespace::NameTable;
     use crate::navigator::RoXmlNavigator;
+    use crate::types::value::DurationValue;
     use crate::xpath::context::XPathContext;
     use crate::xpath::iterator::{VecNodeIterator, XmlItem};
 
@@ -3833,7 +4263,7 @@ mod tests {
 
     #[test]
     fn test_time_compare_uses_implicit_timezone() {
-        let implicit = implicit_timezone_offset();
+        let implicit = host_implicit_timezone();
         let left = time_value(10, 0, Decimal::ZERO);
         let right = time_value_with_tz(10, 0, Decimal::ZERO, implicit);
         let result = eval_binary(BinaryOpKind::GeneralEq, &left, &right).unwrap();
@@ -4146,8 +4576,8 @@ mod tests {
         );
         let right = left.clone();
 
-        assert!(compare_ge(&left, &right, CollationRef::Codepoint).unwrap());
-        assert!(compare_le(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(compare_ge(&left, &right, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
+        assert!(compare_le(&left, &right, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     fn nmtoken(token: &str) -> XmlValue {
@@ -4175,8 +4605,14 @@ mod tests {
             },
         );
 
-        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
-        assert!(!compare_eq(&left, &different, CollationRef::Codepoint).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
+        assert!(!compare_eq(
+            &left,
+            &different,
+            CollationRef::Codepoint,
+            TimezoneOffset::UTC
+        )
+        .unwrap());
     }
 
     #[test]
@@ -4184,7 +4620,7 @@ mod tests {
         let inner = XmlValue::string("hello");
         let left = XmlValue::new(XmlTypeCode::String, XmlValueKind::Union(Box::new(inner)));
         let right = XmlValue::string("hello");
-        assert!(compare_eq(&left, &right, CollationRef::Codepoint).unwrap());
+        assert!(compare_eq(&left, &right, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4487,7 +4923,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Boolean);
         assert_eq!(r.type_code, XmlTypeCode::Boolean);
-        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4498,7 +4934,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.as_boolean(), Some(false));
         assert_eq!(r.as_boolean(), Some(true));
-        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4509,7 +4945,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralLt, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_lt(&l, &r, CollationRef::Codepoint).unwrap());
+        assert!(compare_lt(&l, &r, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4520,7 +4956,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::String);
         assert_eq!(r.type_code, XmlTypeCode::String);
-        assert!(!compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
+        assert!(!compare_eq(&l, &r, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4531,7 +4967,7 @@ mod tests {
         let (l, r) = coerce_for_comparison_10(BinaryOpKind::GeneralEq, &left, &right);
         assert_eq!(l.type_code, XmlTypeCode::Double);
         assert_eq!(r.type_code, XmlTypeCode::Double);
-        assert!(compare_eq(&l, &r, CollationRef::Codepoint).unwrap());
+        assert!(compare_eq(&l, &r, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap());
     }
 
     #[test]
@@ -4642,5 +5078,170 @@ mod tests {
         let left = XmlValue::untyped("abc");
         let right = int_value(XmlTypeCode::Integer, 1);
         assert!(eval_binary(BinaryOpKind::Add, &left, &right).is_err());
+    }
+
+    /// The XPath comparisons of date/time and duration values agree with the
+    /// order of the schema facets (`types::value_order`, batch (v)) once the
+    /// implicit timezone is in place: two values with a timezone are totally
+    /// ordered there, and `eq` / `gt` must give the same answer. Durations:
+    /// `eq` is the identity of the months and seconds (F&O §10.4.5), the two
+    /// subtypes are ordered as the value order orders them.
+    #[test]
+    fn temporal_comparisons_agree_with_the_value_order() {
+        use crate::types::value_order::{date_time_or_duration_cmp, duration_parts};
+        let parse = |code: XmlTypeCode, lexical: &str| {
+            VALIDATOR_REGISTRY
+                .validate(code, lexical)
+                .unwrap_or_else(|e| panic!("{lexical}: {e:?}"))
+        };
+        let with_tz = |value: &XmlValue, tz: TimezoneOffset| -> XmlValue {
+            let mut value = value.clone();
+            if let XmlValueKind::Atomic(atom) = &mut value.value {
+                match atom {
+                    XmlAtomicValue::DateTime(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::Date(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::Time(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::GYearMonth(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::GYear(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::GMonthDay(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::GDay(v) => v.timezone = v.timezone.or(Some(tz)),
+                    XmlAtomicValue::GMonth(v) => v.timezone = v.timezone.or(Some(tz)),
+                    _ => {}
+                }
+            }
+            value
+        };
+        let atom = |value: &XmlValue| match &value.value {
+            XmlValueKind::Atomic(a) => a.clone(),
+            other => panic!("{other:?}"),
+        };
+        let pools: &[(XmlTypeCode, &[&str])] = &[
+            (
+                XmlTypeCode::DateTime,
+                &[
+                    "2000-01-01T00:00:00Z",
+                    "2000-01-01T00:00:00",
+                    "2000-01-01T05:00:00+05:00",
+                    "1999-12-31T23:00:00-01:00",
+                    "2000-01-01T00:00:00.00000000000000000001Z",
+                    "2000-01-01T00:00:00.0000000000000000000000000001",
+                    "1999-12-31T23:59:59.9999999999999999999999999Z",
+                    "2000-01-01T14:00:00",
+                    "2000-01-01T00:00:00-14:00",
+                    "0001-01-01T00:00:00Z",
+                    "2147483647-12-31T23:59:59Z",
+                ],
+            ),
+            (
+                XmlTypeCode::Date,
+                &[
+                    "2000-01-01",
+                    "2000-01-01Z",
+                    "2000-01-02+14:00",
+                    "1999-12-31-10:00",
+                    "2000-01-01-14:00",
+                    "2147483647-12-31",
+                ],
+            ),
+            (
+                XmlTypeCode::Time,
+                &[
+                    "00:00:00",
+                    "00:00:00Z",
+                    "05:00:00+05:00",
+                    "23:59:59.9999999999999999999999999",
+                    "12:00:00.0000000000000000000000001+14:00",
+                    "10:00:00-14:00",
+                ],
+            ),
+            (
+                XmlTypeCode::GYear,
+                &["2000", "2000Z", "2000+14:00", "1999-10:00", "2001"],
+            ),
+            (
+                XmlTypeCode::GYearMonth,
+                &["2000-01", "2000-01Z", "2000-02+14:00", "1999-12-10:00"],
+            ),
+            (
+                XmlTypeCode::GMonthDay,
+                &["--02-14", "--02-14+12:00", "--02-13-12:00", "--02-29"],
+            ),
+            (
+                XmlTypeCode::GDay,
+                &["---02", "---02-14:00", "---03+10:00", "---31", "---01Z"],
+            ),
+            (
+                XmlTypeCode::GMonth,
+                &["--05", "--05Z", "--06-14:00", "--04+14:00"],
+            ),
+        ];
+        let timezones = [0, 300, -210, 840, -840].map(TimezoneOffset);
+        for (code, lexicals) in pools {
+            let values: Vec<XmlValue> = lexicals.iter().map(|l| parse(*code, l)).collect();
+            for tz in timezones {
+                for (a, la) in values.iter().zip(lexicals.iter()) {
+                    for (b, lb) in values.iter().zip(lexicals.iter()) {
+                        let order = date_time_or_duration_cmp(
+                            &atom(&with_tz(a, tz)),
+                            &atom(&with_tz(b, tz)),
+                        )
+                        .expect("two values with a timezone are ordered");
+                        let eq = compare_eq(a, b, CollationRef::Codepoint, tz).unwrap();
+                        assert_eq!(eq, order == Ordering::Equal, "{la} eq {lb} at {tz}");
+                        if !operators_gregorian(*code) {
+                            let gt = compare_gt(a, b, CollationRef::Codepoint, tz).unwrap();
+                            assert_eq!(gt, order == Ordering::Greater, "{la} gt {lb} at {tz}");
+                        }
+                    }
+                }
+            }
+        }
+        let durations: &[(XmlTypeCode, &[&str])] = &[
+            (
+                XmlTypeCode::Duration,
+                &[
+                    "P1Y", "P12M", "P365D", "P400Y", "P146097D", "PT24H", "P1D",
+                    "PT0.00000000000000000001S", "PT0S", "-PT0.5S",
+                    "P4294967295Y4294967295M4294967295DT4294967295H4294967295M79228162514264337593543950335S",
+                ],
+            ),
+            (
+                XmlTypeCode::YearMonthDuration,
+                &["P1Y", "P12M", "P0M", "-P13M", "P4294967295Y11M"],
+            ),
+            (
+                XmlTypeCode::DayTimeDuration,
+                &[
+                    "P1D", "PT24H", "PT0S", "-PT0.5S", "P10000DT0.0000000000000000000001S",
+                    "P10000D", "P4294967295DT4294967295H4294967295M79228162514264337593543950335S",
+                ],
+            ),
+        ];
+        for (code, lexicals) in durations {
+            let values: Vec<XmlValue> = lexicals.iter().map(|l| parse(*code, l)).collect();
+            for (a, la) in values.iter().zip(lexicals.iter()) {
+                for (b, lb) in values.iter().zip(lexicals.iter()) {
+                    let (pa, pb) = (
+                        duration_parts(&atom(a)).unwrap(),
+                        duration_parts(&atom(b)).unwrap(),
+                    );
+                    let eq =
+                        compare_eq(a, b, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap();
+                    assert_eq!(eq, pa == pb, "{la} eq {lb}");
+                    if *code != XmlTypeCode::Duration {
+                        let order = date_time_or_duration_cmp(&atom(a), &atom(b))
+                            .expect("the two subtypes are totally ordered");
+                        let gt =
+                            compare_gt(a, b, CollationRef::Codepoint, TimezoneOffset::UTC).unwrap();
+                        assert_eq!(gt, order == Ordering::Greater, "{la} gt {lb}");
+                        assert_eq!(eq, order == Ordering::Equal, "{la} eq {lb} (order)");
+                    }
+                }
+            }
+        }
+    }
+
+    fn operators_gregorian(code: XmlTypeCode) -> bool {
+        is_gregorian_code(code)
     }
 }

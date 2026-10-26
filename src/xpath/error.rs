@@ -754,6 +754,25 @@ impl XPathError {
         }
     }
 
+    /// FOCA0001: an `xs:float` or `xs:double` value too large for `xs:decimal`.
+    ///
+    /// F&O 1.0 §17.1.3.3: "If SV is too large to be accommodated as an
+    /// xs:decimal, (see \[XML Schema Part 2: Datatypes Second Edition\] for
+    /// ·implementation-defined· limits on numeric values) an error is raised
+    /// \[err:FOCA0001\]." This crate's `xs:decimal` holds a 96-bit mantissa.
+    /// The code has no dedicated variant, so it travels as an error QName; see
+    /// [`XPathError::raised`]. [`XPathError::error_code`] answers
+    /// `Some("FOCA0001")`.
+    pub(crate) fn decimal_too_large(lexical: &str) -> Self {
+        XPathError::raised(
+            XQT_ERRORS_NAMESPACE,
+            "FOCA0001",
+            Some(&format!(
+                "'{lexical}' is too large for xs:decimal here (a 96-bit mantissa)"
+            )),
+        )
+    }
+
     /// FOCA0006: a string cast to `xs:decimal` has more digits of precision
     /// than the implementation holds.
     ///
@@ -925,6 +944,49 @@ pub const DEFAULT_RAISED_ERROR: &str = "FOER0000";
 const DECIMAL_CAPACITY_OPERAND: &str =
     "[FOAR0002] xs:decimal operand beyond the capacity of this implementation";
 
+/// A warning an evaluation raised: the result is computed, but not with
+/// assured correctness (Datatypes 1.1 §5.4: a processor "must indicate to the
+/// user and/or downstream application that it cannot process the input data
+/// with assured correctness").
+///
+/// The one warning today is `xs-seconds-capacity` — the code the validator
+/// reports for a date/time or duration literal whose seconds have more fraction
+/// digits than this implementation holds — for a date/time or duration
+/// arithmetic result whose seconds field could not hold the whole fraction, and
+/// kept it truncated toward zero. Collect them with
+/// [`XPathEvaluator::with_warnings`](crate::xpath::XPathEvaluator::with_warnings)
+/// or [`DynamicContext::take_warnings`](crate::xpath::DynamicContext::take_warnings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XPathWarning {
+    code: &'static str,
+    message: String,
+}
+
+impl XPathWarning {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// The warning code, e.g. `"xs-seconds-capacity"`.
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    /// What happened, for a person.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for XPathWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] {}", self.code, self.message)
+    }
+}
+
 /// The spec-defined codes this crate reports through an error QName — an
 /// [`XPathError::Raised`] in the [`XQT_ERRORS_NAMESPACE`] — rather than
 /// through a variant of their own, and which [`XPathError::error_code`]
@@ -934,6 +996,7 @@ const DECIMAL_CAPACITY_OPERAND: &str =
 /// [`XPathError::XPST0080`].)
 pub const QNAMED_ERROR_CODES: &[&str] = &[
     DEFAULT_RAISED_ERROR,
+    "FOCA0001",
     "FOCA0006",
     "FOCH0004",
     "FODC0001",

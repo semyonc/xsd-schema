@@ -603,26 +603,31 @@ fn absolutize<'u>(context: &XPathContext<'_>, uri: &'u str) -> std::borrow::Cow<
 /// collation does not support collation units an error MAY be raised
 /// \[err:FOCH0004\]"; this crate raises it.
 ///
-/// A zero-length `needle` is answered here rather than left to the host: F&O
-/// fixes the result for it ("if the value of `$arg2` is the zero-length string,
-/// then the function returns true" and its substring counterparts), and the
-/// empty match at the start is that result.
+/// A zero-length `needle` is answered here, before the collation is asked
+/// for its collation units: F&O fixes the result for it ("If the value of
+/// $arg2 is the zero-length string, then the function returns true" and its
+/// substring counterparts), and the empty match at the start is that result —
+/// also under a collation without collation units, for which FOCH0004 "·may·"
+/// be raised only where units are needed. (An unsupported collation was
+/// FOCH0002 before any of this, when the function resolved it: F&O §7.3.1.)
+/// A zero-length `haystack` is not decided here: under a collation with
+/// ignorable units a `needle` may be equivalent to the zero-length string.
 pub(crate) fn collated_find(
     collation: &dyn Collation,
     uri: &str,
     haystack: &str,
     needle: &str,
 ) -> Result<Option<(usize, usize)>, XPathError> {
-    let found = collation
-        .find(haystack, needle)
-        .ok_or_else(|| XPathError::collation_no_units(uri))?;
     if needle.is_empty() {
         return Ok(Some((0, 0)));
     }
-    Ok(found)
+    collation
+        .find(haystack, needle)
+        .ok_or_else(|| XPathError::collation_no_units(uri))
 }
 
-/// `fn:starts-with` under a host collation, or FOCH0004.
+/// `fn:starts-with` under a host collation, or FOCH0004; a zero-length
+/// `needle` is `true` whatever the collation (see [`collated_find`]).
 pub(crate) fn collated_starts_with(
     collation: &dyn Collation,
     uri: &str,
@@ -630,9 +635,6 @@ pub(crate) fn collated_starts_with(
     needle: &str,
 ) -> Result<bool, XPathError> {
     if needle.is_empty() {
-        // Still gate on collation units, so that the answer for a collation
-        // without them does not depend on the argument.
-        collated_find(collation, uri, haystack, needle)?;
         return Ok(true);
     }
     collation
@@ -640,7 +642,8 @@ pub(crate) fn collated_starts_with(
         .ok_or_else(|| XPathError::collation_no_units(uri))
 }
 
-/// `fn:ends-with` under a host collation, or FOCH0004.
+/// `fn:ends-with` under a host collation, or FOCH0004; a zero-length `needle`
+/// is `true` whatever the collation (see [`collated_find`]).
 pub(crate) fn collated_ends_with(
     collation: &dyn Collation,
     uri: &str,
@@ -648,7 +651,6 @@ pub(crate) fn collated_ends_with(
     needle: &str,
 ) -> Result<bool, XPathError> {
     if needle.is_empty() {
-        collated_find(collation, uri, haystack, needle)?;
         return Ok(true);
     }
     collation

@@ -9,7 +9,6 @@
 //! - DateTime constructor (fn:dateTime)
 //! - Timezone adjustment (adjust-dateTime/date/time-to-timezone)
 
-use chrono::Local;
 use num_bigint::BigInt;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -28,12 +27,6 @@ use super::{atomize_to_single_opt, convert, XPathValue};
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Get the implicit timezone offset from the system.
-fn get_implicit_timezone_offset() -> TimezoneOffset {
-    let seconds = Local::now().offset().local_minus_utc();
-    TimezoneOffset((seconds / 60) as i16)
-}
 
 /// Convert a TimezoneOffset to a DayTimeDurationValue.
 fn timezone_to_day_time_duration(tz: TimezoneOffset) -> DayTimeDurationValue {
@@ -275,13 +268,19 @@ fn xml_time(value: TimeValue) -> XmlValue {
 
 /// Implements fn:current-dateTime() - returns the current date and time.
 ///
-/// The value is cached in the dynamic context for the duration of the query.
-/// Uses the implicit timezone from context if set, otherwise uses local timezone.
-/// Preserves fractional seconds from the system clock.
+/// F&O 1.0 §16.3: "Returns the current dateTime (with timezone) from the
+/// dynamic context … This function is ·stable·." The dynamic context's
+/// [`current_datetime`](DynamicContext::current_datetime) when it is set;
+/// otherwise the current instant — read once per dynamic context, with the
+/// fractional seconds of the system clock — expressed in the implicit
+/// timezone ([`DynamicContext::implicit_timezone_or_host`]), and kept in
+/// `current_datetime` for the rest of the evaluation.
 pub fn current_datetime<N: DomNavigator>(
     context: &mut DynamicContext<'_, N>,
     args: Vec<XPathValue<N>>,
 ) -> Result<XPathValue<N>, XPathError> {
+    use chrono::{Datelike, Timelike};
+
     if !args.is_empty() {
         return Err(XPathError::wrong_number_of_arguments(
             "current-dateTime",
@@ -294,27 +293,22 @@ pub fn current_datetime<N: DomNavigator>(
     let dt = if let Some(ref cached) = context.current_datetime {
         cached.clone()
     } else {
-        let now = Local::now();
-
-        // Use context implicit_timezone if set, otherwise use local timezone
-        let tz_offset = context
-            .implicit_timezone
-            .unwrap_or_else(get_implicit_timezone_offset);
-
-        // Extract seconds with fractional part
-        // chrono's timestamp_subsec_nanos gives nanoseconds within the second
-        let secs = now.format("%S").to_string().parse::<u32>().unwrap_or(0);
-        let nanos = now.timestamp_subsec_nanos();
-        // Convert to Decimal: seconds + nanoseconds/1_000_000_000
-        let second = Decimal::from(secs) + Decimal::from(nanos) / Decimal::from(1_000_000_000u64);
+        let tz_offset = context.implicit_timezone_or_host();
+        // The instant, then its local time in the implicit timezone — not the
+        // host's wall-clock time with the implicit timezone's label.
+        let local = context.host_clock().now.naive_utc()
+            + chrono::Duration::minutes(i64::from(tz_offset.0));
+        // A leap second reads as the last nanosecond of its minute.
+        let nanos = local.nanosecond().min(999_999_999);
+        let second = Decimal::from(local.second()) + Decimal::new(i64::from(nanos), 9);
 
         let dt = DateTimeValue {
-            year: now.format("%Y").to_string().parse().unwrap_or(2000),
-            month: now.format("%m").to_string().parse().unwrap_or(1),
-            day: now.format("%d").to_string().parse().unwrap_or(1),
-            hour: now.format("%H").to_string().parse().unwrap_or(0),
-            minute: now.format("%M").to_string().parse().unwrap_or(0),
-            second,
+            year: local.year(),
+            month: local.month() as u8,
+            day: local.day() as u8,
+            hour: local.hour() as u8,
+            minute: local.minute() as u8,
+            second: second.normalize(),
             timezone: Some(tz_offset),
         };
         context.current_datetime = Some(dt.clone());
@@ -413,9 +407,7 @@ pub fn implicit_timezone<N: DomNavigator>(
         ));
     }
 
-    let tz = context
-        .implicit_timezone
-        .unwrap_or_else(get_implicit_timezone_offset);
+    let tz = context.implicit_timezone_or_host();
 
     let duration = timezone_to_day_time_duration(tz);
     Ok(XPathValue::from_atomic(xml_day_time_duration(duration)))
@@ -1274,9 +1266,7 @@ pub fn adjust_datetime_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context
-            .implicit_timezone
-            .unwrap_or_else(get_implicit_timezone_offset)
+        context.implicit_timezone_or_host()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1353,9 +1343,7 @@ pub fn adjust_date_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context
-            .implicit_timezone
-            .unwrap_or_else(get_implicit_timezone_offset)
+        context.implicit_timezone_or_host()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1430,9 +1418,7 @@ pub fn adjust_time_to_timezone<N: DomNavigator>(
         }
     } else {
         // 1-arg form: use implicit timezone
-        context
-            .implicit_timezone
-            .unwrap_or_else(get_implicit_timezone_offset)
+        context.implicit_timezone_or_host()
     };
 
     validate_timezone_offset(target_tz.0)?;
@@ -1589,13 +1575,14 @@ fn add_days_to_date(
             m += 1;
             if m > 12 {
                 m = 1;
-                y += 1;
+                // F&O §10.1.1: FODT0001 beyond the year range held (`i32`).
+                y = y.checked_add(1).ok_or(XPathError::FODT0001)?;
             }
         } else if d < 1 {
             m -= 1;
             if m < 1 {
                 m = 12;
-                y -= 1;
+                y = y.checked_sub(1).ok_or(XPathError::FODT0001)?;
             }
             let days_in_prev_month = days_in_month(y, m as u8)?;
             d += days_in_prev_month as i32;
